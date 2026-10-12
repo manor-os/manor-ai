@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from importlib import reload
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -35,6 +36,20 @@ def test_document_hot_cache_key_is_versioned_and_hides_paths():
     assert original_key != changed_key
     assert "docs/report.md" not in original_key
     assert "ent_1" not in original_key
+
+
+def test_knowledge_payload_cache_defaults_to_one_week(monkeypatch):
+    names = (
+        "KNOWLEDGE_CONTENT_CACHE_TTL_SECONDS",
+        "KNOWLEDGE_THUMBNAIL_CACHE_TTL_SECONDS",
+        "KNOWLEDGE_DOWNLOAD_CACHE_TTL_SECONDS",
+    )
+    with monkeypatch.context() as environment:
+        for name in names:
+            environment.delenv(name, raising=False)
+        reload(knowledge_hot_cache)
+        assert all(getattr(knowledge_hot_cache, name) == 604_800 for name in names)
+    reload(knowledge_hot_cache)
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,8 @@ from pathlib import Path
 from .pptx_dimensions import CANVAS_FORMATS, get_project_info
 from .pptx_discovery import find_svg_files, find_notes_files
 from .pptx_builder import create_pptx_with_native_svg
+from .native_charts import NativeChartSpecError, load_native_chart_manifest, expected_native_chart_counts
+from .embedded_media import EmbeddedMediaSpecError, load_embedded_media_manifest, expected_embedded_video_counts
 from .pptx_narration import NARRATION_EXTENSIONS, find_narration_files, probe_audio_duration
 from .pptx_slide_xml import TRANSITIONS
 from .animation_config import load_animation_config, validate_animation_config
@@ -290,6 +292,24 @@ Recorded narration:
         print("Error: No SVG files found")
         sys.exit(1)
 
+    # A manifest is required content, not an optional preview hint. Validate
+    # it before export and apply it to the native package before delivery.
+    native_chart_manifest = None
+    embedded_media_manifest = None
+    if gen_native:
+        try:
+            chart_path = project_path / "native_charts.json"
+            if chart_path.is_file():
+                native_chart_manifest = load_native_chart_manifest(chart_path)
+                expected_native_chart_counts(native_chart_manifest, native_files)
+            media_path = project_path / "embedded_media.json"
+            if media_path.is_file():
+                embedded_media_manifest = load_embedded_media_manifest(media_path)
+                expected_embedded_video_counts(embedded_media_manifest, native_files, project_path)
+        except (NativeChartSpecError, EmbeddedMediaSpecError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     backup_dir: Path | None = None
@@ -517,6 +537,9 @@ Recorded narration:
             output_path=native_path,
             use_native_shapes=True,
             svg_files=native_files,
+            native_chart_manifest=native_chart_manifest,
+            embedded_media_manifest=embedded_media_manifest,
+            manifest_dir=project_path,
             conversion_trace_path=(
                 native_path.with_name(native_path.name + '.trace.json')
                 if args.conversion_trace else None
@@ -562,7 +585,7 @@ Recorded narration:
                 if verbose:
                     print(f"  [warn] svg_output backup skipped: {exc}")
         elif verbose:
-            print(f"  [info] svg_output/ not found, backup skipped")
+            print("  [info] svg_output/ not found, backup skipped")
 
     if success and cache_dir is not None and cache_dir.is_dir() and not args.keep_cache:
         try:

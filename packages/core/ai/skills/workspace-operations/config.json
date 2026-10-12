@@ -1,0 +1,40 @@
+{
+  "name": "workspace-operations",
+  "display_name": "Workspace Operations",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Select the operation guide for managing the active Workspace, including its App, configuration, Flows, Automations, tasks, Knowledge, goals and human handoffs.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "invoke_skill",
+    "search_tools",
+    "manor"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [],
+    "patch_ops": [],
+    "route_terms": [],
+    "children": [
+      "workspace-app",
+      "workspace-configuration",
+      "workspace-workflows",
+      "workspace-automations",
+      "workspace-tasks",
+      "workspace-knowledge",
+      "workspace-goals-handoffs"
+    ]
+  },
+  "search": {
+    "terms": ["manage workspace", "setup business", "admin guide", "configuration", "app settings", "operations manual"],
+    "examples": ["how to manage my workspace", "which guide for configuring workspace", "workspace operations guide for knowledge and tasks", "update workspace app configuration"]
+  }
+}

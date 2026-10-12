@@ -1,0 +1,50 @@
+{
+  "name": "workspace-tasks",
+  "display_name": "Workspace Tasks",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Create or inspect one-off Tasks, delegate Workspace services, append task-local requirements and recover existing work without duplicating it.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "manor",
+    "search_tasks",
+    "get_task_details"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [
+      "search",
+      "create_task",
+      "update_task_runtime",
+      "delegate_service",
+      "read_delegation_result",
+      "answer_task_blocker",
+      "operation"
+    ],
+    "patch_ops": [
+      "task.prepare"
+    ],
+    "route_terms": [
+      "task",
+      "delegate",
+      "retry",
+      "任务",
+      "委派",
+      "交给",
+      "重试",
+      "进度"
+    ]
+  },
+  "search": {
+    "terms": ["todo", "job", "assignment", "delegate", "background work", "follow up", "ticket", "work item", "task status"],
+    "examples": ["create one off task for agent", "check status of existing task", "delegate work to workspace service", "add requirement to running task"]
+  }
+}

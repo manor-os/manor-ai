@@ -14,5 +14,9 @@
     "mcp__tiktok_shop__get_product",
     "mcp__tiktok_shop__update_price",
     "mcp__tiktok_shop__update_inventory"
-  ]
+  ],
+  "search": {
+    "terms": ["tiktok", "ecommerce", "seller", "sku", "product listing", "price update", "stock", "orders"],
+    "examples": ["check tiktok shop orders today", "update sku price on tiktok shop", "change inventory for tiktok product", "read tiktok shop product details"]
+  }
 }

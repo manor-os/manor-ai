@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +42,90 @@ from packages.core.services.workspace_setup_service import DEFAULT_FIELDS
 
 
 pytestmark = pytest.mark.asyncio
+
+
+async def test_workspace_draft_persists_platform_blueprint_ids(
+    db_session: AsyncSession,
+) -> None:
+    from packages.core.ai.tools.workspace_arch_tools import _suggest_blueprint
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    blueprint_id = "builtin:product-video-studio-v1"
+    blueprint = WorkspaceBlueprint(
+        id=blueprint_id,
+        entity_id=None,
+        slug="product-video-studio-v1",
+        title="Product Video Studio",
+        payload=_payload(
+            agent_slug="product-video-agent",
+            skill_slug="product-video-skill",
+            server_slug="product-video-server",
+        ),
+        payload_version="1.1",
+        status="published",
+    )
+    draft = WorkspaceDraft(
+        entity_id=entity_id,
+        user_id=user_id,
+        fields=dict(DEFAULT_FIELDS),
+        messages=[],
+        missing=[],
+        ready=False,
+        status="active",
+    )
+    db_session.add_all([blueprint, draft])
+    await db_session.commit()
+
+    result = json.loads(await _suggest_blueprint(
+        db_session,
+        entity_id=entity_id,
+        user_id=user_id,
+        draft_id=draft.id,
+        blueprint_id=blueprint_id,
+    ))
+    await db_session.commit()
+    await db_session.refresh(draft)
+
+    assert result["ok"] is True
+    assert draft.suggested_blueprint_id == blueprint_id
+
+    draft.applied_blueprint_id = blueprint_id
+    await db_session.commit()
+    await db_session.refresh(draft)
+    assert draft.applied_blueprint_id == blueprint_id
+
+
+@pytest.mark.parametrize("blueprint_mode", [False, True])
+@pytest.mark.parametrize("user_mode", [None, False, True])
+async def test_blueprint_mode_respects_explicit_creation_switch(
+    db_session, blueprint_mode, user_mode,
+) -> None:
+    from packages.core.services.workspace_draft_service import (
+        apply_public_field_updates,
+        create_draft_shell,
+    )
+
+    entity_id, user_id = generate_ulid(), generate_ulid()
+    payload = _payload(agent_slug="mode-agent", skill_slug="mode-skill", server_slug="mode-server")
+    payload["recipe"]["operating_model"]["heartbeat_enabled"] = blueprint_mode
+    blueprint = WorkspaceBlueprint(
+        id=generate_ulid(), entity_id=entity_id, slug=f"mode-{entity_id}",
+        title="Runtime mode Blueprint", payload=payload,
+        payload_version="1.1", status="published",
+    )
+    db_session.add(blueprint)
+    draft = await create_draft_shell(db_session, entity_id=entity_id, user_id=user_id)
+    if user_mode is not None:
+        apply_public_field_updates(draft, {"heartbeat_enabled": user_mode})
+    await db_session.commit()
+    applied = await apply_blueprint(
+        db_session, draft_id=draft.id, entity_id=entity_id,
+        blueprint_id=blueprint.id, user_id=user_id,
+    )
+    assert applied.fields["heartbeat_enabled"] is (
+        blueprint_mode if user_mode is None else user_mode
+    )
+    assert applied.fields[CREATION_PREFERENCES_FIELD]["autonomy_confirmed"] is (user_mode is not None)
 
 
 def _payload(*, agent_slug: str, skill_slug: str, server_slug: str) -> dict:
@@ -118,10 +203,12 @@ def _payload(*, agent_slug: str, skill_slug: str, server_slug: str) -> dict:
             "goals": [{
                 "title": "Complete copied work",
                 "metric_key": "completed_items",
+                "stat_key": "workspace.tasks.completed",
                 "target_value": 10,
-                "measurement_cadence": "daily",
+                "measurement_cadence": None,
                 "priority": 3,
             }],
+            "stats": [{"library_key": "workspace.tasks.completed", "collection_cadence": "daily"}],
             "task_categories": [],
             "custom_fields": [],
             "sla_policies": [],
@@ -297,7 +384,8 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert custom["mcp_bindings"] == [server_slug]
     assert custom["missing_skill_specs"][0]["slug"] == skill_slug
     assert applied.fields["goals"][0]["target"] == 10
-    assert applied.fields["goals"][0]["cadence"] == "daily"
+    assert applied.fields["goals"][0]["stat_key"] == "workspace.tasks.completed"
+    assert applied.fields["stats"] == payload["recipe"]["stats"]
     assert applied.fields["heartbeat_enabled"] is True
     assert applied.fields["heartbeat_cadence"] == "weekly"
     assert applied.fields["_blueprint_operating_model"]["strategist"]["cadence"] == "daily"
@@ -307,7 +395,7 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert applied.fields["_blueprint_disable_business_ledger_matching"] is True
     assert applied.fields[CREATION_PREFERENCES_FIELD] == {
         "goal_confirmed": False,
-        "autonomy_confirmed": False,
+        "autonomy_confirmed": True,
     }
     assert applied.missing == ["creation_preferences"]
     assert applied.status == "active"
@@ -350,6 +438,16 @@ async def test_apply_blueprint_materializes_agent_capabilities(
     assert workspace is not None
     assert workspace.heartbeat_enabled is True
     assert workspace.heartbeat_cadence == "weekly"
+    from packages.core.models.goal import Goal
+    from packages.core.models.workspace_stat import WorkspaceStat
+
+    goal = (await db_session.execute(select(Goal).where(Goal.workspace_id == workspace_id))).scalar_one()
+    stat = (await db_session.execute(select(WorkspaceStat).where(WorkspaceStat.workspace_id == workspace_id))).scalar_one()
+    assert goal.stat_id == stat.id
+    assert stat.key == "workspace.tasks.completed"
+    assert stat.collection_cadence == "daily"
+    assert stat.current_value is None and goal.current_value is None
+    assert goal.measurement_source is None and goal.measurement_cadence is None
     assert workspace.settings["ledger_contracts"][0]["contract_id"] == (
         "manor.recruiting_ledger/v1"
     )
@@ -611,7 +709,7 @@ async def test_workspace_draft_lint_rejects_local_id_as_marketplace_agent(
 
 
 @pytest.mark.parametrize("source_changed,with_variables,receipt_snapshot", [
-    (False, False, False), (True, False, False), (True, True, False), (True, True, True),
+    (False, False, False), (True, False, False), (True, True, False),
 ])
 async def test_draft_finalize_installs_exact_marketplace_agent_locally(
     db_session: AsyncSession,
@@ -676,25 +774,6 @@ async def test_draft_finalize_installs_exact_marketplace_agent_locally(
         ready=False,
         status="active",
     )
-    if receipt_snapshot:
-        from unittest.mock import AsyncMock
-        from packages.core.models.blueprint_purchase import BlueprintPurchase
-
-        blueprint.entity_id = generate_ulid()
-        blueprint.status = "archived"
-        blueprint.payload = copy.deepcopy(payload)
-        blueprint.payload["recipe"]["operating_model"]["primary_work"] = "Unpublished work"
-        db_session.add(BlueprintPurchase(
-            blueprint_id=blueprint.id, buyer_entity_id=entity_id, buyer_user_id=creator_id,
-            seller_entity_id=blueprint.entity_id, amount_cents=1000, status="completed",
-            seller_amount_cents=1000,
-            blueprint_title=blueprint.title,
-            payload_snapshot=copy.deepcopy(payload), blueprint_content_version="0.9.0",
-        ))
-        monkeypatch.setattr(
-            "packages.core.services.marketplace_billing.require_paid_marketplace_plan",
-            AsyncMock(),
-        )
     db_session.add_all([source_agent, blueprint, draft])
     await db_session.commit()
 

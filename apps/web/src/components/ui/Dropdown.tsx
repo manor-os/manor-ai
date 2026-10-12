@@ -24,6 +24,8 @@ interface DropdownProps {
   onSelect: (key: string) => void;
   align?: "left" | "center" | "right";
   style?: React.CSSProperties;
+  constrainTo?: string;
+  menuStyle?: React.CSSProperties;
 }
 
 export default function Dropdown({
@@ -32,6 +34,8 @@ export default function Dropdown({
   onSelect,
   align = "left",
   style,
+  constrainTo,
+  menuStyle,
 }: DropdownProps) {
   const [open, setOpen] = useState(false);
   const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
@@ -104,10 +108,15 @@ export default function Dropdown({
           : triggerRect.left;
       const preferredTop = triggerRect.bottom + gap;
 
-      const maxLeft = Math.max(0, viewportWidth - menuRect.width);
+      const boundary = constrainTo ? ref.current?.closest<HTMLElement>(constrainTo)?.getBoundingClientRect() : null;
+      const withinBoundary = boundary && boundary.width >= menuRect.width;
+      const minLeft = withinBoundary ? Math.max(0, boundary.left) : 0;
+      const maxLeft = withinBoundary
+        ? Math.min(viewportWidth, boundary.right) - menuRect.width
+        : Math.max(0, viewportWidth - menuRect.width);
       const maxTop = Math.max(0, viewportHeight - menuRect.height);
 
-      const left = Math.min(Math.max(0, preferredLeft), maxLeft);
+      const left = Math.min(Math.max(minLeft, preferredLeft), Math.max(minLeft, maxLeft));
 
       let top = Math.min(Math.max(0, preferredTop), maxTop);
 
@@ -137,7 +146,7 @@ export default function Dropdown({
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
     };
-  }, [open, align, items]);
+  }, [open, align, items, constrainTo]);
 
   return (
     <div
@@ -168,6 +177,7 @@ export default function Dropdown({
               // DetailDrawer and Modal use the 20000/20001 layer. Dropdowns
               // opened from inside them must sit above the dialog surface.
               zIndex: 20010,
+              ...menuStyle,
             }}
             role="menu"
           >

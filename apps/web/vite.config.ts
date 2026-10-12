@@ -1,10 +1,12 @@
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
+import { createHash } from "node:crypto";
 import { extname, resolve, sep } from "path";
 import { cpSync, createReadStream, existsSync, rmSync, statSync } from "fs";
 
 const apiTarget = process.env.VITE_API_TARGET || "http://localhost:8000";
 const buildVersion = process.env.BUILD_VERSION || new Date().toISOString();
+const releaseAssetsDir = `assets/releases/${createHash("sha256").update(buildVersion).digest("hex").slice(0, 20)}`;
 
 function firstHeader(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
@@ -100,8 +102,7 @@ function pdfjsAssets(): Plugin {
   };
 }
 
-// Multi-entry build for private Cloud: the user app and admin portal
-// share node_modules but ship separate bundles.
+// Deployment-specific entries share node_modules but ship separate bundles.
 export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(buildVersion),
@@ -235,6 +236,7 @@ export default defineConfig({
     },
   },
   build: {
+    assetsDir: releaseAssetsDir,
     chunkSizeWarningLimit: 600,
     // Vite's default target (chrome87/edge88/es2020/firefox78/safari14)
     // predates top-level await. @novnc/novnc 1.7.0 uses TLA at module
@@ -251,6 +253,12 @@ export default defineConfig({
         main: resolve(__dirname, "index.html"),
       },
       output: {
+        // Use the standard JavaScript MIME mapping and a new URL so clients
+        // recover from cached .mjs responses served as application/octet-stream.
+        // Keep the original PDF.js module intact, including fallback exports.
+        assetFileNames: (asset) => asset.names.includes("pdf.worker.min.mjs")
+          ? `${releaseAssetsDir}/[name]-[hash].js`
+          : `${releaseAssetsDir}/[name]-[hash][extname]`,
         manualChunks: {
           vendor: ["react", "react-dom", "react-router-dom"],
           query: ["@tanstack/react-query"],

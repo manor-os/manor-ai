@@ -27,14 +27,14 @@ const SESSION_AUTH_KEYS = [
   "oauth_invitation_code",
   "oauth_public_chat_token",
 ] as const;
-const LOCAL_AUTH_PREFIXES = ["manor_public_chat_session:"] as const;
+const LOCAL_AUTH_PREFIXES = ["manor_public_chat_session:", "manor_catalog_v1:"] as const;
 const SESSION_AUTH_PREFIXES = ["manor_public_chat_autostart:"] as const;
 
 function canUseBrowserStorage(): boolean {
   return typeof window !== "undefined";
 }
 
-function notifyAuthTokenChanged() {
+export function notifyAuthTokenChanged() {
   if (canUseBrowserStorage()) window.dispatchEvent(new Event(AUTH_TOKEN_CHANGED_EVENT));
 }
 
@@ -50,6 +50,7 @@ function removeKeysWithPrefixes(storage: Storage, prefixes: readonly string[]) {
 export function clearAuthBrowserState() {
   if (!canUseBrowserStorage()) return;
   try {
+    window.localStorage.setItem("manor_auth_generation", `${Date.now()}:${Math.random()}`);
     LOCAL_AUTH_KEYS.forEach((key) => window.localStorage.removeItem(key));
     removeKeysWithPrefixes(window.localStorage, LOCAL_AUTH_PREFIXES);
   } catch {

@@ -1,0 +1,156 @@
+/* A quiet shared treatment for document preparation, verification and signing.
+ * Scoped to this flow: existing controls, validation and theme tokens remain
+ * the source of truth for the rest of Manor. */
+.signature-flow {
+  color: var(--text-default);
+  background: var(--surface-app);
+}
+
+.signature-flow.signature-dialog {
+  border: 0 !important;
+  border-radius: var(--radius-card) !important;
+  background: var(--surface-panel) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+
+.signature-dialog .manor-dialog-header {
+  padding: 20px 24px 12px;
+  min-height: 0;
+  margin-bottom: 0;
+}
+
+.signature-dialog .manor-dialog-body {
+  padding: 8px 24px 24px;
+}
+
+.signature-dialog .manor-dialog-title {
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.signature-document-toolbar .page-header-title {
+  max-width: 100%;
+}
+
+.signature-flow .signature-section-title,
+.signature-flow label.uppercase {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.signature-flow :is(.manor-input, .manor-textarea) {
+  border: 0;
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  color: var(--text-default);
+}
+
+.signature-flow :is(.manor-input, .manor-textarea):hover:not(:disabled) {
+  background: var(--surface-sunken);
+}
+
+.signature-flow :is(.btn-manor, .btn-manor-lg) {
+  background: var(--accent);
+  background-image: none;
+  border-radius: var(--radius-control);
+  box-shadow: none;
+  font-weight: 500;
+  transform: none;
+}
+
+.signature-flow :is(.btn-manor, .btn-manor-lg):hover:not(:disabled) {
+  background: var(--accent-hover);
+  box-shadow: none;
+}
+
+.signature-flow :is(.btn-manor-outline, .btn-manor-ghost) {
+  box-shadow: none;
+  color: var(--text-default);
+}
+
+.signature-flow .signature-revoke {
+  color: var(--chip-danger-fg);
+}
+
+.signature-flow :is(button, a, input, textarea, summary):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+}
+
+.signature-flow :is(button, input, textarea):disabled {
+  cursor: not-allowed;
+}
+
+@media (max-width: 640px) {
+  .signature-dialog .manor-dialog-header {
+    padding: 16px 16px 8px;
+  }
+
+  .signature-dialog .manor-dialog-body {
+    padding: 8px 16px 16px;
+  }
+
+  .signature-flow :is(.btn-manor, .btn-manor-lg, .btn-manor-outline, .btn-manor-ghost) {
+    min-height: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .signature-flow :is(button, a, input, textarea) {
+    transition: none;
+  }
+}
+
+@media (max-width: 1023px) {
+  .signature-customer-body {
+    padding-bottom: calc(32px + env(safe-area-inset-bottom, 0px));
+  }
+
+  .signature-customer :is(.manor-input, .manor-textarea) {
+    font-size: 16px;
+    min-height: 44px;
+  }
+
+  .signature-customer :is(.btn-manor, .btn-manor-outline, .btn-manor-ghost, .signature-field-row, .signature-field-edit label) {
+    min-width: 44px;
+    min-height: 44px;
+    touch-action: manipulation;
+  }
+
+  .signature-customer :is(.signature-field-row, .signature-mobile-progress, .signature-otp) {
+    overflow-wrap: anywhere;
+  }
+
+  .signature-customer .signature-otp .btn-manor,
+  .signature-customer .signature-otp .btn-manor-outline,
+  .signature-customer .signature-completion > a {
+    width: 100%;
+    justify-content: center;
+  }
+
+  .signature-customer .signature-drawing-pad {
+    height: 160px;
+  }
+
+  .signature-customer .signature-consent {
+    min-height: 44px;
+    padding-block: 6px;
+    font-size: 13px;
+  }
+
+  .signature-customer input[type="checkbox"] {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+  }
+
+  .signature-customer .signature-field-edit {
+    scroll-margin-block: 24px;
+  }
+}

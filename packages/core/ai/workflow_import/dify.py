@@ -10,7 +10,7 @@ import re
 
 from .base import WorkflowImporter
 from .connectors import resolve_connector
-from .model import GraphNode, ImportReport, WorkflowGraph
+from .model import HIDDEN_NODE_TYPES, GraphNode, ImportReport, WorkflowGraph
 
 # Dify variable references look like {{#nodeId.field#}}; manor uses {{field}}.
 _DIFY_REF = re.compile(r"\{\{#[^#}]*?\.([A-Za-z0-9_]+)#\}\}")
@@ -106,6 +106,8 @@ class DifyImporter(WorkflowImporter):
             otype = data.get("type") or "unknown"
             title = data.get("title") or otype
             canonical = DIFY_NODE_MAP.get(otype)
+            if canonical in HIDDEN_NODE_TYPES:
+                canonical = None
 
             if canonical is None:
                 node = self._placeholder(

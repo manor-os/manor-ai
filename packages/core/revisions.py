@@ -1,8 +1,8 @@
 """Execution-config revision bookkeeping (M11).
 
 Every operator/system change to one of the revisioned execution-config
-rows (``ScheduledJob`` / ``WorkflowBinding`` / ``WorkflowDefinition`` /
-``Goal`` / ``Agent`` / ``Skill``) goes through
+rows (``ScheduledJob`` / ``AgentInitiative`` / ``WorkflowBinding`` /
+``WorkflowDefinition`` / ``Goal`` / ``Agent`` / ``Skill``) goes through
 ``bump_revision``: the integer ``revision`` column is incremented inside
 the caller's transaction (so CAS checks see a consistent value), and an
 append-only ``AutomationRevision`` audit row records what changed and
@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # ORM table name → automation_revisions.target_kind discriminator.
 TARGET_KIND_BY_TABLE: dict[str, str] = {
     "scheduled_jobs": "scheduled_job",
+    "agent_initiatives": "agent_initiative",
     "workflow_bindings": "workflow_binding",
     "workflow_definitions": "workflow_definition",
     "goals": "goal",
@@ -61,6 +62,7 @@ SCHEDULED_JOB_CONTENT_REVISION_FIELDS: frozenset[str] = (
             "job_type",
             "payload_message",
             "agent_id",
+            "agent_initiative_id",
             "execution_type",
             "execution_target",
             "execution_script",
@@ -71,6 +73,22 @@ SCHEDULED_JOB_CONTENT_REVISION_FIELDS: frozenset[str] = (
             "enabled",
         }
     )
+)
+AGENT_INITIATIVE_CONTENT_REVISION_FIELDS: frozenset[str] = frozenset(
+    {
+        "agent_subscription_id",
+        "workspace_id",
+        "name",
+        "instruction",
+        "trigger_kind",
+        "trigger_source",
+        "trigger_config",
+        "condition_config",
+        "decision_policy",
+        "delivery_policy",
+        "interruption_policy",
+        "status",
+    }
 )
 
 

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+from urllib.parse import urlsplit, urlunsplit
 
 from celery import Celery
 from celery.schedules import crontab
@@ -20,15 +22,23 @@ from packages.core.services.step_deadline import (
 )
 from packages.core.observability.log_redaction import install_sensitive_log_filter
 
+logger = logging.getLogger(__name__)
+
 
 @after_setup_logger.connect
 @after_setup_task_logger.connect
 def _install_worker_log_redaction(logger=None, **_kwargs) -> None:
     install_sensitive_log_filter(logger)
 
-# Broker and result backend from environment
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/2")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/3")
+# The single-container preview supplies REDIS_URL but not separate Celery URLs.
+# Keep broker/results in separate Redis DBs even in that configuration.
+def _redis_db_url(database: int) -> str:
+    parts = urlsplit(os.getenv("REDIS_URL", "redis://localhost:6379/0"))
+    return urlunsplit((parts.scheme, parts.netloc, f"/{database}", parts.query, parts.fragment))
+
+
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL") or _redis_db_url(2)
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND") or _redis_db_url(3)
 CELERY_RESULT_EXPIRES_SECONDS = int(os.getenv("CELERY_RESULT_EXPIRES_SECONDS", "3600"))
 
 celery_app = Celery(
@@ -73,6 +83,8 @@ celery_app.conf.update(
     # Worker
     worker_prefetch_multiplier=1,
     worker_max_tasks_per_child=100,
+    # Child startup performs two best-effort 10s pricing-cache warmups.
+    worker_proc_alive_timeout=30.0,
     # Queues — heavy work is separated from the control plane so concurrent long
     # steps can no longer starve internal_worker_tick / cleanup_expired_leases /
     # scheduler.tick. Versioned recovery is separate so a rolling-deploy worker
@@ -111,11 +123,21 @@ celery_app.conf.include = [
     "packages.core.tasks.event_tasks",
     "packages.core.tasks.maintenance_tasks",
     "packages.core.tasks.media_tasks",
+    "packages.core.tasks.apify_tasks",
     "packages.core.tasks.runtime_tasks",
+    "packages.core.tasks.room_agent_tasks",
 ]
 
 # Beat schedule — periodic jobs
 celery_app.conf.beat_schedule = {
+    "room-agent-pending-recovery": {
+        "task": "room_agent.recover_pending",
+        "schedule": 15.0,
+    },
+    "apify-collection-recovery": {
+        "task": "apify.reconcile_collections",
+        "schedule": 60.0,
+    },
     "runtime-sandbox-scheduler": {
         "task": "runtime.sandbox_scheduler",
         "schedule": 2.0,
@@ -123,6 +145,17 @@ celery_app.conf.beat_schedule = {
     "runtime-outbox-dispatch": {
         "task": "runtime.outbox_dispatch",
         "schedule": 1.0,
+    },
+    "runtime-plan-cycle-recovery": {
+        "task": "runtime.plan_cycle_recovery",
+        # This is only the lost-wake backstop. Normal state transitions stage
+        # an outbox row transactionally, so they retain one-second delivery
+        # without making every publisher tick scan all parked Plans.
+        "schedule": 10.0,
+    },
+    "runtime-task-coordinator-recovery": {
+        "task": "runtime.task_coordinator_recovery",
+        "schedule": 10.0,
     },
     "scheduler-tick": {
         "task": "scheduler.tick",
@@ -136,6 +169,10 @@ celery_app.conf.beat_schedule = {
         "task": "agent.recover_claim_loss_sweep_v2",
         "schedule": 60.0,
     },
+    "agent-initiative-delivery-sweep": {
+        "task": "agent_initiative.delivery_sweep",
+        "schedule": 60.0,
+    },
     "workflow-resume-sweep": {
         "task": "workflow.resume_sweep",
         "schedule": 15.0,
@@ -143,6 +180,10 @@ celery_app.conf.beat_schedule = {
     "workflow-terminal-effect-sweep": {
         "task": "workflow.terminal_effect_sweep",
         "schedule": 15.0,
+    },
+    "workflow-expired-claim-recovery": {
+        "task": "workflow.recover_expired_claims",
+        "schedule": 60.0,
     },
     "daily-health-briefing": {
         "task": "monitor.daily_health_briefing",
@@ -268,12 +309,6 @@ celery_app.conf.beat_schedule = {
         "task": "metrics.http_flush",
         "schedule": 300.0,  # every 5 minutes
     },
-    "embedding-sweep-pending": {
-        # Recovers stale processing heartbeats and pending dispatch loss. The
-        # sweep is DB-only and fans indexing back out to the work queue.
-        "task": "embeddings.sweep_pending",
-        "schedule": 60.0,
-    },
     # Ops monitoring — host + Docker container snapshot + alerting.
     # Collector writes to Redis (ops:snapshot, TTL 2 min). Alerter
     # reads it and runs the rule engine. Snapshot drives the
@@ -294,7 +329,7 @@ celery_app.conf.beat_schedule = {
         # consume. Cheap when nothing is spiking.
         "task": "ops.log_scan",
         "schedule": 60.0,
-    },
+        },
     "ops-send-digest": {
         # Daily 08:00 UTC — drains the suppressed-warnings queue
         # into one summary email. Cheap (no-op when queue empty).
@@ -314,11 +349,21 @@ celery_app.conf.beat_schedule = {
         "task": "ops.purge_soft_deleted_users",
         "schedule": crontab(hour=2, minute=15),
     },
+    "maintenance-runtime-file-recovery": {
+        "task": "maintenance.recover_runtime_file_commits",
+        "schedule": 60.0,
+    },
     "maintenance-cleanup-chat-uploads": {
         # Daily 03:05 UTC - removes expired hidden chat attachments from
         # uploads/chat. Knowledge files and generated artifacts are excluded.
         "task": "maintenance.cleanup_chat_uploads",
         "schedule": crontab(hour=3, minute=5),
+    },
+    "maintenance-cleanup-document-upload-recovery": {
+        # Daily 03:15 UTC - removes expired browser-upload recovery markers
+        # and only the source bytes that still have no Document projection.
+        "task": "maintenance.cleanup_document_upload_recovery",
+        "schedule": crontab(hour=3, minute=15),
     },
     "maintenance-repair-missing-document-files": {
         # Periodic DB <-> filesystem consistency scan. Missing generated media
@@ -335,6 +380,54 @@ celery_app.conf.beat_schedule = {
         "schedule": 60.0,
     },
 }
+
+# Short-interval ticks are worthless once their successor is due: a worker
+# that was down for a minute would otherwise replay ~30 sandbox-scheduler and
+# ~60 outbox ticks back to back and delay the live ones by that much (seen
+# after a worker restart: the sandbox scheduler claimed a ticket ~100 s late).
+# Every interval entry up to this bound expires when the next tick is due.
+BEAT_EXPIRE_MAX_INTERVAL_SECONDS = 60.0
+
+
+def beat_interval_seconds(schedule_value) -> float | None:
+    """Seconds for an interval schedule (number or timedelta); None for crontab."""
+    from datetime import timedelta
+
+    if isinstance(schedule_value, bool):
+        return None
+    if isinstance(schedule_value, (int, float)):
+        return float(schedule_value)
+    if isinstance(schedule_value, timedelta):
+        return schedule_value.total_seconds()
+    return None
+
+
+def _apply_beat_expiry(schedule: dict) -> None:
+    """Expire short control-plane and monitoring ticks when their successor is due.
+
+    Only control- and ops-queue tasks qualify: the premise "the next tick
+    supersedes this one" holds there because those workers keep up and the
+    ops snapshot is single-flight anyway. On the heavy and recovery queues a
+    tick may legitimately wait minutes behind long work; expiring it would
+    drop the sweep exactly when it is needed (a stranded-job recovery sweep
+    sharing the queue with the jobs it rescues).
+    """
+    from packages.core.queues import TASK_QUEUES, UNDECLARED_TASK_QUEUE, CeleryQueue
+
+    for entry in schedule.values():
+        interval = beat_interval_seconds(entry.get("schedule"))
+        if interval is None:
+            continue
+        if interval <= 0 or interval > BEAT_EXPIRE_MAX_INTERVAL_SECONDS:
+            continue
+        queue = TASK_QUEUES.get(str(entry.get("task") or ""), UNDECLARED_TASK_QUEUE)
+        if queue not in (CeleryQueue.CONTROL, CeleryQueue.OPS):
+            continue
+        options = entry.setdefault("options", {})
+        options.setdefault("expires", float(interval))
+
+
+_apply_beat_expiry(celery_app.conf.beat_schedule)
 
 
 # ── OTEL tracing — opt-in (OTEL_ENABLED=true) ─────────────────────────
@@ -362,6 +455,21 @@ def _init_otel(**_kwargs: object) -> None:
     except Exception:
         pass
 
+
+
+@worker_process_init.connect
+def _warm_tool_registry(**_kwargs: object) -> None:
+    # Registering ~1k built-in and MCP catalog tools is synchronous and takes
+    # seconds. Done lazily it blocks the event loop of the first chat turn each
+    # child process runs (after every deploy and child recycle).
+    try:
+        from packages.core.ai.runtime.tool_registry import (
+            runtime_ensure_tool_registry_initialized,
+        )
+
+        runtime_ensure_tool_registry_initialized()
+    except Exception:
+        logger.warning("Tool registry warm-up failed; it will load on first use", exc_info=True)
 
 
 @worker_process_shutdown.connect

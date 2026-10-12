@@ -13,11 +13,12 @@ from typing import Any, Awaitable, Callable
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.database_runtime import release_read_transaction
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.task import Task
 from packages.core.models.user import Entity
 from packages.core.models.workspace import Workspace
-from packages.core.services.channel_credentials import lease_channel_config_credentials
+from packages.core.services.channel_credentials import lease_channel_config_credentials, use_channel_credential_session
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +92,21 @@ async def deliver_task_external_notifications(
     event_type: str,
     payload: dict[str, Any] | None = None,
     *,
+    db: AsyncSession | None = None,
     completed_sinks: dict[str, Any] | None = None,
     mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     """Deliver configured post-commit task notifications."""
     if not event_type.startswith("task."):
         return {"email": 0, "external_chat": 0}
 
+    if db is not None:
+        return await deliver_task_external_notifications_in_session(
+            db, entity_id, event_type, payload or {},
+            completed_sinks=completed_sinks, mark_sink_completed=mark_sink_completed,
+            before_send=before_send,
+        )
     from packages.core.database import async_session
 
     async with async_session() as db:
@@ -108,6 +117,7 @@ async def deliver_task_external_notifications(
             payload or {},
             completed_sinks=completed_sinks,
             mark_sink_completed=mark_sink_completed,
+            before_send=before_send,
         )
 
 
@@ -119,6 +129,7 @@ async def deliver_task_external_notifications_in_session(
     *,
     completed_sinks: dict[str, Any] | None = None,
     mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> dict[str, int]:
     entity = (await db.execute(
         select(Entity).where(Entity.id == entity_id)
@@ -146,6 +157,7 @@ async def deliver_task_external_notifications_in_session(
             task,
             completed_sinks=completed,
             mark_sink_completed=mark_sink_completed,
+            before_send=before_send,
         )
     if task_event_external_channel_enabled(policy, "external_chat", event_type):
         counts["external_chat"] = await _deliver_external_chat(
@@ -157,6 +169,7 @@ async def deliver_task_external_notifications_in_session(
             _as_dict(policy.get("external_chat")),
             completed_sinks=completed,
             mark_sink_completed=mark_sink_completed,
+            before_send=before_send,
         )
     return counts
 
@@ -190,6 +203,7 @@ async def _deliver_email(
     *,
     completed_sinks: dict[str, Any] | None = None,
     mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> int:
     from packages.core.services.email_service import send_notification_email
     from packages.core.services.task_event_notifications import (
@@ -201,6 +215,8 @@ async def _deliver_email(
     _task, users = await task_event_recipient_users(db, entity_id, event_type, payload)
     message = task_event_message(event_type, payload, task or _task)
     title = task_event_title(event_type)
+    # Free ordinary lookups before provider I/O; lifecycle locks stay held.
+    await release_read_transaction(db)
 
     delivered = 0
     failures = 0
@@ -215,6 +231,8 @@ async def _deliver_email(
         sink_key = f"task_external.email:{normalized_email}"
         if completed.get(sink_key) is True:
             continue
+        if before_send is not None:
+            await before_send()
         try:
             if await send_notification_email(email, title, message):
                 delivered += 1
@@ -243,6 +261,7 @@ async def _deliver_external_chat(
     *,
     completed_sinks: dict[str, Any] | None = None,
     mark_sink_completed: Callable[[str], Awaitable[None]] | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
 ) -> int:
     from packages.core.services.task_event_notifications import (
         task_event_message,
@@ -273,6 +292,7 @@ async def _deliver_external_chat(
     title = task_event_title(event_type)
     body = task_event_message(event_type, payload, task)
     text = f"*{title}*\n{body}"
+    await release_read_transaction(db)
 
     delivered = 0
     failures = 0
@@ -281,8 +301,11 @@ async def _deliver_external_chat(
         sink_key = f"task_external.external_chat:{config.id}"
         if completed.get(sink_key) is True:
             continue
+        if before_send is not None:
+            await before_send()
         try:
-            sent = await _send_channel_message(config, text, policy)
+            with use_channel_credential_session(db):
+                sent = await _send_channel_message(config, text, policy)
             if sent:
                 delivered += 1
                 if mark_sink_completed is not None:

@@ -18,6 +18,22 @@ from packages.core.ai.runtime.approval_messages import (
     approval_preview_arguments,
 )
 
+
+def test_chrome_control_epoch_is_not_consent_but_nested_content_still_is():
+    tool = "mcp__chrome__click_element"
+    args = {"tabId": 1, "ref": "e1", "control_epoch": "old",
+            "operation_intent": {"publication": {"text": "Approved", "control_epoch": "content"}}}
+    changed_lease = {**args, "control_epoch": "new"}
+    assert approval_args_hash(args, tool_name=tool) == approval_args_hash(changed_lease, tool_name=tool)
+    assert approval_args_hash(args, tool_name=tool) == approval_args_hash(
+        {**changed_lease, "controlEpoch": "legacy-alias"}, tool_name=tool,
+    )
+    changed_content = {**args, "operation_intent": {"publication": {"text": "Approved", "control_epoch": "changed"}}}
+    assert approval_args_hash(args, tool_name=tool) != approval_args_hash(changed_content, tool_name=tool)
+    assert approval_args_hash(args, tool_name="mcp__other__write") != approval_args_hash(
+        changed_lease, tool_name="mcp__other__write",
+    )
+
 _VALUE = (
     "Manor AI runs product work in your own Chrome with visible tabs, "
     "grounded page reads, and action-time approvals before external posts "

@@ -10,6 +10,9 @@ Adapted from [Karpathy Guidelines](https://github.com/multica-ai/andrej-karpathy
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
+Before choosing tests or verification scope, read the repository
+[testing policy](../../testing.md). It governs when to add, reuse, or retire tests.
+
 ## 1. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
@@ -56,9 +59,15 @@ The test: Every changed line should trace directly to the user's request.
 **Define success criteria. Loop until verified.**
 
 Transform tasks into verifiable goals:
-- "Add validation" -> "Write tests for invalid inputs, then make them pass."
-- "Fix the bug" -> "Write a test that reproduces it, then make it pass."
-- "Refactor X" -> "Ensure tests pass before and after."
+- "Add validation" -> "Add or extend coverage for meaningful invalid-input boundaries."
+- "Fix the bug" -> "Reproduce it with an existing or focused new test, then verify the fix."
+- "Refactor X" -> "Run existing relevant tests; add tests only for identified coverage gaps."
+
+Low-risk copy, styling, documentation, and mechanical changes do not require
+new automated tests by default. Use the proportional checks in the testing policy.
+Before delivery, apply its keep/consolidate/remove review to tests created during
+implementation. Development probes and intermediate assertions are not
+automatically permanent suite additions.
 
 For multi-step tasks, state a brief plan:
 ```

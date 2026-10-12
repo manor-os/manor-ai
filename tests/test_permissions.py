@@ -71,6 +71,23 @@ def test_member_cannot_manage_users():
     assert not has_permission("member", Permission.ADMIN_API_KEYS)
 
 
+def test_admin_can_transfer_departed_users_knowledge():
+    assert has_permission("admin", Permission.DOCS_TRANSFER_DEPARTED)
+
+
+@pytest.mark.parametrize("role", ["admin", "member", "viewer"])
+def test_non_owner_default_roles_lack_global_knowledge_visibility(role: str):
+    assert not has_permission(role, Permission.DOCS_READ_ALL)
+    assert not has_permission(role, Permission.DOCS_MANAGE_ALL)
+    assert not has_permission(role, Permission.WORKSPACES_READ_ALL)
+
+
+def test_owner_has_global_knowledge_and_workspace_visibility():
+    assert has_permission("owner", Permission.DOCS_READ_ALL)
+    assert has_permission("owner", Permission.DOCS_MANAGE_ALL)
+    assert has_permission("owner", Permission.WORKSPACES_READ_ALL)
+
+
 def test_viewer_read_only():
     """Viewer should only have read/use permissions, no create/update/delete."""
     viewer_perms = _get_role_permissions("viewer")

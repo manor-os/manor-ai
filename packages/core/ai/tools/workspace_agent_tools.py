@@ -1,15 +1,20 @@
 """Workspace Agent tools for Manor AI in workspace chat.
 
-These tools are the durable operation layer behind natural-language workspace
-chat. They let the master agent turn user messages into workspace-scoped tasks,
-task runtime requirements, persistent guardrails, and strategist reviews without
-going through the broad ``manor`` composite gateway.
+These handlers are the durable operation layer behind natural-language
+Workspace chat. Internal masters reach them through
+``manor(action="workspace")``; narrow historical names remain as compatibility
+or external least-privilege entries.
 """
 from __future__ import annotations
 
 import json
 from typing import Any
 
+from packages.core.ai.runtime.composite_tools import WorkspaceToolAction
+from packages.core.ai.runtime.stat_actions import STAT_ASSESSMENT_GUIDANCE, runtime_stat_action
+from packages.core.ai.runtime.workspace_composite_actions import (
+    runtime_visualize_workspace_ledgers_action,
+)
 from packages.core.ai.runtime import (
     runtime_get_goal_status_action,
     runtime_update_goal_value_action,
@@ -27,6 +32,34 @@ from packages.core.ai.runtime import (
     runtime_workspace_update_task_runtime_action,
     runtime_workspace_update_knowledge_policy_action,
 )
+from packages.core.ai.runtime.tool_context import RUNTIME_TOOL_CONTEXT_KEYS
+from packages.core.ai.runtime.workspace_operation_actions import (
+    WORKSPACE_OPERATION_CONFIGURATION_GUIDANCE,
+    WORKSPACE_OPERATION_ACTIONS,
+    describe_operation_patch_ops,
+)
+
+from packages.core.services.workspace_operation_service import operation_patch_item_schema
+
+
+_WORKSPACE_PROTECTED_CONTEXT_KEYS = frozenset(
+    {
+        "entity_id",
+        "user_id",
+        "workspace_id",
+        "conversation_id",
+        "actor_agent_id",
+    }
+    | set(RUNTIME_TOOL_CONTEXT_KEYS)
+)
+
+
+def _workspace_action_params(params: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in params.items()
+        if key not in _WORKSPACE_PROTECTED_CONTEXT_KEYS
+    }
 
 
 WORKSPACE_AGENT_SCHEMA = {
@@ -39,33 +72,40 @@ WORKSPACE_AGENT_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "search",
-                        "create_task",
-                        "update_task_runtime",
-                        "list_knowledge",
-                        "create_knowledge_folder",
-                        "add_knowledge_documents",
-                        "remove_knowledge_document",
-                        "update_knowledge_policy",
-                        "add_rule",
-                        "delegate_service",
-                        "get_goal_status",
-                        "update_goal_value",
-                        "operation",
-                        "request_strategist_review",
-                    ],
+                    "enum": list(WorkspaceToolAction.values()),
                 },
                 "params": {
                     "type": "object",
                     "description": (
                         "Action-specific parameters. For delegate_service include "
-                        "service_key or agent_subscription_id, prompt, and optional max_rounds. "
+                        "service_key or agent_subscription_id, prompt, and optional max_rounds; "
+                        "to run several services at once pass tasks: [{service_key or "
+                        "agent_subscription_id, prompt}] (up to 20, one per service). "
+                        "For read_delegation_result pass run_id and optional offset to read "
+                        "the rest of a shortened delegated answer. "
+                        "Repeated calls continue the same private Agent session in this conversation; "
+                        "pass the returned session_id to bind a follow-up explicitly. "
+                        "The default round budget matches normal chat. continue_interrupted=true: "
+                        "Continue after you have checked the previous turn's effects; this does not repeat it. "
                         "For add_rule include description; add explicit rule_type plus action_patterns "
                         "or capability_patterns when runtime enforcement is required. "
                         "For get_goal_status pass optional goal_id; the current workspace_id "
-                        "is applied automatically. For update_goal_value pass goal_id, value, "
-                        "and optional note to append a verified manual goal_measurements row."
+                        "is applied automatically. For update_goal_value pass goal_id (or goal_key) AND value in the same params object, "
+                        "and optional note to append a verified manual goal_measurements row. "
+                        "For resolve_hitl pass message_id or hitl_id and action='respond' "
+                        "with response for ordinary input; payload.fields/answers and "
+                        "payload.attachments may carry structured answers or file references. "
+                        "Use action='approve'/'reject' only for approval decisions; "
+                        "note is an optional approval explanation. "
+                        "For operation pass params.action ("
+                        + "/".join(WORKSPACE_OPERATION_ACTIONS)
+                        + "), optional draft_id, and patches as [{op, payload}]. "
+                        "Use operation action=get_current first for read-only source "
+                        "rule keys/types/patterns and live governance before changing restrictions. "
+                        "create_draft requires nonempty patches in the same call. "
+                        + WORKSPACE_OPERATION_CONFIGURATION_GUIDANCE
+                        + describe_operation_patch_ops()
+                        + STAT_ASSESSMENT_GUIDANCE
                     ),
                 },
             },
@@ -242,7 +282,9 @@ WORKSPACE_CREATE_TASK_SCHEMA = {
             "task.details.runtime_context. Use this in workspace chat or "
             "public/customer chat when the user asks Manor AI to prepare, do, "
             "follow up, coordinate a concrete piece of work, or record an "
-            "issue/request for staff."
+            "issue/request for staff. For installed Workspace Flows that already "
+            "have a chat entrypoint, use start_workspace_flow so a WorkflowRun is "
+            "created. Never say a workflow has started unless a WorkflowRun exists."
         ),
         "parameters": {
             "type": "object",
@@ -308,7 +350,11 @@ WORKSPACE_CREATE_TASK_SCHEMA = {
                 },
                 "owner_service_key": {
                     "type": "string",
-                    "description": "Optional workspace service key that should own/plan this task.",
+                    "description": (
+                        "Optional active workspace service responsible for this task. "
+                        "Without a pinned owner, first execution and retries use the "
+                        "workspace team, constrained by delegate_service_keys when supplied."
+                    ),
                 },
                 "delegate_service_keys": {
                     "type": "array",
@@ -473,9 +519,10 @@ WORKSPACE_REQUEST_STRATEGIST_REVIEW_SCHEMA = {
             "or reassess workspace goals/rules/knowledge after new context. Do not "
             "use merely because the user appended task-local roles or review stages; "
             "persist those with workspace_update_task_runtime unless the user explicitly "
-            "asks to replan or create follow-up tasks now. A paused or otherwise inactive "
-            "workspace cannot start a review; report that block truthfully and ask the user "
-            "to start the workspace before retrying.\n\n"
+            "asks to replan or create follow-up tasks now. Pausing automatic running "
+            "still permits an explicit user-requested review; background automatic "
+            "reviews remain stopped. Deleted or unavailable workspaces cannot start "
+            "a review. Report any block truthfully.\n\n"
             "TWO-STEP CONTRACT: if proposals from an earlier review are still "
             "awaiting the user's decision, this returns "
             "{\"needs_decision\": true, \"conflict\": {...}} and does NOT start a "
@@ -516,38 +563,35 @@ WORKSPACE_OPERATION_SCHEMA = {
             "Draft, validate, preview, apply, or discard workspace runtime "
             "changes. Use for workspace-wide service/agent/tool/skill/channel/"
             "integration/rule/budget/heartbeat/strategist changes. Applying "
-            "requires explicit user confirmation."
+            "requires explicit user confirmation. Use action=get_current for read-only "
+            "source rules and live governance; inspect the blocking rule before drafting "
+            "a restriction change and re-read the policy after approval."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "get_current",
-                        "create_draft",
-                        "patch_draft",
-                        "validate_draft",
-                        "preview_diff",
-                        "apply_draft",
-                        "discard_draft",
-                    ],
+                    "enum": list(WORKSPACE_OPERATION_ACTIONS),
                 },
-                "draft_id": {"type": "string", "description": "Operation draft id when updating an existing draft."},
+                "draft_id": {"type": "string", "description": (
+                    "Operation draft id when updating an existing draft. "
+                    "create_draft returns the user's review card only when the "
+                    "draft validates; otherwise it returns status='needs_fix' "
+                    "with the validation errors and no card is shown. Fix the "
+                    "errors with patch_draft on this draft_id — the review card "
+                    "is returned once the draft is valid."
+                )},
                 "source_event_id": {"type": "string", "description": "Optional source label for audit."},
                 "patches": {
                     "type": "array",
-                    "items": {"type": "object"},
+                    "items": operation_patch_item_schema(),
                     "description": (
-                        "Operation patches, for example budget_policy.update, "
-                        "heartbeat_policy.update, rule.add, service_role.upsert, "
-                        "capability_binding.upsert, skill_binding.upsert, "
-                        "integration_scope.update, channel.upsert, "
-                        "agent_binding.upsert, agent_binding.remove, "
-                        "agent_mappings.replace, strategist.update, "
-                        "evaluation.update, operating_model.update, "
-                        "goal.measurement_sources.update, task.prepare. "
-                        "Use goal.measurement_sources.update to attach "
+                        "Operation patches as {op, payload}. create_draft requires nonempty "
+                        "patches in the same call; do not create an empty draft first. "
+                        + WORKSPACE_OPERATION_CONFIGURATION_GUIDANCE
+                        + describe_operation_patch_ops()
+                        + " Use goal.measurement_sources.update to attach "
                         "measurement_source, measurement_cadence, baseline_value, "
                         "or current_value to existing goals by goal_key, "
                         "metric_key, key, id, or title. For manual dashboard "
@@ -563,11 +607,17 @@ WORKSPACE_OPERATION_SCHEMA = {
                         "for narrow custom tools. Do not use action labels such "
                         "as 'publish' as capability_type; use 'action' for "
                         "plain action keys. "
-                        "For external platforms/MCP integrations use "
+                        "For a user's request to stop using an integration in this "
+                        "Workspace, use integration.remove with payload.provider. "
+                        "To restore a previously disabled provider, use "
+                        "integration.enable. To add an integration, first discover "
+                        "the user's existing connected provider and then use "
                         "capability_binding.upsert with payload.binding fields "
-                        "owner_scope (workspace_agent/service/agent/task), "
+                        "owner_scope (workspace_agent/service/agent/task; "
+                        "omit it or use workspace_agent unless a specific "
+                        "service_key/agent_id/task_id owns the binding), "
                         "capability_type='mcp', integration_key='<server_key>'. "
-                        "Only include allowed_tools when the user wants to "
+                        "An unconnected provider cannot be added. Only include allowed_tools when the user wants to "
                         "narrow that server's actions. Add "
                         "rule.add patches for approval/review requirements."
                     ),
@@ -591,7 +641,9 @@ WORKSPACE_RESOLVE_HITL_SCHEMA = {
             "Resolve an open workspace chat HITL request when the user's latest "
             "message is semantically answering it. Use the Open Workspace HITL "
             "Requests context to choose the target; do not call this for unrelated "
-            "chat or unclear intent."
+            "chat or unclear intent. Use respond with response for human_input/needs_input cards, "
+            "and approve/reject only for workspace_operation_review cards. Other kinds "
+            "keep their dedicated card controls; never resolve authorization with a reply."
         ),
         "parameters": {
             "type": "object",
@@ -606,15 +658,35 @@ WORKSPACE_RESOLVE_HITL_SCHEMA = {
                 },
                 "action": {
                     "type": "string",
-                    "description": "The user's intended decision, e.g. approve, reject, confirm, cancel.",
+                    "enum": ["respond", "approve", "reject"],
+                    "description": "respond submits ordinary input; approve/reject relays an explicit approval decision.",
+                },
+                "response": {
+                    "type": "string",
+                    "description": "The user's ordinary reply, restated faithfully. Required for respond unless payload contains structured answers or attachments.",
                 },
                 "note": {
                     "type": "string",
-                    "description": "Optional short note explaining the user's decision.",
+                    "description": "Optional explanation for an approve/reject decision. Ordinary reply text belongs in response.",
                 },
                 "payload": {
                     "type": "object",
-                    "description": "Optional structured payload for future HITL kinds.",
+                    "description": "Optional structured input fields/answers or existing Knowledge attachment references; file access is checked when resolving.",
+                    "properties": {
+                        "fields": {"type": "object"},
+                        "answers": {"type": "object"},
+                        "attachments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "string", "minLength": 1},
+                                    "document_id": {"type": "string", "minLength": 1},
+                                },
+                                "anyOf": [{"required": ["id"]}, {"required": ["document_id"]}],
+                            },
+                        },
+                    },
                 },
             },
             "required": ["action"],
@@ -676,45 +748,88 @@ async def _workspace_agent_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    action = str(kwargs.get("action") or "").strip()
+    raw_action = str(kwargs.get("action") or "").strip()
     raw_params = kwargs.get("params") or {}
     params = raw_params if isinstance(raw_params, dict) else {}
-    if not action:
+    if not raw_action:
         return _dumps({"error": "action is required"})
 
-    if action == "search":
+    try:
+        action = WorkspaceToolAction(raw_action)
+    except ValueError:
+        return _dumps({"error": f"unsupported workspace_agent action: {raw_action}"})
+
+    if action is WorkspaceToolAction.SEARCH:
         from packages.core.ai.runtime import runtime_workspace_search
 
         return await runtime_workspace_search(
             entity_id=entity_id,
             workspace_id=workspace_id,
-            **params,
+            **_workspace_action_params(params),
+        )
+
+    if action in {WorkspaceToolAction.GET_STAT_STATUS, WorkspaceToolAction.RECORD_STAT_ASSESSMENT}:
+        return await runtime_stat_action(
+            action=action.value, entity_id=entity_id, workspace_id=workspace_id,
+            user_id=user_id, params=_workspace_action_params(params),
+            origin={"workflow_run_id": kwargs.get("_workflow_run_id_from_context"),
+                    "task_id": kwargs.get("task_id"), "conversation_id": conversation_id},
         )
 
     handlers = {
-        "create_task": _workspace_create_task_handler,
-        "update_task_runtime": _workspace_update_task_runtime_handler,
-        "list_knowledge": _workspace_list_knowledge_handler,
-        "create_knowledge_folder": _workspace_create_knowledge_folder_handler,
-        "add_knowledge_documents": _workspace_add_knowledge_documents_handler,
-        "remove_knowledge_document": _workspace_remove_knowledge_document_handler,
-        "update_knowledge_policy": _workspace_update_knowledge_policy_handler,
-        "add_rule": _workspace_add_rule_handler,
-        "get_goal_status": _workspace_get_goal_status_handler,
-        "update_goal_value": _workspace_update_goal_value_handler,
-        "operation": _workspace_operation_handler,
-        "request_strategist_review": _workspace_request_strategist_review_handler,
-        "delegate_service": _workspace_delegate_service_handler,
+        WorkspaceToolAction.CREATE_TASK: _workspace_create_task_handler,
+        WorkspaceToolAction.UPDATE_TASK_RUNTIME: _workspace_update_task_runtime_handler,
+        WorkspaceToolAction.LIST_KNOWLEDGE: _workspace_list_knowledge_handler,
+        WorkspaceToolAction.CREATE_KNOWLEDGE_FOLDER: _workspace_create_knowledge_folder_handler,
+        WorkspaceToolAction.ADD_KNOWLEDGE_DOCUMENTS: _workspace_add_knowledge_documents_handler,
+        WorkspaceToolAction.REMOVE_KNOWLEDGE_DOCUMENT: _workspace_remove_knowledge_document_handler,
+        WorkspaceToolAction.UPDATE_KNOWLEDGE_POLICY: _workspace_update_knowledge_policy_handler,
+        WorkspaceToolAction.ADD_RULE: _workspace_add_rule_handler,
+        WorkspaceToolAction.GET_GOAL_STATUS: _workspace_get_goal_status_handler,
+        WorkspaceToolAction.UPDATE_GOAL_VALUE: _workspace_update_goal_value_handler,
+        WorkspaceToolAction.OPERATION: _workspace_operation_handler,
+        WorkspaceToolAction.REQUEST_STRATEGIST_REVIEW: _workspace_request_strategist_review_handler,
+        WorkspaceToolAction.DELEGATE_SERVICE: _workspace_delegate_service_handler,
+        WorkspaceToolAction.READ_DELEGATION_RESULT: _workspace_read_delegation_result_handler,
+        WorkspaceToolAction.RESOLVE_HITL: _workspace_resolve_hitl_handler,
+        WorkspaceToolAction.ANSWER_TASK_BLOCKER: _answer_task_blocker_handler,
+        WorkspaceToolAction.VISUALIZE_LEDGERS: _workspace_visualize_ledgers_handler,
     }
     handler = handlers.get(action)
     if not handler:
-        return _dumps({"error": f"unsupported workspace_agent action: {action}"})
+        return _dumps({"error": f"unsupported workspace_agent action: {raw_action}"})
 
     # Stamp the active agent persona so task logs/comments it writes are
     # attributed to that agent in the activity UI (not a generic
     # "workspace-agent"). The id is injected by the runtime tool harness.
+    action_params = _workspace_action_params(params)
+    context_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in RUNTIME_TOOL_CONTEXT_KEYS
+    }
+    runtime_task_id = str(context_kwargs.get("task_id") or "").strip()
+    requested_task_id = str(params.get("task_id") or "").strip()
+    if (
+        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
+        and runtime_task_id
+        and requested_task_id
+        and requested_task_id != runtime_task_id
+    ):
+        return _dumps({"error": "task_id conflicts with active runtime task"})
+    if (
+        action is WorkspaceToolAction.UPDATE_TASK_RUNTIME
+        and not runtime_task_id
+        and requested_task_id
+    ):
+        # A global Workspace chat may target a task explicitly. A task-scoped
+        # Runtime requires an exact match with its injected target above.
+        action_params["task_id"] = requested_task_id
     actor_kwargs: dict[str, Any] = {}
-    if action in ("create_task", "update_task_runtime"):
+    if action in {
+        WorkspaceToolAction.CREATE_TASK,
+        WorkspaceToolAction.UPDATE_TASK_RUNTIME,
+    }:
         actor_agent_id = str(kwargs.get("_agent_id_from_context") or "").strip()
         if actor_agent_id:
             actor_kwargs["actor_agent_id"] = actor_agent_id
@@ -724,8 +839,9 @@ async def _workspace_agent_handler(
         user_id=user_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
+        **context_kwargs,
         **actor_kwargs,
-        **params,
+        **action_params,
     )
 
 
@@ -854,6 +970,7 @@ async def _workspace_operation_handler(
         entity_id=entity_id,
         workspace_id=workspace_id,
         user_id=user_id or None,
+        conversation_id=conversation_id or None,
         params=kwargs,
     )
 
@@ -871,6 +988,23 @@ async def _workspace_resolve_hitl_handler(
         conversation_id=conversation_id,
         user_id=user_id or None,
         params=kwargs,
+    )
+
+
+async def _workspace_visualize_ledgers_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    return await runtime_visualize_workspace_ledgers_action(
+        entity_id=entity_id,
+        tool_kwargs={
+            "workspace_id": workspace_id,
+            "conversation_id": conversation_id,
+            **kwargs,
+        },
     )
 
 
@@ -897,9 +1031,38 @@ async def _workspace_delegate_service_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
-    return await runtime_workspace_delegate_service_action(
+    if isinstance(kwargs.get("tasks"), list):
+        shared = {key: value for key, value in kwargs.items() if key != "tasks"}
+        return await _run_delegation_tasks(
+            entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
+            conversation_id=conversation_id, tasks=kwargs["tasks"], shared=shared,
+        )
+    from packages.core.ai.runtime.workspace_delegation_actions import (
+        runtime_delegation_answer_budget,
+        runtime_delegation_tool_result,
+    )
+
+    return runtime_delegation_tool_result(await runtime_workspace_delegate_service_action(
         entity_id=entity_id,
         workspace_id=workspace_id,
+        user_id=user_id or None,
+        conversation_id=conversation_id or None,
+        params={**kwargs, "answer_max_chars": runtime_delegation_answer_budget(1)},
+    ))
+
+
+async def _workspace_read_delegation_result_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    from packages.core.ai.runtime.workspace_delegation_actions import runtime_read_delegation_result_action
+
+    return await runtime_read_delegation_result_action(
+        entity_id=entity_id,
+        workspace_id=workspace_id or None,
         user_id=user_id or None,
         conversation_id=conversation_id or None,
         params=kwargs,
@@ -969,9 +1132,76 @@ async def _answer_task_blocker_handler(
     )
 
 
+async def _run_delegation_tasks(
+    *,
+    entity_id: str,
+    user_id: str,
+    workspace_id: str,
+    conversation_id: str,
+    tasks: list[Any],
+    shared: dict[str, Any],
+) -> str:
+    """Run delegation tasks: one runs as before, several run at the same time.
+
+    The shared delegation core checks the tasks (see
+    ``runtime_delegation_batch``); chat then runs them nested in this turn.
+    A lone task resolves its own agent; several are pinned by the parallel
+    runner after its depth check.
+    """
+    from packages.core.ai.runtime.workspace_delegation_actions import (
+        runtime_delegation_answer_budget,
+        runtime_delegation_batch,
+        runtime_delegation_batch_result,
+        runtime_workspace_delegate_parallel,
+    )
+
+    batch = await runtime_delegation_batch(
+        entity_id=entity_id, workspace_id=workspace_id, tasks=tasks, shared=shared, pin_targets=False,
+    )
+    if batch.error is not None:
+        return batch.error
+    items = batch.items
+    if len(items) == 1:
+        return runtime_delegation_batch_result(items, [await runtime_workspace_delegate_service_action(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            user_id=user_id or None,
+            conversation_id=conversation_id or None,
+            params={**shared, **items[0]["params"], "answer_max_chars": runtime_delegation_answer_budget(1)},
+        )])
+    return await runtime_workspace_delegate_parallel(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        user_id=user_id or None,
+        conversation_id=conversation_id or None,
+        items=items,
+        shared_params=shared,
+    )
+
+
+async def _delegate_to_agent_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    workspace_id: str = "",
+    conversation_id: str = "",
+    **kwargs: Any,
+) -> str:
+    """Hand tasks to Workspace agents named as people see them."""
+    from packages.core.ai.runtime.workspace_delegation_actions import runtime_delegation_tool_arguments
+
+    tasks, shared = runtime_delegation_tool_arguments(kwargs)
+    return await _run_delegation_tasks(
+        entity_id=entity_id, user_id=user_id, workspace_id=workspace_id,
+        conversation_id=conversation_id, tasks=tasks, shared=shared,
+    )
+
+
 def get_tools():
+    from packages.core.ai.runtime.workspace_delegation_actions import delegate_to_agent_schema
+
     return [
         (WORKSPACE_AGENT_SCHEMA, _workspace_agent_handler),
+        (delegate_to_agent_schema(), _delegate_to_agent_handler),
         (WORKSPACE_CREATE_TASK_SCHEMA, _workspace_create_task_handler),
         (WORKSPACE_UPDATE_TASK_RUNTIME_SCHEMA, _workspace_update_task_runtime_handler),
         (WORKSPACE_LIST_KNOWLEDGE_SCHEMA, _workspace_list_knowledge_handler),

@@ -17,13 +17,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
+from stat import S_ISREG
 from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime.skill_capability_companion import (
+    SkillCapabilityCompanion,
+)
 from packages.core.ai.runtime.skill_invocation_policy import SkillInvocationPolicy
 from packages.core.models.base import generate_ulid
 from packages.core.models.skill import Skill
@@ -38,12 +43,45 @@ _SKILLS_ROOT = (
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _AGENT_SKILLS_ROOT = _REPO_ROOT / ".agents" / "skills"
 _PLATFORM_GUIDE_SKILL_NAMES = ("cloud-intro", "intro")
+# Path markers that locate a built-in bundle inside any checkout or image.
+_BUILTIN_SKILL_PATH_MARKERS = ("packages/core/ai/skills/", ".agents/skills/")
+
+
+def portable_builtin_skill_dir(skill_dir: Path | str) -> str:
+    """The bundle path relative to the repository root.
+
+    ``config["skill_dir"]`` used to store this process's absolute path, so a
+    seed run from another checkout (e.g. ``/tmp/pd``) and the image (``/app``)
+    rewrote every built-in on each other's next turn, and readers in the image
+    could not find files under the foreign path.
+    """
+
+    path = Path(skill_dir)
+    try:
+        return path.resolve().relative_to(_REPO_ROOT.resolve()).as_posix()
+    except ValueError:
+        text = path.as_posix()
+        for marker in _BUILTIN_SKILL_PATH_MARKERS:
+            index = text.find(marker)
+            if index >= 0:
+                return text[index:]
+        return text
+
+
+def resolve_builtin_skill_dir(value: str | None) -> Path | None:
+    """Locate a stored built-in bundle path in this process's checkout."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    portable = portable_builtin_skill_dir(text) if Path(text).is_absolute() else text
+    if Path(portable).is_absolute():
+        return Path(portable)
+    return _REPO_ROOT / portable
+
 _RETIRED_BUILTIN_SKILL_SLUGS = frozenset({
     "mcp_desktop_recording",
-    # Retired until packages/core/ai/mcp/discord.py exists — the pack
-    # instructed agents to call mcp__discord__* tools that had no
-    # dispatchable module behind them.
-    "mcp_discord",
+    "remotion",
 })
 
 # Parent tools that script-backed built-in skills need after `invoke_skill`
@@ -52,11 +90,7 @@ _DEFAULT_SKILL_TOOLS = [
     "invoke_skill",
     "search_tools",
     "generate_file",
-    "sandbox_exec",
-    "sandbox_read_file",
-    "sandbox_write_file",
-    "sandbox_save_result",
-    "sandbox_destroy",
+    "sandbox",
 ]
 
 
@@ -129,6 +163,11 @@ def _builtin_skill_dirs(
     return directories
 
 
+# Set on ``db.info`` when a seed changed rows; callers that memoize a "seeded"
+# state must not do so until those writes are durable.
+BUILTIN_SKILL_SEED_WROTE_KEY = "builtin_skill_seed_wrote"
+
+
 async def _retire_removed_builtin_skills(db: AsyncSession) -> None:
     """Deactivate packaged Skills retained only for migration compatibility."""
     for slug in _RETIRED_BUILTIN_SKILL_SLUGS:
@@ -141,29 +180,61 @@ async def _retire_removed_builtin_skills(db: AsyncSession) -> None:
             )
         ).scalars().all())
         for existing in existing_rows:
+            if existing.status != "inactive" or existing.is_public is not False:
+                db.info[BUILTIN_SKILL_SEED_WROTE_KEY] = True
             existing.status = "inactive"
             existing.is_public = False
+
+
+# skill_dir -> (stat signature, digest). seed_builtin_skills runs on every
+# list_skills call; re-reading ~12k bundle files each time cost seconds of
+# event-loop time, while a stat walk is ~30x cheaper.
+_SOURCE_SHA256_CACHE: dict[str, tuple[tuple[tuple[str, int, int], ...], str]] = {}
 
 
 def _skill_source_sha256(skill_dir: Path) -> str:
     """Fingerprint the complete repository-controlled Skill bundle."""
 
+    entries: list[tuple[tuple[str, ...], str, os.stat_result]] = []
+    root = str(skill_dir)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        rel_dir = os.path.relpath(dirpath, root)
+        parts = () if rel_dir == "." else tuple(rel_dir.split(os.sep))
+        for name in filenames:
+            if name.endswith(".pyc") or name == ".DS_Store":
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                stat = os.stat(full)
+            except OSError:
+                continue
+            if not S_ISREG(stat.st_mode):
+                continue
+            entries.append(((*parts, name), full, stat))
+    # Path ordering compares component-wise; keep it so digests are unchanged.
+    entries.sort(key=lambda entry: entry[0])
+    files = [(Path(full), "/".join(parts)) for parts, full, _ in entries]
+    signature = [
+        ("/".join(parts), stat.st_size, stat.st_mtime_ns)
+        for parts, _, stat in entries
+    ]
+
+    key = str(skill_dir)
+    frozen = tuple(signature)
+    cached = _SOURCE_SHA256_CACHE.get(key)
+    if cached is not None and cached[0] == frozen:
+        return cached[1]
+
     digest = hashlib.sha256()
-    for path in sorted(skill_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(skill_dir)
-        if (
-            "__pycache__" in relative.parts
-            or path.suffix == ".pyc"
-            or path.name == ".DS_Store"
-        ):
-            continue
-        digest.update(relative.as_posix().encode("utf-8"))
+    for path, rel in files:
+        digest.update(rel.encode("utf-8"))
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
-    return digest.hexdigest()
+    value = digest.hexdigest()
+    _SOURCE_SHA256_CACHE[key] = (frozen, value)
+    return value
 
 
 def _read_builtin_skill_extra_files(skill_dir: Path) -> dict[str, str]:
@@ -233,12 +304,214 @@ def read_skill_dir_files(
     return files, skipped
 
 
+def _read_builtin_skill_spec(skill_dir: Path) -> dict | None:
+    """Build the trusted packaged behavior shared by seeding and portability."""
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return None
+
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning("Failed to read %s: %s", skill_md, e)
+        return None
+
+    fm, body = _parse_frontmatter(text)
+    slug = (fm.get("name") or skill_dir.name).strip()
+    description = (fm.get("description") or "").strip()
+    version = (fm.get("version") or "1.0.0").strip()
+    skill_config = _read_skill_config(skill_dir)
+    display_name = str(skill_config.get("display_name") or slug).strip()
+    is_runtime_guidance = skill_config.get("type") == "runtime_guidance"
+    expected_config = {
+        "source": "builtin",
+        "skill_dir": portable_builtin_skill_dir(skill_dir),
+        "source_sha256": _skill_source_sha256(skill_dir),
+    }
+    for key in (
+        "bundle_roots",
+        "allowed_surfaces",
+        "public_allowed_surfaces",
+        "runtime_surfaces",
+        "workspace_operations",
+        "ledger_contracts",
+        "execution_mode",
+        "invocable_skills",
+        "continuation_stages",
+        "discoverable_provider_keys",
+        "discoverable_tool_prefixes",
+        "capability_companion",
+        "invocation_policy",
+        "plugin_key",
+        "type",
+        "max_rounds",
+        "temperature",
+        "model",
+        "search",
+    ):
+        if key in skill_config:
+            if key == "capability_companion":
+                try:
+                    companion = SkillCapabilityCompanion.from_config(
+                        skill_config[key]
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid capability_companion in "
+                        f"{skill_dir / 'config.json'}: {exc}"
+                    ) from exc
+                expected_config[key] = companion.to_dict()
+            elif key == "invocation_policy":
+                try:
+                    policy = SkillInvocationPolicy.from_config(skill_config[key])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Invalid invocation_policy in {skill_dir / 'config.json'}: {exc}"
+                    ) from exc
+                expected_config[key] = policy.to_dict()
+            elif key == "ledger_contracts":
+                raw_contracts = skill_config[key]
+                if (
+                    not isinstance(raw_contracts, list)
+                    or not raw_contracts
+                    or not all(
+                        isinstance(contract_id, str) and contract_id.strip()
+                        for contract_id in raw_contracts
+                    )
+                ):
+                    raise ValueError(
+                        f"ledger_contracts in {skill_dir / 'config.json'} "
+                        "must be an array of non-empty contract ids"
+                    )
+                expected_config[key] = list(dict.fromkeys(
+                    contract_id.strip() for contract_id in raw_contracts
+                ))
+            elif key == "execution_mode":
+                execution_mode = str(skill_config[key] or "").strip()
+                if execution_mode != "instructions_only":
+                    raise ValueError(
+                        f"execution_mode in {skill_dir / 'config.json'} "
+                        "must be 'instructions_only'"
+                    )
+                expected_config[key] = execution_mode
+            elif key == "invocable_skills":
+                slugs = skill_config[key]
+                if not isinstance(slugs, list) or not all(
+                    isinstance(slug, str) and slug.strip() for slug in slugs
+                ):
+                    raise ValueError(
+                        f"invocable_skills in {skill_dir / 'config.json'} "
+                        "must be an array of skill slugs"
+                    )
+                expected_config[key] = [slug.strip() for slug in slugs]
+            elif key == "continuation_stages":
+                from packages.core.ai.runtime.skills import runtime_skill_continuation_stages
+
+                stages = runtime_skill_continuation_stages(skill_config)
+                if not stages or list(stages) != skill_config[key]:
+                    raise ValueError(
+                        f"continuation_stages in {skill_dir / 'config.json'} must be a "
+                        "non-empty array of unique snake_case stage names other than "
+                        "'delivered' and 'blocked'"
+                    )
+                expected_config[key] = list(stages)
+            else:
+                expected_config[key] = skill_config[key]
+    runtime_config = skill_config.get("runtime")
+    if isinstance(runtime_config, dict) and isinstance(runtime_config.get("tools_optional"), bool):
+        # Only the declared-tools opt-out; other runtime policy stays code-owned.
+        expected_config["runtime"] = {"tools_optional": runtime_config["tools_optional"]}
+    if skill_config.get("category") == "workspace-operations":
+        from packages.core.ai.runtime.workspace_operation_skills import (
+            workspace_operation_tool_contract_digest,
+        )
+
+        expected_config["tool_contract_sha256"] = workspace_operation_tool_contract_digest(skill_config)
+    if is_runtime_guidance:
+        expected_config["type"] = "runtime_guidance"
+        bundled_extra_files = _read_builtin_skill_extra_files(skill_dir)
+        if bundled_extra_files:
+            expected_config["extra_files"] = bundled_extra_files
+        if isinstance(skill_config.get("extra_files"), dict):
+            configured_extra_files = {
+                str(path).replace("\\", "/"): str(content)
+                for path, content in skill_config.get("extra_files", {}).items()
+                if str(path).strip()
+            }
+            expected_config["extra_files"] = {
+                **dict(expected_config.get("extra_files") or {}),
+                **configured_extra_files,
+            }
+        description = str(skill_config.get("description") or description).strip()
+        desired_tools = list(skill_config.get("tools") or [])
+        desired_output_format = str(skill_config.get("output_format") or "guidance")
+        desired_category = str(skill_config.get("category") or "browser-automation")
+        desired_tags = list(skill_config.get("tags") or [slug, "builtin", "runtime-guidance"])
+    else:
+        desired_tools = list(skill_config.get("tools") or _DEFAULT_SKILL_TOOLS)
+        if not skill_config.get("tools"):
+            # The default parent tools are a loader convenience for script
+            # Skills, not the Skill's declaration of its own work.
+            expected_config["tools_defaulted"] = True
+        desired_output_format = str(skill_config.get("output_format") or "file")
+        desired_category = str(
+            skill_config.get("category") or "document-generation"
+        )
+        desired_tags = list(skill_config.get("tags") or [slug, "builtin"])
+
+    return {
+        "slug": slug, "name": slug, "display_name": display_name,
+        "description": description, "version": version,
+        "system_prompt": body.strip(), "tools": desired_tools,
+        "input_schema": {"type": "object", "properties": {"input": {"type": "string"}}},
+        "output_format": desired_output_format, "category": desired_category,
+        "tags": desired_tags, "config": expected_config,
+    }
+
+
+def _packaged_builtin_skill_spec(slug: str) -> dict | None:
+    # Resolve only repository-controlled directories, never a row's skill_dir.
+    matches = []
+    for skill_dir in _builtin_skill_dirs():
+        manifest = skill_dir / "SKILL.md"
+        if not manifest.is_file():
+            continue
+        frontmatter, _ = _parse_frontmatter(manifest.read_text(encoding="utf-8"))
+        if str(frontmatter.get("name") or skill_dir.name).strip() == slug:
+            matches.append(skill_dir)
+    return _read_builtin_skill_spec(matches[0]) if len(matches) == 1 else None
+
+
+async def resolve_packaged_builtin_skill(db: AsyncSession, slug: str) -> Skill:
+    """Read the unique current packaged identity without repairing catalog rows.
+
+    Historical duplicate IDs may remain callable and explicitly bound. Neither
+    their slug nor a claimed digest proves equivalent portable behavior.
+    """
+    spec = _packaged_builtin_skill_spec(slug)
+    if spec is None:
+        raise ValueError("Built-in Skill is missing or ambiguous in this deployment")
+    rows = (await db.execute(select(Skill).where(
+        Skill.slug == slug, Skill.entity_id.is_(None),
+        Skill.owner_user_id.is_(None), Skill.workspace_id.is_(None),
+        Skill.is_public.is_(True), Skill.status == "active",
+        Skill.config["source"].as_string() == "builtin",
+        Skill.config["source_sha256"].as_string() == spec["config"]["source_sha256"],
+    ))).scalars().all()
+    behavior_fields = ("system_prompt", "tools", "input_schema", "output_format", "config", "version")
+    matches = [row for row in rows if all(getattr(row, key) == spec[key] for key in behavior_fields)]
+    if len(matches) != 1:
+        raise ValueError("Built-in Skill is missing or ambiguous in this deployment")
+    return matches[0]
+
+
 async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
     """Read packaged built-ins and the edition-specific guide into `skills`.
 
     Called lazily (on first list_skills for an entity) and at app startup.
     Idempotent — re-running is a no-op unless the SKILL.md version changed.
     """
+    db.info.pop(BUILTIN_SKILL_SEED_WROTE_KEY, None)
     await _retire_removed_builtin_skills(db)
     skill_dirs = _builtin_skill_dirs()
     if not skill_dirs:
@@ -251,101 +524,19 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
 
     results: list[Skill] = []
     for skill_dir in skill_dirs:
-        skill_md = skill_dir / "SKILL.md"
-        if not skill_md.exists():
+        spec = _read_builtin_skill_spec(skill_dir)
+        if spec is None:
             continue
-
-        try:
-            text = skill_md.read_text(encoding="utf-8")
-        except Exception as e:
-            logger.warning("Failed to read %s: %s", skill_md, e)
-            continue
-
-        fm, body = _parse_frontmatter(text)
-        slug = (fm.get("name") or skill_dir.name).strip()
-        description = (fm.get("description") or "").strip()
-        version = (fm.get("version") or "1.0.0").strip()
-        skill_config = _read_skill_config(skill_dir)
-        display_name = str(skill_config.get("display_name") or slug).strip()
-        is_runtime_guidance = skill_config.get("type") == "runtime_guidance"
-        expected_config = {
-            "source": "builtin",
-            "skill_dir": str(skill_dir),
-            "source_sha256": _skill_source_sha256(skill_dir),
-        }
-        for key in (
-            "bundle_roots",
-            "allowed_surfaces",
-            "public_allowed_surfaces",
-            "runtime_surfaces",
-            "ledger_contracts",
-            "execution_mode",
-            "invocation_policy",
-            "max_rounds",
-            "temperature",
-            "model",
-        ):
-            if key in skill_config:
-                if key == "invocation_policy":
-                    try:
-                        policy = SkillInvocationPolicy.from_config(skill_config[key])
-                    except ValueError as exc:
-                        raise ValueError(
-                            f"Invalid invocation_policy in {skill_dir / 'config.json'}: {exc}"
-                        ) from exc
-                    expected_config[key] = policy.to_dict()
-                elif key == "ledger_contracts":
-                    raw_contracts = skill_config[key]
-                    if (
-                        not isinstance(raw_contracts, list)
-                        or not raw_contracts
-                        or not all(
-                            isinstance(contract_id, str) and contract_id.strip()
-                            for contract_id in raw_contracts
-                        )
-                    ):
-                        raise ValueError(
-                            f"ledger_contracts in {skill_dir / 'config.json'} "
-                            "must be an array of non-empty contract ids"
-                        )
-                    expected_config[key] = list(dict.fromkeys(
-                        contract_id.strip() for contract_id in raw_contracts
-                    ))
-                elif key == "execution_mode":
-                    execution_mode = str(skill_config[key] or "").strip()
-                    if execution_mode != "instructions_only":
-                        raise ValueError(
-                            f"execution_mode in {skill_dir / 'config.json'} "
-                            "must be 'instructions_only'"
-                        )
-                    expected_config[key] = execution_mode
-                else:
-                    expected_config[key] = skill_config[key]
-        if is_runtime_guidance:
-            expected_config["type"] = "runtime_guidance"
-            bundled_extra_files = _read_builtin_skill_extra_files(skill_dir)
-            if bundled_extra_files:
-                expected_config["extra_files"] = bundled_extra_files
-            if isinstance(skill_config.get("extra_files"), dict):
-                configured_extra_files = {
-                    str(path).replace("\\", "/"): str(content)
-                    for path, content in skill_config.get("extra_files", {}).items()
-                    if str(path).strip()
-                }
-                expected_config["extra_files"] = {
-                    **dict(expected_config.get("extra_files") or {}),
-                    **configured_extra_files,
-                }
-            description = str(skill_config.get("description") or description).strip()
-            desired_tools = list(skill_config.get("tools") or [])
-            desired_output_format = str(skill_config.get("output_format") or "guidance")
-            desired_category = str(skill_config.get("category") or "browser-automation")
-            desired_tags = list(skill_config.get("tags") or [slug, "builtin", "runtime-guidance"])
-        else:
-            desired_tools = _DEFAULT_SKILL_TOOLS
-            desired_output_format = "file"
-            desired_category = "document-generation"
-            desired_tags = [slug, "builtin"]
+        slug = spec["slug"]
+        description = spec["description"]
+        version = spec["version"]
+        display_name = spec["display_name"]
+        system_prompt = spec["system_prompt"]
+        desired_tools = spec["tools"]
+        desired_output_format = spec["output_format"]
+        desired_category = spec["category"]
+        desired_tags = spec["tags"]
+        expected_config = spec["config"]
 
         # Locate existing platform row (entity_id = NULL)
         existing: Optional[Skill] = (
@@ -359,7 +550,6 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
 
         existing_config = existing.config if existing and isinstance(existing.config, dict) else {}
         existing_tools = list(existing.tools or []) if existing else []
-        system_prompt = body.strip()
         if (
             existing
             and existing.version == version
@@ -372,6 +562,10 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
             and existing_config.get("type") == expected_config.get("type")
             and existing_config.get("extra_files") == expected_config.get("extra_files")
             and existing_config.get("source_sha256") == expected_config["source_sha256"]
+            and existing_config.get("tool_contract_sha256") == expected_config.get("tool_contract_sha256")
+            and existing_config.get("tools_defaulted") == expected_config.get("tools_defaulted")
+            and existing_config.get("runtime") == expected_config.get("runtime")
+            and existing.is_public is True
             and existing.status == "active"
         ):
             results.append(existing)
@@ -412,6 +606,7 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
             existing.status = "active"
             if content_patch:
                 await bump_revision(db, existing, patch=content_patch)
+            db.info[BUILTIN_SKILL_SEED_WROTE_KEY] = True
             results.append(existing)
             logger.info("Built-in skill updated: %s (v%s)", slug, version)
         else:
@@ -434,6 +629,7 @@ async def seed_builtin_skills(db: AsyncSession) -> list[Skill]:
                 status="active",
             )
             db.add(skill)
+            db.info[BUILTIN_SKILL_SEED_WROTE_KEY] = True
             results.append(skill)
             logger.info("Built-in skill seeded: %s (v%s)", slug, version)
 

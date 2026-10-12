@@ -1,0 +1,23 @@
+{
+  "id": "remotion-docs",
+  "name": "remotion-docs",
+  "display_name": "Remotion Docs",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Search current Remotion documentation.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "docs",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["api reference", "documentation lookup", "version compatibility", "license", "react video docs"],
+    "examples": ["look up remotion api option", "check remotion license requirements", "remotion package compatibility docs", "verify remotion function in docs"]
+  }
+}

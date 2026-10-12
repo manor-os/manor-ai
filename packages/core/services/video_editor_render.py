@@ -214,7 +214,14 @@ async def finalize_video_editor_preview(
         video_filters.append(
             f"tpad=stop_mode=clone:stop_duration={max(1.0, target_duration):.6f}"
         )
-    video_filters.extend(["scale=trunc(iw/2)*2:trunc(ih/2)*2", "format=yuv420p"])
+    # Canvas recordings can carry full-range/sRGB color tags. Pixel format
+    # alone does not clear those tags: x264 can still emit yuvj420p, which some
+    # browser hardware decoders display as black despite a successful decode.
+    video_filters.extend([
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2:out_range=tv",
+        "format=yuv420p",
+        "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+    ])
     args.extend(
         [
             "-vf",
@@ -227,6 +234,14 @@ async def finalize_video_editor_preview(
             safe_preset,
             "-crf",
             str(safe_crf),
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-color_primaries",
+            "bt709",
         ]
     )
     if has_audio:

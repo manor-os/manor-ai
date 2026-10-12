@@ -22,7 +22,7 @@ async def test_public_document_references_do_not_inherit_internal_access(monkeyp
         file_type="txt", mime_type="text/plain", metadata_={"content": "SYNTHETIC_DOCUMENT_CONTENT"},
     )
     monkeypatch.setattr(document_service, "get_document", AsyncMock(return_value=document))
-    monkeypatch.setattr(document_access, "document_is_owned_by_deleted_workspace", AsyncMock(return_value=policy == "deleted"))
+    monkeypatch.setattr(document_access, "document_entity_is_unavailable", AsyncMock(return_value=policy == "deleted"))
     monkeypatch.setattr(document_access, "effective_document_folder_policy", AsyncMock(return_value=(
         document.classification, document.visibility, document.client_visible,
     )))

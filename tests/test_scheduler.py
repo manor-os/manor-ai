@@ -1,6 +1,7 @@
 """E2E tests: scheduled jobs, job runs, agent executions."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -198,6 +199,95 @@ async def test_create_scheduled_job_uses_lifecycle_before_workspace_lock(
     )
 
     assert calls == ["lifecycle", "workspace", "resources", "persist"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_schedule_resolves_exact_deployment_inside_creation_locks(
+    monkeypatch,
+):
+    from packages.core.services import scheduler_service
+
+    calls: list[str] = []
+
+    async def lock_lifecycle(_db, *, entity_id):
+        assert entity_id == "entity-1"
+        calls.append("lifecycle")
+
+    async def lock_workspace(_db, **_kwargs):
+        calls.append("workspace")
+        return True
+
+    async def resolve_agent(_db, **kwargs):
+        calls.append("resolve")
+        assert kwargs["request"].requested_agent_id == "model-agent"
+        assert kwargs["request"].caller_agent_id == "calling-agent"
+        assert (
+            kwargs["request"].caller_agent_subscription_id
+            == "calling-subscription"
+        )
+        return scheduler_service.RuntimeScheduledJobAgentSelection(
+            agent_id="resolved-agent",
+            agent_subscription_id="resolved-subscription",
+            source="requested",
+        )
+
+    async def lock_resources(_db, **kwargs):
+        calls.append("resources")
+        assert kwargs["agent_id"] == "resolved-agent"
+        assert kwargs["execution_target"] == {
+            "deliverable": "report",
+            "agent_subscription_id": "resolved-subscription",
+        }
+
+    async def persist(_db, job):
+        calls.append("persist")
+        assert job.agent_id == "resolved-agent"
+        assert job.execution_target["agent_subscription_id"] == (
+            "resolved-subscription"
+        )
+
+    monkeypatch.setattr(
+        scheduler_service,
+        "lock_reusable_resource_lifecycle",
+        lock_lifecycle,
+    )
+    monkeypatch.setattr(
+        scheduler_service,
+        "_lock_workspace_scheduling_admission",
+        lock_workspace,
+    )
+    monkeypatch.setattr(
+        scheduler_service,
+        "resolve_runtime_scheduled_job_agent",
+        resolve_agent,
+    )
+    monkeypatch.setattr(
+        scheduler_service,
+        "_lock_scheduled_job_resource_references",
+        lock_resources,
+    )
+    monkeypatch.setattr(scheduler_service, "persist_scheduled_job", persist)
+
+    job = await scheduler_service.create_scheduled_job(
+        object(),
+        "entity-1",
+        "runtime-agent-job",
+        "Runtime Agent job",
+        workspace_id="workspace-1",
+        execution_target={
+            "deliverable": "report",
+            "agent_subscription_id": "model-forged-subscription",
+        },
+        runtime_agent_request=scheduler_service.RuntimeScheduledJobAgentRequest(
+            requested_agent_id="model-agent",
+            caller_agent_id="calling-agent",
+            caller_agent_subscription_id="calling-subscription",
+        ),
+        publish_realtime=False,
+    )
+
+    assert calls == ["lifecycle", "workspace", "resolve", "resources", "persist"]
+    assert job._runtime_agent_selection.source == "requested"
 
 
 @pytest.mark.asyncio
@@ -1519,6 +1609,98 @@ async def test_successful_workspace_chat_job_delivers_result_once(
 
 
 @pytest.mark.asyncio
+async def test_scheduled_agent_chat_projection_preserves_task_subscription(
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.task import Message
+    from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+    from packages.core.services.task_service import create_task
+    from packages.core.tasks.ai_tasks import _deliver_scheduled_agent_result
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    agent_id = generate_ulid()
+    other_subscription_id = "0" * 26
+    owner_subscription_id = "Z" * 26
+    workspace = Workspace(
+        id=workspace_id,
+        entity_id=entity_id,
+        name="Projection identity",
+        operating_model={},
+        settings={},
+    )
+    agent = Agent(
+        id=agent_id,
+        entity_id=entity_id,
+        name="Scheduled reporter",
+        status="active",
+    )
+    other_subscription = AgentSubscription(
+        id=other_subscription_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=agent_id,
+        service_key="other.service",
+        status="active",
+    )
+    owner_subscription = AgentSubscription(
+        id=owner_subscription_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=agent_id,
+        service_key="scheduled.reporter",
+        status="active",
+    )
+    job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"projection-identity:{generate_ulid()}",
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=agent_id,
+        name="Projection identity",
+        execution_type="agent",
+        default_delivery_mode="workspace_chat",
+        enabled=True,
+    )
+    db_session.add_all([
+        workspace,
+        agent,
+        other_subscription,
+        owner_subscription,
+        job,
+    ])
+    await db_session.flush()
+    task = await create_task(
+        db_session,
+        entity_id,
+        title="[Auto] Projection identity",
+        task_type="ai_generated",
+        workspace_id=workspace_id,
+        agent_id=agent_id,
+        owner_subscription_id=owner_subscription_id,
+        details={"scheduled_job_id": job.job_id},
+    )
+
+    message = await _deliver_scheduled_agent_result(
+        db_session,
+        task=task,
+        job=job,
+        run_id=generate_ulid(),
+        result={"response": "Exact deployment result"},
+    )
+    await db_session.flush()
+
+    persisted = await db_session.scalar(
+        select(Message).where(Message.id == message.id)
+    )
+    assert persisted is not None
+    assert persisted.author_subscription_id == owner_subscription_id
+
+
+@pytest.mark.asyncio
 async def test_scheduled_agent_chat_projection_failure_keeps_terminal_state(
     db_session,
     monkeypatch,
@@ -2517,6 +2699,106 @@ async def test_disabled_scheduled_agent_admission_cancels_run_and_task(db_sessio
     assert run.status == "cancelled"
     assert run.result["reason"] == "scheduled_job_disabled"
     assert task.status == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_state", ["waiting", "resume_queued", "resuming"])
+async def test_pristine_scheduled_child_cancel_preserves_runtime_hitl_marker(
+    db_session,
+    marker_state,
+):
+    from packages.core.constants.execution import ScheduledDispatchKind
+    from packages.core.models.base import generate_ulid
+    from packages.core.services.scheduled_run_lifecycle import (
+        cancel_scheduled_child_if_pristine,
+    )
+    from packages.core.services.task_runtime_approvals import (
+        TASK_RUNTIME_HITL_DETAIL_KEY,
+    )
+    from packages.core.services.task_service import create_task
+
+    entity_id = generate_ulid()
+    run_id = generate_ulid()
+    job_id = f"runtime-hitl-marker:{generate_ulid()}"
+    task = await create_task(
+        db_session,
+        entity_id,
+        title="Scheduled child at runtime approval boundary",
+        task_type="ai_generated",
+        details={
+            "scheduled_run_id": run_id,
+            "scheduled_job_id": job_id,
+            TASK_RUNTIME_HITL_DETAIL_KEY: {"state": marker_state},
+        },
+    )
+    await db_session.commit()
+
+    cancelled = await cancel_scheduled_child_if_pristine(
+        db_session,
+        child_kind=ScheduledDispatchKind.AGENT_TASK,
+        child_id=task.id,
+        run_id=run_id,
+        job_id=job_id,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(task)
+    assert cancelled is False
+    assert task.status == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("approval_status", ["pending", "granted"])
+async def test_pristine_scheduled_child_cancel_preserves_live_origin_hitl(
+    db_session,
+    approval_status,
+):
+    from packages.core.constants.execution import ScheduledDispatchKind
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.services.scheduled_run_lifecycle import (
+        cancel_scheduled_child_if_pristine,
+    )
+    from packages.core.services.task_service import create_task
+
+    entity_id = generate_ulid()
+    run_id = generate_ulid()
+    job_id = f"runtime-live-hitl:{generate_ulid()}"
+    task = await create_task(
+        db_session,
+        entity_id,
+        title="Scheduled child with live HITL",
+        task_type="ai_generated",
+        details={"scheduled_run_id": run_id, "scheduled_job_id": job_id},
+    )
+    request = HitlRequest(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        action_key="scheduled.child.action",
+        capability_id="scheduled.child.action",
+        origin_kind="tool_call",
+        origin_task_id=task.id,
+        status=approval_status,
+        dedup_key=f"scheduled-child-live:{task.id}:{approval_status}",
+        context={},
+    )
+    db_session.add(request)
+    await db_session.commit()
+
+    cancelled = await cancel_scheduled_child_if_pristine(
+        db_session,
+        child_kind=ScheduledDispatchKind.AGENT_TASK,
+        child_id=task.id,
+        run_id=run_id,
+        job_id=job_id,
+    )
+    await db_session.commit()
+
+    await db_session.refresh(task)
+    await db_session.refresh(request)
+    assert cancelled is False
+    assert task.status == "pending"
+    assert request.status == approval_status
 
 
 @pytest.mark.asyncio
@@ -4012,6 +4294,63 @@ async def test_delete_scheduled_job_removes_run_history(
 
 
 @pytest.mark.asyncio
+async def test_delete_scheduled_job_rejects_in_progress_agent_child(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.services.task_service import create_task
+
+    headers = await _auth(client, "sched_delete_in_progress")
+    created = await client.post(
+        "/api/v1/jobs",
+        headers=headers,
+        json={
+            "job_id": "delete-running-agent",
+            "name": "Delete running Agent",
+            "execution_type": "agent",
+        },
+    )
+    assert created.status_code == 201
+    job = await db_session.get(ScheduledJob, created.json()["id"])
+    assert job is not None
+    run = ScheduledJobRun(
+        id=generate_ulid(),
+        job_id=job.job_id,
+        status="running",
+        started_at=datetime.now(timezone.utc),
+    )
+    task = await create_task(
+        db_session,
+        job.entity_id,
+        title="In-flight scheduled Agent",
+        task_type="ai_generated",
+        details={
+            "scheduled_job_id": job.job_id,
+            "scheduled_run_id": run.id,
+        },
+    )
+    task.status = "in_progress"
+    job.manor_task_id = task.id
+    scheduled_job_id = job.id
+    scheduled_run_id = run.id
+    task_id = task.id
+    db_session.add(run)
+    await db_session.commit()
+
+    response = await client.delete(
+        f"/api/v1/jobs/{scheduled_job_id}", headers=headers
+    )
+
+    assert response.status_code == 409
+    assert "cannot be deleted" in response.json()["detail"]
+    db_session.expire_all()
+    assert await db_session.get(ScheduledJob, scheduled_job_id) is not None
+    assert await db_session.get(ScheduledJobRun, scheduled_run_id) is not None
+    assert (await db_session.get(type(task), task_id)).status == "in_progress"
+
+
+@pytest.mark.asyncio
 async def test_delete_scheduled_job_serializes_with_queued_dispatch(
     client: AsyncClient,
     db_session,
@@ -4081,6 +4420,55 @@ async def test_delete_scheduled_job_serializes_with_queued_dispatch(
     assert claimed_run_id is not None
     assert await db_session.get(ScheduledJob, job.id) is None
     assert await db_session.get(ScheduledJobRun, claimed_run_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_api_hides_driver_that_becomes_managed_after_precheck(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from apps.api.routers import scheduler as scheduler_router
+    from packages.core.services.scheduler_service import (
+        ManagedAgentInitiativeDriverError,
+    )
+
+    stale_job = SimpleNamespace(
+        agent_initiative_id=None,
+        execution_type="agent",
+        workspace_id=None,
+    )
+
+    async def stale_precheck(*_args, **_kwargs):
+        return stale_job
+
+    async def no_workspace_gate(*_args, **_kwargs):
+        return False
+
+    async def locked_driver_rejection(*_args, **_kwargs):
+        raise ManagedAgentInitiativeDriverError("became managed")
+
+    monkeypatch.setattr(scheduler_router, "get_scheduled_job", stale_precheck)
+    monkeypatch.setattr(
+        scheduler_router,
+        "_legacy_compatible_workspace_gate",
+        no_workspace_gate,
+    )
+    monkeypatch.setattr(
+        scheduler_router,
+        "delete_scheduled_job",
+        locked_driver_rejection,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await scheduler_router.delete_job(
+            "job-1",
+            user=SimpleNamespace(entity_id="entity-1"),
+            db=object(),
+        )
+
+    assert exc_info.value.status_code == 404
+    assert exc_info.value.detail == "Scheduled job not found"
 
 
 @pytest.mark.asyncio
@@ -4499,13 +4887,13 @@ async def test_run_now_propagates_client_idempotency_key(
     client: AsyncClient,
     monkeypatch,
 ):
-    from packages.core.tasks.scheduler_tasks import _dispatch_job_task
+    from packages.core.tasks import scheduler_tasks
 
     queued: list[tuple[tuple, dict]] = []
     monkeypatch.setattr(
-        _dispatch_job_task,
-        "delay",
-        lambda *args, **kwargs: queued.append((args, kwargs)),
+        scheduler_tasks,
+        "_publish_scheduled_dispatch",
+        lambda dispatch: queued.append((dispatch["args"], dispatch["kwargs"])),
     )
     headers = await _auth(client, "sched_run_now_idempotency")
     created = await client.post(
@@ -4530,15 +4918,17 @@ async def test_run_now_propagates_client_idempotency_key(
     assert redelivery.json()["idempotency_key"] == "operator-request-1"
     assert second.json()["idempotency_key"] == "operator-request-2"
     assert queued[0][1]["occurrence_key"] == "manual:operator-request-1"
-    assert queued[1][1]["occurrence_key"] == "manual:operator-request-1"
-    assert queued[2][1]["occurrence_key"] == "manual:operator-request-2"
+    assert len(queued) == 2
+    assert queued[1][1]["occurrence_key"] == "manual:operator-request-2"
 
 
 @pytest.mark.asyncio
-async def test_run_now_rejects_enabled_job_in_paused_workspace(
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_run_now_allows_job_in_paused_workspace(
     client: AsyncClient,
     db_session,
     monkeypatch,
+    enabled,
 ):
     from sqlalchemy import select
     from packages.core.models.scheduler import ScheduledJob
@@ -4569,20 +4959,25 @@ async def test_run_now_rejects_enabled_job_in_paused_workspace(
     job = (await db_session.execute(
         select(ScheduledJob).where(ScheduledJob.id == job_id)
     )).scalar_one()
-    job.enabled = True
+    job.enabled = enabled
     await db_session.commit()
 
-    class _UnexpectedDispatch:
-        def delay(self, *args, **kwargs):
-            raise AssertionError("paused workspace reached the scheduler queue")
+    queued = []
 
     import packages.core.tasks.scheduler_tasks as scheduler_tasks
-    monkeypatch.setattr(scheduler_tasks, "_dispatch_job_task", _UnexpectedDispatch())
+    monkeypatch.setattr(
+        scheduler_tasks, "_publish_scheduled_dispatch",
+        lambda dispatch: queued.append((dispatch["args"], dispatch["kwargs"])),
+    )
 
     response = await client.post(f"/api/v1/jobs/{job_id}/run_now", headers=headers)
 
-    assert response.status_code == 409
-    assert "Workspace is not active" in response.json()["detail"]
+    assert response.status_code == 202
+    assert len(queued) == 1
+    assert queued[0][1]["manual"] is True
+    await db_session.refresh(job)
+    assert job.enabled is enabled
+    assert job.last_run_at is None
     workspace_row = (await db_session.execute(
         select(Workspace).where(Workspace.id == workspace_id)
     )).scalar_one()
@@ -4830,6 +5225,187 @@ async def test_workspace_job_detail_projects_viewer_write_capability(client: Asy
     detail = await client.get(f"/api/v1/jobs/{created.json()['id']}", headers=viewer["headers"])
     assert detail.status_code == 200, detail.text
     assert detail.json()["can_manage"] is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_workspace_automation_create_requires_writer(
+    client: AsyncClient, db_session,
+):
+    from sqlalchemy import func, select
+
+    from packages.core.models.scheduler import ScheduledJob
+    from packages.core.services.scheduler_service import create_scheduled_job
+    from tests.test_document_permissions import _create_entity_user
+    from tests.test_workspace_write_authz import _add_member, _make_workspace
+
+    owner_headers = await _auth(client, "sched_runtime_writer_owner")
+    me = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    entity_id = me["entity_id"]
+    owner_id = me.get("user_id") or me.get("id")
+    workspace_id = await _make_workspace(entity_id, "Runtime automation access", owner_id)
+    viewer = await _create_entity_user(entity_id, "sched_runtime_writer_viewer", role="member")
+    await _add_member(workspace_id, viewer["id"], "viewer")
+
+    with pytest.raises(PermissionError, match="Workspace write access"):
+        await create_scheduled_job(
+            db_session,
+            entity_id,
+            "runtime-viewer-denied",
+            "Viewer automation",
+            workspace_id=workspace_id,
+            user_id=viewer["id"],
+            require_actor_workspace_write=True,
+        )
+    count = await db_session.scalar(
+        select(func.count()).select_from(ScheduledJob).where(
+            ScheduledJob.job_id == "runtime-viewer-denied",
+        )
+    )
+    assert count == 0
+
+    created = await create_scheduled_job(
+        db_session,
+        entity_id,
+        "runtime-owner-allowed",
+        "Owner automation",
+        workspace_id=workspace_id,
+        user_id=owner_id,
+        require_actor_workspace_write=True,
+    )
+    assert created.workspace_id == workspace_id
+    assert created.enabled is True
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_automation_defaults_to_executable_agent(
+    client: AsyncClient, db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.tools.cron_tools import _create_job_handler
+    from packages.core.constants.agents import MANOR_AGENT_ID
+    from packages.core.models.scheduler import ScheduledJob
+    from tests.test_workspace_write_authz import _make_workspace
+
+    headers = await _auth(client, "sched_runtime_default_agent_owner")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    entity_id = me["entity_id"]
+    user_id = me.get("user_id") or me.get("id")
+    workspace_id = await _make_workspace(entity_id, "Executable automation", user_id)
+    result = json.loads(await _create_job_handler(
+        entity_id=entity_id,
+        name="Daily Reel scripts",
+        schedule_kind="cron",
+        cron_expr="0 9 * * *",
+        payload_message="Create today's Reel script",
+        _runtime_envelope_from_context=SimpleNamespace(
+            surface=ChatSurface.WORKSPACE_CHAT,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            agent_id=MANOR_AGENT_ID,
+        ),
+    ))
+
+    assert result["created"] is True
+    job = (await db_session.execute(
+        select(ScheduledJob).where(ScheduledJob.job_id == result["automation"]["job_id"])
+    )).scalar_one()
+    assert job.workspace_id == workspace_id
+    assert job.agent_id == MANOR_AGENT_ID
+    assert job.skill_generation_revision == job.revision
+
+
+@pytest.mark.asyncio
+async def test_runtime_workspace_automation_tools_stay_in_current_workspace(
+    client: AsyncClient, db_session,
+):
+    from packages.core.ai.runtime.scheduling import (
+        runtime_cancel_scheduled_job_action,
+        runtime_list_scheduled_jobs_action,
+        runtime_query_scheduled_jobs_action,
+        runtime_run_scheduled_job_now_action,
+        runtime_toggle_scheduled_job_action,
+    )
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.manor_actions import runtime_manor_list_scheduled_jobs
+    from packages.core.services.scheduler_service import create_scheduled_job, get_scheduled_job
+    from tests.test_document_permissions import _create_entity_user
+    from tests.test_workspace_write_authz import _add_member, _make_workspace
+
+    headers = await _auth(client, "sched_runtime_scope_owner")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    entity_id = me["entity_id"]
+    user_id = me.get("user_id") or me.get("id")
+    workspace_a = await _make_workspace(entity_id, "Runtime scope A", user_id)
+    workspace_b = await _make_workspace(entity_id, "Runtime scope B", user_id)
+    await create_scheduled_job(
+        db_session, entity_id, "runtime-scope-a", "Job A",
+        workspace_id=workspace_a, user_id=user_id,
+    )
+    await create_scheduled_job(
+        db_session, entity_id, "runtime-scope-b", "Job B",
+        workspace_id=workspace_b, user_id=user_id,
+    )
+    await db_session.commit()
+
+    runtime_kwargs = {"_runtime_envelope_from_context": SimpleNamespace(
+        surface=ChatSurface.WORKSPACE_CHAT,
+        workspace_id=workspace_a,
+        user_id=user_id,
+    )}
+    listed = await runtime_list_scheduled_jobs_action(
+        entity_id=entity_id, runtime_kwargs=runtime_kwargs,
+    )
+    assert "runtime-scope-a" in listed
+    assert "runtime-scope-b" not in listed
+
+    queried = await runtime_query_scheduled_jobs_action(
+        entity_id=entity_id,
+        workspace_id=workspace_b,
+        runtime_kwargs=runtime_kwargs,
+    )
+    assert [item["job_id"] for item in json.loads(queried)["automations"]] == [
+        "runtime-scope-a"
+    ]
+    composite = await runtime_manor_list_scheduled_jobs(
+        db_session,
+        entity_id=entity_id,
+        params={"workspace_id": workspace_b},
+        runtime_kwargs=runtime_kwargs,
+    )
+    assert [item["job_id"] for item in json.loads(composite)["automations"]] == [
+        "runtime-scope-a"
+    ]
+    assert "not found" in await runtime_cancel_scheduled_job_action(
+        entity_id=entity_id, job_id="runtime-scope-b", runtime_kwargs=runtime_kwargs,
+    )
+    assert "not found" in await runtime_toggle_scheduled_job_action(
+        entity_id=entity_id, job_id="runtime-scope-b", enabled=False,
+        runtime_kwargs=runtime_kwargs,
+    )
+    assert "not found" in await runtime_run_scheduled_job_now_action(
+        entity_id=entity_id, job_id="runtime-scope-b", runtime_kwargs=runtime_kwargs,
+    )
+    other_job = await get_scheduled_job(db_session, "runtime-scope-b", entity_id)
+    assert other_job is not None
+    assert other_job.enabled is True
+
+    viewer = await _create_entity_user(entity_id, "sched_runtime_scope_viewer", role="member")
+    await _add_member(workspace_a, viewer["id"], "viewer")
+    viewer_kwargs = {"_runtime_envelope_from_context": SimpleNamespace(
+        surface=ChatSurface.WORKSPACE_CHAT,
+        workspace_id=workspace_a,
+        user_id=viewer["id"],
+    )}
+    with pytest.raises(PermissionError, match="Workspace write access"):
+        await runtime_toggle_scheduled_job_action(
+            entity_id=entity_id, job_id="runtime-scope-a", enabled=False,
+            runtime_kwargs=viewer_kwargs,
+        )
+    own_job = await get_scheduled_job(db_session, "runtime-scope-a", entity_id)
+    assert own_job is not None
+    assert own_job.enabled is True
 
 
 @pytest.mark.asyncio

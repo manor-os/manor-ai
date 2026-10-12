@@ -176,7 +176,8 @@ async def test_deleted_workspace_folder_is_hidden_preserved_and_restored(
         f"/api/v1/documents/folders/{deleted['artifact_folder_id']}",
         headers=headers,
     )
-    assert protected_deleted.status_code == 404, protected_deleted.text
+    assert protected_deleted.status_code == 409, protected_deleted.text
+    assert protected_deleted.json()["detail"] == "Workspace folders cannot be deleted from Knowledge"
 
     db_session.expire_all()
     deleted_workspace = (await db_session.execute(
@@ -393,6 +394,7 @@ async def test_manor_folder_actions_preserve_workspace_binding_and_id_storage(
         "rename_document_folder",
         {"folder_id": folder_id, "name": "Detached"},
         workspace["entity_id"],
+        user_id=user_id,
     ))
     assert renamed["updated"] is True
     assert renamed["folder"]["id"] == folder_id
@@ -410,6 +412,7 @@ async def test_manor_folder_actions_preserve_workspace_binding_and_id_storage(
         "delete_document_folder",
         {"folder_id": folder_id},
         workspace["entity_id"],
+        user_id=user_id,
     ))
     assert "cannot be deleted" in deleted["error"]
 

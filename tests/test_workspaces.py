@@ -194,13 +194,14 @@ async def test_create_autonomous_workspace_without_goal_installs_runtime(
     from apps.api.routers import workspaces as workspaces_router
     from packages.core.models.goal import Goal
     from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.user import User
 
-    sync_calls: list[str] = []
+    sync_calls: list[tuple[str, str | None]] = []
     original_sync = workspaces_router.sync_workspace_runtime_schedules
 
-    async def tracked_sync(db, workspace):
-        sync_calls.append(workspace.id)
-        await original_sync(db, workspace)
+    async def tracked_sync(db, workspace, *, user_id: str | None = None):
+        sync_calls.append((workspace.id, user_id))
+        await original_sync(db, workspace, user_id=user_id)
 
     monkeypatch.setattr(
         workspaces_router,
@@ -230,7 +231,10 @@ async def test_create_autonomous_workspace_without_goal_installs_runtime(
     )).scalar_one_or_none()
     assert strategist_job is not None
     assert strategist_job.enabled is True
-    assert sync_calls == [workspace["id"]]
+    creator_id = await db_session.scalar(select(User.id).where(User.email == "wsautonomous@test.com"))
+    assert creator_id is not None
+    assert strategist_job.user_id == creator_id
+    assert sync_calls == [(workspace["id"], creator_id)]
 
 
 
@@ -278,7 +282,14 @@ async def test_generic_workspace_update_cannot_forge_blueprint_setup_contract(
         headers=headers,
     )
     assert ready.status_code == 200, ready.text
-    assert ready.json()["ready"] is True
+    assert ready.json() == {
+        "ready": True,
+        "status": "not_required",
+        "summary": "No blocking Blueprint setup is required.",
+        "incomplete_checks": [],
+        "automatic_setup_task_id": None,
+        "automatic_setup_state": None,
+    }
 
     rejected = await client.put(
         f"/api/v1/workspaces/{workspace_id}",
@@ -303,7 +314,87 @@ async def test_generic_workspace_update_cannot_forge_blueprint_setup_contract(
         headers=headers,
     )
     assert still_ready.status_code == 200, still_ready.text
-    assert still_ready.json()["ready"] is True
+    assert still_ready.json() == ready.json()
+
+
+@pytest.mark.asyncio
+async def test_workspace_owner_can_answer_materials_setup_without_bypassing_file_check(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+    from packages.core.models.participant import HumanCommitment
+    from packages.core.models.workspace import Workspace
+
+    _, headers = await _register(client, "workspace_materials_setup")
+    created = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Materials setup"},
+    )
+    workspace_id = created.json()["id"]
+    workspace = await db_session.get(Workspace, workspace_id)
+    workspace.settings = {
+        **(workspace.settings or {}),
+        "blocking_setup": {"checks": [{
+            "key": "source_materials",
+            "kind": "workspace_user_materials",
+            "blocking": True,
+            "question": "Provide the source and say if notes are skipped.",
+            "all_of": [
+                {"documents": {"suffixes": [".txt"], "name_regex": "source"}},
+                {"any_of": [
+                    {"documents": {"suffixes": [".txt"], "name_regex": "notes"}},
+                    {"fulfilled_input_regex": "skip-notes"},
+                ]},
+            ],
+        }]},
+    }
+    await db_session.commit()
+
+    invalid = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/setup-input",
+        headers=headers,
+        json={"check_key": "other", "text": "skip-notes"},
+    )
+    assert invalid.status_code == 404
+    answered = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/setup-input",
+        headers=headers,
+        json={"check_key": "source_materials", "text": "skip-notes"},
+    )
+    assert answered.status_code == 200, answered.text
+    assert answered.json() == {"accepted": True}
+    blocked = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/setup-status", headers=headers,
+    )
+    assert blocked.json()["ready"] is False
+
+    commitment = (await db_session.execute(select(HumanCommitment).where(
+        HumanCommitment.workspace_id == workspace_id,
+        HumanCommitment.source_kind == "workspace_setup",
+    ))).scalar_one()
+    assert commitment.status == "fulfilled"
+    assert commitment.response["text"] == "skip-notes"
+
+    group = DocumentGroup(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace_id,
+        name="Workspace Knowledge",
+    )
+    document = Document(
+        entity_id=workspace.entity_id,
+        name="source.txt",
+        mime_type="text/plain",
+        source="upload",
+    )
+    db_session.add_all([group, document])
+    await db_session.flush()
+    db_session.add(DocumentGroupMember(group_id=group.id, document_id=document.id))
+    await db_session.commit()
+    ready = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/setup-status", headers=headers,
+    )
+    assert ready.json()["ready"] is True
 
 
 @pytest.mark.asyncio

@@ -1,9 +1,10 @@
 import { useEffect } from "react";
-import { Navigate, Outlet } from "react-router-dom";
+import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
 
 export default function ProtectedRoute() {
   const { token, isLoading, checkAuth } = useAuthStore();
+  const location = useLocation();
 
   useEffect(() => {
     checkAuth();
@@ -18,7 +19,8 @@ export default function ProtectedRoute() {
   }
 
   if (!token) {
-    return <Navigate to="/login" replace />;
+    const next = `${location.pathname}${location.search}${location.hash}`;
+    return <Navigate to={`/login?next=${encodeURIComponent(next)}`} replace />;
   }
 
   return <Outlet />;

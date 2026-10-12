@@ -54,6 +54,12 @@ class OAuthClientApp(Base, TimestampMixin):
     # Whether the client app is currently allowed to issue codes
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
+    # Null preserves historical clients; true requires S256 at consent and redemption.
+    require_pkce: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    require_verified_email: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+
     # Token TTL in minutes (uses JWT_EXPIRE_MINUTES default if null)
     access_token_ttl_minutes: Mapped[Optional[int]] = mapped_column()
 
@@ -84,6 +90,10 @@ class OAuthAuthorizationCode(Base, TimestampMixin):
 
     # CSRF state from the client (echoed back at redirect; not strictly required at /token)
     state: Mapped[Optional[str]] = mapped_column(String(255))
+
+    # Only S256 is supported. A bound code never falls back to secret-only redemption.
+    code_challenge: Mapped[Optional[str]] = mapped_column(String(43), nullable=True)
+    code_challenge_method: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
 
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     redeemed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

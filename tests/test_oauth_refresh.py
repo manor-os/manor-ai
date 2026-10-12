@@ -256,6 +256,99 @@ async def test_youtube_user_token_near_expiry_is_refreshed(client: AsyncClient):
     assert row.token_expires_at > now + timedelta(minutes=30)
 
 
+@pytest.mark.parametrize(
+    ("expires_in_minutes", "status_code"),
+    [(-10, 200), (2, 200), (-10, 400), (-10, 503)],
+)
+async def test_tiktok_user_refresh_scans_encrypted_accounts(
+    client: AsyncClient, expires_in_minutes: int, status_code: int,
+):
+    """TikTok's due-token scan refreshes encrypted rows and restores discovery."""
+    _, user_id, entity_id = await _register(client, "oauth_tiktok_usr")
+    import packages.core.database as dbmod
+
+    now = datetime.now(timezone.utc)
+    account_id = generate_ulid()
+    async with dbmod.async_session() as db:
+        row = OAuthAccount(
+            id=account_id,
+            user_id=user_id,
+            provider="tiktok",
+            provider_user_id="creator-example",
+            token_expires_at=now + timedelta(minutes=expires_in_minutes),
+            profile={},
+        )
+        store_oauth_account_tokens(
+            row,
+            access_token="old-tiktok-access",
+            refresh_token="old-tiktok-refresh",
+            preserve_existing_refresh=False,
+        )
+        assert row.credential_ref and row.refresh_token is None
+        db.add(row)
+        await db.commit()
+
+    calls: list[dict] = []
+
+    class TikTokRefreshClient(_MockHttpxClient):
+        async def post(self, url, data=None, headers=None):
+            calls.append({"url": url, "data": data, "headers": headers})
+            if status_code != 200:
+                return _mock_response(status_code, {
+                    "error": "invalid_grant" if status_code == 400 else "server_error",
+                    "error_description": "Refresh token revoked." if status_code == 400 else "Try again later.",
+                })
+            return await super().post(url, data=data, headers=headers)
+
+    with patch.dict(os.environ, {"TIKTOK_CLIENT_ID": "tk-key", "TIKTOK_CLIENT_SECRET": "tk-secret"}):
+        with patch("httpx.AsyncClient", lambda *a, **kw: TikTokRefreshClient({
+            "access_token": "new-tiktok-access",
+            "refresh_token": "rotated-tiktok-refresh",
+            "expires_in": 86400,
+        })):
+            async with dbmod.async_session() as db:
+                refreshed = await _refresh_oauth_accounts(db)
+                await db.commit()
+
+    assert len(calls) == 1
+    assert calls[0]["url"] == "https://open.tiktokapis.com/v2/oauth/token/"
+    assert calls[0]["data"] == {
+        "client_key": "tk-key",
+        "client_secret": "tk-secret",
+        "grant_type": "refresh_token",
+        "refresh_token": "old-tiktok-refresh",
+    }
+    assert "Authorization" not in calls[0]["headers"]
+    async with dbmod.async_session() as db:
+        row = await db.get(OAuthAccount, account_id)
+        accounts = await list_runtime_integration_accounts(
+            db, user_id=user_id, entity_id=entity_id, provider="tiktok",
+        )
+    if status_code == 200:
+        assert refreshed == 1
+        assert row.access_token is None and row.refresh_token is None
+        assert _leased_tokens(row) == {
+            "access_token": "new-tiktok-access",
+            "refresh_token": "rotated-tiktok-refresh",
+        }
+        assert row.token_expires_at > now + timedelta(hours=23)
+        assert [account.id for account in accounts] == [account_id]
+    elif status_code == 400:
+        assert refreshed == 0
+        assert row.credential_ref is None
+        assert row.profile["oauth_refresh"]["reauth_required"] is True
+        assert row.profile["oauth_refresh"]["error"] == "invalid_grant"
+        assert not accounts
+    else:
+        assert refreshed == 0
+        assert _leased_tokens(row) == {
+            "access_token": "old-tiktok-access",
+            "refresh_token": "old-tiktok-refresh",
+        }
+        assert "oauth_refresh" not in row.profile
+        assert not accounts
+
+
 @pytest.mark.asyncio
 async def test_twitter_user_refresh_uses_basic_auth_without_client_credentials(
     client: AsyncClient,
@@ -575,7 +668,8 @@ async def test_credential_decrypt_failure_marks_only_bad_account_for_reconnect(
 
 
 @pytest.mark.asyncio
-async def test_entity_integration_refreshed(client: AsyncClient):
+@pytest.mark.parametrize("provider", ["quickbooks", "tiktok"])
+async def test_entity_integration_refreshed(client: AsyncClient, provider: str):
     """Integration row with expiring creds.refresh_token gets refreshed."""
     _, _, entity_id = await _register(client, "oauth_ent_1")
 
@@ -587,7 +681,7 @@ async def test_entity_integration_refreshed(client: AsyncClient):
             Integration(
                 id=generate_ulid(),
                 entity_id=entity_id,
-                provider="quickbooks",
+                provider=provider,
                 status="active",
                 config={},
                 credentials={
@@ -613,6 +707,8 @@ async def test_entity_integration_refreshed(client: AsyncClient):
         {
             "QUICKBOOKS_CLIENT_ID": "qb_id",
             "QUICKBOOKS_CLIENT_SECRET": "qb_sec",
+            "TIKTOK_CLIENT_ID": "tk_key",
+            "TIKTOK_CLIENT_SECRET": "tk_sec",
         },
     ):
         with patch("httpx.AsyncClient", fake_client):

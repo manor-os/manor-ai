@@ -3,13 +3,11 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
 from packages.core.ai.runtime.integration_skill_registry import (
     IntegrationSkillRoute,
     integration_skill_route_for_message,
 )
 from packages.core.ai.runtime.skill_invocation_policy import (
-    retain_required_skill_invocation_policies,
     trusted_skill_invocation_policy,
 )
 
@@ -48,6 +46,11 @@ _EXTERNAL_DRAFT_TERMS = (
     "draft", "caption", "copy", "creative", "image", "cover", "visual",
     "文案", "配图", "封面", "图片", "素材", "草稿", "写一篇", "写个", "生成",
 )
+_NEGATED_PLATFORM_ACTION_RE = re.compile(
+    r"(?:不|别|勿|禁止|不要|无需|无须|暂不|先不|不再|"
+    r"\b(?:do\s+not|don't|does\s+not|doesn't|without|never|no)\b)\s*$",
+    re.IGNORECASE,
+)
 _INTEGRATION_OPERATION_TERMS = (
     "use", "run", "create", "get", "fetch", "send", "post", "publish", "upload",
     "download", "update", "edit", "delete", "remove", "add", "list", "search",
@@ -61,18 +64,6 @@ _INTEGRATION_OPERATION_TERMS = (
     "生成", "账单", "付款", "退款", "支付", "安排", "预订", "保存", "查询", "分析",
     "修复", "重构", "测试", "评论", "点赞", "关注", "分享",
 )
-_LOCAL_CODING_SKILL_SLUGS = {
-    "local-coding-operations",
-    "local_coding_operations",
-    "platform-development",
-    "platform_development",
-    "mcp-aider",
-    "mcp-claude-code",
-    "mcp-codex-cli",
-    "mcp-continue-cli",
-    "mcp-cursor-cli",
-    "mcp-gemini-cli",
-}
 _PRESENTATION_SKILL_SLUGS = {
     "pptx",
     "presentation",
@@ -159,41 +150,92 @@ _LINKEDIN_NETWORK_ACTION_TERMS = (
     "connect", "connection", "connection request", "invite", "invitation", "follow", "message", "dm",
     "加人", "连接", "好友", "邀请", "关注", "消息", "私信",
 )
-_LOCAL_CODING_PROVIDER_ORDER = (
-    "codex_cli",
-    "claude_code",
-    "gemini_cli",
-    "aider",
-    "cursor",
-    "continue_cli",
-)
-_LOCAL_CODING_PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
-    "claude_code": ("claude code", "claude_code", "claude cli", "本地claude", "本地 claude"),
-    "codex_cli": ("codex cli", "codex_cli", "codex", "openai codex", "本地codex", "本地 codex"),
-    "gemini_cli": ("gemini cli", "gemini_cli", "本地gemini", "本地 gemini"),
-    "aider": ("aider", "本地aider", "本地 aider"),
-    "cursor": ("cursor", "cursor cli", "本地cursor", "本地 cursor"),
-    "continue_cli": (
-        "continue cli",
-        "continue_cli",
-        "continue.dev",
-        "本地continue",
-        "本地 continue",
-    ),
+_LOCAL_CODING_ENTRYPOINT_SLUGS = {
+    "local-coding-operations",
+    "platform-development",
 }
-_LOCAL_CODING_PROVIDER_TERMS = (
-    "codex cli", "codex_cli", "codex", "claude code", "claude_code",
-    "coding cli", "code cli", "编程cli", "编程 cli", "本地codex", "本地 codex",
-    "本地claude", "本地 claude",
-)
+# Bare product names live here only for provider disambiguation after coding
+# intent is already confirmed. They must not be treated as intent by themselves.
+_LOCAL_CODING_PROVIDERS: dict[str, tuple[str, ...]] = {
+    "codex_cli": ("codex cli", "codex_cli", "codex", "openai codex"),
+    "claude_code": ("claude code", "claude_code", "claude cli"),
+    "gemini_cli": ("gemini cli", "gemini_cli"),
+    "aider": ("aider",),
+    "cursor": ("cursor", "cursor cli"),
+    "continue_cli": ("continue cli", "continue_cli", "continue.dev"),
+}
+_LOCAL_CODING_PROVIDER_ORDER = tuple(_LOCAL_CODING_PROVIDERS)
+_GENERIC_CODING_CLI_PHRASES = ("coding cli", "code cli", "编程cli", "编程 cli")
 _LOCAL_CODING_ACTION_TERMS = (
     "edit", "append", "modify", "change", "review", "refactor", "fix", "test",
     "写入", "追加", "加上", "修改", "改", "编辑", "审查", "评审", "重构", "修复", "测试",
 )
-_LOCAL_CODING_HINT_TERMS = (
-    "local repo", "local repository", "local project", "local directory",
-    "本地项目", "本地目录", "本地仓库", "本地文件", "项目目录", "代码仓库",
-)
+_LOCAL_CODING_LOCALITY_TERMS = ("项目目录", "代码仓库")
+
+
+def _first_hint_segment(term: str) -> str:
+    parts = re.split(r"[\s_]+", term.strip())
+    return parts[0] if parts else term
+
+
+def _compact_hint(term: str) -> str:
+    return re.sub(r"[\s_]+", "", term)
+
+
+def _localized_hint_variants(term: str) -> tuple[str, ...]:
+    first = _first_hint_segment(term)
+    compact = _compact_hint(term)
+    ordered = (
+        f"本地{first}",
+        f"本地 {first}",
+        f"本地{compact}",
+        f"本地 {term}",
+    )
+    return tuple(dict.fromkeys(item.lower() for item in ordered if item.strip()))
+
+
+def _build_local_coding_provider_hints() -> dict[str, tuple[str, ...]]:
+    hints: dict[str, tuple[str, ...]] = {}
+    for provider, terms in _LOCAL_CODING_PROVIDERS.items():
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for term in terms:
+            for item in (term.lower(), *_localized_hint_variants(term)):
+                if item and item not in seen:
+                    seen.add(item)
+                    ordered.append(item)
+        hints[provider] = tuple(ordered)
+    return hints
+
+
+def _is_local_coding_cli_phrase(term: str) -> bool:
+    lowered = term.lower()
+    if any(marker in lowered for marker in ("cli", "coding", "编程", "本地")):
+        return True
+    return bool(re.search(r"(?<![a-z0-9])code(?![a-z0-9])", lowered))
+
+
+def _build_local_coding_cli_phrases() -> tuple[str, ...]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for term in (
+        *_GENERIC_CODING_CLI_PHRASES,
+        *(
+            hint
+            for hints in _LOCAL_CODING_PROVIDER_HINTS.values()
+            for hint in hints
+        ),
+    ):
+        value = term.lower()
+        if not value or value in seen or not _is_local_coding_cli_phrase(value):
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return tuple(ordered)
+
+
+_LOCAL_CODING_PROVIDER_HINTS = _build_local_coding_provider_hints()
+_LOCAL_CODING_CLI_PHRASES = _build_local_coding_cli_phrases()
 _LOCAL_CODING_PATH_RE = re.compile(
     r"(?:~/|(?:^|[\s(\"'`])/(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+|"
     r"downloads/|desktop/|documents/|(?:\./|\.\./)|[a-z]:[\\/])",
@@ -214,6 +256,33 @@ _CHINESE_EXTERNAL_ACTION_RE = re.compile(
     r"发(?!现|生|明|起|热|酵)(?:一|个|条)?)"
     r".{0,12}(?:小红书|微博|抖音|微信|公众号|领英|推特|脸书)"
 )
+_INTERNAL_FILE_DELIVERABLE_RE = re.compile(
+    r"\b(?:create|generate|write|save|produce|make|draft)\b[^.!?\n]{0,100}"
+    r"\b(?:knowledge|document|file|artifact)\b|"
+    r"(?:创建|生成|保存|撰写|编写|制作)[^。！？\n]{0,60}(?:知识|文档|文件|产物)",
+    re.IGNORECASE,
+)
+_INTERNAL_VIDEO_DELIVERABLE_RE = re.compile(
+    r"\b(?:render|edit|compose|merge|concat(?:enate)?|stitch|trim|export|save|"
+    r"create|generate|make|produce)\b[^.!?\n]{0,100}"
+    r"\b(?:video|reel|clip|footage|montage|mp4)\b|"
+    r"(?:剪辑|合成|拼接|渲染)|"
+    r"(?:制作|生成|保存|导出)[^。！？\n]{0,60}(?:视频|短片|成片|MP4)",
+    re.IGNORECASE,
+)
+_NEGATED_EXTERNAL_WRITE_RE = re.compile(
+    r"\b(?:do\s+not|don't|never|must\s+not)\s+"
+    r"(?:publish|upload|send|share|post)"
+    r"(?:\s*(?:,|or|and)\s*(?:publish|upload|send|share|post))*\b|"
+    r"(?:不要|不得|禁止)(?:发布|上传|发送|分享|发帖)"
+    r"(?:(?:、|或|和)(?:发布|上传|发送|分享|发帖))*",
+    re.IGNORECASE,
+)
+_EXTERNAL_WRITE_VERB_RE = re.compile(
+    r"\b(?:publish|upload|send|share|post|comment|reply|follow|retweet|repost)\b|"
+    r"发布|上传|发送|分享|发帖|评论|回复|关注|转发",
+    re.IGNORECASE,
+)
 _RUNTIME_APPROVAL_APPROVED_PREFIX = "[Runtime approval approved]"
 _SKILL_RELEVANCE_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.+-]*|[\u4e00-\u9fff]+", re.IGNORECASE)
 
@@ -233,8 +302,56 @@ def _skill_variants(slug: str | None, name: str | None = None) -> set[str]:
     return variants
 
 
+def _provider_mcp_skill_slugs(provider: str) -> set[str]:
+    tokens = [part for part in re.split(r"[_-]+", provider) if part]
+    if not tokens:
+        return set()
+    full = "-".join(tokens)
+    base_tokens = tokens[:-1] if tokens[-1] == "cli" else tokens
+    base = "-".join(base_tokens)
+    raw = {f"mcp-{full}"}
+    if base != full:
+        raw.add(f"mcp-{base}")
+    else:
+        raw.add(f"mcp-{full}-cli")
+    variants: set[str] = set()
+    for item in raw:
+        variants.update(_skill_variants(item))
+    return variants
+
+
+_LOCAL_CODING_ENTRYPOINT_VARIANTS = frozenset().union(
+    *(_skill_variants(slug) for slug in _LOCAL_CODING_ENTRYPOINT_SLUGS)
+)
+_LOCAL_CODING_SKILL_VARIANTS = frozenset(_LOCAL_CODING_ENTRYPOINT_VARIANTS).union(
+    *(_provider_mcp_skill_slugs(provider) for provider in _LOCAL_CODING_PROVIDERS)
+)
+
+
 def is_local_coding_skill(slug: str | None, name: str | None = None) -> bool:
-    return bool(_skill_variants(slug, name).intersection(_LOCAL_CODING_SKILL_SLUGS))
+    return bool(_skill_variants(slug, name).intersection(_LOCAL_CODING_SKILL_VARIANTS))
+
+
+def is_local_coding_entrypoint_skill(slug: str | None, name: str | None = None) -> bool:
+    return bool(_skill_variants(slug, name).intersection(_LOCAL_CODING_ENTRYPOINT_VARIANTS))
+
+
+def is_mcp_guidance_pack(slug: str | None, name: str | None = None) -> bool:
+    return any(
+        variant.startswith(("mcp-", "mcp_"))
+        for variant in _skill_variants(slug, name)
+    )
+
+
+def is_local_coding_provider_key(key: str | None) -> bool:
+    value = str(key or "").strip().lower()
+    if not value:
+        return False
+    if value in _LOCAL_CODING_PROVIDERS:
+        return True
+    if value.endswith("_cli") and value[:-4] in _LOCAL_CODING_PROVIDERS:
+        return True
+    return f"{value}_cli" in _LOCAL_CODING_PROVIDERS
 
 
 def is_presentation_skill(slug: str | None, name: str | None = None) -> bool:
@@ -355,7 +472,13 @@ def explicit_skill_reference(active_user_message: str | None, skill: str) -> boo
     if not active_user_message or not skill:
         return False
     text = active_user_message.lower()
-    return any(variant and variant in text for variant in _skill_variants(skill))
+    if any(variant and variant in text for variant in _skill_variants(skill)):
+        return True
+    normalized_skill = skill.lower().replace("_", "-")
+    return bool(
+        normalized_skill.startswith("remotion-")
+        and re.search(r"(?<![a-z0-9])remotion(?![a-z0-9])", text)
+    )
 
 
 def _contains_platform_alias(text: str, aliases: Iterable[str]) -> bool:
@@ -376,10 +499,17 @@ def external_platform_action_intent(text: str | None) -> bool:
         return False
     lowered = text.lower()
     has_platform = _contains_platform_alias(lowered, _EXTERNAL_PLATFORM_ALIASES)
-    has_action = (
-        any(term in lowered for term in _EXTERNAL_ACTION_TERMS)
-        or bool(_ENGLISH_POST_TO_PLATFORM_RE.search(lowered))
-        or bool(_CHINESE_EXTERNAL_ACTION_RE.search(text))
+    def requested_action(start: int) -> bool:
+        return not _NEGATED_PLATFORM_ACTION_RE.search(lowered[max(0, start - 24):start])
+
+    has_action = any(
+        requested_action(match.start())
+        for term in _EXTERNAL_ACTION_TERMS
+        for match in re.finditer(re.escape(term), lowered)
+    ) or any(
+        requested_action(match.start())
+        for pattern in (_ENGLISH_POST_TO_PLATFORM_RE, _CHINESE_EXTERNAL_ACTION_RE)
+        for match in pattern.finditer(lowered)
     )
     return has_platform and has_action
 
@@ -473,6 +603,10 @@ def named_integration_operation_intent(text: str | None) -> bool:
     route = integration_skill_route_for_message(text)
     if route is None:
         return False
+    if is_local_coding_skill(route.child_skill, route.provider_key) or is_local_coding_provider_key(
+        route.provider_key
+    ):
+        return False
     lowered = text.lower()
     if route.parent_skill in {
         "platform-linkedin",
@@ -490,18 +624,15 @@ def local_coding_cli_intent(text: str | None) -> bool:
     if not text or runtime_approval_resume_intent(text):
         return False
     lowered = text.lower()
-    has_provider = any(term in lowered for term in _LOCAL_CODING_PROVIDER_TERMS)
-    if has_provider:
+    if any(phrase in lowered for phrase in _LOCAL_CODING_CLI_PHRASES):
         return True
-    has_action = any(term in lowered for term in _LOCAL_CODING_ACTION_TERMS) or any(
-        term in text for term in _LOCAL_CODING_ACTION_TERMS
-    )
+    has_action = any(term in lowered for term in _LOCAL_CODING_ACTION_TERMS)
     if not has_action:
         return False
     has_local_hint = (
-        "本地" in text
+        "本地" in lowered
         or "local" in lowered
-        or any(term in lowered for term in _LOCAL_CODING_HINT_TERMS)
+        or any(term in lowered for term in _LOCAL_CODING_LOCALITY_TERMS)
     )
     path_candidate = _REMOTE_URL_RE.sub(" ", lowered)
     path_candidate = _KNOWLEDGE_PATH_RE.sub(" ", path_candidate)
@@ -573,18 +704,17 @@ def presentation_fresh_creation_intent(text: str | None) -> bool:
 
 def local_coding_provider_route(text: str | None) -> tuple[str, ...]:
     """Return local coding providers that match the active user request."""
-    if not text or runtime_approval_resume_intent(text):
+    if not text or runtime_approval_resume_intent(text) or not local_coding_cli_intent(text):
         return ()
     lowered = text.lower()
-    explicit: list[str] = []
-    for provider in _LOCAL_CODING_PROVIDER_ORDER:
-        if any(hint in lowered for hint in _LOCAL_CODING_PROVIDER_HINTS.get(provider, ())):
-            explicit.append(provider)
+    explicit = [
+        provider
+        for provider in _LOCAL_CODING_PROVIDER_ORDER
+        if any(hint in lowered for hint in _LOCAL_CODING_PROVIDER_HINTS.get(provider, ()))
+    ]
     if explicit:
         return tuple(explicit)
-    if local_coding_cli_intent(text):
-        return ("codex_cli", "claude_code")
-    return ()
+    return ("codex_cli", "claude_code")
 
 
 def should_route_external_action_to_integration(
@@ -592,24 +722,40 @@ def should_route_external_action_to_integration(
     active_user_message: str | None,
     skill: str,
     manual_skill_selected: bool,
+    operation_text: str | None = None,
 ) -> bool:
     """Return True when an accidental skill route should yield to integrations."""
     if manual_skill_selected or explicit_skill_reference(active_user_message, skill):
         return False
-    if named_integration_operation_intent(active_user_message):
+    # Task context may mention later platform work; route this invocation's
+    # operation without treating the whole Task as the current side effect.
+    route_text = operation_text or active_user_message
+    variants = _skill_variants(skill)
+    if (
+        route_text
+        and (
+            ("file_engine" in variants and _INTERNAL_FILE_DELIVERABLE_RE.search(route_text))
+            or ("video_edit" in variants and _INTERNAL_VIDEO_DELIVERABLE_RE.search(route_text))
+        )
+        and not _EXTERNAL_WRITE_VERB_RE.search(
+            _NEGATED_EXTERNAL_WRITE_RE.sub(" ", route_text)
+        )
+    ):
+        return False
+    if named_integration_operation_intent(route_text):
         return not is_named_integration_route_skill(
-            active_user_message,
+            route_text,
             skill,
             skill,
         )
-    if youtube_platform_action_intent(active_user_message) and is_youtube_route_skill(skill):
+    if youtube_platform_action_intent(route_text) and is_youtube_route_skill(skill):
         return False
-    if linkedin_platform_operation_intent(active_user_message):
+    if linkedin_platform_operation_intent(route_text):
         return not is_linkedin_route_skill(skill, skill)
-    if social_platform_action_intent(active_user_message):
-        return not is_social_platform_route_skill(active_user_message, skill, skill)
-    if external_platform_action_intent(active_user_message):
-        if youtube_platform_action_intent(active_user_message):
+    if social_platform_action_intent(route_text):
+        return not is_social_platform_route_skill(route_text, skill, skill)
+    if external_platform_action_intent(route_text):
+        if youtube_platform_action_intent(route_text):
             return not (
                 is_youtube_platform_skill(skill, skill)
                 or is_youtube_mcp_skill(skill, skill)
@@ -682,6 +828,12 @@ def runtime_skill_relevance_score(skill, active_user_message: str | None) -> int
     if not query:
         return 0
     slug, name = skill_slug_and_name(skill)
+    if (
+        is_mcp_guidance_pack(slug, name)
+        and is_local_coding_skill(slug, name)
+        and not local_coding_cli_intent(active_user_message)
+    ):
+        return 0
     variants = _skill_variants(slug, name)
     values = _skill_text_values(skill)
     searchable = " \n".join(values).lower()
@@ -736,119 +888,5 @@ def filter_skills_for_runtime_turn(
     active_user_message: str | None,
     manual_skill_selected: bool = False,
 ) -> list:
-    """Filter accidental skill candidates using runtime turn intent."""
-    items = list(skills or [])
-    if manual_skill_selected:
-        return items
-    if presentation_artifact_intent(active_user_message):
-        selected = [
-            skill
-            for skill in items
-            if is_presentation_skill(*skill_slug_and_name(skill))
-        ]
-        return retain_required_skill_invocation_policies(items, selected)
-    if detect_chrome_local_browser_route(active_user_message):
-        selected = [
-            skill for skill in items
-            if is_chrome_skill(*skill_slug_and_name(skill))
-            or (
-                youtube_platform_action_intent(active_user_message)
-                and (
-                    is_youtube_platform_skill(*skill_slug_and_name(skill))
-                    or is_youtube_mcp_skill(*skill_slug_and_name(skill))
-                )
-            )
-            or (
-                linkedin_platform_operation_intent(active_user_message)
-                and (
-                    is_linkedin_platform_skill(*skill_slug_and_name(skill))
-                    or is_linkedin_mcp_skill(*skill_slug_and_name(skill))
-                )
-            )
-            or (
-                social_platform_action_intent(active_user_message)
-                and (
-                    is_social_platform_skill(*skill_slug_and_name(skill))
-                    or is_social_platform_mcp_skill(
-                        active_user_message, *skill_slug_and_name(skill)
-                    )
-                )
-            )
-            or (
-                named_integration_operation_intent(active_user_message)
-                and (
-                    is_integration_parent_skill(
-                        integration_skill_route_for_message(active_user_message),
-                        *skill_slug_and_name(skill),
-                    )
-                    or is_integration_child_skill(
-                        integration_skill_route_for_message(active_user_message),
-                        *skill_slug_and_name(skill),
-                    )
-                )
-            )
-        ]
-        return retain_required_skill_invocation_policies(items, selected)
-    if youtube_platform_action_intent(active_user_message):
-        selected = [
-            skill
-            for skill in items
-            if is_youtube_platform_skill(*skill_slug_and_name(skill))
-            or is_youtube_mcp_skill(*skill_slug_and_name(skill))
-            or is_chrome_skill(*skill_slug_and_name(skill))
-        ]
-        return retain_required_skill_invocation_policies(items, selected)
-    if linkedin_platform_operation_intent(active_user_message):
-        selected = [
-            skill
-            for skill in items
-            if is_linkedin_platform_skill(*skill_slug_and_name(skill))
-            or is_linkedin_mcp_skill(*skill_slug_and_name(skill))
-            or is_chrome_skill(*skill_slug_and_name(skill))
-        ]
-        return retain_required_skill_invocation_policies(items, selected)
-    if social_platform_action_intent(active_user_message):
-        selected = [
-            skill
-            for skill in items
-            if is_social_platform_route_skill(
-                active_user_message, *skill_slug_and_name(skill)
-            )
-        ]
-        # A social publish request can still need a content skill to prepare
-        # the draft when this workspace has no platform route installed. The
-        # invoke boundary separately blocks accidental external publishing,
-        # so do not hide all ordinary writing candidates at discovery time.
-        if not selected:
-            return items
-        return retain_required_skill_invocation_policies(items, selected)
-    if local_coding_cli_intent(active_user_message):
-        # Keep the local coding umbrella together with connected MCP guidance
-        # packs.  The renderer applies the per-pack availability gate, so an
-        # unconnected provider is still omitted without hiding a connected
-        # provider that can assist the coding task.
-        selected = [
-            skill
-            for skill in items
-            if is_local_coding_skill(*skill_slug_and_name(skill))
-            or str(skill_slug_and_name(skill)[0] or "").startswith(("mcp_", "mcp-"))
-        ]
-        return retain_required_skill_invocation_policies(items, selected)
-    if named_integration_operation_intent(active_user_message):
-        route = integration_skill_route_for_message(active_user_message)
-        selected = [
-            skill
-            for skill in items
-            if is_integration_parent_skill(route, *skill_slug_and_name(skill))
-            or is_integration_child_skill(route, *skill_slug_and_name(skill))
-            or (
-                route is not None
-                and route.chrome_fallback
-                and is_chrome_skill(*skill_slug_and_name(skill))
-            )
-        ]
-        return retain_required_skill_invocation_policies(items, selected)
-    return rank_skills_for_runtime_turn(
-        items,
-        active_user_message=active_user_message,
-    )
+    """Keep authorized candidates available for semantic model selection."""
+    return list(skills or [])

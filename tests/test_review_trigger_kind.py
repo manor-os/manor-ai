@@ -19,7 +19,13 @@ import json
 import logging
 from types import SimpleNamespace
 
+from tests.strategist_helpers import proposal_with_execution_review
+
 import pytest
+
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
 from sqlalchemy import select
 
 from packages.core.ledger import event_types as et
@@ -30,6 +36,7 @@ from packages.core.models.goal import Goal
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
 from packages.core.models.review_run import ReviewRun
 from packages.core.models.task import Conversation, Message, Task
+from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.proposals.constants import (
     LEARNING_EXCLUDED_REASON_CODES,
@@ -79,7 +86,14 @@ async def _seed_workspace(db) -> Workspace:
         service_key="ops",
         status="active",
     )
-    db.add_all([workspace, goal, agent, subscription])
+    db.add_all([
+        User(id=entity_id, entity_id=entity_id, email=f"{entity_id}@approval.example",
+             password_hash="test-only", role="owner", status="active"),
+        UserMembership(user_id=entity_id, entity_id=entity_id, role="owner", status="active"),
+        workspace, goal, agent, subscription,
+    ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=entity_id)
     await db.commit()
     return workspace
 
@@ -136,7 +150,7 @@ _ONE_TASK = {
 def _install_llm(monkeypatch, counter: list[int]):
     async def fake(system_prompt, user_prompt, **kwargs):
         counter.append(1)
-        return SimpleNamespace(content=json.dumps(_ONE_TASK))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(_ONE_TASK, user_prompt)))
 
     monkeypatch.setattr(
         "packages.core.strategist.prompt.runtime_execute_strategist_completion", fake,
@@ -343,7 +357,7 @@ async def test_workflow_only_proposal_blocks_duplicate_review(
 # ── 3. supersede=true → cohort rejected, review runs ──────────────────
 
 
-async def test_human_requested_review_is_not_enqueued_for_paused_workspace(
+async def test_human_requested_review_is_enqueued_for_paused_workspace(
     db_session, monkeypatch,
 ):
     from packages.core import database
@@ -360,7 +374,7 @@ async def test_human_requested_review_is_not_enqueued_for_paused_workspace(
         @staticmethod
         def apply_async(*args, **kwargs):
             enqueued.append({"args": args, "kwargs": kwargs})
-            return SimpleNamespace(id="should-not-be-enqueued")
+            return SimpleNamespace(id="manual-paused-review")
 
     @asynccontextmanager
     async def _current_test_session():
@@ -372,31 +386,128 @@ async def test_human_requested_review_is_not_enqueued_for_paused_workspace(
     result = json.loads(await runtime_workspace_request_strategist_review_action(
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        params={"reason": "What should we do next?"},
+        user_id="test-operator",
+        params={
+            "reason": "What should we do next?",
+            "_runtime_envelope_from_context": SimpleNamespace(profile="workspace_operator"),
+        },
     ))
 
-    assert result == {
-        "requested": False,
-        "blocked": True,
-        "reason": "workspace_inactive",
-        "workspace_id": workspace.id,
-        "workspace_status": "paused",
-        "next_step": (
-            "Tell the user the Strategist review did not start because the workspace "
-            "is paused. Do not claim that the review was requested or is running. "
-            "Ask them to start the workspace first, then request the review again."
-        ),
-    }
-    assert enqueued == []
+    assert result["requested"] is True
+    assert result["trigger_kind"] == "human_requested"
+    assert result["celery_task_id"] == "manual-paused-review"
+    assert len(enqueued) == 1
+    assert workspace.status == "paused"
+
+
+@pytest.mark.parametrize("model_reason", [None, "New work was requested"])
+async def test_chat_requested_review_preserves_current_release(
+    db_session, monkeypatch, model_reason,
+):
+    from packages.core import database
+    from packages.core.ai.runtime.workspace_task_actions import (
+        runtime_workspace_request_strategist_review_action,
+    )
+
+    workspace = await _seed_workspace(db_session)
+    await db_session.commit()
+    enqueued: list[dict] = []
+
+    class _FakeTask:
+        @staticmethod
+        def apply_async(*args, **kwargs):
+            enqueued.append(kwargs)
+            return SimpleNamespace(id="new-release-review")
+
+    @asynccontextmanager
+    async def _current_test_session():
+        yield db_session
+
+    monkeypatch.setattr(database, "async_session", _current_test_session)
+    monkeypatch.setattr(ai_tasks, "run_strategist_review", _FakeTask)
+
+    result = json.loads(await runtime_workspace_request_strategist_review_action(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        user_id="test-operator",
+        params={
+            "reason": model_reason,
+            "_active_user_message_from_context": (
+                "Prepare another single, release_id=sim-far-shore-letter; "
+                "do not reuse the first song's files."
+            ),
+            "_runtime_envelope_from_context": SimpleNamespace(profile="workspace_operator"),
+        },
+    ))
+
+    assert result["requested"] is True
+    assert "release_id=sim-far-shore-letter" in result["trigger_detail"]
+    assert "release_id=sim-far-shore-letter" in enqueued[0]["kwargs"]["trigger_detail"]
+
+
+@pytest.mark.parametrize("v2", [False, True])
+async def test_paused_manual_review_creates_proposal_without_auto_execution(
+    db_session, monkeypatch, v2,
+):
+    workspace = await _seed_workspace(db_session)
+    workspace.status = "paused"
+    workspace.heartbeat_enabled = False
+    await db_session.commit()
+    await set_workspace_test_approval(
+        db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        actor_id=workspace.entity_id, user_rules=[action_rule("workspace.proposal.task")],
+    )
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, v2)
+    llm_calls: list[int] = []
+    _install_llm(monkeypatch, llm_calls)
+    _quiet_side_effects(monkeypatch)
+
+    result = await _execute_strategist_review_cycle(
+        db_session, workspace.id, ReviewTriggerKind.HUMAN_REQUESTED,
+    )
+
+    assert not result.get("skipped")
+    assert len(llm_calls) == 1
+    assert result["auto_approved"] is False
+    tasks = (await db_session.execute(
+        select(Task).where(Task.workspace_id == workspace.id)
+    )).scalars().all()
+    assert len(tasks) == 1
+    assert tasks[0].status == "proposed"
+    assert workspace.status == "paused"
+
+
+@pytest.mark.parametrize("kind", [ReviewTriggerKind.SCHEDULED, ReviewTriggerKind.EVENT])
+async def test_paused_automatic_review_stops_before_model(db_session, monkeypatch, kind):
+    workspace = await _seed_workspace(db_session)
+    workspace.status = "paused"
+    await db_session.commit()
+    await _set_flag(db_session, True)
+    llm_calls: list[int] = []
+    _install_llm(monkeypatch, llm_calls)
+    result = await _execute_strategist_review_cycle(db_session, workspace.id, kind)
+    assert result["skipped"] is True
+    assert result["reason"] == "workspace_inactive"
+    assert llm_calls == []
 
 
 async def test_supersede_rejects_open_cohort_then_runs_the_review(
     db_session, monkeypatch,
 ):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from packages.core import database
     from packages.core.ai.runtime.workspace_task_actions import (
         runtime_workspace_request_strategist_review_action,
     )
 
+    # Keep independent committed reads without reusing connections from a
+    # different test's event loop through the production module-level pool.
+    monkeypatch.setattr(
+        database, "async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
     workspace = await _seed_workspace(db_session)
     await _emit(db_session, workspace)
     await _set_flag(db_session, True)
@@ -419,7 +530,11 @@ async def test_supersede_rejects_open_cohort_then_runs_the_review(
     first = json.loads(await runtime_workspace_request_strategist_review_action(
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        params={"reason": "New priorities from the owner."},
+        user_id="test-operator",
+        params={
+            "reason": "New priorities from the owner.",
+            "_runtime_envelope_from_context": SimpleNamespace(profile="workspace_operator"),
+        },
     ))
     assert first["requested"] is False
     assert first["needs_decision"] is True
@@ -431,7 +546,11 @@ async def test_supersede_rejects_open_cohort_then_runs_the_review(
     second = json.loads(await runtime_workspace_request_strategist_review_action(
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        params={"reason": "New priorities from the owner.", "supersede": True},
+        user_id="test-operator",
+        params={
+            "reason": "New priorities from the owner.", "supersede": True,
+            "_runtime_envelope_from_context": SimpleNamespace(profile="workspace_operator"),
+        },
     ))
     assert second["requested"] is True
     assert second["trigger_kind"] == ReviewTriggerKind.HUMAN_REQUESTED.value

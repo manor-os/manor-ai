@@ -2,7 +2,14 @@
 # Import all models so Alembic auto-detects them
 
 from packages.core.models.base import Base, generate_ulid, TimestampMixin, SoftDeleteMixin
-from packages.core.models.user import Entity, User, OAuthAccount, UserMembership
+from packages.core.models.browser_session import BrowserSession
+from packages.core.models.blueprint_upgrade import WorkspaceBlueprintUpgradeState
+from packages.core.models.user import (
+    Entity,
+    OAuthAccount,
+    User,
+    UserMembership,
+)
 from packages.core.models.workspace import (
     Workspace,
     WorkspaceStaff,
@@ -16,6 +23,9 @@ from packages.core.models.workspace import (
 from packages.core.models.task import (
     TaskCategory, Task, TaskLog, Conversation, Message,
 )
+from packages.core.models.chat_room import ChatRoom, ChatRoomMember, ChatRoomInvite, ChatRoomMessage, ChatRoomMessageReaction, ChatRoomFile, ChatRoomAgentBinding, ChatRoomAgentRun, ChatRoomToolApproval  # noqa: F401
+from packages.core.models.agent_delegation_session import AgentContextArchive, AgentDelegationSession
+from packages.core.models.conversation_transcript import ConversationTranscriptItem
 from packages.core.models.task_template import TaskTemplate
 from packages.core.models.document import DocumentGroup, Document, DocumentFolder, DocumentGroupMember, Integration, Channel
 from packages.core.models.document_version import DocumentVersion
@@ -26,6 +36,9 @@ from packages.core.models.notification import Notification, NotificationOutboxEv
 from packages.core.models.audit import AuditLog
 from packages.core.models.event import EventLog
 from packages.core.models.people import Client
+from packages.core.models.crm import ClientActivity, ClientOpportunity, ClientFollowup
+from packages.core.models.client_delivery import ClientContact, ClientWorkspaceDelivery
+from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
 from packages.core.models.metrics import MetricsDailyUsage, MetricsDailyToolCalls
 from packages.core.models.system_metrics import SystemMetricsSample
@@ -51,12 +64,19 @@ from packages.core.models.automation_revision import AutomationRevision
 from packages.core.models.experiment import Experiment
 from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
 from packages.core.models.workspace_stat import WorkspaceStat, WorkspaceStatObservation
+from packages.core.models.agent_initiative import (
+    AgentInitiative,
+    AgentInitiativeDelivery,
+    AgentInitiativeRun,
+    AgentInitiativeState,
+)
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun, AgentExecution
 from packages.core.models.product_growth import ProductGrowthEvent
 from packages.core.models.webhook import WebhookEndpoint, WebhookDelivery
 from packages.core.models.api_key import ApiKey
 from packages.core.models.conversation_share import ConversationShare
 from packages.core.models.site import Site, SiteEvent
+from packages.core.models.code_project import CodeProject
 from packages.core.models.chat_feedback import ChatMessageFeedback
 from packages.core.models.skill import Skill, AgentSkillBinding
 from packages.core.models.custom_field import CustomFieldDefinition
@@ -98,12 +118,6 @@ from packages.core.models.blueprint import (
     BlueprintFavorite,
     WorkspaceBlueprint,
 )
-from packages.core.models.merchant import MerchantAccount
-from packages.core.models.blueprint_purchase import (
-    BlueprintCheckoutAttempt,
-    BlueprintCheckoutRefund,
-    BlueprintPurchase,
-)
 from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
 from packages.core.models.workspace_draft import WorkspaceDraft
 from packages.core.models.nango_webhook_event import NangoWebhookEvent
@@ -117,6 +131,7 @@ from packages.core.models.platform_announcement import (
 from packages.core.models.support_ticket import SupportMessage, SupportTicket
 from packages.core.models.invitation_code import InvitationCode, InvitationCodeRedemption
 from packages.core.models.media_job import MediaJob
+from packages.core.models.apify_collection import ApifyCollection
 from packages.core.models.waiting_list import WaitingListEntry
 from packages.core.models.model_provider import PlatformModelProviderKey
 from packages.core.models.platform_setting import PlatformSetting
@@ -141,24 +156,35 @@ from packages.core.models.runtime_run import (
     RuntimeRun,
     RuntimeRunStatus,
     SandboxInstance,
+    SandboxRequesterKind,
     SandboxReservation,
     SandboxReservationStatus,
     SandboxRunner,
     SandboxRunnerStatus,
 )
+from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
+from packages.core.models.task_plan_submission import (
+    TaskPlanSubmission,
+    TaskPlanSubmissionKind,
+    TaskPlanSubmissionState,
+)
 
 __all__ = [
     "Base", "generate_ulid", "TimestampMixin", "SoftDeleteMixin",
+    "WorkspaceBlueprintUpgradeState",
     "Entity", "User", "OAuthAccount", "UserMembership",
     "Workspace", "WorkspaceStaff", "Agent", "AgentSubscription", "ToolDefinition", "AgentToolBinding",
     "WorkspaceOperationDraft", "WorkspaceWorkBatch",
     "TaskCategory", "Task", "TaskLog", "Conversation", "Message",
+    "AgentContextArchive", "AgentDelegationSession",
+    "ConversationTranscriptItem",
     "TaskTemplate",
     "DocumentGroup", "Document", "DocumentFolder", "DocumentGroupMember", "DocumentVersion", "Integration", "Channel",
     "Notification", "NotificationOutboxEvent",
     "AuditLog",
     "EventLog",
-    "Client",
+    "Client", "ClientActivity", "ClientOpportunity", "ClientFollowup",
+    "ClientContact", "ClientWorkspaceDelivery", "WorkspaceCollaboration", "WorkspaceCollaborationEntry",
     "TokenUsageLog", "ToolCallLog", "UserSessionLog", "UserSessionLease", "UserPageViewLog",
     "MetricsDailyUsage", "MetricsDailyToolCalls",
     "SystemMetricsSample",
@@ -173,12 +199,14 @@ __all__ = [
     "Experiment",
     "ParticipantProfile", "HumanCommitment", "HumanContribution",
     "Goal", "GoalMeasurement", "GoalTaskLink", "WorkspaceStat", "WorkspaceStatObservation",
+    "AgentInitiative", "AgentInitiativeState", "AgentInitiativeRun",
+    "AgentInitiativeDelivery",
     "ScheduledJob", "ScheduledJobRun", "AgentExecution", "ProductGrowthEvent",
     "WebhookEndpoint", "WebhookDelivery",
     "ApiKey",
     "ConversationShare",
     "ChatMessageFeedback",
-    "Site", "SiteEvent",
+    "Site", "SiteEvent", "CodeProject",
     "Skill",
     "CustomFieldDefinition",
     "AgentMemory",
@@ -203,8 +231,6 @@ __all__ = [
     "GovernancePolicy", "GovernanceRevision",
     "ChannelPairingCode",
     "WorkspaceBlueprint", "BlueprintFavorite",
-    "MerchantAccount",
-    "BlueprintPurchase", "BlueprintCheckoutAttempt", "BlueprintCheckoutRefund",
     "WorkspaceDraft",
     "NangoWebhookEvent",
     "CLIToolSpec", "BrowserToolSpec",
@@ -216,6 +242,7 @@ __all__ = [
     "SupportTicket",
     "InvitationCode", "InvitationCodeRedemption",
     "MediaJob",
+    "ApifyCollection",
     "WaitingListEntry",
     "PlatformModelProviderKey",
     "PlatformSetting",
@@ -226,7 +253,17 @@ __all__ = [
     "GrantStatus", "PendingStatus",
     "OAuthClientApp", "OAuthAuthorizationCode",
     "ClientErrorEvent",
+    "WebchatResidentBinding",
+    "ResidentCreateGrant", "ResidentMaintenanceDraft",
     "ToolIntentPath",
-    "RuntimeRun", "RuntimeRunStatus", "SandboxReservation", "SandboxReservationStatus",
+    "RuntimeRun", "RuntimeRunStatus", "RuntimeFileCommit", "SandboxReservation", "SandboxReservationStatus",
+    "SandboxRequesterKind",
     "SandboxRunner", "SandboxRunnerStatus", "SandboxInstance", "RuntimeOutboxEvent",
+    "TaskCoordinatorPhase", "TaskCoordinatorRun",
+    "TaskPlanSubmission", "TaskPlanSubmissionKind", "TaskPlanSubmissionState",
 ]
+
+from packages.core.models.webchat_resident import WebchatResidentBinding
+from packages.core.models.runtime_file_commit import RuntimeFileCommit
+
+from packages.core.models.webchat_resident_create import ResidentCreateGrant, ResidentMaintenanceDraft

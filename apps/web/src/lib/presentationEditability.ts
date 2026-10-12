@@ -20,6 +20,26 @@ export interface PresentationSlideEditability {
   flattenedImageShapeId: string | null;
 }
 
+/**
+ * Single editability predicate for native presentation objects. Objects that
+ * come from a slide layout/master, or group members the patcher cannot
+ * rewrite, carry `source.editable === false`: they can be selected and
+ * copied, but never moved, resized, restyled, re-ordered, retyped or deleted.
+ * Objects without a source are new and always editable.
+ */
+export function presentationShapeIsEditable(
+  shape: { source?: { editable: boolean } } | null | undefined,
+): boolean {
+  if (!shape) return false;
+  return !shape.source || shape.source.editable;
+}
+
+export function presentationShapeIsLocked(
+  shape: { source?: { editable: boolean } } | null | undefined,
+): boolean {
+  return Boolean(shape) && !presentationShapeIsEditable(shape);
+}
+
 export function presentationShapesForDuplicateSlide<T extends { source?: { part?: string } }>(
   shapes: T[],
   sourcePart?: string,
@@ -36,8 +56,8 @@ export function presentationShapesForDuplicateSlide<T extends { source?: { part?
 export function presentationSlideEditability(
   shapes: PresentationEditabilityShape[],
 ): PresentationSlideEditability {
-  const editableShapes = shapes.filter((shape) => !shape.source || shape.source.editable);
-  const lockedShapeCount = shapes.filter((shape) => shape.source && !shape.source.editable).length;
+  const editableShapes = shapes.filter(presentationShapeIsEditable);
+  const lockedShapeCount = shapes.filter(presentationShapeIsLocked).length;
   const editableTextCount = editableShapes.filter((shape) =>
     shape.texts?.some((paragraph) => Boolean(paragraph.text?.trim())),
   ).length;

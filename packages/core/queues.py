@@ -43,7 +43,13 @@ class CeleryQueue(str, Enum):
 
     CONTROL = "celery"
     INTERACTIVE = "interactive"
+    ROOM_AGENTS = "room-agents"
     HEAVY = "heavy"
+    # Host/container monitoring. Its walks call Docker once per running
+    # container, so a 30 s tick takes seconds on a busy host; on the control
+    # pool that held a slot the millisecond ticks needed, on the heavy pool it
+    # sat behind minute-long agent work. Its own queue keeps it off both.
+    OPS = "ops"
     # Settlement payloads are a versioned wire contract. Keeping them on a
     # queue introduced with their consumer prevents an old rolling-deploy
     # worker from accepting a message whose fencing semantics it does not know.
@@ -94,12 +100,15 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "scheduler.skill_generation_sweep": CeleryQueue.CONTROL,
     "workflow.resume_sweep": CeleryQueue.CONTROL,
     "workflow.terminal_effect_sweep": CeleryQueue.CONTROL,
+    "workflow.recover_expired_claims": CeleryQueue.CONTROL,
     "scheduler.project_scheduled_agent_result": CeleryQueue.CONTROL,
     "scheduler.recover_prepared_dispatch": CeleryQueue.CONTROL,
     "scheduler.settle_scheduled_agent_run": CeleryQueue.RECOVERY_V2,
     "scheduler.settle_scheduled_run": CeleryQueue.RECOVERY_V2,
     "agent.recover_claim_loss_v2": CeleryQueue.RECOVERY_V2,
     "agent.recover_claim_loss_sweep_v2": CeleryQueue.RECOVERY_V2,
+    "agent_initiative.deliver": CeleryQueue.RECOVERY_V2,
+    "agent_initiative.delivery_sweep": CeleryQueue.CONTROL,
     "oauth.refresh_tick": CeleryQueue.CONTROL,
     "notification.dispatch_due": CeleryQueue.CONTROL,
     "monitor.heartbeat_check": CeleryQueue.CONTROL,
@@ -107,15 +116,29 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "monitor.sla_breach_check": CeleryQueue.CONTROL,
     "monitor.workspace_readiness_check": CeleryQueue.CONTROL,
     "experiments.guardrail_tick": CeleryQueue.CONTROL,
-    "ops.collect_snapshot": CeleryQueue.CONTROL,
-    "ops.alert_tick": CeleryQueue.CONTROL,
-    "ops.log_scan": CeleryQueue.CONTROL,
-    "ops.send_digest": CeleryQueue.CONTROL,
+    # Monitoring lives on its own queue (see ``CeleryQueue.OPS``): the
+    # snapshot and log scan walk Docker once per running container, which is
+    # bounded (OPS_SNAPSHOT_BUDGET_SECONDS, single-flight) but still seconds
+    # per tick — long enough to starve the 1-2 s control ticks sharing a
+    # two-slot pool, and too frequent to sit behind heavy agent work.
+    "ops.collect_snapshot": CeleryQueue.OPS,
+    "ops.alert_tick": CeleryQueue.OPS,
+    "ops.log_scan": CeleryQueue.OPS,
+    "ops.send_digest": CeleryQueue.OPS,
     "runtime.sandbox_scheduler": CeleryQueue.CONTROL,
     "runtime.outbox_dispatch": CeleryQueue.CONTROL,
+    "runtime.plan_cycle_recovery": CeleryQueue.CONTROL,
+    "runtime.task_coordinator_recovery": CeleryQueue.CONTROL,
+    "runtime.dispatch_task_execution": CeleryQueue.CONTROL,
+    "runtime.dispatch_task_coordinator": CeleryQueue.CONTROL,
+    "runtime.run_task_coordinator": CeleryQueue.HEAVY,
+    "runtime.run_task_agent_loop": CeleryQueue.HEAVY,
+    "runtime.dispatch_plan_cycle": CeleryQueue.CONTROL,
     "runtime.allocate_sandbox": CeleryQueue.INTERACTIVE,
     "runtime.execute_run": CeleryQueue.INTERACTIVE,
     "runtime.resume_run": CeleryQueue.INTERACTIVE,
+    "room_agent.execute": CeleryQueue.ROOM_AGENTS,
+    "room_agent.recover_pending": CeleryQueue.CONTROL,
 
     # ── heavy: unbounded duration, user-visible execution ────────────
     "packages.core.tasks.ai_tasks.execute_lease": CeleryQueue.HEAVY,
@@ -139,7 +162,9 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "embeddings.sweep_pending": CeleryQueue.HEAVY,
     "media.cleanup_media_references": CeleryQueue.HEAVY,
     "media.process_video_job": CeleryQueue.HEAVY,
+    "media.process_suno_audio_job": CeleryQueue.HEAVY,
     "media.recover_stale_jobs": CeleryQueue.HEAVY,
+    "apify.reconcile_collections": CeleryQueue.HEAVY,
     # Channel replies are user-facing and must remain available while a
     # long-running plan occupies the heavy worker.
     "channel.dispatch_inbound": CeleryQueue.INTERACTIVE,
@@ -158,6 +183,8 @@ TASK_QUEUES: dict[str, CeleryQueue] = {
     "calendar.reconcile_booking_metadata": CeleryQueue.HEAVY,
     "maintenance.cleanup_ai_edit_sessions": CeleryQueue.HEAVY,
     "maintenance.cleanup_chat_uploads": CeleryQueue.HEAVY,
+    "maintenance.cleanup_document_upload_recovery": CeleryQueue.HEAVY,
+    "maintenance.recover_runtime_file_commits": CeleryQueue.HEAVY,
     "maintenance.repair_missing_document_files": CeleryQueue.HEAVY,
     "maintenance.sync_openrouter_pricing": CeleryQueue.HEAVY,
     "ops.purge_soft_deleted_users": CeleryQueue.HEAVY,

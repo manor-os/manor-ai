@@ -1,16 +1,19 @@
 /**
- * ToolCallList — shared tool call rendering for all chat components.
+ * ToolCallList — fallback process card when assistant_blocks are missing.
  *
- * Shows the latest 3 tools by default; older tools are collapsed behind
- * a "Show N more" button. Each tool result can be expanded/collapsed.
+ * Collapsed by default after a run ends. First expand shows grouped human
+ * steps; raw results stay behind a second click on a single step.
  */
 import { useEffect, useMemo, useState } from "react";
 import {
   formatPublicToolResult,
-  WRAPPER_TOOLS,
   type SubAgentEvent,
   type ToolCall,
 } from "../../lib/chatStream";
+import { groupConsecutiveByKey } from "../../lib/assistantProcessFlow";
+import { isWebsiteAccessDenied, websiteAccessDeniedSource } from "../../lib/websiteAccessDenied";
+import { summarizeToolActivity } from "../../lib/toolActivitySummary";
+import { formatProcessDuration, useLiveProcessClock } from "../../lib/assistantProcessPresentation";
 import { resolveDisplayMediaUrl } from "../../lib/api";
 import {
   AudioGenerationStatus,
@@ -19,7 +22,7 @@ import {
 import { t } from "../../lib/i18n";
 import { matchSubAgentRuns } from "../../lib/subAgentDisplay";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
-import { parseMcpToolName, processSurfaceSummary, runtimeToolBadge } from "../../lib/toolRuntimeSurface";
+import { parseMcpToolName } from "../../lib/toolRuntimeSurface";
 import AgentLoopStep from "./AgentLoopStep";
 import VideoCard from "./VideoCard";
 
@@ -91,11 +94,12 @@ interface ToolCallListProps {
   variant?: "inline" | "class";
   /** Whether to compact completed tools */
   compactCompleted?: boolean;
-  /** Workspace chat: collapse the whole list to one quiet line of friendly
-   *  tool names — no arguments, results, or expanders. */
-  minimal?: boolean;
+  /** Simple chat still shows the quiet process card; media stays visible when collapsed. */
+  hideDetails?: boolean;
   /** Delegated Agent runs rendered in place of their workspace_agent step. */
   subAgentRuns?: SubAgentEvent[];
+  /** Live chat turn: keep the quiet card on Processing even between tools. */
+  streaming?: boolean;
 }
 
 function parseToolResult(result?: unknown): Record<string, any> | null {
@@ -128,42 +132,16 @@ function formatToolName(name?: string) {
   return formatUserFacingLabel(name || "tool");
 }
 
-function compactText(value: unknown, maxLength = 96) {
-  const text = formatUserFacingStructuredText(value)
-    .replace(/\s+/g, " ")
-    .trim();
-  if (!text) return "";
-  if (text.length <= maxLength) return text;
-  return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
-}
-
-function pathBasename(value: unknown) {
-  const text = String(value || "").trim();
-  if (!text) return "";
-  const normalized = text.replace(/\\/g, "/");
-  return normalized.split("/").filter(Boolean).pop() || text;
-}
-
-function countInputList(value: unknown) {
-  if (Array.isArray(value)) return value.length;
-  if (typeof value === "string" && value.trim()) {
-    try {
-      const parsed = JSON.parse(value);
-      if (Array.isArray(parsed)) return parsed.length;
-    } catch {
-      return value
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean).length;
-    }
-  }
-  return 0;
-}
-
 // ULID format: 26 chars, Crockford base32 (no I, L, O, U).
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 
 function displayToolName(tc: ToolCall) {
+  if (isWebsiteAccessDenied(tc)) {
+    const source = websiteAccessDeniedSource(tc);
+    return source
+      ? t("component.assistant_message_blocks.website_access_denied_source", { source })
+      : t("component.assistant_message_blocks.website_access_denied");
+  }
   if (tc.name && AI_EDIT_TOOL_LABELS[tc.name]) {
     return AI_EDIT_TOOL_LABELS[tc.name];
   }
@@ -185,142 +163,6 @@ function displayToolName(tc: ToolCall) {
     return `${formatToolName(parsedMcp.serverKey)}: ${formatToolName(parsedMcp.actionKey)}`;
   }
   return formatToolName(tc.name);
-}
-
-function displayToolInput(tc: ToolCall) {
-  const args = parseToolArguments(tc.arguments ?? tc.args);
-  if (!args) return "";
-
-  if (tc.name && AI_EDIT_TOOL_LABELS[tc.name]) {
-    const result = parseToolResult(tc.result);
-    const target = args.file ? pathBasename(args.file) : "";
-    const detail =
-      result?.error ||
-      result?.changes ||
-      result?.patch ||
-      result?.stage ||
-      args.stage ||
-      args.request ||
-      args.summary;
-    return [target, detail ? compactText(detail, 88) : ""]
-      .filter(Boolean)
-      .join(" · ");
-  }
-
-  if (tc.name === "generate_file") {
-    const kind = String(args.kind || "file");
-    const params =
-      args.params && typeof args.params === "object"
-        ? (args.params as Record<string, any>)
-        : {};
-    const name =
-      args.name ||
-      args.path ||
-      args.output_name ||
-      args.filename ||
-      params.name ||
-      params.path ||
-      params.output_name ||
-      params.filename;
-    const label = name ? `${kind}: ${pathBasename(name)}` : kind;
-    return label;
-  }
-
-  if (tc.name === "publish_site") {
-    const name = args.name || args.path;
-    return name ? compactText(String(name), 80) : "";
-  }
-
-  if (tc.name === "manor") {
-    const action = String(args.action || "action");
-    const params =
-      args.params && typeof args.params === "object"
-        ? (args.params as Record<string, any>)
-        : {};
-    const target =
-      params.name ||
-      params.folder_name ||
-      params.folder_path ||
-      params.path ||
-      params.query;
-    return target ? `${action}: ${compactText(target, 80)}` : action;
-  }
-
-  if (tc.name === "wait_media_jobs") {
-    const jobs = countInputList(args.job_ids);
-    const interval = args.poll_interval_seconds;
-    const timeout = args.timeout_seconds;
-    const bits = [`${jobs || "media"} job${jobs === 1 ? "" : "s"}`];
-    if (interval) bits.push(`every ${interval}s`);
-    if (timeout) bits.push(`timeout ${timeout}s`);
-    return bits.join(" · ");
-  }
-
-  if (tc.name === "merge_videos") {
-    const output = args.output_name || args.name || args.path;
-    const inputCount =
-      countInputList(args.job_ids) ||
-      countInputList(args.document_ids) ||
-      countInputList(args.paths);
-    const bits = [];
-    if (inputCount) bits.push(`${inputCount} clips`);
-    if (output) bits.push(pathBasename(output));
-    return bits.join(" → ");
-  }
-
-  if (tc.name === "invoke_skill") {
-    // displayToolName already renders the skill label (e.g. "paper-writing skill"),
-    // so the input subtitle should only show the user input — not repeat the
-    // skill name (which produced "<id> Skill - <id>" duplication when the
-    // backend passed a raw ULID as the skill argument).
-    const input = args.input ? compactText(args.input, 96) : "";
-    return input;
-  }
-
-  const parsedMcp = parseMcpToolName(tc.name);
-  if (parsedMcp) {
-    const target =
-      args.summary ||
-      args.title ||
-      args.name ||
-      args.guest_email ||
-      args.guest_name ||
-      args.email ||
-      args.query ||
-      args.calendar_id ||
-      args.booking_link_slug ||
-      args.path;
-    return target ? compactText(target, 96) : "";
-  }
-
-  const target =
-    args.name ||
-    args.path ||
-    args.output_name ||
-    args.filename ||
-    args.query ||
-    args.action;
-  return target ? compactText(target, 96) : "";
-}
-
-function wrapperProgressText(tc: ToolCall, status: string) {
-  if (status !== "pending" || !WRAPPER_TOOLS.has(tc.name)) return "";
-
-  const activeChild = tc.activeChild || "";
-  const lastChild = !activeChild ? tc.lastChild || "" : "";
-  const completed = tc.completedChildCount || 0;
-  const started = tc.childCount || 0;
-  const parts: string[] = [];
-
-  if (activeChild) {
-    parts.push(`running ${formatToolName(activeChild)}`);
-  } else if (lastChild) {
-    parts.push(`last ${formatToolName(lastChild)}`);
-  }
-  if (started > 0) {
-    parts.push(`${completed}/${started} internal steps`);
-  }
-  return parts.join(" · ");
 }
 
 function recoverPartialToolResult(result: string): Record<string, any> | null {
@@ -397,8 +239,8 @@ export default function ToolCallList(props: ToolCallListProps) {
     keyPrefix,
     variant = "class",
     subAgentRuns = [],
+    streaming = false,
   } = props;
-  const shouldCompactCompleted = props.compactCompleted ?? true;
   const [expandedResults, setExpandedResults] = useState<
     Record<string, boolean>
   >({});
@@ -410,67 +252,58 @@ export default function ToolCallList(props: ToolCallListProps) {
     [displayTools, subAgentRuns],
   );
 
-  const hasError = displayTools.some((tc) => tc.status === "error");
+  const hasError = displayTools.some((tc) => tc.status === "error" && !isWebsiteAccessDenied(tc));
+  const hasUnavailable = displayTools.some(isWebsiteAccessDenied);
   const hasRunning = displayTools.some(
     (tc) => (tc.status || (tc.result ? "success" : "pending")) === "pending",
   );
+  const isLiveTurn = streaming;
+  const hasUnsettledHistory = hasRunning && !isLiveTurn;
   const durationSeconds = displayTools.reduce((sum, tc) => {
     const text = String(tc.duration || "");
     const value = Number(text.replace(/s$/, ""));
     return Number.isFinite(value) ? sum + value : sum;
   }, 0);
-  const [processExpanded, setProcessExpanded] = useState(
-    !shouldCompactCompleted || hasRunning || hasError,
-  );
+  const elapsedMs = useLiveProcessClock({
+    live: isLiveTurn,
+    serverDurationMs: durationSeconds * 1000,
+  });
+  const [processExpanded, setProcessExpanded] = useState(false);
   const useInline = variant === "inline";
 
-  useEffect(() => {
-    setProcessExpanded(!shouldCompactCompleted || hasRunning || hasError);
-  }, [hasRunning, hasError, shouldCompactCompleted]);
-
   if (displayTools.length === 0) return null;
-
-  if (props.minimal && subAgentRunByTool.size === 0) {
-    const names = Array.from(
-      new Set(displayTools.map((tc) => `${runtimeToolBadge(tc.name).compactLabel}: ${displayToolName(tc)}`)),
-    ).filter(Boolean);
-    const shown = names.slice(0, 4);
-    const label =
-      shown.join(", ") +
-      (names.length > shown.length ? ` +${names.length - shown.length}` : "");
-    return (
-      <div className="ws-activity-line-row">
-        <span className="ws-activity-line">
-          <span className="ws-activity-line-glyph" aria-hidden>
-            ▸
-          </span>
-          <span className="ws-activity-line-text">{label}</span>
-        </span>
-      </div>
-    );
-  }
 
   const toggleResult = (key: string) => {
     setExpandedResults((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
-  const processStatus = hasRunning ? "pending" : hasError ? "error" : "success";
-  const processTitle = hasRunning
-    ? "Processing"
+  const processStatus = isLiveTurn ? "pending" : hasError ? "error" : hasUnsettledHistory ? "unverified" : hasUnavailable ? "unavailable" : "success";
+  const processTitle = isLiveTurn
+    ? t("component.assistant_message_blocks.processing")
     : hasError
-      ? "Process completed with issues"
-      : "Process completed";
-  const durationLabel = durationSeconds > 0 ? ` · ${durationSeconds.toFixed(1)}s` : "";
-  const surfaceSummary =
-    subAgentRunByTool.size > 0
-      ? ""
-      : processSurfaceSummary(displayTools.map((tool) => tool.name));
-  const surfaceLabel = surfaceSummary ? ` · ${surfaceSummary}` : "";
-  const processLabel = `${processTitle} · ${displayTools.length} step${displayTools.length === 1 ? "" : "s"}${surfaceLabel}${durationLabel}`;
+      ? t("component.assistant_message_blocks.process_error")
+      : hasUnsettledHistory
+        ? t("component.assistant_message_blocks.process_status_pending")
+        : t("component.assistant_message_blocks.processed");
+  const durationLabel = formatProcessDuration(elapsedMs);
+  const activityLabel = summarizeToolActivity(displayTools.map((tool) => ({
+    ...tool, status: isWebsiteAccessDenied(tool) ? "unavailable" : tool.status, label: displayToolName(tool),
+  })));
+  const processLabel = `${activityLabel} · ${processTitle}${durationLabel ? ` · ${durationLabel}` : ""}`;
+  const toolGroups = groupConsecutiveByKey(displayTools, (tc, index) => {
+    if (subAgentRunByTool.get(index)) return null;
+    if (tc.status === "error" || tc.status === "unverified") return null;
+    return displayToolName(tc) || null;
+  });
+
+  const collapsedArtifacts = displayTools.map((tool, index) => {
+    return <MediaPreview key={`${keyPrefix}-media-${index}`} tc={tool} />;
+  });
 
   return (
     <div
       className={useInline ? undefined : "chat-tool-calls chat-process-block"}
+      role={hasError ? "alert" : undefined}
       style={
         useInline
           ? {
@@ -488,8 +321,9 @@ export default function ToolCallList(props: ToolCallListProps) {
       }
     >
       <button
-        className={useInline ? undefined : "chat-process-header"}
+        className={`assistant-tool-activity-toggle${useInline ? "" : " chat-process-header"}`}
         onClick={() => setProcessExpanded((value) => !value)}
+        aria-expanded={processExpanded}
         type="button"
         style={
           useInline
@@ -500,7 +334,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                 width: "100%",
                 border: "none",
                 background: "transparent",
-                color: hasRunning ? "#4f7d75" : hasError ? "#d65f59" : "#78716c",
+                color: isLiveTurn ? "#4f7d75" : hasError ? "#d65f59" : "#78716c",
                 cursor: "pointer",
                 fontSize: 11,
                 fontWeight: 650,
@@ -517,6 +351,8 @@ export default function ToolCallList(props: ToolCallListProps) {
         <ChevronIcon expanded={processExpanded} />
       </button>
 
+      {!processExpanded && collapsedArtifacts}
+
       {processExpanded && (
         <div
           className={useInline ? undefined : "chat-process-steps"}
@@ -527,22 +363,32 @@ export default function ToolCallList(props: ToolCallListProps) {
             padding: useInline ? "0 4px 4px" : undefined,
           }}
         >
-          {displayTools.map((tc, j) => {
+          {toolGroups.map((group) => {
+            const j = group.startIndex;
+            const tc = group.items[0];
             const key = `${keyPrefix}-${j}`;
+            const grouped = group.items.length > 1;
             const subAgentRun = subAgentRunByTool.get(j);
-            const resultText = formatPublicToolResult(tc.result);
-            const displayResultText = resultText ? formatUserFacingStructuredText(resultText) : "";
-            const status = tc.status || (resultText ? "success" : "pending");
-            const isExpanded = expandedResults[key];
+            const resultText = grouped ? "" : formatPublicToolResult(tc.result);
+            const displayResultText = resultText && !isWebsiteAccessDenied(tc) ? formatUserFacingStructuredText(resultText) : "";
+            const status = isWebsiteAccessDenied(tc) ? "unavailable" : group.items.some((item) => (item.status || (item.result ? "success" : "pending")) === "pending")
+              ? (isLiveTurn ? "pending" : "unverified")
+              : (tc.status || (resultText ? "success" : "pending"));
+            const canInspect = Boolean(displayResultText) && !grouped;
+            const isExpanded = Boolean(canInspect && expandedResults[key]);
             const label = displayToolName(tc);
-            const inputDetail = displayToolInput(tc);
-            const progress = wrapperProgressText(tc, status);
-            const badge = runtimeToolBadge(tc.name);
+            const repeatLabel = grouped
+              ? t("component.assistant_message_blocks.repeated_attempts", { count: group.items.length })
+              : "";
 
             if (subAgentRun) {
-              return <AgentLoopStep key={key} run={subAgentRun} />;
+              return <AgentLoopStep key={key} run={subAgentRun} live={isLiveTurn} />;
             }
 
+
+            const media = group.items.map((item, itemIndex) => (
+              <MediaPreview key={`${key}-media-${itemIndex}`} tc={item} />
+            ));
 
             if (useInline) {
               return (
@@ -557,20 +403,19 @@ export default function ToolCallList(props: ToolCallListProps) {
                   }}
                 >
                   <div
-                    onClick={() => displayResultText && toggleResult(key)}
+                    onClick={() => canInspect && toggleResult(key)}
                     style={{
                       display: "flex",
                       alignItems: "center",
                       gap: 6,
                       padding: "5px 8px",
-                      cursor: displayResultText ? "pointer" : "default",
+                      cursor: canInspect ? "pointer" : "default",
                       fontSize: 11,
                       fontWeight: 600,
                       color: "#57534e",
                     }}
                   >
                     <StatusIcon status={status} />
-                    <RuntimeSurfaceBadge badge={badge} compact />
                     <span
                       style={{
                         flex: 1,
@@ -580,29 +425,20 @@ export default function ToolCallList(props: ToolCallListProps) {
                       }}
                     >
                       {label}
-                      {progress && (
-                        <span style={{ color: "#a8a29e", fontWeight: 500 }}>
-                          {" · "}
-                          {progress}
-                        </span>
-                      )}
-                      {inputDetail && (
-                        <span style={{ color: "#78716c", fontWeight: 500 }}>
-                          {" · "}
-                          {inputDetail}
-                        </span>
+                      {repeatLabel && (
+                        <span className="chat-tool-entry-repeat">{repeatLabel}</span>
                       )}
                     </span>
-                    {tc.duration && (
+                    {!grouped && tc.duration && (
                       <span
                         style={{ fontSize: 10, color: "#a8a29e", fontWeight: 500 }}
                       >
                         {tc.duration}
                       </span>
                     )}
-                    {displayResultText && <ChevronIcon expanded={isExpanded} />}
+                    {canInspect && <ChevronIcon expanded={isExpanded} />}
                   </div>
-                  <MediaPreview tc={tc} />
+                  {media}
                   {isExpanded && displayResultText && (
                     <div
                       style={{
@@ -637,30 +473,20 @@ export default function ToolCallList(props: ToolCallListProps) {
               >
                 <div
                   className="chat-tool-entry-header"
-                  onClick={() => displayResultText && toggleResult(key)}
-                  style={{ cursor: displayResultText ? "pointer" : "default" }}
+                  onClick={() => canInspect && toggleResult(key)}
+                  style={{ cursor: canInspect ? "pointer" : "default" }}
                 >
                   <StatusIcon status={status} />
-                  <RuntimeSurfaceBadge badge={badge} />
                   <span className="chat-tool-entry-name">
                     {label}
-                    {progress && (
-                      <span style={{ color: "#a8a29e", fontWeight: 500 }}>
-                        {" · "}
-                        {progress}
-                      </span>
-                    )}
-                    {inputDetail && (
-                      <span style={{ color: "#78716c", fontWeight: 500 }}>
-                        {" · "}
-                        {inputDetail}
-                      </span>
+                    {repeatLabel && (
+                      <span className="chat-tool-entry-repeat">{repeatLabel}</span>
                     )}
                   </span>
-                  {tc.duration && (
+                  {!grouped && tc.duration && (
                     <span className="chat-tool-entry-duration">{tc.duration}</span>
                   )}
-                  {displayResultText && (
+                  {canInspect && (
                     <svg
                       className={`chat-tool-entry-chevron${isExpanded ? " expanded" : ""}`}
                       width="12"
@@ -674,7 +500,7 @@ export default function ToolCallList(props: ToolCallListProps) {
                     </svg>
                   )}
                 </div>
-                <MediaPreview tc={tc} />
+                {media}
                 {isExpanded && displayResultText && (
                   <div className="chat-tool-entry-result">
                     <pre>{displayResultText}</pre>
@@ -691,38 +517,14 @@ export default function ToolCallList(props: ToolCallListProps) {
 
 /* ── Small helpers ── */
 
-function RuntimeSurfaceBadge({
-  badge,
-  compact,
-}: {
-  badge: { label: string; bg: string; color: string; border: string };
-  compact?: boolean;
-}) {
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        flexShrink: 0,
-        height: compact ? 16 : 18,
-        borderRadius: 4,
-        border: `1px solid ${badge.border}`,
-        background: badge.bg,
-        color: badge.color,
-        fontSize: compact ? 9 : 10,
-        fontWeight: 700,
-        lineHeight: 1,
-        padding: compact ? "0 4px" : "0 5px",
-        whiteSpace: "nowrap",
-      }}
-    >
-      {badge.label}
-    </span>
-  );
-}
-
 function StatusIcon({ status }: { status: string }) {
   if (status === "pending") return <span className="chat-tool-spinner" />;
+  if (status === "unavailable") return <span className="assistant-process-step-icon assistant-process-step-icon--unavailable" aria-hidden="true" />;
+  if (status === "unverified") return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="12" cy="12" r="9" strokeDasharray="3 3" />
+    </svg>
+  );
   if (status === "error")
     return (
       <svg
@@ -764,11 +566,11 @@ function ChevronIcon({ expanded }: { expanded?: boolean }) {
       stroke="#a8a29e"
       strokeWidth="2"
       style={{
-        transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+        transform: expanded ? "rotate(90deg)" : "rotate(0deg)",
         transition: "transform 0.15s",
       }}
     >
-      <polyline points="6 9 12 15 18 9" />
+      <polyline points="9 5 16 12 9 19" />
     </svg>
   );
 }

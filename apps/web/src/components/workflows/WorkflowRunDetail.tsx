@@ -4,6 +4,10 @@ import { api, translateApiError } from "../../lib/api";
 import { formatDateLong } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
+import {
+  ACTIVE_WORKFLOW_FAMILY_POLL_MS,
+  ACTIVE_WORKFLOW_RUN_POLL_MS,
+} from "../../lib/workspaceLiveRefresh";
 import InlineFileReferenceCard from "../InlineFileReferenceCard";
 import {
   IconArrowLeft,
@@ -20,6 +24,7 @@ import LoadingSpinner from "../ui/LoadingSpinner";
 import MediaPreview from "./MediaPreview";
 import PublicationReceiptCards from "./PublicationReceiptCards";
 import WorkflowRunIntervention from "./WorkflowRunIntervention";
+import WorkflowRunResumeControl from "./WorkflowRunResumeControl";
 import {
   buildWorkflowSnapshotNodes,
   buildWorkflowRunTimeline,
@@ -73,6 +78,10 @@ const RUN_STATUSES = new Set<WorkflowRunStatus>([
   "skipped",
   "cancelled",
 ]);
+
+function nonEmptyString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
 
 function runStatus(value: unknown): WorkflowRunStatus {
   const normalized = typeof value === "string" ? value.toLowerCase() : "pending";
@@ -291,8 +300,8 @@ function WorkflowChildRunDetail({ childRunId }: { childRunId: string }) {
   const childQuery = useQuery({
     queryKey: ["workflow-run-history-child", childRunId],
     queryFn: () => api.workflows.getRun(childRunId),
-    refetchInterval: (query) => runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? 1_000 : false,
-    refetchIntervalInBackground: true,
+    refetchInterval: (query) => runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? ACTIVE_WORKFLOW_RUN_POLL_MS : false,
+    refetchIntervalInBackground: false,
   });
 
   if (childQuery.isLoading) {
@@ -426,14 +435,15 @@ export default function WorkflowRunDetail({
 }: WorkflowRunDetailProps) {
   const queryClient = useQueryClient();
   const headingRef = useRef<HTMLHeadingElement>(null);
+  const nestedRecoveryWasActiveRef = useRef(false);
   const [expandedChildRunId, setExpandedChildRunId] = useState("");
   const detailQuery = useQuery({
     queryKey: ["workflow-run-history-detail", runId],
     queryFn: () => api.workflows.getRun(runId),
     refetchInterval: (query) => (
-      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? 1_000 : false
+      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? ACTIVE_WORKFLOW_RUN_POLL_MS : false
     ),
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false,
   });
   const run = detailQuery.data as WorkflowHistoryRun | undefined;
   const familyQuery = useQuery({
@@ -441,9 +451,9 @@ export default function WorkflowRunDetail({
     queryFn: () => api.workflows.getRunFamily(runId),
     refetchInterval: (query) => {
       const familyRuns = (query.state.data || []) as WorkflowHistoryRun[];
-      return familyRuns.some(runIsActive) ? 1_000 : false;
+      return familyRuns.some(runIsActive) ? ACTIVE_WORKFLOW_FAMILY_POLL_MS : false;
     },
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false,
   });
   const relatedRuns = (familyQuery.data || []) as WorkflowHistoryRun[];
   const provisionalFamily = run
@@ -462,9 +472,9 @@ export default function WorkflowRunDetail({
       && controlRunId !== run.id
     ),
     refetchInterval: (query) => (
-      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? 1_000 : false
+      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? ACTIVE_WORKFLOW_RUN_POLL_MS : false
     ),
-    refetchIntervalInBackground: true,
+    refetchIntervalInBackground: false,
   });
   const latestDetailedRun = controlRunId === run?.id
     ? run
@@ -479,21 +489,43 @@ export default function WorkflowRunDetail({
       ))
     : undefined;
   const controlRun = latestDetailedRun || family?.latestRun;
-  const canCancel = Boolean(controlRun && canCancelWorkflowRun(controlRun));
   const canControl = controlRun?.capabilities?.can_control === true;
   const canHaveRetry = controlRun?.status === "failed" || controlRun?.status === "completed";
   const controlQuery = useQuery({
     queryKey: ["workflow-run-history-control", controlRunId],
     queryFn: () => api.workflows.getRun(controlRunId, false),
     enabled: Boolean(familyQuery.isSuccess && controlRunId && canControl && canHaveRetry),
+    refetchInterval: (query) => (
+      runIsActive(query.state.data as WorkflowHistoryRun | undefined) ? 1_000 : false
+    ),
+    refetchIntervalInBackground: true,
   });
   const compactRun = controlQuery.data as WorkflowHistoryRun | undefined;
+  const canCancel = Boolean(controlRun && canCancelWorkflowRun({
+    ...controlRun,
+    status: compactRun?.status || controlRun.status,
+    business_outcome: compactRun?.business_outcome ?? controlRun.business_outcome,
+  }));
   const intervention = compactRun?.intervention?.kind === "workflow_retry"
     ? compactRun.intervention
     : null;
 
   useEffect(() => {
+    if (!compactRun) return;
+    if (runIsActive(compactRun)) {
+      nestedRecoveryWasActiveRef.current = true;
+      return;
+    }
+    if (!nestedRecoveryWasActiveRef.current) return;
+    nestedRecoveryWasActiveRef.current = false;
+    void queryClient.invalidateQueries({
+      queryKey: ["workflow-run-history-family", runId],
+    });
+  }, [compactRun, queryClient, runId]);
+
+  useEffect(() => {
     setExpandedChildRunId("");
+    nestedRecoveryWasActiveRef.current = false;
   }, [runId]);
 
   useEffect(() => {
@@ -509,16 +541,22 @@ export default function WorkflowRunDetail({
       sourceRun: WorkflowHistoryRun;
       action?: WorkflowRunAction | null;
       variables?: Record<string, unknown>;
-    }) => api.workflows.retryRun(sourceRun.id, {
-      from_step_id: action?.retry_from_step_id
-        || sourceRun.retry_from_step_id
-        || sourceRun.current_step_id,
-      variables,
-      execute: true,
-    }),
-    onSuccess: (retriedRun: WorkflowHistoryRun) => {
+    }) => api.workflows.retryRun(
+      sourceRun.id,
+      {
+        from_step_id: action?.retry_from_step_id
+          || sourceRun.retry_from_step_id
+          || sourceRun.current_step_id,
+        variables,
+        execute: true,
+      },
+    ),
+    onSuccess: (retriedRun: WorkflowHistoryRun, { sourceRun }) => {
       queryClient.invalidateQueries({ queryKey: ["workspace-workflow-runs", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workflow-run-history-family"] });
+      queryClient.invalidateQueries({
+        queryKey: ["workflow-run-history-control", sourceRun.id],
+      });
       onSelectRun(retriedRun.id);
     },
   });
@@ -573,8 +611,8 @@ export default function WorkflowRunDetail({
     t("component.workflow_run.error_truncated"),
   );
   const familyStatusPresentation = workflowRunStatusPresentation({
-    status: runStatus(family.status),
-    businessOutcome: family.businessOutcome,
+    status: runStatus(compactRun?.status || family.status),
+    businessOutcome: compactRun?.business_outcome || family.businessOutcome,
   });
   const interventionSchemaCompatible = Boolean(
     intervention
@@ -587,6 +625,8 @@ export default function WorkflowRunDetail({
     controlQuery.isSuccess
     && canShowDirectWorkflowRetry({
       ...controlRun,
+      status: compactRun?.status || controlRun.status,
+      business_outcome: compactRun?.business_outcome ?? controlRun.business_outcome,
       capabilities: compactRun?.capabilities || controlRun.capabilities,
     }, Boolean(visibleIntervention)),
   );
@@ -705,6 +745,12 @@ export default function WorkflowRunDetail({
         </section>
       )}
 
+      {canControl && controlRun.status === "paused" && controlRun.resume_action && (
+        <section className="workflow-run-history-controls" aria-label={t("component.workflow_run_history.controls")}>
+          <WorkflowRunResumeControl runId={controlRun.id} />
+        </section>
+      )}
+
       {showControlSurface && (
         <section className="workflow-run-history-controls" aria-label={t("component.workflow_run_history.controls")}>
           {controlQuery.isLoading ? (
@@ -720,6 +766,7 @@ export default function WorkflowRunDetail({
             <WorkflowRunIntervention
               run={controlRunView}
               action={visibleIntervention}
+              workspaceId={controlRun.workspace_id}
               loading={retryMutation.isPending}
               error={retryMutation.error}
               onResolve={async (_choice, _note, payload) => {

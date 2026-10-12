@@ -10,7 +10,7 @@ import "../../src/index.css";
 
 // Real completion/attachment renderers and FileViewer; the E2E spec intercepts
 // all API traffic, including errors. Nothing is written to a live workspace.
-setLocale("en");
+await setLocale("en");
 const name = "AI_SDE_20小时课程_Agenda与课程内容.md";
 const id = "01M1B8KT380NRNZ9DGX8ZVGF7A";
 const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

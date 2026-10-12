@@ -97,6 +97,106 @@ async def test_strategist_activity_is_persisted_as_a_timeline_stage(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_strategist_review_updates_one_activity_message(
+    db_session, monkeypatch,
+) -> None:
+    import packages.core.database as database
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.workspace import Workspace
+    from packages.core.strategist import service
+
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        name="Activity stages",
+        status="active",
+        settings={},
+    )
+    db_session.add(workspace)
+    await db_session.commit()
+
+    monkeypatch.setattr(
+        database,
+        "async_session",
+        async_sessionmaker(
+            db_session.bind,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        ),
+    )
+    published: list[tuple[str, str]] = []
+
+    async def _publish(*_args, message, **_kwargs):
+        published.append((message.id, message.meta["strategist_activity"]["stage"]))
+
+    monkeypatch.setattr(
+        service.chat_service,
+        "publish_workspace_chat_message_event",
+        _publish,
+    )
+
+    activity_id = await service._post_strategist_activity(
+        workspace,
+        stage="collecting_feedback",
+        body="Collecting feedback",
+        review_id="rv_one",
+    )
+    assert activity_id is not None
+    for stage, body in (
+        ("analyzing_context", "Analyzing context"),
+        ("generating_plan", "Generating plan"),
+        ("finalizing_plan", "Preparing plan"),
+    ):
+        assert await service._post_strategist_activity(
+            workspace,
+            stage=stage,
+            body=body,
+            review_id="rv_one",
+            message_id=activity_id,
+        ) == activity_id
+
+    rows = list((await db_session.execute(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.workspace_id == workspace.id,
+            Message.message_kind == "strategist_activity",
+        )
+    )).scalars())
+    assert len(rows) == 1
+    assert rows[0].id == activity_id
+    await db_session.refresh(rows[0])
+    assert rows[0].content == "Preparing plan"
+    assert rows[0].meta["strategist_activity"]["stage"] == "finalizing_plan"
+    assert rows[0].meta["strategist_activity"]["state"] == "running"
+    assert published == [
+        (activity_id, stage) for stage in (
+            "collecting_feedback",
+            "analyzing_context",
+            "generating_plan",
+            "finalizing_plan",
+        )
+    ]
+
+    assert await service._finish_strategist_activity(
+        workspace, message_id=activity_id, state="completed",
+    ) is True
+    await db_session.refresh(rows[0])
+    assert rows[0].meta["strategist_activity"]["state"] == "completed"
+    assert await service._post_strategist_activity(
+        workspace,
+        stage="collecting_feedback",
+        body="Late stage update",
+        review_id="rv_one",
+        message_id=activity_id,
+    ) == activity_id
+    await db_session.refresh(rows[0])
+    assert rows[0].content == "Preparing plan"
+    assert rows[0].meta["strategist_activity"]["state"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_strategist_failure_finishes_only_its_review_activity(
     db_session, monkeypatch,
 ) -> None:
@@ -341,7 +441,7 @@ async def test_strategist_review_refreshes_cached_workspace_before_status_gate(
     # The review session still has the pre-pause object in its identity map.
     assert workspace.status == "active"
 
-    result = await service.run_review(db_session, workspace.id, trigger="manual")
+    result = await service.run_review(db_session, workspace.id, trigger="scheduled")
 
     assert result == {
         "workspace_id": workspace.id,
@@ -434,7 +534,7 @@ async def test_strategist_review_rechecks_lifecycle_after_model_generation(
                     seconds=90
                 )
             await concurrent_db.commit()
-        return SimpleNamespace()
+        return SimpleNamespace(tasks=[])
 
     async def _suppress_workflow_runs(*_args, **_kwargs):
         return None
@@ -485,7 +585,7 @@ async def test_strategist_review_rechecks_lifecycle_after_model_generation(
         result = await service.run_review(
             db_session,
             workspace.id,
-            trigger="manual",
+            trigger="scheduled",
             **review_kwargs,
         )
         assert result == {
@@ -1086,27 +1186,29 @@ async def test_strategist_review_deduplicates_terminal_delivery(
 
 
 @pytest.mark.asyncio
-async def test_legacy_review_failure_uses_its_exact_activity_review_id(monkeypatch) -> None:
+async def test_legacy_review_failure_uses_its_exact_activity_review_id(
+    db_session, monkeypatch,
+) -> None:
     import packages.core.strategist as strategist_package
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.review_run import ReviewRun
+    from packages.core.models.workspace import Workspace
     from packages.core.services import feature_flags
     from packages.core.strategist import orchestrator, service
     from packages.core.strategist.triggers import ReviewTriggerKind
 
     calls: list[tuple[str, str]] = []
 
-    workspace = SimpleNamespace(
-        id="ws_test",
-        entity_id="entity_test",
+    workspace_id = generate_ulid()
+    workspace = Workspace(
+        id=workspace_id,
+        entity_id=generate_ulid(),
+        name="Legacy review failure receipt",
         status="active",
+        settings={},
     )
-
-    class _Db:
-        execute_calls = 0
-
-        async def execute(self, _query):
-            self.execute_calls += 1
-            value = workspace if self.execute_calls == 1 else None
-            return SimpleNamespace(scalar_one_or_none=lambda: value)
+    db_session.add(workspace)
+    await db_session.commit()
 
     async def _disabled(*_args, **_kwargs):
         return False
@@ -1117,11 +1219,21 @@ async def test_legacy_review_failure_uses_its_exact_activity_review_id(monkeypat
 
     async def _run_review(
         *_args,
+        review_run,
+        review_lease_owner,
+        briefing_markdown,
         activity_review_id,
         initial_activity_message_id,
         **_kwargs,
     ):
         calls.append(("run", activity_review_id))
+        assert review_run.id == activity_review_id
+        assert review_run.status == "running"
+        assert review_lease_owner == "worker-legacy"
+        assert briefing_markdown is None
+        # The legacy prompt path must commit the same durable admission as v2
+        # before entering model work, without keeping its transaction open.
+        assert not db_session.in_transaction()
         assert initial_activity_message_id == "msg_collecting"
         raise RuntimeError("model unavailable")
 
@@ -1133,19 +1245,28 @@ async def test_legacy_review_failure_uses_its_exact_activity_review_id(monkeypat
     monkeypatch.setattr(strategist_package, "run_review", _run_review)
     monkeypatch.setattr(service, "_post_strategist_activity", _post_activity)
     monkeypatch.setattr(service, "finish_strategist_review_activity", _finish_review)
-    monkeypatch.setattr(orchestrator, "generate_ulid", lambda: "review_test")
-
     with pytest.raises(RuntimeError, match="model unavailable"):
         await orchestrator.run_strategist_review_cycle(
-            _Db(),
-            "ws_test",
+            db_session,
+            workspace_id,
             ReviewTriggerKind.HUMAN_REQUESTED,
+            execution_owner="worker-legacy",
         )
 
+    review = (
+        await db_session.execute(
+            select(ReviewRun).where(ReviewRun.workspace_id == workspace_id)
+        )
+    ).scalar_one()
+    assert review.status == "failed"
+    assert review.error == "model unavailable"
+    assert review.completed_at is not None
+    assert review.lease_owner is None
+    assert review.lease_expires_at is None
     assert calls == [
-        ("start", "rv_review_test"),
-        ("run", "rv_review_test"),
-        ("failed", "rv_review_test"),
+        ("start", review.id),
+        ("run", review.id),
+        ("failed", review.id),
     ]
 
 
@@ -1164,6 +1285,8 @@ async def test_v2_collecting_activity_starts_before_consolidators(monkeypatch) -
         id="ws_test",
         entity_id="entity_test",
         status="active",
+        deleted_at=None,
+        settings={},
     )
     review = SimpleNamespace(id="rv_test", briefing=None)
 

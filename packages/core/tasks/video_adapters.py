@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # The gateway persists the full JSON body, where base64 expands image bytes by
 # roughly one third. Leave room for the prompt and async operation envelope.
 VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES = 160 * 1024
+# Below this much remaining allowance an image is sent by URL instead of being
+# squeezed into an unusably small inline copy.
+VERCEL_VIDEO_MIN_INLINE_REFERENCE_BYTES = 32 * 1024
 # OpenRouter accepts data URLs for image_url payloads. Keep each local image
 # bounded so multiple reference images cannot produce an unreasonably large
 # video-start request.
@@ -83,8 +86,10 @@ OPENROUTER_IMAGE_MEDIA_REFERENCE = MediaReferenceCapability(
 
 
 VIDEO_NATIVE_MODEL_MAP = {
+    "bytedance/seedance-2.5": "doubao-seedance-2-5-260628",
     "bytedance/seedance-2.0": "doubao-seedance-2-0-260128",
     "bytedance/seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
+    "bytedance/seedance-v1.0-pro-fast": "seedance-1-0-pro-fast-251015",
     "kwaivgi/kling-v3.0-std": "kling-v3.0-std",
     "kwaivgi/kling-v3.0-pro": "kling-v3.0-pro",
     # Atlas Cloud model ids are three-part vendor/model/route paths.
@@ -274,7 +279,7 @@ class VideoAdapterRuntime:
     extract_task_id: Callable[[dict[str, Any]], str]
     provider_error_message: Callable[[Any], str]
     openrouter_api_url: Callable[[str], str]
-    normalize_duration: Callable[[Any], int]
+    normalize_duration: Callable[..., int]
     normalize_resolution: Callable[[str | None, Any], str]
     ensure_inline_data_url: Callable[..., Awaitable[str]] | None = None
 
@@ -532,10 +537,41 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
             "resolution": _vercel_video_resolution(resolution, aspect_ratio),
             "generateAudio": seedance_bool(params.get("generate_audio", False)),
         }
+        # The gateway ignores a top-level generateAudio: provider settings go
+        # under providerOptions.<provider>. Without it Seedance adds an audio
+        # track, which its copyright filter can reject.
+        provider = str(model).split("/", 1)[0].strip()
+        if provider:
+            payload["providerOptions"] = {provider: {"generateAudio": payload["generateAudio"]}}
         if params.get("seed") is not None:
             payload["seed"] = params["seed"]
 
-        image_capability = self.media_reference_capability(model, "image")
+        # The gateway caps the whole request (~300KB), not each image, so the
+        # inline allowance is one budget shared by every image in it; an image
+        # that does not fit what is left goes as a signed URL instead.
+        inline_budget = [VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES]
+
+        async def reference_file(value: str, media_kind: Literal["image", "video", "audio"]) -> dict[str, str]:
+            capability = self.media_reference_capability(model, media_kind)
+            if INLINE_BASE64_REFERENCE in capability.transports:
+                if inline_budget[0] < VERCEL_VIDEO_MIN_INLINE_REFERENCE_BYTES:
+                    capability = PUBLIC_URL_MEDIA_REFERENCE
+                else:
+                    capability = MediaReferenceCapability(
+                        capability.transports, max_inline_bytes=inline_budget[0],
+                    )
+            reference = await materialize_video_reference(
+                value,
+                job.entity_id,
+                media_kind=media_kind,
+                capability=capability,
+                runtime=runtime,
+                public_base_url=public_base_url,
+            )
+            if reference.type == "file":
+                inline_budget[0] -= len(reference.value) * 3 // 4
+            return reference.as_vercel_file()
+
         frame_images: list[dict[str, Any]] = []
         for frame_type, value in (
             ("first_frame", params.get("first_frame_url")),
@@ -544,19 +580,7 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
             if not value:
                 continue
             frame_images.append(
-                {
-                    "frameType": frame_type,
-                    "image": (
-                        await materialize_video_reference(
-                            str(value),
-                            job.entity_id,
-                            media_kind="image",
-                            capability=image_capability,
-                            runtime=runtime,
-                            public_base_url=public_base_url,
-                        )
-                    ).as_vercel_file(),
-                }
+                {"frameType": frame_type, "image": await reference_file(str(value), "image")}
             )
         if frame_images:
             payload["frameImages"] = frame_images
@@ -566,20 +590,8 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
             ("image", params.get("reference_urls") or []),
             ("video", params.get("reference_video_urls") or []),
         ):
-            capability = self.media_reference_capability(model, media_kind)
             for value in values:
-                input_references.append(
-                    (
-                        await materialize_video_reference(
-                            str(value),
-                            job.entity_id,
-                            media_kind=media_kind,
-                            capability=capability,
-                            runtime=runtime,
-                            public_base_url=public_base_url,
-                        )
-                    ).as_vercel_file()
-                )
+                input_references.append(await reference_file(str(value), media_kind))
         if input_references:
             payload["inputReferences"] = input_references
 
@@ -654,7 +666,20 @@ class VercelGatewayVideoAdapter(VideoGenerationAdapter):
 
 
 def _vercel_video_resolution(resolution: str, aspect_ratio: str) -> str:
-    height = {"480p": 480, "720p": 720, "1080p": 1080}.get(resolution, 720)
+    """Gateway pixel size: preserve native portrait presets before defaults.
+
+    1080p vertical is 1080x1920, not 608x1080: providers reject a portrait
+    size whose long side is the tier. Native 3:4 presets use a provider tier
+    rather than a literal short-edge pixel count; other ratios retain the
+    existing short-side conversion.
+    """
+    portrait_presets = {
+        "9:16": {"480p": "480x864", "720p": "720x1280", "1080p": "1080x1920"},
+        "3:4": {"480p": "560x752", "720p": "834x1112", "1080p": "1248x1664"},
+    }
+    if aspect_ratio in portrait_presets:
+        return portrait_presets[aspect_ratio].get(resolution, portrait_presets[aspect_ratio]["720p"])
+    short_side = {"480p": 480, "720p": 720, "1080p": 1080}.get(resolution, 720)
     width_ratio, height_ratio = {
         "21:9": (21, 9),
         "16:9": (16, 9),
@@ -663,8 +688,9 @@ def _vercel_video_resolution(resolution: str, aspect_ratio: str) -> str:
         "4:3": (4, 3),
         "3:4": (3, 4),
     }.get(aspect_ratio, (16, 9))
-    width = max(1, round(height * width_ratio / height_ratio))
-    return f"{width}x{height}"
+    if width_ratio >= height_ratio:
+        return f"{max(1, round(short_side * width_ratio / height_ratio))}x{short_side}"
+    return f"{short_side}x{max(1, round(short_side * height_ratio / width_ratio))}"
 
 
 def _video_media_type(value: str, media_kind: Literal["image", "video", "audio"]) -> str:
@@ -770,9 +796,11 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
         model = job.model or "bytedance/seedance-2.0"
         native_model = native_video_model(model)
         params = job.params or {}
-        duration = runtime.normalize_duration(params.get("duration", 5))
+        duration = runtime.normalize_duration(params.get("duration", 5), model)
         resolution = runtime.normalize_resolution(native_model, params.get("resolution", "720p"))
         aspect_ratio = params.get("aspect_ratio", "16:9")
+        if model == "bytedance/seedance-2.5" and (params.get("first_frame_url") or params.get("last_frame_url")):
+            aspect_ratio = "adaptive"
         public_base_url = str(params.get("public_base_url") or "").strip()
         bases = volcengine_base_url_candidates(base_url)
 
@@ -797,9 +825,12 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
                 public_base_url=public_base_url,
             ))
 
+        from packages.core.constants.models import video_model_capabilities
+
+        capabilities = video_model_capabilities(model)
         reference_urls = params.get("reference_urls") or []
         if reference_urls and not frame_control_blocks_reference_media:
-            for ref_url in reference_urls[:9]:
+            for ref_url in reference_urls[:capabilities["max_reference_images"]]:
                 content.append(await seedance_image_content(
                     ref_url,
                     job.entity_id,
@@ -809,7 +840,7 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
                 ))
         reference_video_urls = params.get("reference_video_urls") or []
         if reference_video_urls and not frame_control_blocks_reference_media:
-            for ref_url in reference_video_urls[:3]:
+            for ref_url in reference_video_urls[:capabilities["max_reference_videos"]]:
                 content.append(await seedance_media_content(
                     ref_url,
                     job.entity_id,
@@ -822,7 +853,7 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
         if not audio_reference_urls and params.get("audio_reference_url"):
             audio_reference_urls = [params.get("audio_reference_url")]
         if audio_reference_urls and not frame_control_blocks_reference_media:
-            for ref_url in audio_reference_urls[:3]:
+            for ref_url in audio_reference_urls[:capabilities["max_audio_references"]]:
                 content.append(await seedance_media_content(
                     ref_url,
                     job.entity_id,
@@ -856,9 +887,11 @@ class VolcengineSeedanceAdapter(VideoGenerationAdapter):
                 payload["duration"] = duration
         else:
             payload["duration"] = duration
-        if params.get("seed") is not None:
+        if params.get("seed") is not None and model != "bytedance/seedance-2.5":
             payload["seed"] = params["seed"]
         for key in ("return_last_frame", "camera_fixed", "draft"):
+            if model == "bytedance/seedance-2.5" and key == "camera_fixed":
+                continue
             if params.get(key) is not None:
                 payload[key] = seedance_bool(params[key])
 
@@ -1193,6 +1226,8 @@ def select_video_generation_adapter(
     api_key: str,
 ) -> VideoGenerationAdapter | None:
     selected_provider = (provider or catalog_video_provider(model)).lower()
+    if model == "bytedance/seedance-2.5" and (selected_provider == "vercel" or (api_key or "").startswith("sk-or-")):
+        return None
     # Atlas models exist only on Atlas — never route them through OpenRouter,
     # even when the resolved key is an OpenRouter key.
     if selected_provider == "atlascloud":
@@ -1247,6 +1282,8 @@ async def _download_adapter_result(
     *,
     auth_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    from packages.core.contracts.media_job_output import media_job_output_kwargs
+
     params = job.params or {}
     return await runtime.download_and_save(
         video_url,
@@ -1265,4 +1302,5 @@ async def _download_adapter_result(
         user_id=getattr(job, "user_id", None),
         with_audio=bool(params.get("generate_audio")),
         has_video_input=bool(params.get("reference_video_urls")),
+        **media_job_output_kwargs(params),
     )

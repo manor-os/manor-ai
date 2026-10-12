@@ -16,6 +16,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -50,6 +51,19 @@ async def _auth(client: AsyncClient, username: str) -> dict:
         },
     )
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+async def _connect_signature_mailbox(client: AsyncClient, headers: dict, *, address: str = "sender@example.com") -> str:
+    response = await client.post(
+        "/api/v1/integrations", headers=headers,
+        json={"provider": "email", "credentials": {
+            "smtp_host": "smtp.example.com", "smtp_port": 587,
+            "username": address, "password": "test-app-password",
+            "from_address": f"Contract Sender <{address}>",
+        }},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
 
 
 async def _create_entity_user(
@@ -991,6 +1005,927 @@ async def test_share_create_list_revoke(client: AsyncClient, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source_kind", "status_code", "error_text"),
+    [
+        ("outside_page", 400, "Signature page is outside the PDF"),
+        ("unreadable", 400, "not a readable PDF"),
+        ("encrypted", 409, "Password-protected PDFs"),
+        ("digitally_signed", 409, "already contains a digital signature"),
+    ],
+)
+async def test_signature_request_rejects_invalid_source_before_persistence_or_email(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    source_kind: str,
+    status_code: int,
+    error_text: str,
+):
+    from pypdf import PdfWriter
+    from pypdf.generic import ArrayObject, DictionaryObject, NameObject
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, "signaturevalidation")
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    if source_kind == "encrypted":
+        writer.encrypt("private-password")
+    elif source_kind == "digitally_signed":
+        signature = writer._add_object(DictionaryObject({
+            NameObject("/Type"): NameObject("/Sig"),
+        }))
+        field = writer._add_object(DictionaryObject({
+            NameObject("/FT"): NameObject("/Sig"),
+            NameObject("/V"): signature,
+        }))
+        writer._root_object[NameObject("/AcroForm")] = DictionaryObject({
+            NameObject("/Fields"): ArrayObject([field]),
+        })
+    source_buffer = io.BytesIO()
+    writer.write(source_buffer)
+    source_bytes = (
+        b"%PDF-1.7\nThis is not a readable PDF\n%%EOF\n"
+        if source_kind == "unreadable"
+        else source_buffer.getvalue()
+    )
+    upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("validation.pdf", source_bytes, "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc = upload.json()
+    delivered: list[str] = []
+
+    async def capture_email(to: str, _subject: str, _content: str) -> bool:
+        delivered.append(to)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_common_email", capture_email,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.email_service.is_email_delivery_enabled", lambda: True,
+    )
+    rejected = await client.post(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+        json={
+            "recipient_name": "Client",
+            "recipient_email": "client@partner.com",
+            "placement": {
+                "page": 2 if source_kind == "outside_page" else 1,
+                "x": 0.62,
+                "y": 0.78,
+                "width": 0.30,
+                "height": 0.12,
+            },
+        },
+    )
+    assert rejected.status_code == status_code, rejected.text
+    assert error_text in rejected.text
+    rows = await client.get(
+        f"/api/v1/documents/{doc['id']}/signature-requests", headers=headers,
+    )
+    assert rows.status_code == 200, rows.text
+    assert rows.json() == []
+    assert delivered == []
+
+
+def test_signature_request_rejects_oversized_png_before_pixel_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from fastapi import HTTPException
+    from PIL import Image
+    from apps.api.routers.document_permissions import _decode_signature_image
+
+    signature_buffer = io.BytesIO()
+    Image.new("RGBA", (4097, 8)).save(signature_buffer, format="PNG")
+
+    def unexpected_conversion(*_args, **_kwargs):
+        pytest.fail("Oversized signature images must be rejected before allocating RGBA pixels")
+
+    monkeypatch.setattr(Image.Image, "convert", unexpected_conversion)
+    with pytest.raises(HTTPException) as rejected:
+        _decode_signature_image(
+            "data:image/png;base64,"
+            + base64.b64encode(signature_buffer.getvalue()).decode("ascii")
+        )
+    assert rejected.value.status_code == 400
+    assert "dimensions" in rejected.value.detail
+
+
+@pytest.mark.parametrize(
+    ("crop_box", "placement_y"),
+    [((0, 0, 612, 792), 0.78), ((0, 0, 612, 792), 0.88), ((40, 60, 572, 732), 0.88)],
+)
+def test_signature_request_long_email_caption_stays_readable_inside_visible_page(
+    crop_box: tuple[int, int, int, int],
+    placement_y: float,
+):
+    from PIL import Image
+    from pypdf import PdfReader, PdfWriter
+    from pypdf.generic import RectangleObject
+    from apps.api.routers.document_permissions import SignaturePlacement, _stamp_pdf_signature
+
+    source_buffer = io.BytesIO()
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    page.cropbox = RectangleObject(crop_box)
+    writer.write(source_buffer)
+    signer_email = "customer-" + "w" * 55 + "@" + "partner." * 15 + "example.test"
+    signed_at = datetime(2026, 9, 9, 8, 45, tzinfo=timezone.utc)
+    signed_bytes = _stamp_pdf_signature(
+        source_buffer.getvalue(),
+        Image.new("RGBA", (600, 180), (20, 20, 20, 255)),
+        placement=SignaturePlacement(y=placement_y),
+        signer_email=signer_email,
+        signed_at=signed_at,
+        request_id="longemailcaption",
+    )
+    signed_page = PdfReader(io.BytesIO(signed_bytes)).pages[0]
+    text_runs = []
+
+    def collect_text(value, _cm, tm, font, size):
+        if value.strip():
+            text_runs.append((value.strip(), tm[4], tm[5], font, size))
+
+    extracted = signed_page.extract_text(visitor_text=collect_text)
+    compact_text = "".join(extracted.split())
+    assert f"Signedby{signer_email}" in compact_text
+    assert "at2026-09-0908:45UTC" in compact_text
+    assert len(text_runs) > 2
+    for value, x, y, font, size in text_runs:
+        assert font["/BaseFont"] == "/Courier"
+        assert size == 9
+        assert crop_box[0] + 8 <= x
+        assert x + len(value) * size * 0.6 <= crop_box[2] - 8 + 0.001
+        assert crop_box[1] + 8 <= y - 2
+        assert y + size <= crop_box[3] - 8
+    image_transform = next(
+        operands for operands, operator in signed_page.get_contents().operations
+        if operator == b"cm"
+    )
+    image_bottom = float(image_transform[5])
+    image_top = image_bottom + float(image_transform[3])
+    assert image_bottom > max(y + size for _value, _x, y, _font, size in text_runs)
+    assert image_top <= crop_box[3] - 8
+
+
+@pytest.mark.asyncio
+async def test_signature_request_requires_sender_owned_default_smtp_account(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    from pypdf import PdfWriter
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr("apps.api.routers.documents.settings", settings)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, "nomailowner")
+    source = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.write(source)
+    upload = await client.post(
+        "/api/v1/documents/upload", headers=headers,
+        files={"file": ("agreement.pdf", source.getvalue(), "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    assert upload.json()["fs_path"], upload.text
+    doc_id = upload.json()["id"]
+    created = await client.post(
+        f"/api/v1/documents/{doc_id}/signature-requests", headers=headers,
+        json={"recipient_name": "Alice", "recipient_email": "alice@partner.com"},
+    )
+    assert created.status_code == 409, created.text
+    assert created.json()["detail"]["code"] == "permissions.error.signature_request.sender_email_required"
+    rows = await client.get(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers)
+    assert rows.json() == []
+
+    first_id = await _connect_signature_mailbox(client, headers, address="first@example.com")
+    second_id = await _connect_signature_mailbox(client, headers, address="second@example.com")
+    options = await client.get(f"/api/v1/documents/{doc_id}/signature-senders", headers=headers)
+    assert options.status_code == 200, options.text
+    assert {item["id"] for item in options.json()} == {first_id, second_id}
+    assert {item["email"] for item in options.json()} == {"first@example.com", "second@example.com"}
+    switched = await client.put("/api/v1/integrations/email-accounts/default", headers=headers,
+                                json={"sender_id": second_id})
+    assert switched.status_code == 204, switched.text
+    sent_from: list[str] = []
+    async def capture_email(*, message, **transport) -> None:
+        from email.utils import parseaddr
+        sent_from.append(parseaddr(str(message["From"]))[1])
+    monkeypatch.setattr("packages.core.services.smtp_transport.send_message_async", capture_email)
+    selected = await client.post(
+        f"/api/v1/documents/{doc_id}/signature-requests", headers=headers,
+        json={"recipient_name": "Alice", "recipient_email": "alice@partner.com"},
+    )
+    assert selected.status_code == 201, selected.text
+    assert sent_from == ["second@example.com"]
+
+
+
+@pytest.mark.asyncio
+async def test_signature_sender_options_include_owned_oauth_and_nango_mailboxes(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    from pypdf import PdfWriter
+    from packages.core.config import get_settings
+    from packages.core.models.document import Integration
+    from packages.core.models.user import OAuthAccount
+    from packages.core.services import email_service
+
+    settings = get_settings()
+    monkeypatch.setattr("apps.api.routers.documents.settings", settings)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, "oauthsignowner")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    owner_id, entity_id = me["id"], me["entity_id"]
+    async with db_module.async_session() as session:
+        gmail = OAuthAccount(
+            user_id=owner_id, provider="gmail", provider_user_id="gmail-opaque",
+            access_token="gmail-token", profile={"email": "gmail@example.com"},
+        )
+        outlook = OAuthAccount(
+            user_id=owner_id, provider="outlook", provider_user_id="outlook-opaque",
+            access_token="outlook-token", profile={"email": "outlook@example.com"},
+        )
+        nango = Integration(
+            entity_id=entity_id, owner_user_id=owner_id, provider="gmail", status="active",
+            config={"nango": {"connection_id": f"{entity_id}--{owner_id}--gmail--test",
+                              "provider_config_key": "gmail"}},
+            credentials={},
+        )
+        session.add_all([gmail, outlook, nango])
+        await session.commit()
+        gmail_id, outlook_id, nango_id = gmail.id, outlook.id, nango.id
+
+    async def nango_secret(*args, **kwargs):
+        return "nango-secret"
+
+    async def nango_token(**kwargs):
+        return "nango-token"
+
+    async def mailbox(provider, token):
+        return {
+            "gmail-token": "gmail@example.com",
+            "outlook-token": "outlook@example.com",
+            "nango-token": "nango@example.com",
+        }[token]
+
+    sent = []
+
+    async def send_oauth(provider, token, **kwargs):
+        sent.append((provider, token, kwargs["expected_sender"], kwargs["to"]))
+        return True
+
+    monkeypatch.setattr("packages.core.ai.mcp.nango.get_nango_secret", nango_secret)
+    monkeypatch.setattr("packages.core.services.nango_bridge.fetch_nango_access_token", nango_token)
+    monkeypatch.setattr(email_service, "connected_oauth_sender", mailbox)
+    monkeypatch.setattr(email_service, "send_connected_oauth_email", send_oauth)
+    source = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.write(source)
+    upload = await client.post(
+        "/api/v1/documents/upload", headers=headers,
+        files={"file": ("agreement.pdf", source.getvalue(), "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    assert upload.json()["fs_path"], upload.text
+    doc_id = upload.json()["id"]
+    options = await client.get(f"/api/v1/documents/{doc_id}/signature-senders", headers=headers)
+    assert options.status_code == 200, options.text
+    assert {(item["id"], item["email"], item["provider"]) for item in options.json()} == {
+        (f"oauth:{gmail_id}", "gmail@example.com", "gmail"),
+        (f"oauth:{outlook_id}", "outlook@example.com", "outlook"),
+        (nango_id, "nango@example.com", "gmail"),
+    }
+    switched = await client.put("/api/v1/integrations/email-accounts/default", headers=headers,
+                                json={"sender_id": f"oauth:{outlook_id}"})
+    assert switched.status_code == 204, switched.text
+    common = (await client.get("/api/v1/integrations/email-accounts", headers=headers)).json()
+    assert common["default_sender_id"] == f"oauth:{outlook_id}"
+    group = await client.post("/api/v1/chat/rooms", headers=headers, json={
+        "kind": "group", "title": "Same default as eSign", "owner_scope": "personal", "recipient_email": "alice@partner.com",
+    })
+    assert group.status_code == 201, group.text
+    assert group.json()["invite_email_sent"] is True
+    created = await client.post(
+        f"/api/v1/documents/{doc_id}/signature-requests", headers=headers,
+        json={"recipient_name": "Alice", "recipient_email": "alice@partner.com"},
+    )
+    assert created.status_code == 201, created.text
+    assert sent == [("outlook", "outlook-token", "outlook@example.com", "alice@partner.com")] * 2
+    async with db_module.async_session() as session:
+        disconnected = await session.get(OAuthAccount, outlook_id)
+        assert disconnected is not None
+        await session.delete(disconnected)
+        await session.commit()
+    resent = await client.post(
+        f"/api/v1/documents/{doc_id}/signature-requests/{created.json()['id']}/resend",
+        headers=headers,
+    )
+    assert resent.status_code == 200, resent.text
+    assert resent.json()["delivery_status"] == "failed"
+    assert len(sent) == 2
+
+
+
+@pytest.mark.asyncio
+async def test_pdf_multi_signer_group_finalizes_only_after_every_signer(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    import re
+    from PIL import Image, ImageDraw
+    from pypdf import PdfReader, PdfWriter
+    from sqlalchemy import select
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document
+    from packages.core.services.entity_fs import resolve_path
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, "multisignowner")
+    await _connect_signature_mailbox(client, headers)
+    source_buffer = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.write(source_buffer)
+    upload = await client.post(
+        "/api/v1/documents/upload", headers=headers,
+        files={"file": ("agreement.pdf", source_buffer.getvalue(), "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc_id = upload.json()["id"]
+
+    invitations: dict[str, str] = {}
+    otp_codes: dict[str, str] = {}
+
+    async def capture_email(*, message, **transport) -> None:
+        from email.utils import parseaddr
+        assert parseaddr(str(message["From"]))[1] == "sender@example.com"
+        assert transport["username"] == "sender@example.com"
+        to = str(message["To"])
+        subject = str(message["Subject"])
+        content = message.get_payload(0).get_payload(decode=True).decode("utf-8")
+        if subject.startswith("Signature requested:"):
+            match = re.search(r"/sign/([^\"<]+)", content)
+            if match:
+                invitations[to] = match.group(1)
+        elif subject.startswith("Verify your email"):
+            otp_codes[to] = re.search(r"verification code is <strong>(\d{6})</strong>", content).group(1)
+
+    monkeypatch.setattr("packages.core.services.smtp_transport.send_message_async", capture_email)
+    def field(field_id: str, x: float) -> dict:
+        return {"id": field_id, "type": "signature", "label": field_id,
+                "required": True, "page": 1, "x": x, "y": 0.75, "width": 0.25, "height": 0.12}
+
+    created = await client.post(
+        f"/api/v1/documents/{doc_id}/signature-requests", headers=headers,
+        json={
+            "recipient_name": "Alice", "recipient_email": "alice@partner.com",
+            "recipient_emails": ["alice@partner.com", "alice.alt@partner.com"],
+            "fields": [field("alice_signature", 0.1)],
+            "additional_recipients": [{
+                "recipient_name": "Bob", "recipient_email": "bob@partner.com",
+                "recipient_emails": ["bob@partner.com", "bob.alt@partner.com"],
+                "fields": [field("bob_signature", 0.55)],
+            }],
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["group_size"] == 2
+    assert set(invitations) == {"alice@partner.com", "alice.alt@partner.com", "bob@partner.com", "bob.alt@partner.com"}
+    assert invitations["alice@partner.com"] == invitations["alice.alt@partner.com"]
+    assert invitations["bob@partner.com"] == invitations["bob.alt@partner.com"]
+    other_account_id = await _connect_signature_mailbox(client, headers, address="other@example.com")
+    switched = await client.post(
+        f"/api/v1/integrations/mcp-servers/email/entity-accounts/{other_account_id}/set-default",
+        headers=headers,
+    )
+    assert switched.status_code == 204, switched.text
+    rows = (await client.get(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers)).json()
+    assert len(rows) == 2
+    assert len({row["group_id"] for row in rows}) == 1
+
+    blocked_edit = await client.put(
+        f"/api/v1/documents/{doc_id}/file", headers=headers,
+        files={"file": ("agreement.pdf", source_buffer.getvalue(), "application/pdf")},
+    )
+    assert blocked_edit.status_code == 409, blocked_edit.text
+
+    image = Image.new("RGBA", (600, 180), (0, 0, 0, 0))
+    ImageDraw.Draw(image).line([(20, 130), (160, 30), (300, 145), (560, 45)], fill=(25, 25, 25, 255), width=10)
+    signature_buffer = io.BytesIO()
+    image.save(signature_buffer, format="PNG")
+    signature_data_url = "data:image/png;base64," + base64.b64encode(signature_buffer.getvalue()).decode("ascii")
+
+    for index, (email, field_id) in enumerate((
+        ("alice.alt@partner.com", "alice_signature"),
+        ("bob.alt@partner.com", "bob_signature"),
+    )):
+        token = invitations[email]
+        sent = await client.post(f"/api/v1/shared-doc/{token}/request-otp", json={"email": email})
+        assert sent.status_code == 200, sent.text
+        verified = await client.post(
+            f"/api/v1/shared-doc/{token}/verify-otp",
+            json={"email": email, "code": otp_codes[email]},
+        )
+        assert verified.status_code == 200, verified.text
+        signed = await client.post(
+            f"/api/v1/shared-doc/{token}/signature",
+            json={"field_values": {field_id: signature_data_url}, "consent": True},
+        )
+        assert signed.status_code == 200, signed.text
+        assert signed.json()["group_finalized"] is (index == 1)
+        if index == 0:
+            assert signed.json()["signed_document_id"] is None
+        else:
+            assert signed.json()["signed_document_id"]
+        progress = await client.get(f"/api/v1/shared-doc/{token}/signature-request")
+        assert progress.status_code == 200, progress.text
+        assert progress.json()["group_signed_count"] == index + 1
+        assert progress.json()["group_finalized"] is (index == 1)
+        content = await client.get(f"/api/v1/shared-doc/{token}/content")
+        assert content.status_code == 200, content.text
+        signed_reader = PdfReader(io.BytesIO(content.content))
+        assert signed_reader.metadata["/ManorSignatureStatus"] == (
+            "completed" if index == 1 else "pending"
+        )
+        assert len(signed_reader.pages[0]["/Resources"]["/XObject"]) == index + 1
+        download = await client.get(f"/api/v1/shared-doc/{token}/download")
+        assert download.status_code == (200 if index == 1 else 409), download.text
+        if index == 0:
+            assert download.json()["detail"]["code"] == "permissions.error.signature.group_pending"
+            await db_session.rollback()
+            source_row = await db_session.get(Document, doc_id)
+            assert Path(resolve_path(source_row.entity_id, source_row.fs_path)).read_bytes() == source_buffer.getvalue()
+            assert (await db_session.execute(
+                select(Document).where(
+                    Document.entity_id == source_row.entity_id,
+                    Document.source == "signature",
+                )
+            )).scalars().all() == []
+
+    final_rows = (await client.get(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers)).json()
+    assert all(row["status"] == "completed" and row["group_finalized"] for row in final_rows)
+    assert all(row["group_signed_count"] == 2 for row in final_rows)
+    first_signer_download = await client.get(
+        f"/api/v1/shared-doc/{invitations['alice@partner.com']}/download"
+    )
+    assert first_signer_download.status_code == 200, first_signer_download.text
+    completion = signed.json()
+    assert completion["signed_document_name"] == "agreement-signed.pdf"
+    await db_session.rollback()
+    source_row = await db_session.get(Document, doc_id)
+    signed_copy = await db_session.get(Document, completion["signed_document_id"])
+    assert signed_copy is not None
+    assert signed_copy.folder_id == source_row.folder_id
+    assert Path(signed_copy.fs_path).parent == Path(source_row.fs_path).parent
+    assert Path(resolve_path(source_row.entity_id, source_row.fs_path)).read_bytes() == source_buffer.getvalue()
+    assert Path(resolve_path(signed_copy.entity_id, signed_copy.fs_path)).read_bytes() == first_signer_download.content
+    assert "working_fs_path" not in source_row.metadata_["signature_lock"]
+    assert set(source_row.metadata_["signature_lock"]["signer_emails"]) == {"alice.alt@partner.com", "bob.alt@partner.com"}
+    assert not Path(tmp_path, source_row.entity_id, ".signatures", f"{created.json()['group_id']}.pdf").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_first", [False, True])
+async def test_pdf_multi_signer_group_revoke_preserves_partial_signature(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    partial_first: bool,
+):
+    from PIL import Image, ImageDraw
+    from pypdf import PdfWriter
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, f"multirevoke{int(partial_first)}")
+    await _connect_signature_mailbox(client, headers)
+    source = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.write(source)
+    upload = await client.post(
+        "/api/v1/documents/upload", headers=headers,
+        files={"file": ("agreement.pdf", source.getvalue(), "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc_id = upload.json()["id"]
+    otp_codes: dict[str, str] = {}
+    async def capture_email(_credentials: dict, *, to: str, subject: str, content: str,
+                            sender_name: str, expected_sender: str) -> bool:
+        if subject.startswith("Verify your email"):
+            import re
+            otp_codes[to] = re.search(r"\b\d{6}\b", content).group(0)
+        return True
+    monkeypatch.setattr("packages.core.services.email_service.send_connected_email", capture_email)
+    field = {"id": "signature", "type": "signature", "label": "Signature",
+             "required": True, "page": 1, "x": 0.6, "y": 0.75, "width": 0.25, "height": 0.12}
+    payload = {
+        "recipient_name": "Alice", "recipient_email": "alice@partner.com", "fields": [field],
+        "additional_recipients": [{
+            "recipient_name": "Bob", "recipient_email": "bob@partner.com",
+            "fields": [{**field, "x": 0.1}],
+        }],
+    }
+    created = await client.post(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers, json=payload)
+    assert created.status_code == 201, created.text
+    rows = (await client.get(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers)).json()
+    second_id = next(row["id"] for row in rows if row["recipient_email"] == "bob@partner.com")
+
+    if partial_first:
+        token = created.json()["url"].rsplit("/", 1)[-1]
+        otp = await client.post(f"/api/v1/shared-doc/{token}/request-otp", json={"email": "alice@partner.com"})
+        assert otp.status_code == 200, otp.text
+        verified = await client.post(
+            f"/api/v1/shared-doc/{token}/verify-otp",
+            json={"email": "alice@partner.com", "code": otp_codes["alice@partner.com"]},
+        )
+        assert verified.status_code == 200, verified.text
+        image = Image.new("RGBA", (600, 180), (0, 0, 0, 0))
+        ImageDraw.Draw(image).line([(20, 130), (160, 30), (300, 145), (560, 45)], fill=(25, 25, 25, 255), width=10)
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        signed = await client.post(f"/api/v1/shared-doc/{token}/signature", json={
+            "field_values": {"signature": "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")},
+            "consent": True,
+        })
+        assert signed.status_code == 200, signed.text
+        assert signed.json()["group_finalized"] is False
+
+    revoked = await client.delete(f"/api/v1/documents/{doc_id}/signature-requests/{second_id}", headers=headers)
+    assert revoked.status_code == 204, revoked.text
+    rows = (await client.get(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers)).json()
+    assert all(row["status"] == "revoked" for row in rows)
+    retried = await client.post(f"/api/v1/documents/{doc_id}/signature-requests", headers=headers, json=payload)
+    assert retried.status_code == (409 if partial_first else 201), retried.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("escalate_during_stamp", [False, True])
+async def test_pdf_signature_request_email_otp_stamp_and_duplicate_guard(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    escalate_during_stamp: bool,
+):
+    from PIL import Image, ImageDraw
+    from pypdf import PdfReader, PdfWriter
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+
+    headers = await _auth(client, "signatureowner")
+    await _connect_signature_mailbox(client, headers)
+    source_buffer = io.BytesIO()
+    source_writer = PdfWriter()
+    source_writer.add_blank_page(width=612, height=792)
+    source_writer.write(source_buffer)
+    upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("contract.pdf", source_buffer.getvalue(), "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc = upload.json()
+
+    if escalate_during_stamp:
+        from packages.core.models.document import Document, DocumentFolder
+
+        row = await db_session.get(Document, doc["id"])
+        folder = DocumentFolder(
+            id=generate_ulid(), entity_id=row.entity_id, name="Contracts",
+            classification="internal", visibility="entity", client_visible=False,
+        )
+        db_session.add(folder)
+        row.folder_id = folder.id
+        await db_session.commit()
+
+    signature_emails: list[tuple[str, str]] = []
+    otp_codes: dict[str, str] = {}
+
+    async def capture_signature_email(_credentials: dict, *, to: str, subject: str, content: str,
+                                      sender_name: str, expected_sender: str) -> bool:
+        signature_emails.append((to, subject))
+        if subject.startswith("Verify your email"):
+            import re
+            otp_codes[to] = re.search(r"\b\d{6}\b", content).group(0)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_connected_email",
+        capture_signature_email,
+    )
+    created = await client.post(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+        json={
+            "recipient_name": "Client Signer",
+            "recipient_email": "client@partner.com",
+            "message": "Please review and sign.",
+            "placement": {
+                "page": 1,
+                "x": 0.62,
+                "y": 0.78,
+                "width": 0.30,
+                "height": 0.12,
+            },
+        },
+    )
+    assert created.status_code == 201, created.text
+    request_data = created.json()
+    assert request_data["status"] == "pending"
+    assert request_data["delivery_status"] == "sent"
+    assert "/sign/" in request_data["url"]
+    token = request_data["url"].rsplit("/", 1)[-1]
+    assert signature_emails[0][0] == "client@partner.com"
+
+    signature_rows = await client.get(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+    )
+    assert signature_rows.status_code == 200, signature_rows.text
+    assert len(signature_rows.json()) == 1
+    ordinary_shares = await client.get(
+        f"/api/v1/documents/{doc['id']}/shares",
+        headers=headers,
+    )
+    assert ordinary_shares.status_code == 200
+    assert ordinary_shares.json() == []
+
+    unverified = await client.get(f"/api/v1/shared-doc/{token}/signature-request")
+    assert unverified.status_code == 401
+    sent = await client.post(
+        f"/api/v1/shared-doc/{token}/request-otp",
+        json={"email": "client@partner.com"},
+    )
+    assert sent.status_code == 200, sent.text
+    verified = await client.post(
+        f"/api/v1/shared-doc/{token}/verify-otp",
+        json={"email": "client@partner.com", "code": otp_codes["client@partner.com"]},
+    )
+    assert verified.status_code == 200, verified.text
+    public_request = await client.get(f"/api/v1/shared-doc/{token}/signature-request")
+    assert public_request.status_code == 200, public_request.text
+    assert public_request.json()["status"] == "pending"
+    assert public_request.json()["recipient_email"] == "client@partner.com"
+
+    signature_image = Image.new("RGBA", (600, 180), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(signature_image)
+    draw.line([(20, 130), (160, 30), (300, 145), (560, 45)], fill=(25, 25, 25, 255), width=10)
+    signature_buffer = io.BytesIO()
+    signature_image.save(signature_buffer, format="PNG")
+    signature_data_url = "data:image/png;base64," + base64.b64encode(
+        signature_buffer.getvalue()
+    ).decode("ascii")
+
+    if escalate_during_stamp:
+        import threading
+        from apps.api.routers import document_permissions
+        from packages.core.models.permission import Share
+
+        stamp_started, continue_stamp = threading.Event(), threading.Event()
+        stamp = document_permissions._stamp_pdf_signature
+
+        def pause_stamp(*args, **kwargs):
+            stamp_started.set()
+            assert continue_stamp.wait(timeout=10)
+            return stamp(*args, **kwargs)
+
+        monkeypatch.setattr(document_permissions, "_stamp_pdf_signature", pause_stamp)
+        completion = asyncio.create_task(client.post(
+            f"/api/v1/shared-doc/{token}/signature",
+            json={"signature_data_url": signature_data_url, "consent": True},
+        ))
+        try:
+            assert await asyncio.to_thread(stamp_started.wait, 10)
+            # A parent policy change leaves the pinned Document revision intact.
+            folder.classification = "confidential"
+            await db_session.commit()
+        finally:
+            continue_stamp.set()
+        rejected = await asyncio.wait_for(completion, timeout=10)
+        assert rejected.status_code == 410, rejected.text
+        assert "revoked_by_policy" in rejected.text
+        await db_session.refresh(row)
+        share_row = await db_session.get(Share, request_data["id"])
+        assert share_row.metadata_["signature_status"] == "pending"
+        assert not (row.metadata_ or {}).get("signature_lock")
+        from packages.core.services.entity_fs import resolve_path
+        assert Path(resolve_path(row.entity_id, row.fs_path)).read_bytes() == source_buffer.getvalue()
+        return
+
+    completion_responses = await asyncio.gather(*[
+        client.post(
+            f"/api/v1/shared-doc/{token}/signature",
+            json={"signature_data_url": signature_data_url, "consent": True},
+        )
+        for _attempt in range(2)
+    ])
+    status_codes = sorted(response.status_code for response in completion_responses)
+    assert status_codes == [200, 409], [response.text for response in completion_responses]
+    completed = next(response for response in completion_responses if response.status_code == 200)
+    assert completed.json()["status"] == "completed"
+
+    signed_content = await client.get(f"/api/v1/shared-doc/{token}/content")
+    assert signed_content.status_code == 200, signed_content.text
+    signed_reader = PdfReader(io.BytesIO(signed_content.content))
+    assert signed_reader.metadata["/ManorSignatureStatus"] == "completed"
+    assert signed_reader.metadata["/ManorSigner"] == "client@partner.com"
+    assert "Signed by client@partner.com" in (signed_reader.pages[0].extract_text() or "")
+    edit_signed = await client.put(
+        f"/api/v1/documents/{doc['id']}/file",
+        headers=headers,
+        files={"file": ("contract.pdf", source_buffer.getvalue(), "application/pdf")},
+    )
+    assert edit_signed.status_code == 409, edit_signed.text
+    text_edit = await client.put(
+        f"/api/v1/documents/{doc['id']}/content",
+        headers=headers,
+        json={"content": "Must not overwrite the signed PDF"},
+    )
+    assert text_edit.status_code == 409, text_edit.text
+    unchanged = await client.get(f"/api/v1/shared-doc/{token}/content")
+    assert unchanged.content == signed_content.content
+
+    final_rows = await client.get(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+    )
+    assert final_rows.json()[0]["status"] == "completed"
+    assert final_rows.json()[0]["viewed_at"]
+    assert final_rows.json()[0]["signed_at"]
+    access_log = await client.get(
+        f"/api/v1/documents/{doc['id']}/access-log",
+        headers=headers,
+    )
+    assert access_log.status_code == 200, access_log.text
+    access_actions = {row["action"] for row in access_log.json()}
+    assert {
+        "signature_request_create",
+        "signature_request_view",
+        "signature_complete",
+    } <= access_actions
+    second_request = await client.post(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+        json={
+            "recipient_name": "Another Client",
+            "recipient_email": "another@partner.com",
+            "placement": {"page": 1, "x": 0.62, "y": 0.78, "width": 0.30, "height": 0.12},
+        },
+    )
+    assert second_request.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_signature_request_delivery_failure_resend_rotates_and_revoke_invalidates(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+):
+    from PIL import Image, ImageDraw
+    from pypdf import PdfWriter
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    headers = await _auth(client, "signaturelifecycle")
+    await _connect_signature_mailbox(client, headers)
+    source_buffer = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    writer.write(source_buffer)
+    upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("agreement.pdf", source_buffer.getvalue(), "application/pdf")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc = upload.json()
+
+    async def fail_email(_credentials: dict, *, to: str, subject: str, content: str,
+                         sender_name: str, expected_sender: str) -> bool:
+        return False
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_connected_email",
+        fail_email,
+    )
+    created = await client.post(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+        json={
+            "recipient_name": "Retry Client",
+            "recipient_email": "retry@partner.com",
+            "placement": {"page": 1, "x": 0.62, "y": 0.78, "width": 0.30, "height": 0.12},
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["delivery_status"] == "failed"
+    request_id = created.json()["id"]
+    old_token = created.json()["url"].rsplit("/", 1)[-1]
+
+    otp_codes: dict[str, str] = {}
+    async def deliver_email(_credentials: dict, *, to: str, subject: str, content: str,
+                            sender_name: str, expected_sender: str) -> bool:
+        if subject.startswith("Verify your email"):
+            import re
+            otp_codes[to] = re.search(r"\b\d{6}\b", content).group(0)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.email_service.send_connected_email",
+        deliver_email,
+    )
+    resent = await client.post(
+        f"/api/v1/documents/{doc['id']}/signature-requests/{request_id}/resend",
+        headers=headers,
+    )
+    assert resent.status_code == 200, resent.text
+    assert resent.json()["delivery_status"] == "sent"
+    new_token = resent.json()["url"].rsplit("/", 1)[-1]
+    assert new_token != old_token
+    old_link = await client.get(f"/api/v1/shared-doc/{old_token}/signature-request")
+    assert old_link.status_code == 404
+
+    changed_buffer = io.BytesIO()
+    changed_writer = PdfWriter()
+    changed_writer.add_blank_page(width=612, height=792)
+    changed_writer.add_blank_page(width=612, height=792)
+    changed_writer.write(changed_buffer)
+    changed = await client.put(
+        f"/api/v1/documents/{doc['id']}/file",
+        headers=headers,
+        files={"file": ("agreement.pdf", changed_buffer.getvalue(), "application/pdf")},
+    )
+    assert changed.status_code == 200, changed.text
+
+    await client.post(
+        f"/api/v1/shared-doc/{new_token}/request-otp",
+        json={"email": "retry@partner.com"},
+    )
+    verified = await client.post(
+        f"/api/v1/shared-doc/{new_token}/verify-otp",
+        json={"email": "retry@partner.com", "code": otp_codes["retry@partner.com"]},
+    )
+    assert verified.status_code == 200, verified.text
+    signature_image = Image.new("RGBA", (200, 80), (0, 0, 0, 0))
+    ImageDraw.Draw(signature_image).line(
+        [(10, 60), (80, 10), (190, 55)], fill=(20, 20, 20, 255), width=7,
+    )
+    signature_buffer = io.BytesIO()
+    signature_image.save(signature_buffer, format="PNG")
+    stale_signature = await client.post(
+        f"/api/v1/shared-doc/{new_token}/signature",
+        json={
+            "signature_data_url": "data:image/png;base64," + base64.b64encode(
+                signature_buffer.getvalue()
+            ).decode("ascii"),
+            "consent": True,
+        },
+    )
+    assert stale_signature.status_code == 409, stale_signature.text
+    assert "signature_request.document_changed" in stale_signature.text
+
+    revoked = await client.delete(
+        f"/api/v1/documents/{doc['id']}/signature-requests/{request_id}",
+        headers=headers,
+    )
+    assert revoked.status_code == 204, revoked.text
+    current_link = await client.get(f"/api/v1/shared-doc/{new_token}/signature-request")
+    assert current_link.status_code == 404
+    rows = await client.get(
+        f"/api/v1/documents/{doc['id']}/signature-requests",
+        headers=headers,
+    )
+    assert rows.status_code == 200
+    assert rows.json()[0]["status"] == "revoked"
+    assert "url" not in rows.json()[0] or rows.json()[0]["url"] is None
+
+
+@pytest.mark.asyncio
 async def test_shared_doc_otp_releases_database_locks_before_email_provider(
     client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1395,7 +2330,7 @@ async def test_trash_immediately_revokes_external_share(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_deleted_workspace_blocks_document_acl_and_public_share_until_restore(
+async def test_deleted_workspace_retains_document_acl_and_explicit_public_share(
     client: AsyncClient,
     db_session: AsyncSession,
 ):
@@ -1431,16 +2366,16 @@ async def test_deleted_workspace_blocks_document_acl_and_public_share_until_rest
         headers=headers,
     )
     assert deleted.status_code == 204, deleted.text
-    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 410
+    assert (await client.get(f"/api/v1/shared-doc/{token}")).status_code == 200
     assert (
         await client.get(
             f"/api/v1/documents/{doc['id']}",
             headers=headers,
         )
-    ).status_code == 404
+    ).status_code == 200
     listed_while_deleted = await client.get("/api/v1/documents", headers=headers)
     assert listed_while_deleted.status_code == 200, listed_while_deleted.text
-    assert doc["id"] not in {
+    assert doc["id"] in {
         item["id"] for item in listed_while_deleted.json()["items"]
     }
     assert (
@@ -1448,7 +2383,7 @@ async def test_deleted_workspace_blocks_document_acl_and_public_share_until_rest
             f"/api/v1/documents/{doc['id']}/grants",
             headers=headers,
         )
-    ).status_code == 404
+    ).status_code == 200
     access_request = await client.post(
         "/api/v1/permissions/access-requests",
         headers=headers,
@@ -1458,7 +2393,7 @@ async def test_deleted_workspace_blocks_document_acl_and_public_share_until_rest
             "requested_capabilities": [Capability.VIEW],
         },
     )
-    assert access_request.status_code == 404, access_request.text
+    assert access_request.status_code == 200, access_request.text
 
     restored = await client.post(
         f"/api/v1/workspaces/{workspace_data['id']}/restore",
@@ -1592,10 +2527,10 @@ async def test_bulk_reindex_serializes_with_workspace_delete(
 
     response = await asyncio.wait_for(reindex_task, timeout=5)
     assert response.status_code == 200, response.text
-    assert response.json()["count"] == 1
+    assert response.json()["count"] == 2
     await db_session.refresh(workspace_row)
     await db_session.refresh(global_row)
-    assert workspace_row.vector_status == VectorStatus.READY
+    assert workspace_row.vector_status == VectorStatus.PENDING
     assert global_row.vector_status == VectorStatus.PENDING
 
 
@@ -1659,7 +2594,7 @@ async def test_document_permission_writes_serialize_with_workspace_delete(
         await deleting_db.commit()
 
     response = await asyncio.wait_for(request_task, timeout=5)
-    assert response.status_code == 404, response.text
+    assert response.status_code == (201 if surface == "share" else 200), response.text
 
     async with db_module.async_session() as verify_db:
         model = Share if surface == "share" else ResourceGrantPending
@@ -1667,11 +2602,11 @@ async def test_document_permission_writes_serialize_with_workspace_delete(
             model.entity_id == workspace_data["entity_id"],
             model.resource_id == doc["id"],
         ))
-        assert created == 0
+        assert created == 1
 
 
 @pytest.mark.asyncio
-async def test_document_content_write_rechecks_workspace_delete_inside_fs_boundary(
+async def test_document_content_write_survives_source_workspace_delete_inside_fs_boundary(
     client: AsyncClient,
     db_session: AsyncSession,
     tmp_path: Path,
@@ -1707,15 +2642,15 @@ async def test_document_content_write_rechecks_workspace_delete_inside_fs_bounda
         write_task = asyncio.create_task(client.put(
             f"/api/v1/documents/{doc['id']}/content",
             headers=headers,
-            json={"content": "must not be committed"},
+            json={"content": "retained Knowledge edit"},
         ))
         await asyncio.sleep(0.1)
         assert write_task.done() is False
         await deleting_db.commit()
 
     response = await asyncio.wait_for(write_task, timeout=5)
-    assert response.status_code == 404, response.text
-    assert Path(tmp_path, doc["entity_id"], doc["fs_path"]).read_bytes() == b"hello"
+    assert response.status_code == 200, response.text
+    assert Path(tmp_path, doc["entity_id"], doc["fs_path"]).read_bytes() == b"retained Knowledge edit"
 
 
 @pytest.mark.asyncio
@@ -1828,7 +2763,7 @@ async def test_public_document_share_serializes_with_workspace_delete(
         await deleting_db.commit()
 
     response = await asyncio.wait_for(request_task, timeout=5)
-    assert response.status_code == 410, response.text
+    assert response.status_code == 200, response.text
 
 
 @pytest.mark.asyncio
@@ -2755,6 +3690,56 @@ async def test_shared_doc_office_preview_reads_are_token_scoped(
         assert image.content == png
         assert image.headers["content-disposition"].startswith("inline")
         assert image.headers["cache-control"] == "private, no-store"
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
+async def test_shared_doc_slide_preview_is_admission_bounded(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A busy render queue answers a retryable 503 instead of holding the request."""
+    from packages.core.config import get_settings
+    from packages.core.services import slide_renderer
+
+    settings = get_settings()
+    old_root, old_enabled = settings.MANOR_FS_ROOT, settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    seen_kwargs: dict = {}
+
+    async def busy_render(*_args, **kwargs):
+        seen_kwargs.update(kwargs)
+        raise slide_renderer.OfficeRenderBusyError("render slots busy")
+
+    monkeypatch.setattr(slide_renderer, "render_slides", busy_render)
+    try:
+        headers = await _auth(client, "sharedslidesbusy")
+        doc = await _upload(
+            client,
+            headers,
+            name="presentation.pptx",
+            body=_office_fixture("ppt/presentation.xml"),
+        )
+        share = await client.post(
+            f"/api/v1/documents/{doc['id']}/shares",
+            headers=headers,
+            json={"audience_type": "anonymous", "capabilities": ["view"], "allow_download": False},
+        )
+        assert share.status_code == 201, share.text
+        token = share.json()["token"]
+        opened = await client.get(f"/api/v1/shared-doc/{token}")
+        assert opened.status_code == 200, opened.text
+
+        preview = await client.get(f"/api/v1/shared-doc/{token}/preview/slides")
+        assert preview.status_code == 503, preview.text
+        assert preview.json()["detail"]["code"] == "office_render_busy"
+        assert preview.headers["retry-after"]
+        assert seen_kwargs["admission_timeout"] == slide_renderer.INTERACTIVE_RENDER_ADMISSION_TIMEOUT_SECONDS
+        assert callable(seen_kwargs["should_abandon"])
     finally:
         settings.MANOR_FS_ROOT = old_root
         settings.MANOR_FS_ENABLED = old_enabled

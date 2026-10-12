@@ -71,7 +71,11 @@ services:
       retries: 10
 
   minio:
-    image: minio/minio
+    # minio/minio was removed from Docker Hub (2026-10). Chainguard's rebuild;
+    # the -dev variant ships busybox wget for the healthcheck. Run as root so
+    # volumes created by the old root-run image stay writable.
+    image: cgr.dev/chainguard/minio:latest-dev
+    user: "0:0"
     container_name: manor-os-minio
     restart: unless-stopped
     command: server /data --console-address ":9001"
@@ -84,7 +88,7 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -179,7 +183,7 @@ services:
     # Mounts JuiceFS (privileged + /dev/fuse via entrypoint.sh). Give the app
     # plus the FUSE layer time to flush cache to MinIO and unmount cleanly on
     # stop — the default 10s can SIGKILL mid-flush and leave a wedged mount the
-    # daemon then can't kill (the deploy self-heal in deploy.yml is the net).
+    # daemon then cannot unmount it cleanly during the next restart.
     stop_grace_period: 30s
     privileged: true
     devices:
@@ -211,6 +215,7 @@ services:
       - ${API_TIMEOUT_KEEP_ALIVE:-5}
     environment: &api-env
       MANOR_SERVICE_ROLE: api
+      PMS_API_URL: ${PMS_API_URL:-https://portfolio.manorai.xyz/api/mcp}
       MANOR_STARTUP_SIDE_EFFECTS_OWNER: ${MANOR_STARTUP_SIDE_EFFECTS_OWNER:-true}
       API_WORKERS: ${API_WORKERS:-1}
       API_LIMIT_CONCURRENCY: ${API_LIMIT_CONCURRENCY:-120}
@@ -222,6 +227,13 @@ services:
       DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-2}
       DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-10}
       DATABASE_POOL_RECYCLE: ${DATABASE_POOL_RECYCLE:-1800}
+      DATABASE_ADMISSION_LIMIT: ${DATABASE_ADMISSION_LIMIT:-0}
+      DATABASE_MAX_WAITERS: ${DATABASE_MAX_WAITERS:-14}
+      DATABASE_ADMISSION_TIMEOUT: ${DATABASE_ADMISSION_TIMEOUT:-2}
+      DATABASE_HOLD_WARN_SECONDS: ${DATABASE_HOLD_WARN_SECONDS:-5}
+      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-0}
+      DATABASE_LOCK_TIMEOUT_MS: ${DATABASE_LOCK_TIMEOUT_MS:-0}
+      DATABASE_IDLE_TRANSACTION_TIMEOUT_MS: ${DATABASE_IDLE_TRANSACTION_TIMEOUT_MS:-0}
       REDIS_URL: redis://redis:6379/0
       RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-false}
       CHAT_RATE_LIMIT_ENABLED: ${CHAT_RATE_LIMIT_ENABLED:-false}
@@ -248,7 +260,7 @@ services:
       DOCUMENT_FILE_REPAIR_ENABLED: ${DOCUMENT_FILE_REPAIR_ENABLED:-true}
       DOCUMENT_FILE_STALE_HEAL_ENABLED: ${DOCUMENT_FILE_STALE_HEAL_ENABLED:-true}
       SANDBOX_SERVICE_URL: http://manor-sandbox:8000
-      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-}
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
       SHELL_SANDBOX_ENABLED: "true"
       CELERY_BROKER_URL: redis://redis:6379/2
       CELERY_RESULT_BACKEND: redis://redis:6379/3
@@ -379,10 +391,12 @@ services:
 
   # ── Workers ──
   #
-  # Two Celery worker roles consume the queues declared in packages/core/queues.py:
-  #   manor-worker       -Q celery,interactive,recovery-v2 — control, Chat,
-  #                        and version-isolated settlement recovery
-  #   manor-worker-heavy -Q heavy,work — long work plus one-release legacy drain
+  # Four Celery worker roles consume the queues declared in packages/core/queues.py:
+  #   manor-worker         -Q interactive,recovery-v2 — Chat turns and
+  #                          version-isolated settlement recovery
+  #   manor-worker-control -Q celery — sandbox scheduler, runtime outbox, lease ticks
+  #   manor-worker-ops     -Q ops — host/container monitoring (Docker walks)
+  #   manor-worker-heavy   -Q heavy,work — long work plus one-release legacy drain
   #
   # Celery beat stays in manor-beat as a single process, so scaling
   # manor-worker does not duplicate scheduled dispatch.
@@ -397,7 +411,7 @@ services:
     # tasks against it. Give in-flight tasks plus the FUSE layer time to drain,
     # flush cache to MinIO, and unmount cleanly on stop — the default 10s can
     # SIGKILL mid-flush and leave a wedged mount the daemon can't kill, which is
-    # exactly what failed the 2026-06-02 deploy (deploy.yml self-heal is the net).
+    # a later worker restart cannot recover without manual mount cleanup.
     stop_grace_period: 30s
     privileged: true
     devices:
@@ -407,15 +421,28 @@ services:
       # ops.log_scan need read access to the Docker daemon to inspect
       # peer containers + tail their stderr. Read-only.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: celery -A packages.core.celery_app worker --hostname manor-worker@%h -l info -Q celery,interactive,recovery-v2 -c ${WORKER_CONTROL_CONCURRENCY:-2}
+    # Interactive turns only. The control plane (queue ``celery``: sandbox
+    # scheduler, runtime outbox, lease ticks) lives in
+    # manor-worker-control below — sharing one small pool let two concurrent
+    # chat turns starve every scheduler tick, and a queued sandbox ticket then
+    # sat unallocated with runner capacity free until a chat finished.
+    command: celery -A packages.core.celery_app worker --hostname manor-worker@%h -l info -Q interactive,recovery-v2 -c ${WORKER_INTERACTIVE_CONCURRENCY:-2}
     environment: &worker-env
       MANOR_SERVICE_ROLE: worker
+      PMS_API_URL: ${PMS_API_URL:-https://portfolio.manorai.xyz/api/mcp}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-manor}:${POSTGRES_PASSWORD:-manor_secret}@postgres:5432/${POSTGRES_DB:-manor}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-5}
       DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-2}
       DATABASE_POOL_TIMEOUT: ${DATABASE_POOL_TIMEOUT:-10}
       DATABASE_POOL_RECYCLE: ${DATABASE_POOL_RECYCLE:-1800}
+      DATABASE_ADMISSION_LIMIT: ${DATABASE_ADMISSION_LIMIT:-0}
+      DATABASE_MAX_WAITERS: ${DATABASE_MAX_WAITERS:-14}
+      DATABASE_ADMISSION_TIMEOUT: ${DATABASE_ADMISSION_TIMEOUT:-2}
+      DATABASE_HOLD_WARN_SECONDS: ${DATABASE_HOLD_WARN_SECONDS:-5}
+      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-0}
+      DATABASE_LOCK_TIMEOUT_MS: ${DATABASE_LOCK_TIMEOUT_MS:-0}
+      DATABASE_IDLE_TRANSACTION_TIMEOUT_MS: ${DATABASE_IDLE_TRANSACTION_TIMEOUT_MS:-0}
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/2
       CELERY_RESULT_BACKEND: redis://redis:6379/3
@@ -428,6 +455,8 @@ services:
       JUICEFS_EXPECTED_BUCKET: ${JUICEFS_EXPECTED_BUCKET:-}
       DOCUMENT_FILE_REPAIR_ENABLED: ${DOCUMENT_FILE_REPAIR_ENABLED:-true}
       DOCUMENT_FILE_STALE_HEAL_ENABLED: ${DOCUMENT_FILE_STALE_HEAL_ENABLED:-true}
+      SANDBOX_SERVICE_URL: ${SANDBOX_SERVICE_URL:-http://manor-sandbox:8000}
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
       EMBEDDING_BASE_URL: http://ollama:11434/v1
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-mxbai-embed-large}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
@@ -475,6 +504,14 @@ services:
       manor-migration:
         condition: service_completed_successfully
 
+  manor-worker-room:
+    <<: *worker-runtime-service
+    container_name: manor-worker-room
+    command: celery -A packages.core.celery_app worker --hostname manor-worker-room@%h -l info -Q room-agents -c ${WORKER_ROOM_CONCURRENCY:-2}
+    environment:
+      <<: *worker-env
+      MANOR_SERVICE_ROLE: worker-room
+
   manor-worker-heavy:
     <<: *worker-runtime-service
     container_name: manor-worker-heavy
@@ -483,6 +520,34 @@ services:
       <<: *worker-env
       MANOR_SERVICE_ROLE: worker-heavy
       OPS_HEALTH_URL: ${OPS_HEALTH_URL:-http://manor-api:8000/health/deep}
+
+  manor-worker-control:
+    <<: *worker-runtime-service
+    container_name: manor-worker-control
+    # Control plane on its own pool: short periodic ticks whose beat entries
+    # carry ``expires``, so they must never wait behind a long chat turn.
+    command: celery -A packages.core.celery_app worker --hostname manor-worker-control@%h -l info -Q celery -c ${WORKER_CONTROL_CONCURRENCY:-2}
+    environment:
+      <<: *worker-env
+      # Same runtime role as manor-worker (entrypoint / role validation know
+      # "worker"); only the queue set differs.
+      MANOR_SERVICE_ROLE: worker
+
+  manor-worker-ops:
+    <<: *worker-runtime-service
+    container_name: manor-worker-ops
+    # Monitoring on its own pool: ops.collect_snapshot / ops.log_scan walk
+    # Docker once per running container (seconds on a busy host). On the
+    # control pool that held one of two slots and the 1-2 s scheduler and
+    # outbox ticks were discarded meanwhile. Needs the Docker socket (from the
+    # anchor) but no JuiceFS mount.
+    command: celery -A packages.core.celery_app worker --hostname manor-worker-ops@%h -l info -Q ops -c ${WORKER_OPS_CONCURRENCY:-1}
+    privileged: false
+    devices: []
+    environment:
+      <<: *worker-env
+      MANOR_SERVICE_ROLE: worker
+      MANOR_FS_ENABLED: "false"
 
   manor-beat:
     <<: *worker-runtime-service
@@ -531,7 +596,7 @@ services:
     # to settle. Default 10s sometimes wasn't enough during deploy windows.
     stop_grace_period: 30s
     ports:
-      - "8110:8000"
+      - "127.0.0.1:8110:8000"
     volumes:
       # Sandbox service needs host Docker daemon to spawn skill containers
       - /var/run/docker.sock:/var/run/docker.sock
@@ -539,8 +604,11 @@ services:
       MANOR_SERVICE_ROLE: sandbox
       SANDBOX_HOST: "0.0.0.0"
       SANDBOX_PORT: "8000"
-      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-}
+      SANDBOX_API_TOKEN: ${SANDBOX_API_TOKEN:-manor-local-sandbox-token-change-me}
       SANDBOX_IMAGE: ${SANDBOX_IMAGE:-sandbox-skill:latest}
+      # Separate local skill containers from other sandbox deployments that
+      # share this host Docker daemon (their startup orphan sweep is scoped).
+      SANDBOX_SERVICE_SCOPE: ${SANDBOX_SERVICE_SCOPE:-manor-os}
       SANDBOX_NETWORK: ${SANDBOX_NETWORK:-bridge}
       # The general sandbox uses bridge for managed skill sessions. The
       # ephemeral Chat bash runner explicitly requests `none` so code-lab

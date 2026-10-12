@@ -126,6 +126,8 @@ async def channel_callback(
         "chat_id": parsed.reply_to,
         "content": parsed.content,
     }
+    if parsed.attachments:
+        dispatch_kwargs["attachments"] = parsed.attachments
 
     def enqueue_or_raise() -> None:
         try:
@@ -148,6 +150,7 @@ async def channel_callback(
                     "from": parsed.source_id,
                     "to": parsed.reply_to,
                     "content": parsed.content,
+                    "attachments": parsed.attachments,
                     "message_id": parsed.external_message_id,
                     "channel_type": channel_type,
                     "metadata": {

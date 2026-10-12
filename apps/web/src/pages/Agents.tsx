@@ -1,7 +1,9 @@
+import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import React, { useEffect, useState, useRef } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, type AgentDeploymentResponse } from "../lib/api";
+import { agentListQueryOptions, deploymentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
@@ -396,6 +398,7 @@ function agentWorkspaceItems(deployments?: AgentDeploymentResponse[]) {
 
 export default function Agents() {
   const queryClient = useQueryClient();
+  const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
@@ -430,8 +433,7 @@ export default function Agents() {
 
 
   const { data: myAgents, isLoading: myLoading } = useQuery({
-    queryKey: ["agents", "my"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
   const myAgentIds = React.useMemo(
     () =>
@@ -443,21 +445,8 @@ export default function Agents() {
   );
 
   const { data: agentDeploymentsById } = useQuery<AgentDeploymentMap>({
-    queryKey: ["agent-deployments", "my", myAgentIds.join(",")],
-    queryFn: async () => {
-      const entries = await Promise.all(
-        myAgentIds.map(async (agentId) => {
-          try {
-            const deployments = await api.agents.deployments(agentId);
-            return [agentId, deployments] as const;
-          } catch {
-            return [agentId, []] as const;
-          }
-        }),
-      );
-      return Object.fromEntries(entries);
-    },
-    enabled: tab === "my" && myAgentIds.length > 0,
+    ...deploymentListQueryOptions(catalogScope, myAgentIds),
+    enabled: !!catalogScope && tab === "my" && myAgentIds.length > 0,
   });
 
 
@@ -474,7 +463,9 @@ export default function Agents() {
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.agents.delete(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       if (deleteIsUnsubscribeRef.current) {
         toast.success(t("page.agents.unsubscribed"));
         deleteIsUnsubscribeRef.current = false;
@@ -547,7 +538,8 @@ export default function Agents() {
       await api.agents.update(promptAgent.id as string, {
         system_prompt: editPromptText,
       });
-      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       toast.success(t("page.agents.prompt_saved"));
       setPromptModal(false);
     } catch {
@@ -1071,7 +1063,9 @@ export default function Agents() {
         open={showImportModal}
         onClose={() => setShowImportModal(false)}
         onImported={() => {
-          queryClient.invalidateQueries({ queryKey: ["agents"] });
+          invalidateCatalogQueries(queryClient, "agents");
+          invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+          queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
           setTab("my");
         }}
       />

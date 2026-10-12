@@ -8,11 +8,13 @@ import pytest
 from httpx import AsyncClient
 from types import SimpleNamespace
 
+from tests.auth_helpers import register_user_and_get_token
+
 
 async def _auth(client: AsyncClient, username: str = "wfuser") -> dict:
-    resp = await client.post("/api/v1/auth/register", json={
+    resp = await register_user_and_get_token(client, json={
         "username": username, "email": f"{username}@test.com",
-        "password": "pass123", "entity_name": "Workflow Corp",
+        "password": "WorkflowApprovalTest123!", "entity_name": "Workflow Corp",
     })
     data = resp.json()
     return {"Authorization": f"Bearer {data['access_token']}"}
@@ -30,6 +32,54 @@ async def _create_workspace(
     )
     assert response.status_code == 201, response.text
     return response.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_flow_list_excludes_deleted_workspace_and_internal_blueprint_flows(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowDefinition, WorkflowTemplateInstallation
+    from packages.core.services.entity_service import soft_delete_workspace
+
+    headers = await _auth(client, "flow_list_lifecycle")
+    active_id = await _create_workspace(client, headers, "Video Studio")
+    deleted_id = await _create_workspace(client, headers, "Old Video Studio")
+    owner = (await db_session.execute(
+        select(User).where(User.email == "flow_list_lifecycle@test.com")
+    )).scalar_one()
+    definitions = [
+        WorkflowDefinition(entity_id=owner.entity_id, created_by=owner.id, name="Standalone"),
+        WorkflowDefinition(entity_id=owner.entity_id, created_by=owner.id,
+                           workspace_id=active_id, name="Create Video"),
+        WorkflowDefinition(entity_id=owner.entity_id, created_by=owner.id,
+                           workspace_id=active_id, name="Internal Executor"),
+        WorkflowDefinition(entity_id=owner.entity_id, created_by=owner.id,
+                           workspace_id=deleted_id, name="Create Video"),
+    ]
+    db_session.add_all(definitions)
+    await db_session.flush()
+    db_session.add(WorkflowTemplateInstallation(
+        entity_id=owner.entity_id,
+        template_id=f"blueprint:{active_id}",
+        component_key="internal-executor",
+        workflow_id=definitions[2].id,
+        source_type="workspace_blueprint",
+        installation_metadata={"internal": True},
+    ))
+    await db_session.commit()
+    assert await soft_delete_workspace(db_session, deleted_id, owner.entity_id)
+    await db_session.commit()
+
+    response = await client.get("/api/v1/workflows", headers=headers)
+    assert response.status_code == 200, response.text
+    assert {flow["id"] for flow in response.json()} == {definitions[0].id, definitions[1].id}
+    scoped = next(flow for flow in response.json() if flow["name"] == "Create Video")
+    assert scoped["workspace_id"] == active_id
+    assert scoped["workspace_name"] == "Video Studio"
 
 
 def _simple_steps(step_ids: list[str]) -> list[dict]:
@@ -52,6 +102,25 @@ def _simple_steps(step_ids: list[str]) -> list[dict]:
         steps.append(step)
     steps.append({"id": "end", "type": "end", "name": "Done", "config": {}, "next": []})
     return steps
+
+
+async def _execute_created_retry(
+    client: AsyncClient,
+    headers: dict,
+    response,
+) -> dict:
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    assert response.status_code == 201, response.text
+    created = response.json()
+    assert created["status"] == "running"
+    await WorkflowRunner().run(created["id"])
+    refreshed = await client.get(
+        f"/api/v1/workflows/runs/{created['id']}",
+        headers=headers,
+    )
+    assert refreshed.status_code == 200, refreshed.text
+    return refreshed.json()
 
 
 @pytest.mark.asyncio
@@ -92,7 +161,7 @@ async def test_start_workflow_rejects_workspace_from_another_entity(
 
 
 @pytest.mark.asyncio
-async def test_start_workflow_requires_a_real_active_workspace(
+async def test_start_workflow_allows_manual_work_but_not_automatic_work_when_paused(
     client: AsyncClient,
     db_session,
 ):
@@ -124,12 +193,24 @@ async def test_start_workflow_requires_a_real_active_workspace(
     )).scalar_one()
     entity_id = str(owner.entity_id)
 
+    run = await start_workflow(
+        db_session,
+        entity_id,
+        workflow.json()["id"],
+        workspace_id=workspace.json()["id"],
+        started_by=owner.id,
+    )
+    assert run.workspace_id == workspace.json()["id"]
+    assert run.trigger_source == "manual"
+    await db_session.commit()
+
     with pytest.raises(ValueError, match="active Workspace"):
         await start_workflow(
             db_session,
             entity_id,
             workflow.json()["id"],
             workspace_id=workspace.json()["id"],
+            trigger_source="event",
         )
     await db_session.rollback()
 
@@ -423,9 +504,17 @@ def test_execution_trace_records_transition_metadata_and_enforces_caps():
     assert completed["artifact_refs"][0] == {"id": "artifact-0"}
     assert "do-not-store" not in json.dumps(completed["artifact_refs"])
     assert run.trigger_data["_workflow_history_summary"] == {
+        "schema_version": 2,
         "business_outcome": "needs_input",
         "processed_count": 1,
         "total_count": 1,
+        "workflow_steps": [{
+            "id": "render",
+            "name": "Render",
+            "type": "tool",
+            "status": "completed",
+            "child_run_ids": ["child-1", "child-2"],
+        }],
         "artifact_count": 64,
         "blocker": "Browser disconnected",
     }
@@ -450,6 +539,7 @@ def test_workflow_run_trigger_data_drops_caller_supplied_history_summary():
     )
     trigger_data = _attempt_trigger_data(workflow, {
         "request": "Create a product video",
+        "_workspace_user_request": {"user_id": "forged-user"},
         "_workflow_history_summary": {
             "business_outcome": "accepted",
             "processed_count": 999,
@@ -461,6 +551,26 @@ def test_workflow_run_trigger_data_drops_caller_supplied_history_summary():
 
     assert trigger_data["request"] == "Create a product video"
     assert "_workflow_history_summary" not in trigger_data
+    assert "_workspace_user_request" not in trigger_data
+
+
+@pytest.mark.parametrize(
+    "started_by,user_request,expected",
+    [
+        ("owner", {"user_id": "owner"}, {"_workspace_user_request": {"user_id": "owner"}}),
+        ("owner", {"user_id": "other-user"}, {}),
+        ("owner", None, {}),
+        (None, {"user_id": None}, {}),
+    ],
+)
+def test_child_workflow_inherits_only_matching_durable_user_request(started_by, user_request, expected):
+    from packages.core.ai.workflow_runner import _child_workflow_user_request
+
+    run = SimpleNamespace(
+        started_by=started_by,
+        trigger_data={"_workspace_user_request": user_request},
+    )
+    assert _child_workflow_user_request(run) == expected
 
 
 
@@ -529,6 +639,120 @@ def test_execution_trace_compacts_and_byte_caps_artifact_and_child_refs():
     assert "payload" not in json.dumps(entry["artifact_refs"])
     assert "artifact-secret-value" not in json.dumps(entry["artifact_refs"])
     assert "url-secret-value" not in json.dumps(entry["artifact_refs"])
+
+
+def test_workflow_execution_steps_append_not_reached_nodes_and_share_counts():
+    from types import SimpleNamespace
+
+    from packages.core.services.workflow_run_trace import (
+        workflow_execution_progress,
+        workflow_execution_steps,
+    )
+
+    run = SimpleNamespace(
+        definition_snapshot={
+            "nodes": [
+                {"id": "start", "name": "Start", "type": "trigger", "order": 0},
+                {
+                    "id": "unused_branch",
+                    "name": "Unused branch",
+                    "type": "stop",
+                    "order": 1,
+                },
+                {"id": "review", "name": "Review", "type": "wait", "order": 2},
+                {
+                    "id": "publish",
+                    "name": "Publish",
+                    "type": "subworkflow",
+                    "order": 3,
+                },
+                {"id": "done", "name": "Done", "type": "end", "order": 4},
+            ],
+        },
+        execution_trace=[
+            {"sequence": 1, "node_id": "start", "status": "running"},
+            {"sequence": 2, "node_id": "start", "status": "completed"},
+            {"sequence": 3, "node_id": "review", "status": "running"},
+            {"sequence": 4, "node_id": "review", "status": "completed"},
+            {
+                "sequence": 5,
+                "node_id": "publish",
+                "status": "running",
+                "child_run_ids": ["child-run-1"],
+            },
+            {
+                "sequence": 6,
+                "node_id": "publish",
+                "status": "failed",
+                "child_run_ids": ["child-run-1"],
+            },
+        ],
+        step_results={
+            "start": {"status": "completed"},
+            "review": {"status": "completed"},
+            "publish": {
+                "status": "failed",
+                "subrun_id": "child-run-1",
+            },
+        },
+        status="failed",
+        current_step_id="publish",
+        retry_of_run_id=None,
+    )
+
+    steps = workflow_execution_steps(run)
+
+    assert [(step["id"], step["status"]) for step in steps] == [
+        ("start", "completed"),
+        ("review", "completed"),
+        ("publish", "failed"),
+        ("unused_branch", "pending"),
+        ("done", "pending"),
+    ]
+    assert steps[2]["child_run_ids"] == ["child-run-1"]
+    assert workflow_execution_progress(steps) == {
+        "processed_count": 3,
+        "total_count": 5,
+    }
+
+
+def test_workflow_execution_steps_prepend_retry_receipts_and_keep_real_skips():
+    from types import SimpleNamespace
+
+    from packages.core.services.workflow_run_trace import workflow_execution_steps
+
+    run = SimpleNamespace(
+        definition_snapshot={
+            "nodes": [
+                {"id": "start", "name": "Start", "type": "trigger", "order": 0},
+                {"id": "prepare", "name": "Prepare", "type": "agent", "order": 1},
+                {"id": "optional", "name": "Optional", "type": "tool", "order": 2},
+                {"id": "publish", "name": "Publish", "type": "agent", "order": 3},
+            ],
+        },
+        execution_trace=[
+            {"sequence": 1, "node_id": "optional", "status": "running"},
+            {"sequence": 2, "node_id": "optional", "status": "skipped"},
+            {"sequence": 3, "node_id": "publish", "status": "running"},
+        ],
+        # Retry inheritance is a set in the persistence service, so JSON key
+        # order cannot be treated as execution order for these receipts.
+        step_results={
+            "prepare": {"status": "completed"},
+            "start": {"status": "completed"},
+            "optional": {"status": "skipped", "skipped": True},
+        },
+        status="running",
+        current_step_id="publish",
+        retry_of_run_id="prior-run",
+    )
+
+    assert [(step["id"], step["status"]) for step in workflow_execution_steps(run)] == [
+        ("start", "completed"),
+        ("prepare", "completed"),
+        ("optional", "skipped"),
+        ("publish", "running"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1581,6 +1805,188 @@ def test_retry_variables_do_not_flatten_a_completed_stage_output_into_cleanup_ke
     assert "input" not in variables
 
 
+def test_retry_variables_do_not_flatten_subworkflow_output_into_cleanup_keys():
+    from packages.core.services.workflow_service import _retry_variables
+
+    schema = {"type": "object", "required": ["artifact"]}
+    runtime_context = {"workspace_id": "workspace-1"}
+    child_output = {
+        "stickman_video_project_schema": schema,
+        "runtime_context": runtime_context,
+        "video_project": {"project_id": "project-1"},
+    }
+    workflow = SimpleNamespace(
+        variables={"stickman_video_project_schema": schema},
+        steps=[
+            {"id": "start", "type": "trigger", "next": ["create_video"]},
+            {
+                "id": "create_video",
+                "type": "subworkflow",
+                "config": {"output_var": "video_generation"},
+                "next": ["publish_video"],
+            },
+            {"id": "publish_video", "type": "subworkflow", "config": {}, "next": []},
+        ],
+    )
+    prior = SimpleNamespace(
+        variables={
+            "stickman_video_project_schema": schema,
+            "runtime_context": runtime_context,
+            "create_video": child_output,
+            "video_generation": child_output,
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "create_video": {"status": "completed", "output": child_output},
+            "publish_video": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start"},
+        None,
+        "create_video",
+    )
+
+    assert variables["stickman_video_project_schema"] == schema
+    assert variables["runtime_context"] == runtime_context
+    assert "create_video" not in variables
+    assert "video_generation" not in variables
+
+
+def test_retry_variables_restore_missing_definition_defaults():
+    from packages.core.services.workflow_service import _retry_variables
+
+    schema = {"type": "object", "required": ["artifact"]}
+    runtime_context = {"workspace_id": "workspace-1"}
+    child_output = {"video_project": {"project_id": "project-1"}}
+    workflow = SimpleNamespace(
+        variables={
+            "stickman_video_project_schema": schema,
+            "runtime_context": runtime_context,
+        },
+        steps=[
+            {"id": "start", "type": "trigger", "next": ["create_video"]},
+            {
+                "id": "create_video",
+                "type": "subworkflow",
+                "config": {"output_var": "video_generation"},
+                "next": ["publish_video"],
+            },
+            {"id": "publish_video", "type": "subworkflow", "config": {}, "next": []},
+        ],
+    )
+    prior = SimpleNamespace(
+        variables={
+            "create_video": child_output,
+            "video_generation": child_output,
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "create_video": {"status": "completed", "output": child_output},
+            "publish_video": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start"},
+        None,
+        "create_video",
+    )
+
+    assert variables["stickman_video_project_schema"] == schema
+    assert variables["runtime_context"] == runtime_context
+    assert "create_video" not in variables
+    assert "video_generation" not in variables
+
+
+def test_retry_variables_refresh_stale_definition_schema_without_replacing_inputs():
+    from packages.core.services.workflow_service import _retry_variables
+
+    current_schema = {
+        "type": "object",
+        "properties": {
+            "artifact": {
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string"},
+                    "filename": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    }
+    stale_schema = deepcopy(current_schema)
+    del stale_schema["properties"]["artifact"]["properties"]["document_id"]
+    generated_video = {"video_source": "Workspaces/example/final/video.mp4"}
+    workflow = SimpleNamespace(
+        variables={
+            "stickman_video_project_schema": current_schema,
+            "target_duration": 120,
+        },
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "config": {
+                    "run_inputs": [
+                        {
+                            "key": "target_duration",
+                            "target": "target_duration",
+                        },
+                    ],
+                },
+                "next": ["generate_video"],
+            },
+            {
+                "id": "generate_video",
+                "type": "tool",
+                "config": {"output_var": "video_generation"},
+                "next": ["claim_video_project"],
+            },
+            {
+                "id": "claim_video_project",
+                "type": "tool",
+                "config": {},
+                "next": [],
+            },
+        ],
+    )
+    prior = SimpleNamespace(
+        variables={
+            "stickman_video_project_schema": stale_schema,
+            "target_duration": 20,
+            "generate_video": generated_video,
+            "video_generation": generated_video,
+        },
+        step_results={
+            "start": {"status": "completed"},
+            "generate_video": {
+                "status": "completed",
+                "output": generated_video,
+            },
+            "claim_video_project": {"status": "failed"},
+        },
+    )
+
+    variables = _retry_variables(
+        workflow,
+        prior,
+        {"start", "generate_video"},
+        None,
+        "claim_video_project",
+    )
+
+    assert variables["stickman_video_project_schema"] == current_schema
+    assert variables["target_duration"] == 20
+    assert variables["generate_video"] == generated_video
+    assert variables["video_generation"] == generated_video
+
+
 def test_retry_variable_patch_resolves_run_inputs_from_nested_targets():
     from packages.core.services.workflow_service import _validate_retry_variable_patch
 
@@ -1647,6 +2053,32 @@ def test_retry_variable_patch_resolves_run_inputs_from_nested_targets():
     }
 
 
+def test_retry_variable_patch_accepts_frozen_execution_view_without_description():
+    from packages.core.services.workflow_service import _validate_retry_variable_patch
+
+    workflow = SimpleNamespace(
+        id="workflow-release",
+        name="Prepare release",
+        variables={"change_request": ""},
+        steps=[{
+            "id": "start",
+            "type": "trigger",
+            "config": {"run_inputs": [{
+                "key": "change_request",
+                "type": "string",
+                "schema": {"type": "string"},
+            }]},
+        }],
+    )
+    prior = SimpleNamespace(workspace_id="workspace-release", variables={})
+
+    assert _validate_retry_variable_patch(
+        workflow,
+        prior,
+        {"change_request": "formatting feedback"},
+    ) == {"change_request": "formatting feedback"}
+
+
 @pytest.mark.asyncio
 async def test_retry_refreshes_the_latest_durable_project_revision(db_session):
     from packages.core.services.workflow_project_service import (
@@ -1696,6 +2128,78 @@ async def test_retry_refreshes_the_latest_durable_project_revision(db_session):
     assert variables["project"]["revision"] == 1
     assert variables["project"]["state"]["phase"] == "discovery"
     assert variables["project"]["last_run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_stickman_publication_claim_rejects_a_stale_video_revision(
+    db_session,
+):
+    from packages.core.services.workflow_project_service import (
+        WorkflowProjectConflict,
+        create_workflow_project,
+        patch_workflow_project,
+    )
+
+    state = {
+        "artifact": {
+            "document_id": "document-stickman",
+            "fs_path": "runs/stickman/final.mp4",
+            "filename": "final.mp4",
+            "sha256": "a" * 64,
+        },
+        "publication": {
+            "title": "Verified Stickman video",
+            "description": "Ready for operator review",
+            "audience": "not_made_for_kids",
+            "visibility": "public",
+            "review_status": "draft",
+        },
+        "topic": {
+            "reservation_id": "topic-stickman",
+            "selected_topic": "A practical lesson",
+        },
+    }
+    project = await create_workflow_project(
+        db_session,
+        entity_id="entity-stickman-publish",
+        workspace_id="workspace-stickman-publish",
+        project_type="stickman_video",
+        project_key="topic-stickman",
+        state=state,
+        created_by="user-stickman-publish",
+        current_stage="video_ready",
+        last_run_id="generation-run",
+    )
+    await db_session.commit()
+
+    approved_state = deepcopy(state)
+    approved_state["publication"]["review_status"] = "approved"
+    winner = await patch_workflow_project(
+        db_session,
+        project_id=project.id,
+        entity_id="entity-stickman-publish",
+        workspace_id="workspace-stickman-publish",
+        expected_revision=0,
+        state=approved_state,
+        current_stage="publishing",
+        last_run_id="publisher-a",
+    )
+
+    with pytest.raises(WorkflowProjectConflict):
+        await patch_workflow_project(
+            db_session,
+            project_id=project.id,
+            entity_id="entity-stickman-publish",
+            workspace_id="workspace-stickman-publish",
+            expected_revision=0,
+            state=approved_state,
+            current_stage="publishing",
+            last_run_id="publisher-b",
+        )
+
+    assert winner.revision == 1
+    assert winner.current_stage == "publishing"
+    assert winner.last_run_id == "publisher-a"
 
 
 @pytest.mark.asyncio
@@ -1808,7 +2312,10 @@ async def test_manor_agent_workflow_tools_crud_deploy_and_run(client: AsyncClien
     assert updated["ok"] is True
     assert updated["workflow"]["version"] == version + 1
 
-    async def fake_ai_edit(prompt, current_steps, generated_entity_id):
+    actor_user_id = user_id
+
+    async def fake_ai_edit(prompt, current_steps, generated_entity_id, *, user_id=None):
+        assert user_id == actor_user_id
         assert prompt == "Add a final audit step"
         assert generated_entity_id == entity_id
         assert current_steps[0]["type"] == "trigger"
@@ -1822,6 +2329,7 @@ async def test_manor_agent_workflow_tools_crud_deploy_and_run(client: AsyncClien
     monkeypatch.setattr(workflow_generator, "generate_workflow", fake_ai_edit)
     edited = json.loads(await tools._ai_edit_workflow(
         entity_id=entity_id,
+        user_id=user_id,
         workflow=workflow_id,
         prompt="Add a final audit step",
         expected_version=updated["workflow"]["version"],
@@ -2537,8 +3045,9 @@ async def test_manual_step_returns_terminal_result_when_effects_are_deferred(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("projection", ["chat", "approval"])
 async def test_workflow_status_settlement_survives_chat_projection_failure(
-    monkeypatch,
+    monkeypatch, projection,
 ):
     from packages.core.services import proposal_workflow_runs
     from packages.core.services import scheduler_service
@@ -2572,7 +3081,25 @@ async def test_workflow_status_settlement_survives_chat_projection_failure(
         events.append("chat_projection")
         raise RuntimeError("corrupt chat projection")
 
-    workflow_run = SimpleNamespace(id="run-1")
+    from packages.core.services import workflow_runtime_approvals
+
+    async def project_approval(_db, *, run, step, result):
+        assert run is workflow_run
+        assert step == {"id": "step-1"}
+        assert result == {"status": "paused"}
+        events.append("approval_projection")
+        if projection == "approval":
+            raise RuntimeError("corrupt approval projection")
+
+    workflow_run = SimpleNamespace(
+        id="run-1", current_step_id="step-1",
+        step_results={"step-1": {"status": "paused"}},
+    )
+    monkeypatch.setattr(
+        workflow_runtime_approvals,
+        "project_workflow_runtime_approval",
+        project_approval,
+    )
     monkeypatch.setattr(
         scheduler_service,
         "finalize_scheduled_workflow_run",
@@ -2599,7 +3126,8 @@ async def test_workflow_status_settlement_survives_chat_projection_failure(
         "proposal_synced",
         "authoritative_flush",
         "chat_savepoint",
-        "chat_projection",
+        "approval_projection",
+        *(["chat_projection"] if projection == "chat" else []),
         "chat_rollback:RuntimeError",
     ]
 
@@ -2930,6 +3458,298 @@ async def test_workflow_run_lineage_is_server_owned_for_manual_and_webhook_start
     assert all(run.attempt_number == 1 for run in stored)
     assert all(run.lineage_root_run_id == run.id for run in stored)
     assert all(run.lineage_is_legacy is False for run in stored)
+
+
+@pytest.mark.asyncio
+async def test_workspace_manual_binding_run_projects_wait_to_workspace_chat(
+    client: AsyncClient,
+):
+    long_review = "Detailed evidence. " * 900
+    headers = await _auth(client, "wfworkspacemanualwait")
+    workspace_id = await _create_workspace(
+        client,
+        headers,
+        "Workspace manual wait projection",
+    )
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Review generated video",
+            "variables": {
+                "video_project": {
+                    "title": "Verified Stickman video",
+                    "document_id": "document-video-1",
+                    "notes": long_review,
+                },
+            },
+            "steps": [
+                {
+                    "id": "trigger",
+                    "type": "trigger",
+                    "name": "Start",
+                    "config": {},
+                    "next": ["approve_video"],
+                },
+                {
+                    "id": "approve_video",
+                    "type": "wait",
+                    "name": "Approve video",
+                    "config": {
+                        "wait_type": "approval",
+                        "message": "Review the verified video before publication.",
+                        "review_title": "Verified Stickman video",
+                        "review": "{{video_project}}",
+                        "response_variable": "video_decision",
+                        "options": ["approve", "cancel"],
+                    },
+                    "next": ["end"],
+                },
+                {
+                    "id": "end",
+                    "type": "end",
+                    "name": "Done",
+                    "config": {},
+                    "next": [],
+                },
+            ],
+        },
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "workspace_id": workspace_id,
+            "trigger_type": "manual",
+            "config": {
+                "workspace_attached": True,
+                "chat_entrypoint": {
+                    "enabled": True,
+                    "title": "Create, review, and publish a Stickman video",
+                    "projection": {"progress": True, "step_outputs": "explicit"},
+                    "wait_bridge": True,
+                },
+            },
+        },
+    )).json()
+
+    response = await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run",
+        headers=headers,
+        json={
+            "execute": True,
+            "trigger_data": {"workspace_manual": True},
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["status"] == "paused"
+    assert run["current_step_id"] == "approve_video"
+    origin = run["trigger_data"]["_workflow_chat_origin"]
+    assert origin["wait_bridge"] is True
+    assert origin["route_source"] == "workspace_manual"
+    assert origin["activity_message_id"]
+
+    messages_response = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages",
+        headers=headers,
+    )
+    assert messages_response.status_code == 200, messages_response.text
+    messages = messages_response.json()
+    activity = next(
+        message
+        for message in messages
+        if message["id"] == origin["activity_message_id"]
+    )
+    assert activity["message_kind"] == "workflow_activity"
+    assert activity["meta"]["workflow_run_id"] == run["id"]
+    approval = next(
+        message
+        for message in messages
+        if (message.get("pending_action") or {}).get("workflow_run_id") == run["id"]
+    )
+    assert approval["pending_action"]["kind"] == "workflow_approval"
+    assert approval["pending_action"]["step_id"] == "approve_video"
+    assert approval["pending_action"]["review"] == {
+        "title": "Verified Stickman video",
+        "document_id": "document-video-1",
+        "notes": long_review,
+    }
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}", headers=headers,
+    )).json()
+    action = detail["resume_action"]
+    assert action["message_id"] == approval["id"]
+    assert action["message_workspace_id"] == workspace_id
+    assert action["step_id"] == "approve_video"
+    assert action["review"] == approval["pending_action"]["review"]
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{action['message_id']}/resolve",
+        headers=headers, json={"choice": "cancel"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    terminal = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}", headers=headers,
+    )).json()
+    assert terminal["status"] == "cancelled"
+    assert terminal["resume_action"] is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_manual_binding_run_requests_missing_starter_input(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "wfworkspacemanualstarter")
+    workspace_id = await _create_workspace(
+        client,
+        headers,
+        "Workspace manual starter input",
+    )
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Publish existing video",
+            "variables": {"workflow_project_id": ""},
+            "steps": [
+                {
+                    "id": "trigger",
+                    "type": "trigger",
+                    "name": "Start",
+                    "config": {
+                        "run_inputs": [
+                            {
+                                "key": "workflow_project_id",
+                                "type": "string",
+                                "label": "Verified video project",
+                                "required": True,
+                            },
+                        ],
+                    },
+                    "next": ["end"],
+                },
+                {
+                    "id": "end",
+                    "type": "end",
+                    "name": "Done",
+                    "config": {},
+                    "next": [],
+                },
+            ],
+        },
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "workspace_id": workspace_id,
+            "trigger_type": "manual",
+            "config": {
+                "workspace_attached": True,
+                "chat_entrypoint": {
+                    "enabled": True,
+                    "title": "Publish an existing Stickman video",
+                    "wait_bridge": True,
+                },
+            },
+        },
+    )).json()
+
+    response = await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run",
+        headers=headers,
+        json={
+            "execute": False,
+            "trigger_data": {"workspace_manual": True},
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["status"] == "paused"
+    assert run["current_step_id"] == "trigger"
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages",
+        headers=headers,
+    )).json()
+    starter = next(
+        message
+        for message in messages
+        if (message.get("pending_action") or {}).get("kind")
+        == "workflow_starter_input"
+    )
+    assert starter["pending_action"]["workflow_run_id"] == run["id"]
+    assert starter["pending_action"]["values"] == {}
+
+
+@pytest.mark.asyncio
+async def test_workspace_manual_binding_run_projects_enqueue_failure(
+    client: AsyncClient,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *_args, **_kwargs: False),
+    )
+    headers = await _auth(client, "wfworkspacemanualqueuefail")
+    workspace_id = await _create_workspace(
+        client,
+        headers,
+        "Workspace manual queue failure",
+    )
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Queue failure projection",
+            "steps": _simple_steps([]),
+        },
+    )).json()
+    binding = (await client.post(
+        "/api/v1/workflows/bindings",
+        headers=headers,
+        json={
+            "workflow_id": workflow["id"],
+            "workspace_id": workspace_id,
+            "trigger_type": "manual",
+            "config": {
+                "workspace_attached": True,
+                "chat_entrypoint": {
+                    "enabled": True,
+                    "title": "Queue failure projection",
+                    "wait_bridge": True,
+                },
+            },
+        },
+    )).json()
+
+    response = await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run",
+        headers=headers,
+        json={
+            "execute": False,
+            "trigger_data": {"workspace_manual": True},
+        },
+    )
+
+    assert response.status_code == 201, response.text
+    run = response.json()
+    assert run["status"] == "failed"
+    assert "could not be queued" in run["error"]
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages",
+        headers=headers,
+    )).json()
+    activity = next(
+        message
+        for message in messages
+        if message["message_kind"] == "workflow_activity"
+    )
+    assert activity["meta"]["workflow_run_id"] == run["id"]
+    assert activity["meta"]["workflow_status"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -3636,6 +4456,8 @@ async def test_run_summary_does_not_use_the_full_detail_loader(
         "pending",
         "pending",
     ]
+    assert summary["processed_count"] == 0
+    assert summary["total_count"] == 3
     assert summary["business_outcome"] == "in_progress"
     assert summary["intervention"] is None
     for heavy_key in (
@@ -3645,6 +4467,75 @@ async def test_run_summary_does_not_use_the_full_detail_loader(
         "execution_trace",
     ):
         assert heavy_key not in summary
+
+
+@pytest.mark.asyncio
+async def test_legacy_run_summary_recovers_trace_order_and_not_reached_nodes(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wflegacysummaryorder")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Legacy summary order",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["review"]},
+                {"id": "publish", "type": "agent", "next": []},
+                {"id": "unused", "type": "stop", "next": []},
+                {"id": "review", "type": "wait", "next": ["publish"]},
+            ],
+        },
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    stored = await db_session.get(WorkflowRun, run["id"])
+    stored.status = "failed"
+    stored.current_step_id = "publish"
+    stored.step_results = {
+        "start": {"status": "completed"},
+        "review": {"status": "completed"},
+        "publish": {"status": "failed", "error": "Upload failed"},
+    }
+    stored.execution_trace = [
+        {"sequence": 1, "node_id": "start", "status": "completed"},
+        {"sequence": 2, "node_id": "review", "status": "completed"},
+        {"sequence": 3, "node_id": "publish", "status": "failed"},
+    ]
+    stored.trigger_data = {
+        **(stored.trigger_data or {}),
+        "_workflow_history_summary": {
+            "business_outcome": "",
+            "processed_count": 3,
+            "total_count": 3,
+            "artifact_count": 0,
+            "blocker": "Upload failed",
+        },
+    }
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/v1/workflows/runs/{run['id']}?detail=false",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    summary = response.json()
+    assert [step["id"] for step in summary["workflow_steps"]] == [
+        "start",
+        "review",
+        "publish",
+        "unused",
+    ]
+    assert summary["processed_count"] == 3
+    assert summary["total_count"] == 4
+    assert "execution_trace" not in summary
 
 
 @pytest.mark.asyncio
@@ -3694,9 +4585,15 @@ async def test_list_runs_exposes_persisted_history_summary(client: AsyncClient, 
     stored.trigger_data = {
         **(stored.trigger_data or {}),
         "_workflow_history_summary": {
+            "schema_version": 2,
             "business_outcome": "needs_input",
             "processed_count": 2,
             "total_count": 3,
+            "workflow_steps": [
+                {"id": "start", "name": "Start", "type": "trigger", "status": "completed"},
+                {"id": "review", "name": "Review", "type": "wait", "status": "completed"},
+                {"id": "publish", "name": "Publish", "type": "agent", "status": "running"},
+            ],
             "artifact_count": 4,
             "blocker": "Browser disconnected",
         },
@@ -3710,10 +4607,36 @@ async def test_list_runs_exposes_persisted_history_summary(client: AsyncClient, 
     assert listed["business_outcome"] == "needs_input"
     assert listed["processed_count"] == 2
     assert listed["total_count"] == 3
+    assert [step["id"] for step in listed["workflow_steps"]] == [
+        "start",
+        "review",
+        "publish",
+    ]
     assert listed["artifact_count"] == 4
     assert listed["history_blocker"] == "Browser disconnected"
     for heavy_key in ("variables", "step_results", "definition_snapshot", "execution_trace"):
         assert heavy_key not in listed
+
+
+def test_legacy_history_summary_does_not_expose_incompatible_progress_counts():
+    from types import SimpleNamespace
+
+    from apps.api.routers.workflows import _persisted_workflow_history_state
+
+    state = _persisted_workflow_history_state(SimpleNamespace(
+        summary_history_state={
+            "business_outcome": "needs_input",
+            "processed_count": 9,
+            "total_count": 13,
+            "artifact_count": 1,
+            "blocker": "Legacy blocker",
+        },
+    ))
+
+    assert state["processed_count"] is None
+    assert state["total_count"] is None
+    assert state["workflow_steps"] is None
+    assert state["artifact_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -3771,6 +4694,173 @@ async def test_run_summary_preserves_current_paused_step_reason(
 
 
 @pytest.mark.asyncio
+async def test_run_summary_exposes_same_run_resume_for_reexecute_pause(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfreexecuteintervention")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Reexecute paused step", "steps": _simple_steps(["publish"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    blocker = "Chrome control paused after the user took over the browser."
+    stored = await db_session.get(WorkflowRun, run["id"])
+    stored.status = "paused"
+    stored.current_step_id = "publish"
+    stored.step_results = {
+        "publish": {
+            "status": "paused",
+            "step_id": "publish",
+            "resume_strategy": "reexecute",
+            "error": blocker,
+            "chrome_outcome": {"status": "needs_user"},
+        },
+    }
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/v1/workflows/runs/{run['id']}?detail=false",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    summary = response.json()
+    assert summary["status"] == "paused"
+    assert summary["intervention"] == {
+        "kind": "workflow_resume",
+        "workflow_run_id": run["id"],
+        "workflow_binding_id": None,
+        "step_id": "publish",
+        "observed_problem": blocker,
+        "options": ["resume", "cancel"],
+    }
+    assert "step_results" not in summary
+    assert "execution_trace" not in summary
+
+
+@pytest.mark.asyncio
+async def test_chrome_reexecute_resume_passes_prior_outcome_to_same_run(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import func, select
+
+    from packages.core.ai import workflow_runner as runner_module
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfchromesamerunresume")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Chrome same-run recovery",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["publish"]},
+                {
+                    "id": "publish",
+                    "type": "agent",
+                    "config": {
+                        "skill": "chrome",
+                        "prompt": "Publish the approved video.",
+                        "output_format": "json",
+                        "output_schema": {
+                            "type": "object",
+                            "required": ["success"],
+                            "properties": {"success": {"type": "boolean"}},
+                            "additionalProperties": False,
+                        },
+                    },
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    created = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    workflow_run_id = created["id"]
+    prompts = []
+
+    async def invoke_skill(_db, _skill, _entity_id, input_text, **_kwargs):
+        prompts.append(input_text)
+        if len(prompts) == 1:
+            return {
+                "content": "Chrome control was interrupted.",
+                "stop_reason": "completed",
+                "control": {},
+                "chrome_outcome": {
+                    "status": "needs_user",
+                    "run_id": "chrome-run-1",
+                    "summary": "Chrome control was interrupted.",
+                    "browser_group": {"group_id": "browser-group-1"},
+                    "resume_context": {"next": "reobserve_and_continue"},
+                    "retryable": True,
+                },
+            }
+        assert '"same_workflow_run": true' in input_text
+        assert f'"workflow_run_id": "{workflow_run_id}"' in input_text
+        assert '"group_id": "browser-group-1"' in input_text
+        assert '"summary": "Chrome control was interrupted."' in input_text
+        assert '"evidence"' not in input_text
+        assert "First re-observe the target before any mutation" in input_text
+        assert "references require current observation" in input_text
+        return {
+            "content": '{"success":true}',
+            "stop_reason": "completed",
+            "control": {},
+            "chrome_outcome": {
+                "status": "completed",
+                "run_id": "chrome-run-1",
+            },
+        }
+
+    monkeypatch.setattr(runner_module, "runtime_invoke_skill", invoke_skill)
+
+    await WorkflowRunner().run(created["id"])
+    compact = (await client.get(
+        f"/api/v1/workflows/runs/{created['id']}?detail=false",
+        headers=headers,
+    )).json()
+    assert compact["intervention"]["kind"] == "workflow_resume"
+
+    response = await client.post(
+        f"/api/v1/workflows/runs/{created['id']}/resume",
+        headers=headers,
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    resumed = response.json()
+    assert resumed["id"] == created["id"]
+    assert resumed["status"] == "running"
+    await WorkflowRunner().run(created["id"])
+    resumed = (await client.get(
+        f"/api/v1/workflows/runs/{created['id']}",
+        headers=headers,
+    )).json()
+    assert resumed["status"] == "completed"
+    assert len(prompts) == 2
+    assert await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == workflow["id"]
+        )
+    ) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_summary_describes_paused_child_workflows_without_step_output(
     client: AsyncClient,
     db_session,
@@ -3791,13 +4881,35 @@ async def test_run_summary_describes_paused_child_workflows_without_step_output(
     stored = await db_session.get(WorkflowRun, run["id"])
     stored.status = "paused"
     stored.current_step_id = "collect"
+    child = WorkflowRun(
+        id="child-paused-summary",
+        workflow_id=stored.workflow_id,
+        entity_id=stored.entity_id,
+        workspace_id=stored.workspace_id,
+        status="paused",
+        current_step_id="collect",
+        variables={},
+        step_results={
+            "collect": {
+                "status": "paused",
+                "resume_strategy": "reexecute",
+                "error": "Chrome action approval is required.",
+            },
+        },
+        trigger_data={
+            "parent_run_id": stored.id,
+            "parent_step_id": "collect",
+        },
+        started_by=stored.started_by,
+    )
     stored.step_results = {
         "collect": {
             "status": "paused",
             "step_id": "collect",
-            "subrun_ids": ["child-a", "child-b"],
+            "subrun_id": child.id,
         },
     }
+    db_session.add(child)
     await db_session.commit()
 
     response = await client.get(
@@ -3806,7 +4918,26 @@ async def test_run_summary_describes_paused_child_workflows_without_step_output(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["intervention"] is None
+    assert response.json()["intervention"] == {
+        "kind": "workflow_resume",
+        "workflow_run_id": child.id,
+        "workflow_binding_id": None,
+        "step_id": "collect",
+        "observed_problem": "Chrome action approval is required.",
+        "options": ["resume", "cancel"],
+    }
+
+    child.trigger_data = {
+        "parent_run_id": "foreign-parent",
+        "parent_step_id": "collect",
+    }
+    await db_session.commit()
+    foreign_child_response = await client.get(
+        f"/api/v1/workflows/runs/{run['id']}?detail=false",
+        headers=headers,
+    )
+    assert foreign_child_response.status_code == 200, foreign_child_response.text
+    assert foreign_child_response.json()["intervention"] is None
 
 
 @pytest.mark.asyncio
@@ -3947,6 +5078,483 @@ async def test_cancel_run(client: AsyncClient):
     assert cancel2.status_code == 200
     assert cancel2.json()["id"] == run["id"]
     assert cancel2.json()["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_parent_cascades_to_active_subworkflow_descendants(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.constants.execution import ExecutionClaimKind
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution_claim import RuntimeExecutionClaim
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfcancelchildren")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancel child tree", "steps": _simple_steps(["work"])},
+    )).json()
+    parent = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    owner = (await db_session.execute(
+        select(User).where(User.email == "wfcancelchildren@test.com")
+    )).scalar_one()
+    parent_row = await db_session.get(WorkflowRun, parent["id"])
+
+    def child_run(*, status: str, parent_run_id: str) -> WorkflowRun:
+        run_id = generate_ulid()
+        return WorkflowRun(
+            id=run_id,
+            workflow_id=workflow["id"],
+            entity_id=owner.entity_id,
+            status=status,
+            current_step_id="work",
+            variables={},
+            step_results={},
+            trigger_data={
+                "parent_run_id": parent_run_id,
+                "parent_step_id": "child",
+            },
+            execution_trace=[],
+            started_by=owner.id,
+            completed_at=(
+                datetime.now(timezone.utc)
+                if status == "completed"
+                else None
+            ),
+        )
+
+    pending_child = child_run(status="pending", parent_run_id=parent_row.id)
+    running_child = child_run(status="running", parent_run_id=parent_row.id)
+    paused_child = child_run(status="paused", parent_run_id=parent_row.id)
+    completed_child = child_run(status="completed", parent_run_id=parent_row.id)
+    grandchild = child_run(status="running", parent_run_id=paused_child.id)
+    parent_row.current_step_id = "child"
+    parent_row.step_results = {
+        "child": {
+            "status": "paused",
+            "subrun_id": running_child.id,
+        }
+    }
+    db_session.add_all([
+        pending_child,
+        running_child,
+        paused_child,
+        completed_child,
+        grandchild,
+    ])
+    claimed_run_ids = {
+        parent_row.id,
+        pending_child.id,
+        running_child.id,
+        paused_child.id,
+        grandchild.id,
+    }
+    db_session.add_all([
+        RuntimeExecutionClaim(
+            claim_key=f"{ExecutionClaimKind.WORKFLOW_RUN.value}:{run_id}",
+            claim_token=generate_ulid(),
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+        )
+        for run_id in claimed_run_ids
+    ])
+    unrelated_claim = RuntimeExecutionClaim(
+        claim_key=f"{ExecutionClaimKind.AGENT_TASK.value}:{generate_ulid()}",
+        claim_token=generate_ulid(),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    db_session.add(unrelated_claim)
+    await db_session.commit()
+
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{parent_row.id}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+    for active_child in (
+        pending_child,
+        running_child,
+        paused_child,
+        grandchild,
+    ):
+        await db_session.refresh(active_child)
+        assert active_child.status == "cancelled"
+        assert (
+            active_child.trigger_data["_workflow_run_control"]["cancelled_by"]
+            == owner.id
+        )
+    await db_session.refresh(completed_child)
+    assert completed_child.status == "completed"
+    remaining_claims = set((await db_session.execute(
+        select(RuntimeExecutionClaim.claim_key)
+    )).scalars().all())
+    assert not {
+        f"{ExecutionClaimKind.WORKFLOW_RUN.value}:{run_id}"
+        for run_id in claimed_run_ids
+    } & remaining_claims
+    assert unrelated_claim.claim_key in remaining_claims
+
+    # A stale child worker may commit after cancellation. Its terminal receipt
+    # must never move the cancelled parent back into a runnable state.
+    running_child.status = "completed"
+    running_child.completed_at = datetime.now(timezone.utc)
+    await db_session.commit()
+    await WorkflowRunner()._propagate_subworkflow_result(running_child, db_session)
+    await db_session.refresh(parent_row)
+    assert parent_row.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_revokes_claim_and_stops_in_flight_worker(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.services import workflow_run_execution_claim as claim_service
+
+    headers = await _auth(client, "wfcancelworker")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancel active worker", "steps": _simple_steps(["work"])},
+    )).json()
+    run = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+
+    work_started = asyncio.Event()
+    work_cancelled = asyncio.Event()
+    original_execute = WorkflowRunner._execute_step_safe
+
+    async def blocking_work(self, step, workflow_run, db):
+        if step["id"] == "work":
+            work_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                work_cancelled.set()
+                raise
+        return await original_execute(self, step, workflow_run, db)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", blocking_work)
+    monkeypatch.setattr(
+        claim_service,
+        "_WORKFLOW_RUN_EXECUTION_HEARTBEAT_SECONDS",
+        0.01,
+    )
+
+    worker = asyncio.create_task(WorkflowRunner().run(run["id"]))
+    await asyncio.wait_for(work_started.wait(), timeout=2)
+
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert await asyncio.wait_for(worker, timeout=2) == "executed"
+    assert work_cancelled.is_set()
+
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )).json()
+    assert detail["status"] == "cancelled"
+    assert detail["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_parent_returns_while_child_row_is_locked(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.constants.execution import ExecutionClaimKind
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution_claim import RuntimeExecutionClaim
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfcancellockedchildreal")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancel real locked child", "steps": _simple_steps(["work"])},
+    )).json()
+    parent = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    owner = (await db_session.execute(
+        select(User).where(User.email == "wfcancellockedchildreal@test.com")
+    )).scalar_one()
+    child = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=workflow["id"],
+        entity_id=owner.entity_id,
+        status="running",
+        current_step_id="work",
+        variables={},
+        step_results={},
+        trigger_data={
+            "parent_run_id": parent["id"],
+            "parent_step_id": "child",
+        },
+        execution_trace=[],
+        started_by=owner.id,
+    )
+    db_session.add(child)
+    db_session.add(RuntimeExecutionClaim(
+        claim_key=f"{ExecutionClaimKind.WORKFLOW_RUN.value}:{child.id}",
+        claim_token=generate_ulid(),
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+    ))
+    await db_session.commit()
+
+    sessions = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with sessions() as lock_db:
+        locked_child = (await lock_db.execute(
+            select(WorkflowRun)
+            .where(WorkflowRun.id == child.id)
+            .with_for_update()
+        )).scalar_one()
+        try:
+            cancelled = await asyncio.wait_for(
+                client.post(
+                    f"/api/v1/workflows/runs/{parent['id']}/cancel",
+                    headers=headers,
+                ),
+                timeout=2,
+            )
+            assert cancelled.status_code == 200, cancelled.text
+            assert cancelled.json()["status"] == "cancelled"
+            assert locked_child.status == "running"
+        finally:
+            await lock_db.rollback()
+
+    await db_session.refresh(child)
+    assert child.status == "running"
+    claim = await db_session.get(
+        RuntimeExecutionClaim,
+        f"{ExecutionClaimKind.WORKFLOW_RUN.value}:{child.id}",
+    )
+    assert claim is None
+
+    assert await WorkflowRunner().run(child.id) == "executed"
+    await db_session.refresh(child)
+    assert child.status == "cancelled"
+    assert child.error is None
+    assert child.step_results == {}
+    assert child.terminal_effects_completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_child_run_does_not_execute_after_parent_was_cancelled(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfcancelancestor")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancelled ancestor", "steps": _simple_steps(["work"])},
+    )).json()
+    parent = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{parent['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+    owner = (await db_session.execute(
+        select(User).where(User.email == "wfcancelancestor@test.com")
+    )).scalar_one()
+    child = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=workflow["id"],
+        entity_id=owner.entity_id,
+        status="running",
+        current_step_id="work",
+        variables={},
+        step_results={},
+        trigger_data={
+            "parent_run_id": parent["id"],
+            "parent_step_id": "child",
+        },
+        execution_trace=[],
+        started_by=owner.id,
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    assert await WorkflowRunner().run(child.id) == "executed"
+    await db_session.refresh(child)
+    assert child.status == "cancelled"
+    assert child.error is None
+    assert child.step_results == {}
+
+
+@pytest.mark.asyncio
+async def test_claim_loss_reports_cancelled_when_parent_was_cancelled(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfclaimlosscancelledancestor")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Claim loss cancelled ancestor", "steps": _simple_steps(["work"])},
+    )).json()
+    parent = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{parent['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+    owner = (await db_session.execute(
+        select(User).where(
+            User.email == "wfclaimlosscancelledancestor@test.com",
+        )
+    )).scalar_one()
+    child = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=workflow["id"],
+        entity_id=owner.entity_id,
+        status="running",
+        current_step_id="work",
+        variables={},
+        step_results={},
+        trigger_data={
+            "parent_run_id": parent["id"],
+            "parent_step_id": "child",
+        },
+        execution_trace=[],
+        started_by=owner.id,
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    settled_status = await WorkflowRunner._fail_lost_execution_claim(child.id)
+
+    assert settled_status == "cancelled"
+    await db_session.refresh(child)
+    assert child.status == "cancelled"
+    assert child.error is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_parent_claim_loss_settles_active_child(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai import workflow_runner as runner_module
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import User
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_execution_claim import (
+        WorkflowRunExecutionClaimLost,
+    )
+
+    headers = await _auth(client, "wfcancelparentclaimloss")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancelled parent claim loss", "steps": _simple_steps(["work"])},
+    )).json()
+    parent = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    cancelled = await client.post(
+        f"/api/v1/workflows/runs/{parent['id']}/cancel",
+        headers=headers,
+    )
+    assert cancelled.status_code == 200, cancelled.text
+
+    owner = (await db_session.execute(
+        select(User).where(User.email == "wfcancelparentclaimloss@test.com")
+    )).scalar_one()
+    child = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=workflow["id"],
+        entity_id=owner.entity_id,
+        status="running",
+        current_step_id="work",
+        variables={},
+        step_results={},
+        trigger_data={
+            "parent_run_id": parent["id"],
+            "parent_step_id": "child",
+        },
+        execution_trace=[],
+        started_by=owner.id,
+    )
+    db_session.add(child)
+    await db_session.commit()
+
+    async def lose_parent_claim(*_args, **_kwargs):
+        raise WorkflowRunExecutionClaimLost("lost parent claim")
+
+    monkeypatch.setattr(
+        runner_module.WorkflowRunner,
+        "_run_claimed",
+        lose_parent_claim,
+    )
+
+    assert await WorkflowRunner().run(parent["id"]) == "executed"
+
+    await db_session.refresh(child)
+    assert child.status == "cancelled"
+    assert child.error is None
+    assert child.terminal_effects_completed_at is not None
 
 
 @pytest.mark.asyncio
@@ -4151,9 +5759,16 @@ async def test_run_detail_enriches_visible_artifact_document_names(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enqueue_succeeds", [True, False], ids=["queued", "broker_failure"])
 async def test_manual_pause_resumes_without_consuming_current_node_as_approval(
     client: AsyncClient,
+    db_session,
+    monkeypatch,
+    enqueue_succeeds: bool,
 ):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
     headers = await _auth(client, "wfmanualpause")
     wf = (await client.post(
         "/api/v1/workflows",
@@ -4182,17 +5797,51 @@ async def test_manual_pause_resumes_without_consuming_current_node_as_approval(
     assert compact["intervention"]["kind"] == "workflow_resume"
     assert compact["intervention"]["options"] == ["resume", "cancel"]
 
+    enqueued: list[tuple[str, str | None]] = []
+
+    def record_enqueue(run_id, _delay_seconds, *, continuation_token=None):
+        enqueued.append((run_id, continuation_token))
+        return enqueue_succeeds
+
+    async def reject_inline_run(*_args, **_kwargs):
+        raise AssertionError("HTTP resume must not execute the workflow inline")
+
+    monkeypatch.setattr(WorkflowRunner, "enqueue_resume", staticmethod(record_enqueue))
+    monkeypatch.setattr(WorkflowRunner, "run", reject_inline_run)
+
     resumed_response = await client.post(
+        f"/api/v1/workflows/runs/{run['id']}/resume",
+        headers=headers,
+        json={"execute": True},
+    )
+    assert resumed_response.status_code == 200, resumed_response.text
+    resumed = resumed_response.json()
+    assert resumed["status"] == "running"
+    assert "p1" not in resumed["step_results"]
+    assert "p2" not in resumed["step_results"]
+    assert resumed["trigger_data"]["_workflow_run_control"]["state"] == "resumed"
+    assert len(enqueued) == 1
+    assert enqueued[0][0] == run["id"]
+    assert enqueued[0][1]
+
+    persisted = await db_session.get(WorkflowRun, run["id"])
+    assert persisted is not None
+    assert persisted.continuation_token == enqueued[0][1]
+
+    duplicate = await client.post(
         f"/api/v1/workflows/runs/{run['id']}/resume",
         headers=headers,
         json={},
     )
-    assert resumed_response.status_code == 200, resumed_response.text
-    resumed = resumed_response.json()
-    assert resumed["status"] == "completed"
-    assert resumed["step_results"]["p1"]["status"] == "completed"
-    assert resumed["step_results"]["p2"]["status"] == "completed"
-    assert resumed["trigger_data"]["_workflow_run_control"]["state"] == "resumed"
+    assert duplicate.status_code == 400
+    assert len(enqueued) == 1
+
+    # This test intentionally leaves a recoverable intent. Remove its fixture
+    # state so the durable-sweep test only observes continuations it created.
+    persisted.continuation_token = None
+    persisted.continuation_due_at = None
+    persisted.continuation_next_attempt_at = None
+    await db_session.commit()
 
 
 @pytest.mark.asyncio
@@ -4303,12 +5952,20 @@ async def test_pause_during_in_flight_node_freezes_then_resumes_next_node(
     )
     assert resumed_response.status_code == 200, resumed_response.text
     resumed = resumed_response.json()
+    assert resumed["status"] == "running"
+    await WorkflowRunner().run(run["id"])
+    resumed = (await client.get(
+        f"/api/v1/workflows/runs/{run['id']}",
+        headers=headers,
+    )).json()
     assert resumed["status"] == "completed"
     assert resumed["step_results"]["later"]["status"] == "completed"
 
 
 @pytest.mark.asyncio
 async def test_resume_continues_paused_run_to_completion(client: AsyncClient):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfresume")
     steps = [
         {"id": "start", "type": "trigger", "name": "Start", "next": ["approval"]},
@@ -4342,6 +5999,25 @@ async def test_resume_continues_paused_run_to_completion(client: AsyncClient):
     assert paused["status"] == "paused"
     assert paused["current_step_id"] == "approval"
 
+    detail = (await client.get(
+        f"/api/v1/workflows/runs/{paused['id']}", headers=headers,
+    )).json()
+    assert detail["resume_action"]["step_id"] == "approval"
+    assert detail["resume_action"]["options"] == ["approve", "reject"]
+    assert detail["resume_action"]["response_variable"] == "decision"
+    assert detail["resume_action"]["prompt"] == "Need sign-off"
+    stale_decision = await client.post(
+        f"/api/v1/workflows/runs/{paused['id']}/resume",
+        headers=headers,
+        json={"expected_step_id": "different_wait", "variables": {"decision": "approved"}},
+    )
+    assert stale_decision.status_code == 409
+    still_paused = (await client.get(
+        f"/api/v1/workflows/runs/{paused['id']}", headers=headers,
+    )).json()
+    assert still_paused["status"] == "paused"
+    assert "decision" not in still_paused["variables"]
+
     missing_decision = await client.post(
         f"/api/v1/workflows/runs/{paused['id']}/resume",
         headers=headers,
@@ -4352,10 +6028,16 @@ async def test_resume_continues_paused_run_to_completion(client: AsyncClient):
     response = await client.post(
         f"/api/v1/workflows/runs/{paused['id']}/resume",
         headers=headers,
-        json={"variables": {"decision": "approved"}},
+        json={"expected_step_id": "approval", "variables": {"decision": "approved"}},
     )
     assert response.status_code == 200
     completed = response.json()
+    assert completed["status"] == "running"
+    await WorkflowRunner().run(paused["id"])
+    completed = (await client.get(
+        f"/api/v1/workflows/runs/{paused['id']}",
+        headers=headers,
+    )).json()
     assert completed["status"] == "completed"
     assert completed["variables"]["decision_recorded"] == "approved"
     assert completed["step_results"]["approval"]["resumed"] is True
@@ -4378,6 +6060,8 @@ async def test_resume_continues_paused_run_to_completion(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_resume_continues_from_an_internal_stage_approval(client: AsyncClient):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfstagresume")
     workflow = (await client.post(
         "/api/v1/workflows",
@@ -4446,6 +6130,12 @@ async def test_resume_continues_from_an_internal_stage_approval(client: AsyncCli
 
     assert response.status_code == 200, response.text
     completed = response.json()
+    assert completed["status"] == "running"
+    await WorkflowRunner().run(paused["id"])
+    completed = (await client.get(
+        f"/api/v1/workflows/runs/{paused['id']}",
+        headers=headers,
+    )).json()
     assert completed["status"] == "completed"
     assert completed["variables"]["decision_recorded"] == "approved"
     state = completed["variables"]["__stage_execution"]["review"]
@@ -4464,6 +6154,8 @@ async def test_resume_continues_from_an_internal_stage_approval(client: AsyncCli
 async def test_resume_uses_private_snapshot_when_live_definition_changes(
     client: AsyncClient,
 ):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfresumesnapshotdrift")
     steps = [
         {"id": "start", "type": "trigger", "next": ["approval"]},
@@ -4501,7 +6193,8 @@ async def test_resume_uses_private_snapshot_when_live_definition_changes(
     )
 
     assert response.status_code == 200, response.text
-    assert response.json()["status"] == "completed"
+    assert response.json()["status"] == "running"
+    await WorkflowRunner().run(paused["id"])
     detail = (await client.get(
         f"/api/v1/workflows/runs/{paused['id']}",
         headers=headers,
@@ -4519,6 +6212,8 @@ async def test_resume_uses_private_snapshot_when_live_definition_changes(
 
 @pytest.mark.asyncio
 async def test_resume_accepts_structured_approval_choice_for_branching(client: AsyncClient):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfstructuredresume")
     steps = [
         {"id": "start", "type": "trigger", "name": "Start", "next": ["approval"]},
@@ -4575,6 +6270,12 @@ async def test_resume_accepts_structured_approval_choice_for_branching(client: A
 
     assert response.status_code == 200
     completed = response.json()
+    assert completed["status"] == "running"
+    await WorkflowRunner().run(paused["id"])
+    completed = (await client.get(
+        f"/api/v1/workflows/runs/{paused['id']}",
+        headers=headers,
+    )).json()
     assert completed["status"] == "completed"
     assert completed["variables"]["plan_decision"] == {"choice": "approve"}
     assert completed["variables"]["branch"] == "approved"
@@ -4584,6 +6285,8 @@ async def test_resume_accepts_structured_approval_choice_for_branching(client: A
 
 @pytest.mark.asyncio
 async def test_resumed_subworkflow_automatically_continues_parent(client: AsyncClient):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfsubresume")
     child = (await client.post(
         "/api/v1/workflows",
@@ -4672,7 +6375,8 @@ async def test_resumed_subworkflow_automatically_continues_parent(client: AsyncC
         json={"variables": {"decision": "approved"}},
     )
     assert child_resumed.status_code == 200
-    assert child_resumed.json()["status"] == "completed"
+    assert child_resumed.json()["status"] == "running"
+    await WorkflowRunner().run(child_run_id)
 
     completed_parent = (await client.get(
         f"/api/v1/workflows/runs/{parent_run['id']}",
@@ -4690,6 +6394,8 @@ async def test_resumed_subworkflow_automatically_continues_parent(client: AsyncC
 
 @pytest.mark.asyncio
 async def test_failed_resumed_subworkflow_appends_parent_terminal_trace(client: AsyncClient):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfsubresumefailedtrace")
     child = (await client.post(
         "/api/v1/workflows",
@@ -4743,7 +6449,8 @@ async def test_failed_resumed_subworkflow_appends_parent_terminal_trace(client: 
         json={"variables": {"decision": "approved"}},
     )
     assert resumed.status_code == 200, resumed.text
-    assert resumed.json()["status"] == "failed"
+    assert resumed.json()["status"] == "running"
+    await WorkflowRunner().run(child_run_id)
 
     failed_parent = (await client.get(
         f"/api/v1/workflows/runs/{parent_run['id']}",
@@ -4755,6 +6462,870 @@ async def test_failed_resumed_subworkflow_appends_parent_terminal_trace(client: 
         for entry in failed_parent["execution_trace"]
         if entry["node_id"] == "child"
     ] == ["running", "paused", "failed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during_recovery", [False, True])
+@pytest.mark.parametrize("deepest_child_is_newer", [False, True])
+@pytest.mark.parametrize("retry_blocked", [False, True])
+async def test_compact_root_run_retries_deepest_failed_subworkflow(
+    client: AsyncClient,
+    db_session,
+    cancel_during_recovery: bool,
+    deepest_child_is_newer: bool,
+    retry_blocked: bool,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfcompactdeepretry")
+    executor = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "YouTube executor",
+            "variables": {"metadata_ready": False},
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["set_youtube_metadata"]},
+                {
+                    "id": "set_youtube_metadata",
+                    "type": "condition",
+                    "config": {"expression": "metadata_ready == true"},
+                    "true_next": ["end"],
+                    "false_next": ["youtube_metadata_blocked"],
+                },
+                {
+                    "id": "youtube_metadata_blocked",
+                    "type": "stop",
+                    "config": {
+                        "message": "metadata update failed",
+                        "retry_from_step_id": "set_youtube_metadata",
+                    },
+                    "next": [],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    publisher = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Publish video",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["publish_video"]},
+                {
+                    "id": "publish_video",
+                    "type": "subworkflow",
+                    "config": {"workflow_id": executor["id"]},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    root = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Create and publish video",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["publish_video"]},
+                {
+                    "id": "publish_video",
+                    "type": "subworkflow",
+                    "config": {"workflow_id": publisher["id"]},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+
+    root_run = (await client.post(
+        f"/api/v1/workflows/{root['id']}/run",
+        headers=headers,
+        json={},
+    )).json()
+    publisher_run_id = root_run["step_results"]["publish_video"]["subrun_id"]
+    publisher_run = (await client.get(
+        f"/api/v1/workflows/runs/{publisher_run_id}",
+        headers=headers,
+    )).json()
+    executor_run_id = publisher_run["step_results"]["publish_video"]["subrun_id"]
+
+    # Workspace Chat roots do not have a retry message for nested executor
+    # failures; compact state must still preserve the direct nested retry.
+    root_row = await db_session.get(WorkflowRun, root_run["id"])
+    executor_row = await db_session.get(WorkflowRun, executor_run_id)
+    root_row.trigger_source = "workspace_chat"
+    executor_row.retry_from_step_id = "set_youtube_metadata"
+    executor_row.trigger_data = {
+        **executor_row.trigger_data,
+        "_workflow_chat_origin": {
+            "enabled": True,
+            "conversation_id": "missing-child-activity-conversation",
+            "activity_message_id": "missing-child-activity-message",
+        },
+    }
+    if retry_blocked:
+        executor_row.step_results = {
+            **executor_row.step_results,
+            "youtube_metadata_blocked": {
+                **executor_row.step_results["youtube_metadata_blocked"],
+                "retryable": False,
+                "do_not_replay": True,
+                "retry_blocked": True,
+            },
+        }
+    base_updated_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    root_row.updated_at = base_updated_at + timedelta(
+        minutes=1 if deepest_child_is_newer else 2,
+    )
+    executor_row.updated_at = base_updated_at + timedelta(
+        minutes=2 if deepest_child_is_newer else 1,
+    )
+    await db_session.commit()
+
+    compact = (await client.get(
+        f"/api/v1/workflows/runs/{root_run['id']}?detail=false",
+        headers=headers,
+    )).json()
+
+    assert compact["id"] == root_run["id"]
+    assert compact["status"] == "failed"
+    if retry_blocked:
+        assert compact["retry_from_step_id"] is None
+        assert compact["intervention"] is None
+        assert compact["error"] == "metadata update failed"
+        assert datetime.fromisoformat(compact["updated_at"]) == max(
+            root_row.updated_at,
+            executor_row.updated_at,
+        )
+        return
+    assert compact["intervention"]["kind"] == "workflow_retry"
+    assert compact["intervention"]["workflow_run_id"] == root_run["id"]
+    assert compact["intervention"]["step_id"] == "youtube_metadata_blocked"
+    assert compact["intervention"]["retry_from_step_id"] == "set_youtube_metadata"
+    assert compact["retry_from_step_id"] == "set_youtube_metadata"
+    assert datetime.fromisoformat(compact["updated_at"]) == max(
+        root_row.updated_at,
+        executor_row.updated_at,
+    )
+
+    first_retry = await client.post(
+        f"/api/v1/workflows/runs/{root_run['id']}/retry",
+        headers=headers,
+        json={
+            "from_step_id": compact["intervention"]["retry_from_step_id"],
+            "variables": {"metadata_ready": False},
+            "execute": False,
+        },
+    )
+    assert first_retry.status_code == 201, first_retry.text
+    first_executor_retry = first_retry.json()
+    assert first_executor_retry["workflow_id"] == executor["id"]
+    assert first_executor_retry["status"] == "running"
+
+    first_executor_retry_row = await db_session.get(
+        WorkflowRun,
+        first_executor_retry["id"],
+    )
+    assert first_executor_retry_row.trigger_data["parent_run_id"] == publisher_run_id
+    assert first_executor_retry_row.trigger_data["parent_step_id"] == "publish_video"
+
+    visible_history = (await client.get(
+        "/api/v1/workflows/runs",
+        headers=headers,
+    )).json()
+    assert [item["id"] for item in visible_history] == [root_run["id"]]
+
+    active_root = (await client.get(
+        f"/api/v1/workflows/runs/{root_run['id']}?detail=false",
+        headers=headers,
+    )).json()
+    assert active_root["id"] == root_run["id"]
+    assert active_root["status"] == "running"
+    assert active_root["intervention"] is None
+
+    if cancel_during_recovery:
+        cancelled = await client.post(
+            f"/api/v1/workflows/runs/{root_run['id']}/cancel",
+            headers=headers,
+        )
+        assert cancelled.status_code == 200, cancelled.text
+        assert cancelled.json()["id"] == root_run["id"]
+        assert cancelled.json()["status"] == "cancelled"
+
+        await db_session.refresh(root_row)
+        await db_session.refresh(first_executor_retry_row)
+        assert root_row.status == "cancelled"
+        assert first_executor_retry_row.status == "cancelled"
+
+        cancelled_root = (await client.get(
+            f"/api/v1/workflows/runs/{root_run['id']}?detail=false",
+            headers=headers,
+        )).json()
+        assert cancelled_root["status"] == "cancelled"
+        assert cancelled_root["intervention"] is None
+        return
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    await WorkflowRunner().run(first_executor_retry["id"])
+    await db_session.refresh(first_executor_retry_row)
+    failed_root = (await client.get(
+        f"/api/v1/workflows/runs/{root_run['id']}?detail=false",
+        headers=headers,
+    )).json()
+    assert failed_root["status"] == "failed"
+    assert failed_root["intervention"]["workflow_run_id"] == root_run["id"]
+    assert failed_root["intervention"]["retry_from_step_id"] == "set_youtube_metadata"
+
+    second_retry = await client.post(
+        f"/api/v1/workflows/runs/{root_run['id']}/retry",
+        headers=headers,
+        json={
+            "from_step_id": failed_root["intervention"]["retry_from_step_id"],
+            "variables": {"metadata_ready": True},
+            "execute": False,
+        },
+    )
+    assert second_retry.status_code == 201, second_retry.text
+    completed_executor = await _execute_created_retry(
+        client,
+        headers,
+        second_retry,
+    )
+    assert completed_executor["workflow_id"] == executor["id"]
+    assert completed_executor["status"] == "completed"
+
+    executor_attempts = (await db_session.execute(
+        select(WorkflowRun)
+        .where(WorkflowRun.workflow_id == executor["id"])
+        .order_by(WorkflowRun.attempt_number)
+    )).scalars().all()
+    assert [attempt.status for attempt in executor_attempts] == [
+        "failed",
+        "failed",
+        "completed",
+    ]
+
+    parent_attempts = (await db_session.execute(
+        select(WorkflowRun)
+        .where(WorkflowRun.workflow_id.in_([publisher["id"], root["id"]]))
+        .order_by(WorkflowRun.workflow_id, WorkflowRun.attempt_number)
+    )).scalars().all()
+    attempts_by_workflow = {
+        workflow_id: [
+            attempt
+            for attempt in parent_attempts
+            if attempt.workflow_id == workflow_id
+        ]
+        for workflow_id in (publisher["id"], root["id"])
+    }
+    for workflow_id in (publisher["id"], root["id"]):
+        attempts = attempts_by_workflow[workflow_id]
+        assert [attempt.status for attempt in attempts] == ["failed", "completed"]
+        assert attempts[1].retry_of_run_id == attempts[0].id
+        assert attempts[1].retry_from_step_id == "publish_video"
+
+    completed_root = (await client.get(
+        f"/api/v1/workflows/runs/{root_run['id']}?detail=false",
+        headers=headers,
+    )).json()
+    assert completed_root["id"] == root_run["id"]
+    assert completed_root["status"] == "completed"
+    assert completed_root["intervention"] is None
+
+
+@pytest.mark.asyncio
+async def test_top_level_cancel_serializes_with_nested_retry_creation(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import func, select
+
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services import workflow_run_control, workflow_service
+
+    headers = await _auth(client, "wfcancelnestedretryrace")
+    child = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Nested retry race child",
+            "variables": {"recover": False},
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["recoverable"]},
+                {
+                    "id": "recoverable",
+                    "type": "condition",
+                    "config": {"expression": "recover == true"},
+                    "true_next": ["end"],
+                    "false_next": ["blocked"],
+                },
+                {
+                    "id": "blocked",
+                    "type": "stop",
+                    "config": {
+                        "message": "nested retry required",
+                        "retry_from_step_id": "recoverable",
+                    },
+                    "next": [],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    root = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Nested retry race root",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["child"]},
+                {
+                    "id": "child",
+                    "type": "subworkflow",
+                    "config": {"workflow_id": child["id"]},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    root_run = (await client.post(
+        f"/api/v1/workflows/{root['id']}/run",
+        headers=headers,
+        json={},
+    )).json()
+    assert root_run["status"] == "failed"
+
+    cancel_holds_owner_lock = asyncio.Event()
+    release_cancel = asyncio.Event()
+    retry_locked_resource = asyncio.Event()
+    original_cancel_descendants = (
+        workflow_run_control.cancel_active_subworkflow_descendants
+    )
+    original_lock_resource = workflow_service.lock_reusable_resource_reference
+
+    async def hold_cancel_before_commit(*args, **kwargs):
+        cancel_holds_owner_lock.set()
+        await release_cancel.wait()
+        return await original_cancel_descendants(*args, **kwargs)
+
+    async def observe_retry_resource_lock(*args, **kwargs):
+        await original_lock_resource(*args, **kwargs)
+        retry_locked_resource.set()
+
+    monkeypatch.setattr(
+        workflow_run_control,
+        "cancel_active_subworkflow_descendants",
+        hold_cancel_before_commit,
+    )
+    monkeypatch.setattr(
+        workflow_service,
+        "lock_reusable_resource_reference",
+        observe_retry_resource_lock,
+    )
+
+    cancel_task = asyncio.create_task(client.post(
+        f"/api/v1/workflows/runs/{root_run['id']}/cancel",
+        headers=headers,
+    ))
+    await asyncio.wait_for(cancel_holds_owner_lock.wait(), timeout=2)
+    retry_task = asyncio.create_task(client.post(
+        f"/api/v1/workflows/runs/{root_run['id']}/retry",
+        headers=headers,
+        json={
+            "from_step_id": "recoverable",
+            "variables": {"recover": True},
+            "execute": False,
+        },
+    ))
+    await asyncio.wait_for(retry_locked_resource.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    retry_completed_before_cancel = retry_task.done()
+    release_cancel.set()
+
+    cancelled, retried = await asyncio.gather(cancel_task, retry_task)
+    assert retry_completed_before_cancel is False
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert retried.status_code == 409, retried.text
+
+    child_attempt_count = await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == child["id"],
+        )
+    )
+    assert child_attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_deep_retry_target_rejects_out_of_scope_or_broken_subworkflow_links(
+    db_session,
+):
+    from apps.api.routers.workflows import _deepest_retryable_subworkflow_run
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.workflow import WorkflowRun
+
+    def failed_run(
+        *,
+        entity_id: str,
+        workspace_id: str | None,
+        current_step_id: str,
+        parent_run_id: str | None = None,
+        parent_step_id: str | None = None,
+    ) -> WorkflowRun:
+        run_id = generate_ulid()
+        trigger_data = {}
+        if parent_run_id:
+            trigger_data = {
+                "parent_run_id": parent_run_id,
+                "parent_step_id": parent_step_id,
+            }
+        return WorkflowRun(
+            id=run_id,
+            workflow_id=generate_ulid(),
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            lineage_root_run_id=run_id,
+            lineage_is_legacy=False,
+            status="failed",
+            current_step_id=current_step_id,
+            variables={},
+            step_results={},
+            trigger_data=trigger_data,
+            definition_snapshot={},
+            execution_snapshot={},
+            execution_trace=[],
+        )
+
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    root = failed_run(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        current_step_id="publish",
+    )
+    child = failed_run(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        current_step_id="execute",
+        parent_run_id=root.id,
+        parent_step_id="publish",
+    )
+    grandchild = failed_run(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        current_step_id="metadata",
+        parent_run_id=child.id,
+        parent_step_id="execute",
+    )
+    root.step_results = {
+        "publish": {"status": "failed", "subrun_id": child.id},
+    }
+    child.step_results = {
+        "execute": {"status": "failed", "subrun_id": grandchild.id},
+    }
+    grandchild.step_results = {"metadata": {"status": "failed"}}
+    db_session.add_all([root, child, grandchild])
+    await db_session.commit()
+
+    target = await _deepest_retryable_subworkflow_run(db_session, root)
+    assert target.id == grandchild.id
+
+    child.entity_id = generate_ulid()
+    await db_session.commit()
+    assert (await _deepest_retryable_subworkflow_run(db_session, root)).id == root.id
+    child.entity_id = entity_id
+
+    child.workspace_id = generate_ulid()
+    await db_session.commit()
+    assert (await _deepest_retryable_subworkflow_run(db_session, root)).id == root.id
+    child.workspace_id = workspace_id
+
+    child.trigger_data = {"parent_run_id": root.id, "parent_step_id": "wrong-step"}
+    await db_session.commit()
+    assert (await _deepest_retryable_subworkflow_run(db_session, root)).id == root.id
+    child.trigger_data = {"parent_run_id": root.id, "parent_step_id": "publish"}
+
+    root.step_results = {
+        "publish": {"status": "failed", "subrun_id": generate_ulid()},
+    }
+    await db_session.commit()
+    assert (await _deepest_retryable_subworkflow_run(db_session, root)).id == root.id
+    root.step_results = {
+        "publish": {"status": "failed", "subrun_id": child.id},
+    }
+
+    grandchild.step_results = {
+        "metadata": {"status": "failed", "subrun_id": root.id},
+    }
+    root.trigger_data = {
+        "parent_run_id": grandchild.id,
+        "parent_step_id": "metadata",
+    }
+    await db_session.commit()
+    assert (await _deepest_retryable_subworkflow_run(db_session, root)).id == root.id
+
+
+@pytest.mark.asyncio
+async def test_successful_child_retry_reconciles_failed_parent_with_linked_attempt(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfsubretryreconcile")
+    child = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Retryable child",
+            "variables": {"recover": False},
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["recoverable"]},
+                {
+                    "id": "recoverable",
+                    "type": "condition",
+                    "config": {"expression": "recover == true"},
+                    "true_next": ["produce"],
+                    "false_next": ["fail"],
+                },
+                {
+                    "id": "produce",
+                    "type": "transform",
+                    "config": {"set": {"child_value": "recovered"}},
+                    "next": ["end"],
+                },
+                {
+                    "id": "fail",
+                    "type": "stop",
+                    "config": {"message": "child needs retry"},
+                    "next": [],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    parent = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Parent reconciles child retry",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["child"]},
+                {
+                    "id": "child",
+                    "type": "subworkflow",
+                    "config": {"workflow_id": child["id"]},
+                    "next": ["parent_finish"],
+                },
+                {
+                    "id": "parent_finish",
+                    "type": "transform",
+                    "config": {
+                        "set": {"parent_value": "{{child.child_value}}"},
+                    },
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+
+    failed_parent = (await client.post(
+        f"/api/v1/workflows/{parent['id']}/run",
+        headers=headers,
+        json={},
+    )).json()
+    assert failed_parent["status"] == "failed"
+    failed_child_id = failed_parent["step_results"]["child"]["subrun_id"]
+
+    retried_child_response = await client.post(
+        f"/api/v1/workflows/runs/{failed_child_id}/retry",
+        headers=headers,
+        json={
+            "from_step_id": "recoverable",
+            "variables": {"recover": True},
+            "execute": False,
+        },
+    )
+    retried_child = await _execute_created_retry(
+        client,
+        headers,
+        retried_child_response,
+    )
+    assert retried_child["status"] == "completed"
+
+    parent_attempts = (await db_session.execute(
+        select(WorkflowRun)
+        .where(WorkflowRun.lineage_root_run_id == failed_parent["id"])
+        .order_by(WorkflowRun.attempt_number)
+    )).scalars().all()
+    assert len(parent_attempts) == 2
+    recovered_parent = parent_attempts[-1]
+    assert recovered_parent.retry_of_run_id == failed_parent["id"]
+    assert recovered_parent.retry_from_step_id == "child"
+    assert recovered_parent.status == "completed"
+    assert recovered_parent.step_results["child"]["subrun_id"] == retried_child["id"]
+    assert recovered_parent.variables["parent_value"] == "recovered"
+
+    original_parent = await db_session.get(WorkflowRun, failed_parent["id"])
+    assert original_parent.status == "failed"
+
+    # Terminal-effect redelivery is at-least-once. Replaying the successful
+    # child receipt must not reopen either terminal row or create attempt 3.
+    retried_child_row = await db_session.get(WorkflowRun, retried_child["id"])
+    await WorkflowRunner()._propagate_subworkflow_result(
+        retried_child_row,
+        db_session,
+    )
+    parent_attempts = (await db_session.execute(
+        select(WorkflowRun)
+        .where(WorkflowRun.lineage_root_run_id == failed_parent["id"])
+        .order_by(WorkflowRun.attempt_number)
+    )).scalars().all()
+    assert len(parent_attempts) == 2
+    assert [attempt.status for attempt in parent_attempts] == ["failed", "completed"]
+
+    # A process can commit the reconciled attempt before continuing it. If a
+    # user then cancels that attempt, redelivery must respect the cancellation
+    # rather than create and execute attempt 3.
+    recovered_parent.status = "cancelled"
+    recovered_parent.completed_at = datetime.now(timezone.utc)
+    await db_session.commit()
+    await WorkflowRunner()._propagate_subworkflow_result(
+        retried_child_row,
+        db_session,
+    )
+    parent_attempts = (await db_session.execute(
+        select(WorkflowRun)
+        .where(WorkflowRun.lineage_root_run_id == failed_parent["id"])
+        .order_by(WorkflowRun.attempt_number)
+    )).scalars().all()
+    assert len(parent_attempts) == 2
+    assert [attempt.status for attempt in parent_attempts] == ["failed", "cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_child_retry_reconciliation_rejects_mismatched_parent_target(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_trace import (
+        workflow_definition_fingerprint,
+    )
+
+    headers = await _auth(client, "wfsubretrymismatch")
+    child = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Bound child",
+            "variables": {"recover": False},
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["recoverable"]},
+                {
+                    "id": "recoverable",
+                    "type": "condition",
+                    "config": {"expression": "recover == true"},
+                    "true_next": ["end"],
+                    "false_next": ["fail"],
+                },
+                {
+                    "id": "fail",
+                    "type": "stop",
+                    "config": {"message": "child needs retry"},
+                    "next": [],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+    parent = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={
+            "name": "Parent with corrupted binding",
+            "steps": [
+                {"id": "start", "type": "trigger", "next": ["child"]},
+                {
+                    "id": "child",
+                    "type": "subworkflow",
+                    "config": {"workflow_id": child["id"]},
+                    "next": ["end"],
+                },
+                {"id": "end", "type": "end", "next": []},
+            ],
+        },
+    )).json()
+
+    failed_parent = (await client.post(
+        f"/api/v1/workflows/{parent['id']}/run",
+        headers=headers,
+        json={},
+    )).json()
+    failed_child_id = failed_parent["step_results"]["child"]["subrun_id"]
+    parent_row = await db_session.get(WorkflowRun, failed_parent["id"])
+    corrupted_snapshot = deepcopy(parent_row.execution_snapshot)
+    child_step = next(
+        step for step in corrupted_snapshot["steps"] if step["id"] == "child"
+    )
+    child_step["config"]["workflow_id"] = parent["id"]
+    frozen = SimpleNamespace(
+        id=corrupted_snapshot["workflow_id"],
+        version=corrupted_snapshot["version"],
+        steps=corrupted_snapshot["steps"],
+    )
+    corrupted_snapshot["fingerprint"] = workflow_definition_fingerprint(frozen)
+    parent_row.execution_snapshot = corrupted_snapshot
+    await db_session.commit()
+
+    retried_child = await client.post(
+        f"/api/v1/workflows/runs/{failed_child_id}/retry",
+        headers=headers,
+        json={
+            "from_step_id": "recoverable",
+            "variables": {"recover": True},
+            "execute": False,
+        },
+    )
+    retried_child_result = await _execute_created_retry(
+        client,
+        headers,
+        retried_child,
+    )
+    assert retried_child_result["status"] == "completed"
+
+    parent_attempts = (await db_session.execute(
+        select(WorkflowRun).where(
+            WorkflowRun.lineage_root_run_id == failed_parent["id"]
+        )
+    )).scalars().all()
+    assert len(parent_attempts) == 1
+    assert parent_attempts[0].status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_retry_queues_execution_and_returns_before_workflow_finishes(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretrybackground")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Background retry", "steps": _simple_steps(["work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    await db_session.commit()
+
+    inline_execution_started = asyncio.Event()
+
+    async def never_finishes(*_args, **_kwargs):
+        inline_execution_started.set()
+        await asyncio.Event().wait()
+
+    queued_run_ids: list[str] = []
+
+    def enqueue(run_id: str, delay_seconds: float = 0) -> bool:
+        assert delay_seconds == 0
+        queued_run_ids.append(run_id)
+        return True
+
+    monkeypatch.setattr(WorkflowRunner, "run", never_finishes)
+    monkeypatch.setattr(WorkflowRunner, "enqueue", staticmethod(enqueue))
+
+    response = await asyncio.wait_for(
+        client.post(
+            f"/api/v1/workflows/runs/{failed['id']}/retry",
+            headers=headers,
+            json={"from_step_id": "work", "execute": True},
+        ),
+        timeout=0.5,
+    )
+
+    assert response.status_code == 201, response.text
+    retried = response.json()
+    assert retried["status"] == "running"
+    assert queued_run_ids == [retried["id"]]
+    assert inline_execution_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_retry_records_queue_failure_without_leaving_a_running_attempt(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretryqueuefailure")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Failed retry dispatch", "steps": _simple_steps(["work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "work"
+    await db_session.commit()
+
+    async def must_not_run_inline(*_args, **_kwargs):
+        raise AssertionError("Retry execution must not run inside the API request")
+
+    monkeypatch.setattr(WorkflowRunner, "run", must_not_run_inline)
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "enqueue",
+        staticmethod(lambda *_args, **_kwargs: False),
+    )
+
+    response = await client.post(
+        f"/api/v1/workflows/runs/{failed['id']}/retry",
+        headers=headers,
+        json={"from_step_id": "work", "execute": True},
+    )
+
+    assert response.status_code == 201, response.text
+    retried = response.json()
+    assert retried["status"] == "failed"
+    assert retried["completed_at"] is not None
+    assert "could not be queued" in retried["error"].lower()
+
+    stored = await db_session.get(WorkflowRun, retried["id"])
+    await db_session.refresh(stored)
+    assert stored.status == "failed"
+    assert stored.completed_at is not None
 
 
 @pytest.mark.asyncio
@@ -4825,12 +7396,11 @@ async def test_retry_attempt_restarts_failed_node_with_corrected_input(
         json={
             "from_step_id": "unstable",
             "variables": {"corrected_input": "ready"},
-            "execute": True,
+            "execute": False,
         },
     )
 
-    assert response.status_code == 201, response.text
-    retried = response.json()
+    retried = await _execute_created_retry(client, headers, response)
     assert retried["id"] != failed["id"]
     assert retried["status"] == "completed"
     assert retried["retry_of_run_id"] == failed["id"]
@@ -4871,6 +7441,69 @@ async def test_retry_attempt_restarts_failed_node_with_corrected_input(
     assert unchanged["status"] == "failed"
     assert unchanged["error"] == original_error
     assert unchanged["step_results"]["unstable"]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_internal_retry_reloads_cancelled_latest_attempt_before_recovery(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import func, select
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_run_control import cancel_run
+    from packages.core.services.workflow_service import retry_workflow_run
+
+    headers = await _auth(client, "wfinternalretrycancelrace")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Cancelled internal recovery", "steps": _simple_steps(["work"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    stale_failed = await db_session.get(WorkflowRun, failed["id"])
+    stale_failed.status = "failed"
+    stale_failed.current_step_id = "work"
+    await db_session.commit()
+
+    sessions = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with sessions() as cancel_db:
+        cancelled = await cancel_db.get(WorkflowRun, failed["id"])
+        cancel_run(
+            cancelled,
+            actor_id=stale_failed.started_by,
+            allow_problem_terminal=True,
+        )
+        await cancel_db.commit()
+
+    assert stale_failed.status == "failed"
+    with pytest.raises(ValueError, match="newer workflow attempt"):
+        await retry_workflow_run(
+            db_session,
+            run_id=failed["id"],
+            entity_id=stale_failed.entity_id,
+            started_by=stale_failed.started_by,
+            from_step_id="work",
+            expected_latest_run_id=failed["id"],
+        )
+    await db_session.rollback()
+
+    assert await db_session.scalar(
+        select(func.count()).select_from(WorkflowRun).where(
+            WorkflowRun.workflow_id == workflow["id"],
+        )
+    ) == 1
+    await db_session.refresh(stale_failed)
+    assert stale_failed.status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -4915,6 +7548,113 @@ async def test_retry_rejects_completed_producer_with_invalid_contract(
             started_by=failed_row.started_by,
             from_step_id="publish",
         )
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_step_with_uncertain_external_effect(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_service import retry_workflow_run
+
+    headers = await _auth(client, "wfretryblockeduncertain")
+    workflow = (await client.post(
+        "/api/v1/workflows",
+        headers=headers,
+        json={"name": "Uncertain upload", "steps": _simple_steps(["upload"])},
+    )).json()
+    failed = (await client.post(
+        f"/api/v1/workflows/{workflow['id']}/run",
+        headers=headers,
+        json={"execute": False},
+    )).json()
+    failed_row = await db_session.get(WorkflowRun, failed["id"])
+    failed_row.status = "failed"
+    failed_row.current_step_id = "upload"
+    failed_row.step_results = {
+        "upload": {
+            "status": "failed",
+            "retryable": False,
+            "do_not_replay": True,
+            "retry_blocked": True,
+        }
+    }
+    await db_session.commit()
+
+    with pytest.raises(ValueError, match="Workflow retry is blocked"):
+        await retry_workflow_run(
+            db_session,
+            run_id=failed["id"],
+            entity_id=failed_row.entity_id,
+            started_by=failed_row.started_by,
+            from_step_id="upload",
+        )
+
+
+
+
+@pytest.mark.asyncio
+async def test_agent_retry_hydrates_legacy_history_then_preserves_it_on_later_failure(
+    client: AsyncClient, db_session,
+):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.models.workflow import WorkflowRun
+
+    headers = await _auth(client, "wfretryagenthistory")
+    workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": "Recover existing external result", "steps": [
+            {"id": "start", "type": "trigger", "next": ["work"]},
+            {"id": "work", "type": "agent", "config": {
+                "prompt": "Complete the requested operation"}, "next": ["end"]},
+            {"id": "end", "type": "end", "next": []},
+        ],
+    })).json()
+    original = (await client.post(f"/api/v1/workflows/{workflow['id']}/run", headers=headers,
+                                  json={"execute": False})).json()
+    row = await db_session.get(WorkflowRun, original["id"])
+    row.status = "failed"
+    row.current_step_id = "work"
+    row.error = "Save response lost"
+    row.step_results = {"start": {"status": "completed"}, "work": {
+        "status": "failed", "output": {"resource_id": "original-resource", "success": False},
+        "chrome_outcome": {"receipts": [{"operation_id": "original-save", "action_executed": True}]},
+    }}
+    original_result = deepcopy(row.step_results)
+    await db_session.commit()
+
+    async def retry(source_id):
+        response = await client.post(f"/api/v1/workflows/runs/{source_id}/retry", headers=headers,
+                                    json={"from_step_id": "work", "execute": False})
+        assert response.status_code == 201, response.text
+        return await db_session.get(WorkflowRun, response.json()["id"])
+
+    legacy = await retry(row.id)
+    # Emulate an already stored retry from before recovery history was retained.
+    legacy.status = "failed"
+    legacy.step_results = {"start": {"status": "completed"}, "work": {
+        "status": "failed", "output": {"blocker": "Optional dialog still open"},
+    }}
+    await db_session.commit()
+    recovered = await retry(legacy.id)
+    attempts = recovered.step_results["work"]["agent_recovery"]["attempts"]
+    assert [a["run_id"] for a in attempts] == [row.id, legacy.id]
+    assert attempts[0]["result"]["output"]["resource_id"] == "original-resource"
+    assert attempts[0]["result"]["chrome_outcome"]["receipts"][0]["action_executed"] is True
+    assert attempts[1]["result"]["output"]["blocker"] == "Optional dialog still open"
+    assert recovered.execution_snapshot == row.execution_snapshot
+
+    WorkflowRunner()._record_step_result(
+        {"id": "work", "type": "agent"}, {"status": "failed", "error": "Connection lost"}, recovered,
+    )
+    recovered.status = "failed"
+    await db_session.commit()
+    next_retry = await retry(recovered.id)
+    attempts = next_retry.step_results["work"]["agent_recovery"]["attempts"]
+    assert [a["run_id"] for a in attempts] == [row.id, legacy.id, recovered.id]
+    await db_session.refresh(row)
+    assert row.step_results == original_result
+    assert row.status == "failed"
 
 
 @pytest.mark.asyncio
@@ -5020,12 +7760,12 @@ async def test_retry_executes_original_execution_snapshot_not_live_definition(
     retried = await client.post(
         f"/api/v1/workflows/runs/{failed['id']}/retry",
         headers=headers,
-        json={"from_step_id": "work", "execute": True},
+        json={"from_step_id": "work", "execute": False},
     )
 
-    assert retried.status_code == 201, retried.text
-    assert retried.json()["status"] == "completed"
-    assert retried.json()["variables"]["result"] == "original"
+    retried_result = await _execute_created_retry(client, headers, retried)
+    assert retried_result["status"] == "completed"
+    assert retried_result["variables"]["result"] == "original"
 
 
 @pytest.mark.asyncio
@@ -5160,11 +7900,10 @@ async def test_retry_attempt_can_resume_cancelled_run(client: AsyncClient):
     response = await client.post(
         f"/api/v1/workflows/runs/{pending['id']}/retry",
         headers=headers,
-        json={"from_step_id": "start", "execute": True},
+        json={"from_step_id": "start", "execute": False},
     )
 
-    assert response.status_code == 201, response.text
-    retried = response.json()
+    retried = await _execute_created_retry(client, headers, response)
     assert retried["status"] == "completed"
     assert retried["retry_of_run_id"] == pending["id"]
     assert retried["retry_from_step_id"] == "start"
@@ -5260,12 +7999,11 @@ async def test_retry_attempt_resumes_failed_operation_inside_stage(client: Async
         json={
             "from_step_id": "work",
             "variables": {"corrected_input": "ready"},
-            "execute": True,
+            "execute": False,
         },
     )
 
-    assert response.status_code == 201, response.text
-    retried = response.json()
+    retried = await _execute_created_retry(client, headers, response)
     assert retried["status"] == "completed"
     assert retried["variables"]["rendered"] == "ready"
     assert set(retried["variables"]["__stage_execution"]) == {"work"}
@@ -5474,12 +8212,11 @@ async def test_business_retry_reexecutes_completed_stage_with_durable_project(
         headers=headers,
         json={
             "variables": {"corrected_input": "ready"},
-            "execute": True,
+            "execute": False,
         },
     )
 
-    assert response.status_code == 201, response.text
-    retried = response.json()
+    retried = await _execute_created_retry(client, headers, response)
     assert retried["status"] == "completed"
     assert retried["retry_from_step_id"] == "check_browser"
     assert retried["variables"]["check_value"] == "ready"
@@ -5591,6 +8328,8 @@ async def test_foreach_subworkflow_preserves_item_order(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_foreach_subworkflow_resumes_each_paused_child_before_parent(client: AsyncClient):
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
     headers = await _auth(client, "wfforeachresume")
     child = (await client.post(
         "/api/v1/workflows",
@@ -5674,6 +8413,8 @@ async def test_foreach_subworkflow_resumes_each_paused_child_before_parent(clien
         json={"variables": {"decision": "approved"}},
     )
     assert first_resume.status_code == 200, first_resume.text
+    assert first_resume.json()["status"] == "running"
+    await WorkflowRunner().run(first_child_id)
 
     parent_after_first = (await client.get(
         f"/api/v1/workflows/runs/{parent_run['id']}",
@@ -5689,6 +8430,8 @@ async def test_foreach_subworkflow_resumes_each_paused_child_before_parent(clien
         json={"variables": {"decision": "approved"}},
     )
     assert second_resume.status_code == 200, second_resume.text
+    assert second_resume.json()["status"] == "running"
+    await WorkflowRunner().run(second_child_id)
 
     completed_parent = (await client.get(
         f"/api/v1/workflows/runs/{parent_run['id']}",
@@ -5772,6 +8515,7 @@ async def test_foreach_subworkflow_rejects_parent_definition_change_before_child
     client: AsyncClient,
     db_session,
 ):
+    from packages.core.ai.workflow_runner import WorkflowRunner
     from packages.core.models.workflow import WorkflowRun
 
     headers = await _auth(client, "wfforeachstaleparent")
@@ -5856,6 +8600,8 @@ async def test_foreach_subworkflow_rejects_parent_definition_change_before_child
         json={"variables": {"decision": "approved"}},
     )
     assert child_resume.status_code == 200, child_resume.text
+    assert child_resume.json()["status"] == "running"
+    await WorkflowRunner().run(first_child_id)
 
     stale_parent = (await client.get(
         f"/api/v1/workflows/runs/{parent_run['id']}",
@@ -6164,6 +8910,114 @@ async def test_list_bindings_filters_by_workspace(client: AsyncClient):
     )).json()
     assert len(only_a) == 1
     assert only_a[0]["workspace_id"] == workspace_a
+
+
+@pytest.mark.asyncio
+async def test_list_workflow_project_candidates_is_workspace_scoped_and_minimal(
+    client: AsyncClient,
+    db_session,
+):
+    from sqlalchemy import select
+
+    from packages.core.models.user import User
+    from packages.core.services.workflow_project_service import create_workflow_project
+
+    headers = await _auth(client, "workflowprojectcandidates")
+    other_headers = await _auth(client, "workflowprojectcandidateother")
+    workspace_id = await _create_workspace(client, headers, "Project candidates")
+    other_workspace_id = await _create_workspace(client, headers, "Other candidates")
+    owner = (await db_session.execute(
+        select(User).where(User.email == "workflowprojectcandidates@test.com")
+    )).scalar_one()
+
+    ready = await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=workspace_id,
+        project_type="stickman_video",
+        state={
+            "publication": {"title": "Ready video"},
+            "youtube": {},
+            "private_runtime_value": "must-not-leak",
+        },
+        created_by=owner.id,
+        current_stage="video_ready",
+    )
+    published = await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=workspace_id,
+        project_type="stickman_video",
+        state={
+            "publication": {"title": "Published video"},
+            "youtube": {"video_id": "youtube-123"},
+        },
+        created_by=owner.id,
+        current_stage="youtube_saved",
+    )
+    await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=workspace_id,
+        project_type="stickman_video",
+        state={"publication": {"title": "Active upload"}},
+        created_by=owner.id,
+        current_stage="publishing",
+    )
+    await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=other_workspace_id,
+        project_type="stickman_video",
+        state={"publication": {"title": "Wrong workspace"}},
+        created_by=owner.id,
+        current_stage="video_ready",
+    )
+    await create_workflow_project(
+        db_session,
+        entity_id=owner.entity_id,
+        workspace_id=workspace_id,
+        project_type="product_video",
+        state={"publication": {"title": "Wrong type"}},
+        created_by=owner.id,
+        current_stage="video_ready",
+    )
+    await db_session.commit()
+
+    response = await client.get(
+        "/api/v1/workflows/projects/candidates",
+        headers=headers,
+        params=[
+            ("workspace_id", workspace_id),
+            ("project_type", "stickman_video"),
+            ("stage", "video_ready"),
+            ("stage", "youtube_saved"),
+        ],
+    )
+
+    assert response.status_code == 200, response.text
+    candidates = response.json()
+    assert {item["id"] for item in candidates} == {ready.id, published.id}
+    assert {item["title"] for item in candidates} == {
+        "Ready video",
+        "Published video",
+    }
+    published_candidate = next(
+        item for item in candidates if item["id"] == published.id
+    )
+    assert published_candidate["youtube_video_id"] == "youtube-123"
+    assert all("state" not in item for item in candidates)
+
+    forbidden = await client.get(
+        "/api/v1/workflows/projects/candidates",
+        headers=other_headers,
+        params={
+            "workspace_id": workspace_id,
+            "project_type": "stickman_video",
+            "stage": "video_ready",
+        },
+    )
+    assert forbidden.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -6804,3 +9658,41 @@ def test_workflow_terminal_effect_sweep_republishes_to_runner(monkeypatch):
 
     assert result == {"claimed": 2, "published": 1}
     assert published == ["run-1", "run-2"]
+
+
+@pytest.mark.asyncio
+async def test_run_single_node_is_a_real_running_run_that_tools_accept(client: AsyncClient, monkeypatch):
+    """Tools a node calls check that their run exists, is running, and belongs
+    to the caller; a node test must pass that check (an in-memory stand-in
+    run failed it with workflow_origin_not_executable) and stay out of lists."""
+    from packages.core.ai.workflow_runner import WorkflowRunner
+    from packages.core.governance.service import workflow_run_is_executable
+
+    seen: dict = {}
+
+    async def fake_step(self, step, run, db):
+        seen["run_id"] = run.id
+        seen["executable"] = await workflow_run_is_executable(
+            db,
+            entity_id=run.entity_id,
+            workspace_id=None,
+            user_id=run.started_by,
+            workflow_run_id=run.id,
+        )
+        return {"status": "completed", "output": {"image_url": "/api/v1/fs/e/test.png"}}
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_step_safe", fake_step)
+    headers = await _auth(client, "wfnodetool")
+    resp = await client.post(
+        "/api/v1/workflows/run-node",
+        headers=headers,
+        json={"step": {"id": "img", "type": "image", "name": "Image", "config": {"prompt": "a cat"}}},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "completed"
+    assert seen["executable"] is True
+    assert seen["run_id"] != "adhoc"
+
+    runs = (await client.get("/api/v1/workflows/runs", headers=headers)).json()
+    rows = runs if isinstance(runs, list) else runs.get("runs") or runs.get("items") or []
+    assert all(row.get("id") != seen["run_id"] for row in rows)

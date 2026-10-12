@@ -30,6 +30,9 @@ POST /api/v1/backup/export/download  # download an export archive
 
 这是数据级导出（适合迁移和异地副本），不能替代对整个部署的卷级备份。
 
+蓝图 JSON 只包含脱敏配置和选定的 starter knowledge，不包含历史、密钥或 grant。
+它不是用户、任务、transcript、供应商凭据或在途 run 的备份。
+
 ## PostgreSQL {#postgresql}
 
 导出：

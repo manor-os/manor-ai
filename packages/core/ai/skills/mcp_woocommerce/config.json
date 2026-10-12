@@ -17,5 +17,9 @@
     "mcp__woocommerce__update_order_status",
     "mcp__woocommerce__list_customers",
     "mcp__woocommerce__get_customer"
-  ]
+  ],
+  "search": {
+    "terms": ["wordpress", "ecommerce", "online shop", "inventory", "order status", "store products", "woo"],
+    "examples": ["list woocommerce orders pending", "update stock for woocommerce product", "change order status to completed", "add new product to wordpress shop"]
+  }
 }

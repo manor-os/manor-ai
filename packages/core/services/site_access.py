@@ -47,7 +47,7 @@ async def user_can_manage_site(
                 Workspace.id == workspace_id,
                 Workspace.entity_id == user.entity_id,
                 Workspace.deleted_at.is_(None),
-                Workspace.status == "active",
+                Workspace.status.in_(("active", "paused")),
             )
         )
         if workspace is not None and await user_can_manage_workspace(

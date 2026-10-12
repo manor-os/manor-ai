@@ -9,9 +9,21 @@ import pytest
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, VectorStatus
+from packages.core.models.user import Entity
 
 
-def test_embedding_task_and_recovery_schedule_cover_long_local_indexes():
+@pytest.fixture(autouse=True)
+def _exercise_enabled_embedding_implementation(monkeypatch):
+    from packages.core.services import embedding_service
+
+    monkeypatch.setattr(
+        embedding_service,
+        "_EMBEDDINGS_TEMPORARILY_PAUSED",
+        False,
+    )
+
+
+def test_embedding_tasks_remain_routed_while_periodic_sweep_is_paused():
     from packages.core.celery_app import celery_app
     from packages.core.queues import CeleryQueue, TASK_QUEUES
     from packages.core.tasks.ai_tasks import process_document_embeddings
@@ -19,7 +31,7 @@ def test_embedding_task_and_recovery_schedule_cover_long_local_indexes():
     assert process_document_embeddings.soft_time_limit == 6_900
     assert process_document_embeddings.time_limit == 7_200
     assert process_document_embeddings.time_limit > process_document_embeddings.soft_time_limit
-    assert celery_app.conf.beat_schedule["embedding-sweep-pending"]["schedule"] == 60.0
+    assert "embedding-sweep-pending" not in celery_app.conf.beat_schedule
     assert TASK_QUEUES["embeddings.sweep_pending"] == CeleryQueue.HEAVY
     assert TASK_QUEUES["packages.core.tasks.ai_tasks.process_document_embeddings"] == CeleryQueue.HEAVY
 
@@ -179,10 +191,11 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     now = datetime.now(timezone.utc)
     stale_at = now - timedelta(minutes=20)
     fresh_at = now - timedelta(seconds=30)
+    active_entity = Entity(id=generate_ulid(), name="Active entity")
 
     stale = Document(
         id=generate_ulid(),
-        entity_id=generate_ulid(),
+        entity_id=active_entity.id,
         name="stale.md",
         vector_status=VectorStatus.PROCESSING,
         # Heartbeat, not content-version updated_at, determines liveness.
@@ -197,7 +210,7 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     )
     exhausted = Document(
         id=generate_ulid(),
-        entity_id=generate_ulid(),
+        entity_id=active_entity.id,
         name="exhausted.md",
         vector_status=VectorStatus.PROCESSING,
         updated_at=stale_at,
@@ -205,14 +218,14 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     )
     pending = Document(
         id=generate_ulid(),
-        entity_id=generate_ulid(),
+        entity_id=active_entity.id,
         name="undispatched.md",
         vector_status=VectorStatus.PENDING,
         updated_at=stale_at,
     )
     workspace_deleted = Document(
         id=generate_ulid(),
-        entity_id=generate_ulid(),
+        entity_id=active_entity.id,
         name="deleted-workspace.md",
         vector_status=VectorStatus.PENDING,
         updated_at=stale_at,
@@ -225,7 +238,7 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     )
     fresh = Document(
         id=generate_ulid(),
-        entity_id=generate_ulid(),
+        entity_id=active_entity.id,
         name="live.md",
         vector_status=VectorStatus.PROCESSING,
         updated_at=stale_at,
@@ -237,7 +250,60 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
             }
         },
     )
-    db_session.add_all([stale, exhausted, pending, workspace_deleted, fresh])
+    trashed = Document(
+        id=generate_ulid(),
+        entity_id=active_entity.id,
+        name="trashed.md",
+        vector_status=VectorStatus.PENDING,
+        is_trashed=True,
+        updated_at=stale_at,
+        metadata_={"indexing": {"blocked_reason": "workspace_deleted"}},
+    )
+    quarantined = Document(
+        id=generate_ulid(),
+        entity_id=active_entity.id,
+        name="quarantined.md",
+        vector_status=VectorStatus.PENDING,
+        quarantine_status="quarantined",
+        updated_at=stale_at,
+        metadata_={"indexing": {"blocked_reason": "workspace_deleted"}},
+    )
+    deleted_entity = Entity(
+        id=generate_ulid(),
+        name="Deleted entity",
+        deleted_at=now,
+    )
+    deleted_entity_document = Document(
+        id=generate_ulid(),
+        entity_id=deleted_entity.id,
+        name="deleted-entity.md",
+        vector_status=VectorStatus.PENDING,
+        updated_at=stale_at,
+        metadata_={"indexing": {"blocked_reason": "workspace_deleted"}},
+    )
+    missing_entity_document = Document(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        name="missing-entity.md",
+        vector_status=VectorStatus.PENDING,
+        updated_at=stale_at,
+        metadata_={"indexing": {"blocked_reason": "workspace_deleted"}},
+    )
+    db_session.add_all(
+        [
+            stale,
+            exhausted,
+            pending,
+            workspace_deleted,
+            fresh,
+            trashed,
+            quarantined,
+            active_entity,
+            deleted_entity,
+            deleted_entity_document,
+            missing_entity_document,
+        ]
+    )
     await db_session.commit()
 
     result = await recover_stale_embedding_documents(
@@ -249,10 +315,20 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
         limit=10,
     )
 
-    assert set(result["requeued"]) == {stale.id, pending.id}
+    assert set(result["requeued"]) == {stale.id, pending.id, workspace_deleted.id}
     assert result["failed"] == [exhausted.id]
 
-    for doc in (stale, exhausted, pending, workspace_deleted, fresh):
+    for doc in (
+        stale,
+        exhausted,
+        pending,
+        workspace_deleted,
+        fresh,
+        trashed,
+        quarantined,
+        deleted_entity_document,
+        missing_entity_document,
+    ):
         await db_session.refresh(doc)
 
     assert stale.vector_status == VectorStatus.PENDING
@@ -262,7 +338,13 @@ async def test_recovery_sweep_requeues_stale_rows_and_bounds_retries(db_session)
     assert pending.vector_status == VectorStatus.PENDING
     assert pending.metadata_["indexing"]["step"] == "queued"
     assert workspace_deleted.vector_status == VectorStatus.PENDING
-    assert workspace_deleted.metadata_["indexing"]["step"] == "blocked"
+    assert workspace_deleted.metadata_["indexing"]["step"] == "queued"
+    assert "blocked_reason" not in workspace_deleted.metadata_["indexing"]
+    assert "blocked_at" not in workspace_deleted.metadata_["indexing"]
+    assert trashed.metadata_["indexing"]["blocked_reason"] == "workspace_deleted"
+    assert quarantined.metadata_["indexing"]["blocked_reason"] == "workspace_deleted"
+    assert deleted_entity_document.metadata_["indexing"]["blocked_reason"] == "workspace_deleted"
+    assert missing_entity_document.metadata_["indexing"]["blocked_reason"] == "workspace_deleted"
     assert exhausted.vector_status == VectorStatus.FAILED
     assert exhausted.metadata_["indexing"]["error_code"] == "stale_heartbeat"
     assert exhausted.metadata_["indexing"]["recovery_attempts"] == 4

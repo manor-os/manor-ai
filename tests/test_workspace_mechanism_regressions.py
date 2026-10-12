@@ -6,6 +6,13 @@ from unittest.mock import ANY, AsyncMock
 
 import pytest
 from httpx import AsyncClient
+from tests.approval_settings_test_utils import action_rule, set_workspace_test_approval
+
+
+def _policy_actions(policy, effect):
+    from packages.core.governance.approval_projection import policy_override
+    return [rule.selector.action_key for rule in policy_override(policy).rules
+        if rule.effect == effect and rule.selector.kind == "action"]
 
 
 async def _register(client: AsyncClient, username: str) -> dict:
@@ -233,6 +240,95 @@ async def test_workspace_chat_messages_resolve_author_user(client: AsyncClient, 
 
 
 @pytest.mark.asyncio
+async def test_workspace_team_chat_is_shared_without_starting_agent(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from apps.api.routers import workspace_chat
+    from packages.core.models.workspace import WorkspaceStaff
+    from tests.test_document_permissions import _create_entity_user
+
+    scheduled: list[dict] = []
+    publish_event = AsyncMock()
+    monkeypatch.setattr(
+        workspace_chat,
+        "_schedule_workspace_chat_processing",
+        lambda **kwargs: scheduled.append(kwargs),
+    )
+    monkeypatch.setattr(
+        workspace_chat.chat_service,
+        "publish_workspace_chat_message_event",
+        publish_event,
+    )
+
+    owner_headers = await _register(client, "ws_team_chat_owner")
+    owner = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    workspace = (
+        await client.post(
+            "/api/v1/workspaces",
+            headers=owner_headers,
+            json={"name": "Internal Team Chat"},
+        )
+    ).json()
+    member = await _create_entity_user(
+        owner["entity_id"],
+        "ws_team_chat_member",
+        role="member",
+        display_name="Workspace Teammate",
+        avatar_url="https://example.com/teammate.png",
+    )
+    db_session.add(
+        WorkspaceStaff(
+            workspace_id=workspace["id"],
+            staff_id=None,
+            user_id=member["id"],
+            role="contributor",
+            status="active",
+        )
+    )
+    await db_session.commit()
+
+    team_post = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=member["headers"],
+        json={"body": "Can everyone review the launch plan?", "audience": "team"},
+    )
+
+    assert team_post.status_code == 201, team_post.text
+    team_message = team_post.json()
+    assert scheduled == []
+    assert team_message["author_user_id"] == member["id"]
+    assert team_message["author_user_name"] == "Workspace Teammate"
+    assert team_message["author_user_avatar_url"] == "https://example.com/teammate.png"
+    assert team_message["meta"]["workspace_chat_audience"] == "team"
+    publish_event.assert_awaited_once_with(
+        owner["entity_id"],
+        workspace_id=workspace["id"],
+        message=ANY,
+    )
+
+    owner_messages = (
+        await client.get(
+            f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+            headers=owner_headers,
+        )
+    ).json()
+    shared_message = next(item for item in owner_messages if item["id"] == team_message["id"])
+    assert shared_message["body"] == "Can everyone review the launch plan?"
+    assert shared_message["author_user_id"] == member["id"]
+
+    ai_post = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=member["headers"],
+        json={"body": "Summarize the launch plan.", "audience": "ai"},
+    )
+    assert ai_post.status_code == 201, ai_post.text
+    assert len(scheduled) == 1
+    assert publish_event.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_legacy_workspace_setup_endpoints_are_gone(client: AsyncClient):
     headers = await _register(client, "ws_setup_gone")
     create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "No Legacy Setup"})
@@ -421,10 +517,14 @@ async def test_workspace_knowledge_group_changes_refresh_context_and_policy(clie
 async def test_workspace_search_accepts_plain_string_operating_rules(db_session):
     from packages.core.models.base import generate_ulid
     from packages.core.models.workspace import Workspace
+    from packages.core.models.user import Entity
+    from packages.core.governance.approval_policy_service import account_defaults, initialize_workspace_approval
     from packages.core.workspace_chat import context as chat_context
 
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
+    db_session.add(Entity(id=entity_id, name="String rules account",
+        settings={"approval_defaults": account_defaults()}))
     db_session.add(
         Workspace(
             id=workspace_id,
@@ -439,6 +539,8 @@ async def test_workspace_search_accepts_plain_string_operating_rules(db_session)
             },
         )
     )
+    await db_session.flush()
+    await initialize_workspace_approval(db_session, await db_session.get(Workspace, workspace_id))
     await db_session.commit()
 
     search = await chat_context.workspace_search(
@@ -613,6 +715,7 @@ async def test_workspace_agent_request_strategist_review_enqueues_and_records_ac
     db_session,
     monkeypatch,
 ):
+    from types import SimpleNamespace
     from sqlalchemy import select
     from packages.core.ai.tools.workspace_agent_tools import _workspace_request_strategist_review_handler
     from packages.core.models.base import generate_ulid
@@ -643,6 +746,7 @@ async def test_workspace_agent_request_strategist_review_enqueues_and_records_ac
             workspace_id=workspace["id"],
             reason="User asked for a new plan after updated leasing priorities.",
             countdown_seconds=0,
+            _runtime_envelope_from_context=SimpleNamespace(profile="workspace_operator"),
         )
     )
 
@@ -661,6 +765,7 @@ async def test_workspace_agent_request_strategist_review_enqueues_and_records_ac
                 "kwargs": {
                     "trigger_kind": "human_requested",
                     "trigger_detail": payload["trigger_detail"],
+                    "user_id": user_id,
                 },
                 "countdown": 0,
             },
@@ -803,7 +908,7 @@ async def test_workspace_operation_rule_apply_syncs_governance(client: AsyncClie
     policy = (
         await db_session.execute(select(GovernancePolicy).where(GovernancePolicy.workspace_id == ws_id))
     ).scalar_one()
-    assert "social_post.publish" in policy.policy["hitl_required_actions"]
+    assert "social_post.publish" in _policy_actions(policy.policy, "ask")
     await db_session.refresh(workspace)
     assert workspace.budget_alert_state == "critical_100"
 
@@ -847,7 +952,7 @@ async def test_workspace_operation_rules_replace_drops_stale_inferred_governance
     policy = (
         await db_session.execute(select(GovernancePolicy).where(GovernancePolicy.workspace_id == ws_id))
     ).scalar_one()
-    assert policy.policy["never_allow_actions"] == ["social_post.publish"]
+    assert _policy_actions(policy.policy, "deny") == ["social_post.publish"]
 
     second = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts",
@@ -884,13 +989,17 @@ async def test_workspace_operation_rules_replace_drops_stale_inferred_governance
     ).scalar_one()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_id))).scalar_one()
 
-    assert policy.policy["never_allow_actions"] == []
-    assert policy.policy["hitl_required_actions"] == ["social_post.publish"]
-    assert workspace.operating_model["governance"]["never_allow_actions"] == []
-    assert workspace.operating_model["governance"]["hitl_required_actions"] == ["social_post.publish"]
+    assert _policy_actions(policy.policy, "deny") == []
+    assert _policy_actions(policy.policy, "ask") == ["social_post.publish"]
+    assert _policy_actions(workspace.operating_model["governance"], "deny") == []
+    assert _policy_actions(workspace.operating_model["governance"], "ask") == ["social_post.publish"]
 
-    stale_policy = dict(policy.policy or {})
-    stale_policy["never_allow_actions"] = ["social_post.publish"]
+    from copy import deepcopy
+    stale_policy = deepcopy(policy.policy)
+    stale_policy["approval"]["policy"]["rules"].append({
+        "id": "stale-derived-deny", "effect": "deny", "source_kind": "workspace_rule",
+        "source_id": "draft_only_social", "selector": {"kind": "action", "action_key": "social_post.publish"},
+    })
     policy.policy = stale_policy
     stale_model = dict(workspace.operating_model or {})
     stale_model["governance"] = stale_policy
@@ -919,6 +1028,11 @@ async def test_workspace_operation_rules_replace_drops_stale_inferred_governance
         },
     )
     assert third.status_code == 200
+    # The rules themselves are unchanged, but applying repairs durable policy
+    # drift. That real effect must be visible before approval, not rejected by
+    # the no-op guard or hidden by the runtime policy cache.
+    assert "governance_policy" in third.json()["diff"]["changed_keys"]
+    assert _policy_actions(third.json()["diff"]["changes"]["governance_policy"]["after"], "deny") == []
     applied_third = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts/{third.json()['id']}/apply",
         headers=headers,
@@ -931,8 +1045,8 @@ async def test_workspace_operation_rules_replace_drops_stale_inferred_governance
         await db_session.execute(select(GovernancePolicy).where(GovernancePolicy.workspace_id == ws_id))
     ).scalar_one()
     repaired_workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_id))).scalar_one()
-    assert repaired_policy.policy["never_allow_actions"] == []
-    assert repaired_workspace.operating_model["governance"]["never_allow_actions"] == []
+    assert _policy_actions(repaired_policy.policy, "deny") == []
+    assert _policy_actions(repaired_workspace.operating_model["governance"], "deny") == []
 
 
 @pytest.mark.asyncio
@@ -1620,6 +1734,121 @@ async def test_get_skill_by_slug_accepts_hyphen_underscore_aliases(
 
 
 @pytest.mark.asyncio
+async def test_invoke_skill_slug_prefers_agent_available_workspace_duplicate(
+    db_session,
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.skill import AgentSkillBinding, Skill
+    from packages.core.models.workspace import Agent, Workspace
+    from packages.core.services import skill_service
+
+    entity_id = generate_ulid()
+    target_workspace_id = generate_ulid()
+    other_workspace_id = generate_ulid()
+    agent_id = generate_ulid()
+    target_skill_id = generate_ulid()
+    other_skill_id = generate_ulid()
+    db_session.add_all([
+        Workspace(
+            id=target_workspace_id,
+            entity_id=entity_id,
+            name="Target Stickman Workspace",
+            operating_model={},
+            settings={},
+            status="active",
+        ),
+        Workspace(
+            id=other_workspace_id,
+            entity_id=entity_id,
+            name="Newer Stickman Workspace",
+            operating_model={},
+            settings={},
+            status="active",
+        ),
+        Agent(
+            id=agent_id,
+            entity_id=entity_id,
+            workspace_id=target_workspace_id,
+            name="Target Stickman Producer",
+            system_prompt="Produce the target Workspace video.",
+            config={},
+            status="active",
+        ),
+        Skill(
+            id=target_skill_id,
+            entity_id=entity_id,
+            workspace_id=target_workspace_id,
+            name="Target Stickman Video Creator",
+            slug="stickman-video-creator",
+            system_prompt="TARGET WORKSPACE SKILL",
+            tools=[],
+            input_schema={},
+            config={},
+            status="active",
+            is_public=False,
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        ),
+        Skill(
+            id=other_skill_id,
+            entity_id=entity_id,
+            workspace_id=other_workspace_id,
+            name="Other Stickman Video Creator",
+            slug="stickman-video-creator",
+            system_prompt="OTHER WORKSPACE SKILL",
+            tools=[],
+            input_schema={},
+            config={},
+            status="active",
+            is_public=False,
+            created_at=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        ),
+        AgentSkillBinding(
+            id=generate_ulid(),
+            agent_id=agent_id,
+            skill_id=target_skill_id,
+            status="active",
+        ),
+    ])
+    await db_session.flush()
+
+    captured = {}
+
+    async def fake_execute_skill_agent_loop(**kwargs):
+        captured["system_prompt"] = kwargs["system_prompt"]
+        return SimpleNamespace(
+            content="completed",
+            usage={},
+            tool_calls_made=[],
+            rounds=1,
+            stop_reason="stop",
+            control={},
+            error=None,
+            error_detail=None,
+        )
+
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.runtime_execute_skill_agent_loop",
+        fake_execute_skill_agent_loop,
+    )
+
+    result = await skill_service.invoke_skill(
+        db_session,
+        "stickman-video-creator",
+        entity_id,
+        "Create the video.",
+        agent_id=agent_id,
+        workspace_id=target_workspace_id,
+    )
+
+    assert result["skill"] == "Target Stickman Video Creator"
+    assert captured["system_prompt"] == "TARGET WORKSPACE SKILL"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["twitter_x", "stripe", "facebook", "analytics"])
 async def test_external_goal_measurement_requires_provider_evidence(
     client: AsyncClient,
@@ -2218,7 +2447,18 @@ async def test_manor_tool_workspace_mutations_use_operation_runtime(client: Asyn
             workspace_id=ws_id,
         )
     )
-    assert add_service["workspace_revision"] == 1
+    # Legacy manor mutations stage a review card; nothing applies until the
+    # person approves it (2026-09-07 review-gate bypass).
+    assert add_service["__hitl__"] is True
+    assert add_service["draft"]["status"] == "open"
+    await db_session.commit()
+    applied = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts/{add_service['draft']['id']}/apply",
+        headers=headers,
+        json={"user_confirmation": True},
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["workspace_revision"] == 1
 
     mapped = json.loads(
         await _dispatch_action(
@@ -2233,7 +2473,16 @@ async def test_manor_tool_workspace_mutations_use_operation_runtime(client: Asyn
             workspace_id=ws_id,
         )
     )
-    assert mapped["agent_mappings"]["created"] == 1
+    assert mapped["__hitl__"] is True
+    await db_session.commit()
+    applied = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts/{mapped['draft']['id']}/apply",
+        headers=headers,
+        json={"user_confirmation": True},
+    )
+    assert applied.status_code == 200, applied.text
+    assert "agent_mappings" in applied.json(), applied.json()
+    assert applied.json()["agent_mappings"]["created"] == 1
 
     db_session.expire_all()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_id))).scalar_one()
@@ -2262,7 +2511,15 @@ async def test_manor_tool_workspace_mutations_use_operation_runtime(client: Asyn
             workspace_id=ws_id,
         )
     )
-    assert unmapped["agent_mappings"]["deactivated"] == 1
+    assert unmapped["__hitl__"] is True
+    await db_session.commit()
+    applied = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts/{unmapped['draft']['id']}/apply",
+        headers=headers,
+        json={"user_confirmation": True},
+    )
+    assert applied.status_code == 200, applied.text
+    assert applied.json()["agent_mappings"]["deactivated"] == 1
 
     db_session.expire_all()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_id))).scalar_one()
@@ -2754,6 +3011,11 @@ async def test_workspace_operation_capability_binding_overlays_runtime_tool_scop
     ws_id = create.json()["id"]
     entity_id = create.json()["entity_id"]
     agent = await client.post("/api/v1/agents", headers=headers, json={"name": "Tool Scoped Agent"})
+    connection = await client.post(
+        "/api/v1/integrations", headers=headers,
+        json={"provider": "linkedin", "credentials": {"access_token": "test-token"}},
+    )
+    assert connection.status_code == 201
     tool_name = "test_leasing_unit_search"
     mcp_tool_name = "mcp__linkedin__create_post"
 
@@ -2836,13 +3098,13 @@ async def test_workspace_operation_capability_binding_overlays_runtime_tool_scop
     )
 
     assert tool_name in (service_runtime.bound_tool_names or set())
-    assert tool_name in (master_runtime.bound_tool_names or set())
+    assert tool_name not in (master_runtime.bound_tool_names or set())
     assert "workspace_create_task" in (service_runtime.bound_tool_names or set())
     assert "workspace_update_task_runtime" in (service_runtime.bound_tool_names or set())
     assert "workspace.task" in service_runtime.capability_ids
-    assert "workspace.task" in master_runtime.capability_ids
+    assert "workspace.task" not in master_runtime.capability_ids
     assert mcp_tool_name in (service_runtime.mcp_allowed_names or set())
-    assert mcp_tool_name in (master_runtime.mcp_allowed_names or set())
+    assert master_runtime.mcp_provider_scopes == ()
 
 
 @pytest.mark.asyncio
@@ -2964,10 +3226,11 @@ async def test_workspace_ledger_tools_are_inherited_by_active_internal_service_a
         "visualize_workspace_ledgers",
     } <= service_tools
     assert "record_finance_ledger" not in service_tools
-    assert "record_finance_ledger" in set(master_runtime.bound_tool_names or set())
-    assert "read_finance_ledger" in set(read_only_runtime.bound_tool_names or set())
-    assert "record_finance_ledger" not in set(read_only_runtime.bound_tool_names or set())
-    assert "record_finance_ledger" in set(background_runtime.bound_tool_names or set())
+    # Main Chat and background Host turns retain their unrestricted built-in
+    # registry scope; ledger write authorization is checked when tools execute.
+    assert master_runtime.bound_tool_names is None
+    assert read_only_runtime.bound_tool_names is None
+    assert background_runtime.bound_tool_names is None
     assert "read_finance_ledger" not in set(
         unrelated_runtime.bound_tool_names or set()
     )
@@ -2975,7 +3238,7 @@ async def test_workspace_ledger_tools_are_inherited_by_active_internal_service_a
 
 
 @pytest.mark.asyncio
-async def test_empty_workspace_ledger_configuration_is_reachable_from_chat(
+async def test_empty_workspace_ledger_configuration_keeps_master_registry_unrestricted(
     client: AsyncClient,
     db_session,
 ):
@@ -3033,24 +3296,12 @@ async def test_empty_workspace_ledger_configuration_is_reachable_from_chat(
         runtime_surface=ChatSurface.SCHEDULED_AGENT_RUN,
     )
 
-    tools = set(runtime.bound_tool_names or set())
-    assert "visualize_workspace_ledgers" in tools
-    assert "query_ledger" not in tools
-    assert not tools.intersection({
-        "read_content_ledger",
-        "read_finance_ledger",
-        "read_recruiting_ledger",
-        "read_relationship_ledger",
-        "record_content_ledger",
-        "record_finance_ledger",
-        "record_recruiting_ledger",
-        "record_relationship_ledger",
-    })
+    # An unrestricted Host keeps the registry open; an empty Ledger contract
+    # does not turn that scope into a narrow tool allowlist.
+    assert runtime.bound_tool_names is None
+    assert background_runtime.bound_tool_names is None
     assert "visualize_workspace_ledgers" not in set(
         public_runtime.bound_tool_names or set()
-    )
-    assert "visualize_workspace_ledgers" not in set(
-        background_runtime.bound_tool_names or set()
     )
 
 
@@ -3305,6 +3556,8 @@ async def test_workspace_operation_channel_apply_materializes_webchat_binding(cl
         )
     ).scalar_one()
     assert config.name == "Leasing Webchat"
+    assert config.owner_user_id == create.json()["created_by_user_id"]
+    assert binding.user_id == config.owner_user_id
     assert config.config["public_token"]
     assert config.config["linked_service_key"] == "leasing_consultant"
     assert binding.agent_subscription_id is not None
@@ -3412,7 +3665,7 @@ async def test_workspace_operation_repair_materializes_existing_operating_model(
 
     assert repaired.status_code == 200
     body = repaired.json()
-    assert body["workspace_revision"] == 7
+    assert body["workspace_revision"] == 8
     assert body["goals"]["created"] == 1
     assert body["agent_mappings"]["created"] == 1
     assert body["channels"]["created_configs"] == 1
@@ -3436,6 +3689,8 @@ async def test_workspace_operation_repair_materializes_existing_operating_model(
 
     assert float(goal.target_value) == 42
     assert sub.agent_id == agent.json()["id"]
+    assert config.owner_user_id == create.json()["created_by_user_id"]
+    assert binding.user_id == config.owner_user_id
     assert config.config["linked_service_key"] == "leasing_consultant"
     assert binding.agent_subscription_id == sub.id
 
@@ -3445,14 +3700,16 @@ async def test_workspace_operation_repair_materializes_existing_operating_model(
     )
 
     assert repaired_again.status_code == 200
-    assert repaired_again.json()["workspace_revision"] == 7
+    assert repaired_again.json()["workspace_revision"] == 8
     assert repaired_again.json()["channels"]["created_configs"] == 0
     assert repaired_again.json()["channels"]["created_bindings"] == 0
 
 
 @pytest.mark.asyncio
-async def test_workspace_operation_repair_reuses_legacy_builtin_channel(client: AsyncClient, db_session):
+@pytest.mark.parametrize("has_existing_owner", [False, True])
+async def test_workspace_operation_repair_reuses_legacy_builtin_channel(client: AsyncClient, db_session, has_existing_owner):
     from sqlalchemy import select
+    from packages.core.models.base import generate_ulid
     from packages.core.models.channel import ChannelConfig
     from packages.core.models.document import Channel
     from packages.core.models.workspace import AgentSubscription, Workspace
@@ -3462,8 +3719,10 @@ async def test_workspace_operation_repair_reuses_legacy_builtin_channel(client: 
     ws_id = create.json()["id"]
     agent = await client.post("/api/v1/agents", headers=headers, json={"name": "Legacy Channel Agent"})
 
+    existing_owner_id = generate_ulid() if has_existing_owner else None
     legacy_config = ChannelConfig(
         entity_id=create.json()["entity_id"],
+        owner_user_id=existing_owner_id,
         workspace_id=ws_id,
         channel_type="webchat",
         provider="webchat",
@@ -3533,6 +3792,8 @@ async def test_workspace_operation_repair_reuses_legacy_builtin_channel(client: 
     assert configs[0].config["role"] == "primary_external"
     assert configs[0].config["linked_service_key"] == "lead_intake"
     assert configs[0].config["public_token"] == "legacy-token"
+    assert configs[0].owner_user_id == existing_owner_id
+    assert bindings[0].user_id == existing_owner_id
     assert bindings[0].agent_subscription_id == sub.id
 
 
@@ -3578,7 +3839,8 @@ async def test_workspace_operation_startup_repair_backfills_once(db_session):
     repaired_workspace = (await db_session.execute(select(Workspace).where(Workspace.id == workspace_id))).scalar_one()
     marker = repaired_workspace.settings["workspace_operation_runtime_repair_v1"]
     assert marker["completed"] is True
-    assert marker["result"]["workspace_revision"] == 0
+    assert marker["result"]["workspace_revision"] == 1
+    assert repaired_workspace.operation_revision == 1
 
     goal = (
         await db_session.execute(
@@ -3601,11 +3863,17 @@ async def test_workspace_operation_startup_repair_backfills_once(db_session):
 
     assert second_report.repaired == 0
     assert second_report.skipped_marked >= 1
+    await db_session.refresh(repaired_workspace)
+    assert repaired_workspace.operation_revision == 1
 
 
 @pytest.mark.asyncio
-async def test_workspace_operation_rejects_unowned_capability_binding(client: AsyncClient):
-    headers = await _register(client, "ws_op_binding")
+async def test_workspace_operation_defaults_unowned_capability_binding_to_workspace_agent(client: AsyncClient):
+    # A binding drafted with no owner at all means the workspace agent. The
+    # prompts that describe ``capability_binding.upsert`` never named the owner,
+    # so models routinely omitted it and the draft died on
+    # ``owner_scope binding must be owned by …`` with Approve greyed out.
+    headers = await _register(client, "ws_op_binding_default")
     create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Binding Runtime"})
     ws_id = create.json()["id"]
 
@@ -3617,6 +3885,37 @@ async def test_workspace_operation_rejects_unowned_capability_binding(client: As
                 {
                     "op": "capability_binding.upsert",
                     "payload": {"tool_name": "generate_file"},
+                }
+            ],
+        },
+    )
+
+    assert draft.status_code == 200
+    body = draft.json()
+    assert body["validation"]["valid"] is True, body["validation"]
+    binding = body["current_state"]["capability_bindings"][-1]
+    # The inferred owner is written into the draft, so the diff the operator
+    # approves shows exactly what will be installed.
+    assert binding["owner_scope"] == "workspace_agent"
+    assert "unscoped" not in binding["binding_key"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_operation_rejects_unknown_owner_scope_capability_binding(client: AsyncClient):
+    # An owner the runtime cannot map is not guessed at: the draft stays
+    # invalid and cannot be applied.
+    headers = await _register(client, "ws_op_binding")
+    create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Binding Runtime"})
+    ws_id = create.json()["id"]
+
+    draft = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts",
+        headers=headers,
+        json={
+            "patches": [
+                {
+                    "op": "capability_binding.upsert",
+                    "payload": {"tool_name": "generate_file", "owner_scope": "marketing_team"},
                 }
             ],
         },
@@ -3641,6 +3940,11 @@ async def test_workspace_operation_allows_mcp_binding_without_allowed_tools(clie
     headers = await _register(client, "ws_op_mcp_binding")
     create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "MCP Binding Runtime"})
     ws_id = create.json()["id"]
+    connection = await client.post(
+        "/api/v1/integrations", headers=headers,
+        json={"provider": "linkedin", "credentials": {"access_token": "test-token"}},
+    )
+    assert connection.status_code == 201
 
     draft = await client.post(
         f"/api/v1/workspaces/{ws_id}/operation/drafts",
@@ -3672,6 +3976,52 @@ async def test_workspace_operation_allows_mcp_binding_without_allowed_tools(clie
     )
 
     assert applied.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_workspace_operation_integration_must_still_exist_when_applied(client: AsyncClient):
+    headers = await _register(client, "ws_op_connected_integration")
+    created = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Connected Integration"},
+    )
+    ws_id = created.json()["id"]
+    patch = {"op": "capability_binding.upsert", "payload": {"binding": {
+        "owner_scope": "workspace_agent", "capability_type": "mcp",
+        "integration_key": "linkedin",
+    }}}
+
+    missing = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts",
+        headers=headers, json={"patches": [patch]},
+    )
+    assert missing.status_code == 200
+    assert missing.json()["validation"]["valid"] is False
+    assert any(
+        error.get("code") == "integration_not_connected"
+        for error in missing.json()["validation"]["errors"]
+    )
+
+    connection = await client.post(
+        "/api/v1/integrations", headers=headers,
+        json={"provider": "linkedin", "credentials": {"access_token": "test-token"}},
+    )
+    assert connection.status_code == 201
+    ready = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts",
+        headers=headers, json={"patches": [patch]},
+    )
+    assert ready.status_code == 200
+    assert ready.json()["validation"]["valid"] is True
+
+    disconnected = await client.delete(
+        f"/api/v1/integrations/{connection.json()['id']}", headers=headers,
+    )
+    assert disconnected.status_code in {200, 204}
+    applied = await client.post(
+        f"/api/v1/workspaces/{ws_id}/operation/drafts/{ready.json()['id']}/apply",
+        headers=headers, json={"user_confirmation": True},
+    )
+    assert applied.status_code == 400
 
 
 @pytest.mark.asyncio
@@ -3739,6 +4089,7 @@ async def test_workspace_operation_stale_revision_is_rejected(client: AsyncClien
 
 @pytest.mark.asyncio
 async def test_workspace_budget_endpoint_uses_operation_runtime(client: AsyncClient, db_session):
+    from copy import deepcopy
     from sqlalchemy import select
     from packages.core.models.governance import GovernancePolicy
     from packages.core.models.workspace import Workspace
@@ -3746,6 +4097,10 @@ async def test_workspace_budget_endpoint_uses_operation_runtime(client: AsyncCli
     headers = await _register(client, "ws_budget_runtime_endpoint")
     create = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Budget API Runtime"})
     ws_id = create.json()["id"]
+    original_policy = (await db_session.execute(select(GovernancePolicy).where(
+        GovernancePolicy.workspace_id == ws_id))).scalar_one()
+    approval_before = deepcopy(original_policy.policy)
+    revision_before = original_policy.revision
 
     updated = await client.put(
         f"/api/v1/workspaces/{ws_id}/budget",
@@ -3790,7 +4145,201 @@ async def test_workspace_budget_endpoint_uses_operation_runtime(client: AsyncCli
     policy = (
         await db_session.execute(select(GovernancePolicy).where(GovernancePolicy.workspace_id == ws_id))
     ).scalar_one_or_none()
-    assert policy is None
+    assert policy is not None
+    await db_session.refresh(policy)
+    assert policy.policy == approval_before
+    assert policy.revision == revision_before
+
+
+@pytest.mark.asyncio
+async def test_workspace_credit_usage_summary_returns_integer_zeros(client: AsyncClient, db_session):
+    from packages.core.models.user import User
+
+    headers = await _register(client, "ws_credit_usage_empty")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Empty Credit Usage"},
+    )
+    user = await db_session.get(User, me["id"])
+    user.timezone = "not/a-timezone"
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/v1/workspaces/{workspace.json()['id']}/credit-usage-summary",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "today_credits": 0,
+        "week_credits": 0,
+        "all_time_credits": 0,
+        "timezone": "UTC",
+    }
+
+
+@pytest.mark.asyncio
+async def test_workspace_credit_usage_summary_missing_timezone_falls_back_to_utc(
+    client: AsyncClient,
+    db_session,
+):
+    from types import SimpleNamespace
+
+    from apps.api.routers.workspaces import get_workspace_credit_usage_summary_endpoint
+
+    headers = await _register(client, "ws_credit_usage_missing_timezone")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Missing Timezone Credit Usage"},
+    )
+
+    response = await get_workspace_credit_usage_summary_endpoint(
+        workspace.json()["id"],
+        user=SimpleNamespace(
+            id=me["id"],
+            entity_id=me["entity_id"],
+            token_version=0,
+            timezone=None,
+        ),
+        db=db_session,
+    )
+
+    assert response.model_dump() == {
+        "today_credits": 0,
+        "week_credits": 0,
+        "all_time_credits": 0,
+        "timezone": "UTC",
+    }
+
+
+@pytest.mark.asyncio
+async def test_workspace_credit_usage_summary_uses_user_local_day_and_week(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    import packages.core.budget.service as budget_service
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.billing import CreditUsageLog
+    from packages.core.models.user import User
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.timezone_utils import user_current_date, user_day_bounds_utc
+
+    headers = await _register(client, "ws_credit_usage_shanghai")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Shanghai Credit Usage"},
+    )
+    other_workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Other Credit Usage"},
+    )
+    user = await db_session.get(User, me["id"])
+    user.timezone = "Asia/Shanghai"
+
+    now = datetime(2026, 9, 16, 4, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(budget_service, "utc_now", lambda: now, raising=False)
+    today_start, _ = user_day_bounds_utc("Asia/Shanghai", now=now)
+    local_today = user_current_date("Asia/Shanghai", now)
+    monday_start, _ = user_day_bounds_utc(
+        "Asia/Shanghai",
+        day=local_today - timedelta(days=local_today.weekday()),
+    )
+
+    workspace_id = workspace.json()["id"]
+    workspace_row = await db_session.get(Workspace, workspace_id)
+    workspace_row.created_at = monday_start - timedelta(days=1)
+    rows = [
+        (workspace_id, me["entity_id"], workspace_row.created_at - timedelta(microseconds=1), 11),
+        (workspace_id, me["entity_id"], monday_start - timedelta(microseconds=1), 2),
+        (workspace_id, me["entity_id"], monday_start, 3),
+        (workspace_id, me["entity_id"], today_start - timedelta(microseconds=1), 5),
+        (workspace_id, me["entity_id"], today_start, 7),
+        (workspace_id, me["entity_id"], today_start + timedelta(minutes=1), 0),
+        (other_workspace.json()["id"], me["entity_id"], today_start, 1000),
+        (workspace_id, generate_ulid(), today_start, 2000),
+    ]
+    db_session.add_all([
+        CreditUsageLog(
+            entity_id=entity_id,
+            workspace_id=row_workspace_id,
+            total_credit=credits,
+            business_type="byok" if credits == 0 else "llm",
+            created_at=created_at,
+        )
+        for row_workspace_id, entity_id, created_at, credits in rows
+    ])
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/v1/workspaces/{workspace_id}/credit-usage-summary",
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "today_credits": 7,
+        "week_credits": 15,
+        "all_time_credits": 17,
+        "timezone": "Asia/Shanghai",
+    }
+
+
+@pytest.mark.asyncio
+async def test_workspace_credit_usage_summary_enforces_same_entity_read_access(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.workspace import WorkspaceStaff
+    from tests.test_document_permissions import _create_entity_user
+
+    owner_headers = await _register(client, "ws_credit_usage_owner")
+    owner = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    nonmember = await _create_entity_user(
+        owner["entity_id"],
+        "ws_credit_usage_nonmember",
+        role="member",
+    )
+    viewer = await _create_entity_user(
+        owner["entity_id"],
+        "ws_credit_usage_viewer",
+        role="member",
+    )
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner_headers,
+        json={"name": "Private Credit Usage"},
+    )
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace.json()["id"],
+        staff_id=None,
+        user_id=viewer["id"],
+        role="viewer",
+        status="active",
+    ))
+    await db_session.commit()
+
+    denied = await client.get(
+        f"/api/v1/workspaces/{workspace.json()['id']}/credit-usage-summary",
+        headers=nonmember["headers"],
+    )
+    allowed = await client.get(
+        f"/api/v1/workspaces/{workspace.json()['id']}/credit-usage-summary",
+        headers=viewer["headers"],
+    )
+
+    assert denied.status_code == 404
+    assert allowed.status_code == 200
+    assert allowed.json()["timezone"] == "UTC"
 
 
 @pytest.mark.asyncio
@@ -3878,6 +4427,7 @@ async def test_workspace_work_batch_triggers_strategist_after_all_tasks_terminal
     assert calls[0]["kwargs"]["kwargs"] == {
         "trigger_kind": "event",
         "trigger_detail": f"work batch completed: {batch_id}",
+        "user_id": None,
     }
 
 
@@ -3982,6 +4532,7 @@ async def test_task_details_update_preserves_workspace_batch_runtime(
     assert calls[0]["kwargs"]["kwargs"] == {
         "trigger_kind": "event",
         "trigger_detail": "work batch completed: batch_details_merge",
+        "user_id": None,
     }
 
 
@@ -4079,6 +4630,7 @@ async def test_workspace_staff_list_includes_user_only_membership(
         "ws_user_only_staff_member",
         role="member",
         display_name="User-only Member",
+        avatar_url="https://example.com/member-avatar.png",
     )
     dirty_member = await _create_entity_user(
         owner["entity_id"],
@@ -4114,6 +4666,7 @@ async def test_workspace_staff_list_includes_user_only_membership(
     assert row["staff_id"] is None
     assert row["display_name"] == "User-only Member"
     assert row["email"] == "ws_user_only_staff_member@test.com"
+    assert row["avatar_url"] == "https://example.com/member-avatar.png"
     assert all(item["staff_id"] != foreign_staff.json()["id"] for item in listed.json())
 
 
@@ -4503,7 +5056,8 @@ async def test_public_webchat_info_resolves_subscription_agent_name(client: Asyn
     workspace.status = "paused"
     await db_session.commit()
     paused = await client.get(f"/api/v1/public/chat/{token}")
-    assert paused.status_code == 404
+    assert paused.status_code == 200
+    assert paused.json()["agent_name"] == "Lead Intake Concierge"
 
     workspace.status = "active"
     workspace.deleted_at = datetime.now(timezone.utc)
@@ -4595,7 +5149,9 @@ async def test_public_webchat_poll_reads_gateway_conversation(client: AsyncClien
     assert send_body["reply"] == "Thanks, I can help with that."
     assert send_body["sent"]
     assert "runtime_metadata" in agent_turn
-    assert agent_turn["runtime_metadata"] is None
+    # Gateway normalizes absent metadata to a map, without injecting private
+    # email attachment/voice context into a public Webchat turn.
+    assert agent_turn["runtime_metadata"] == {}
 
     poll = await client.get(f"/api/v1/public/chat/{token}/messages?session_id={session_id}")
 
@@ -4737,7 +5293,6 @@ async def test_public_webchat_auto_replies_even_when_external_approval_rule_exis
     db_session,
     monkeypatch,
 ):
-    from packages.core.governance import WorkspacePolicy, update_policy
     from packages.core.models.base import generate_ulid
     from packages.core.models.channel import ChannelConfig
     from packages.core.models.document import Channel
@@ -4788,14 +5343,10 @@ async def test_public_webchat_auto_replies_even_when_external_approval_rule_exis
             status="active",
         )
     )
-    await update_policy(
-        db_session,
-        entity_id=ws_body["entity_id"],
-        workspace_id=ws_body["id"],
-        policy=WorkspacePolicy(hitl_required_actions=["external_message.send"]),
-        changed_by="test",
-        change_summary="Require review for external replies",
-    )
+    actor = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    await set_workspace_test_approval(db_session, entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"], actor_id=actor["id"],
+        user_rules=[action_rule("external_message.send", effect="ask")])
     await db_session.commit()
 
     from packages.core.services.channel_agent_runtime import ChannelAgentRunResult
@@ -5014,27 +5565,49 @@ async def test_workspace_documents_filter_cross_entity_members(client: AsyncClie
 @pytest.mark.asyncio
 async def test_workspace_documents_include_generated_artifacts(client: AsyncClient, db_session):
     from packages.core.models.base import generate_ulid
-    from packages.core.models.document import Document
+    from packages.core.models.document import Document, DocumentFolder
 
     headers = await _register(client, "ws_docs_artifacts")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Docs Artifacts"})
     ws_body = ws.json()
     doc_id = generate_ulid()
-    db_session.add(
+    report_folder_id = generate_ulid()
+    daily_folder_id = generate_ulid()
+    empty_folder_id = generate_ulid()
+    db_session.add_all([
+        DocumentFolder(
+            id=report_folder_id,
+            entity_id=ws_body["entity_id"],
+            name="reports",
+            parent_id=ws_body["artifact_folder_id"],
+        ),
+        DocumentFolder(
+            id=daily_folder_id,
+            entity_id=ws_body["entity_id"],
+            name="daily",
+            parent_id=report_folder_id,
+        ),
+        DocumentFolder(
+            id=empty_folder_id,
+            entity_id=ws_body["entity_id"],
+            name="empty",
+            parent_id=report_folder_id,
+        ),
         Document(
             id=doc_id,
             entity_id=ws_body["entity_id"],
             name="draft-pack.md",
-            fs_path="Workspaces/Docs Artifacts/Artifacts/draft-pack.md",
+            fs_path=f"Workspaces/_by_id/{ws_body['artifact_folder_id']}/reports/daily/draft-pack.md",
             file_type="md",
             vector_status="ready",
             source="ai_generated",
+            folder_id=daily_folder_id,
             metadata_={
                 "origin": {"workspace_id": ws_body["id"], "task_id": generate_ulid()},
                 "artifact": {"role": "final"},
             },
-        )
-    )
+        ),
+    ])
     await db_session.commit()
 
     resp = await client.get(f"/api/v1/workspaces/{ws_body['id']}/documents", headers=headers)
@@ -5045,6 +5618,25 @@ async def test_workspace_documents_include_generated_artifacts(client: AsyncClie
     assert artifacts["document_count"] == 1
     assert artifacts["documents"][0]["id"] == doc_id
     assert artifacts["documents"][0]["name"] == "draft-pack.md"
+    assert artifacts["documents"][0]["folder_id"] == daily_folder_id
+    folders = {folder["id"]: folder for folder in artifacts["folders"]}
+    assert folders == {
+        report_folder_id: {
+            "id": report_folder_id,
+            "name": "reports",
+            "parent_id": None,
+        },
+        daily_folder_id: {
+            "id": daily_folder_id,
+            "name": "daily",
+            "parent_id": report_folder_id,
+        },
+        empty_folder_id: {
+            "id": empty_folder_id,
+            "name": "empty",
+            "parent_id": report_folder_id,
+        },
+    }
 
 
 @pytest.mark.asyncio
@@ -5457,6 +6049,9 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
 
     from sqlalchemy import func, select
 
+    from packages.core.ai.runtime.requests import AIRuntimeRequest
+    from packages.core.ai.runtime.resolver import RuntimeResolver
+    from packages.core.ai.runtime.surfaces import ChatSurface
     from packages.core.ai.tool_pool import ToolPool
     from packages.core.ai.tools.workspace_agent_tools import (
         WORKSPACE_AGENT_SCHEMA,
@@ -5474,6 +6069,9 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
     assert me.status_code == 200
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Task Rule Scope E2E"})
     ws_body = ws.json()
+    await set_workspace_test_approval(db_session, workspace_id=ws_body["id"],
+        entity_id=ws_body["entity_id"], actor_id=me.json()["id"],
+        user_rules=[action_rule("workspace.task.create")])
     main = await ensure_main_conversation(
         db_session,
         entity_id=ws_body["entity_id"],
@@ -5493,6 +6091,8 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
         await pool.execute(
             "workspace_agent",
             {
+                "_runtime_run_id_from_context": "task-rule-scope",
+                "_runtime_tool_call_id_from_context": "create-first",
                 "action": "create_task",
                 "params": {
                     "title": "Prepare verified outreach",
@@ -5501,7 +6101,7 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
                             "rule_key": "no_nested_tasks",
                             "rule_type": "deny",
                             "description": "Do not create another task from this task.",
-                            "action_patterns": ["workspace.task.create"],
+                            "approval_selectors": [{"kind": "action", "action_key": "workspace.task.create"}],
                         }
                     ],
                 },
@@ -5524,6 +6124,8 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
         await pool.execute(
             "workspace_agent",
             {
+                "_runtime_run_id_from_context": "task-rule-scope",
+                "_runtime_tool_call_id_from_context": "create-second",
                 "action": "create_task",
                 "params": {"title": "Prepare partner contact packet"},
             },
@@ -5549,15 +6151,32 @@ async def test_workspace_task_rule_scope_e2e_through_runtime_tool_gate(
     )
     assert task_runtime["task_id"] == first["task"]["id"]
 
+    # This call represents the foreground Task-comment runtime, not the
+    # background worker bound to the Task's original creation conversation.
+    task_envelope = RuntimeResolver().resolve_trace_envelope(
+        AIRuntimeRequest(
+            surface=ChatSurface.TASK_COMMENT_THREAD,
+            conversation_id=task_thread.id,
+            task_id=task_runtime["task_id"],
+            thread_ref_kind="task",
+            thread_ref_id=task_runtime["task_id"],
+            **common,
+        ),
+        tool_schemas=[WORKSPACE_AGENT_SCHEMA],
+        allowed_tool_names={"workspace_agent"},
+    )
     nested = json.loads(
         await pool.execute(
             "workspace_agent",
             {
+                "_runtime_run_id_from_context": "task-rule-scope",
+                "_runtime_tool_call_id_from_context": "create-nested",
                 "action": "create_task",
                 "params": {"title": "Nested task must be blocked"},
             },
             conversation_id=task_thread.id,
             task_id=task_runtime["task_id"],
+            runtime_envelope=task_envelope,
             **common,
         )
     )
@@ -5593,7 +6212,15 @@ async def test_workspace_chat_uses_workspace_agent_tool_profile(client: AsyncCli
 
     assert ctx.runtime_profile == RuntimeProfile.WORKSPACE_OPERATOR.value
     assert ctx.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
-    assert {"search_tools", "workspace_agent", "workspace_resolve_hitl", "answer_task_blocker", "workspace_search", "rag"} <= eager_names
+    assert {"search_tools", "manor"} <= eager_names
+    assert "rag" not in eager_names
+    assert not {
+        "workspace_agent",
+        "workspace_resolve_hitl",
+        "answer_task_blocker",
+        "workspace_search",
+        "workspace_create_task",
+    }.intersection(eager_names)
     assert "bash" in eager_names
     assert "bash" in ctx.allowed_tool_names
     assert "browse_web" in ctx.allowed_tool_names
@@ -5722,7 +6349,7 @@ async def test_workspace_runtime_resolves_explicit_task_without_conversation(cli
 
 
 @pytest.mark.asyncio
-async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: AsyncClient, db_session):
+async def test_workspace_runtime_keeps_task_service_agent_tool_scope_on_service_agent(client: AsyncClient, db_session):
     import json
 
     from packages.core.ai.runtime.profiles import (
@@ -5811,6 +6438,15 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
             workspace_id=ws_body["id"],
             task_id=task_id,
         )
+        service_runtime = await resolve_workspace_runtime(
+            db_session,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            task_id=task_id,
+            agent_id=agent_id,
+            agent_subscription_id=sub_id,
+            is_master=False,
+        )
         from packages.core.ai.runtime.tool_registry import runtime_registered_tool_surface_from_schemas
 
         surface = runtime_registered_tool_surface_from_schemas(
@@ -5842,10 +6478,10 @@ async def test_workspace_runtime_includes_task_service_agent_tool_scope(client: 
     assert runtime.tool_profile == WORKSPACE_AGENT_TOOL_PROFILE
     assert runtime.is_master is True
     assert runtime.service_agent_ids == [agent_id]
-    assert runtime.bound_tool_names is not None
-    assert tool_name in runtime.bound_tool_names
-    assert tool_name in allowed
-    assert tool_name in set(search_result.get("loaded_tools") or [])
+    assert tool_name not in (runtime.bound_tool_names or set())
+    assert tool_name in (service_runtime.bound_tool_names or set())
+    assert tool_name not in allowed
+    assert tool_name not in set(search_result.get("loaded_tools") or [])
     assert "bash" in allowed
 
 
@@ -6118,7 +6754,8 @@ async def test_workspace_chat_context_surfaces_knowledge_policy_and_document_mat
     assert "Knowledge runtime: before answering or executing document-dependent requests" in summary
     assert "Knowledge strict mode" in summary
     assert "Pricing Escalation.md" in search
-    assert "Use rag(workspace_id=...)" in search
+    assert "list_documents or search_documents" in search
+    assert "rag(workspace_id=" not in search
 
 
 @pytest.mark.asyncio
@@ -6169,7 +6806,7 @@ async def test_workspace_agent_creates_workspace_task_with_runtime_context(clien
 
 
 @pytest.mark.asyncio
-async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(client: AsyncClient, db_session):
+async def test_public_webchat_explicit_ticket_binding_can_create_customer_ticket(client: AsyncClient, db_session):
     import json
 
     from sqlalchemy import select
@@ -6192,6 +6829,10 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
     agent = await client.post("/api/v1/agents", headers=headers, json={"name": "Ticket Concierge"})
     ws_body = ws.json()
     agent_body = agent.json()
+    await set_workspace_test_approval(db_session, workspace_id=ws_body["id"],
+        entity_id=ws_body["entity_id"], actor_id=me["id"],
+        user_rules=[action_rule("workspace.task.create")])
+    await db_session.commit()
 
     request = AIRuntimeRequest(
         surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
@@ -6213,15 +6854,24 @@ async def test_public_webchat_broad_agent_binding_can_create_customer_ticket(cli
     surface = runtime_prepare_agent_tool_surface_for_turn(
         request,
         agent_id=agent_body["id"],
-        bound_tool_names={"rag", "workspace_agent", "workspace_operation", "manor"},
+        bound_tool_names={
+            "rag",
+            "workspace_agent",
+            "workspace_operation",
+            "workspace_create_task",
+            "manor",
+        },
     )
 
-    assert surface.allowed_tool_names == {"rag", "workspace_create_task"}
+    assert surface.allowed_tool_names == {"workspace_create_task"}
+    assert "rag" not in surface.allowed_tool_names
     assert "workspace_agent" not in surface.allowed_tool_names
 
     raw = await runtime_execute_registered_tool(
         tool_name="workspace_create_task",
         arguments={
+            "_runtime_run_id_from_context": "public-ticket",
+            "_runtime_tool_call_id_from_context": "create-ticket",
             "title": "Repair Room 206 toilet",
             "description": "Guest Alex reports the toilet in room 206 is broken.",
             "priority": 2,
@@ -6372,18 +7022,15 @@ async def test_workspace_agent_updates_existing_task_runtime_context(client: Asy
 async def test_workspace_agent_start_dispatches_planner_and_resolves_single_owner(
     client: AsyncClient,
     db_session,
-    monkeypatch,
 ):
     import json
     from sqlalchemy import select
     from packages.core.ai.tools.workspace_agent_tools import _workspace_agent_handler
     from packages.core.models.base import generate_ulid
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Task
     from packages.core.models.workspace import Agent, AgentSubscription
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
 
     headers = await _register(client, "ws_agent_start")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Agent Start Runtime"})
@@ -6430,7 +7077,12 @@ async def test_workspace_agent_start_dispatches_planner_and_resolves_single_owne
 
     assert result["created"] is True
     assert result["dispatched"] is True
-    assert dispatched == [task_id]
+    staged = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalar_one()
+    assert staged.payload["task_id"] == task_id
     assert task.status == "in_progress"
     assert task.owner_service_key == "leasing_consultant"
     assert task.owner_subscription_id == sub_id
@@ -6561,7 +7213,9 @@ async def test_workspace_agent_delegates_to_service_bound_agent(
     assert seen["context_kwargs"]["workspace_id"] == ws_body["id"]
     assert "Use the brand voice before posting." in seen["context_kwargs"]["extra_system_prompt"]
     assert seen["loop_kwargs"]["agent_id"] == agent_id
-    assert seen["loop_kwargs"]["allowed_tool_names"] == {"mcp__twitter_x__post_tweet"}
+    assert set(seen["loop_kwargs"]["allowed_tool_names"]) == {
+        "mcp__twitter_x__post_tweet", "request_input",
+    }
     assert seen["loop_kwargs"]["max_rounds"] == 5
     assert len(delegated_runs) == 1
     assert delegated_runs[0]["run_id"] == result["run_id"]
@@ -6596,21 +7250,497 @@ async def test_workspace_agent_delegates_to_service_bound_agent(
 
 
 @pytest.mark.asyncio
-async def test_workspace_agent_create_task_respects_dependency_outputs_before_dispatch(
+async def test_workspace_agent_delegated_file_approval_resumes_same_service_call(
     client: AsyncClient,
     db_session,
     monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from sqlalchemy import select
+
+    from packages.core import database
+    from packages.core.ai.runtime.approval_service import guard_runtime_tool_action
+    from packages.core.ai.runtime.envelope import RuntimeEnvelope
+    from packages.core.ai.runtime.principals import RuntimePrincipal
+    from packages.core.ai.runtime.profiles import RuntimeProfile
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.tools.workspace_agent_tools import _workspace_agent_handler
+    from packages.core.constants.agents import MANOR_AGENT_ID
+    from packages.core.constants.runtime_principal import RuntimePrincipalKind
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task import Conversation
+    from packages.core.models.workspace import Agent, AgentSubscription
+    from packages.core.services.chat_approvals import resolve_chat_approval_turn
+
+    headers = await _register(client, "ws_agent_delegate_hitl")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Delegated Approval Runtime"},
+    )
+    workspace_data = workspace.json()
+    agent_id = generate_ulid()
+    subscription_id = generate_ulid()
+    conversation_id = generate_ulid()
+    patch_arguments = {
+        "path": "brand/stickman-workspace-assets.md",
+        "operations": [
+            {
+                "op": "replace_text",
+                "old_text": "old manifest",
+                "new_text": "new manifest",
+            }
+        ],
+    }
+    db_session.add_all(
+        [
+            Agent(
+                id=agent_id,
+                entity_id=workspace_data["entity_id"],
+                name="Stickman Producer",
+                status="active",
+            ),
+            AgentSubscription(
+                id=subscription_id,
+                entity_id=workspace_data["entity_id"],
+                agent_id=agent_id,
+                workspace_id=workspace_data["id"],
+                service_key="stickman.production",
+                status="active",
+            ),
+            Conversation(
+                id=conversation_id,
+                entity_id=workspace_data["entity_id"],
+                user_id=me["id"],
+                workspace_id=workspace_data["id"],
+                scope="workspace_main",
+                status="active",
+                meta={},
+            ),
+        ]
+    )
+    await set_workspace_test_approval(db_session, entity_id=workspace_data["entity_id"],
+        workspace_id=workspace_data["id"], actor_id=me["id"],
+        user_rules=[action_rule("workspace.file.modify", effect="ask")])
+    await db_session.commit()
+
+    class _SessionContext:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext())
+    runtime_envelope = RuntimeEnvelope(
+        surface=ChatSurface.WORKSPACE_CHAT,
+        principal=RuntimePrincipal(
+            kind=RuntimePrincipalKind.WORKSPACE_MEMBER,
+            entity_id=workspace_data["entity_id"],
+            actor_user_id=me["id"],
+            execution_user_id=me["id"],
+            agent_id=MANOR_AGENT_ID,
+            workspace_id=workspace_data["id"],
+        ),
+        profile=RuntimeProfile.WORKSPACE_OPERATOR,
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        agent_id=MANOR_AGENT_ID,
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        allowed_tool_names=("patch_file",),
+    )
+
+    async def fake_build_agent_context(db, **kwargs):
+        return SimpleNamespace(
+            runtime_envelope=runtime_envelope,
+            system_prompt="Stickman production prompt",
+            tools=[{"type": "function", "function": {"name": "patch_file"}}],
+            allowed_tool_names={"patch_file", "read_file"},
+            task_id=None,
+            tool_profile="workspace_agent",
+            model="gpt-test",
+            llm_metadata=None,
+        )
+
+    loop_calls: list[dict] = []
+    executed_patch_tokens: list[str] = []
+
+    async def fake_execute_chat_agent_loop(**kwargs):
+        loop_calls.append(kwargs)
+        forced_calls = kwargs.get("forced_tool_calls") or []
+        if not forced_calls:
+            hitl_result = await guard_runtime_tool_action(
+                name="patch_file",
+                arguments=dict(patch_arguments),
+                entity_id=workspace_data["entity_id"],
+                user_id=me["id"],
+                workspace_id=workspace_data["id"],
+                conversation_id=conversation_id,
+                runtime_envelope=runtime_envelope,
+                operation_id=f"runtime:delegated-test:call:{len(loop_calls)}",
+            )
+            assert hitl_result is not None
+            kwargs["on_tool_start"]("patch_file", patch_arguments)
+            kwargs["on_tool_end"](
+                "patch_file",
+                hitl_result,
+                25,
+                patch_arguments,
+            )
+            return SimpleNamespace(
+                content="",
+                messages=[],
+                rounds=2,
+                tool_calls_made=["patch_file"],
+                usage={"total_tokens": 42},
+                stop_reason="hitl_required",
+                error=None,
+                control={
+                    "kind": "approval_required",
+                    "tool_name": "patch_file",
+                    "blocking_result": hitl_result,
+                },
+            )
+        assert len(forced_calls) == 1
+        forced_patch = forced_calls[0]
+        assert forced_patch["name"] == "patch_file"
+        approval_token = forced_patch["arguments"]["approval_token"]
+        assert forced_patch["arguments"] == {
+            **patch_arguments,
+            "approval_token": approval_token,
+        }
+        guarded_arguments = dict(forced_patch["arguments"])
+        assert await guard_runtime_tool_action(
+            name="patch_file",
+            arguments=guarded_arguments,
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            workspace_id=workspace_data["id"],
+            conversation_id=conversation_id,
+            runtime_envelope=runtime_envelope,
+        ) is None
+        assert "approval_token" not in guarded_arguments
+        executed_patch_tokens.append(approval_token)
+        kwargs["on_tool_end"]("patch_file", '{"status":"completed"}', 1, guarded_arguments)
+        kwargs["on_tool_end"]("read_file", "Verified manifest content", 1, {})
+        return SimpleNamespace(
+            content="Character manifest updated and verified.",
+            messages=[],
+            rounds=2,
+            tool_calls_made=["patch_file", "read_file"],
+            usage={"total_tokens": 21},
+            stop_reason="completed",
+            error=None,
+            control=None,
+        )
+
+    monkeypatch.setattr(
+        "packages.core.ai.context.build_agent_context",
+        fake_build_agent_context,
+    )
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.harness.runtime_execute_chat_agent_loop",
+        fake_execute_chat_agent_loop,
+    )
+
+    delegated = json.loads(
+        await _workspace_agent_handler(
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            workspace_id=workspace_data["id"],
+            conversation_id=conversation_id,
+            action="delegate_service",
+            params={
+                "service_key": "stickman.production",
+                "prompt": "Replace the active character with the generated 3D candidate.",
+            },
+        )
+    )
+    assert delegated["__hitl__"] is True
+    assert delegated["hitl"]["tool"] == "patch_file"
+    approval_id = delegated["approval_token"]
+
+    request = (await db_session.execute(
+        select(HitlRequest)
+        .where(HitlRequest.id == approval_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+    assert request.status == "pending"
+    assert request.origin_conversation_id == conversation_id
+    assert request.context["tool"] == "patch_file"
+    assert request.context["continuation"]["arguments"] == patch_arguments
+    resume = request.context["delegation_resume"]
+    assert resume["agent_subscription_id"] == subscription_id
+    assert resume["tool_name"] == "patch_file"
+    assert resume["approval_token"] == approval_id
+    assert "tool_arguments" not in resume
+
+    premature_resume = json.loads(
+        await _workspace_agent_handler(
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            workspace_id=workspace_data["id"],
+            conversation_id=conversation_id,
+            action="delegate_service",
+            params={
+                "agent_subscription_id": subscription_id,
+                "approval_token": approval_id,
+            },
+        )
+    )
+    assert premature_resume["error"] == "delegated_approval_resume_rejected"
+    assert len(loop_calls) == 1
+
+    approval_message = json.dumps({"hitl_id": approval_id, "action": "approve"})
+    replacement, saved_text, save_user, runtime_metadata = (
+        await resolve_chat_approval_turn(
+            db_session,
+            conversation_id=conversation_id,
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            message=approval_message,
+        )
+    )
+    await db_session.commit()
+    assert replacement
+    assert saved_text == "Approved the requested action."
+    assert save_user is True
+    assert runtime_metadata
+    forced_delegate = runtime_metadata["forced_tool_calls"][0]
+    assert forced_delegate["name"] == "workspace_agent"
+    assert forced_delegate["disable_followup_tools"] is True
+    assert forced_delegate["arguments"]["action"] == "delegate_service"
+    assert forced_delegate["arguments"]["params"]["approval_token"] == approval_id
+    assert runtime_metadata["extra_tool_names"] == ["workspace_agent"]
+
+    resumed = json.loads(
+        await _workspace_agent_handler(
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            workspace_id=workspace_data["id"],
+            conversation_id=conversation_id,
+            **forced_delegate["arguments"],
+        )
+    )
+    assert resumed["status"] == "completed"
+    assert resumed["service"]["agent_subscription_id"] == subscription_id
+    assert resumed["content"] == "Character manifest updated and verified."
+    assert len(loop_calls) == 2
+    assert executed_patch_tokens == [approval_id]
+
+    request = (await db_session.execute(
+        select(HitlRequest)
+        .where(HitlRequest.id == approval_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+    assert request.status == "consumed"
+    assert request.consumed_at is not None
+
+    replay = json.loads(
+        await _workspace_agent_handler(
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            workspace_id=workspace_data["id"],
+            conversation_id=conversation_id,
+            **forced_delegate["arguments"],
+        )
+    )
+    assert replay["error"] == "delegated_approval_resume_rejected"
+    assert len(loop_calls) == 2
+    assert executed_patch_tokens == [approval_id]
+
+    direct_arguments = {
+        "path": "brand/direct-workspace-file.md",
+        "operations": [{"op": "replace_text", "old_text": "a", "new_text": "b"}],
+    }
+    direct_hitl = json.loads(await guard_runtime_tool_action(
+        name="patch_file",
+        arguments=dict(direct_arguments),
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        runtime_envelope=runtime_envelope,
+        operation_id="runtime:delegated-test:call:direct",
+    ) or "{}")
+
+    direct_resolution = await resolve_chat_approval_turn(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        message=json.dumps({
+            "hitl_id": direct_hitl["approval_token"],
+            "action": "approve",
+        }),
+    )
+    await db_session.commit()
+    assert direct_resolution[0]
+    direct_metadata = direct_resolution[3]
+    assert direct_metadata["extra_tool_names"] == ["patch_file"]
+    assert direct_metadata["forced_tool_calls"] == [
+        {
+            "name": "patch_file",
+            "arguments": {
+                **direct_arguments,
+                "approval_token": direct_hitl["approval_token"],
+            },
+            "disable_followup_tools": True,
+        }
+    ]
+    direct_retry_arguments = dict(
+        direct_metadata["forced_tool_calls"][0]["arguments"]
+    )
+    assert await guard_runtime_tool_action(
+        name="patch_file",
+        arguments=direct_retry_arguments,
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        runtime_envelope=runtime_envelope,
+    ) is None
+    assert len(loop_calls) == 2
+
+    rejected = json.loads(await _workspace_agent_handler(
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        action="delegate_service",
+        params={
+            "service_key": "stickman.production",
+            "prompt": "Try another character update that the user will reject.",
+        },
+    ))
+    rejected_resolution = await resolve_chat_approval_turn(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        message=json.dumps({
+            "hitl_id": rejected["approval_token"],
+            "action": "reject",
+        }),
+    )
+    assert rejected_resolution[3] == {
+        "approval_kind": "runtime_terminal",
+        "approval_outcome": "rejected",
+    }
+    rejected_request = await db_session.get(
+        HitlRequest, rejected["approval_token"], populate_existing=True,
+    )
+    assert rejected_request.status == "denied"
+    assert rejected_request.consumed_at is None
+
+    tampered = json.loads(await _workspace_agent_handler(
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        action="delegate_service",
+        params={
+            "service_key": "stickman.production",
+            "prompt": "Apply an update whose saved resume marker is corrupted.",
+        },
+    ))
+    tampered_request = await db_session.get(
+        HitlRequest, tampered["approval_token"], populate_existing=True,
+    )
+    tampered_context = dict(tampered_request.context or {})
+    tampered_resume = dict(tampered_context["delegation_resume"])
+    tampered_resume["approval_token"] = generate_ulid()
+    tampered_context["delegation_resume"] = tampered_resume
+    tampered_request.context = tampered_context
+    await db_session.commit()
+
+    tampered_resolution = await resolve_chat_approval_turn(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        message=json.dumps({
+            "hitl_id": tampered["approval_token"],
+            "action": "approve",
+        }),
+    )
+    assert tampered_resolution[3] == {
+        "approval_kind": "runtime_terminal",
+        "approval_outcome": "handled",
+    }
+    tampered_request = await db_session.get(
+        HitlRequest, tampered["approval_token"], populate_existing=True,
+    )
+    assert tampered_request.status == "expired"
+    assert tampered_request.resolved_reason == (
+        "delegated_approval_continuation_unavailable"
+    )
+    assert executed_patch_tokens == [approval_id]
+
+    always = json.loads(await _workspace_agent_handler(
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        action="delegate_service",
+        params={
+            "service_key": "stickman.production",
+            "prompt": "Apply another character update and always allow this action.",
+        },
+    ))
+    with pytest.raises(ValueError, match="versioned approval-settings"):
+        await resolve_chat_approval_turn(
+            db_session,
+            conversation_id=conversation_id,
+            entity_id=workspace_data["entity_id"],
+            user_id=me["id"],
+            message=json.dumps({
+                "hitl_id": always["approval_token"],
+                "action": "always_approve",
+            }),
+        )
+    always_request = await db_session.get(
+        HitlRequest, always["approval_token"], populate_existing=True,
+    )
+    assert always_request.status == "pending"
+    assert always_request.consumed_at is None
+    await set_workspace_test_approval(db_session, entity_id=workspace_data["entity_id"],
+        workspace_id=workspace_data["id"], actor_id=me["id"],
+        user_rules=[action_rule("workspace.file.modify")])
+
+    automatically_allowed = {
+        "path": patch_arguments["path"],
+        "operations": [{"op": "replace_text", "old_text": "a", "new_text": "b"}],
+    }
+    assert await guard_runtime_tool_action(
+        name="patch_file",
+        arguments=automatically_allowed,
+        entity_id=workspace_data["entity_id"],
+        user_id=me["id"],
+        workspace_id=workspace_data["id"],
+        conversation_id=conversation_id,
+        runtime_envelope=runtime_envelope,
+        operation_id="runtime:delegated-test:call:new-saved-rule",
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_agent_create_task_respects_dependency_outputs_before_dispatch(
+    client: AsyncClient,
+    db_session,
 ):
     import json
     from sqlalchemy import select
     from packages.core.ai.tools.workspace_agent_tools import _workspace_agent_handler
     from packages.core.models.base import generate_ulid
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Task
     from packages.core.models.workspace import Agent, AgentSubscription
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
 
     headers = await _register(client, "ws_agent_dependency")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Agent Dependency Runtime"})
@@ -6706,7 +7836,12 @@ async def test_workspace_agent_create_task_respects_dependency_outputs_before_di
     assert blocked["dispatch_blocked_by_dependencies"] is True
     assert blocked_task.status == "pending"
     assert blocked_task.details["dependency_status"] == "waiting"
-    assert dispatched == [ready_task.id]
+    staged = list((await db_session.execute(select(RuntimeOutboxEvent.aggregate_id).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id.in_([ready_task.id, blocked_task.id]),
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalars())
+    assert staged == [ready_task.id]
 
 
 @pytest.mark.asyncio
@@ -6814,9 +7949,12 @@ async def test_plan_finalize_dispatches_a_supervisor_requested_replan(db_session
     )
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Task
+    from packages.core.models.workspace import Workspace
     from packages.core.plans.executor import PlanExecutor
-    import packages.core.tasks.ai_tasks as ai_tasks
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+    from tests.test_workspace_write_authz import _add_workspace_plan_runtime
 
     async def _needs_replan_supervisor(_db, _plan, _status):
         return SupervisorDecision(
@@ -6825,12 +7963,18 @@ async def test_plan_finalize_dispatches_a_supervisor_requested_replan(db_session
             source=SupervisorDecisionSource.MODEL,
         )
 
-    dispatched: list[str] = []
     monkeypatch.setattr(PlanExecutor, "_supervise_outcome", staticmethod(_needs_replan_supervisor))
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
 
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
+    db_session.add(Workspace(
+        id=workspace_id, entity_id=entity_id, name="Supervisor replan",
+        status="active", settings={},
+    ))
+    await db_session.flush()
+    subscription = await _add_workspace_plan_runtime(
+        db_session, entity_id=entity_id, workspace_id=workspace_id,
+    )
     task_id = generate_ulid()
     plan_id = generate_ulid()
     task = Task(
@@ -6840,6 +7984,8 @@ async def test_plan_finalize_dispatches_a_supervisor_requested_replan(db_session
         title="Select today's Stickman video topic",
         status="in_progress",
         task_type="general",
+        owner_service_key=subscription.service_key,
+        owner_subscription_id=subscription.id,
     )
     plan = ExecutionPlan(
         id=plan_id,
@@ -6878,13 +8024,18 @@ async def test_plan_finalize_dispatches_a_supervisor_requested_replan(db_session
     assert event is None
     assert refreshed_task.status == "in_progress"
     assert refreshed_plan.status == "replanned"
-    assert dispatched == [task_id]
+    staged = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalar_one()
+    assert staged.payload["task_id"] == task_id
     assert refreshed_task.details["_replan_context"]["reason"] == "supervisor_review"
     assert refreshed_task.actual_output["supervisor_verdict"] == "needs_replan"
 
 
 @pytest.mark.asyncio
-async def test_task_detail_reconciles_stale_output_from_latest_completed_plan(client: AsyncClient, db_session):
+async def test_task_detail_does_not_complete_stale_output_without_verified_artifact(client: AsyncClient, db_session):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -6951,12 +8102,12 @@ async def test_task_detail_reconciles_stale_output_from_latest_completed_plan(cl
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "completed"
+    assert body["status"] == "waiting_on_customer"
     assert body["actual_output"]["plan_id"] == new_plan_id
     assert body["actual_output"]["plan_status"] == "completed"
     assert body["actual_output"]["files"][0]["fs_path"] == "workspace/social_ops/draft-pack.md"
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.status == "completed"
+    assert task.status == "waiting_on_customer"
     assert task.actual_output["plan_id"] == new_plan_id
 
 
@@ -7039,7 +8190,7 @@ async def test_task_detail_keeps_open_supervisor_input_request_waiting(client: A
 
 
 @pytest.mark.asyncio
-async def test_plan_finalize_asks_supervisor_before_marking_text_output_complete(db_session, monkeypatch):
+async def test_plan_finalize_retries_missing_output_without_synthetic_human_input(db_session, monkeypatch):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -7112,22 +8263,26 @@ async def test_plan_finalize_asks_supervisor_before_marking_text_output_complete
         .scalars()
         .all()
     )
-    assert task.status == "waiting_on_customer"
-    assert task.actual_output["supervisor_verdict"] == "needs_human"
-    assert task.actual_output["needs_input"] is True
+    assert task.status == "in_progress"
+    assert task.actual_output is None
+    assert plan.status == "running"
     assert supervisor_prompts
     assert "judge the task itself, not the subject it reports on" in supervisor_prompts[-1]
-    assert logs and logs[-1].meta["structured_blocker"] is False
-    assert event["event_type"] == "task.hitl_requested"
+    assert not logs
+    assert event is None
 
 
 @pytest.mark.asyncio
-async def test_plan_finalize_holds_structured_blocker_before_status_update(db_session, monkeypatch):
+async def test_plan_finalize_replans_structured_claim_without_human_input(db_session, monkeypatch):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Task, TaskLog
+    from packages.core.models.workspace import Workspace
     from packages.core.plans.executor import PlanExecutor
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+    from tests.test_workspace_write_authz import _add_workspace_plan_runtime
 
     async def fake_chat_completion(*_args, **_kwargs):
         raise AssertionError("structured blockers should not need supervisor LLM")
@@ -7136,6 +8291,14 @@ async def test_plan_finalize_holds_structured_blocker_before_status_update(db_se
 
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
+    db_session.add(Workspace(
+        id=workspace_id, entity_id=entity_id, name="Structured blocker",
+        status="active", settings={},
+    ))
+    await db_session.flush()
+    subscription = await _add_workspace_plan_runtime(
+        db_session, entity_id=entity_id, workspace_id=workspace_id,
+    )
     task_id = generate_ulid()
     plan_id = generate_ulid()
 
@@ -7148,6 +8311,8 @@ async def test_plan_finalize_holds_structured_blocker_before_status_update(db_se
             status="in_progress",
             priority=3,
             task_type="general",
+            owner_service_key=subscription.service_key,
+            owner_subscription_id=subscription.id,
         )
     )
     plan = ExecutionPlan(
@@ -7192,10 +8357,17 @@ async def test_plan_finalize_holds_structured_blocker_before_status_update(db_se
         .scalars()
         .all()
     )
-    assert task.status == "waiting_on_customer"
-    assert task.actual_output["supervisor_verdict"] == "needs_human"
-    assert logs and logs[-1].meta["structured_blocker"] is True
-    assert event["event_type"] == "task.hitl_requested"
+    assert task.status == "in_progress"
+    assert task.actual_output["supervisor_verdict"] == "needs_replan"
+    assert plan.status == "replanned"
+    assert logs == []
+    assert event is None
+    wake = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalar_one()
+    assert wake.payload["task_id"] == task_id
 
 
 def test_task_output_artifact_refs_preserve_document_id_for_viewer_links():
@@ -7317,7 +8489,7 @@ async def test_task_detail_reconciles_duplicate_file_refs(client: AsyncClient, d
 
 
 @pytest.mark.asyncio
-async def test_goal_progress_reconciles_stale_linked_task_from_completed_plan(client: AsyncClient, db_session):
+async def test_goal_progress_does_not_complete_task_without_verified_artifact(client: AsyncClient, db_session):
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -7395,11 +8567,10 @@ async def test_goal_progress_reconciles_stale_linked_task_from_completed_plan(cl
 
     assert resp.status_code == 200
     goal = next(item for item in resp.json() if item["id"] == goal_id)
-    assert goal["task_status_counts"] == {"completed": 1}
-    assert goal["task_progress_fraction"] == 1
+    assert goal["task_status_counts"] == {"waiting_on_customer": 1}
+    assert goal["task_progress_fraction"] == 0
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.status == "completed"
-    assert task.actual_output["plan_id"] == plan_id
+    assert task.status == "waiting_on_customer"
 
 
 @pytest.mark.asyncio
@@ -7580,7 +8751,9 @@ async def test_workspace_agent_add_rule_updates_operating_model_and_governance(c
     assert result["__hitl__"] is True
     assert result["hitl"]["action"] == "workspace.operation.apply"
     assert result["operation"]["kind"] == "workspace_operation_review"
-    assert result["operation"]["draft_id"] == result["approval_token"]
+    assert result["approval_token"].startswith(f"workspace_operation:{result['operation']['draft_id']}:")
+
+    await _persist_workspace_operation_review(db_session, conversation_id, result)
 
     replacement = await resolve_workspace_operation_review_message(
         db_session,
@@ -7603,7 +8776,7 @@ async def test_workspace_agent_add_rule_updates_operating_model_and_governance(c
     assert rule["runtime_enforced"] is True
     assert rule["rule_type"] == "approval_required"
     assert "social_post.publish" in rule["action_patterns"]
-    assert "social_post.publish" in policy.policy["hitl_required_actions"]
+    assert "social_post.publish" in _policy_actions(policy.policy, "ask")
 
 
 @pytest.mark.asyncio
@@ -7670,10 +8843,12 @@ async def test_workspace_operation_create_draft_returns_review_card_for_goal_cha
 
     assert result["__hitl__"] is True
     assert result["operation"]["kind"] == "workspace_operation_review"
-    assert result["operation"]["draft_id"] == result["approval_token"]
+    assert result["approval_token"].startswith(f"workspace_operation:{result['operation']['draft_id']}:")
     assert result["hitl"]["action"] == "workspace.operation.apply"
     assert result["draft"]["status"] == "open"
     assert "goals" in result["operation"]["changed_keys"]
+
+    await _persist_workspace_operation_review(db_session, conversation_id, result)
 
     replacement = await resolve_workspace_operation_review_message(
         db_session,
@@ -7785,16 +8960,21 @@ async def test_non_streaming_workspace_chat_persists_operation_review_card(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("tool_name", "visualization_kind"),
+    ("tool_name", "tool_args", "visualization_kind"),
     [
-        ("visualize_workspace_ledgers", "workspace_ledger_overview"),
-        ("query_ledger", "ledger_query_result"),
+        (
+            "manor",
+            {"action": "workspace", "params": {"action": "visualize_ledgers"}},
+            "workspace_ledger_overview",
+        ),
+        ("query_ledger", {}, "ledger_query_result"),
     ],
 )
 async def test_non_streaming_workspace_chat_persists_ledger_visualization(
     client: AsyncClient,
     monkeypatch,
     tool_name: str,
+    tool_args: dict,
     visualization_kind: str,
 ):
     import importlib
@@ -7855,7 +9035,7 @@ async def test_non_streaming_workspace_chat_persists_ledger_visualization(
             for tool in kwargs["tools"]
             if isinstance(tool, dict)
         )
-        assert tool_name in captured_tool_names
+        assert tool_name in captured_tool_names or kwargs["tool_schema_resolver"](tool_name)
         tool_result = json.dumps({
             "ok": True,
             "visualization": {
@@ -7863,12 +9043,12 @@ async def test_non_streaming_workspace_chat_persists_ledger_visualization(
                 "data": visualization_data,
             },
         })
-        kwargs["on_tool_start"](tool_name, {})
+        kwargs["on_tool_start"](tool_name, tool_args)
         kwargs["on_tool_end"](
             tool_name,
             tool_result,
             duration_ms=1,
-            args={},
+            args=tool_args,
         )
         return SimpleNamespace(
             content="Here is the current recruiting Ledger overview.",
@@ -7896,6 +9076,13 @@ async def test_non_streaming_workspace_chat_persists_ledger_visualization(
     assert ws.status_code == 201
     workspace_id = ws.json()["id"]
     overview["workspace_id"] = workspace_id
+    if tool_name == "query_ledger":
+        configured = await client.put(
+            f"/api/v1/workspaces/{workspace_id}/ledgers/configuration",
+            headers=headers,
+            json={"ledger_contracts": ["manor.recruiting_ledger/v1"]},
+        )
+        assert configured.status_code == 200, configured.text
 
     response = await client.post(
         "/api/v1/chat/message",
@@ -7928,16 +9115,21 @@ async def test_non_streaming_workspace_chat_persists_ledger_visualization(
     )
     assert visualization["kind"] == visualization_kind
     assert visualization["data"] == visualization_data
-    assert assistant["meta"]["assistant_blocks"] == assistant["assistant_blocks"]
+    assert "assistant_blocks" not in assistant["meta"]
 
 
 @pytest.mark.asyncio
 async def test_workspace_chat_operation_review_card_applies_draft(client: AsyncClient, db_session):
     from sqlalchemy import select
+    from packages.core.ai.runtime.workspace_operation_actions import _operation_review_payload
     from packages.core.models.base import generate_ulid
     from packages.core.models.governance import GovernancePolicy
     from packages.core.models.task import Conversation, Message
     from packages.core.models.workspace import Workspace
+    from packages.core.services.hitl_requests import (
+        hitl_requests_from_data,
+        workspace_operation_pending_action_from_data,
+    )
 
     headers = await _register(client, "ws_chat_op_review")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Operation Review Chat"})
@@ -7963,7 +9155,11 @@ async def test_workspace_chat_operation_review_card_applies_draft(client: AsyncC
         },
     )
     assert draft.status_code == 200
-    draft_id = draft.json()["id"]
+    review_data = _operation_review_payload(
+        draft.json(),
+        prompt="Review workspace operation",
+        content="Post publishing must be reviewed by the user first.",
+    )
     conv_id = generate_ulid()
     message_id = generate_ulid()
     db_session.add(
@@ -7984,14 +9180,8 @@ async def test_workspace_chat_operation_review_card_applies_draft(client: AsyncC
             content="Review workspace operation",
             author_kind="agent",
             message_kind="hitl_request",
-            pending_action={
-                "kind": "workspace_operation_review",
-                "draft_id": draft_id,
-                "action": "workspace.operation.apply",
-                "tool": "workspace_operation",
-                "operation": {"kind": "workspace_operation_review", "draft_id": draft_id},
-                "options": ["approve", "reject"],
-            },
+            meta={"hitl_requests": hitl_requests_from_data(review_data)},
+            pending_action=workspace_operation_pending_action_from_data(review_data),
         )
     )
     await db_session.commit()
@@ -8010,7 +9200,7 @@ async def test_workspace_chat_operation_review_card_applies_draft(client: AsyncC
         await db_session.execute(select(GovernancePolicy).where(GovernancePolicy.workspace_id == ws_body["id"]))
     ).scalar_one()
     assert workspace.operation_revision == 1
-    assert "social_post.publish" in policy.policy["hitl_required_actions"]
+    assert "social_post.publish" in _policy_actions(policy.policy, "ask")
 
 
 @pytest.mark.asyncio
@@ -8021,10 +9211,15 @@ async def test_workspace_agent_context_resolves_duplicate_operation_hitl_cards(
 ):
     from sqlalchemy import select
     from apps.api.routers import workspace_chat as workspace_chat_router
+    from packages.core.ai.runtime.workspace_operation_actions import _operation_review_payload
     from packages.core.ai.tools import workspace_agent_tools
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Message
     from packages.core.models.workspace import Workspace
+    from packages.core.services.hitl_requests import (
+        hitl_requests_from_data,
+        workspace_operation_pending_action_from_data,
+    )
     from packages.core.services.workspace_runtime import resolve_workspace_runtime
     from packages.core.workspace_chat import service as workspace_chat_service
 
@@ -8053,7 +9248,11 @@ async def test_workspace_agent_context_resolves_duplicate_operation_hitl_cards(
         },
     )
     assert draft.status_code == 200
-    draft_id = draft.json()["id"]
+    review_data = _operation_review_payload(
+        draft.json(),
+        prompt="Review workspace operation",
+        content="Post publishing must be reviewed by the user first.",
+    )
 
     conv = await workspace_chat_service.ensure_main_conversation(
         db_session,
@@ -8071,14 +9270,8 @@ async def test_workspace_agent_context_resolves_duplicate_operation_hitl_cards(
                 content="Review workspace operation",
                 author_kind="agent",
                 message_kind="hitl_request",
-                pending_action={
-                    "kind": "workspace_operation_review",
-                    "draft_id": draft_id,
-                    "action": "workspace.operation.apply",
-                    "tool": "workspace_operation",
-                    "operation": {"kind": "workspace_operation_review", "draft_id": draft_id},
-                    "options": ["approve", "reject"],
-                },
+                meta={"hitl_requests": hitl_requests_from_data(review_data)},
+                pending_action=workspace_operation_pending_action_from_data(review_data),
             )
         )
     await db_session.commit()
@@ -8108,9 +9301,9 @@ async def test_workspace_agent_context_resolves_duplicate_operation_hitl_cards(
         conversation_id=conv_id,
         workspace_id=ws_body["id"],
     )
-    assert "Open Workspace HITL Requests" in (envelope.extra_context or "")
-    assert message_ids[-1] in (envelope.extra_context or "")
-    assert draft_id in (envelope.extra_context or "")
+    # "确认部署" is not a HITL reply phrase; keep the cards pending in UI
+    # without hijacking this turn's extra_context.
+    assert "Open Workspace HITL Requests" not in (envelope.extra_context or "")
 
     resolved_payload = json.loads(
         await workspace_agent_tools._workspace_resolve_hitl_handler(
@@ -8369,22 +9562,16 @@ async def test_workspace_chat_feedback_resolution_posts_feedback_message(client:
 async def test_workspace_chat_approve_all_starts_proposed_tickets(
     client: AsyncClient,
     db_session,
-    monkeypatch,
     choice: str,
     pre_resolved: bool,
 ):
     from datetime import datetime, timezone
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Conversation, Message, Task
-    from packages.core.tasks import ai_tasks
-
-    dispatched: list[str] = []
-    monkeypatch.setattr(
-        ai_tasks.plan_and_run_task,
-        "delay",
-        lambda task_id: dispatched.append(task_id),
-    )
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+    from tests.test_workspace_write_authz import _add_workspace_plan_runtime
 
     headers = await _register(
         client,
@@ -8396,6 +9583,10 @@ async def test_workspace_chat_approve_all_starts_proposed_tickets(
         json={"name": "Approve All Proposals"},
     )
     ws_body = ws.json()
+    subscription = await _add_workspace_plan_runtime(
+        db_session, entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"], service_key="stickman.production",
+    )
     conv_id = generate_ulid()
     message_id = generate_ulid()
     task_id = generate_ulid()
@@ -8442,9 +9633,16 @@ async def test_workspace_chat_approve_all_starts_proposed_tickets(
             title="Create today's stickman video",
             status="proposed",
             owner_service_key="stickman.production",
+            owner_subscription_id=subscription.id,
             details={"strategist_review_id": review_id},
         )
     )
+    from packages.core.models.workspace import Workspace
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    actor_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["id"]
+    await initialize_test_task_proposal(db_session,
+        await db_session.get(Workspace, ws_body["id"]), review_id=review_id, actor_id=actor_id)
     await db_session.commit()
 
     response = await client.post(
@@ -8453,16 +9651,198 @@ async def test_workspace_chat_approve_all_starts_proposed_tickets(
         json={"choice": choice},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert response.json()["resolution"]["payload"]["approved_task_ids"] == [task_id]
     db_session.expire_all()
+    stored_message = await db_session.get(Message, message_id)
+    assert stored_message.resolution["payload"]["approved_task_ids"] == [task_id]
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
     assert task.status == "in_progress"
-    assert dispatched == [task_id]
+    staged = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == task_id,
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalar_one()
+    assert staged.payload["task_id"] == task_id
 
 
 @pytest.mark.asyncio
-async def test_workspace_chat_always_approve_proposals_persists_workspace_preference(
+async def test_workspace_chat_approve_all_closes_already_consumed_proposal_card(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import select
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message, Task
+    from packages.core.tasks import ai_tasks
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "delay",
+        lambda task_id: dispatched.append(task_id),
+    )
+
+    headers = await _register(client, "ws_chat_approve_consumed_proposal_card")
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Consumed Proposal Card"},
+    )
+    ws_body = ws.json()
+    conv_id = generate_ulid()
+    message_id = generate_ulid()
+    task_id = generate_ulid()
+    review_id = "rv_test_consumed_card"
+
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Proposal approval",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="Review this proposal",
+            author_kind="agent",
+            message_kind="proposal",
+            pending_action={
+                "kind": "approve_proposals",
+                "review_id": review_id,
+                "task_ids": [task_id],
+                "task_titles": ["Build DistroKid operator handoff"],
+                "options": ["approve", "always_approve", "reject"],
+            },
+        )
+    )
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Build DistroKid operator handoff",
+            status="completed",
+            details={"strategist_review_id": review_id},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": "approve"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["resolved_at"] is not None
+    assert body["resolution"]["payload"]["approved_task_ids"] == []
+    db_session.expire_all()
+    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+    message = (
+        await db_session.execute(select(Message).where(Message.id == message_id))
+    ).scalar_one()
+    assert task.status == "completed"
+    assert dispatched == []
+    assert message.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_approve_all_keeps_card_when_proposed_tickets_unmoved(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy import select
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message, Task
+    from packages.core.tasks import ai_tasks
+
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        ai_tasks.plan_and_run_task,
+        "delay",
+        lambda task_id: dispatched.append(task_id),
+    )
+
+    headers = await _register(client, "ws_chat_approve_drifted_proposal_card")
+    ws = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Drifted Proposal Card"},
+    )
+    ws_body = ws.json()
+    conv_id = generate_ulid()
+    message_id = generate_ulid()
+    task_id = generate_ulid()
+
+    db_session.add(
+        Conversation(
+            id=conv_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Proposal approval",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conv_id,
+            role="assistant",
+            content="Review this proposal",
+            author_kind="agent",
+            message_kind="proposal",
+            pending_action={
+                "kind": "approve_proposals",
+                "review_id": "rv_card_review",
+                "task_ids": [task_id],
+                "task_titles": ["Still proposed ticket"],
+                "options": ["approve", "always_approve", "reject"],
+            },
+        )
+    )
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=ws_body["entity_id"],
+            workspace_id=ws_body["id"],
+            title="Still proposed ticket",
+            status="proposed",
+            details={"strategist_review_id": "rv_other_review"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": "approve"},
+    )
+
+    assert response.status_code == 409
+    assert "No proposed tickets were approved" in response.json()["detail"]
+    db_session.expire_all()
+    task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
+    message = (
+        await db_session.execute(select(Message).where(Message.id == message_id))
+    ).scalar_one()
+    assert task.status == "proposed"
+    assert dispatched == []
+    assert message.resolved_at is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_retired_always_approve_leaves_proposal_pending(
     client: AsyncClient,
     db_session,
 ):
@@ -8470,7 +9850,7 @@ async def test_workspace_chat_always_approve_proposals_persists_workspace_prefer
     from packages.core.models.runtime_learning import RuntimeEvidence
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Conversation, Message, Task
-    from packages.core.models.workspace import Workspace, WorkspaceActivity
+    from packages.core.models.workspace import Agent, AgentSubscription, Workspace, WorkspaceActivity
 
     headers = await _register(client, "ws_chat_always_approve_proposals")
     ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Always Approve Proposals"})
@@ -8480,6 +9860,17 @@ async def test_workspace_chat_always_approve_proposals_persists_workspace_prefer
     message_id = generate_ulid()
     review_id = "rv_test_always_approve"
     task_id = generate_ulid()
+    agent_id = generate_ulid()
+    subscription_id = generate_ulid()
+    db_session.add(Agent(
+        id=agent_id, entity_id=ws_body["entity_id"],
+        name="Proposal operator", status="active",
+    ))
+    db_session.add(AgentSubscription(
+        id=subscription_id, entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"], agent_id=agent_id,
+        service_key="proposal_operator", status="active",
+    ))
     db_session.add(
         Conversation(
             id=conv_id,
@@ -8514,37 +9905,36 @@ async def test_workspace_chat_always_approve_proposals_persists_workspace_prefer
             workspace_id=ws_body["id"],
             title="Prepare weekly batch",
             status="proposed",
+            owner_subscription_id=subscription_id,
+            owner_service_key="proposal_operator",
             details={"strategist_review_id": review_id},
         )
     )
     await db_session.commit()
 
+    policy_path = f"/api/v1/approval-settings/workspaces/{ws_body['id']}"
+    before = await client.get(policy_path, headers=headers)
+    assert before.status_code == 200, before.text
     resolved = await client.post(
         f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/resolve",
         headers=headers,
         json={"choice": "always_approve"},
     )
 
-    assert resolved.status_code == 200
-    body = resolved.json()
-    assert body["resolution"]["choice"] == "always_approve"
-    assert "Future workspace proposals" in body["resolution"]["note"]
-
+    assert resolved.status_code == 410, resolved.text
+    assert "Execution & approvals" in resolved.json()["detail"]
+    assert (await client.get(policy_path, headers=headers)).json() == before.json()
     db_session.expire_all()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_body["id"]))).scalar_one()
-    assert workspace.settings["strategist"]["auto_approve_proposals"] is True
+    assert not (workspace.settings or {}).get("strategist", {}).get("auto_approve_proposals")
     task = (await db_session.execute(select(Task).where(Task.id == task_id))).scalar_one()
-    assert task.status == "in_progress"
-
-    evidence = (
-        await db_session.execute(
-            select(RuntimeEvidence).where(
-                RuntimeEvidence.workspace_id == ws_body["id"],
-                RuntimeEvidence.evidence_type == "proposal_decision",
-            )
-        )
-    ).scalar_one()
-    assert evidence.details["choice"] == "always_approve"
+    assert task.status == "proposed"
+    message = await db_session.get(Message, message_id)
+    assert message.resolved_at is None
+    assert (await db_session.execute(select(RuntimeEvidence.id).where(
+        RuntimeEvidence.workspace_id == ws_body["id"],
+        RuntimeEvidence.evidence_type == "proposal_decision",
+    ))).scalar_one_or_none() is None
 
     activity_events = list(
         (
@@ -8557,8 +9947,7 @@ async def test_workspace_chat_always_approve_proposals_persists_workspace_prefer
         .scalars()
         .all()
     )
-    assert "strategist_proposal.auto_approval_enabled" in activity_events
-    assert "strategist_proposal.approved" in activity_events
+    assert "strategist_proposal.approved" not in activity_events
 
 
 @pytest.mark.asyncio
@@ -9710,6 +11099,7 @@ async def test_workspace_chat_approve_selected_keeps_dependency_closure(
     from sqlalchemy import select
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Conversation, Message, Task
+    from packages.core.models.workspace import Agent, AgentSubscription
 
     headers = await _register(client, "ws_chat_approve_selected_deps")
     ws = await client.post(
@@ -9725,6 +11115,18 @@ async def test_workspace_chat_approve_selected_keeps_dependency_closure(
     task_a_id = generate_ulid()
     task_b_id = generate_ulid()
     task_c_id = generate_ulid()
+    agent_id = generate_ulid()
+    subscription_id = generate_ulid()
+
+    db_session.add(Agent(
+        id=agent_id, entity_id=ws_body["entity_id"],
+        name="Proposal operator", status="active",
+    ))
+    db_session.add(AgentSubscription(
+        id=subscription_id, entity_id=ws_body["entity_id"],
+        workspace_id=ws_body["id"], agent_id=agent_id,
+        service_key="proposal_operator", status="active",
+    ))
 
     db_session.add(
         Conversation(
@@ -9765,6 +11167,8 @@ async def test_workspace_chat_approve_selected_keeps_dependency_closure(
                 workspace_id=ws_body["id"],
                 title="Prepare source artifact",
                 status="proposed",
+                owner_subscription_id=subscription_id,
+                owner_service_key="proposal_operator",
                 details={"strategist_review_id": review_id, "strategist_task_key": "source"},
             ),
             Task(
@@ -9773,6 +11177,8 @@ async def test_workspace_chat_approve_selected_keeps_dependency_closure(
                 workspace_id=ws_body["id"],
                 title="Use source artifact",
                 status="proposed",
+                owner_subscription_id=subscription_id,
+                owner_service_key="proposal_operator",
                 details={
                     "strategist_review_id": review_id,
                     "strategist_task_key": "downstream",
@@ -9785,10 +11191,18 @@ async def test_workspace_chat_approve_selected_keeps_dependency_closure(
                 workspace_id=ws_body["id"],
                 title="Optional unrelated task",
                 status="proposed",
+                owner_subscription_id=subscription_id,
+                owner_service_key="proposal_operator",
                 details={"strategist_review_id": review_id, "strategist_task_key": "optional"},
             ),
         ]
     )
+    from packages.core.models.workspace import Workspace
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    actor_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["id"]
+    await initialize_test_task_proposal(db_session,
+        await db_session.get(Workspace, ws_body["id"]), review_id=review_id, actor_id=actor_id)
     await db_session.commit()
 
     resolved = await client.post(
@@ -9800,7 +11214,7 @@ async def test_workspace_chat_approve_selected_keeps_dependency_closure(
         },
     )
 
-    assert resolved.status_code == 200
+    assert resolved.status_code == 200, resolved.text
     db_session.expire_all()
     tasks = list(
         (await db_session.execute(select(Task).where(Task.id.in_([task_a_id, task_b_id, task_c_id])))).scalars().all()
@@ -10330,17 +11744,18 @@ async def test_scheduler_skips_workspace_job_when_workspace_paused(client: Async
 
 
 @pytest.mark.asyncio
-async def test_paused_workspace_rejects_pending_action_without_resuming_plan(
+async def test_paused_workspace_accepts_manual_input_without_resuming_autonomy(
     client: AsyncClient,
     db_session,
-    monkeypatch,
 ):
     from sqlalchemy import select
 
-    import packages.core.tasks.ai_tasks as ai_tasks
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
     from packages.core.models.task import Conversation, Message, Task
+    from packages.core.models.workspace import Workspace
+    from packages.core.plans.wakeup import PLAN_CYCLE_OUTBOX_EVENT
 
     headers = await _register(client, "ws_paused_pending_action")
     me = (await client.get("/api/v1/auth/me", headers=headers)).json()
@@ -10398,8 +11813,6 @@ async def test_paused_workspace_rejects_pending_action_without_resuming_plan(
     db_session.add_all([task, plan, step, conversation, message])
     await db_session.commit()
 
-    queued: list[str] = []
-    monkeypatch.setattr(ai_tasks.run_plan, "delay", queued.append)
     pause = await client.post(
         f"/api/v1/workspaces/{workspace['id']}/pause",
         headers=headers,
@@ -10409,12 +11822,13 @@ async def test_paused_workspace_rejects_pending_action_without_resuming_plan(
     response = await client.post(
         f"/api/v1/workspaces/{workspace['id']}/chat/messages/{message.id}/resolve",
         headers=headers,
-        json={"choice": "provide_answers", "payload": {"answer": "ready"}},
+        json={"choice": "provide_answers", "payload": {"answers": {"answer": "ready"}}},
     )
 
-    assert response.status_code == 409, response.text
+    assert response.status_code == 200, response.text
     step_id = step.id
     plan_id = plan.id
+    task_id = task.id
     message_id = message.id
     db_session.expire_all()
     stored_step = (await db_session.execute(
@@ -10426,10 +11840,40 @@ async def test_paused_workspace_rejects_pending_action_without_resuming_plan(
     stored_message = (await db_session.execute(
         select(Message).where(Message.id == message_id)
     )).scalar_one()
-    assert stored_step.step_status == "waiting_human"
-    assert stored_plan.status == "paused"
-    assert stored_message.resolved_at is None
-    assert queued == []
+    stored_task = await db_session.get(Task, task_id)
+    stored_workspace = await db_session.get(Workspace, workspace["id"])
+    assert stored_step.step_status == "pending"
+    assert stored_step.params["answers"] == {"answer": "ready"}
+    assert stored_plan.status == "running"
+    assert stored_task.status == "in_progress"
+    for receipt in (
+        stored_task.details["_manual_execution"],
+        stored_plan.dispatcher_state["_manual_execution"],
+    ):
+        assert receipt["user_id"] == me["id"]
+        assert receipt["action"] == "step_resume"
+    assert stored_workspace.status == "paused"
+    assert stored_message.resolved_at is not None
+    assert stored_message.resolved_by_user_id == me["id"]
+    wake = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == plan_id,
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalar_one()
+    assert wake.payload["plan_id"] == plan_id
+
+    repeated = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": "provide_answers", "payload": {"answers": {"answer": "ready"}}},
+    )
+    assert repeated.status_code == 200, repeated.text
+    wake = (await db_session.execute(select(RuntimeOutboxEvent).where(
+        RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id == plan_id,
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ))).scalar_one()
+    assert wake.payload["plan_id"] == plan_id
 
 
 @pytest.mark.asyncio
@@ -10960,6 +12404,51 @@ async def test_workspace_architect_lint_allows_no_goal_but_requires_materializab
     assert "agent_mappings.content_ops.tool_bindings" in p0_locations
     assert "agent_mappings.content_ops.skill_bindings" in p0_locations
     assert "agent_mappings.content_ops.mcp_bindings" in p0_locations
+
+
+@pytest.mark.asyncio
+async def test_workspace_creation_rejects_mapped_agent_with_unconnected_integration(db_session):
+    from packages.core.ai.tools.workspace_arch_tools import _lint_draft
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.mcp import AgentMCPBinding, MCPServer
+    from packages.core.models.workspace import Agent
+    from packages.core.models.workspace_draft import WorkspaceDraft
+    from sqlalchemy import select
+
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    agent = Agent(
+        id=generate_ulid(), entity_id=entity_id, owner_user_id=user_id,
+        name="Existing Agent", system_prompt="Handle work.", status="active",
+    )
+    draft = WorkspaceDraft(
+        id=generate_ulid(), entity_id=entity_id, user_id=user_id,
+        fields={
+            "name": "Integration selection", "kind": "operations",
+            "operating_context": "Handle connected work", "primary_work": "Use the selected Agent",
+            "services": [{"service_key": "work", "name": "Work"}],
+            "agent_mappings": [{"service_key": "work", "agent_id": agent.id}],
+        },
+    )
+    server = (await db_session.execute(
+        select(MCPServer).where(MCPServer.server_key == "linkedin")
+    )).scalar_one()
+    db_session.add_all([agent, draft])
+    await db_session.flush()
+    db_session.add(AgentMCPBinding(
+        id=generate_ulid(), agent_id=agent.id, mcp_server_id=server.id, status="active",
+    ))
+    await db_session.flush()
+
+    lint = json.loads(await _lint_draft(
+        db_session, draft_id=draft.id, entity_id=entity_id, user_id=user_id,
+    ))
+
+    assert any(
+        issue["where"] == "agent_mappings.work.mcp_bindings"
+        and issue["severity"] == "P0"
+        for issue in lint["issues"]
+    )
 
 
 @pytest.mark.asyncio
@@ -11512,7 +13001,7 @@ async def test_finalize_draft_serializes_concurrent_requests(db_session, monkeyp
         await asyncio.sleep(0.1)
         return workspace_id
 
-    async def _fake_refresh_missing_from_lint(db, draft):
+    async def _fake_refresh_missing_from_lint(db, draft, *, issues_out=None):
         return True
 
     monkeypatch.setattr(workspace_draft_service, "finalize_setup", _fake_finalize_setup)
@@ -11764,10 +13253,10 @@ async def test_finalize_setup_create_custom_agent_gets_workspace_runtime_binding
         "web_search",
         "manor",
         "workspace_agent",
-        "rag",
         "generate_file",
         "invoke_skill",
     }.issubset(tool_names)
+    assert "rag" not in set(tool_names)
     assert skill_binding is not None
     assert workspace.operating_model["agent_mappings"][0]["service_key"] == "customer_support"
 
@@ -12104,7 +13593,7 @@ async def test_finalize_setup_materializes_runtime_governance_from_rules(db_sess
                     "rule_key": "review_social_posts",
                     "description": "发任何社媒 post 前，必须给用户审核完整内容，得到同意才能发布。",
                     "rule_type": "approval_required",
-                    "action_patterns": ["social_post.publish"],
+                    "approval_selectors": [{"kind": "action", "action_key": "social_post.publish"}],
                 }
             ],
             "channel_config": {},
@@ -12121,19 +13610,19 @@ async def test_finalize_setup_materializes_runtime_governance_from_rules(db_sess
     ).scalar_one()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == workspace_id))).scalar_one()
 
-    assert policy.policy["hitl_required_actions"] == ["social_post.publish"]
+    assert _policy_actions(policy.policy, "ask") == ["social_post.publish"]
     assert policy.updated_by == "USERGOVRULES00000000000"
     rule = workspace.operating_model["rules"][0]
     assert rule["runtime_enforced"] is True
     assert rule["rule_type"] == "approval_required"
-    assert rule["action_patterns"] == ["social_post.publish"]
+    assert rule["approval_selectors"] == [{"kind": "action", "action_key": "social_post.publish"}]
 
     from packages.core.workspace_chat import context as chat_context
 
     chat_context.invalidate(workspace_id)
     summary = await chat_context.get_summary(db_session, workspace_id, "ENTGOVRULES000000000000")
     assert "Runtime guardrails:" in summary
-    assert "approval required for social_post.publish" in summary
+    assert "ask: social_post.publish" in summary
 
 
 def test_governance_rule_description_is_not_interpreted_as_runtime_policy() -> None:
@@ -12390,7 +13879,13 @@ async def test_workspace_rename_refreshes_subscription_framing(db_session):
         source="auto_workspace_setup",
         status="active",
     )
-    db_session.add_all([workspace, agent])
+    operator_agent = Agent(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Operator Agent",
+        status="active",
+    )
+    db_session.add_all([workspace, agent, operator_agent])
     await db_session.flush()
 
     auto_framing_sub = AgentSubscription(
@@ -12408,7 +13903,7 @@ async def test_workspace_rename_refreshes_subscription_framing(db_session):
     operator_written_sub = AgentSubscription(
         id=generate_ulid(),
         entity_id=entity_id,
-        agent_id=agent.id,
+        agent_id=operator_agent.id,
         workspace_id=workspace.id,
         service_key="ops",
         custom_prompt="Always reply in the user's language and keep tone neutral.",
@@ -12438,3 +13933,292 @@ async def test_workspace_rename_refreshes_subscription_framing(db_session):
     assert "onboard new users" in refreshed_auto.custom_prompt
     # Operator-written prompts must not be touched.
     assert refreshed_manual.custom_prompt == ("Always reply in the user's language and keep tone neutral.")
+
+
+# ── One review, two persisted copies: resolving either must close both ───────
+#
+# A workspace-operation review is stored twice on the same assistant message:
+# ``meta.hitl_requests`` (the channel FloatingChat/EmbeddedChat render) and
+# ``pending_action`` (the durable row workspace chat's resolve endpoint and the
+# runtime's resolver key off). Before this, approving through one path left the
+# other copy open, offering Approve on a draft that was already applied.
+
+
+async def _seed_operation_review_message(client, db_session, username: str):
+    import json
+    from sqlalchemy import select
+    from packages.core.ai.tools.workspace_agent_tools import _workspace_agent_handler
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.user import User
+    from packages.core.services.hitl_requests import (
+        hitl_requests_from_data,
+        workspace_operation_pending_action_from_data,
+    )
+
+    headers = await _register(client, username)
+    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Review mirror"})
+    ws_body = ws.json()
+    user = (await db_session.execute(select(User).where(User.email == f"{username}@test.com"))).scalar_one()
+    conversation_id = generate_ulid()
+    db_session.add(
+        Conversation(
+            id=conversation_id,
+            entity_id=ws_body["entity_id"],
+            user_id=user.id,
+            workspace_id=ws_body["id"],
+            title="Workspace review mirror",
+            channel="workspace",
+            scope="workspace_main",
+        )
+    )
+    await db_session.commit()
+
+    hitl_data = json.loads(
+        await _workspace_agent_handler(
+            entity_id=ws_body["entity_id"],
+            user_id=user.id,
+            workspace_id=ws_body["id"],
+            conversation_id=conversation_id,
+            action="add_rule",
+            params={
+                "description": "Posting requires review.",
+                "rule_type": "approval_required",
+                "action_patterns": ["social_post.publish"],
+            },
+        )
+    )
+    assert hitl_data["__hitl__"] is True
+    pending_action = workspace_operation_pending_action_from_data(hitl_data)
+    hitl_requests = hitl_requests_from_data(hitl_data)
+    assert pending_action and hitl_requests
+    # Both copies name the same draft — that is what lets either path find the other.
+    assert hitl_requests[0]["id"] == pending_action["approval_token"] == hitl_data["approval_token"]
+
+    message_id = generate_ulid()
+    db_session.add(
+        Message(
+            id=message_id,
+            conversation_id=conversation_id,
+            role="assistant",
+            content="Review this workspace change.",
+            author_kind="agent",
+            message_kind="hitl_request",
+            meta={"hitl_requests": hitl_requests},
+            pending_action=pending_action,
+        )
+    )
+    await db_session.commit()
+    # Return the id, not the row: callers expire the session and a lazy
+    # attribute load on an expired row is sync IO under asyncpg.
+    return headers, ws_body, user.id, conversation_id, message_id, hitl_data["operation"]["draft_id"]
+
+
+async def _reload_message(db_session, message_id: str):
+    from sqlalchemy import select
+    from packages.core.models.task import Message
+
+    db_session.expire_all()
+    return (await db_session.execute(select(Message).where(Message.id == message_id))).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_hitl_path_approval_closes_mirrored_pending_action(client: AsyncClient, db_session):
+    from packages.core.services.workspace_operation_service import (
+        get_operation_draft,
+        resolve_workspace_operation_review_message,
+    )
+
+    _headers, ws_body, user_id, conversation_id, message_id, draft_id = (
+        await _seed_operation_review_message(client, db_session, "review_mirror_hitl")
+    )
+
+    card = await _reload_message(db_session, message_id)
+    replacement = await resolve_workspace_operation_review_message(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=ws_body["entity_id"],
+        user_id=user_id,
+        hitl_id=card.meta["hitl_requests"][0]["id"],
+        action="approve",
+    )
+    assert replacement and replacement.startswith("[Workspace operation approved]")
+    await db_session.commit()
+
+    msg = await _reload_message(db_session, message_id)
+    assert msg.meta["hitl_requests"][0]["resolved"] is True
+    assert msg.meta["hitl_requests"][0]["resolution"] == "approve"
+    # The durable card is closed too — no second Approve on an applied draft.
+    assert msg.resolved_at is not None
+    assert msg.resolution == {"choice": "approve"}
+    assert msg.resolved_by_user_id == user_id
+    draft = await get_operation_draft(db_session, draft_id, ws_body["entity_id"], ws_body["id"])
+    assert draft.status == "applied"
+
+
+@pytest.mark.asyncio
+async def test_pending_action_endpoint_approval_closes_mirrored_hitl_card(client: AsyncClient, db_session):
+    from packages.core.services.workspace_operation_service import get_operation_draft
+
+    headers, ws_body, _user_id, _conversation_id, message_id, draft_id = (
+        await _seed_operation_review_message(client, db_session, "review_mirror_endpoint")
+    )
+
+    resp = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": "approve"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    msg = await _reload_message(db_session, message_id)
+    assert msg.resolved_at is not None
+    assert msg.resolution["choice"] == "approve"
+    # The hitl copy (what FloatingChat renders) is closed by the same click.
+    assert msg.meta["hitl_requests"][0]["resolved"] is True
+    assert msg.meta["hitl_requests"][0]["resolution"] == "approve"
+    draft = await get_operation_draft(db_session, draft_id, ws_body["entity_id"], ws_body["id"])
+    assert draft.status == "applied"
+
+
+# ── An invalid draft must not produce an approval card ────────────────────────
+#
+# Prod card "发布 X post": create_draft produced the review card even though the
+# draft failed validation, with Approve greyed out and the model told to wait
+# for approval. The operator could only reject and the model never saw the
+# error. Now the errors go back to the model, and patch_draft returns the card
+# once the draft validates.
+
+
+@pytest.mark.asyncio
+async def test_invalid_operation_draft_returns_errors_to_the_model_not_a_card(client: AsyncClient, db_session):
+    import json
+    from packages.core.ai.tools.workspace_agent_tools import _workspace_agent_handler
+    from packages.core.models.user import OAuthAccount
+
+    headers = await _register(client, "ws_op_needs_fix")
+    ws = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Needs Fix Runtime"})
+    ws_body = ws.json()
+    user_id = (await client.get("/api/v1/auth/me", headers=headers)).json()["id"]
+    db_session.add(OAuthAccount(
+        user_id=user_id,
+        provider="twitter_x",
+        provider_user_id="ws_op_needs_fix",
+        access_token="fixture",
+    ))
+    await db_session.commit()
+
+    async def operation(params: dict) -> dict:
+        return json.loads(
+            await _workspace_agent_handler(
+                entity_id=ws_body["entity_id"],
+                user_id=user_id,
+                workspace_id=ws_body["id"],
+                action="operation",
+                params=params,
+            )
+        )
+
+    bad_binding = {
+        "op": "capability_binding.upsert",
+        "payload": {"binding": {
+            "capability_type": "mcp",
+            "integration_key": "x",
+            "allowed_tools": ["create_tweet"],
+            # Not a scope the runtime knows and not a synonym: cannot be inferred.
+            "owner_scope": "x_marketing_team",
+        }},
+    }
+    created = await operation({"action": "create_draft", "patches": [bad_binding]})
+
+    # No card: the model, not the operator, has to act on this.
+    assert "__hitl__" not in created
+    assert created["status"] == "needs_fix"
+    assert created["error"] == "operation_validation_failed"
+    assert [e["path"] for e in created["details"]["validation_errors"]] == ["capability_bindings[0].owner_scope"]
+    assert "patch_draft" not in created["message"]
+    draft_id = created["details"]["draft_id"]
+    from packages.core.services.workspace_operation_service import get_operation_draft
+    stored_draft = await get_operation_draft(db_session, draft_id, ws_body["entity_id"], ws_body["id"])
+    assert stored_draft is not None
+    bad_key = stored_draft.current_state["capability_bindings"][0]["binding_key"]
+
+    # Asking to apply an invalid draft without confirmation gets the same answer.
+    unconfirmed = await operation({"action": "apply_draft", "draft_id": draft_id})
+    assert "__hitl__" not in unconfirmed
+    assert unconfirmed["status"] == "needs_fix"
+
+    # The fix: drop the broken binding, add the corrected one. The card follows.
+    patched = await operation({
+        "action": "patch_draft",
+        "draft_id": draft_id,
+        "patches": [
+            {"op": "capability_binding.remove", "payload": {"binding_key": bad_key}},
+            {
+                "op": "capability_binding.upsert",
+                "payload": {"binding": {
+                    "capability_type": "mcp",
+                    "integration_key": "x",
+                    "allowed_tools": ["create_tweet"],
+                    "owner_scope": "workspace_agent",
+                }},
+            },
+        ],
+    })
+    assert patched["__hitl__"] is True
+    assert patched["operation"]["draft_id"] == draft_id
+    assert patched["operation"]["kind"] == "workspace_operation_review"
+    assert patched["operation"]["validation"]["valid"] is True
+    bindings = patched["draft"]["current_state"]["capability_bindings"]
+    assert [b["owner_scope"] for b in bindings] == ["workspace_agent"]
+
+    # And a valid draft asked to apply without confirmation shows the card too,
+    # instead of a "user confirmation is required" error the model can only relay.
+    asked = await operation({"action": "apply_draft", "draft_id": draft_id})
+    assert asked["__hitl__"] is True
+    assert asked["operation"]["draft_id"] == draft_id
+
+
+@pytest.mark.asyncio
+async def test_paused_workspace_still_accepts_manual_approvals(client: AsyncClient, db_session):
+    """Pausing a workspace stops the autonomous loop (no strategist runs); it
+    does not lock the operator out. Approving a review card while paused used
+    to return 409 — and the UI disabled the button with no visible cue, which
+    read as "Approve does nothing"."""
+    from sqlalchemy import select
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_operation_service import get_operation_draft
+
+    headers, ws_body, _user_id, _conversation_id, message_id, draft_id = (
+        await _seed_operation_review_message(client, db_session, "paused_manual_approve")
+    )
+    workspace = (await db_session.execute(select(Workspace).where(Workspace.id == ws_body["id"]))).scalar_one()
+    workspace.status = "paused"
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/workspaces/{ws_body['id']}/chat/messages/{message_id}/resolve",
+        headers=headers,
+        json={"choice": "approve"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    msg = await _reload_message(db_session, message_id)
+    assert msg.resolved_at is not None
+    draft = await get_operation_draft(db_session, draft_id, ws_body["entity_id"], ws_body["id"])
+    assert draft.status == "applied"
+
+
+async def _persist_workspace_operation_review(db, conversation_id, review):
+    from packages.core.models.task import Message
+    from packages.core.services.hitl_requests import (
+        hitl_requests_from_data, workspace_operation_pending_action_from_data,
+    )
+
+    db.add(Message(
+        conversation_id=conversation_id, role="assistant", content="Review changes",
+        author_kind="agent", message_kind="hitl_request",
+        meta={"hitl_requests": hitl_requests_from_data(review)},
+        pending_action=workspace_operation_pending_action_from_data(review),
+    ))
+    await db.commit()

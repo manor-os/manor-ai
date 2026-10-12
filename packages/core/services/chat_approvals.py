@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -13,6 +14,18 @@ from packages.core.services.hitl_options import normalize_approval_choice
 
 
 CHAT_TURN_CANCEL_GENERATION_KEY = "chat_turn_cancel_generation"
+_WORKFLOW_HITL_ACTION_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+
+
+def _chat_runtime_resolution_metadata(resolution) -> dict:
+    """Make every host-resolved Runtime decision explicit to Chat routing."""
+
+    if isinstance(resolution.runtime_metadata, dict):
+        return dict(resolution.runtime_metadata)
+    return {
+        "approval_kind": "runtime_terminal",
+        "approval_outcome": "handled",
+    }
 
 
 def _chat_turn_cancel_generation(meta: object) -> int:
@@ -102,7 +115,10 @@ def parse_hitl_action(message: str) -> tuple[str, str, dict | None] | None:
     if not isinstance(data, dict):
         return None
     hitl_id = str(data.get("hitl_id") or "").strip()
-    action = normalize_approval_choice(data.get("action"))
+    raw_action = str(data.get("action") or "").strip().lower()
+    action = normalize_approval_choice(raw_action)
+    if action is None and _WORKFLOW_HITL_ACTION_RE.fullmatch(raw_action):
+        action = raw_action
     if not hitl_id or not action:
         return None
     payload = data.get("payload") if isinstance(data.get("payload"), dict) else None
@@ -152,13 +168,32 @@ async def chat_hitl_action_is_pending(
         )
     )).scalars().all()
     for row in rows:
+        request: dict | None = None
         if row.id == hitl_id:
-            return True
+            request = row.pending_action if isinstance(row.pending_action, dict) else None
         meta = row.meta if isinstance(row.meta, dict) else {}
-        if any(
-            isinstance(request, dict) and str(request.get("id") or "") == hitl_id
-            for request in meta.get("hitl_requests") or []
-        ):
+        if request is None:
+            request = next(
+                (
+                    candidate
+                    for candidate in meta.get("hitl_requests") or []
+                    if isinstance(candidate, dict)
+                    and str(candidate.get("id") or "") == hitl_id
+                ),
+                None,
+            )
+        if request is None:
+            continue
+        options = request.get("options")
+        if isinstance(options, list) and options:
+            allowed = {
+                str(option or "").strip().lower()
+                for option in options
+                if str(option or "").strip()
+            }
+            if _action not in allowed:
+                continue
+        if request:
             return True
     return False
 
@@ -170,12 +205,33 @@ async def register_chat_provider_approval(
     entity_id: str,
     user_id: str,
     request: dict,
+    task_id: str | None = None,
+    runtime_envelope=None,
 ) -> dict | None:
     """Register a normalized provider approval through the chat adapter."""
 
     from packages.core.ai.runtime.approval_service import (
         register_provider_runtime_approval,
     )
+    from packages.core.services.task_comment_approval_origin import is_task_comment_runtime
+
+    # Chat historically supplied no Task origin. Add the new foreground
+    # binding only; never clear or replace an explicitly supplied Task id.
+    if task_id is None and is_task_comment_runtime(runtime_envelope):
+        from packages.core.constants.task import TaskType
+        from packages.core.models.task import Task
+
+        task = (await db.execute(select(Task).where(
+            Task.id == runtime_envelope.task_id,
+            Task.entity_id == entity_id,
+            Task.workspace_id == runtime_envelope.workspace_id,
+        ))).scalar_one_or_none()
+        if task is None:
+            from packages.core.services.task_comment_approval_origin import TaskCommentApprovalOriginError
+
+            raise TaskCommentApprovalOriginError("Task comment origin is unavailable")
+        if task.task_type == TaskType.GENERAL.value:
+            task_id = task.id
 
     return await register_provider_runtime_approval(
         db,
@@ -183,6 +239,8 @@ async def register_chat_provider_approval(
         entity_id=entity_id,
         user_id=user_id,
         request=request,
+        task_id=task_id,
+        runtime_envelope=runtime_envelope,
     )
 
 
@@ -207,6 +265,21 @@ async def resolve_chat_approval_turn(
     from packages.core.services.workspace_operation_service import (
         resolve_workspace_operation_review_message,
     )
+    from packages.core.services.task_comment_approval_origin import (
+        TaskCommentApprovalOriginError,
+        lock_task_comment_turn_boundary,
+    )
+
+    try:
+        await lock_task_comment_turn_boundary(
+            db, entity_id=entity_id, conversation_id=conversation_id,
+        )
+    except TaskCommentApprovalOriginError:
+        return (
+            "This Task comment approval is no longer executable. No action was run.",
+            None, False,
+            {"approval_kind": "runtime_terminal", "approval_outcome": "blocked"},
+        )
 
     if hitl := parse_hitl_action(message):
         hitl_id, hitl_action, hitl_payload = hitl
@@ -228,13 +301,18 @@ async def resolve_chat_approval_turn(
             hitl_id=hitl_id,
             action=hitl_action,
             revision_request=_hitl_revision_request(hitl_payload),
+            submitted_review=(hitl_payload or {}).get("review"),
         )
         if runtime_resolution:
+            remains_pending = (
+                isinstance(runtime_resolution.runtime_metadata, dict)
+                and runtime_resolution.runtime_metadata.get("approval_outcome") == "pending"
+            )
             return (
                 runtime_resolution.message,
-                user_visible_hitl_action_text(hitl_action),
+                "The publishing review still needs confirmation." if remains_pending else user_visible_hitl_action_text(hitl_action),
                 True,
-                runtime_resolution.runtime_metadata,
+                _chat_runtime_resolution_metadata(runtime_resolution),
             )
         replacement = await resolve_workspace_operation_review_message(
             db,
@@ -245,7 +323,12 @@ async def resolve_chat_approval_turn(
             action=hitl_action,
         )
         if replacement:
-            return replacement, user_visible_hitl_action_text(hitl_action), True, None
+            saved_text = (
+                "Requested approval; the workspace operation was not applied."
+                if replacement.startswith("[Workspace operation not applied]")
+                else user_visible_hitl_action_text(hitl_action)
+            )
+            return replacement, saved_text, True, None
         from packages.core.services.workflow_chat_approvals import (
             resolve_chat_workflow_wait,
         )
@@ -288,7 +371,7 @@ async def resolve_chat_approval_turn(
             runtime_resolution.message,
             None,
             True,
-            runtime_resolution.runtime_metadata,
+            _chat_runtime_resolution_metadata(runtime_resolution),
         )
     return None, None, True, None
 
@@ -307,6 +390,17 @@ async def cancel_chat_approvals(
 
     from packages.core.ai.runtime.approval_service import cancel_pending_runtime_approvals
     from packages.core.services.ai_file_permissions import cancel_pending_file_approvals
+    from packages.core.services.task_comment_approval_origin import (
+        TaskCommentApprovalOriginError,
+        lock_task_comment_turn_boundary,
+    )
+
+    try:
+        await lock_task_comment_turn_boundary(
+            db, entity_id=entity_id, conversation_id=conversation_id,
+        )
+    except TaskCommentApprovalOriginError:
+        return {"cancelled": 0, "file_cancelled": 0, "runtime_cancelled": 0, "cancel_requested": 0}
 
     file_cancelled = await cancel_pending_file_approvals(
         db,

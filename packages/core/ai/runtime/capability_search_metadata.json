@@ -1,0 +1,5789 @@
+{
+ "_comment": "Search metadata for tools, Manor operations and MCP providers, by catalog id. English only. See capability_search_metadata.py; tests/test_capability_registration_contract.py ranks every example against the built-in catalog.",
+ "manor_action:add_task_comment": {
+  "terms": [
+   "note",
+   "reply",
+   "log entry",
+   "update task",
+   "discussion"
+  ],
+  "examples": [
+   "comment on task",
+   "add note to task",
+   "post progress update on task",
+   "log entry for a ticket"
+  ]
+ },
+ "manor_action:add_workspace_service": {
+  "terms": [
+   "offering",
+   "capability",
+   "operating model",
+   "business service",
+   "add service"
+  ],
+  "examples": [
+   "add service to workspace",
+   "extend workspace operating model",
+   "new service in workspace",
+   "register business service"
+  ]
+ },
+ "manor_action:assign_task": {
+  "terms": [
+   "delegate task",
+   "reassign task",
+   "give task to",
+   "task owner",
+   "change assignee"
+  ],
+  "examples": [
+   "assign task to team member",
+   "reassign task to another person",
+   "delegate task to agent",
+   "set task owner by email"
+  ]
+ },
+ "manor_action:bind_channel": {
+  "terms": [
+   "route messages",
+   "connect channel",
+   "assign agent to channel",
+   "inbound routing",
+   "telegram",
+   "slack channel"
+  ],
+  "examples": [
+   "route channel messages to agent",
+   "assign agent to inbound channel",
+   "connect channel config with agent",
+   "make agent answer channel messages"
+  ]
+ },
+ "manor_action:cancel_scheduled_job": {
+  "terms": [
+   "stop job",
+   "remove schedule",
+   "cron",
+   "recurring job"
+  ],
+  "examples": [
+   "cancel scheduled background job",
+   "stop a recurring scheduled job",
+   "delete scheduled job by id",
+   "remove timed job"
+  ]
+ },
+ "manor_action:continue_workspace_draft": {
+  "terms": [
+   "edit draft",
+   "modify workspace setup",
+   "change configuration",
+   "revise draft",
+   "creation panel",
+   "continue draft",
+   "change draft"
+  ],
+  "examples": [
+   "update workspace draft with new request",
+   "user changed workspace configuration",
+   "add or remove something from draft",
+   "continue editing workspace draft"
+  ]
+ },
+ "manor_action:create_client": {
+  "terms": [
+   "add customer",
+   "new contact",
+   "crm",
+   "new lead",
+   "add account",
+   "prospect"
+  ],
+  "examples": [
+   "create a new client",
+   "add customer to crm",
+   "register new contact",
+   "save new lead record"
+  ]
+ },
+ "manor_action:create_client_activity": {
+  "terms": [
+   "log customer communication",
+   "record crm call meeting",
+   "add activity note"
+  ],
+  "examples": [
+   "log a customer phone call",
+   "add a client meeting note",
+   "record an email in crm activity history"
+  ]
+ },
+ "manor_action:create_client_contact": {
+  "terms": [
+   "add customer contact",
+   "company contact person",
+   "new crm contact"
+  ],
+  "examples": [
+   "add a contact to a client company",
+   "create customer contact person",
+   "save a new crm contact"
+  ]
+ },
+ "manor_action:create_client_followup": {
+  "terms": [
+   "add customer follow up",
+   "new crm follow up record",
+   "follow up due date"
+  ],
+  "examples": [
+   "create a client follow up",
+   "add a customer follow up record",
+   "plan a crm follow up due date"
+  ]
+ },
+ "manor_action:create_client_opportunity": {
+  "terms": [
+   "add customer deal",
+   "new sales opportunity",
+   "create crm deal"
+  ],
+  "examples": [
+   "create a client sales opportunity",
+   "add a new customer deal",
+   "create a crm deal amount and currency"
+  ]
+ },
+ "manor_action:create_document_folder": {
+  "terms": [
+   "new folder",
+   "make directory",
+   "knowledge folder",
+   "mkdir",
+   "organize documents",
+   "knowledge base directory"
+  ],
+  "examples": [
+   "create new knowledge folder",
+   "make folder for documents",
+   "add directory to knowledge base",
+   "create folder for contracts"
+  ]
+ },
+ "manor_action:create_order": {
+  "terms": [
+   "new sale",
+   "purchase order",
+   "add order",
+   "place order",
+   "sales order"
+  ],
+  "examples": [
+   "create a new order",
+   "add order for customer",
+   "record new sales order",
+   "place order in system"
+  ]
+ },
+ "manor_action:create_scheduled_job": {
+  "terms": [
+   "cron",
+   "recurring",
+   "timer",
+   "scheduler",
+   "repeat",
+   "every day",
+   "reminder job",
+   "reminder",
+   "remind",
+   "every",
+   "daily",
+   "weekly",
+   "monthly",
+   "run once"
+  ],
+  "examples": [
+   "schedule recurring workspace report",
+   "run job every monday morning",
+   "create cron automation daily",
+   "run something once at a set time"
+  ]
+ },
+ "manor_action:create_skill": {
+  "terms": [
+   "new skill",
+   "make skill",
+   "custom skill",
+   "skill builder",
+   "save workflow as skill"
+  ],
+  "examples": [
+   "create a new reusable skill",
+   "save what we just did as reusable skill",
+   "build custom skill from description",
+   "make my own skill"
+  ]
+ },
+ "manor_action:create_task": {
+  "terms": [
+   "todo",
+   "to-do",
+   "action item",
+   "assign work",
+   "add task",
+   "follow",
+   "up",
+   "action",
+   "item"
+  ],
+  "examples": [
+   "create new task for team member",
+   "add todo with deadline",
+   "assign task to teammate high priority",
+   "make an action item for tomorrow"
+  ]
+ },
+ "manor_action:delete_client": {
+  "terms": [
+   "remove customer",
+   "erase contact",
+   "archive client",
+   "crm cleanup"
+  ],
+  "examples": [
+   "delete client by id",
+   "remove customer from crm",
+   "soft delete a contact",
+   "archive client record"
+  ]
+ },
+ "manor_action:delete_client_activity": {
+  "terms": [
+   "remove communication record",
+   "delete crm activity note"
+  ],
+  "examples": [
+   "delete a client activity record",
+   "remove a customer communication note",
+   "delete a manual crm meeting record"
+  ]
+ },
+ "manor_action:delete_client_contact": {
+  "terms": [
+   "remove customer contact",
+   "delete contact person"
+  ],
+  "examples": [
+   "delete a client contact",
+   "remove customer company contact",
+   "delete a crm contact person"
+  ]
+ },
+ "manor_action:delete_client_followup": {
+  "terms": [
+   "remove customer follow up",
+   "delete crm follow up record"
+  ],
+  "examples": [
+   "delete a client follow up",
+   "remove a customer follow up record",
+   "delete a crm follow up item"
+  ]
+ },
+ "manor_action:delete_client_opportunity": {
+  "terms": [
+   "remove customer deal",
+   "delete sales opportunity"
+  ],
+  "examples": [
+   "delete a client sales opportunity",
+   "remove a customer deal",
+   "delete a crm opportunity record"
+  ]
+ },
+ "manor_action:delete_document": {
+  "terms": [
+   "remove file",
+   "trash",
+   "erase document",
+   "knowledge file",
+   "get rid of"
+  ],
+  "examples": [
+   "delete knowledge document",
+   "remove uploaded file",
+   "erase document by id",
+   "get rid of old file"
+  ]
+ },
+ "manor_action:delete_document_folder": {
+  "terms": [
+   "remove folder",
+   "erase directory",
+   "delete knowledge folder",
+   "clean up folder"
+  ],
+  "examples": [
+   "delete a knowledge folder",
+   "remove folder and everything inside",
+   "erase document directory",
+   "clean up unused folder"
+  ]
+ },
+ "manor_action:delete_skill": {
+  "terms": [
+   "remove skill",
+   "uninstall skill",
+   "get rid of"
+  ],
+  "examples": [
+   "delete a custom skill",
+   "remove my skill",
+   "get rid of unused skill",
+   "uninstall custom skill"
+  ]
+ },
+ "manor_action:get_client": {
+  "terms": [
+   "customer",
+   "contact",
+   "account",
+   "crm",
+   "lead",
+   "customer record",
+   "look up client",
+   "client details by id",
+   "client info"
+  ],
+  "examples": [
+   "get client details by id",
+   "look up customer record",
+   "show client info",
+   "view crm customer profile"
+  ]
+ },
+ "manor_action:get_crm_overview": {
+  "terms": [
+   "crm dashboard",
+   "customer summary",
+   "sales forecast",
+   "overdue follow ups"
+  ],
+  "examples": [
+   "show crm overview",
+   "summarize customer sales forecast",
+   "crm counts and overdue follow ups"
+  ]
+ },
+ "manor_action:get_dashboard_summary": {
+  "terms": [
+   "kpi",
+   "metrics",
+   "completion rate",
+   "satisfaction score",
+   "performance stats",
+   "overview"
+  ],
+  "examples": [
+   "get task completion stats",
+   "show customer satisfaction summary",
+   "overall performance metrics for period",
+   "completion kpis for last week"
+  ]
+ },
+ "manor_action:get_document": {
+  "terms": [
+   "file details",
+   "doc info",
+   "document metadata",
+   "knowledge file"
+  ],
+  "examples": [
+   "get document details by id",
+   "show knowledge document info",
+   "look up document metadata",
+   "view document details"
+  ]
+ },
+ "manor_action:get_entity_info": {
+  "terms": [
+   "company info",
+   "organization name",
+   "account settings",
+   "tenant",
+   "company profile"
+  ],
+  "examples": [
+   "get organization name and settings",
+   "what is my company name",
+   "show current entity info",
+   "get company profile settings"
+  ]
+ },
+ "manor_action:get_goal_status": {
+  "terms": [
+   "kpi",
+   "progress",
+   "objective",
+   "target",
+   "okr",
+   "pace",
+   "on track"
+  ],
+  "examples": [
+   "check progress toward goal",
+   "are we on track for target",
+   "show active goals status",
+   "kpi pace for workspace"
+  ]
+ },
+ "manor_action:get_operating_model": {
+  "terms": [
+   "business model",
+   "services and goals",
+   "workspace rules",
+   "operating plan",
+   "workspace configuration",
+   "rules workspace follows"
+  ],
+  "examples": [
+   "get workspace operating model",
+   "show workspace services and goals",
+   "what rules does workspace follow",
+   "view workspace services goals and rules"
+  ]
+ },
+ "manor_action:get_order": {
+  "terms": [
+   "purchase",
+   "order status",
+   "order lookup",
+   "order record",
+   "sale details",
+   "look up order"
+  ],
+  "examples": [
+   "get order details by id",
+   "look up customer order",
+   "check status of an order",
+   "show order record"
+  ]
+ },
+ "manor_action:get_skill": {
+  "terms": [
+   "skill info",
+   "skill definition",
+   "playbook"
+  ],
+  "examples": [
+   "get skill details",
+   "read skill definition",
+   "show playbook details",
+   "view skill definition"
+  ]
+ },
+ "manor_action:get_staff": {
+  "terms": [
+   "employee",
+   "team member",
+   "user profile",
+   "staff details",
+   "colleague"
+  ],
+  "examples": [
+   "get staff member details",
+   "look up team member by id",
+   "show employee profile",
+   "who is this staff member"
+  ]
+ },
+ "manor_action:get_stat_status": {
+  "terms": [
+   "metrics",
+   "kpi",
+   "assessment",
+   "stats",
+   "measure",
+   "evidence",
+   "observation"
+  ],
+  "examples": [
+   "read workspace metric definitions",
+   "get latest stat assessment",
+   "check metric status before assessing",
+   "stat source document versions"
+  ]
+ },
+ "manor_action:get_task_details": {
+  "terms": [
+   "task status",
+   "task logs",
+   "task info",
+   "task progress"
+  ],
+  "examples": [
+   "show task details and logs",
+   "why did my task fail",
+   "check progress of a task",
+   "get task processing log"
+  ]
+ },
+ "manor_action:get_workspace": {
+  "terms": [
+   "workspace info",
+   "business profile",
+   "operating model",
+   "company details"
+  ],
+  "examples": [
+   "get workspace details",
+   "show workspace operating model",
+   "view workspace info",
+   "read workspace business profile"
+  ]
+ },
+ "manor_action:get_workspace_activity": {
+  "terms": [
+   "activity feed",
+   "audit log",
+   "recent events",
+   "history",
+   "what happened"
+  ],
+  "examples": [
+   "show recent workspace activity",
+   "workspace activity log",
+   "what happened in workspace lately",
+   "recent changes feed"
+  ]
+ },
+ "manor_action:get_workspace_agents": {
+  "terms": [
+   "team agents",
+   "who works in workspace",
+   "agent roster",
+   "service mapping",
+   "assigned agents",
+   "who handles service"
+  ],
+  "examples": [
+   "which agents are in workspace",
+   "show agent service mappings",
+   "list workspace agent team",
+   "who handles each service"
+  ]
+ },
+ "manor_action:get_workspace_daily_summary": {
+  "terms": [
+   "daily briefing",
+   "standup",
+   "yesterday outcomes",
+   "today's focus",
+   "daily digest",
+   "morning report"
+  ],
+  "examples": [
+   "workspace daily summary for today",
+   "what happened yesterday in workspace",
+   "items needing human handoff today",
+   "morning briefing for workspace"
+  ]
+ },
+ "manor_action:get_workspace_dashboard": {
+  "terms": [
+   "workspace overview",
+   "workspace metrics",
+   "workspace kpis",
+   "home stats"
+  ],
+  "examples": [
+   "get workspace dashboard stats",
+   "show workspace overview numbers",
+   "how is workspace doing",
+   "workspace health metrics"
+  ]
+ },
+ "manor_action:link_client_relationship": {
+  "terms": [
+   "associate customer ledger subject",
+   "link crm profile to relationship ledger"
+  ],
+  "examples": [
+   "link client to relationship ledger",
+   "associate customer with a ledger subject",
+   "attach crm profile to current workspace relationship"
+  ]
+ },
+ "manor_action:list_agents": {
+  "terms": [
+   "agent roster",
+   "ai employees",
+   "bots",
+   "agent directory",
+   "agent category",
+   "deployed agents"
+  ],
+  "examples": [
+   "list agents in workspace",
+   "find agents by category",
+   "show which agents are deployed",
+   "list my ai employees"
+  ]
+ },
+ "manor_action:list_channel_bindings": {
+  "terms": [
+   "chat channels",
+   "message routing",
+   "which agent handles",
+   "telegram slack whatsapp",
+   "channel mapping"
+  ],
+  "examples": [
+   "list channels and routed agents",
+   "which agent answers telegram",
+   "show channel bindings",
+   "see where whatsapp messages go"
+  ]
+ },
+ "manor_action:list_client_activities": {
+  "terms": [
+   "communication history",
+   "crm activity history",
+   "client sales stage history"
+  ],
+  "examples": [
+   "show client communication history",
+   "list crm activities for a customer",
+   "read customer sales stage history"
+  ]
+ },
+ "manor_action:list_client_contacts": {
+  "terms": [
+   "customer contacts",
+   "company address book",
+   "primary contact"
+  ],
+  "examples": [
+   "list contacts for a client",
+   "show customer company contacts",
+   "find the primary contact for a client"
+  ]
+ },
+ "manor_action:list_client_deliveries": {
+  "terms": [
+   "customer workspace delivery receipts",
+   "invitation email status",
+   "handoff history"
+  ],
+  "examples": [
+   "list client workspace deliveries",
+   "show customer delivery receipts",
+   "check client invitation email status"
+  ]
+ },
+ "manor_action:list_client_followups": {
+  "terms": [
+   "customer follow up records",
+   "client follow up list"
+  ],
+  "examples": [
+   "list follow ups for a client",
+   "show customer follow up records",
+   "read client crm follow ups"
+  ]
+ },
+ "manor_action:list_client_opportunities": {
+  "terms": [
+   "customer sales opportunities",
+   "client deals"
+  ],
+  "examples": [
+   "list sales opportunities for a client",
+   "show customer deals",
+   "read client crm opportunities"
+  ]
+ },
+ "manor_action:list_client_relationships": {
+  "terms": [
+   "customer ledger associations",
+   "crm linked relationship subjects"
+  ],
+  "examples": [
+   "list client relationship ledger links",
+   "show customer ledger associations",
+   "read crm linked workspace relationships"
+  ]
+ },
+ "manor_action:list_clients": {
+  "terms": [
+   "customers",
+   "contacts",
+   "crm",
+   "accounts",
+   "leads",
+   "search clients",
+   "customer email lookup"
+  ],
+  "examples": [
+   "list clients by status",
+   "find customer by email",
+   "show all active clients",
+   "search clients by name"
+  ]
+ },
+ "manor_action:list_conversations": {
+  "terms": [
+   "chats",
+   "chat history",
+   "threads",
+   "dialogues",
+   "past messages"
+  ],
+  "examples": [
+   "list chats for an agent",
+   "show user conversations",
+   "find past conversations by user",
+   "recent chat threads of agent"
+  ]
+ },
+ "manor_action:list_crm_followups": {
+  "terms": [
+   "company follow up queue",
+   "overdue customer follow ups",
+   "all crm follow ups"
+  ],
+  "examples": [
+   "list company follow up queue",
+   "show overdue crm follow ups",
+   "find all open customer follow ups"
+  ]
+ },
+ "manor_action:list_crm_opportunities": {
+  "terms": [
+   "company wide sales pipeline",
+   "all company deals",
+   "search crm opportunities"
+  ],
+  "examples": [
+   "list company sales pipeline",
+   "search crm opportunities across clients",
+   "show all company deals"
+  ]
+ },
+ "manor_action:list_document_folders": {
+  "terms": [
+   "knowledge folders",
+   "folder tree",
+   "directories",
+   "knowledge base structure"
+  ],
+  "examples": [
+   "list knowledge folders",
+   "show folder structure of knowledge base",
+   "what folders do I have",
+   "browse document directories"
+  ]
+ },
+ "manor_action:list_document_groups": {
+  "terms": [
+   "collections",
+   "rag",
+   "knowledge groups",
+   "document sets",
+   "context groups"
+  ],
+  "examples": [
+   "list document groups for rag",
+   "show knowledge collections",
+   "what document collections exist",
+   "workspace context groups"
+  ]
+ },
+ "manor_action:list_documents": {
+  "terms": [
+   "files",
+   "uploads",
+   "knowledge base",
+   "docs",
+   "browse files",
+   "files by folder",
+   "uploaded files"
+  ],
+  "examples": [
+   "list my knowledge documents",
+   "show uploaded files in workspace",
+   "list documents uploaded last week",
+   "list pdf files by folder"
+  ]
+ },
+ "manor_action:list_integrations": {
+  "terms": [
+   "connected apps",
+   "linked accounts",
+   "connections",
+   "integration status",
+   "what is connected"
+  ],
+  "examples": [
+   "list connected integrations",
+   "which accounts are linked",
+   "check integration readiness",
+   "show my connected apps"
+  ]
+ },
+ "manor_action:list_notifications": {
+  "terms": [
+   "alerts",
+   "inbox",
+   "unread",
+   "read status",
+   "notices"
+  ],
+  "examples": [
+   "list unread notifications",
+   "show my alerts",
+   "check new notifications",
+   "filter notifications by read status"
+  ]
+ },
+ "manor_action:list_orders": {
+  "terms": [
+   "sales",
+   "purchases",
+   "invoices",
+   "order status",
+   "customer orders",
+   "pending orders"
+  ],
+  "examples": [
+   "list business orders by status",
+   "show pending orders",
+   "find recent sales orders",
+   "filter orders shipped"
+  ]
+ },
+ "manor_action:list_ready_integrations": {
+  "terms": [
+   "connected apps",
+   "connectors",
+   "mcp servers",
+   "accounts",
+   "available integrations",
+   "linked accounts"
+  ],
+  "examples": [
+   "which integrations are connected",
+   "list callable mcp servers",
+   "show connected accounts",
+   "which apps are connected for agent"
+  ]
+ },
+ "manor_action:list_roles": {
+  "terms": [
+   "permissions",
+   "access levels",
+   "user roles",
+   "rbac",
+   "admin member roles"
+  ],
+  "examples": [
+   "list roles and permissions",
+   "show team roles with head counts",
+   "what permissions does each role have",
+   "view entity roles"
+  ]
+ },
+ "manor_action:list_scheduled_jobs": {
+  "terms": [
+   "cron",
+   "recurring automation",
+   "timer",
+   "background jobs"
+  ],
+  "examples": [
+   "list scheduled automations",
+   "show my cron jobs",
+   "what recurring jobs are set up",
+   "see background automations running"
+  ]
+ },
+ "manor_action:list_skills": {
+  "terms": [
+   "playbooks",
+   "abilities",
+   "skill catalog",
+   "browse skills",
+   "installed skills",
+   "custom skills",
+   "skills by category"
+  ],
+  "examples": [
+   "list available skills",
+   "which skills are installed",
+   "show custom skills by category",
+   "browse skill catalog"
+  ]
+ },
+ "manor_action:list_staff": {
+  "terms": [
+   "employees",
+   "team",
+   "contractors",
+   "vendors",
+   "people",
+   "roster",
+   "directory"
+  ],
+  "examples": [
+   "list team members",
+   "show employees and contractors",
+   "find vendors in staff list",
+   "who is on the team by role"
+  ]
+ },
+ "manor_action:list_task_categories": {
+  "terms": [
+   "labels",
+   "task types",
+   "task tags"
+  ],
+  "examples": [
+   "list task categories",
+   "what task types exist",
+   "show categories for tasks",
+   "available task labels"
+  ]
+ },
+ "manor_action:list_tasks": {
+  "terms": [
+   "todo",
+   "to-do",
+   "open tasks",
+   "my tasks",
+   "task list",
+   "backlog",
+   "pending work",
+   "tasks in progress",
+   "overdue tasks",
+   "blocked tasks"
+  ],
+  "examples": [
+   "list my open tasks",
+   "show tasks in progress",
+   "find overdue blocked tasks",
+   "todo items assigned to teammate"
+  ]
+ },
+ "manor_action:list_workspace_artifacts": {
+  "terms": [
+   "deliverables",
+   "outputs",
+   "generated files",
+   "saved files",
+   "ai files"
+  ],
+  "examples": [
+   "list workspace artifacts",
+   "show files ai generated in workspace",
+   "find saved deliverables",
+   "workspace outputs list"
+  ]
+ },
+ "manor_action:list_workspaces": {
+  "terms": [
+   "projects",
+   "teams",
+   "spaces",
+   "all workspaces"
+  ],
+  "examples": [
+   "list all workspaces",
+   "show all workspaces",
+   "what workspaces exist in entity",
+   "get workspace ids for all projects"
+  ]
+ },
+ "manor_action:map_agent_to_service": {
+  "terms": [
+   "assign agent",
+   "link agent",
+   "agent to service",
+   "staff service",
+   "delegate service"
+  ],
+  "examples": [
+   "assign agent to workspace service",
+   "map agent to a service",
+   "who handles this service set agent",
+   "connect agent with service"
+  ]
+ },
+ "manor_action:move_document_folder": {
+  "terms": [
+   "relocate",
+   "reorganize",
+   "rearrange",
+   "knowledge folder",
+   "nest folder"
+  ],
+  "examples": [
+   "move knowledge folder into another folder",
+   "reorganize folders to root",
+   "relocate document folder",
+   "put folder under different parent"
+  ]
+ },
+ "manor_action:move_document_to_folder": {
+  "terms": [
+   "relocate document",
+   "organize file",
+   "file into folder",
+   "change folder"
+  ],
+  "examples": [
+   "move document into folder",
+   "put file in another folder",
+   "relocate knowledge document to root",
+   "organize document into folder"
+  ]
+ },
+ "manor_action:move_documents_to_folder": {
+  "terms": [
+   "organize",
+   "file into folder",
+   "bulk move",
+   "relocate files",
+   "reorganize"
+  ],
+  "examples": [
+   "move several documents to folder",
+   "organize files into folder",
+   "bulk move knowledge files to root",
+   "relocate documents between folders"
+  ]
+ },
+ "manor_action:notify_members": {
+  "terms": [
+   "alert team",
+   "message team",
+   "broadcast",
+   "push notification",
+   "ping staff",
+   "announce"
+  ],
+  "examples": [
+   "notify all team members",
+   "send alert to staff",
+   "ping teammates about update",
+   "broadcast announcement to team"
+  ]
+ },
+ "manor_action:prepare_client_delivery": {
+  "terms": [
+   "deliver workspace to customer",
+   "private workspace handoff invitation"
+  ],
+  "examples": [
+   "deliver a workspace to a client",
+   "send private workspace handoff invitation",
+   "prepare customer workspace delivery"
+  ]
+ },
+ "manor_action:record_stat_assessment": {
+  "terms": [
+   "metric value",
+   "kpi measurement",
+   "goal progress",
+   "evidence assessment",
+   "stat update",
+   "okr"
+  ],
+  "examples": [
+   "record metric assessment with evidence",
+   "save measured value for stat",
+   "update goal metric from document",
+   "log insufficient evidence for stat"
+  ]
+ },
+ "manor_action:remove_workspace_service": {
+  "terms": [
+   "delete service",
+   "drop service",
+   "disable service",
+   "offering"
+  ],
+  "examples": [
+   "remove service from workspace",
+   "delete a workspace service",
+   "drop service offering",
+   "take service out of workspace"
+  ]
+ },
+ "manor_action:rename_document_folder": {
+  "terms": [
+   "change folder name",
+   "relabel",
+   "knowledge folder"
+  ],
+  "examples": [
+   "rename knowledge folder",
+   "change name of document folder",
+   "relabel folder in knowledge",
+   "fix folder title"
+  ]
+ },
+ "manor_action:revoke_client_delivery": {
+  "terms": [
+   "cancel customer workspace invitation",
+   "withdraw handoff",
+   "revoke delivery link"
+  ],
+  "examples": [
+   "revoke a client workspace invitation",
+   "cancel pending customer delivery",
+   "withdraw a workspace handoff invitation"
+  ]
+ },
+ "manor_action:rotate_client_delivery": {
+  "terms": [
+   "resend customer workspace invitation",
+   "rotate delivery link",
+   "replace handoff url"
+  ],
+  "examples": [
+   "resend client workspace invitation",
+   "rotate customer delivery link",
+   "replace a pending handoff invitation url"
+  ]
+ },
+ "manor_action:run_scheduled_job_now": {
+  "terms": [
+   "trigger",
+   "execute now",
+   "manual run",
+   "cron",
+   "manually"
+  ],
+  "examples": [
+   "run scheduled job right now",
+   "trigger automation manually",
+   "force run background job",
+   "execute cron job immediately"
+  ]
+ },
+ "manor_action:search_documents": {
+  "terms": [
+   "files",
+   "knowledge base",
+   "uploads",
+   "my files",
+   "find file",
+   "pdf",
+   "spreadsheet"
+  ],
+  "examples": [
+   "find uploaded pdf files in knowledge",
+   "search documents mentioning the budget",
+   "what files do i have in workspace",
+   "search documents by folder and type"
+  ]
+ },
+ "manor_action:send_email": {
+  "terms": [
+   "mail",
+   "compose email",
+   "email customer",
+   "smtp"
+  ],
+  "examples": [
+   "send email to customer",
+   "email a report to my boss",
+   "send mail from specific account",
+   "write and send an email"
+  ]
+ },
+ "manor_action:start_workspace_draft": {
+  "terms": [
+   "new workspace",
+   "build workspace",
+   "set up business workspace",
+   "workspace wizard",
+   "onboarding workspace",
+   "create workspace",
+   "set up workspace"
+  ],
+  "examples": [
+   "create a new workspace",
+   "start workspace draft in chat",
+   "set up workspace for my business",
+   "build a workspace from scratch"
+  ]
+ },
+ "manor_action:toggle_scheduled_job": {
+  "terms": [
+   "pause",
+   "turn off",
+   "turn on",
+   "stop job",
+   "resume job",
+   "disable cron"
+  ],
+  "examples": [
+   "pause scheduled job",
+   "turn off recurring automation",
+   "re-enable disabled cron job",
+   "stop daily report job"
+  ]
+ },
+ "manor_action:unbind_channel": {
+  "terms": [
+   "detach agent",
+   "disconnect",
+   "unlink",
+   "stop agent replying",
+   "channel binding"
+  ],
+  "examples": [
+   "unbind agent from channel",
+   "stop agent responding in channel",
+   "detach agent from chat channel",
+   "remove channel agent binding"
+  ]
+ },
+ "manor_action:unlink_client_relationship": {
+  "terms": [
+   "disconnect customer ledger association",
+   "unlink crm relationship"
+  ],
+  "examples": [
+   "unlink client from relationship ledger",
+   "remove customer ledger association",
+   "disconnect crm profile from a workspace relationship"
+  ]
+ },
+ "manor_action:unmap_agent_from_service": {
+  "terms": [
+   "detach agent",
+   "remove agent",
+   "unassign agent",
+   "take agent off service"
+  ],
+  "examples": [
+   "remove agent from workspace service",
+   "unassign agent from a service",
+   "detach agent mapping",
+   "take agent off a service"
+  ]
+ },
+ "manor_action:update_client": {
+  "terms": [
+   "edit customer",
+   "change contact",
+   "crm update",
+   "modify client details",
+   "customer record",
+   "client phone email"
+  ],
+  "examples": [
+   "update client fields",
+   "edit customer contact details",
+   "change client phone or email",
+   "modify crm client record"
+  ]
+ },
+ "manor_action:update_client_activity": {
+  "terms": [
+   "edit communication record",
+   "update crm activity",
+   "change meeting note"
+  ],
+  "examples": [
+   "edit a client activity record",
+   "update a customer meeting note",
+   "change a crm communication record"
+  ]
+ },
+ "manor_action:update_client_contact": {
+  "terms": [
+   "edit customer contact",
+   "change contact person",
+   "contact email phone job title"
+  ],
+  "examples": [
+   "edit a client contact",
+   "change customer contact email",
+   "update company contact job title"
+  ]
+ },
+ "manor_action:update_client_followup": {
+  "terms": [
+   "edit customer follow up",
+   "complete reopen crm follow up"
+  ],
+  "examples": [
+   "update a client follow up",
+   "complete a customer follow up record",
+   "reopen a crm follow up"
+  ]
+ },
+ "manor_action:update_client_opportunity": {
+  "terms": [
+   "edit customer deal",
+   "change sales stage",
+   "mark opportunity won lost"
+  ],
+  "examples": [
+   "update a client sales opportunity",
+   "change a customer deal stage",
+   "mark a crm opportunity as won"
+  ]
+ },
+ "manor_action:update_goal_value": {
+  "terms": [
+   "kpi",
+   "okr",
+   "progress",
+   "metric",
+   "target",
+   "measurement",
+   "goal number"
+  ],
+  "examples": [
+   "update goal progress value",
+   "record kpi measurement manually",
+   "log new number for goal",
+   "set current value of okr"
+  ]
+ },
+ "manor_action:update_operating_model": {
+  "terms": [
+   "business model",
+   "company operations",
+   "operating plan",
+   "workspace strategy",
+   "how workspace operates"
+  ],
+  "examples": [
+   "update workspace operating model",
+   "change how the workspace operates",
+   "edit operating model settings",
+   "revise business operating model"
+  ]
+ },
+ "manor_action:update_order": {
+  "terms": [
+   "change order",
+   "order status",
+   "fulfillment",
+   "edit order",
+   "shipped",
+   "cancel order"
+  ],
+  "examples": [
+   "update order status",
+   "mark order as shipped",
+   "change order fields",
+   "edit order details"
+  ]
+ },
+ "manor_action:update_skill": {
+  "terms": [
+   "edit skill",
+   "modify skill",
+   "patch skill",
+   "change skill instructions",
+   "revise skill"
+  ],
+  "examples": [
+   "edit existing skill instructions",
+   "modify skill behavior",
+   "patch skill with changes",
+   "fix a skill that is wrong"
+  ]
+ },
+ "manor_action:update_task": {
+  "terms": [
+   "edit task",
+   "change task",
+   "mark done",
+   "reassign",
+   "rename task",
+   "set due priority"
+  ],
+  "examples": [
+   "update task status to done",
+   "change task priority",
+   "reassign task to teammate",
+   "rename task title"
+  ]
+ },
+ "manor_action:update_workspace": {
+  "terms": [
+   "rename workspace",
+   "edit workspace",
+   "change category",
+   "change description"
+  ],
+  "examples": [
+   "rename workspace",
+   "update workspace description",
+   "change workspace category",
+   "edit workspace details"
+  ]
+ },
+ "manor_action:update_workspace_goals": {
+  "terms": [
+   "change goals",
+   "edit objectives",
+   "workspace targets",
+   "revise kpis"
+  ],
+  "examples": [
+   "update workspace goals",
+   "change workspace objectives",
+   "edit goal targets for workspace",
+   "revise workspace kpis"
+  ]
+ },
+ "manor_action:update_workspace_rules": {
+  "terms": [
+   "policy",
+   "guardrails",
+   "approval rules",
+   "governance",
+   "permissions",
+   "constraints"
+  ],
+  "examples": [
+   "change workspace rules",
+   "update workspace policy",
+   "edit approval rules for workspace",
+   "set guardrails for agents"
+  ]
+ },
+ "manor_action:upload_document": {
+  "terms": [
+   "add file",
+   "knowledge base upload",
+   "save document",
+   "import file",
+   "store doc"
+  ],
+  "examples": [
+   "upload document to knowledge base",
+   "add file to knowledge",
+   "save this doc to my library",
+   "import a file into knowledge"
+  ]
+ },
+ "manor_mcp:manor_mcp_calendar.create_booking_link": {
+  "terms": [
+   "booking link",
+   "scheduling link",
+   "meeting link",
+   "book a call",
+   "manor calendar"
+  ],
+  "examples": [
+   "create a 30 minute booking link",
+   "make a scheduling link for intro calls",
+   "new booking page for demos",
+   "let people book a meeting with me"
+  ]
+ },
+ "manor_mcp:manor_mcp_calendar.get_calendar_settings": {
+  "terms": [
+   "calendar settings",
+   "booking settings",
+   "manor calendar",
+   "availability"
+  ],
+  "examples": [
+   "show my manor calendar settings",
+   "what are my booking defaults",
+   "check my calendar availability settings",
+   "read manor booking settings"
+  ]
+ },
+ "manor_mcp:manor_mcp_calendar.get_daily_agenda": {
+  "terms": [
+   "agenda",
+   "today schedule",
+   "manor calendar",
+   "my day"
+  ],
+  "examples": [
+   "what is on my manor calendar today",
+   "show my agenda for tomorrow",
+   "my schedule today",
+   "daily agenda"
+  ]
+ },
+ "manor_mcp:manor_mcp_calendar.list_booking_links": {
+  "terms": [
+   "booking links",
+   "scheduling links",
+   "manor calendar"
+  ],
+  "examples": [
+   "list my booking links",
+   "show my scheduling links",
+   "what booking pages do I have",
+   "get my manor booking link urls"
+  ]
+ },
+ "manor_mcp:manor_mcp_calendar.list_bookings": {
+  "terms": [
+   "bookings",
+   "booked meetings",
+   "appointments",
+   "meeting url"
+  ],
+  "examples": [
+   "list my bookings this week",
+   "who booked a call with me",
+   "show upcoming appointments",
+   "get the meeting link for my next booking"
+  ]
+ },
+ "manor_mcp:manor_mcp_calendar.update_working_hours": {
+  "terms": [
+   "working hours",
+   "availability",
+   "office hours",
+   "booking hours",
+   "block days",
+   "unavailable days",
+   "days off"
+  ],
+  "examples": [
+   "set my working hours to 9 to 5",
+   "change my availability on weekdays",
+   "update office hours for bookings",
+   "block fridays from bookings"
+  ]
+ },
+ "provider:alpaca_market_data": {
+  "terms": [
+   "stock price",
+   "ticker",
+   "equities",
+   "options",
+   "quotes",
+   "market news",
+   "historical prices",
+   "candles"
+  ],
+  "examples": [
+   "get latest stock quote for ticker",
+   "historical price bars for stock",
+   "option chain for symbol",
+   "recent market news about company"
+  ]
+ },
+ "provider:alpha_vantage": {
+  "terms": [
+   "stock price",
+   "ticker",
+   "equities",
+   "market data",
+   "fundamentals",
+   "financial statements",
+   "symbol lookup"
+  ],
+  "examples": [
+   "get stock quote for ticker",
+   "company overview and fundamentals",
+   "daily price history of stock",
+   "search stock symbol by name"
+  ]
+ },
+ "provider:amazon": {
+  "terms": [
+   "amazon seller",
+   "fba",
+   "listing",
+   "sp-api",
+   "asin",
+   "marketplace",
+   "seller central",
+   "product price update"
+  ],
+  "examples": [
+   "list amazon seller orders",
+   "patch amazon listing price",
+   "check fba inventory levels",
+   "search amazon catalog by asin"
+  ]
+ },
+ "provider:apify": {
+  "terms": [
+   "instagram",
+   "scraper",
+   "reels",
+   "creators",
+   "influencer",
+   "social media posts",
+   "budget quote"
+  ],
+  "examples": [
+   "search instagram creators",
+   "collect recent reels from instagram",
+   "quote instagram scrape cost",
+   "get status of instagram collection"
+  ]
+ },
+ "provider:discord": {
+  "terms": [
+   "server",
+   "chat message",
+   "community",
+   "react emoji",
+   "channel post",
+   "guild"
+  ],
+  "examples": [
+   "send message to discord channel",
+   "list discord server channels",
+   "add reaction to discord message",
+   "post announcement in discord"
+  ]
+ },
+ "provider:elevenlabs": {
+  "terms": [
+   "text to speech",
+   "voiceover",
+   "voice clone",
+   "music generation",
+   "sound effects",
+   "audio narration",
+   "tts",
+   "dialogue",
+   "voice library"
+  ],
+  "examples": [
+   "convert text to speech mp3",
+   "generate sound effect",
+   "clone my voice for narration",
+   "list voices for text to speech"
+  ]
+ },
+ "provider:email": {
+  "terms": [
+   "imap",
+   "smtp",
+   "inbox",
+   "mailbox",
+   "attachments",
+   "gmail outlook yahoo",
+   "reply",
+   "draft"
+  ],
+  "examples": [
+   "read inbox messages via imap",
+   "reply to email thread",
+   "download email attachment",
+   "list unread emails on imap account"
+  ]
+ },
+ "provider:facebook": {
+  "terms": [
+   "facebook",
+   "instagram",
+   "meta",
+   "social media post",
+   "messenger",
+   "page insights",
+   "reels",
+   "go live"
+  ],
+  "examples": [
+   "post to facebook page",
+   "publish instagram photo",
+   "get instagram insights",
+   "reply to facebook comments"
+  ]
+ },
+ "provider:github": {
+  "terms": [
+   "git",
+   "repo",
+   "code review",
+   "commit",
+   "branch",
+   "pull request",
+   "bug report",
+   "ci logs"
+  ],
+  "examples": [
+   "create github issue for bug",
+   "open pull request on repo",
+   "list open pull requests",
+   "get github workflow run logs"
+  ]
+ },
+ "provider:gmail": {
+  "terms": [
+   "email",
+   "google mail",
+   "inbox",
+   "mail",
+   "reply",
+   "label",
+   "attachments",
+   "draft email"
+  ],
+  "examples": [
+   "send email to customer",
+   "read my unread inbox messages",
+   "reply to email thread",
+   "download gmail attachment"
+  ]
+ },
+ "provider:google_calendar": {
+  "terms": [
+   "gcal",
+   "schedule",
+   "meeting",
+   "appointment",
+   "availability",
+   "invite",
+   "agenda",
+   "rsvp"
+  ],
+  "examples": [
+   "list my calendar events tomorrow",
+   "create meeting on google calendar",
+   "check when i am free",
+   "respond to calendar invite"
+  ]
+ },
+ "provider:google_drive": {
+  "terms": [
+   "gdrive",
+   "docs",
+   "sheets",
+   "cloud storage",
+   "upload",
+   "share link",
+   "folder",
+   "permissions",
+   "trash"
+  ],
+  "examples": [
+   "search google drive files",
+   "share drive file with someone",
+   "create folder in drive",
+   "read file from google drive"
+  ]
+ },
+ "provider:jimeng": {
+  "terms": [
+   "bytedance",
+   "jianying",
+   "dreamina",
+   "text to image",
+   "text to video",
+   "image editing",
+   "ai art"
+  ],
+  "examples": [
+   "generate image with jimeng",
+   "create short video with jimeng",
+   "edit image using jimeng",
+   "bytedance ai video generation"
+  ]
+ },
+ "provider:lark": {
+  "terms": [
+   "lark",
+   "feishu",
+   "lark chat",
+   "lark docs",
+   "lark base",
+   "bitable"
+  ],
+  "examples": [
+   "send a message to a lark group chat",
+   "read a feishu document",
+   "add a row to a lark base table",
+   "search lark docs for the project brief"
+  ]
+ },
+ "provider:linkedin": {
+  "terms": [
+   "social post",
+   "company page",
+   "carousel",
+   "engagement",
+   "likes",
+   "share on linkedin",
+   "thought leadership"
+  ],
+  "examples": [
+   "post update to linkedin",
+   "get linkedin post engagement stats",
+   "publish on company page",
+   "reply to comment on my linkedin post"
+  ]
+ },
+ "provider:manor_mcp_calendar": {
+  "terms": [
+   "schedule",
+   "appointments",
+   "meetings",
+   "availability",
+   "agenda",
+   "scheduling link",
+   "calendly",
+   "office hours"
+  ],
+  "examples": [
+   "create booking link for meetings",
+   "show my agenda today",
+   "list upcoming appointments bookings",
+   "update working hours availability"
+  ]
+ },
+ "provider:manor_mcp_minutes": {
+  "terms": [
+   "meeting transcript",
+   "meeting recap",
+   "call notes",
+   "minutes",
+   "action items",
+   "standup notes",
+   "recording",
+   "summarize meeting"
+  ],
+  "examples": [
+   "get transcript of last meeting",
+   "list action items from meeting",
+   "search past meetings for topic",
+   "summarize yesterday's call"
+  ]
+ },
+ "provider:manor_pms": {
+  "terms": [
+   "property management",
+   "rental",
+   "landlord",
+   "vacancy",
+   "airbnb",
+   "short term rental",
+   "rent collection",
+   "work orders"
+  ],
+  "examples": [
+   "list available rental units",
+   "create maintenance request for tenant",
+   "check lease and rent payments",
+   "schedule property tour for lead"
+  ]
+ },
+ "provider:ms_calendar": {
+  "terms": [
+   "outlook",
+   "office 365",
+   "microsoft 365",
+   "exchange",
+   "teams meeting",
+   "schedule meeting",
+   "find meeting time",
+   "availability"
+  ],
+  "examples": [
+   "list outlook calendar events",
+   "find meeting time for attendees",
+   "accept outlook invite",
+   "create event on microsoft calendar"
+  ]
+ },
+ "provider:ms_excel": {
+  "terms": [
+   "spreadsheet",
+   "onedrive",
+   "xlsx",
+   "cells",
+   "formulas",
+   "sheet",
+   "microsoft 365 excel",
+   "append row"
+  ],
+  "examples": [
+   "append row to excel table",
+   "read range from excel workbook",
+   "update cell in onedrive spreadsheet",
+   "list worksheets in excel file"
+  ]
+ },
+ "provider:ms_teams": {
+  "terms": [
+   "microsoft teams",
+   "office 365",
+   "chat",
+   "meeting link",
+   "channel message",
+   "presence",
+   "dm",
+   "video call"
+  ],
+  "examples": [
+   "send message to teams channel",
+   "create teams meeting link",
+   "list teams chats",
+   "set my teams presence status"
+  ]
+ },
+ "provider:nango": {
+  "terms": [
+   "integrations",
+   "hubspot",
+   "salesforce",
+   "linear",
+   "airtable",
+   "intercom",
+   "crm connect",
+   "api proxy",
+   "saas connector"
+  ],
+  "examples": [
+   "call hubspot api",
+   "connect salesforce account",
+   "list connected saas apps",
+   "create linear issue via proxy"
+  ]
+ },
+ "provider:notion": {
+  "terms": [
+   "wiki",
+   "notes",
+   "notion database",
+   "workspace pages",
+   "knowledge base",
+   "docs"
+  ],
+  "examples": [
+   "create notion page",
+   "query notion database rows",
+   "append text to notion page",
+   "search notion for notes"
+  ]
+ },
+ "provider:onedrive": {
+  "terms": [
+   "microsoft cloud storage",
+   "file sharing",
+   "share link",
+   "office files",
+   "upload to onedrive",
+   "versions"
+  ],
+  "examples": [
+   "search files in onedrive",
+   "create share link for onedrive file",
+   "upload text file to onedrive",
+   "restore previous file version"
+  ]
+ },
+ "provider:outlook": {
+  "terms": [
+   "microsoft email",
+   "office 365",
+   "hotmail",
+   "exchange",
+   "m365 mail",
+   "outlook inbox",
+   "microsoft mail"
+  ],
+  "examples": [
+   "send outlook email",
+   "forward message in outlook",
+   "move email to folder",
+   "list unread outlook messages"
+  ]
+ },
+ "provider:paypal": {
+  "terms": [
+   "payments",
+   "refund",
+   "payout",
+   "checkout",
+   "billing",
+   "chargeback",
+   "paypal invoice"
+  ],
+  "examples": [
+   "refund paypal payment",
+   "create paypal invoice for client",
+   "list paypal disputes",
+   "cancel paypal subscription"
+  ]
+ },
+ "provider:producthunt": {
+  "terms": [
+   "launch",
+   "ph",
+   "product launch",
+   "upvotes",
+   "makers",
+   "daily top products",
+   "launch day"
+  ],
+  "examples": [
+   "search product hunt posts",
+   "reply to product hunt commenters",
+   "get todays top launches",
+   "monitor my launch comments"
+  ]
+ },
+ "provider:quickbooks": {
+  "terms": [
+   "accounting",
+   "bookkeeping",
+   "bills",
+   "vendors",
+   "expenses",
+   "qbo",
+   "finance report",
+   "payments",
+   "profit and loss"
+  ],
+  "examples": [
+   "create quickbooks invoice for customer",
+   "run profit and loss report",
+   "list unpaid invoices",
+   "send invoice to client via quickbooks"
+  ]
+ },
+ "provider:replicate": {
+  "terms": [
+   "flux",
+   "stable diffusion",
+   "ideogram",
+   "luma",
+   "ltx",
+   "minimax",
+   "whisper",
+   "musicgen",
+   "open source models",
+   "text to image",
+   "text to video"
+  ],
+  "examples": [
+   "generate image with flux on replicate",
+   "run open source model",
+   "create video with luma",
+   "generate music with musicgen"
+  ]
+ },
+ "provider:robinhood": {
+  "terms": [
+   "stocks",
+   "portfolio",
+   "brokerage",
+   "trading",
+   "investments",
+   "holdings",
+   "market data",
+   "crypto"
+  ],
+  "examples": [
+   "show my robinhood portfolio",
+   "read watchlist and market data",
+   "check stock holdings",
+   "view investing account positions"
+  ]
+ },
+ "provider:shopify": {
+  "terms": [
+   "ecommerce",
+   "online store",
+   "inventory",
+   "sku",
+   "fulfillment",
+   "storefront",
+   "tag orders"
+  ],
+  "examples": [
+   "list shopify orders",
+   "update product price in shopify",
+   "adjust inventory stock level",
+   "create new shopify product"
+  ]
+ },
+ "provider:slack": {
+  "terms": [
+   "chat",
+   "workspace chat",
+   "dm",
+   "emoji reaction",
+   "notify team",
+   "post message",
+   "thread reply"
+  ],
+  "examples": [
+   "send message to slack channel",
+   "post update to slack thread",
+   "react to slack message",
+   "notify team in slack"
+  ]
+ },
+ "provider:square": {
+  "terms": [
+   "pos",
+   "point of sale",
+   "retail",
+   "stock count",
+   "payments",
+   "menu items",
+   "shop",
+   "merchant",
+   "sales"
+  ],
+  "examples": [
+   "list square orders",
+   "adjust inventory stock count",
+   "create square customer",
+   "search catalog items in square"
+  ]
+ },
+ "provider:stripe": {
+  "terms": [
+   "payments",
+   "billing",
+   "charge",
+   "refund",
+   "checkout link",
+   "revenue",
+   "chargeback",
+   "subscription cancel"
+  ],
+  "examples": [
+   "refund stripe charge",
+   "create payment link for product",
+   "list customer subscriptions",
+   "check stripe account balance"
+  ]
+ },
+ "provider:suno": {
+  "terms": [
+   "ai music",
+   "song",
+   "music generation",
+   "audio track",
+   "lyrics",
+   "remix",
+   "soundtrack"
+  ],
+  "examples": [
+   "generate a song with suno",
+   "create music cover",
+   "make mashup of two songs",
+   "check suno generation status"
+  ]
+ },
+ "provider:tavily": {
+  "terms": [
+   "web search",
+   "internet",
+   "google",
+   "research",
+   "scrape",
+   "crawl",
+   "news",
+   "extract page",
+   "answer"
+  ],
+  "examples": [
+   "search the web for news",
+   "extract content from url",
+   "research topic online",
+   "get article text from webpage"
+  ]
+ },
+ "provider:telegram": {
+  "terms": [
+   "bot",
+   "telegram chat",
+   "send photo",
+   "telegram message",
+   "tg"
+  ],
+  "examples": [
+   "send telegram message",
+   "send photo via telegram bot",
+   "share file on telegram",
+   "post to telegram chat"
+  ]
+ },
+ "provider:tiktok": {
+  "terms": [
+   "tik tok",
+   "short video",
+   "post video",
+   "creator",
+   "upload video",
+   "publish photo",
+   "social"
+  ],
+  "examples": [
+   "publish video to tiktok",
+   "post photo to tiktok",
+   "list my tiktok videos",
+   "check tiktok publish status"
+  ]
+ },
+ "provider:tiktok_shop": {
+  "terms": [
+   "ecommerce",
+   "store",
+   "seller",
+   "sku",
+   "products",
+   "inventory",
+   "stock",
+   "orders",
+   "pricing",
+   "shop"
+  ],
+  "examples": [
+   "search tiktok shop orders",
+   "update product price on tiktok shop",
+   "change sku inventory stock",
+   "list authorized tiktok shops"
+  ]
+ },
+ "provider:twelve_data": {
+  "terms": [
+   "stock price",
+   "ticker",
+   "candlestick",
+   "ohlc",
+   "rsi",
+   "macd",
+   "forex rates",
+   "crypto price",
+   "chart data",
+   "market quote"
+  ],
+  "examples": [
+   "get stock quote for ticker",
+   "historical price time series",
+   "rsi technical indicator for stock",
+   "bitcoin price and forex rate"
+  ]
+ },
+ "provider:twilio": {
+  "terms": [
+   "text message",
+   "phone call",
+   "sms",
+   "dial",
+   "mobile",
+   "phone numbers"
+  ],
+  "examples": [
+   "send sms text message",
+   "make phone call to customer",
+   "list my twilio phone numbers",
+   "check twilio usage"
+  ]
+ },
+ "provider:twitter_x": {
+  "terms": [
+   "tweet",
+   "post",
+   "x.com",
+   "social media",
+   "timeline",
+   "mentions",
+   "retweet",
+   "thread"
+  ],
+  "examples": [
+   "post tweet on x",
+   "search recent tweets about topic",
+   "get my mentions on twitter",
+   "create twitter thread"
+  ]
+ },
+ "provider:webhook": {
+  "terms": [
+   "http",
+   "post request",
+   "api call",
+   "zapier",
+   "integration",
+   "notify endpoint",
+   "callback"
+  ],
+  "examples": [
+   "send webhook to external url",
+   "trigger http post to endpoint",
+   "call outbound webhook",
+   "notify external system via webhook"
+  ]
+ },
+ "provider:wechat_official": {
+  "terms": [
+   "weixin",
+   "wechat",
+   "official account",
+   "mp",
+   "followers",
+   "template message",
+   "subscribers",
+   "menu"
+  ],
+  "examples": [
+   "send wechat text message to follower",
+   "send wechat template notification",
+   "list wechat official account followers",
+   "upload image media to wechat"
+  ]
+ },
+ "provider:wechat_personal": {
+  "terms": [
+   "weixin",
+   "wechat bot",
+   "qr login",
+   "group chat",
+   "chinese messaging",
+   "contacts"
+  ],
+  "examples": [
+   "send wechat message to group",
+   "get wechat login qr code",
+   "list wechat contacts",
+   "message friend on wechat"
+  ]
+ },
+ "provider:whatsapp": {
+  "terms": [
+   "wa",
+   "whatsapp cloud",
+   "meta",
+   "chat message",
+   "template message",
+   "business messaging",
+   "text customer"
+  ],
+  "examples": [
+   "send whatsapp message to customer",
+   "create whatsapp message template",
+   "send image over whatsapp",
+   "list whatsapp phone numbers"
+  ]
+ },
+ "provider:woocommerce": {
+  "terms": [
+   "wordpress store",
+   "online shop",
+   "ecommerce",
+   "inventory",
+   "wc",
+   "stock level",
+   "order status",
+   "order completed"
+  ],
+  "examples": [
+   "list woocommerce orders",
+   "update product stock quantity",
+   "create new woocommerce product",
+   "mark order as completed"
+  ]
+ },
+ "provider:youtube": {
+  "terms": [
+   "video upload",
+   "channel",
+   "playlist",
+   "subtitles",
+   "creator",
+   "comments reply",
+   "publish video",
+   "thumbnail",
+   "views"
+  ],
+  "examples": [
+   "upload video to youtube from url",
+   "reply to youtube comment",
+   "search youtube channels",
+   "update video title and tags"
+  ]
+ },
+ "tool:ai_edit_workflow": {
+  "terms": [
+   "modify workflow",
+   "change flow",
+   "edit automation",
+   "natural language workflow edit",
+   "flow canvas",
+   "add step"
+  ],
+  "examples": [
+   "edit workflow from plain request",
+   "add step to existing workflow",
+   "change workflow with ai",
+   "update flow graph by prompt"
+  ]
+ },
+ "tool:align_subtitles": {
+  "terms": [
+   "captions",
+   "srt",
+   "vtt",
+   "ass",
+   "closed captions",
+   "timing",
+   "transcript sync"
+  ],
+  "examples": [
+   "create srt subtitles from narration",
+   "generate captions from narration script",
+   "sync subtitle timing to audio",
+   "make vtt file from transcript"
+  ]
+ },
+ "tool:analyze_audio": {
+  "terms": [
+   "loudness",
+   "lufs",
+   "silence detection",
+   "volume level",
+   "peak",
+   "audio quality",
+   "too quiet",
+   "too loud"
+  ],
+  "examples": [
+   "measure audio loudness lufs",
+   "detect silence in video",
+   "check true peak of audio",
+   "is my audio too quiet"
+  ]
+ },
+ "tool:archive_file_collection": {
+  "terms": [
+   "backup media",
+   "archive videos",
+   "durable copy",
+   "preserve files",
+   "save source media"
+  ],
+  "examples": [
+   "archive source media files",
+   "back up verified video collection",
+   "copy media into durable archive",
+   "get archive receipts for files"
+  ]
+ },
+ "tool:bash": {
+  "terms": [
+   "terminal",
+   "shell",
+   "command line",
+   "script",
+   "run command",
+   "linux",
+   "sandbox"
+  ],
+  "examples": [
+   "run shell command in workspace",
+   "execute python script",
+   "grep files from command line",
+   "run ls in filesystem"
+  ]
+ },
+ "tool:browse_web": {
+  "terms": [
+   "scrape",
+   "website",
+   "url",
+   "open page",
+   "spa",
+   "fetch webpage",
+   "crawl",
+   "web page"
+  ],
+  "examples": [
+   "open website and read rendered content",
+   "scrape javascript page data",
+   "check if website is up",
+   "fetch text from url"
+  ]
+ },
+ "tool:build_narration_timeline": {
+  "terms": [
+   "voiceover",
+   "subtitles",
+   "captions",
+   "srt",
+   "tts timing",
+   "audio sync",
+   "narrated video caption timing"
+  ],
+  "examples": [
+   "build narration timeline from audio segments",
+   "create subtitle cues for voiceover",
+   "sync tts audio offsets to captions",
+   "generate caption timing for narrated video"
+  ]
+ },
+ "tool:call_tool": {
+  "terms": [
+   "invoke",
+   "execute loaded tool",
+   "run discovered tool",
+   "gateway"
+  ],
+  "examples": [
+   "call a tool loaded by search",
+   "run newly found tool",
+   "invoke discovered tool with arguments",
+   "use tool from search results"
+  ]
+ },
+ "tool:cancel_scheduled_job": {
+  "terms": [
+   "stop job",
+   "remove schedule",
+   "cron",
+   "recurring job"
+  ],
+  "examples": [
+   "cancel scheduled background job",
+   "stop a recurring scheduled job",
+   "delete scheduled job by id",
+   "remove timed job"
+  ]
+ },
+ "tool:cancel_workflow_run": {
+  "terms": [
+   "stop workflow",
+   "abort run",
+   "kill automation",
+   "halt run"
+  ],
+  "examples": [
+   "cancel running workflow",
+   "stop a paused workflow run",
+   "abort pending workflow run",
+   "halt workflow by run id"
+  ]
+ },
+ "tool:code": {
+  "terms": [
+   "dashboard module",
+   "widget code",
+   "module bundle",
+   "validate dashboard"
+  ],
+  "examples": [
+   "validate dashboard module code",
+   "check custom dashboard widget bundle",
+   "lint dashboard module"
+  ]
+ },
+ "tool:code_project": {
+  "terms": [
+   "website",
+   "web app",
+   "html",
+   "landing page",
+   "static site",
+   "coding",
+   "build site",
+   "frontend",
+   "source code",
+   "publish site"
+  ],
+  "examples": [
+   "build a landing page website",
+   "create code project with files",
+   "edit existing website project",
+   "write files to my app project"
+  ]
+ },
+ "tool:compose_creative_dub": {
+  "terms": [
+   "dubbing",
+   "translate video",
+   "voiceover translation",
+   "localize video",
+   "foreign language narration",
+   "burn subtitles"
+  ],
+  "examples": [
+   "dub video into another language",
+   "replace video audio with translated narration",
+   "localize video with subtitles",
+   "translate video voice to spanish"
+  ]
+ },
+ "tool:compose_creative_publication": {
+  "terms": [
+   "slides",
+   "presentation",
+   "deck",
+   "pptx",
+   "pdf",
+   "brochure",
+   "ebook",
+   "illustrated"
+  ],
+  "examples": [
+   "create illustrated presentation with pdf",
+   "make slide deck with speaker notes",
+   "compose pptx and pdf from pages",
+   "build illustrated booklet from content"
+  ]
+ },
+ "tool:compose_video_timeline": {
+  "terms": [
+   "render video",
+   "mix audio",
+   "burn subtitles",
+   "final cut",
+   "ffmpeg",
+   "background music",
+   "assemble video"
+  ],
+  "examples": [
+   "render final video with voiceover and music",
+   "burn subtitles into mp4",
+   "mix narration audio onto video",
+   "compose video from timeline json"
+  ]
+ },
+ "tool:create_agent_initiative": {
+  "terms": [
+   "reminder",
+   "notify me",
+   "alert",
+   "proactive",
+   "daily digest",
+   "watch",
+   "monitor",
+   "if condition tell me",
+   "remind me",
+   "hourly update",
+   "recurring update",
+   "price drop alert"
+  ],
+  "examples": [
+   "remind me every day with news",
+   "notify me when condition happens",
+   "send me hourly update in this chat",
+   "tell me if price drops"
+  ]
+ },
+ "tool:create_goal": {
+  "terms": [
+   "objective",
+   "okr",
+   "kpi",
+   "target",
+   "long term goal",
+   "metric tracking"
+  ],
+  "examples": [
+   "create goal 10k followers by october",
+   "set long running business objective",
+   "track metric target over months",
+   "add measurable goal with deadline"
+  ]
+ },
+ "tool:create_scheduled_job": {
+  "terms": [
+   "cron",
+   "recurring",
+   "timer",
+   "scheduler",
+   "recurring report",
+   "repeat",
+   "every day",
+   "reminder job",
+   "reminder",
+   "remind",
+   "every",
+   "daily",
+   "weekly",
+   "monthly",
+   "run once"
+  ],
+  "examples": [
+   "schedule recurring workspace report",
+   "run job every monday morning",
+   "create cron automation daily",
+   "run something once at a set time"
+  ]
+ },
+ "tool:create_skill": {
+  "terms": [
+   "new skill",
+   "make skill",
+   "custom skill",
+   "skill builder",
+   "save workflow as skill"
+  ],
+  "examples": [
+   "create a new reusable skill",
+   "save what we just did as reusable skill",
+   "build custom skill from description",
+   "make my own skill"
+  ]
+ },
+ "tool:create_task": {
+  "terms": [
+   "todo",
+   "to-do",
+   "action item",
+   "assign work",
+   "add task",
+   "follow",
+   "up",
+   "action",
+   "item"
+  ],
+  "examples": [
+   "create new task for team member",
+   "add todo with deadline",
+   "assign task to teammate high priority",
+   "make an action item for tomorrow"
+  ]
+ },
+ "tool:create_workflow": {
+  "terms": [
+   "automation",
+   "flow",
+   "pipeline",
+   "build workflow",
+   "new workflow",
+   "steps graph",
+   "trigger",
+   "triggered",
+   "when",
+   "submitted",
+   "daily workflow"
+  ],
+  "examples": [
+   "create new workflow from prompt",
+   "build automation with steps",
+   "make a workflow that runs daily",
+   "define workflow graph"
+  ]
+ },
+ "tool:dashboard_submit_module": {
+  "terms": [
+   "dashboard widgets",
+   "custom dashboard",
+   "layout code",
+   "widget module",
+   "finish dashboard"
+  ],
+  "examples": [
+   "submit finished dashboard layout",
+   "save dashboard widgets after validation",
+   "publish dashboard module code",
+   "finalize custom dashboard"
+  ]
+ },
+ "tool:delegate_to_agent": {
+  "terms": [
+   "subagent",
+   "assign task",
+   "hand off",
+   "teammate agent",
+   "parallel agents",
+   "ask another agent",
+   "multi-agent"
+  ],
+  "examples": [
+   "delegate task to another agent",
+   "hand work to marketing agent",
+   "run several agents in parallel",
+   "ask specialist agent to do research"
+  ]
+ },
+ "tool:delete_agent_initiative": {
+  "terms": [
+   "remove reminder",
+   "cancel alert",
+   "stop notifications",
+   "remove rule",
+   "unsubscribe",
+   "chat updates",
+   "stop telling me"
+  ],
+  "examples": [
+   "delete proactive rule",
+   "cancel daily reminder",
+   "remove scheduled chat updates",
+   "stop telling me every day"
+  ]
+ },
+ "tool:delete_file": {
+  "terms": [
+   "remove file",
+   "rm",
+   "erase",
+   "trash",
+   "delete folder",
+   "get rid of"
+  ],
+  "examples": [
+   "delete a file from filesystem",
+   "remove empty directory",
+   "erase old file",
+   "get rid of this document"
+  ]
+ },
+ "tool:delete_skill": {
+  "terms": [
+   "remove skill",
+   "uninstall skill",
+   "get rid of"
+  ],
+  "examples": [
+   "delete a custom skill",
+   "remove my skill",
+   "get rid of unused skill",
+   "uninstall custom skill"
+  ]
+ },
+ "tool:delete_workflow": {
+  "terms": [
+   "remove workflow",
+   "drop flow",
+   "delete automation",
+   "erase pipeline",
+   "get rid of"
+  ],
+  "examples": [
+   "delete a workflow",
+   "remove old flow definition",
+   "get rid of unused workflow",
+   "delete workflow and its deployments"
+  ]
+ },
+ "tool:deploy_workflow": {
+  "terms": [
+   "publish",
+   "activate",
+   "go live",
+   "schedule workflow",
+   "cron trigger",
+   "binding",
+   "enable workflow"
+  ],
+  "examples": [
+   "deploy workflow as agent tool",
+   "publish workflow via mcp",
+   "schedule workflow on cron",
+   "activate workflow for workspace"
+  ]
+ },
+ "tool:draft_skill": {
+  "terms": [
+   "skill questions",
+   "skill planning",
+   "new skill idea",
+   "clarify skill"
+  ],
+  "examples": [
+   "clarify vague skill request",
+   "ask questions before creating skill",
+   "plan a new skill",
+   "what do I need to create skill"
+  ]
+ },
+ "tool:extract_data": {
+  "terms": [
+   "parse text",
+   "json extraction",
+   "structured output",
+   "scrape fields",
+   "pull fields",
+   "information extraction"
+  ],
+  "examples": [
+   "extract fields from text into json",
+   "parse invoice text into structured data",
+   "pull names and dates out of text",
+   "convert unstructured text to schema"
+  ]
+ },
+ "tool:find_team_members": {
+  "terms": [
+   "colleague",
+   "teammate",
+   "employee",
+   "user lookup",
+   "coworker",
+   "staff",
+   "directory",
+   "people",
+   "last login",
+   "logged in"
+  ],
+  "examples": [
+   "find teammate by name or email",
+   "look up teammate user id",
+   "list active members in workspace",
+   "who logged in recently"
+  ]
+ },
+ "tool:generate_file": {
+  "terms": [
+   "create image",
+   "create video",
+   "create audio",
+   "docx",
+   "pptx",
+   "xlsx",
+   "pdf",
+   "convert format",
+   "office document",
+   "text to speech",
+   "music"
+  ],
+  "examples": [
+   "generate image from prompt",
+   "create powerpoint presentation file",
+   "convert docx to pdf",
+   "convert image to another format"
+  ]
+ },
+ "tool:generate_image": {
+  "terms": [
+   "picture",
+   "illustration",
+   "artwork",
+   "text to image",
+   "logo",
+   "dall-e",
+   "midjourney",
+   "draw",
+   "photo"
+  ],
+  "examples": [
+   "generate image from prompt",
+   "create a logo picture",
+   "make illustration for blog post",
+   "draw picture using reference image"
+  ]
+ },
+ "tool:generate_video": {
+  "terms": [
+   "text to video",
+   "ai video",
+   "create video",
+   "image to video",
+   "animate image",
+   "clip",
+   "veo",
+   "kling",
+   "sora",
+   "short video"
+  ],
+  "examples": [
+   "generate video clip from prompt",
+   "animate an image into video",
+   "create short ai video",
+   "make video from first frame"
+  ]
+ },
+ "tool:get_agent_initiative": {
+  "terms": [
+   "proactive rule",
+   "agent rule",
+   "proactive chat",
+   "initiative details",
+   "check rule",
+   "initiative configuration"
+  ],
+  "examples": [
+   "get proactive agent rule by id",
+   "show initiative configuration",
+   "view one proactive rule",
+   "details of agent initiative"
+  ]
+ },
+ "tool:get_current_time": {
+  "terms": [
+   "now",
+   "today's date",
+   "timezone",
+   "clock",
+   "what time is it",
+   "utc",
+   "what",
+   "time"
+  ],
+  "examples": [
+   "get current date and time",
+   "what is today's date",
+   "user local timezone now",
+   "current time utc"
+  ]
+ },
+ "tool:get_entity_info": {
+  "terms": [
+   "company info",
+   "organization name",
+   "account settings",
+   "tenant",
+   "company profile"
+  ],
+  "examples": [
+   "get organization name and settings",
+   "what is my company name",
+   "show current entity info",
+   "get company profile settings"
+  ]
+ },
+ "tool:get_goal_status": {
+  "terms": [
+   "kpi",
+   "progress",
+   "objective",
+   "target",
+   "okr",
+   "pace",
+   "on track"
+  ],
+  "examples": [
+   "check progress toward goal",
+   "are we on track for target",
+   "show active goals status",
+   "kpi pace for workspace"
+  ]
+ },
+ "tool:get_skill_details": {
+  "terms": [
+   "skill info",
+   "skill description",
+   "inspect skill"
+  ],
+  "examples": [
+   "get details of a skill",
+   "what does this skill do",
+   "inspect skill descriptor metadata",
+   "show skill info by id"
+  ]
+ },
+ "tool:get_task_details": {
+  "terms": [
+   "task status",
+   "task logs",
+   "task info",
+   "task progress"
+  ],
+  "examples": [
+   "show task details and logs",
+   "why did my task fail",
+   "check progress of a task",
+   "get task processing log"
+  ]
+ },
+ "tool:get_workflow": {
+  "terms": [
+   "flow definition",
+   "automation graph",
+   "nodes",
+   "edges",
+   "view workflow",
+   "inspect workflow",
+   "saved workflow"
+  ],
+  "examples": [
+   "show workflow definition nodes edges",
+   "inspect saved workflow",
+   "get workflow version and variables",
+   "view workflow validation"
+  ]
+ },
+ "tool:get_workflow_run": {
+  "terms": [
+   "run details",
+   "flow result",
+   "execution log",
+   "workflow failed",
+   "node output",
+   "run status"
+  ],
+  "examples": [
+   "get workflow run results",
+   "why did workflow run fail",
+   "show per node results of run",
+   "check status of flow execution"
+  ]
+ },
+ "tool:glob_files": {
+  "terms": [
+   "find files",
+   "list files",
+   "wildcard",
+   "file search by name",
+   "ls"
+  ],
+  "examples": [
+   "find files matching pattern",
+   "glob csv files in folder",
+   "locate file path by name",
+   "list files with wildcard"
+  ]
+ },
+ "tool:grep_files": {
+  "terms": [
+   "regex",
+   "find text in files",
+   "pattern search",
+   "ripgrep",
+   "locate heading",
+   "search inside pdf"
+  ],
+  "examples": [
+   "search text pattern inside files",
+   "find line containing heading in file",
+   "grep regex in pdf text",
+   "locate field in knowledge file"
+  ]
+ },
+ "tool:import_free_music": {
+  "terms": [
+   "royalty free",
+   "background music",
+   "bgm",
+   "soundtrack",
+   "stock music",
+   "license"
+  ],
+  "examples": [
+   "import free background music track",
+   "add royalty free music to video",
+   "use stock soundtrack in project",
+   "import catalog music into knowledge"
+  ]
+ },
+ "tool:import_workflow": {
+  "terms": [
+   "n8n",
+   "dify",
+   "comfyui",
+   "migrate",
+   "convert",
+   "import json",
+   "dry run"
+  ],
+  "examples": [
+   "import n8n workflow export",
+   "migrate dify workflow to manor",
+   "convert comfyui workflow",
+   "dry run workflow import mapping"
+  ]
+ },
+ "tool:inspect_file_engine": {
+  "terms": [
+   "supported formats",
+   "docx pptx xlsx",
+   "document types",
+   "file capabilities",
+   "patch support"
+  ],
+  "examples": [
+   "what file types can be generated",
+   "check file engine patch capabilities",
+   "supported document formats for generation",
+   "which formats can I edit"
+  ]
+ },
+ "tool:inspect_narration_recovery": {
+  "terms": [
+   "tts retry",
+   "voiceover segments",
+   "missing audio",
+   "narration receipts",
+   "stickman"
+  ],
+  "examples": [
+   "inspect narration segments before retry",
+   "find which tts segments are missing",
+   "check voiceover receipts to reuse",
+   "recover failed narration generation"
+  ]
+ },
+ "tool:interact_with_page": {
+  "terms": [
+   "click button",
+   "type into field",
+   "run javascript",
+   "form filling",
+   "web automation",
+   "browser actions"
+  ],
+  "examples": [
+   "click element on current web page",
+   "fill input field on page",
+   "evaluate javascript in browser page",
+   "press submit button on website"
+  ]
+ },
+ "tool:invoke_skill": {
+  "terms": [
+   "execute skill",
+   "use skill",
+   "skill runner",
+   "apply skill"
+  ],
+  "examples": [
+   "run a skill by id",
+   "use matching skill to do the task",
+   "execute selected skill with input",
+   "run skill for writing blog article"
+  ]
+ },
+ "tool:list_agent_files": {
+  "terms": [
+   "agent instructions",
+   "agent definition",
+   "agent config files",
+   "agent prompt files",
+   "soul md"
+  ],
+  "examples": [
+   "list agent definition files",
+   "show files that define agent",
+   "what instruction files does agent have",
+   "agent file sizes"
+  ]
+ },
+ "tool:list_agent_initiative_runs": {
+  "terms": [
+   "initiative history",
+   "check log",
+   "silent checks",
+   "proactive decisions",
+   "run history",
+   "fire"
+  ],
+  "examples": [
+   "list recent initiative check decisions",
+   "why did proactive rule not fire",
+   "show history of proactive checks",
+   "initiative run log"
+  ]
+ },
+ "tool:list_agent_initiatives": {
+  "terms": [
+   "proactive",
+   "autonomous rules",
+   "triggers",
+   "scheduled messages",
+   "proactive chat",
+   "watchers",
+   "all initiatives",
+   "initiative id",
+   "revision"
+  ],
+  "examples": [
+   "list proactive agent rules",
+   "show agent initiatives",
+   "what proactive chat rules are set",
+   "find initiative id and revision"
+  ]
+ },
+ "tool:list_documents": {
+  "terms": [
+   "files",
+   "uploads",
+   "knowledge base",
+   "docs",
+   "browse files",
+   "files by folder",
+   "uploaded files"
+  ],
+  "examples": [
+   "list my knowledge documents",
+   "show uploaded files in workspace",
+   "find documents created last week",
+   "list pdf files by folder"
+  ]
+ },
+ "tool:list_files": {
+  "terms": [
+   "directory",
+   "folder contents",
+   "ls",
+   "browse files",
+   "file tree",
+   "filesystem"
+  ],
+  "examples": [
+   "list files in folder",
+   "show directory contents recursively",
+   "what files exist in path",
+   "browse workspace filesystem"
+  ]
+ },
+ "tool:list_sandbox_files": {
+  "terms": [
+   "output files",
+   "generated files",
+   "sandbox directory",
+   "created files",
+   "artifacts"
+  ],
+  "examples": [
+   "list files created by sandbox",
+   "what files did the command produce",
+   "check sandbox output folder",
+   "show generated output files"
+  ]
+ },
+ "tool:list_scheduled_jobs": {
+  "terms": [
+   "cron",
+   "recurring automation",
+   "timer",
+   "background jobs"
+  ],
+  "examples": [
+   "list scheduled automations",
+   "show my cron jobs",
+   "what recurring jobs are set up",
+   "see background automations running"
+  ]
+ },
+ "tool:list_skills": {
+  "terms": [
+   "playbooks",
+   "abilities",
+   "skill catalog",
+   "browse skills",
+   "installed skills"
+  ],
+  "examples": [
+   "list available skills",
+   "which skills are installed",
+   "show custom skills by category",
+   "browse skill catalog"
+  ]
+ },
+ "tool:list_workflow_definitions": {
+  "terms": [
+   "automations",
+   "workflow drafts",
+   "inactive workflows",
+   "search workflows",
+   "workflow list"
+  ],
+  "examples": [
+   "list all workflow definitions",
+   "find draft or inactive workflows",
+   "show workflows created by user",
+   "query workflows by category and status"
+  ]
+ },
+ "tool:list_workflow_runs": {
+  "terms": [
+   "run history",
+   "executions",
+   "logs",
+   "failed runs",
+   "status",
+   "audit",
+   "last run"
+  ],
+  "examples": [
+   "list workflow run history",
+   "show failed workflow executions",
+   "check workflow runs by status",
+   "when did workflow last run"
+  ]
+ },
+ "tool:list_workflows": {
+  "terms": [
+   "automations",
+   "flows",
+   "mcp tools",
+   "published workflows",
+   "callable",
+   "agent can call"
+  ],
+  "examples": [
+   "list published workflows",
+   "show workflows available as tools",
+   "what automations can agent call",
+   "find workflow by mcp binding"
+  ]
+ },
+ "tool:list_workspace_flows": {
+  "terms": [
+   "workflows installed",
+   "user flows",
+   "automation list",
+   "flow name",
+   "available flows"
+  ],
+  "examples": [
+   "list flows installed in my workspaces",
+   "show available workspace flows",
+   "what flows can i run",
+   "find flow by name"
+  ]
+ },
+ "tool:manor": {
+  "terms": [
+   "manor platform",
+   "platform actions",
+   "workspace action",
+   "manor calendar",
+   "workspace operations",
+   "platform search"
+  ],
+  "examples": [
+   "call manor workspace action",
+   "find manor platform capabilities",
+   "run workspace operation through manor",
+   "search manor platform actions"
+  ]
+ },
+ "tool:merge_videos": {
+  "terms": [
+   "concatenate videos",
+   "combine clips",
+   "join videos",
+   "stitch video",
+   "ffmpeg",
+   "mp4"
+  ],
+  "examples": [
+   "merge several video clips into one",
+   "combine videos into single mp4",
+   "join clips in folder together",
+   "stitch video segments final"
+  ]
+ },
+ "tool:mute_agent_initiative": {
+  "terms": [
+   "silence",
+   "quiet",
+   "stop notifications",
+   "snooze",
+   "mute reminder",
+   "mute rule"
+  ],
+  "examples": [
+   "mute proactive rule",
+   "stop delivering updates but keep checking",
+   "silence reminder in chat",
+   "snooze daily digest"
+  ]
+ },
+ "tool:normalize_audio_loudness": {
+  "terms": [
+   "lufs",
+   "volume",
+   "audio levels",
+   "loudnorm",
+   "ffmpeg",
+   "leveling",
+   "mastering",
+   "podcast loudness"
+  ],
+  "examples": [
+   "normalize audio volume to lufs",
+   "make audio loudness consistent",
+   "level out narration volume",
+   "master podcast audio loudness"
+  ]
+ },
+ "tool:notify_user": {
+  "terms": [
+   "alert",
+   "ping",
+   "push notification",
+   "message teammate",
+   "bell",
+   "telegram wechat email"
+  ],
+  "examples": [
+   "notify a teammate when job completes",
+   "send in-app notification to user",
+   "ping user about new task assignment",
+   "alert someone that needs attention"
+  ]
+ },
+ "tool:patch_file": {
+  "terms": [
+   "edit file",
+   "modify document",
+   "change file",
+   "find and replace",
+   "update document"
+  ],
+  "examples": [
+   "edit existing document without regenerating",
+   "patch part of a file",
+   "change a paragraph in saved document",
+   "apply edits to knowledge file"
+  ]
+ },
+ "tool:pause_agent_initiative": {
+  "terms": [
+   "stop proactive",
+   "disable rule",
+   "mute agent",
+   "halt checks",
+   "turn off initiative"
+  ],
+  "examples": [
+   "pause proactive agent rule",
+   "stop agent from checking",
+   "turn off initiative to save cost",
+   "disable proactive messages"
+  ]
+ },
+ "tool:plan_video_segments": {
+  "terms": [
+   "clip length",
+   "video length",
+   "scene durations",
+   "storyboard",
+   "split video"
+  ],
+  "examples": [
+   "plan video segment durations",
+   "how to split 60 second video into clips",
+   "check video model duration limits",
+   "figure out clip lengths before writing scenes"
+  ]
+ },
+ "tool:prepare_creative_studio": {
+  "terms": [
+   "creative brief",
+   "production run",
+   "reference files",
+   "studio setup",
+   "content production"
+  ],
+  "examples": [
+   "prepare creative production run from brief",
+   "freeze creative brief with source files",
+   "start creative studio with uploaded references",
+   "set up run folder for creative project"
+  ]
+ },
+ "tool:prepare_narration_timeline": {
+  "terms": [
+   "voiceover",
+   "tts timing",
+   "audio cues",
+   "narration sync",
+   "speech blocks",
+   "loudness normalize"
+  ],
+  "examples": [
+   "build narration timeline from tts clips",
+   "sync voiceover audio to video blocks",
+   "normalize narration segments loudness",
+   "create cues for narration audio"
+  ]
+ },
+ "tool:prepare_recording": {
+  "terms": [
+   "narrated video",
+   "transcript snapshot",
+   "srt",
+   "interview",
+   "lecture",
+   "recording"
+  ],
+  "examples": [
+   "prepare uploaded recording for editing",
+   "load srt subtitles for video",
+   "transcribe original speech of recording",
+   "snapshot transcript of narrated video"
+  ]
+ },
+ "tool:probe_media": {
+  "terms": [
+   "ffprobe",
+   "video duration",
+   "codec",
+   "resolution",
+   "media info",
+   "metadata",
+   "bitrate"
+  ],
+  "examples": [
+   "get video duration and resolution",
+   "inspect media file streams",
+   "check audio codec of file",
+   "ffprobe video metadata"
+  ]
+ },
+ "tool:provision_agent": {
+  "terms": [
+   "create agent",
+   "new agent",
+   "hire agent",
+   "build bot",
+   "assistant with tools",
+   "agent bindings"
+  ],
+  "examples": [
+   "create custom agent with tools and skills",
+   "spin up agent for specific job",
+   "provision new agent for user",
+   "make an assistant that handles support"
+  ]
+ },
+ "tool:publish_site": {
+  "terms": [
+   "deploy website",
+   "host site",
+   "go live",
+   "landing page",
+   "public url",
+   "html hosting",
+   "web page online"
+  ],
+  "examples": [
+   "publish static website to public url",
+   "put my html page online",
+   "deploy landing page",
+   "update live site after edits"
+  ]
+ },
+ "tool:query_agent_capabilities": {
+  "terms": [
+   "what can you do",
+   "available tools",
+   "capability list",
+   "connected integrations",
+   "readiness",
+   "skills list"
+  ],
+  "examples": [
+   "list all available tools and skills",
+   "what capabilities does my agent have",
+   "check which integrations are connected",
+   "catalog of agent actions"
+  ]
+ },
+ "tool:query_entity_agents": {
+  "terms": [
+   "list agents",
+   "find agents",
+   "agent roster",
+   "ai employees",
+   "agent directory",
+   "filter agents"
+  ],
+  "examples": [
+   "query agents by owner and category",
+   "find agents in a workspace",
+   "how many deployments per agent",
+   "show agents created last month"
+  ]
+ },
+ "tool:query_ledger": {
+  "terms": [
+   "revenue",
+   "expenses",
+   "finance",
+   "transactions",
+   "sum",
+   "analytics",
+   "report",
+   "bookkeeping"
+  ],
+  "examples": [
+   "total revenue this month by category",
+   "count ledger records by status",
+   "list transactions in date range",
+   "sum expenses grouped by currency"
+  ]
+ },
+ "tool:query_scheduled_jobs": {
+  "terms": [
+   "cron",
+   "recurring job",
+   "automation list",
+   "failed jobs",
+   "job history",
+   "schedule audit",
+   "failing jobs"
+  ],
+  "examples": [
+   "list scheduled automations with errors",
+   "find failing cron jobs",
+   "show enabled recurring jobs",
+   "which scheduled jobs failed last run"
+  ]
+ },
+ "tool:read_agent_file": {
+  "terms": [
+   "persona",
+   "instructions",
+   "soul",
+   "agent config",
+   "agent memory",
+   "rules file",
+   "prompt"
+  ],
+  "examples": [
+   "read agent soul file",
+   "show agent instructions and rules",
+   "view agent memory file",
+   "check agent goals and style"
+  ]
+ },
+ "tool:read_content_ledger": {
+  "terms": [
+   "content history",
+   "published posts log",
+   "content log",
+   "audit trail"
+  ],
+  "examples": [
+   "read content ledger history",
+   "show past published content records",
+   "read append only content history",
+   "content calendar history log"
+  ]
+ },
+ "tool:read_file": {
+  "terms": [
+   "open file",
+   "view file",
+   "cat",
+   "load document",
+   "show contents",
+   "image view"
+  ],
+  "examples": [
+   "read contents of a file",
+   "open text document and view",
+   "view image file from knowledge",
+   "grep section then read file offset"
+  ]
+ },
+ "tool:read_finance_ledger": {
+  "terms": [
+   "accounting entries",
+   "bookkeeping",
+   "transactions",
+   "income expenses",
+   "books"
+  ],
+  "examples": [
+   "read finance ledger entries",
+   "show workspace bookkeeping records",
+   "view income and expense entries",
+   "get ledger of financial transactions"
+  ]
+ },
+ "tool:read_recruiting_ledger": {
+  "terms": [
+   "hiring",
+   "candidates",
+   "applicants",
+   "hr",
+   "pipeline",
+   "talent"
+  ],
+  "examples": [
+   "read recruiting ledger",
+   "show hiring pipeline status",
+   "list candidates and recent events",
+   "current HR recruiting projection"
+  ]
+ },
+ "tool:read_relationship_ledger": {
+  "terms": [
+   "crm interactions",
+   "contact history",
+   "customer relationship",
+   "touchpoints"
+  ],
+  "examples": [
+   "read relationship ledger",
+   "show recent interactions with contacts",
+   "view relationship projection",
+   "get contact interaction history"
+  ]
+ },
+ "tool:read_stickman_topic_ledger": {
+  "terms": [
+   "topic history",
+   "past topics",
+   "video ideas",
+   "avoid duplicate topics",
+   "content calendar"
+  ],
+  "examples": [
+   "read stickman topic history",
+   "check previously used video topics",
+   "avoid repeating past topics",
+   "get topic ledger before brainstorming"
+  ]
+ },
+ "tool:read_youtube_public_metrics": {
+  "terms": [
+   "views",
+   "likes",
+   "comments count",
+   "video stats",
+   "analytics",
+   "performance"
+  ],
+  "examples": [
+   "how many views did our youtube video get",
+   "check published video performance",
+   "youtube video stats after upload",
+   "get likes and comments of latest video"
+  ]
+ },
+ "tool:record_content_ledger": {
+  "terms": [
+   "content calendar",
+   "dedupe content",
+   "published content log",
+   "avoid duplicate posts",
+   "content reservation",
+   "editorial log"
+  ],
+  "examples": [
+   "reserve content identity avoid duplicate",
+   "log published content lifecycle event",
+   "record content in ledger",
+   "check content already published"
+  ]
+ },
+ "tool:record_finance_ledger": {
+  "terms": [
+   "accounting",
+   "bookkeeping",
+   "transaction",
+   "invoice",
+   "payment record",
+   "expense",
+   "income",
+   "journal entry"
+  ],
+  "examples": [
+   "record payment received in ledger",
+   "log expense entry",
+   "append invoice to finance ledger",
+   "correct reverse a ledger entry"
+  ]
+ },
+ "tool:record_recruiting_ledger": {
+  "terms": [
+   "hiring",
+   "applicant",
+   "candidate pipeline",
+   "hr",
+   "onboarding",
+   "recruiter",
+   "ats",
+   "interview stage",
+   "job applicant"
+  ],
+  "examples": [
+   "record candidate stage change",
+   "add new job applicant",
+   "log hiring pipeline event",
+   "update employee onboarding status"
+  ]
+ },
+ "tool:record_relationship_ledger": {
+  "terms": [
+   "crm",
+   "contact",
+   "lead",
+   "customer history",
+   "interaction log",
+   "deal stage",
+   "pipeline"
+  ],
+  "examples": [
+   "log customer interaction in crm",
+   "record new investor lead",
+   "update prospect stage",
+   "add relationship event for vendor"
+  ]
+ },
+ "tool:record_stickman_topic_ledger": {
+  "terms": [
+   "youtube topic",
+   "video topic",
+   "stick figure",
+   "content calendar",
+   "topic dedupe",
+   "reserve topic",
+   "history"
+  ],
+  "examples": [
+   "reserve stickman video topic",
+   "record uploaded video in topic ledger",
+   "import historical topics with evidence",
+   "avoid repeating video topics"
+  ]
+ },
+ "tool:record_youtube_publication": {
+  "terms": [
+   "youtube upload",
+   "published video",
+   "video url",
+   "save youtube link",
+   "channel"
+  ],
+  "examples": [
+   "record published youtube video",
+   "save youtube video as latest publication",
+   "verify youtube video url after publishing",
+   "log that video went live on youtube"
+  ]
+ },
+ "tool:record_youtube_workspace_metrics": {
+  "terms": [
+   "youtube",
+   "views",
+   "likes",
+   "channel stats",
+   "video stats"
+  ],
+  "examples": [
+   "record latest youtube video metrics",
+   "log youtube views to workspace metrics",
+   "track public youtube stats",
+   "how many videos published on youtube"
+  ]
+ },
+ "tool:render_frame_samples": {
+  "terms": [
+   "screenshots",
+   "thumbnails",
+   "video frames",
+   "extract frames",
+   "preview stills",
+   "video check"
+  ],
+  "examples": [
+   "extract frames from video",
+   "take screenshots at timestamps of video",
+   "sample video frames for review",
+   "check scene boundaries with stills"
+  ]
+ },
+ "tool:render_recording": {
+  "terms": [
+   "screen recording",
+   "shorts",
+   "tutorial video",
+   "subtitles",
+   "captions",
+   "clip highlights",
+   "cut recording"
+  ],
+  "examples": [
+   "cut recording into short clips with subtitles",
+   "render tutorial video from screen recording",
+   "make portrait shorts from recording",
+   "burn subtitles into recording"
+  ]
+ },
+ "tool:render_response_surface": {
+  "terms": [
+   "interactive widget",
+   "chart",
+   "visual",
+   "ui in chat",
+   "embedded html",
+   "diagram",
+   "calculator",
+   "form",
+   "clickable cards",
+   "choices"
+  ],
+  "examples": [
+   "show interactive chart in chat",
+   "render visual widget in response",
+   "embed interactive ui in reply",
+   "display choices as clickable cards"
+  ]
+ },
+ "tool:replace_file": {
+  "terms": [
+   "overwrite",
+   "swap file",
+   "update file contents",
+   "copy over"
+  ],
+  "examples": [
+   "overwrite knowledge file with new version",
+   "replace existing document keep url",
+   "swap file with another file contents",
+   "atomically replace target file"
+  ]
+ },
+ "tool:request_input": {
+  "terms": [
+   "ask user",
+   "clarifying question",
+   "prompt user",
+   "need answer",
+   "human decision",
+   "pause for input",
+   "form"
+  ],
+  "examples": [
+   "ask user a clarifying question",
+   "need user decision before continuing",
+   "request missing information from user",
+   "ask human to review file"
+  ]
+ },
+ "tool:resume_agent_initiative": {
+  "terms": [
+   "unpause rule",
+   "restart proactive check",
+   "reactivate",
+   "enable rule"
+  ],
+  "examples": [
+   "resume paused proactive rule",
+   "turn paused initiative back on",
+   "restart proactive rule checks",
+   "unpause agent initiative"
+  ]
+ },
+ "tool:resume_workflow_run": {
+  "terms": [
+   "continue",
+   "unpause",
+   "approve",
+   "restart run",
+   "paused run",
+   "waiting approval"
+  ],
+  "examples": [
+   "resume paused workflow run",
+   "continue workflow after approval",
+   "unpause stuck run",
+   "provide event variables to resume"
+  ]
+ },
+ "tool:run_agent_initiative_now": {
+  "terms": [
+   "trigger",
+   "fire",
+   "test rule",
+   "execute now",
+   "paused"
+  ],
+  "examples": [
+   "run proactive rule now",
+   "trigger agent initiative immediately",
+   "test proactive chat rule",
+   "fire paused rule once"
+  ]
+ },
+ "tool:run_scheduled_job_now": {
+  "terms": [
+   "trigger",
+   "execute now",
+   "manual run",
+   "cron",
+   "manually"
+  ],
+  "examples": [
+   "run scheduled job right now",
+   "trigger automation manually",
+   "force run background job",
+   "execute cron job immediately"
+  ]
+ },
+ "tool:run_workflow": {
+  "terms": [
+   "execute workflow",
+   "trigger workflow",
+   "start flow",
+   "automation run",
+   "pipeline"
+  ],
+  "examples": [
+   "run a published workflow",
+   "trigger workflow with inputs",
+   "start automation flow",
+   "execute flow in another workspace"
+  ]
+ },
+ "tool:sandbox": {
+  "terms": [
+   "code execution",
+   "run python",
+   "shell",
+   "container",
+   "run script",
+   "terminal",
+   "isolated environment"
+  ],
+  "examples": [
+   "run python code in sandbox",
+   "execute shell command safely",
+   "create isolated sandbox and run script",
+   "read or write file in sandbox"
+  ]
+ },
+ "tool:save_sandbox_file": {
+  "terms": [
+   "export file",
+   "persist output",
+   "save result file",
+   "store generated file",
+   "download from sandbox",
+   "produced by code"
+  ],
+  "examples": [
+   "save generated file from sandbox to knowledge",
+   "store pptx created by script",
+   "register sandbox output as document",
+   "keep pdf produced by python code"
+  ]
+ },
+ "tool:search_documents": {
+  "terms": [
+   "files",
+   "knowledge base",
+   "uploads",
+   "my files",
+   "find file",
+   "pdf",
+   "spreadsheet"
+  ],
+  "examples": [
+   "find uploaded pdf files in knowledge",
+   "list documents created last week",
+   "what files do i have in workspace",
+   "search documents by folder and type"
+  ]
+ },
+ "tool:search_free_music": {
+  "terms": [
+   "background music",
+   "royalty free",
+   "bgm",
+   "soundtrack",
+   "openverse",
+   "creative commons",
+   "audio track",
+   "song"
+  ],
+  "examples": [
+   "find royalty free background music",
+   "search commercial use music tracks",
+   "cc licensed song for video",
+   "get music with attribution license"
+  ]
+ },
+ "tool:search_tasks": {
+  "terms": [
+   "todo",
+   "to-do",
+   "ticket",
+   "find tasks",
+   "overdue",
+   "assigned to"
+  ],
+  "examples": [
+   "find high priority open tasks",
+   "show tasks assigned to john",
+   "list my overdue to-dos",
+   "search tasks by status and workspace"
+  ]
+ },
+ "tool:search_tools": {
+  "terms": [
+   "find tool",
+   "discover",
+   "capabilities",
+   "tool lookup",
+   "available actions",
+   "mcp",
+   "integration search"
+  ],
+  "examples": [
+   "discover which tools are available",
+   "search available integrations and skills",
+   "find a tool for this job",
+   "look up tool by exact name"
+  ]
+ },
+ "tool:start_workspace_flow": {
+  "terms": [
+   "run flow",
+   "launch flow",
+   "kick off process",
+   "pipeline run",
+   "execute flow"
+  ],
+  "examples": [
+   "start a workspace flow",
+   "launch flow with inputs",
+   "run flow binding for workspace",
+   "kick off flow from brief"
+  ]
+ },
+ "tool:still_to_video": {
+  "terms": [
+   "image to video",
+   "ken burns",
+   "slideshow",
+   "photo to clip",
+   "mp4 from picture",
+   "animate image"
+  ],
+  "examples": [
+   "turn image into short video clip",
+   "convert still picture to mp4 scene",
+   "make video from a single photo",
+   "image to mp4 with duration"
+  ]
+ },
+ "tool:take_screenshot": {
+  "terms": [
+   "capture page",
+   "screen capture",
+   "page image",
+   "snapshot",
+   "web screenshot",
+   "png"
+  ],
+  "examples": [
+   "screenshot the current web page",
+   "capture full page image",
+   "take picture of browser page",
+   "save page snapshot png"
+  ]
+ },
+ "tool:test_workflow": {
+  "terms": [
+   "dry run",
+   "try workflow",
+   "debug workflow",
+   "preview run",
+   "simulate"
+  ],
+  "examples": [
+   "test workflow definition inline",
+   "dry run a workflow with inputs",
+   "try out workflow before deploying",
+   "debug automation without deploying"
+  ]
+ },
+ "tool:test_workflow_node": {
+  "terms": [
+   "debug step",
+   "try node",
+   "dry run",
+   "test step",
+   "single node run"
+  ],
+  "examples": [
+   "test one workflow node",
+   "run workflow step in isolation",
+   "debug node with sample inputs",
+   "try step output and errors"
+  ]
+ },
+ "tool:toggle_scheduled_job": {
+  "terms": [
+   "pause",
+   "turn off",
+   "turn on",
+   "stop job",
+   "resume job",
+   "disable cron"
+  ],
+  "examples": [
+   "pause scheduled job",
+   "turn off recurring automation",
+   "re-enable disabled cron job",
+   "stop daily report job"
+  ]
+ },
+ "tool:transcribe_audio": {
+  "terms": [
+   "speech to text",
+   "whisper",
+   "stt",
+   "captions",
+   "srt",
+   "subtitles",
+   "voice to text",
+   "recording transcript"
+  ],
+  "examples": [
+   "transcribe audio file to text",
+   "generate srt subtitles from narration",
+   "speech to text with timestamps",
+   "get transcript of recording"
+  ]
+ },
+ "tool:transcribe_video": {
+  "terms": [
+   "speech to text",
+   "stt",
+   "captions",
+   "subtitles",
+   "transcript",
+   "video to text",
+   "said in video"
+  ],
+  "examples": [
+   "transcribe speech from video",
+   "get transcript of uploaded video",
+   "convert video audio to text with timestamps",
+   "what is said in this video"
+  ]
+ },
+ "tool:unmute_agent_initiative": {
+  "terms": [
+   "resume",
+   "unpause",
+   "turn back on",
+   "enable",
+   "muted"
+  ],
+  "examples": [
+   "unmute proactive rule",
+   "resume muted agent initiative",
+   "turn notifications back on for rule",
+   "re-enable muted proactive message"
+  ]
+ },
+ "tool:update_agent_initiative": {
+  "terms": [
+   "edit proactive rule",
+   "change reminder",
+   "modify trigger",
+   "reschedule check",
+   "proactive chat"
+  ],
+  "examples": [
+   "update proactive rule time",
+   "change condition of agent initiative",
+   "reschedule a proactive check",
+   "edit existing proactive rule"
+  ]
+ },
+ "tool:update_goal_value": {
+  "terms": [
+   "kpi",
+   "okr",
+   "progress",
+   "metric",
+   "target",
+   "measurement",
+   "goal number"
+  ],
+  "examples": [
+   "update goal progress value",
+   "record kpi measurement manually",
+   "log new number for goal",
+   "set current value of okr"
+  ]
+ },
+ "tool:update_skill": {
+  "terms": [
+   "edit skill",
+   "modify skill",
+   "patch skill",
+   "change skill instructions",
+   "revise skill"
+  ],
+  "examples": [
+   "edit existing skill instructions",
+   "modify skill behavior",
+   "patch skill with changes",
+   "fix a skill that is wrong"
+  ]
+ },
+ "tool:update_task": {
+  "terms": [
+   "edit task",
+   "change task",
+   "mark done",
+   "reassign",
+   "rename task",
+   "set due priority"
+  ],
+  "examples": [
+   "update task status to done",
+   "change task priority",
+   "reassign task to teammate",
+   "rename task title"
+  ]
+ },
+ "tool:update_workflow": {
+  "terms": [
+   "edit workflow",
+   "modify automation",
+   "change steps",
+   "workflow graph",
+   "rename workflow"
+  ],
+  "examples": [
+   "update workflow steps",
+   "edit workflow node graph",
+   "rename or retag a workflow",
+   "change workflow variables safely"
+  ]
+ },
+ "tool:validate_subtitles": {
+  "terms": [
+   "srt",
+   "vtt",
+   "captions check",
+   "subtitle timing",
+   "caption lint",
+   "webvtt"
+  ],
+  "examples": [
+   "validate srt subtitle file",
+   "check caption timing overlap",
+   "lint vtt subtitles for video",
+   "verify ass subtitle margins"
+  ]
+ },
+ "tool:validate_workflow": {
+  "terms": [
+   "lint",
+   "check graph",
+   "verify",
+   "dry run check",
+   "reachability"
+  ],
+  "examples": [
+   "validate workflow graph",
+   "check workflow for errors",
+   "verify steps are reachable",
+   "lint unsaved workflow steps"
+  ]
+ },
+ "tool:verify_creative_studio": {
+  "terms": [
+   "qa",
+   "quality check",
+   "validate output",
+   "deliverables check",
+   "proof",
+   "final check",
+   "receipt"
+  ],
+  "examples": [
+   "verify generated deliverables are readable",
+   "check output files before delivery",
+   "validate pdf and video outputs",
+   "confirm page counts and formats of outputs"
+  ]
+ },
+ "tool:verify_file_collection": {
+  "terms": [
+   "deliverables",
+   "delivery check",
+   "verify outputs",
+   "file bundle",
+   "handoff files",
+   "required files"
+  ],
+  "examples": [
+   "verify deliverable files exist",
+   "check delivery of generated documents",
+   "confirm required file roles present",
+   "validate output file set"
+  ]
+ },
+ "tool:verify_stickman_final_media": {
+  "terms": [
+   "video qa",
+   "final video check",
+   "subtitle check",
+   "pre publish verification",
+   "narration quality"
+  ],
+  "examples": [
+   "verify final stickman video before publishing",
+   "check video subtitles and narration quality",
+   "validate final mp4 against target duration",
+   "qa final video before upload"
+  ]
+ },
+ "tool:video_edit": {
+  "terms": [
+   "video editor",
+   "promo",
+   "demo video",
+   "explainer",
+   "motion graphics",
+   "render",
+   "animation",
+   "hyperframes",
+   "title sequence"
+  ],
+  "examples": [
+   "make product demo video from screenshots",
+   "create promo video with motion graphics",
+   "edit video project in sandbox",
+   "render explainer video"
+  ]
+ },
+ "tool:wait_media_jobs": {
+  "terms": [
+   "video status",
+   "generation progress",
+   "pending job",
+   "await video",
+   "poll job",
+   "check render finished"
+  ],
+  "examples": [
+   "wait for video generation to finish",
+   "poll pending media jobs",
+   "check if generated video is ready",
+   "await job ids before merging"
+  ]
+ },
+ "tool:weather_search": {
+  "terms": [
+   "forecast",
+   "temperature",
+   "rain",
+   "climate",
+   "humidity",
+   "wind"
+  ],
+  "examples": [
+   "weather forecast for tokyo",
+   "will it rain tomorrow",
+   "current temperature in london",
+   "five day forecast new york"
+  ]
+ },
+ "tool:web_event_search": {
+  "terms": [
+   "conferences",
+   "meetups",
+   "concerts",
+   "things to do",
+   "happenings",
+   "local events"
+  ],
+  "examples": [
+   "find events in city next week",
+   "search conferences in london in may",
+   "what is happening in tokyo this weekend",
+   "find industry meetups near me"
+  ]
+ },
+ "tool:web_fetch": {
+  "terms": [
+   "scrape",
+   "download page",
+   "read url",
+   "open link",
+   "fetch webpage",
+   "read article",
+   "pdf url",
+   "curl"
+  ],
+  "examples": [
+   "read content of a url",
+   "fetch web page as markdown",
+   "extract text from pdf link",
+   "open link and summarize page"
+  ]
+ },
+ "tool:web_search": {
+  "terms": [
+   "google",
+   "internet search",
+   "look up online",
+   "news",
+   "browse internet",
+   "search engine",
+   "latest information"
+  ],
+  "examples": [
+   "search the web for latest news",
+   "google competitor prices online",
+   "look up information online",
+   "search internet for links about topic"
+  ]
+ },
+ "tool:workspace_create_task": {
+  "terms": [
+   "ticket",
+   "support ticket",
+   "issue",
+   "request",
+   "follow up",
+   "customer request",
+   "escalate to staff",
+   "customer complaint task"
+  ],
+  "examples": [
+   "create support ticket for customer issue",
+   "record request for staff in workspace",
+   "create workspace task with guardrails",
+   "log customer complaint as task"
+  ]
+ },
+ "tool:workspace_search": {
+  "terms": [
+   "find in workspace",
+   "goals",
+   "status lookup",
+   "progress",
+   "decision history",
+   "search workspace"
+  ],
+  "examples": [
+   "search workspace for goal progress",
+   "find task or agent in workspace",
+   "what is happening in this workspace",
+   "look up past decisions in workspace"
+  ]
+ },
+ "tool:write_agent_file": {
+  "terms": [
+   "agent memory",
+   "persona",
+   "system prompt",
+   "soul",
+   "agent instructions",
+   "edit agent",
+   "learnings",
+   "how agent behaves"
+  ],
+  "examples": [
+   "update agent instructions file",
+   "edit agent identity and rules",
+   "write agent memory file",
+   "change how my agent behaves"
+  ]
+ },
+ "tool:ws_assign_staff": {
+  "terms": [
+   "add team member",
+   "assign employee",
+   "staff role",
+   "hire agent",
+   "roster"
+  ],
+  "examples": [
+   "assign staff member to workspace",
+   "put team member on a service",
+   "give a staff role in new workspace",
+   "attach agent employee to workspace draft"
+  ]
+ },
+ "tool:ws_attach_knowledge": {
+  "terms": [
+   "knowledge base",
+   "rag",
+   "document group",
+   "playbook template",
+   "docs context",
+   "knowledge network",
+   "reference documents"
+  ],
+  "examples": [
+   "attach knowledge base to workspace",
+   "create new knowledge net for draft",
+   "clone template playbook documents",
+   "give workspace agents reference documents"
+  ]
+ },
+ "tool:ws_commit_basics": {
+  "terms": [
+   "workspace setup",
+   "onboarding",
+   "new workspace",
+   "business type",
+   "company profile"
+  ],
+  "examples": [
+   "save workspace name and kind to draft",
+   "commit workspace basics identity",
+   "set workspace primary work and operating context",
+   "workspace setup basics"
+  ]
+ },
+ "tool:ws_configure_app_view": {
+  "terms": [
+   "workspace home",
+   "dashboard layout",
+   "landing panel",
+   "ui layout",
+   "form fields",
+   "display labels"
+  ],
+  "examples": [
+   "configure workspace home panel title",
+   "set hero service and labels for workspace",
+   "customize workspace app view layout",
+   "add guided input form to workspace home"
+  ]
+ },
+ "tool:ws_confirm_creation_preferences": {
+  "terms": [
+   "autopilot",
+   "autonomy",
+   "manual mode",
+   "automatic mode",
+   "goal preference",
+   "cadence"
+  ],
+  "examples": [
+   "record user goal choice for draft",
+   "set workspace autonomous mode",
+   "choose automatic or manual goals",
+   "set autonomy cadence for new workspace"
+  ]
+ },
+ "tool:ws_get_draft": {
+  "terms": [
+   "draft state",
+   "current setup",
+   "review draft",
+   "what was committed",
+   "setup so far"
+  ],
+  "examples": [
+   "read current workspace draft",
+   "show what workspace setup has so far",
+   "recover draft context",
+   "view committed workspace draft"
+  ]
+ },
+ "tool:ws_lint_draft": {
+  "terms": [
+   "validate workspace",
+   "check draft",
+   "draft issues",
+   "pre-publish check",
+   "readiness"
+  ],
+  "examples": [
+   "lint workspace draft for issues",
+   "check workspace draft before finishing",
+   "find missing config in workspace draft",
+   "self check workspace before ready"
+  ]
+ },
+ "tool:ws_mark_ready": {
+  "terms": [
+   "finish draft",
+   "finalize",
+   "ready to create",
+   "publish draft",
+   "lint passed",
+   "create button"
+  ],
+  "examples": [
+   "mark workspace draft ready",
+   "finalize draft so user can create",
+   "draft ready after lint",
+   "enable create button for workspace"
+  ]
+ },
+ "tool:ws_propose_agent_mapping": {
+  "terms": [
+   "assign agent",
+   "marketplace agent",
+   "service owner",
+   "staff service"
+  ],
+  "examples": [
+   "assign agent to workspace service",
+   "map marketplace agent to service",
+   "propose agent for workspace service",
+   "which agent handles this service"
+  ]
+ },
+ "tool:ws_propose_automation": {
+  "terms": [
+   "schedule",
+   "trigger",
+   "recurring",
+   "cron",
+   "event based",
+   "routine",
+   "draft automation"
+  ],
+  "examples": [
+   "propose recurring automation for draft workspace",
+   "propose event triggered automation",
+   "set daily recurring workflow in draft",
+   "workspace automation with trigger"
+  ]
+ },
+ "tool:ws_propose_channel": {
+  "terms": [
+   "messaging channel",
+   "slack",
+   "twitter",
+   "email channel",
+   "telegram",
+   "social account",
+   "communication platform",
+   "where workspace posts"
+  ],
+  "examples": [
+   "set workspace publishing channel",
+   "bind slack channel to workspace",
+   "add secondary external channel",
+   "choose where workspace posts"
+  ]
+ },
+ "tool:ws_propose_goal": {
+  "terms": [
+   "kpi",
+   "target",
+   "objective",
+   "okr",
+   "metric",
+   "draft goal",
+   "success measure"
+  ],
+  "examples": [
+   "propose measurable goal for workspace",
+   "add kpi target to draft",
+   "set goal with cadence and measurement",
+   "replace workspace goal in draft"
+  ]
+ },
+ "tool:ws_propose_rule": {
+  "terms": [
+   "policy",
+   "guardrail",
+   "approval required",
+   "escalation",
+   "constraint",
+   "never do"
+  ],
+  "examples": [
+   "add rule requiring approval before posting",
+   "workspace policy never post on sundays",
+   "escalate complaints over threshold to human",
+   "set workspace guardrail for external actions"
+  ]
+ },
+ "tool:ws_propose_service": {
+  "terms": [
+   "service offering",
+   "workspace setup",
+   "business service",
+   "primary work",
+   "autonomy",
+   "onboarding draft"
+  ],
+  "examples": [
+   "add service to workspace draft",
+   "propose a service the workspace performs",
+   "define workspace service with autonomy level",
+   "replace service in workspace plan"
+  ]
+ },
+ "tool:ws_read_source": {
+  "terms": [
+   "uploaded file",
+   "attached document",
+   "pasted link",
+   "read attachment",
+   "source material",
+   "brief",
+   "page through"
+  ],
+  "examples": [
+   "read attached source for draft",
+   "read uploaded file in workspace setup",
+   "page through knowledge doc source",
+   "open pasted link source text"
+  ]
+ },
+ "tool:ws_remove": {
+  "terms": [
+   "delete from draft",
+   "undo",
+   "drop",
+   "discard",
+   "clear warning"
+  ],
+  "examples": [
+   "remove proposed service from draft",
+   "drop a goal from workspace draft",
+   "clear missing integration warning",
+   "user changed mind remove rule"
+  ]
+ },
+ "tool:ws_request_custom_agent": {
+  "terms": [
+   "new agent",
+   "build agent",
+   "agent design",
+   "create agent for service",
+   "custom bot"
+  ],
+  "examples": [
+   "design custom agent for service",
+   "no existing agent fits create one",
+   "request new agent in workspace draft",
+   "create specialized agent with skills"
+  ]
+ },
+ "tool:ws_search_blueprints": {
+  "terms": [
+   "templates",
+   "marketplace",
+   "prebuilt workspace",
+   "starter workspace",
+   "blueprint gallery",
+   "business template",
+   "ready made workspace"
+  ],
+  "examples": [
+   "search workspace blueprint marketplace",
+   "find existing template for my business",
+   "list published workspace templates",
+   "is there a ready made workspace"
+  ]
+ },
+ "tool:ws_search_capabilities": {
+  "terms": [
+   "least privilege",
+   "tools plan",
+   "service capabilities",
+   "find tools for agent",
+   "mcp skills"
+  ],
+  "examples": [
+   "find tools for workspace service",
+   "match service to tools and skills",
+   "build least privilege capability plan",
+   "search capabilities for custom agent"
+  ]
+ },
+ "tool:ws_search_entity_agents": {
+  "terms": [
+   "available agents",
+   "agent catalog",
+   "existing agents",
+   "agent roster",
+   "find agent",
+   "pick agent",
+   "agents to assign",
+   "platform agents"
+  ],
+  "examples": [
+   "list existing agents to map to service",
+   "find agents with their tools and skills",
+   "which agents can I assign",
+   "show all platform agents"
+  ]
+ },
+ "tool:ws_set_autonomy": {
+  "terms": [
+   "auto pilot",
+   "manual mode",
+   "strategist review schedule",
+   "automatic mode",
+   "cadence"
+  ],
+  "examples": [
+   "set workspace autonomy automatic or manual",
+   "change strategist review cadence",
+   "turn off automatic workspace reviews",
+   "configure autonomous schedule for workspace"
+  ]
+ },
+ "tool:ws_set_budget": {
+  "terms": [
+   "spending limit",
+   "credit cap",
+   "cost limit",
+   "monthly cap",
+   "pause on budget",
+   "spend ceiling"
+  ],
+  "examples": [
+   "set monthly workspace budget cap",
+   "limit workspace credit spending",
+   "cap monthly cost for workspace",
+   "auto pause when budget reached"
+  ]
+ },
+ "tool:ws_set_evaluation": {
+  "terms": [
+   "scorecard",
+   "review cadence",
+   "kpi",
+   "performance review",
+   "target score"
+  ],
+  "examples": [
+   "set workspace evaluation scorecard",
+   "define scoring cadence and target",
+   "map goals to metrics scorecard",
+   "set warning score threshold"
+  ]
+ },
+ "tool:ws_suggest_blueprint": {
+  "terms": [
+   "template",
+   "preset",
+   "starter",
+   "blueprint pick",
+   "recommend template"
+  ],
+  "examples": [
+   "suggest blueprint for workspace draft",
+   "pick matching workspace template",
+   "record chosen blueprint rationale",
+   "select published blueprint"
+  ]
+ },
+ "workspace_action:add_knowledge_documents": {
+  "terms": [
+   "attach document",
+   "add docs",
+   "workspace knowledge",
+   "attach file",
+   "knowledge base document"
+  ],
+  "examples": [
+   "attach the pricing pdf to workspace knowledge",
+   "add documents to this workspace",
+   "attach knowledge files to workspace",
+   "put the handbook into workspace knowledge"
+  ]
+ },
+ "workspace_action:add_rule": {
+  "terms": [
+   "rule",
+   "guardrail",
+   "policy",
+   "approval",
+   "never do",
+   "always do"
+  ],
+  "examples": [
+   "add a workspace rule about refunds",
+   "require my approval before refunds",
+   "add guardrail never email customers at night",
+   "new operating rule for this workspace"
+  ]
+ },
+ "workspace_action:answer_task_blocker": {
+  "terms": [
+   "task blocker",
+   "blocked task",
+   "unblock",
+   "answer task",
+   "stuck task",
+   "needs input"
+  ],
+  "examples": [
+   "answer the blocked task",
+   "unblock the paused task with this info",
+   "reply to the task blocker",
+   "give the stuck task what it needs"
+  ]
+ },
+ "workspace_action:create_knowledge_folder": {
+  "terms": [
+   "knowledge net",
+   "knowledge folder",
+   "new folder",
+   "document group"
+  ],
+  "examples": [
+   "create a knowledge folder in this workspace",
+   "new knowledge net for pricing",
+   "make a workspace folder for contracts",
+   "add a document group to workspace knowledge"
+  ]
+ },
+ "workspace_action:create_task": {
+  "terms": [
+   "new task",
+   "ticket",
+   "support ticket",
+   "to do",
+   "follow up",
+   "assign work"
+  ],
+  "examples": [
+   "create a task for the sales service",
+   "open a support ticket for this customer",
+   "add a follow up task for tomorrow",
+   "create workspace task with deadline"
+  ]
+ },
+ "workspace_action:delegate_service": {
+  "terms": [
+   "delegate",
+   "ask agent",
+   "hand off",
+   "service agent",
+   "parallel agents",
+   "in parallel",
+   "agents"
+  ],
+  "examples": [
+   "ask the research agent to summarize competitors",
+   "delegate this to the sales service",
+   "ask the agents to write intros in parallel",
+   "hand off work to another agent"
+  ]
+ },
+ "workspace_action:get_goal_status": {
+  "terms": [
+   "goal progress",
+   "goals",
+   "targets",
+   "how far along",
+   "kpi status"
+  ],
+  "examples": [
+   "how are we doing on our goals",
+   "show goal progress for this workspace",
+   "check workspace targets",
+   "goal status this month"
+  ]
+ },
+ "workspace_action:get_stat_status": {
+  "terms": [
+   "stats",
+   "tracked stats",
+   "metrics status",
+   "assessments"
+  ],
+  "examples": [
+   "show workspace stats",
+   "how are the tracked stats",
+   "check stat assessments",
+   "latest workspace metrics status"
+  ]
+ },
+ "workspace_action:list_knowledge": {
+  "terms": [
+   "knowledge nets",
+   "workspace documents",
+   "attached docs",
+   "knowledge list"
+  ],
+  "examples": [
+   "list workspace knowledge nets",
+   "which documents are attached to this workspace",
+   "show workspace knowledge documents",
+   "what knowledge does this workspace have"
+  ]
+ },
+ "workspace_action:read_delegation_result": {
+  "terms": [
+   "delegated answer",
+   "rest of answer",
+   "run id",
+   "shortened result"
+  ],
+  "examples": [
+   "read the rest of the delegated answer",
+   "show the full result of that agent run",
+   "continue reading a shortened delegation",
+   "get the remaining delegated output"
+  ]
+ },
+ "workspace_action:record_stat_assessment": {
+  "terms": [
+   "stat assessment",
+   "rate stat",
+   "score metric",
+   "assess"
+  ],
+  "examples": [
+   "record an assessment for a workspace stat",
+   "score this week's response time stat",
+   "rate the stat as healthy",
+   "log stat assessment"
+  ]
+ },
+ "workspace_action:remove_knowledge_document": {
+  "terms": [
+   "detach document",
+   "remove doc",
+   "unlink file",
+   "stop using document"
+  ],
+  "examples": [
+   "remove a document from workspace knowledge",
+   "detach the old price list from this workspace",
+   "unlink a file from workspace knowledge",
+   "stop using this document in the workspace"
+  ]
+ },
+ "workspace_action:request_strategist_review": {
+  "terms": [
+   "strategist",
+   "review",
+   "reprioritize",
+   "plan next steps",
+   "assess workspace"
+  ],
+  "examples": [
+   "ask the strategist to review this workspace",
+   "reprioritize the workspace plan",
+   "propose next tasks for this workspace",
+   "strategist review of how we are doing"
+  ]
+ },
+ "workspace_action:resolve_hitl": {
+  "terms": [
+   "answer request",
+   "approve",
+   "reject",
+   "human input",
+   "pending question"
+  ],
+  "examples": [
+   "answer the pending workspace question",
+   "approve the open request",
+   "reject the pending approval",
+   "respond to the agent waiting for input"
+  ]
+ },
+ "workspace_action:search": {
+  "terms": [
+   "find in workspace",
+   "workspace status",
+   "progress",
+   "what happened",
+   "decision history",
+   "look up"
+  ],
+  "examples": [
+   "search this workspace for the onboarding plan",
+   "what happened in this workspace today",
+   "find tasks about the Acme renewal",
+   "look up past decisions in this workspace"
+  ]
+ },
+ "workspace_action:update_goal_value": {
+  "terms": [
+   "goal value",
+   "record progress",
+   "update metric",
+   "current value"
+  ],
+  "examples": [
+   "record 30 leads toward the goal",
+   "update the goal current value",
+   "log progress on the revenue goal",
+   "set goal value to 12"
+  ]
+ },
+ "workspace_action:update_knowledge_policy": {
+  "terms": [
+   "retrieval policy",
+   "cite sources",
+   "auto search",
+   "strict mode",
+   "knowledge settings"
+  ],
+  "examples": [
+   "make the workspace always cite sources",
+   "turn on strict knowledge mode",
+   "change workspace knowledge retrieval settings",
+   "enable auto search of workspace knowledge"
+  ]
+ },
+ "workspace_action:update_task_runtime": {
+  "terms": [
+   "task instructions",
+   "task guardrail",
+   "extra instructions",
+   "task rules",
+   "references for task"
+  ],
+  "examples": [
+   "add instructions to an existing task",
+   "give the running task extra guardrails",
+   "attach reference document to task",
+   "update task runtime instructions"
+  ]
+ },
+ "workspace_action:visualize_ledgers": {
+  "terms": [
+   "ledger chart",
+   "finance chart",
+   "visualize",
+   "graph ledger"
+  ],
+  "examples": [
+   "chart the finance ledger",
+   "visualize content ledger",
+   "graph recruiting ledger over time",
+   "show ledger charts for this workspace"
+  ]
+ },
+ "workspace_operation:agent_binding.remove": {
+  "terms": [
+   "unassign agent",
+   "unmap agent",
+   "remove agent from service"
+  ],
+  "examples": [
+   "remove the agent from the support service",
+   "unassign an agent",
+   "unmap agents from analytics",
+   "take the agent off the service"
+  ]
+ },
+ "workspace_operation:agent_binding.upsert": {
+  "terms": [
+   "assign agent",
+   "map agent",
+   "agent to service",
+   "staff service"
+  ],
+  "examples": [
+   "assign the research agent to analytics",
+   "map an agent to a service",
+   "put this agent on the support service",
+   "staff the billing service"
+  ]
+ },
+ "workspace_operation:agent_mappings.replace": {
+  "terms": [
+   "agent mappings",
+   "reassign all agents",
+   "staffing"
+  ],
+  "examples": [
+   "replace all agent assignments",
+   "reassign every service agent",
+   "reset agent to service mappings",
+   "redo workspace staffing"
+  ]
+ },
+ "workspace_operation:app_view.update": {
+  "terms": [
+   "app",
+   "app page",
+   "button",
+   "main action",
+   "layout",
+   "form",
+   "home page"
+  ],
+  "examples": [
+   "change the app main button text",
+   "rename the app action",
+   "reorder the workspace app page",
+   "edit the app form fields"
+  ]
+ },
+ "workspace_operation:budget_policy.update": {
+  "terms": [
+   "budget",
+   "spending cap",
+   "monthly limit",
+   "credits",
+   "cost cap"
+  ],
+  "examples": [
+   "cap monthly spending at 200 dollars",
+   "set the workspace budget",
+   "limit monthly credits",
+   "change the workspace cost cap"
+  ]
+ },
+ "workspace_operation:capability_binding.remove": {
+  "terms": [
+   "unbind tool",
+   "remove capability",
+   "revoke tool"
+  ],
+  "examples": [
+   "remove a tool from the agent",
+   "unbind the capability from the service",
+   "revoke an integration from an agent",
+   "take a tool away from support"
+  ]
+ },
+ "workspace_operation:capability_binding.upsert": {
+  "terms": [
+   "bind tool",
+   "capability",
+   "give agent tool",
+   "allow integration"
+  ],
+  "examples": [
+   "give the sales agent the email tool",
+   "bind a capability to a service",
+   "allow this agent to use an integration",
+   "add a tool to the support service"
+  ]
+ },
+ "workspace_operation:channel.upsert": {
+  "terms": [
+   "channel",
+   "telegram",
+   "whatsapp",
+   "connect channel",
+   "inbox"
+  ],
+  "examples": [
+   "connect a telegram bot to the workspace",
+   "add an email channel",
+   "set up whatsapp channel",
+   "edit a workspace channel"
+  ]
+ },
+ "workspace_operation:evaluation.update": {
+  "terms": [
+   "scorecard",
+   "evaluation",
+   "review cadence",
+   "target score"
+  ],
+  "examples": [
+   "set the workspace scorecard",
+   "change evaluation cadence",
+   "update target score for the workspace",
+   "edit evaluation criteria"
+  ]
+ },
+ "workspace_operation:goal.measurement_sources.update": {
+  "terms": [
+   "goal measurement",
+   "data source",
+   "baseline",
+   "measure goal"
+  ],
+  "examples": [
+   "measure the leads goal from the CRM",
+   "set goal baseline",
+   "change how a goal is measured",
+   "attach a data source to the goal"
+  ]
+ },
+ "workspace_operation:goal.upsert": {
+  "terms": [
+   "add goal",
+   "edit goal",
+   "target",
+   "kpi",
+   "objective"
+  ],
+  "examples": [
+   "add a goal of 50 leads this month",
+   "change the revenue target",
+   "new workspace objective",
+   "edit one goal"
+  ]
+ },
+ "workspace_operation:goals.replace": {
+  "terms": [
+   "replace goals",
+   "all goals",
+   "goal list"
+  ],
+  "examples": [
+   "replace all workspace goals",
+   "reset the goal list",
+   "set new goals for the quarter",
+   "overwrite every goal"
+  ]
+ },
+ "workspace_operation:governance_policy.update": {
+  "terms": [
+   "auto approve",
+   "without asking",
+   "approval policy",
+   "risk level",
+   "never allow",
+   "permissions"
+  ],
+  "examples": [
+   "let agents act without asking me for small things",
+   "auto approve low risk actions",
+   "require approval for high risk actions",
+   "never allow deleting customer data"
+  ]
+ },
+ "workspace_operation:heartbeat_policy.update": {
+  "terms": [
+   "heartbeat",
+   "check in",
+   "cadence",
+   "every hours",
+   "periodic report",
+   "report status",
+   "status report"
+  ],
+  "examples": [
+   "agents check in every 2 hours",
+   "set heartbeat cadence",
+   "turn off the workspace heartbeat",
+   "make agents report status every morning"
+  ]
+ },
+ "workspace_operation:integration.enable": {
+  "terms": [
+   "turn on integration",
+   "enable integration",
+   "restore provider"
+  ],
+  "examples": [
+   "turn gmail back on for this workspace",
+   "enable an integration again",
+   "restore the slack integration",
+   "undo disabling a provider"
+  ]
+ },
+ "workspace_operation:integration.remove": {
+  "terms": [
+   "turn off integration",
+   "disable integration",
+   "remove provider",
+   "stop using integration"
+  ],
+  "examples": [
+   "turn off gmail for this workspace",
+   "disable an integration in the workspace",
+   "stop this workspace using slack",
+   "remove a provider from the workspace"
+  ]
+ },
+ "workspace_operation:integration_scope.update": {
+  "terms": [
+   "disabled integrations",
+   "integration scope",
+   "providers list"
+  ],
+  "examples": [
+   "set which integrations are disabled",
+   "update workspace integration scope",
+   "disable several providers at once",
+   "change disabled providers list"
+  ]
+ },
+ "workspace_operation:knowledge_policy.update": {
+  "terms": [
+   "knowledge policy",
+   "retrieval",
+   "cite sources"
+  ],
+  "examples": [
+   "update workspace knowledge policy",
+   "change knowledge retrieval for agents",
+   "require citing knowledge sources",
+   "edit knowledge policy settings"
+  ]
+ },
+ "workspace_operation:operating_model.replace": {
+  "terms": [
+   "replace operating model",
+   "rebuild workspace",
+   "full configuration",
+   "overwrite setup",
+   "workspace setup"
+  ],
+  "examples": [
+   "replace the whole workspace configuration",
+   "rebuild the workspace operating model",
+   "overwrite workspace setup entirely",
+   "reset the operating model"
+  ]
+ },
+ "workspace_operation:operating_model.update": {
+  "terms": [
+   "workspace description",
+   "workspace settings",
+   "mission",
+   "operating model",
+   "rename workspace"
+  ],
+  "examples": [
+   "change the workspace description",
+   "update workspace mission",
+   "change the workspace mission statement",
+   "update the operating model summary"
+  ]
+ },
+ "workspace_operation:process.upsert": {
+  "terms": [
+   "process",
+   "procedure",
+   "sop",
+   "process description"
+  ],
+  "examples": [
+   "describe the refund process",
+   "add a standard operating procedure",
+   "edit the onboarding process notes",
+   "document a workspace process"
+  ]
+ },
+ "workspace_operation:rule.add": {
+  "terms": [
+   "rule",
+   "guardrail",
+   "approval rule",
+   "add rule"
+  ],
+  "examples": [
+   "add a rule refunds need approval",
+   "new workspace guardrail",
+   "add rule never contact customers on weekends",
+   "require approval before sending invoices"
+  ]
+ },
+ "workspace_operation:rule.remove": {
+  "terms": [
+   "remove rule",
+   "delete rule",
+   "drop guardrail",
+   "stop enforcing"
+  ],
+  "examples": [
+   "remove the refund rule",
+   "delete a workspace rule",
+   "drop the weekend guardrail",
+   "stop enforcing this rule"
+  ]
+ },
+ "workspace_operation:rule.update": {
+  "terms": [
+   "edit rule",
+   "change rule",
+   "rule type",
+   "relax rule"
+  ],
+  "examples": [
+   "change the refund rule threshold",
+   "edit a workspace rule",
+   "make the rule require approval instead of blocking",
+   "update rule wording"
+  ]
+ },
+ "workspace_operation:rules.replace": {
+  "terms": [
+   "replace rules",
+   "all rules",
+   "rule list",
+   "overwrite rules",
+   "every guardrail"
+  ],
+  "examples": [
+   "replace all workspace rules",
+   "reset the rule list",
+   "overwrite every guardrail",
+   "set the full list of rules"
+  ]
+ },
+ "workspace_operation:service_role.remove": {
+  "terms": [
+   "remove service",
+   "delete service",
+   "drop service"
+  ],
+  "examples": [
+   "remove the support service",
+   "delete a workspace service",
+   "drop the billing service",
+   "take the analytics service out"
+  ]
+ },
+ "workspace_operation:service_role.upsert": {
+  "terms": [
+   "add service",
+   "service role",
+   "new service",
+   "edit service"
+  ],
+  "examples": [
+   "add an analytics service to the workspace",
+   "create a new service role",
+   "edit the support service",
+   "add a billing service"
+  ]
+ },
+ "workspace_operation:skill_binding.upsert": {
+  "terms": [
+   "bind skill",
+   "give skill",
+   "skill access",
+   "use skill"
+  ],
+  "examples": [
+   "let the sales service use the docx skill",
+   "bind a skill to an agent",
+   "give the support agent a skill",
+   "add skill to service"
+  ]
+ },
+ "workspace_operation:strategist.update": {
+  "terms": [
+   "strategist settings",
+   "strategist policy",
+   "review frequency"
+  ],
+  "examples": [
+   "change strategist settings",
+   "make the strategist review weekly",
+   "update strategist policy",
+   "turn off strategist reviews"
+  ]
+ },
+ "workspace_operation:task.prepare": {
+  "terms": [
+   "queue task",
+   "task on apply",
+   "prepare task",
+   "starter task",
+   "draft task"
+  ],
+  "examples": [
+   "queue a task to run after applying changes",
+   "prepare a kickoff task with the draft",
+   "create a task when the configuration is applied",
+   "add a starter task to the draft"
+  ]
+ },
+ "workspace_operation:workflow_binding.attach": {
+  "terms": [
+   "attach workflow",
+   "app main action",
+   "workflow button",
+   "link workflow"
+  ],
+  "examples": [
+   "attach a workflow to the app",
+   "make the lead intake workflow the main action",
+   "link a saved workflow to the app button",
+   "set workflow as app entry"
+  ]
+ }
+}

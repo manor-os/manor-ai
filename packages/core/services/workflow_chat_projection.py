@@ -6,6 +6,7 @@ import json
 import logging
 from copy import deepcopy
 from typing import Any
+from urllib.parse import quote
 
 from sqlalchemy import event, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +20,7 @@ from packages.core.services.workflow_run_trace import (
     summarize_trace_text,
     summarize_trace_value,
     workflow_chat_projection_visibility,
+    workflow_execution_steps,
 )
 
 
@@ -27,7 +29,32 @@ _NOTIFICATION_LISTENER_KEY = "workflow_chat_projection_listeners"
 _ACTIONABLE_COMPLETED_OUTCOMES = {
     "needs_input",
 }
+_FINAL_ARTIFACT_CONTAINER_KEYS = {
+    "artifact",
+    "artifacts",
+    "assets",
+    "deliverable",
+    "deliverables",
+    "documents",
+    "files",
+    "final_artifact",
+    "final_artifacts",
+    "final_document",
+    "final_documents",
+    "final_file",
+    "final_files",
+    "final_video",
+    "final_videos",
+    "knowledge_artifacts",
+    "outputs",
+}
 logger = logging.getLogger(__name__)
+
+
+def _workflow_run_url(run: Any) -> str:
+    workflow_id = quote(str(run.workflow_id), safe="")
+    run_id = quote(str(run.id), safe="")
+    return f"/flows/{workflow_id}/runs/{run_id}"
 
 
 async def _push_notification(payload: dict[str, Any]) -> None:
@@ -96,6 +123,53 @@ def _entrypoint_context(run: Any) -> dict[str, Any] | None:
     return workflow_chat_context(run)
 
 
+def _agent_recovery_checkpoint(run: Any, step_id: str, result: dict[str, Any]) -> bool:
+    snapshot = getattr(run, "execution_snapshot", None)
+    steps = snapshot.get("steps") if isinstance(snapshot, dict) else None
+    step = next(
+        (
+            item for item in steps or []
+            if isinstance(item, dict) and str(item.get("id") or "") == step_id
+        ),
+        {},
+    )
+    return (
+        step.get("type") == "agent"
+        and result.get("producer_completed") is not True
+        and isinstance(result.get("chrome_outcome"), dict)
+    )
+
+
+def workflow_retry_from_step_id(run: Any, retry_state: dict[str, Any]) -> str:
+    current_step_id = str(getattr(run, "current_step_id", "") or "").strip()
+    step_results = getattr(run, "step_results", None) or {}
+    current_result = step_results.get(current_step_id)
+    if (
+        isinstance(current_result, dict)
+        and current_result.get("retry_blocked") is True
+        and not _agent_recovery_checkpoint(run, current_step_id, current_result)
+    ):
+        return ""
+    configured = str(retry_state.get("retry_from_step_id") or "").strip()
+    if configured:
+        return configured
+    if isinstance(current_result, dict):
+        configured = str(current_result.get("retry_from_step_id") or "").strip()
+        if configured:
+            return configured
+    if str(getattr(run, "status", "") or "") == "failed" and current_step_id:
+        is_retry_attempt = bool(
+            str(getattr(run, "effective_retry_of_run_id", "") or "").strip()
+        )
+        prior_retry_from = str(
+            getattr(run, "effective_retry_from_step_id", "") or ""
+        ).strip()
+        if prior_retry_from and not is_retry_attempt:
+            return prior_retry_from
+        return current_step_id
+    return str(getattr(run, "effective_retry_from_step_id", "") or "").strip()
+
+
 def workflow_projection_settings(context: dict[str, Any]) -> dict[str, Any]:
     projection = context.get("projection") if isinstance(context.get("projection"), dict) else {}
     step_outputs = str(projection.get("step_outputs") or "explicit").lower()
@@ -129,97 +203,105 @@ def workflow_progress_steps(
     activity_status: str | None = None,
     existing_steps: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Project the run snapshot into stable, display-safe progress rows."""
-    snapshot = run.definition_snapshot if isinstance(run.definition_snapshot, dict) else {}
-    nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), list) else []
-    if not nodes and isinstance(existing_steps, list):
-        nodes = existing_steps
+    """Project the stable, display-safe execution path into Workspace Chat."""
+    steps = workflow_execution_steps(
+        run,
+        activity_status=activity_status,
+        existing_steps=existing_steps,
+    )
+    steps = _workflow_chat_path_steps(run, steps)
+    if str(getattr(run, "status", "") or "").strip().lower() != "completed":
+        return steps
+
+    business_outcome, _retry_state = _workflow_business_state(run)
+    if business_outcome not in _ACTIONABLE_COMPLETED_OUTCOMES:
+        return steps
 
     results = run.step_results if isinstance(run.step_results, dict) else {}
-    existing_by_id = {
-        str(step.get("id") or ""): step
-        for step in (existing_steps or [])
-        if isinstance(step, dict) and step.get("id")
+    reached_ids = {
+        str(step_id)
+        for step_id, result in results.items()
+        if isinstance(result, dict)
+        and result.get("skipped") is not True
+        and str(result.get("status") or "").strip().lower() != "skipped"
     }
-    run_status = str(getattr(run, "status", "") or "").lower()
-    active_status = str(activity_status or run_status).lower()
-    active_id = str(getattr(run, "current_step_id", "") or "")
-    variables = run.variables if isinstance(getattr(run, "variables", None), dict) else {}
-    project = variables.get("project") if isinstance(variables.get("project"), dict) else {}
-    state = project.get("state") if isinstance(project.get("state"), dict) else {}
-    business_outcome = str(state.get("business_outcome") or "").strip().lower()
-    preserves_unreached_nodes = (
-        run_status == "completed"
-        and business_outcome in _ACTIONABLE_COMPLETED_OUTCOMES
-    )
-    result_frontier = -1
-    if run_status in {"running", "paused", "failed"} or preserves_unreached_nodes:
-        for index, node in enumerate(nodes):
-            if not isinstance(node, dict) or str(node.get("type") or "").lower() == "end":
-                continue
-            result = results.get(str(node.get("id") or ""))
-            if not isinstance(result, dict) or result.get("skipped"):
-                continue
-            result_status = str(result.get("status") or "").lower()
-            if result_status in {"completed", "failed", "paused"}:
-                result_frontier = index
-    if not active_id:
-        active_id = next(
-            (
-                str(node.get("id"))
-                for node in nodes
-                if isinstance(node, dict)
-                and node.get("id")
-                and node.get("type") in {"trigger", "webhook"}
-            ),
-            "",
-        )
+    return [step for step in steps if step.get("id") in reached_ids]
 
-    projected: list[dict[str, Any]] = []
-    for node_index, node in enumerate(nodes):
-        if (
-            not isinstance(node, dict)
-            or workflow_chat_projection_visibility(node) == "hidden"
-        ):
-            continue
-        node_id = str(node.get("id") or "")
-        if not node_id:
-            continue
+
+def _workflow_chat_path_steps(
+    run: Any,
+    steps: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Hide pending branches excluded by durable routing receipts in Chat."""
+    snapshot = getattr(run, "definition_snapshot", None)
+    nodes = snapshot.get("nodes") if isinstance(snapshot, dict) else None
+    if not isinstance(nodes, list) or not any(
+        isinstance(node, dict) and "targets" in node for node in nodes
+    ):
+        return steps
+
+    node_ids = [
+        str(node.get("id") or "").strip()
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("id") or "").strip()
+    ]
+    node_id_set = set(node_ids)
+    targets_by_id = {
+        str(node.get("id") or "").strip(): [
+            str(target)
+            for target in (node.get("targets") or [])
+            if str(target).strip() in node_id_set
+        ]
+        for node in nodes
+        if isinstance(node, dict) and str(node.get("id") or "").strip()
+    }
+    condition_ids = {
+        str(node.get("id") or "").strip()
+        for node in nodes
+        if isinstance(node, dict)
+        and str(node.get("type") or "").strip().lower() == "condition"
+    }
+    incoming_ids = {
+        target
+        for targets in targets_by_id.values()
+        for target in targets
+    }
+    entry_ids = [node_id for node_id in node_ids if node_id not in incoming_ids]
+    results = getattr(run, "step_results", None)
+    results = results if isinstance(results, dict) else {}
+
+    def selected_targets(node_id: str) -> list[str]:
         result = results.get(node_id)
-        status = "pending"
-        if isinstance(result, dict):
-            result_status = str(result.get("status") or "").lower()
-            if result.get("skipped") or result_status == "skipped":
-                status = "skipped"
-            elif result_status in {"completed", "failed", "paused"}:
-                status = result_status
-        elif run_status == "completed" and not preserves_unreached_nodes:
-            status = "skipped"
-        elif (
-            result_frontier >= 0
-            and node_index < result_frontier
-            and node_id != active_id
-        ):
-            status = "skipped"
-        if (
-            status == "pending"
-            and run_status in {"pending", "running"}
-            and node_id == active_id
-            and active_status in {"queued", "running"}
-        ):
-            status = active_status
+        if not isinstance(result, dict) or "next_override" not in result:
+            if node_id in condition_ids:
+                return []
+            return targets_by_id.get(node_id, [])
+        value = result.get("next_override")
+        values = value if isinstance(value, list) else [value]
+        return [
+            str(target)
+            for target in values
+            if str(target or "").strip() in node_id_set
+        ]
 
-        row = {
-            "id": node_id,
-            "name": str(node.get("name") or node_id),
-            "type": str(node.get("type") or ""),
-            "status": status,
-        }
-        existing = existing_by_id.get(node_id)
-        if isinstance(existing, dict) and existing.get("subscription_id") is not None:
-            row["subscription_id"] = existing["subscription_id"]
-        projected.append(row)
-    return projected
+    current_id = str(getattr(run, "current_step_id", "") or "").strip()
+    pending = list(entry_ids)
+    if current_id in node_id_set and current_id not in pending:
+        pending.append(current_id)
+    active_ids: set[str] = set()
+    while pending:
+        node_id = pending.pop()
+        if node_id in active_ids:
+            continue
+        active_ids.add(node_id)
+        pending.extend(selected_targets(node_id))
+
+    return [
+        step
+        for step in steps
+        if str(step.get("status") or "").strip().lower() != "pending"
+        or str(step.get("id") or "") in active_ids
+    ]
 
 
 def _step_visibility(step: dict[str, Any]) -> str:
@@ -279,6 +361,61 @@ def _workflow_result_record(value: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _workflow_final_output_attachments(
+    value: Any,
+    *,
+    entity_id: str,
+) -> list[dict[str, Any]]:
+    """Convert durable file records in the final result to Chat attachments."""
+    from packages.core.workspace_chat.notifiers import (
+        _artifacts_as_attachments,
+        extract_artifacts_for_chat,
+    )
+
+    root = _workflow_result_record(value) if isinstance(value, str) else value
+    artifacts: list[dict[str, Any]] = []
+    preferred_assets: list[dict[str, Any]] = []
+    preferred_artifacts: list[dict[str, Any]] = []
+    visited: set[int] = set()
+
+    def extract(candidate: Any) -> list[dict[str, Any]]:
+        if isinstance(candidate, dict):
+            return extract_artifacts_for_chat(candidate)
+        if isinstance(candidate, (list, tuple)):
+            return [
+                artifact
+                for item in candidate
+                for artifact in extract(item)
+            ]
+        return []
+
+    def visit(candidate: Any, depth: int) -> None:
+        if candidate is None or depth > 6:
+            return
+        if isinstance(candidate, (list, tuple)):
+            for item in candidate:
+                visit(item, depth + 1)
+            return
+        if not isinstance(candidate, dict) or id(candidate) in visited:
+            return
+        visited.add(id(candidate))
+        artifacts.extend(extract_artifacts_for_chat(candidate))
+        for key, nested in candidate.items():
+            normalized_key = str(key).strip().lower()
+            if normalized_key == "assets":
+                preferred_assets.extend(extract(nested))
+            elif normalized_key in _FINAL_ARTIFACT_CONTAINER_KEYS:
+                preferred_artifacts.extend(extract(nested))
+            if isinstance(nested, (dict, list, tuple)):
+                visit(nested, depth + 1)
+
+    visit(root, 0)
+    return _artifacts_as_attachments(
+        preferred_assets + preferred_artifacts or artifacts,
+        entity_id=entity_id,
+    )
 
 
 def workflow_result_chat_projection(
@@ -371,7 +508,7 @@ def workflow_result_chat_projection(
         "workflow_id": workflow_id,
         "workflow_name": workflow_name,
         "run_id": run_id,
-        "url": f"/flows?workflow={workflow_id}&run={run_id}",
+        "url": _workflow_run_url(run),
         "status": str(getattr(run, "status", None) or "completed"),
         "kind": result_kind,
         "title": result_title or None,
@@ -386,11 +523,20 @@ def workflow_result_chat_projection(
 
 
 def _workflow_business_state(run: Any) -> tuple[str, dict[str, Any]]:
-    variables = run.variables if isinstance(run.variables, dict) else {}
+    raw_variables = getattr(run, "variables", None)
+    variables = raw_variables if isinstance(raw_variables, dict) else {}
     project = variables.get("project") if isinstance(variables.get("project"), dict) else {}
     state = project.get("state") if isinstance(project.get("state"), dict) else {}
     outcome = str(state.get("business_outcome") or "in_progress").strip().lower()
     retry_state = state.get("retry_state")
+    if not isinstance(retry_state, dict):
+        current_step_id = str(getattr(run, "current_step_id", "") or "")
+        step_results = (
+            run.step_results if isinstance(run.step_results, dict) else {}
+        )
+        current_result = step_results.get(current_step_id)
+        if isinstance(current_result, dict):
+            retry_state = current_result.get("retry_state")
     return outcome or "in_progress", retry_state if isinstance(retry_state, dict) else {}
 
 
@@ -720,7 +866,13 @@ async def _project_wait_action(
 ) -> None:
     if not context.get("wait_bridge") or result.get("status") != "paused":
         return
-    config = step.get("config") if isinstance(step.get("config"), dict) else {}
+    from packages.core.services.workflow_chat_approvals import (
+        workflow_chat_wait_config,
+    )
+
+    config = workflow_chat_wait_config(run, step)
+    if config is None:
+        return
     wait_config = (
         result.get("wait_config")
         if isinstance(result.get("wait_config"), dict)
@@ -736,6 +888,7 @@ async def _project_wait_action(
             Message.meta["workflow_run_id"].as_string() == str(run.id),
             Message.meta["workflow_step_id"].as_string() == step_id,
             Message.pending_action.isnot(None),
+            Message.resolved_at.is_(None),
         ).limit(1)
     )).scalar_one_or_none()
     if existing:
@@ -780,6 +933,13 @@ async def _project_wait_action(
         "prompt": message,
         "options": [str(option) for option in options],
     }
+    if isinstance(result.get("collection_fields"), list):
+        pending_action["inputs"] = result["collection_fields"]
+        pending_action["values"] = result.get("collection_values") or {}
+        pending_action["title"] = str(step.get("name") or "补充资料")
+        pending_action["collection_round"] = result.get("collection_round")
+    if context.get("nested") is True and context.get("host_run_id"):
+        pending_action["workflow_chat_host_run_id"] = str(context["host_run_id"])
     review_in_history = (
         kind == PendingActionKind.WORKFLOW_APPROVAL
         and result.get("review") is not None
@@ -791,9 +951,11 @@ async def _project_wait_action(
         pending_action["review"] = result["review"]
     if result.get("review_title") is not None:
         pending_action["review_title"] = str(result["review_title"])
+    if config.get("review_read_only") is True:
+        pending_action["review_read_only"] = True
     snapshot = run.definition_snapshot if isinstance(run.definition_snapshot, dict) else {}
     workflow_name = str(snapshot.get("name") or run.workflow_id)
-    workflow_url = f"/flows?workflow={run.workflow_id}"
+    workflow_url = _workflow_run_url(run)
     node_name = str(step.get("name") or step_id)
     hitl_message = await add_message(
         db,
@@ -823,6 +985,7 @@ async def _project_wait_action(
         "tool": "workflow",
         "options": [str(option) for option in options],
         "review_title": str(result.get("review_title") or node_name),
+        "review_read_only": config.get("review_read_only") is True,
         "workflow": {
             "id": run.workflow_id,
             "name": workflow_name,
@@ -872,11 +1035,16 @@ async def _project_final_output(
         ).limit(1)
     )).scalar_one_or_none()
     output, workflow_result = workflow_result_chat_projection(run, raw_output)
+    attachments = _workflow_final_output_attachments(
+        raw_output,
+        entity_id=str(getattr(run, "entity_id", "") or ""),
+    )
     if existing:
         # Runs completed before structured result cards were introduced stored
         # the full JSON payload directly in Chat. Upgrade that projection when
         # the same run is observed again without creating a duplicate message.
         existing_meta = dict(existing.meta or {})
+        changed = False
         if not isinstance(existing_meta.get("workflow_result"), dict):
             existing.content = output
             existing.refs = [
@@ -894,6 +1062,12 @@ async def _project_final_output(
                 "workflow_result": workflow_result,
             }
             flag_modified(existing, "meta")
+            changed = True
+        if attachments and existing.attachments != attachments:
+            existing.attachments = attachments
+            changed = True
+        if changed:
+            await _notify_update(db, existing)
         return
     subscription_id = str((activity.meta or {}).get("workflow_current_subscription_id") or "") or None
     from packages.core.services.conversation_messages import add_message
@@ -903,6 +1077,7 @@ async def _project_final_output(
         str(context["conversation_id"]),
         role="assistant" if subscription_id else "system",
         content=output,
+        attachments=attachments or None,
         author_subscription_id=subscription_id,
         message_kind="agent_update",
         refs=[
@@ -932,6 +1107,16 @@ async def project_workflow_step(
     context = _entrypoint_context(run)
     visibility = _step_visibility(step)
     if context is None or visibility == "hidden":
+        return
+    if context.get("nested") is True:
+        if result is not None:
+            await _project_wait_action(
+                db,
+                run=run,
+                context=context,
+                step=step,
+                result=result,
+            )
         return
     settings = workflow_projection_settings(context)
     activity = await _activity_message(db, run, context)
@@ -1011,6 +1196,11 @@ async def project_workflow_run_status(
     await db.flush()
     try:
         async with db.begin_nested():
+            from packages.core.services.workflow_runtime_approvals import project_workflow_runtime_approval
+            await project_workflow_runtime_approval(
+                db, run=run, step={"id": run.current_step_id},
+                result=(run.step_results or {}).get(run.current_step_id),
+            )
             await _project_workflow_run_status_chat(db, run=run)
     except Exception:
         logger.debug("Workflow Chat run projection skipped", exc_info=True)
@@ -1023,7 +1213,7 @@ async def _project_workflow_run_status_chat(
 ) -> None:
     """Project run status into Chat inside the caller's UI savepoint."""
     context = _entrypoint_context(run)
-    if context is None:
+    if context is None or context.get("nested") is True:
         return
     activity = await _activity_message(db, run, context)
     if activity is None:
@@ -1043,12 +1233,7 @@ async def _project_workflow_run_status_chat(
     meta["workflow_attempt_number"] = run.effective_attempt_number
     if run.effective_retry_of_run_id:
         meta["workflow_retry_of_run_id"] = run.effective_retry_of_run_id
-    retry_from_step_id = str(
-        retry_state.get("retry_from_step_id")
-        or run.effective_retry_from_step_id
-        or (run.current_step_id if run.status == "failed" else "")
-        or ""
-    ).strip()
+    retry_from_step_id = workflow_retry_from_step_id(run, retry_state)
     if retry_from_step_id:
         meta["workflow_retry_from_step_id"] = retry_from_step_id
     raw_workflow_error = _workflow_error_payload(run)

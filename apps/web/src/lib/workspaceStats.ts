@@ -10,6 +10,15 @@ export function workspaceStatAttentionPresentation(
   status: string,
 ): WorkspaceStatAttentionPresentation | null {
   if (status === "fresh") return null;
+  if (["assessing", "assessment_error", "configuration_error"].includes(status)) {
+    return { type: status === "assessing" ? "info" : "danger", label: t(`page.workspace_stats.${status}`) };
+  }
+  if (status === "insufficient_evidence") {
+    return { type: "warning", label: t("page.workspace_stats.insufficient_evidence") };
+  }
+  if (status === "not_assessed") {
+    return { type: "info", label: t("page.workspace_stats.not_assessed") };
+  }
   if (status === "stale") {
     return { type: "warning", label: t("page.workspace_stats.stale") };
   }
@@ -24,8 +33,12 @@ export function workspaceStatAttentionPresentation(
 
 export function formatWorkspaceStatValue(
   stat: WorkspaceStatDefinition,
-  value = stat.current_value,
+  value?: number | null,
 ): string {
+  if (value === undefined) {
+    if (["insufficient_evidence", "not_assessed"].includes(stat.freshness_status)) return "—";
+    value = stat.current_value;
+  }
   if (value === null || value === undefined || !Number.isFinite(Number(value))) {
     return "—";
   }
@@ -35,4 +48,11 @@ export function formatWorkspaceStatValue(
   if (stat.value_type === "percent") return `${formatted}%`;
   if (stat.value_type === "currency") return `${stat.unit || ""}${formatted}`;
   return stat.unit ? `${formatted} ${stat.unit}` : formatted;
+}
+
+export function workspaceStatAssessmentNote(stat: WorkspaceStatDefinition): string | null {
+  return stat.last_assessment?.evidence?.gaps?.join(" · ") || (
+    stat.collector_type === "agent_review" && !stat.last_assessment
+      ? t("page.workspace_stats.not_assessed") : null
+  );
 }

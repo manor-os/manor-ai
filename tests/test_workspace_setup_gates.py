@@ -8,6 +8,7 @@ import pytest
 from packages.core.constants.blueprints import installed_blueprint_job_id
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan
+from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.workspace import Workspace
 from packages.core.plans.executor import PlanExecutor
 from packages.core.services.entity_service import (
@@ -17,6 +18,7 @@ from packages.core.services.entity_service import (
 from packages.core.services.workspace_readiness import (
     WorkspaceReadinessPartStatus,
     evaluate_workspace_blocking_setup,
+    evaluate_workspace_automatic_setup_state,
     normalize_workspace_setup_task_key,
 )
 from packages.core.strategist.service import _restrict_proposal_to_setup_work
@@ -62,6 +64,62 @@ def test_setup_request_keys_use_one_normalized_shape() -> None:
         "Prepare-Workspace Identity"
     ) == "prepare_workspace_identity"
     assert normalize_workspace_setup_task_key(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_automatic_setup_state_tracks_the_installed_job_lifecycle(
+    db_session,
+) -> None:
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=generate_ulid(),
+        name="Automatic setup state",
+        status="active",
+        settings={},
+    )
+    job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=installed_blueprint_job_id("prepare-assets", workspace.id),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        name="Prepare assets",
+        job_type="manual",
+        execution_target={"workspace_id": workspace.id},
+        enabled=True,
+    )
+    db_session.add_all([workspace, job])
+    await db_session.flush()
+    checks = [{"setup_job_id": "prepare-assets"}]
+
+    assert await evaluate_workspace_automatic_setup_state(
+        db_session,
+        workspace,
+        checks,
+    ) == "pending"
+
+    job.last_status = "running"
+    await db_session.flush()
+    assert await evaluate_workspace_automatic_setup_state(
+        db_session,
+        workspace,
+        checks,
+    ) == "running"
+
+    job.last_status = "error"
+    await db_session.flush()
+    assert await evaluate_workspace_automatic_setup_state(
+        db_session,
+        workspace,
+        checks,
+    ) == "retrying"
+
+    job.enabled = False
+    await db_session.flush()
+    assert await evaluate_workspace_automatic_setup_state(
+        db_session,
+        workspace,
+        checks,
+    ) == "failed"
 
 
 def test_workspace_setup_monitor_notifies_once_per_connection_incident() -> None:
@@ -389,7 +447,7 @@ async def test_plan_executor_does_not_advance_materialized_plan_while_setup_bloc
 
 
 @pytest.mark.asyncio
-async def test_plan_executor_stops_polling_when_workspace_is_paused(
+async def test_plan_executor_defers_automatic_work_when_workspace_is_paused(
     db_session,
 ) -> None:
     entity_id = generate_ulid()
@@ -421,7 +479,9 @@ async def test_plan_executor_stops_polling_when_workspace_is_paused(
 
     assert result == {
         "plan_id": plan.id,
-        "status": "workspace_unavailable",
-        "next_action": "stop",
+        "status": "workspace_autonomy_paused",
+        "next_action": "schedule_self",
+        "delay_seconds": 60,
+        "continuation_staged": True,
     }
     assert plan.status == "draft"

@@ -27,6 +27,7 @@ interface ChatScrollRailProps {
   containerRef: RefObject<HTMLElement | null>;
   markers?: ChatScrollRailMarker[];
   className?: string;
+  onNavigate?: (top: number) => void;
 }
 
 interface SampledRailMarker {
@@ -123,6 +124,7 @@ export default function ChatScrollRail({
   containerRef,
   markers = [],
   className = "",
+  onNavigate,
 }: ChatScrollRailProps) {
   const [snapshot, setSnapshot] = useState({
     scrollTop: 0,
@@ -234,7 +236,8 @@ export default function ChatScrollRail({
         entry.sourceIndex,
       );
       if (targetTop != null) {
-        el.scrollTo({ top: targetTop, behavior: "smooth" });
+        if (onNavigate) onNavigate(targetTop);
+        else el.scrollTo({ top: targetTop, behavior: "smooth" });
         return;
       }
     }
@@ -243,10 +246,9 @@ export default function ChatScrollRail({
       : sampledMarkers.length <= 1
         ? 0
         : index / (sampledMarkers.length - 1);
-    el.scrollTo({
-      top: ratio * Math.max(0, el.scrollHeight - el.clientHeight),
-      behavior: "smooth",
-    });
+    const top = ratio * Math.max(0, el.scrollHeight - el.clientHeight);
+    if (onNavigate) onNavigate(top);
+    else el.scrollTo({ top, behavior: "smooth" });
   };
 
   if (!isScrollable && sampledMarkers.length < 4) return null;

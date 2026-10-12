@@ -49,21 +49,31 @@ DEFAULTS = {
 
 _MODEL_INPUT_MODALITIES = {
     "openai/gpt-4": frozenset({"text"}),
+    "openai/gpt-6-astra": frozenset({"text", "image"}),
     "openai/gpt-5.6-sol": frozenset({"text", "image"}),
     "openai/gpt-5.6-terra": frozenset({"text", "image"}),
     "openai/gpt-5.6-luna": frozenset({"text", "image"}),
     "openai/gpt-5.5": frozenset({"text", "image"}),
     "openai/gpt-5.5-pro": frozenset({"text", "image"}),
-    "moonshotai/kimi-k3": frozenset({"text", "image"}),
+    "moonshotai/kimi-k3": frozenset({"text", "image", "video"}),
+    "moonshotai/kimi-k2.6": frozenset({"text", "image", "video"}),
     "deepseek/deepseek-v4-pro": frozenset({"text"}),
     "deepseek/deepseek-v4-flash": frozenset({"text"}),
     # Product Catalog IDs stay gateway-neutral. Vercel maps these Qwen IDs to
     # its ``alibaba/*`` namespace at the provider boundary.
-    "qwen/qwen3.8-max": frozenset({"text", "image"}),
-    "qwen/qwen3.7-flash": frozenset({"text", "image"}),
+    "qwen/qwen3.8-max": frozenset({"text", "image", "video"}),
+    "qwen/qwen3.7-flash": frozenset({"text", "image", "video"}),
+    "qwen/qwen3.6-plus": frozenset({"text", "image", "video"}),
     # Accept settings saved during the short-lived Vercel-canonical migration.
-    "alibaba/qwen3.8-max": frozenset({"text", "image"}),
-    "alibaba/qwen3.7-flash": frozenset({"text", "image"}),
+    "alibaba/qwen3.8-max": frozenset({"text", "image", "video"}),
+    "alibaba/qwen3.7-flash": frozenset({"text", "image", "video"}),
+    "alibaba/qwen3.6-plus": frozenset({"text", "image", "video"}),
+    # Gemini chat models accept video for understanding via the native API.
+    "google/gemini-3.6-flash": frozenset({"text", "image", "video"}),
+    "google/gemini-3.5-flash-lite": frozenset({"text", "image", "video"}),
+    "google/gemini-2.5-pro": frozenset({"text", "image", "video"}),
+    "google/gemini-2.5-flash": frozenset({"text", "image", "video"}),
+    "google/gemini-2.5-flash-lite": frozenset({"text", "image", "video"}),
 }
 _MODEL_INPUT_MODALITY_PREFIXES = (
     ("openai/gpt-4o", frozenset({"text", "image"})),
@@ -97,9 +107,12 @@ CATALOG = {
     "primary": [
         # First entry = the factory default in ``DEFAULTS``; keep them in sync.
         {"id": "openai/gpt-5.6-luna",          "name": "GPT-5.6 Luna",       "tier": "budget",   "quality": "good",    "tag": "Recommended"},
+        {"id": "openai/gpt-6-astra",           "name": "GPT-6 Astra",        "tier": "premium",  "quality": "highest", "tag": "New"},
         {"id": "anthropic/claude-sonnet-4.6",  "name": "Claude Sonnet 4.6",  "tier": "balanced", "quality": "high",    "tag": "Balanced"},
-        {"id": "anthropic/claude-fable-5",     "name": "Claude Fable 5",     "tier": "premium",  "quality": "highest", "tag": "Most capable"},
-        {"id": "anthropic/claude-opus-5",      "name": "Claude Opus 5",      "tier": "premium",  "quality": "highest", "tag": "New"},
+        {"id": "anthropic/claude-fable-5.1",   "name": "Claude Fable 5.1",   "tier": "premium",  "quality": "highest", "tag": "Most capable"},
+        {"id": "anthropic/claude-fable-5",     "name": "Claude Fable 5",     "tier": "premium",  "quality": "highest", "tag": ""},
+        {"id": "anthropic/claude-opus-5.5",    "name": "Claude Opus 5.5",    "tier": "premium",  "quality": "highest", "tag": "New"},
+        {"id": "anthropic/claude-opus-5",      "name": "Claude Opus 5",      "tier": "premium",  "quality": "highest", "tag": ""},
         {"id": "anthropic/claude-opus-4.7",    "name": "Claude Opus 4.7",    "tier": "premium",  "quality": "highest", "tag": ""},
         {"id": "openai/gpt-5.6-sol",           "name": "GPT-5.6 Sol",        "tier": "premium",  "quality": "highest", "tag": ""},
         {"id": "openai/gpt-5.6-terra",         "name": "GPT-5.6 Terra",      "tier": "balanced", "quality": "high",    "tag": "Value"},
@@ -136,7 +149,6 @@ CATALOG = {
         {"id": "google/gemini-3.5-flash-lite", "name": "Gemini 3.5 Flash Lite", "tier": "budget", "quality": "good",   "tag": "New"},
         {"id": "google/gemini-2.5-flash",     "name": "Gemini 2.5 Flash",   "tier": "budget",   "quality": "good",    "tag": ""},
         {"id": "google/gemini-2.5-flash-lite", "name": "Gemini Flash Lite",  "tier": "cheap",    "quality": "basic",   "tag": ""},
-        {"id": "openai/gpt-4",                "name": "GPT-4",              "tier": "premium",  "quality": "high",    "tag": ""},
     ],
     # The product catalog includes native/BYOK models alongside the subset
     # that can use Vercel's image protocol.
@@ -156,6 +168,7 @@ CATALOG = {
         {"id": "openai/tts-1",    "name": "OpenAI TTS",    "tier": "budget",   "quality": "good", "tag": "Fast"},
     ],
     "audio": [
+        {"id": "suno/music", "name": "Suno Music", "tier": "premium", "quality": "highest", "tag": "Full song"},
         {"id": "google/lyria-3-clip-preview", "name": "Lyria 3 Clip", "tier": "balanced", "quality": "high", "tag": "Recommended"},
         {"id": "google/lyria-3-pro-preview", "name": "Lyria 3 Pro", "tier": "premium", "quality": "highest", "tag": "Full song"},
         {"id": "openai/gpt-audio-mini", "name": "GPT Audio Mini", "tier": "budget", "quality": "good", "tag": "Flexible"},
@@ -255,8 +268,10 @@ CATALOG = {
     ],
     # Keep native/BYOK video choices in addition to Vercel-compatible Seedance.
     "video": [
+        {"id": "bytedance/seedance-2.5",     "name": "Seedance 2.5",     "tier": "premium", "quality": "highest", "tag": "New"},
         {"id": "bytedance/seedance-2.0",     "name": "Seedance 2.0",     "tier": "balanced", "quality": "high",    "tag": "Recommended"},
         {"id": "bytedance/seedance-2.0-fast", "name": "Seedance 2.0 Fast","tier": "budget",  "quality": "good",    "tag": "Fast"},
+        {"id": "bytedance/seedance-v1.0-pro-fast", "name": "Seedance v1.0 Pro Fast", "tier": "cheap", "quality": "good", "tag": "Cheapest"},
         {"id": "kwaivgi/kling-v3.0-std", "name": "Kling v3.0 Standard", "tier": "balanced", "quality": "high", "tag": "New"},
         {"id": "kwaivgi/kling-v3.0-pro", "name": "Kling v3.0 Pro", "tier": "premium", "quality": "highest", "tag": "HQ"},
         {"id": "atlascloud/wan-2.2-turbo-spicy", "name": "Wan 2.2 Turbo I2V (Atlas)", "tier": "cheap", "quality": "basic", "tag": "Image required · BYOK"},
@@ -282,12 +297,65 @@ CATALOG = {
 }
 
 
+# This describes verified native video understanding, not whether Manor has
+# attached a video to the current request. None means unverified, not unsupported.
+# Video generation is a separate role.
+for _chat_role in ("primary", "worker"):
+    for _chat_model in CATALOG[_chat_role]:
+        _modalities = model_input_modalities(_chat_model["id"])
+        _chat_model.setdefault("capabilities", {})["video_input"] = (
+            True if _modalities and "video" in _modalities else None
+        )
+
+
 # These roles only accept exact product-catalog selections. Their BYOK
 # settings reuse a catalog model ID with different credentials; unlike the
 # general LLM/embedding roles, they do not support arbitrary custom model IDs.
 # Keeping the constraint here also makes preferences saved by an older catalog
 # safely fall through to the current default instead of routing a removed model.
 CATALOG_ONLY_ROLES = frozenset({"image", "voice", "audio", "sfx", "stt", "video"})
+
+# Text-completion roles whose models run the agent loop. Every model they
+# list must have a context window below (guard-tested).
+CONTEXT_WINDOW_ROLES = ("primary", "worker")
+
+# Input context window in tokens per catalog model: the smallest value across
+# the gateways a call can route through (Vercel ``context_window``, OpenRouter
+# ``context_length`` / ``top_provider.context_length``), snapshot 2026-09-30.
+# The pricing syncs refresh live values into their caches; lookups take the
+# smaller of this snapshot and the live data
+# (``packages/core/services/model_context_window.py``).
+MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+    "anthropic/claude-fable-5": 1_000_000,
+    "anthropic/claude-fable-5.1": 1_000_000,
+    "anthropic/claude-haiku-4.5": 200_000,
+    "anthropic/claude-opus-4.6": 1_000_000,
+    "anthropic/claude-opus-4.7": 1_000_000,
+    "anthropic/claude-opus-5": 1_000_000,
+    "anthropic/claude-opus-5.5": 1_000_000,
+    "anthropic/claude-sonnet-4.6": 1_000_000,
+    "deepseek/deepseek-v4-flash": 1_000_000,
+    "deepseek/deepseek-v4-pro": 1_000_000,
+    "google/gemini-2.5-flash": 1_000_000,
+    "google/gemini-2.5-flash-lite": 1_048_576,
+    "google/gemini-2.5-pro": 1_048_576,
+    "google/gemini-3.5-flash-lite": 1_000_000,
+    "google/gemini-3.6-flash": 1_000_000,
+    "moonshotai/kimi-k2.6": 262_000,
+    "moonshotai/kimi-k3": 1_000_000,
+    "openai/gpt-4.1": 1_047_576,
+    "openai/gpt-4.1-mini": 1_047_576,
+    "openai/gpt-4o": 128_000,
+    "openai/gpt-5.5": 1_000_000,
+    "openai/gpt-5.5-pro": 1_000_000,
+    "openai/gpt-5.6-luna": 1_050_000,
+    "openai/gpt-5.6-sol": 1_050_000,
+    "openai/gpt-5.6-terra": 1_050_000,
+    "openai/gpt-6-astra": 1_050_000,
+    "qwen/qwen3.6-plus": 1_000_000,
+    "qwen/qwen3.7-flash": 991_000,
+    "qwen/qwen3.8-max": 262_144,
+}
 
 
 def model_preference_is_available(
@@ -310,6 +378,31 @@ def model_preference_is_available(
 
 
 VIDEO_MODEL_CAPABILITIES = {
+    "bytedance/seedance-2.5": {
+        "text_to_video": True,
+        "requires_first_frame": False,
+        "first_frame": True,
+        "last_frame": True,
+        "reference_images": True,
+        "max_reference_images": 30,
+        "reference_videos": True,
+        "max_reference_videos": 10,
+        "max_reference_video_total_seconds": 30,
+        "native_audio": True,
+        "native_dialogue": False,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": True,
+        "max_audio_references": 10,
+        "max_audio_reference_total_seconds": 30,
+        "audio_requires_visual_reference": False,
+        "generation_schema": {
+            "duration": {
+                "text_to_video": {"type": "integer", "minimum": 4, "maximum": 30, "default": 5},
+                "image_to_video": {"type": "integer", "minimum": 4, "maximum": 30, "default": 5},
+            }
+        },
+    },
     "bytedance/seedance-2.0": {
         "text_to_video": True,
         "requires_first_frame": False,
@@ -341,6 +434,31 @@ VIDEO_MODEL_CAPABILITIES = {
         "native_subtitles": False,
         "audio_reference": True,
         "max_audio_references": 3,
+    },
+    "bytedance/seedance-v1.0-pro-fast": {
+        "text_to_video": True,
+        "requires_first_frame": False,
+        "first_frame": True,
+        "last_frame": False,
+        "reference_images": False,
+        "max_reference_images": 0,
+        "reference_videos": False,
+        "max_reference_videos": 0,
+        "native_audio": False,
+        "native_dialogue": False,
+        "native_narration": False,
+        "native_subtitles": False,
+        "audio_reference": False,
+        "max_audio_references": 0,
+        "generation_schema": {
+            "duration": {
+                "image_to_video": {
+                    "type": "integer",
+                    "enum": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+                    "default": 5,
+                }
+            }
+        },
     },
     "kwaivgi/kling-v3.0-std": {
         "text_to_video": True,

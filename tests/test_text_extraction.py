@@ -2,9 +2,12 @@
 
 import json
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from packages.core.services import text_extraction
 from packages.core.services.text_extraction import extract_text
 
 
@@ -104,6 +107,69 @@ async def test_extract_json(tmp_file):
     parsed = json.loads(result)
     assert parsed["key"] == "value"
     assert parsed["nested"]["a"] == 1
+
+
+async def test_extract_pdf_keeps_native_text_without_ocr(tmp_file, monkeypatch):
+    path = tmp_file(b"%PDF-native", ".pdf")
+    monkeypatch.setattr(text_extraction, "_extract_pdf_native", lambda _path, **_kwargs: ("Native PDF text", 1))
+
+    def unexpected_ocr(_path, _page_count):
+        raise AssertionError("OCR must not run when native PDF text exists")
+
+    monkeypatch.setattr(text_extraction, "_ocr_pdf_sync", unexpected_ocr)
+
+    assert await extract_text(path) == "Native PDF text"
+
+
+async def test_extract_pdf_uses_ocr_when_native_text_is_blank(tmp_file, monkeypatch):
+    path = tmp_file(b"%PDF-image-only", ".pdf")
+    seen = {}
+    monkeypatch.setattr(text_extraction, "_extract_pdf_native", lambda _path, **_kwargs: ("\n\n", 3))
+
+    def fake_ocr(ocr_path, page_count):
+        seen.update(path=ocr_path, page_count=page_count)
+        return "Recognized slide text"
+
+    monkeypatch.setattr(text_extraction, "_ocr_pdf_sync", fake_ocr)
+
+    assert await extract_text(path) == "Recognized slide text"
+    assert seen == {"path": path, "page_count": 3}
+
+
+async def test_extract_pdf_preserves_native_result_when_ocr_is_unavailable(tmp_file, monkeypatch):
+    path = tmp_file(b"%PDF-image-only", ".pdf")
+    monkeypatch.setattr(text_extraction, "_extract_pdf_native", lambda _path, **_kwargs: ("\n\n", 3))
+    monkeypatch.setattr(text_extraction, "_ocr_pdf_sync", lambda _path, _page_count: "")
+
+    assert await extract_text(path) == "\n\n"
+
+
+def test_pdf_ocr_renders_and_recognizes_each_page(monkeypatch):
+    monkeypatch.setattr(
+        text_extraction.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"pdftoppm", "tesseract"} else None,
+    )
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command[0].endswith("tesseract") and command[1] == "--list-langs":
+            return SimpleNamespace(returncode=0, stdout="eng\nchi_sim\n", stderr="")
+        if command[0].endswith("pdftoppm"):
+            Path(f"{command[-1]}.png").write_bytes(b"fake png")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        page_name = Path(command[1]).stem
+        return SimpleNamespace(returncode=0, stdout=f"Text from {page_name}", stderr="")
+
+    monkeypatch.setattr(text_extraction.subprocess, "run", fake_run)
+
+    result = text_extraction._ocr_pdf_sync("/tmp/image-only.pdf", 2)
+
+    assert result == "Text from page-0001\n\nText from page-0002"
+    ocr_calls = [call for call in calls if call[0].endswith("tesseract") and call[1] != "--list-langs"]
+    assert len(ocr_calls) == 2
+    assert all(call[-2:] == ["-l", "eng+chi_sim"] for call in ocr_calls)
 
 
 async def test_unsupported_type(tmp_file):

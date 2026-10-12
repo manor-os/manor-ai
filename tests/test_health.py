@@ -32,6 +32,7 @@ async def test_health_reports_service_role(client):
 
 @pytest.mark.asyncio
 async def test_client_config_defaults_flows_to_coming_soon_in_prod(client, monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     monkeypatch.delenv("FLOWS_AVAILABLE", raising=False)
     monkeypatch.setenv("MANOR_ENV", "prod")
 
@@ -39,6 +40,29 @@ async def test_client_config_defaults_flows_to_coming_soon_in_prod(client, monke
 
     assert response.status_code == 200
     assert response.json()["flows_available"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("environment", ["prod", "production"])
+async def test_oss_production_enables_stable_flows(monkeypatch, environment):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setenv("MANOR_ENV", environment)
+    monkeypatch.delenv("FLOWS_AVAILABLE", raising=False)
+    monkeypatch.delenv("FLOWS_RELEASED", raising=False)
+    config = await health_router.client_config()
+    assert config["flows_available"] is True
+    assert config["flows_released"] is True
+
+
+@pytest.mark.asyncio
+async def test_oss_flows_respects_explicit_administrator_disable(monkeypatch):
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setenv("MANOR_ENV", "prod")
+    monkeypatch.setenv("FLOWS_AVAILABLE", "false")
+    monkeypatch.setenv("FLOWS_RELEASED", "off")
+    config = await health_router.client_config()
+    assert config["flows_available"] is False
+    assert config["flows_released"] is False
 
 
 @pytest.mark.asyncio
@@ -135,7 +159,7 @@ async def test_system_info(client):
     data = resp.json()
     assert "system" in data
     system = data["system"]
-    assert system["version"] == "0.1.0"
+    assert system["version"] == "0.1.1"
     assert "uptime_seconds" in system
     assert isinstance(system["uptime_seconds"], int)
     assert system["uptime_seconds"] >= 0

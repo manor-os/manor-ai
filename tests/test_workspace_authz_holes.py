@@ -141,6 +141,68 @@ async def test_expired_workspace_owner_cannot_manage(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_workspace_delete_capability_matches_effective_delete_permission(client: AsyncClient):
+    owner_headers = await _auth(client, "wsdelete_capability_owner")
+    owner = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    entity_id = owner["entity_id"]
+    owner_id = owner.get("user_id") or owner.get("id")
+    workspace_id = await _make_members_only_workspace(
+        entity_id, "Delete capability", owner_id,
+    )
+    admin = await _create_entity_user(entity_id, "wsdelete_capability_admin", role="admin")
+    workspace_owner = await _create_entity_user(
+        entity_id, "wsdelete_capability_workspace_owner", role="member",
+    )
+    viewer = await _create_entity_user(entity_id, "wsdelete_capability_viewer", role="member")
+    async with db_module.async_session() as db:
+        db.add_all([
+            WorkspaceStaff(
+                workspace_id=workspace_id, user_id=admin["id"],
+                role="viewer", status="active",
+            ),
+            WorkspaceStaff(
+                workspace_id=workspace_id, user_id=workspace_owner["id"],
+                role="owner", status="active",
+            ),
+            WorkspaceStaff(
+                workspace_id=workspace_id, user_id=viewer["id"],
+                role="viewer", status="active",
+            ),
+        ])
+        await db.commit()
+
+    actors = [
+        (owner_headers, True, True),
+        (admin["headers"], False, False),
+        (workspace_owner["headers"], True, True),
+        (viewer["headers"], False, False),
+    ]
+    for headers, can_manage, can_delete in actors:
+        detail = await client.get(f"/api/v1/workspaces/{workspace_id}", headers=headers)
+        assert detail.status_code == 200, detail.text
+        listing = await client.get("/api/v1/workspaces", headers=headers)
+        assert listing.status_code == 200, listing.text
+        row = next(item for item in listing.json() if item["id"] == workspace_id)
+        for payload in (detail.json(), row):
+            assert payload["can_manage"] is can_manage
+            assert payload["can_delete"] is can_delete
+
+    admin_denied = await client.delete(
+        f"/api/v1/workspaces/{workspace_id}", headers=admin["headers"],
+    )
+    assert admin_denied.status_code == 403
+    deleted = await client.delete(
+        f"/api/v1/workspaces/{workspace_id}", headers=workspace_owner["headers"],
+    )
+    assert deleted.status_code == 204
+    trash = await client.get("/api/v1/workspaces/trash/list", headers=owner_headers)
+    assert trash.status_code == 200, trash.text
+    trashed = next(item for item in trash.json() if item["id"] == workspace_id)
+    assert trashed["deleted_at"] is not None
+    assert trashed["can_delete"] is False
+
+
+@pytest.mark.asyncio
 async def test_entity_wide_task_list_excludes_unreadable_workspaces(client: AsyncClient):
     """GET /tasks with no workspace_id must not surface members_only tasks the
     caller can't read — only entity-level (workspace-less) tasks + readable

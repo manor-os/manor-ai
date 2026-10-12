@@ -12,6 +12,7 @@ from packages.core.ai.runtime.skill_forcing import (
     runtime_resolve_manual_skill_refs,
     runtime_strip_manual_skill_tokens,
 )
+from packages.core.ai.runtime.surfaces import ChatSurface
 
 
 class ManualSkillResolutionError(ValueError):
@@ -41,6 +42,7 @@ async def prepare_chat_manual_skill_turn(
     *,
     entity_id: str,
     agent_id: str | None,
+    workspace_id: str | None = None,
     message: str,
     manual_skill_ids: str | None = None,
     manual_skill_refs: str | None = None,
@@ -54,8 +56,14 @@ async def prepare_chat_manual_skill_turn(
             db,
             entity_id=entity_id,
             agent_id=agent_id,
+            workspace_id=workspace_id,
             user_id=user_id,
             user_role=user_role,
+            surface=(
+                ChatSurface.WORKSPACE_CHAT
+                if workspace_id
+                else ChatSurface.GLOBAL_OWNER_CHAT
+            ),
             manual_skill_ids=manual_skill_ids,
             manual_skill_refs=manual_skill_refs,
         )

@@ -1,5 +1,109 @@
 from __future__ import annotations
 
+import json
+from typing import Any
+
+
+# Provider transcripts only carry system/user/assistant/tool roles, and
+# mid-conversation system messages are not portable, so Runtime feedback rides
+# in a user-role message. Without an explicit source the model reads a raw
+# diagnostic as something the user typed and answers it to the user.
+RUNTIME_HOST_FEEDBACK_TAG = "runtime-feedback"
+RUNTIME_HOST_FEEDBACK_KEY = "runtime_feedback"
+RUNTIME_HOST_FEEDBACK_NOTE = (
+    "Written by the Manor runtime, not by the user; the user has not seen it. "
+    "Act on it silently and continue the user's latest request. Never attribute "
+    "it to the user or mention it in the reply."
+)
+
+
+def runtime_host_feedback_message(content: str | dict[str, Any]) -> dict[str, str]:
+    """Build a user-role transcript message that is marked as Runtime-authored.
+
+    Structured diagnostics stay one JSON object with every original key, so
+    callers and the model still read ``error``/``message`` directly.
+    """
+
+    if isinstance(content, dict):
+        payload = {
+            RUNTIME_HOST_FEEDBACK_KEY: RUNTIME_HOST_FEEDBACK_NOTE,
+            **{key: value for key, value in content.items() if key != RUNTIME_HOST_FEEDBACK_KEY},
+        }
+        text = json.dumps(payload, ensure_ascii=False)
+    else:
+        text = (
+            f'<{RUNTIME_HOST_FEEDBACK_TAG} source="manor-runtime">\n'
+            f"{RUNTIME_HOST_FEEDBACK_NOTE}\n{content}\n"
+            f"</{RUNTIME_HOST_FEEDBACK_TAG}>"
+        )
+    return {"role": "user", "content": text}
+
+
+def runtime_is_host_feedback_message(message: Any) -> bool:
+    """Return whether a transcript message came from runtime_host_feedback_message."""
+
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    if content.startswith(f"<{RUNTIME_HOST_FEEDBACK_TAG} "):
+        return True
+    if not content.startswith(f'{{"{RUNTIME_HOST_FEEDBACK_KEY}"'):
+        return False
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get(RUNTIME_HOST_FEEDBACK_KEY) == RUNTIME_HOST_FEEDBACK_NOTE
+
+
+RUNTIME_TURN_CONTEXT_TAG = "turn-context"
+
+
+def runtime_turn_context_message(content: str) -> dict[str, str]:
+    """System-role context for this turn, sent after the history.
+
+    It holds what follows the current message, turn state or the clock, so the
+    tools, system prompt and history before it stay byte-identical from turn to
+    turn and can be served from the provider's prompt cache. It is rebuilt every
+    call and never stored in the transcript.
+    """
+    return {
+        "role": "system",
+        "content": f"<{RUNTIME_TURN_CONTEXT_TAG}>\n{content.strip()}\n</{RUNTIME_TURN_CONTEXT_TAG}>",
+    }
+
+
+def runtime_is_turn_context_message(message: Any) -> bool:
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and message["content"].startswith(f"<{RUNTIME_TURN_CONTEXT_TAG}>")
+    )
+
+
+def runtime_with_turn_context(messages: list[dict[str, Any]], content: str | None) -> list[dict[str, Any]]:
+    """Insert the turn context right before the current request.
+
+    The current request is the last user message that is not runtime feedback;
+    inserting there keeps tool-call/result groups intact and keeps the position
+    the same for every round of the run.
+    """
+    if not content or not content.strip():
+        return list(messages)
+    result = list(messages)
+    index = next(
+        (
+            i for i in range(len(result) - 1, -1, -1)
+            if result[i].get("role") == "user" and not runtime_is_host_feedback_message(result[i])
+        ),
+        len(result),
+    )
+    result.insert(index, runtime_turn_context_message(content))
+    return result
+
 
 RUNTIME_AGENTIC_STRUCTURAL_COMPACTION_PREFIX = (
     "[Context compacted — earlier tool rounds summarized]"
@@ -46,9 +150,9 @@ def runtime_agentic_empty_response_retry_message(*, has_tools: bool) -> str:
         )
     else:
         retry = (
-            "Retry the user's latest request now. If it requires a file change, "
-            "call the appropriate file mutation tool so the permission layer can "
-            "handle approval."
+            "Retry the user's latest request now. Choose an available tool only "
+            "if the request needs one; all tool calls remain subject to their "
+            "normal permission checks."
         )
     return (
         "[System: The model provider returned an empty response with no tool calls. "
@@ -60,20 +164,19 @@ def runtime_agentic_truncated_tool_call_retry_message() -> str:
     """Build the retry instruction after a tool call is truncated."""
 
     return (
-        "[System: Your last tool call was truncated because it exceeded the output limit. "
-        "Use patch_file, or edit_file with old_text/new_text, with targeted operations instead of rewriting "
-        "entire files with write_file. Break large changes into multiple smaller "
-        "patch_file calls.]"
+        "[System: Your last tool call was truncated by the output limit and was "
+        "not executed. Reassess the request and, if a tool is still needed, send "
+        "a complete valid call that fits the limit.]"
     )
 
 
 def runtime_agentic_auto_next_calls_message() -> str:
-    """Build the instruction that lets the loop continue recommended tool calls."""
+    """Explain host-owned follow-ups already scheduled by the Runtime."""
 
     return (
-        "[System: Continue this workflow now by executing the returned "
-        "recommended_next_calls in order. Do not summarize progress until "
-        "these tool calls either complete, fail, or report a real human blocker.]"
+        "[System: Runtime is continuing a pending operation. The follow-up "
+        "remains subject to normal authorization and safety checks. Consider its result before "
+        "responding to the user.]"
     )
 
 
@@ -83,6 +186,31 @@ def runtime_agentic_max_rounds_final_prompt() -> str:
     return (
         "You've used all available tool rounds. Please provide your final "
         "response based on everything you've gathered so far."
+    )
+
+
+
+
+
+
+
+
+PSEUDO_TOOL_MARKUP_FINAL_CONTENT = (
+    "The model described tool activity in text instead of calling a tool, so no "
+    "action was taken and its claimed results were discarded."
+)
+
+
+def runtime_agentic_pseudo_tool_markup_retry_message(markup_kinds: list[str]) -> str:
+    """One repair note after the final text imitated tool-call markup."""
+
+    return (
+        "[System: Your previous response wrote tool-call markup as text ("
+        + ", ".join(markup_kinds[:6])
+        + "). No tool was executed. Tools run only through function calling. "
+        "Call the tool, or say the capability is unavailable. Do not write "
+        "tool-call or tool-result markup in your answer. If you are showing the "
+        "syntax, put it in a code block.]"
     )
 
 

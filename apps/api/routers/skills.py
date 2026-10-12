@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +37,7 @@ from packages.core.services.skill_generator import (
 from packages.core.services.sse_events import format_sse
 from packages.core.services.github_skill_installer import install_from_github
 from apps.api.deps import get_current_user
+from apps.api.catalog import CatalogResponse, catalog_response
 from apps.api.streaming_concurrency import acquire_chat_stream_lease
 
 router = APIRouter(prefix="/api/v1/skills", tags=["skills"])
@@ -221,6 +222,9 @@ class InvokeRequest(BaseModel):
     # to the LLM as the user message — most skills' system prompts are
     # written to expect JSON anyway.
     input: str | dict
+    # Exact Knowledge IDs only. The gateway resolves and reauthorizes each
+    # Document; a caller-supplied URL or server path is not a file grant.
+    reference_document_ids: list[str] = Field(default_factory=list)
 
 
 class InvokeResponse(BaseModel):
@@ -298,12 +302,37 @@ async def _binding_contexts_for_skills(
     skills: list[Skill],
     *,
     entity_id: str,
+    user: User | None = None,
 ) -> dict[str, list[dict]]:
     """Return display-ready provenance for agent/workspace/automation skill use."""
+    from packages.core.services.skill_service import builtin_skill_copy_sources
+
     skill_ids = [skill.id for skill in skills if getattr(skill, "id", None)]
     contexts: dict[str, list[dict]] = {skill_id: [] for skill_id in skill_ids}
     if not skill_ids:
         return contexts
+
+    builtin_ids = [
+        skill.id for skill in skills
+        if skill.entity_id is None and (skill.config or {}).get("source") == "builtin"
+    ]
+    visible_copies = []
+    if builtin_ids and user is not None:
+        copies = (await db.execute(select(Skill).where(
+            Skill.entity_id == entity_id,
+            Skill.status == "active",
+            Skill.config["source"].as_string() == "marketplace",
+            Skill.config["source_skill_id"].as_string().in_(builtin_ids),
+        ))).scalars().all()
+        for copy in copies:
+            if copy.id in skill_ids or await user_can_access_resource(
+                db, descriptor=ResourceDescriptor.from_row(copy, ResourceType.SKILL),
+                entity_id=entity_id, user_id=user.id, role=getattr(user, "role", None),
+                capability=Capability.VIEW,
+            ):
+                visible_copies.append(copy)
+    legacy_copies = builtin_skill_copy_sources([*skills, *visible_copies])
+    skill_ids = list(set(skill_ids) | set(legacy_copies))
 
     rows = (await db.execute(
         select(AgentSkillBinding, Agent)
@@ -314,6 +343,7 @@ async def _binding_contexts_for_skills(
             Agent.entity_id == entity_id,
             Agent.status == "active",
         )
+        .order_by(AgentSkillBinding.id)
     )).all()
 
     agent_ids = {agent.id for _binding, agent in rows if agent and agent.id}
@@ -347,8 +377,10 @@ async def _binding_contexts_for_skills(
                 AgentSubscription.entity_id == entity_id,
                 AgentSubscription.status == "active",
                 Workspace.entity_id == entity_id,
-                Workspace.status == "active",
+                Workspace.status.in_(("active", "paused")),
+                Workspace.deleted_at.is_(None),
             )
+            .order_by(AgentSubscription.id)
         )).all()
     subscriptions_by_agent: dict[str, list[tuple[AgentSubscription, Workspace]]] = {}
     workspace_by_id: dict[str, Workspace] = {}
@@ -399,6 +431,7 @@ async def _binding_contexts_for_skills(
             jobs_by_ref[job.id] = job
 
     for binding, agent in rows:
+        display_skill_id = legacy_copies.get(binding.skill_id, binding.skill_id)
         raw_contexts = _binding_config_contexts(binding.config)
         if not raw_contexts:
             raw_contexts = [{}]
@@ -409,11 +442,11 @@ async def _binding_contexts_for_skills(
                 raw_context=raw_context,
                 workspace_by_id=workspace_by_id,
             )
-            contexts.setdefault(binding.skill_id, []).append(context)
+            contexts.setdefault(display_skill_id, []).append(context)
 
         if not any(raw.get("workspace_id") for raw in raw_contexts):
             for subscription, workspace in subscriptions_by_agent.get(agent.id, [])[:5]:
-                contexts.setdefault(binding.skill_id, []).append(_clean_dict({
+                contexts.setdefault(display_skill_id, []).append(_clean_dict({
                     "binding_id": binding.id,
                     "binding_type": "agent_skill_binding",
                     "source": "agent_subscription",
@@ -524,19 +557,36 @@ def _dedupe_contexts(items: list[dict]) -> list[dict]:
     return deduped
 
 
-# ── Endpoints ──
-
-@router.get("", response_model=list[SkillResponse])
-async def list_skills_endpoint(
-    category: str = Query(None),
-    include_platform: bool = Query(False),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
+async def _skill_list_response(
+    db: AsyncSession,
+    user: User,
+    *,
+    category: str | None = None,
+    include_platform: bool = False,
+) -> list[SkillResponse]:
     """List skills for the current entity + platform skills."""
+    from packages.core.services.skill_service import builtin_skill_copy_sources
+
     skills = await list_skills(db, user.entity_id, category=category)
+    legacy_copies = builtin_skill_copy_sources(skills)
     if not include_platform:
-        skills = [s for s in skills if s.entity_id == user.entity_id]
+        skills = [s for s in skills if s.entity_id == user.entity_id and s.id not in legacy_copies]
+    else:
+        # Optional built-in plugin Skills are platform-owned, but they must not
+        # appear in user-facing pickers while that user has the plugin disabled.
+        from packages.core.services.builtin_plugin_service import (
+            builtin_plugin_is_enabled,
+            builtin_plugin_key_for_skill,
+            load_user_builtin_plugin_preferences,
+        )
+
+        plugin_preferences = await load_user_builtin_plugin_preferences(db, user.id)
+        skills = [
+            skill
+            for skill in skills
+            if not (plugin_key := builtin_plugin_key_for_skill(skill))
+            or builtin_plugin_is_enabled(plugin_key, plugin_preferences)
+        ]
     # Platform skills stay visible to everyone; entity skills go through the
     # gateway so private and workspace-scoped ones drop out of the list.
     visible: list[Skill] = []
@@ -554,8 +604,39 @@ async def list_skills_endpoint(
         ):
             visible.append(candidate)
     skills = visible
-    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id)
-    return [_to_response(s, bindings=bindings.get(s.id, [])) for s in skills]
+    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id, user=user)
+    return [
+        SkillResponse(**_to_response(s, bindings=bindings.get(s.id, [])))
+        for s in skills if s.id not in legacy_copies
+    ]
+
+
+# ── Endpoints ──
+
+@router.get("", response_model=list[SkillResponse])
+async def list_skills_endpoint(
+    category: str = Query(None),
+    include_platform: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    return await _skill_list_response(db, user, category=category, include_platform=include_platform)
+
+
+@router.get("/catalog", response_model=CatalogResponse[SkillResponse])
+async def skill_catalog(
+    known_version: str | None = Query(None),
+    category: str | None = Query(None),
+    include_platform: bool = Query(False),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    items = await _skill_list_response(db, user, category=category, include_platform=include_platform)
+    return catalog_response(
+        items, catalog="skills", user=user,
+        filters={"category": category or "", "include_platform": include_platform},
+        known_version=known_version,
+    )
 
 
 def _bundle_paths(cfg: dict) -> list[str]:
@@ -714,6 +795,7 @@ async def draft_skill_questions_endpoint(
     try:
         questions = await runtime_skill_clarifying_questions(
             body.prompt, entity_id=user.entity_id,
+            user_id=user.id,
         )
     except Exception:
         questions = []
@@ -754,6 +836,7 @@ async def ai_update_skill_endpoint(
             skill_id=skill_id,
             change_description=body.prompt,
             entity_id=user.entity_id,
+            user_id=user.id,
             db=db,
         )
     except ValueError as exc:
@@ -833,7 +916,7 @@ async def get_skill_endpoint(
 ):
     """Get a skill by ID."""
     skill = await _require_skill(db, user, skill_id, Capability.VIEW)
-    bindings = await _binding_contexts_for_skills(db, [skill], entity_id=user.entity_id)
+    bindings = await _binding_contexts_for_skills(db, [skill], entity_id=user.entity_id, user=user)
     return _to_response(skill, bindings=bindings.get(skill.id, []))
 
 
@@ -891,7 +974,7 @@ async def update_skill_endpoint(
                 "MinIO bundle-file delete failed skill=%s: %s", skill_id, exc
             )
 
-    bindings = await _binding_contexts_for_skills(db, [skill], entity_id=user.entity_id)
+    bindings = await _binding_contexts_for_skills(db, [skill], entity_id=user.entity_id, user=user)
     return _to_response(skill, bindings=bindings.get(skill.id, []))
 
 
@@ -946,12 +1029,15 @@ async def get_skill_files(
     else:
         from pathlib import Path
 
-        from packages.core.services.builtin_skill_loader import read_skill_dir_files
+        from packages.core.services.builtin_skill_loader import (
+            read_skill_dir_files,
+            resolve_builtin_skill_dir,
+        )
 
         disk_dir = cfg.get("skill_dir")
         disk_files: dict[str, str] = {}
         if isinstance(disk_dir, str) and disk_dir:
-            disk_files, skipped_files = read_skill_dir_files(Path(disk_dir))
+            disk_files, skipped_files = read_skill_dir_files(resolve_builtin_skill_dir(disk_dir))
         if disk_files:
             prompt = disk_files.pop("SKILL.md", None) or prompt
             extra_files = disk_files
@@ -1009,7 +1095,27 @@ async def invoke_skill_endpoint(
     """Invoke a skill."""
     # Invoking runs a skill without altering it, so it takes the read path —
     # a viewer may use skills, just not change them.
-    await _require_skill(db, user, skill_id, Capability.VIEW)
+    skill = await _require_skill(db, user, skill_id, Capability.VIEW)
+    from packages.core.services.skill_service import _determine_skill_type
+
+    skill_config = skill.config or {}
+    source_skill_id = skill_config.get("source_skill_id")
+    if skill_config.get("source") == "marketplace" and isinstance(source_skill_id, str):
+        source_skill = await get_skill(db, source_skill_id)
+        if (
+            source_skill is not None
+            and source_skill.entity_id is None
+            and source_skill.status == "active"
+            and (source_skill.config or {}).get("source") == "builtin"
+        ):
+            skill = source_skill
+    if _determine_skill_type(skill) == "sandbox":
+        raise HTTPException(
+            422,
+            "This Skill requires an agent run to drive and save its sandbox output; use Chat or a Task.",
+        )
+    if len(body.reference_document_ids) > 30:
+        raise HTTPException(422, "Too many Skill reference documents")
     import json as _json
     # Stringify dict inputs into JSON so the skill's LLM gets a clean,
     # parseable user message. Skills with structured input_schema
@@ -1021,12 +1127,21 @@ async def invoke_skill_endpoint(
     )
     result = await runtime_invoke_skill(
         db, skill_id, user.entity_id, input_payload, user_id=user.id,
+        reference_document_ids=body.reference_document_ids,
     )
     if result.get("error"):
         raise HTTPException(
-            404,
+            422 if str(result.get("code") or "").startswith("reference_") else 404,
             runtime_assistant_stream_error_content(str(result["error"])),
         )
+    if result.get("stop_reason") == "sandbox_ready":
+        from packages.core.ai.runtime.skills import runtime_discard_unhosted_skill_sandbox
+
+        try:
+            await runtime_discard_unhosted_skill_sandbox(result)
+        except Exception:
+            pass
+        raise HTTPException(422, "Skill sandbox was allocated but this endpoint cannot complete its run")
     return result
 
 
@@ -1088,7 +1203,7 @@ async def list_agent_bindings(
 ):
     """List skills bound to a specific agent."""
     skills = await list_agent_skill_bindings(db, agent_id, user.entity_id)
-    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id)
+    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id, user=user)
     return [_to_response(s, bindings=bindings.get(s.id, [])) for s in skills]
 
 
@@ -1100,7 +1215,7 @@ async def list_agent_available_skills(
 ):
     """List entity skills not yet bound to the agent."""
     skills = await list_available_skills_for_agent(db, agent_id, user.entity_id)
-    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id)
+    bindings = await _binding_contexts_for_skills(db, list(skills), entity_id=user.entity_id, user=user)
     return [_to_response(s, bindings=bindings.get(s.id, [])) for s in skills]
 
 

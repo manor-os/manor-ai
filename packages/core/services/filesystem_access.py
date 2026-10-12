@@ -12,17 +12,18 @@ from packages.core.models.user import User
 from packages.core.permissions import (
     Permission,
     effective_user_has_permission,
-    user_is_effective_entity_admin,
 )
 from packages.core.services.document_access import (
-    document_is_owned_by_deleted_workspace,
+    document_entity_is_unavailable,
     document_workspace_ids_batched,
-    folder_is_owned_by_deleted_workspace,
+    folder_entity_is_unavailable,
     user_can_edit_document,
     user_has_document_capability,
     user_has_folder_capability,
+    user_owns_workspace_folder,
 )
 from packages.core.services.knowledge_visibility import normalize_rel_path
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 
 class FilesystemAccessDenied(PermissionError):
@@ -39,7 +40,7 @@ async def _require_workspace_artifact_scope(
     rel_path: str,
     workspace_id: str | None,
 ) -> bool:
-    """Keep a Workspace runtime inside its active physical artifact root."""
+    """Keep user-directed work inside its available Workspace artifact root."""
     if not workspace_id:
         return False
     from packages.core.services.workspace_access import (
@@ -54,14 +55,12 @@ async def _require_workspace_artifact_scope(
         entity_id=user.entity_id,
     )
     if (
-        workspace is None
-        or workspace.status != "active"
-        or workspace.deleted_at is not None
+        not workspace_allows_manual_work(workspace)
         or not workspace.artifact_folder_id
     ):
         raise FilesystemAccessDenied(
             403,
-            "The active Workspace artifact scope is unavailable",
+            "The Workspace artifact scope is unavailable",
         )
     workspace_artifact_folder_id = workspace.artifact_folder_id
     normalized_path = normalize_rel_path(rel_path)
@@ -78,7 +77,7 @@ async def _require_workspace_artifact_scope(
     if inside_physical_workspace_storage and not inside_workspace_artifacts:
         raise FilesystemAccessDenied(
             403,
-            "The path is outside the active Workspace artifact scope",
+            "The path is outside the Workspace artifact scope",
         )
     if not await user_can_write_workspace_artifacts(
         db,
@@ -101,14 +100,14 @@ async def _require_active_workspace_path_owner(
     documents: list[Document] | None = None,
     folder: DocumentFolder | None = None,
 ) -> None:
-    """Serialize path mutation with its Workspace lifecycle owner."""
+    """Retain policy locks; gate Knowledge by Entity and raw paths by Workspace."""
     from packages.core.models.workspace import Workspace
     from packages.core.services.workspace_artifacts import (
         artifact_folder_id_from_entity_storage_path,
     )
 
     artifact_folder_id = artifact_folder_id_from_entity_storage_path(rel_path)
-    if artifact_folder_id:
+    if artifact_folder_id and not documents and folder is None:
         workspace = (await db.execute(
             select(Workspace)
             .where(
@@ -124,25 +123,25 @@ async def _require_active_workspace_path_owner(
                 "The Workspace that owns this path is deleted",
             )
 
-    if folder is not None and await folder_is_owned_by_deleted_workspace(
+    if folder is not None and await folder_entity_is_unavailable(
         db,
         folder,
         for_update=True,
     ):
         raise FilesystemAccessDenied(
             403,
-            "The Workspace that owns this folder is deleted",
+            "The folder's Entity is unavailable",
         )
 
     for document in sorted(documents or [], key=lambda item: str(item.id)):
-        if await document_is_owned_by_deleted_workspace(
+        if await document_entity_is_unavailable(
             db,
             document,
             for_update=True,
         ):
             raise FilesystemAccessDenied(
                 403,
-                "The Workspace that owns this document is deleted",
+                "The document's Entity is unavailable",
             )
 
 
@@ -166,26 +165,29 @@ async def _require_documents_workspace_scope(
             )
 
 
-async def folder_projection_for_path(
+async def folder_projections_for_path(
     db: AsyncSession,
     *,
     entity_id: str,
     rel_path: str,
-) -> DocumentFolder | None:
-    parent_id: str | None = None
-    folder: DocumentFolder | None = None
+) -> list[DocumentFolder]:
+    folders: list[DocumentFolder] = []
     for name in (part for part in normalize_rel_path(rel_path).split("/") if part):
-        folder = await db.scalar(
+        parent_ids = [folder.id for folder in folders]
+        rows = await db.scalars(
             select(DocumentFolder).where(
                 DocumentFolder.entity_id == entity_id,
                 DocumentFolder.name == name,
-                DocumentFolder.parent_id == parent_id,
-            ).limit(1)
+                (
+                    DocumentFolder.parent_id.in_(parent_ids)
+                    if parent_ids else DocumentFolder.parent_id.is_(None)
+                ),
+            )
         )
-        if folder is None:
-            return None
-        parent_id = folder.id
-    return folder
+        folders = list(rows)
+        if not folders:
+            return []
+    return folders
 
 
 async def require_directory_write_access(
@@ -200,34 +202,41 @@ async def require_directory_write_access(
     rel_path = normalize_rel_path(rel_path)
     if not rel_path:
         return
-    folder = await folder_projection_for_path(
+    folders = await folder_projections_for_path(
         db,
         entity_id=user.entity_id,
         rel_path=rel_path,
     )
-    await _require_active_workspace_path_owner(
-        db,
-        entity_id=user.entity_id,
-        rel_path=rel_path,
-        folder=folder,
-    )
-    if await user_is_effective_entity_admin(db, user):
+    for folder in folders or [None]:
+        await _require_active_workspace_path_owner(
+            db,
+            entity_id=user.entity_id,
+            rel_path=rel_path,
+            folder=folder,
+        )
+    if await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
         return
-    if folder is None:
+    if not folders:
         raise FilesystemAccessDenied(
             403,
             "Create folders through Knowledge so parent permissions can be enforced",
         )
-    if folder.owner_id == user.id:
+    if any(folder.owner_id == user.id for folder in folders):
         return
-    if await user_has_folder_capability(
-        db,
-        entity_id=user.entity_id,
-        folder_id=folder.id,
-        user_id=user.id,
-        capabilities={Capability.UPLOAD_TO, Capability.EDIT},
-    ):
+    if any([
+        await user_owns_workspace_folder(db, folder=folder, user_id=user.id)
+        for folder in folders
+    ]):
         return
+    for folder in folders:
+        if await user_has_folder_capability(
+            db,
+            entity_id=user.entity_id,
+            folder_id=folder.id,
+            user_id=user.id,
+            capabilities={Capability.UPLOAD_TO, Capability.EDIT},
+        ):
+            return
     raise FilesystemAccessDenied(
         403,
         "Upload or edit access is required for the target folder",
@@ -280,13 +289,15 @@ async def require_path_write_access(
         entity_id=user.entity_id,
         rel_path=rel_path,
     )
-    is_entity_admin = await user_is_effective_entity_admin(db, user)
-    if exists and not is_entity_admin:
+    can_manage_all = await effective_user_has_permission(
+        db, user, Permission.DOCS_MANAGE_ALL
+    )
+    if exists and not can_manage_all:
         raise FilesystemAccessDenied(
             403,
             "Unindexed files can only be overwritten by an entity administrator",
         )
-    if not exists and not is_entity_admin:
+    if not exists and not can_manage_all:
         if inside_workspace_artifacts:
             return
         await require_directory_write_access(
@@ -334,13 +345,16 @@ async def _user_can_delete_document(
     user: User,
     document: Document,
 ) -> bool:
-    if await document_is_owned_by_deleted_workspace(
+    if await document_entity_is_unavailable(
         db,
         document,
         for_update=True,
     ):
         return False
-    if await user_is_effective_entity_admin(db, user) or document.owner_id == user.id:
+    if (
+        await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL)
+        or document.owner_id == user.id
+    ):
         return True
     if document.created_by == user.id:
         return True
@@ -409,11 +423,17 @@ async def require_path_mutation_access(
     )
     folder = None
     if is_dir:
-        folder = await folder_projection_for_path(
+        folders = await folder_projections_for_path(
             db,
             entity_id=user.entity_id,
             rel_path=rel_path,
         )
+        if len(folders) > 1:
+            raise FilesystemAccessDenied(
+                409,
+                "This physical directory contains multiple personal Knowledge folders",
+            )
+        folder = folders[0] if folders else None
         if folder is not None:
             from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
 
@@ -439,30 +459,40 @@ async def require_path_mutation_access(
         folder=folder,
     )
     if destination_rel_path:
-        destination_folder = await folder_projection_for_path(
+        destination_folders = await folder_projections_for_path(
             db,
             entity_id=user.entity_id,
             rel_path=os.path.dirname(destination_rel_path),
         )
-        await _require_active_workspace_path_owner(
-            db,
-            entity_id=user.entity_id,
-            rel_path=destination_rel_path,
-            folder=destination_folder,
-        )
+        if len(destination_folders) > 1:
+            raise FilesystemAccessDenied(
+                409,
+                "The destination has multiple personal Knowledge folders",
+            )
+        for destination_folder in destination_folders or [None]:
+            await _require_active_workspace_path_owner(
+                db,
+                entity_id=user.entity_id,
+                rel_path=destination_rel_path,
+                folder=destination_folder,
+            )
     if is_dir:
-        if not await user_is_effective_entity_admin(db, user):
+        if not await effective_user_has_permission(
+            db, user, Permission.DOCS_MANAGE_ALL
+        ):
             if folder is None:
                 raise FilesystemAccessDenied(
                     403,
                     f"Unindexed folders can only be {action}d by an entity administrator",
                 )
-            if folder.owner_id != user.id:
+            if folder.owner_id != user.id and not await user_owns_workspace_folder(
+                db, folder=folder, user_id=user.id,
+            ):
                 raise FilesystemAccessDenied(
                     403,
                     "Only the folder owner can move or delete this folder",
                 )
-    if await user_is_effective_entity_admin(db, user):
+    if await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
         return documents
 
     indexed_paths = {document.fs_path for document in documents if document.fs_path}

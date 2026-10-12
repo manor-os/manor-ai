@@ -12,6 +12,9 @@ import {
 import UserAvatar from "./UserAvatar";
 
 function statusLabel(status?: string) {
+  if (status === "unverified") {
+    return t("component.assistant_message_blocks.process_status_pending");
+  }
   if (status === "completed") {
     return t("component.workspace_chat.agent_run_completed");
   }
@@ -89,12 +92,13 @@ function durationLabel(durationMs?: number) {
     : `${(durationMs / 1000).toFixed(durationMs < 10000 ? 1 : 0)}s`;
 }
 
-export default function AgentLoopStep({ run }: { run: SubAgentEvent }) {
-  const status = run.status || "running";
+export default function AgentLoopStep({ run, live = true }: { run: SubAgentEvent; live?: boolean }) {
+  const recordedStatus = run.status || "running";
+  const status = recordedStatus === "running" && !live ? "unverified" : recordedStatus;
   const tools = Array.isArray(run.tools) ? run.tools : [];
   const activeTool = [...tools]
     .reverse()
-    .find((tool) => tool.status === "running");
+    .find((tool) => tool.status === "running" && live && status === "running");
   const isRunning = status === "running";
   const activity = activeTool
     ? t("component.workspace_chat.agent_run_using").replace(
@@ -147,8 +151,9 @@ export default function AgentLoopStep({ run }: { run: SubAgentEvent }) {
               const badge = runtimeToolBadge(tool.name);
               const detail = toolDetail(tool.arguments);
               const toolStatus = tool.status || "completed";
-              const isToolRunning = toolStatus === "running";
+              const isToolRunning = toolStatus === "running" && live && isRunning;
               const isToolError = toolStatus === "error";
+              const isToolUnverified = toolStatus === "running" && !isToolRunning;
               return (
                 <div
                   key={`${tool.seq ?? index}-${tool.name}`}
@@ -158,7 +163,7 @@ export default function AgentLoopStep({ run }: { run: SubAgentEvent }) {
                     <span className="assistant-process-spinner" />
                   ) : (
                     <span
-                      className={`assistant-process-step-icon${isToolError ? " assistant-process-step-icon--error" : ""}`}
+                      className={`assistant-process-step-icon${isToolError ? " assistant-process-step-icon--error" : isToolUnverified ? " assistant-process-step-icon--unverified" : ""}`}
                     />
                   )}
                   <span
@@ -189,7 +194,9 @@ export default function AgentLoopStep({ run }: { run: SubAgentEvent }) {
             })
           ) : (
             <div className="agent-loop-step__empty">
-              {t("component.workspace_chat.agent_run_preparing")}
+              {isRunning
+                ? t("component.workspace_chat.agent_run_preparing")
+                : statusLabel(status)}
             </div>
           )}
         </div>

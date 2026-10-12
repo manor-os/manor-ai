@@ -14,6 +14,8 @@ interface ButtonProps {
   title?: string;
   ariaLabel?: string;
   ariaExpanded?: boolean;
+  "aria-haspopup"?: React.AriaAttributes["aria-haspopup"];
+  "aria-expanded"?: React.AriaAttributes["aria-expanded"];
   ariaBusy?: boolean;
   ariaPressed?: boolean;
   ariaDescribedBy?: string;
@@ -47,6 +49,8 @@ export default function Button({
   title,
   ariaLabel,
   ariaExpanded,
+  "aria-haspopup": ariaHasPopup,
+  "aria-expanded": ariaExpandedAttribute,
   ariaBusy,
   ariaPressed,
   ariaDescribedBy,
@@ -68,7 +72,8 @@ export default function Button({
       onClick={onClick}
       title={title}
       aria-label={ariaLabel}
-      aria-expanded={ariaExpanded}
+      aria-haspopup={ariaHasPopup}
+      aria-expanded={ariaExpandedAttribute ?? ariaExpanded}
       aria-busy={ariaBusy}
       aria-pressed={ariaPressed}
       aria-describedby={ariaDescribedBy}

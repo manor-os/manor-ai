@@ -65,6 +65,10 @@ An `agent` node runs the same agentic loop as chat: give it a prompt, an
 optional system prompt, tool list, model, and round cap — or point it at a
 workspace service so the workspace's assigned agent handles the step.
 
+Node wall-clock timeouts are opt-in: missing or `null` `config.timeout` adds
+no outer Workflow node deadline; a finite positive value sets one in seconds.
+HTTP requests, integrations, and sandboxes keep their own execution limits.
+
 ## A Minimal Example
 
 The built-in "Daily digest" template is three working steps:
@@ -108,6 +112,18 @@ A follow-up `workflow_action_grant` node can convert an approved wait into a
 durable, time-boxed grant, so repeated runs of the same workflow don't
 re-prompt for an action that was already approved at that scope.
 
+Native `tool` and `connector` actions, and tool calls made by an `agent` node
+or nested Skill, obey the current [approval policy](hitl-governance.md).
+A `runtime_approval_required` result parks the run at its exact saved run,
+node, and invocation; the run detail and Workspace Chat expose the pending
+decision. Approval resumes only that invocation without repeating earlier
+effects, after rechecking current policy and lifecycle. A generic resume,
+retry, or changed definition is not approval. Nested calls require an exact
+saved continuation; if it is absent or no longer matches, the run fails
+rather than replaying the parent step.
+Chat message projection is best-effort: a failed projection does not discard
+the authoritative paused run or its approval continuation.
+
 ## Runs, Retries, and Observability
 
 Every run stores its definition snapshot, per-step outputs, and a sanitized
@@ -116,12 +132,15 @@ child runs linked). The run detail view streams node status live via SSE.
 
 - **Cancel / resume**: `POST /api/v1/workflows/runs/{run_id}/cancel` and
   `/resume`.
-- **Retry**: `/retry` restarts a failed run; `from_step_id` retries from a
-  checkpoint, reusing results of unchanged earlier steps. Checkpoint retries
-  are refused (HTTP 409) if the definition changed since the original run.
-- **Lineage**: `GET /runs/{run_id}/family` returns the retry chain.
-- Results of unchanged steps can be reused between runs for cacheable node
-  types, ComfyUI-style, so iterating on the tail of a graph is fast.
+- **Retry**: `/retry` creates a new attempt from the failed receipt or an
+  explicit `from_step_id` checkpoint. It preserves completed sibling receipts
+  outside the recovery frontier, invalidates the selected node and affected
+  downstream work, and waits for every required branch before a merge
+  continues. Recovery uses the run's immutable execution snapshot; missing
+  or incompatible snapshots are refused. A step with an uncertain external
+  effect must be reconciled before retry.
+- **Lineage**: `GET /runs/{run_id}/family` returns the retry chain and its
+  durable recovery evidence.
 
 ## API Summary
 
@@ -141,7 +160,8 @@ All under `/api/v1/workflows`:
 
 ## Availability
 
-Flows are enabled by default in local and development environments. In
-production environments the navigation item shows as **Soon** until the
-deployment sets `FLOWS_AVAILABLE=true` — see
+Stable Flows are enabled by default in self-hosted deployments, including
+`prod` and `production`. Set `FLOWS_AVAILABLE=false` to disable them explicitly;
+Cloud production rollout is managed separately. This does not enable the
+experimental `task_agent_loop`, which remains off by default. See
 [Configuration](../configuration#feature-rollout).

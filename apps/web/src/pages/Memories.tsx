@@ -1,3 +1,4 @@
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useState, useMemo } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
@@ -20,6 +21,7 @@ import { t } from "../lib/i18n";
 /* -- component ------------------------------------------------ */
 
 export default function Memories() {
+  const catalogScope = useCatalogScope();
   const queryClient = useQueryClient();
   const toast = useToastStore();
 
@@ -44,8 +46,7 @@ export default function Memories() {
   });
 
   const { data: agents = [] } = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
 
   const createMutation = useMutation({

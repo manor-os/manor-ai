@@ -775,6 +775,14 @@ async def _async_hitl_waiting_reminder(
     stale_cutoff = current - timedelta(minutes=after_minutes)
 
     async with create_worker_session()() as db:
+        from packages.core.services.task_execution_reconcile import (
+            recover_misclassified_tool_error_human_waits,
+        )
+
+        recovered = await recover_misclassified_tool_error_human_waits(db)
+        if recovered:
+            await db.commit()
+
         rows = list((await db.execute(
             select(ExecutionStep, ExecutionPlan, Task)
             .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
@@ -1009,10 +1017,13 @@ async def _async_readiness_check() -> int:
                     )
                     run_strategist_review.apply_async(
                         args=[ws.id],
-                        kwargs=ReviewTrigger(
-                            kind=ReviewTriggerKind.EVENT,
-                            detail=f"readiness changed: {', '.join(diff_parts)}",
-                        ).celery_kwargs(),
+                        kwargs={
+                            **ReviewTrigger(
+                                kind=ReviewTriggerKind.EVENT,
+                                detail=f"readiness changed: {', '.join(diff_parts)}",
+                            ).celery_kwargs(),
+                            "user_id": (ws.settings or {}).get("created_by_user_id"),
+                        },
                         countdown=5,
                     )
                     triggered += 1

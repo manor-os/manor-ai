@@ -77,7 +77,7 @@ async def test_legacy_office_conversion_returns_editable_copy_without_mutating_s
         "packages.core.services.office_editing.shutil.which",
         lambda executable: "soffice" if executable == "soffice" else None,
     )
-    monkeypatch.setattr("packages.core.services.office_editing.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.office_editing.run_in_process_group", fake_run)
 
     converted = await convert_legacy_office_for_editing(str(source), source_name)
 
@@ -163,7 +163,7 @@ async def test_legacy_office_conversion_rejects_oversized_editable_output(
         lambda executable: "soffice" if executable == "soffice" else None,
     )
     monkeypatch.setattr(
-        "packages.core.services.office_editing.subprocess.run",
+        "packages.core.services.office_editing.run_in_process_group",
         fake_run,
     )
 

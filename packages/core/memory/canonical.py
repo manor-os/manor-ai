@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Iterable
 
 from packages.core.memory.paths import workspace_memory_root
+from packages.core.memory.learning_summary import merge_learning_entries
 
 
 @dataclass(frozen=True)
@@ -266,12 +267,9 @@ def _write_if_missing(path: str, body: str) -> None:
 
 
 def _read(path: str) -> str | None:
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            content = f.read().strip()
-        return content or None
-    except FileNotFoundError:
-        return None
+    from packages.core.memory.cache import read_memory_text
+    content = read_memory_text(path)
+    return (content.strip() or None) if content is not None else None
 
 
 def ensure_workspace_memory_docs(
@@ -429,7 +427,7 @@ def load_workspace_operating_memory(
     filenames: Iterable[str] | None = None,
     max_chars: int = _TOTAL_PROMPT_MAX_CHARS,
 ) -> str:
-    """Load bounded fixed workspace memory docs for prompt injection."""
+    """Bound reloadable memories; retain authoritative RULES.md in full."""
     selected = list(filenames) if filenames else [
         name
         for name in WORKSPACE_MEMORY_DEFAULT_LOAD_ORDER
@@ -442,14 +440,17 @@ def load_workspace_operating_memory(
         content = read_workspace_memory_file(entity_id, workspace_id, filename)
         if not content:
             continue
-        used = sum(len(p) for p in parts) + (2 * len(parts))
+        if filename == "RULES.md":
+            parts.append(f"### {filename}\n{content}")
+            continue
+        used = sum(len(p) for p in parts if not p.startswith("### RULES.md\n")) + (2 * len(parts))
         remaining = max_chars - used
         if parts:
             remaining -= 2
         header = f"### {filename}\n"
         content_budget = min(_FILE_PROMPT_MAX_CHARS, remaining - len(header))
         if content_budget <= 80:
-            break
+            continue
         block = f"{header}{_compact_memory_doc_for_prompt(content, filename=filename, max_chars=content_budget)}"
         if used + len(block) + (2 if parts else 0) > max_chars:
             block = f"{header}{_truncate_middle(content, content_budget, label='memory doc budget')}"
@@ -476,7 +477,7 @@ def _compact_memory_doc_for_prompt(content: str, *, filename: str, max_chars: in
 
     user_authored = _RUNTIME_LEARNING_BLOCK_RE.sub("", without_summary).strip()
     summaries = [_summarize_managed_block(match.group(0)) for match in blocks]
-    summaries = [s for s in summaries if s]
+    summaries = merge_learning_entries(text, [s for s in summaries if s])
     summary = _managed_summary_block(summaries, filename=filename, compacted_count=len(blocks))
     user_budget = max(240, max_chars // 3)
     compacted = (
@@ -503,9 +504,12 @@ def load_workspace_agent_memory(
         content = _read(os.path.join(root, filename))
         if not content:
             continue
+        if filename == "RULES.md":
+            parts.append(f"### {filename}\n{content}")
+            continue
         block = f"### {filename}\n{_truncate_middle(content, 800, label='workspace-agent memory budget')}"
-        if sum(len(p) for p in parts) + len(block) + 2 > max_chars:
-            break
+        if sum(len(p) for p in parts if not p.startswith("### RULES.md\n")) + len(block) + 2 > max_chars:
+            continue
         parts.append(block)
     return "\n\n".join(parts)
 
@@ -569,7 +573,7 @@ def _append_managed_block(
 
 
 def _compact_managed_blocks(existing: str, *, filename: str) -> tuple[str, dict[str, int]]:
-    if len(existing or "") <= _CANONICAL_FILE_SOFT_LIMIT_CHARS:
+    if filename == "RULES.md" or len(existing or "") <= _CANONICAL_FILE_SOFT_LIMIT_CHARS:
         return existing or "", {"compacted_blocks": 0}
     without_summary = _RUNTIME_LEARNING_SUMMARY_RE.sub("", existing or "")
     blocks = list(_RUNTIME_LEARNING_BLOCK_RE.finditer(without_summary))
@@ -577,7 +581,7 @@ def _compact_managed_blocks(existing: str, *, filename: str) -> tuple[str, dict[
         return existing or "", {"compacted_blocks": 0}
     user_authored = _RUNTIME_LEARNING_BLOCK_RE.sub("", without_summary).rstrip()
     summaries = [_summarize_managed_block(match.group(0)) for match in blocks]
-    summaries = [s for s in summaries if s]
+    summaries = merge_learning_entries(existing, [s for s in summaries if s])
     summary = _managed_summary_block(summaries, filename=filename, compacted_count=len(blocks))
     next_text = f"{user_authored}\n\n{summary}\n" if user_authored else f"{summary}\n"
     return next_text, {"compacted_blocks": len(blocks)}
@@ -619,7 +623,7 @@ def _managed_summary_block(summaries: list[str], *, filename: str, compacted_cou
             "to keep this operating memory bounded."
         ),
     ]
-    for item in summaries[-12:]:
+    for item in summaries:
         lines.append(f"- {item}")
     lines.append("- Full original context remains available in runtime evidence.")
     lines.append("<!-- /runtime-learning-summary -->")

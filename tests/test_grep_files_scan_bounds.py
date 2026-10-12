@@ -215,3 +215,29 @@ async def test_errors_still_surface_in_the_original_shape(fs_root, monkeypatch):
     monkeypatch.setattr(file_tools.os, "walk", explode)
     body = json.loads(await _grep_files(ENTITY, pattern="x"))
     assert body.get("error") == "disk went away", body
+
+
+@pytest.mark.asyncio
+async def test_grep_files_accepts_a_file_path(fs_root):
+    """Models often pass a known file to path=; that must grep the file, not
+    report Directory not found."""
+    _write(fs_root, "notes/keys.md", b"ssh-ed25519 AAAA real\n")
+    _write(fs_root, "notes/other.md", b"ssh-ed25519 AAAA decoy\n")
+
+    body = json.loads(await _grep_files(ENTITY, pattern="ssh-ed25519", path="notes/keys.md"))
+    assert "error" not in body, body
+    assert body["count"] == 1, body
+    assert body["matches"][0]["file"] == "notes/keys.md"
+    assert body["files_scanned"] == 1
+
+
+def test_grep_files_schema_describes_locate_then_patch() -> None:
+    from packages.core.ai.tools.file_tools import GREP_FILES_SCHEMA, READ_FILE_SCHEMA
+
+    grep_description = GREP_FILES_SCHEMA["function"]["description"]
+    assert "Locate a heading, field, or snippet" in grep_description
+    assert "patch_file" in grep_description
+    assert "paging `read_file`" in grep_description
+    read_description = READ_FILE_SCHEMA["function"]["description"]
+    assert "grep_files first" in read_description
+    assert "do not page the whole file" in read_description

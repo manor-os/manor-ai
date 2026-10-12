@@ -22,6 +22,7 @@ class Site(Base):
     __table_args__ = (
         Index("ix_sites_entity", "entity_id"),
         Index("ix_sites_workspace", "workspace_id"),
+        Index("ix_sites_project", "project_id"),
         Index("ix_sites_created_by_user", "created_by_user_id"),
         Index("ix_sites_slug", "slug", unique=True),
         Index("ix_sites_custom_domain", "custom_domain", unique=True),
@@ -52,6 +53,8 @@ class Site(Base):
     connections: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
     )
+    # Code project this site was published from, when there is one.
+    project_id: Mapped[Optional[str]] = mapped_column(String(26), nullable=True)
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

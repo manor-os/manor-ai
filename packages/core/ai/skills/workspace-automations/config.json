@@ -1,0 +1,43 @@
+{
+  "name": "workspace-automations",
+  "display_name": "Workspace Automations",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Create, inspect, pause, restore, cancel or run scheduled Workspace Automations, keeping schedule changes separate from App links and Workflow execution.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "create_scheduled_job",
+    "list_scheduled_jobs",
+    "query_scheduled_jobs",
+    "cancel_scheduled_job",
+    "toggle_scheduled_job",
+    "run_scheduled_job_now"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [],
+    "patch_ops": [],
+    "route_terms": [
+      "automation",
+      "schedule",
+      "cron",
+      "自动化",
+      "定时",
+      "周期",
+      "每天",
+      "每周"
+    ]
+  },
+  "search": {
+    "terms": ["scheduler", "recurring job", "cron", "timer", "pause schedule", "daily run", "repeat task", "trigger"],
+    "examples": ["schedule workflow every monday morning", "pause recurring automation", "list scheduled automations in workspace", "run automation now"]
+  }
+}

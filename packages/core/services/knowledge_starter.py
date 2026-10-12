@@ -58,3 +58,87 @@ def starter_document_state(
             starter.get("task_key") or starter_knowledge_task_key(group_name)
         ),
     }
+
+
+async def write_markdown_document(
+    db,
+    *,
+    entity_id: str,
+    name: str,
+    content: str,
+    source: str,
+    metadata: dict[str, Any],
+):
+    """Create a Document row and persist markdown content to the entity FS.
+
+    Shared by the starter-document task and finalize link sources so both
+    take the same write path (FS when MANOR_FS_ENABLED, metadata fallback).
+    """
+    import logging
+    import os
+    import time as _time
+
+    from packages.core.config import get_settings
+    from packages.core.services.document_service import create_document
+    from packages.core.services.entity_fs import write_entity_file_atomic
+    from packages.core.services.knowledge_visibility import is_user_visible_path
+
+    logger = logging.getLogger(__name__)
+    filename = os.path.basename(name if name.endswith(".md") else f"{name}.md")
+    if not is_user_visible_path(filename):
+        filename = "Knowledge Starter.md"
+    workspace_id = str((metadata.get("origin") or {}).get("workspace_id") or "").strip()
+    folder_id = None
+    relative_directory = ""
+    if workspace_id:
+        from packages.core.services.workspace_artifacts import (
+            ensure_workspace_document_folder, workspace_artifact_storage_base,
+        )
+        folder_id = await ensure_workspace_document_folder(
+            db=db, entity_id=entity_id, workspace_id=workspace_id, rel_path=filename,
+        )
+        if not folder_id:
+            raise ValueError("Workspace starter destination could not be resolved")
+        relative_directory = workspace_artifact_storage_base(folder_id)
+    doc = await create_document(
+        db,
+        entity_id,
+        name=filename,
+        folder_id=folder_id,
+        file_type="md",
+        mime_type="text/markdown",
+        source=source,
+        visibility="entity",
+        metadata=metadata,
+    )
+    doc.vector_status = "pending"
+    body = (content or "").strip()
+    try:
+        settings = get_settings()
+        if settings.MANOR_FS_ENABLED:
+            entity_root = os.path.join(settings.MANOR_FS_ROOT, entity_id)
+            os.makedirs(entity_root, exist_ok=True)
+            target = os.path.normpath(os.path.join(entity_root, relative_directory, filename))
+            entity_root_norm = os.path.normpath(entity_root)
+            if os.path.commonpath([entity_root_norm, target]) != entity_root_norm:
+                raise ValueError("Generated knowledge filename escaped entity root")
+            if os.path.exists(target):
+                base, ext = os.path.splitext(filename)
+                target = os.path.join(entity_root, relative_directory, f"{base}_{int(_time.time())}{ext}")
+            content_bytes = body.encode("utf-8")
+            target = write_entity_file_atomic(
+                entity_id,
+                os.path.relpath(target, entity_root),
+                content_bytes,
+                expected_size=len(content_bytes),
+                allow_empty=False,
+            )
+            doc.fs_path = os.path.relpath(target, entity_root)
+            doc.file_size = len(content_bytes)
+        else:
+            doc.metadata_ = {**(doc.metadata_ or {}), "content_text": body[:50000]}
+    except Exception:
+        logger.warning("Failed to write markdown document %s to filesystem", doc.id, exc_info=True)
+        doc.metadata_ = {**(doc.metadata_ or {}), "content_text": body[:50000]}
+    await db.flush()
+    return doc

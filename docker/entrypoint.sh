@@ -185,6 +185,7 @@ with e.connect() as c:
             python3 scripts/init_db.py || echo "[entrypoint] WARNING: init_db seed step failed (non-fatal)"
         fi
     else
+
         # Remove alembic_version entries that are now ancestors of other entries.
         python3 - <<'PYEOF'
 import os, sys
@@ -227,6 +228,13 @@ PYEOF
         # Seed MCP catalog and system tool_definitions.
         python3 scripts/init_db.py || echo "[entrypoint] WARNING: init_db seed step failed (non-fatal)"
     fi
+
+    # K8s API/Chat/Worker replicas deliberately skip startup side effects.
+    # Its single migration owner must apply IdP client policy after schema
+    # upgrades, and a configured client failure must stop the rollout.
+    if [ "$MANOR_SERVICE_ROLE" = "migration" ]; then
+        python3 scripts/bootstrap_oauth_provider_clients.py
+    fi
 elif [ -f "alembic.ini" ] && [ -n "${DATABASE_URL_SYNC:-}" ]; then
     echo "[entrypoint] Skipping database bootstrap for MANOR_SERVICE_ROLE=$MANOR_SERVICE_ROLE."
 fi
@@ -240,8 +248,7 @@ fi
 # down gracefully, we unmount JuiceFS. Leaving a stalled FUSE mount mounted when
 # the container is finally SIGKILLed is what wedges the main process in
 # uninterruptible D-state — un-killable by the daemon — which failed the
-# 2026-06-02 deploy (see the escalate_kill self-heal in deploy.yml and the
-# stop_grace_period notes in docker-compose.yml).
+# 2026-06-02 deploy (see the stop_grace_period notes in docker-compose.yml).
 # ---------------------------------------------------------------------------
 _unmount_juicefs() {
     if [ "${MANOR_FS_ENABLED}" = "true" ] && [ "$MANOR_FS_MOUNT_MANAGED" = "juicefs" ] && [ "$_JUICEFS_MOUNTED_BY_ENTRYPOINT" = "1" ]; then

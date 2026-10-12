@@ -13,5 +13,9 @@
     "mcp__manor_mcp_calendar__update_working_hours",
     "mcp__manor_mcp_calendar__get_daily_agenda",
     "mcp__manor_mcp_calendar__list_bookings"
-  ]
+  ],
+  "search": {
+    "terms": ["scheduling link", "availability", "office hours", "appointment slots", "book a call", "meeting link", "timezone"],
+    "examples": ["create booking link for consultations", "set my working hours monday friday", "list upcoming bookings in manor", "show daily agenda today"]
+  }
 }

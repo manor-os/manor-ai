@@ -14,6 +14,7 @@ from packages.core.models.conversation_share import ConversationShare
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
 from packages.core.models.task import Conversation, Message
+from packages.core.models.workspace import Agent, Workspace
 from packages.core.models.worker import CredentialSublease, WorkLease, WorkerActivityLog
 from packages.core.services.conversation_lifecycle import (
     cleanup_expired_ai_edit_conversations,
@@ -202,6 +203,119 @@ async def test_delete_conversation(client: AsyncClient):
     # Messages should also be gone
     msgs = await client.get(f"/api/v1/chat/conversations/{conv_id}/messages", headers=headers)
     assert msgs.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_draft_reuses_personal_web_conversation_and_renames_it(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers = await _auth(client, "agent_draft_owner")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    agent = (await client.post(
+        "/api/v1/agents", headers=headers, json={"name": "Draft Agent"},
+    )).json()
+    db_session.add(Conversation(
+        entity_id=me["entity_id"], user_id=me["id"], agent_id=agent["id"],
+        channel="webchat", title="External channel history",
+    ))
+    await db_session.commit()
+
+    first = await client.post(
+        "/api/v1/chat/conversations/agent-draft",
+        headers=headers,
+        json={"agent_id": agent["id"], "title": "First title"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["title"] == "First title"
+    assert first.json()["user_id"] == me["id"]
+    assert first.json()["agent_id"] == agent["id"]
+    assert first.json()["workspace_id"] is None
+    assert first.json()["channel"] == "web"
+    assert first.json()["message_count"] == 0
+
+    again = await client.post(
+        "/api/v1/chat/conversations/agent-draft",
+        headers=headers,
+        json={"agent_id": agent["id"], "title": "Renamed draft"},
+    )
+    assert again.status_code == 200, again.text
+    assert again.json()["id"] == first.json()["id"]
+    assert again.json()["title"] == "Renamed draft"
+    listing = (await client.get("/api/v1/chat/conversations", headers=headers)).json()
+    assert len([row for row in listing if row["agent_id"] == agent["id"] and row["channel"] == "web"]) == 1
+    assert next(row for row in listing if row["id"] == first.json()["id"])["title"] == "Renamed draft"
+    assert (await db_session.execute(select(Message).where(
+        Message.conversation_id == first.json()["id"],
+    ))).scalars().first() is None
+
+    workspace_attempt = await client.post(
+        "/api/v1/chat/conversations/agent-draft",
+        headers=headers,
+        json={"agent_id": agent["id"], "workspace_id": generate_ulid()},
+    )
+    assert workspace_attempt.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_agent_draft_rejects_agents_not_visible_in_personal_scope(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    from packages.core.models.user import User, UserMembership
+    from packages.core.services.auth_service import create_access_token, hash_password
+
+    owner_headers = await _auth(client, "agent_draft_admin")
+    owner = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    entity_id = owner["entity_id"]
+    member = User(
+        id=generate_ulid(), entity_id=entity_id, email="agentdraftmember@test.com",
+        password_hash=hash_password("pass123"), role="member", status="active",
+    )
+    hidden_workspace = Workspace(
+        entity_id=entity_id, name="Hidden Agent Home",
+        settings={"access_mode": "members_only"},
+    )
+    db_session.add_all([member, UserMembership(
+        user_id=member.id, entity_id=entity_id, role="member",
+        status="active", is_primary=True,
+    ), hidden_workspace])
+    await db_session.flush()
+    visible = Agent(entity_id=entity_id, name="Visible", visibility="entity")
+    template = Agent(entity_id=None, name="Template", is_template=True, is_public=True)
+    hidden = [
+        Agent(entity_id=entity_id, name="Private", visibility="private", owner_user_id=owner["id"]),
+        Agent(entity_id=entity_id, name="Workspace", visibility="workspace", workspace_id=hidden_workspace.id),
+        Agent(entity_id=generate_ulid(), name="Other entity", is_public=True),
+        Agent(entity_id=entity_id, name="Inactive", status="inactive"),
+        Agent(entity_id=entity_id, name="Deleted", deleted_at=datetime.now(timezone.utc)),
+        Agent(entity_id=None, name="Unpublished template", is_template=True),
+    ]
+    db_session.add_all([visible, template, *hidden])
+    await db_session.commit()
+    member_headers = {
+        "Authorization": f"Bearer {create_access_token(member.id, entity_id, 'member')}"
+    }
+
+    for agent in (visible, template):
+        response = await client.post(
+            "/api/v1/chat/conversations/agent-draft",
+            headers=member_headers, json={"agent_id": agent.id},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["workspace_id"] is None
+
+    for agent in hidden:
+        response = await client.post(
+            "/api/v1/chat/conversations/agent-draft",
+            headers=member_headers, json={"agent_id": agent.id},
+        )
+        assert response.status_code == 404, (agent.name, response.text)
+
+    rows = (await db_session.execute(select(Conversation).where(
+        Conversation.user_id == member.id,
+    ))).scalars().all()
+    assert {row.agent_id for row in rows} == {visible.id, template.id}
 
 
 @pytest.mark.asyncio

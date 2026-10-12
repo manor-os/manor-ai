@@ -1,24 +1,16 @@
-"""Always approve for provider-required approvals.
+"""Provider continuations obey the current unified approval policy.
 
-A provider can demand its own per-action confirmation. Manor records the
-operator's standing decision per provider AND action, then answers that gate
-on their behalf — the provider keeps demanding, it just stops being the
-operator's problem. Production 2026-07-27: the operator approved the same
-`Chrome Fill Or Select` five times and nothing published — the card offered no
-"Always approve", and after each approval the model improvised a second,
-tokenless attempt that raised a fresh gate.
-
-With a standing grant Manor now answers that gate itself — confirm, then retry
-with the returned single-use token injected — inside the tool call, so the
-model never sees an approval it cannot resolve.
-
-The gate itself is untouched: without a grant, the card flow runs exactly as
-before.
+An exact saved action exception may answer a provider confirmation and retry
+with its single-use token. Pending requests, explicit denial and required
+human interaction still stop execution. Tests isolate storage and the provider
+executor while using the real shared policy service and evaluator.
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -66,28 +58,38 @@ def _recorder(*, token: str | None = "approval-token-abc"):
     return execute, calls
 
 
-def _grant(monkeypatch, granted: bool, *, seen: dict | None = None):
-    async def fake_grant(db, **kwargs):
-        if seen is not None:
+def _policy(monkeypatch, granted: bool, *, seen: dict | None = None, effect="allow", pending=False):
+    from packages.core.governance import service as governance
+    from packages.core.governance.approval_policy import ApprovalScope
+    from packages.core.governance.approval_policy_service import build_policy_chain
+    from packages.core.governance.policy import WorkspacePolicy
+
+    rules = [{"id": "provider-exception", "effect": effect, "selector": {
+        "kind": "action", "action_key": "chrome.action"}}] if granted else []
+    chain = build_policy_chain(scope=ApprovalScope(kind="workspace", id="WS", entity_id="ENT"),
+        root={"revision": 1, "policy": {"mode": "risk_based", "rules": rules}},
+        local={"root_entity_id": "ENT", "revision": 1, "policy": {"mode": None, "rules": []}})
+    history = [SimpleNamespace(status="pending")] if pending else []
+    result = SimpleNamespace(scalars=lambda: SimpleNamespace(all=lambda: history))
+    db = SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(entity_id="ENT")),
+        execute=AsyncMock(return_value=result))
+    monkeypatch.setattr(governance, "get_policy", AsyncMock(return_value=WorkspacePolicy()))
+    monkeypatch.setattr("packages.core.governance.approval_policy_service.load_policy_chain",
+        AsyncMock(return_value=chain))
+    if seen is not None:
+        original = approval_service._standing_grant
+        async def capture_policy_scope(db, **kwargs):
             seen.update(kwargs)
-        return granted
+            return await original(db, **kwargs)
+        monkeypatch.setattr(approval_service, "_standing_grant", capture_policy_scope)
 
-    monkeypatch.setattr(approval_service, "_standing_grant", fake_grant)
-
-    class _Session:
-        async def __aenter__(self):
-            return None
-
-        async def __aexit__(self, *exc):
-            return False
-
-    monkeypatch.setattr(
-        "packages.core.database.async_session",
-        lambda: _Session(),
-    )
+    class Session:
+        async def __aenter__(self): return db
+        async def __aexit__(self, *exc): return False
+    monkeypatch.setattr("packages.core.database.async_session", Session)
 
 
-def test_every_normalized_provider_supports_always_approve():
+def test_normalized_provider_supports_policy_driven_continuation():
     """The operator's authority does not depend on who wrote the gate."""
     assert _provider_supports_always_approve("chrome") is True
     assert _provider_supports_always_approve("linkedin") is True
@@ -121,7 +123,7 @@ def _youtube_browser_request(*, target_label: str) -> dict[str, object]:
     }
 
 
-def test_proposal_always_approve_is_limited_to_bound_youtube_actions():
+def test_proposal_exact_grant_is_limited_to_bound_youtube_actions():
     authorization = _proposal_authorization()
 
     assert proposal_youtube_public_request_matches(
@@ -147,7 +149,7 @@ def test_proposal_always_approve_is_limited_to_bound_youtube_actions():
     ) is False
 
 
-def test_proposal_always_approve_requires_the_upload_entry_action():
+def test_proposal_exact_grant_requires_the_upload_entry_action():
     authorization = _proposal_authorization()
 
     assert proposal_youtube_public_upload_entry_request_matches(
@@ -173,7 +175,7 @@ def test_proposal_always_approve_requires_the_upload_entry_action():
     ) is False
 
 
-def test_proposal_always_approve_rejects_unbound_workspace():
+def test_proposal_exact_grant_rejects_unbound_workspace():
     settings = {
         **_proposal_authorization(),
     }
@@ -187,9 +189,9 @@ def test_proposal_always_approve_rejects_unbound_workspace():
 
 
 @pytest.mark.asyncio
-async def test_standing_grant_confirms_and_retries_with_the_token(monkeypatch):
-    """The fix: one prior 'Always approve' resolves the gate in place."""
-    _grant(monkeypatch, True)
+async def test_exact_saved_rule_confirms_and_retries_with_the_token(monkeypatch):
+    """A saved exact rule permits the provider continuation."""
+    _policy(monkeypatch, True)
     execute, calls = _recorder()
 
     out = await runtime_auto_confirm_provider_approval(
@@ -214,9 +216,9 @@ async def test_standing_grant_confirms_and_retries_with_the_token(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_standing_grant_retries_the_exact_action_once(monkeypatch):
-    """Always approve cannot alter the approved tab/ref/payload or loop."""
-    _grant(monkeypatch, True)
+async def test_exact_saved_rule_retries_the_exact_action_once(monkeypatch):
+    """An exact rule cannot alter the provider tab/ref/payload or loop."""
+    _policy(monkeypatch, True)
     execute, calls = _recorder()
 
     payload = json.loads(_approval_required_result())
@@ -247,9 +249,9 @@ async def test_standing_grant_retries_the_exact_action_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_canonical_action_scope_reaches_standing_grant(monkeypatch):
+async def test_canonical_action_scope_reaches_shared_policy(monkeypatch):
     seen: dict = {}
-    _grant(monkeypatch, False, seen=seen)
+    _policy(monkeypatch, False, seen=seen)
     execute, calls = _recorder()
 
     payload = json.loads(_approval_required_result())
@@ -269,6 +271,7 @@ async def test_canonical_action_scope_reaches_standing_grant(monkeypatch):
     assert out == original
     assert calls == []
     assert seen == {
+        "entity_id": "ENT",
         "workspace_id": "WS",
         "user_id": "USR",
         "action_key": "chrome.fill_or_select",
@@ -278,9 +281,9 @@ async def test_canonical_action_scope_reaches_standing_grant(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_without_a_grant_the_card_flow_is_untouched(monkeypatch):
-    """No standing grant ⇒ no auto-confirm, no tool calls, original result."""
-    _grant(monkeypatch, False)
+async def test_without_an_allow_rule_the_card_flow_is_untouched(monkeypatch):
+    """The risk-based mode asks for this unknown provider impact."""
+    _policy(monkeypatch, False)
     execute, calls = _recorder()
     original = _approval_required_result()
 
@@ -300,7 +303,7 @@ async def test_without_a_grant_the_card_flow_is_untouched(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_successful_results_pass_straight_through(monkeypatch):
-    _grant(monkeypatch, True)
+    _policy(monkeypatch, True)
     execute, calls = _recorder()
     plain = json.dumps({"ok": True, "status": "filled"})
 
@@ -321,7 +324,7 @@ async def test_successful_results_pass_straight_through(monkeypatch):
 async def test_confirm_without_a_token_falls_back_to_the_card(monkeypatch):
     """If the provider does not hand back a token there is nothing to retry
     with — surface the approval rather than firing an unauthorized action."""
-    _grant(monkeypatch, True)
+    _policy(monkeypatch, True)
     execute, calls = _recorder(token=None)
     original = _approval_required_result()
 
@@ -340,7 +343,7 @@ async def test_confirm_without_a_token_falls_back_to_the_card(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_executor_failure_falls_back_to_the_card(monkeypatch):
-    _grant(monkeypatch, True)
+    _policy(monkeypatch, True)
 
     async def exploding(name: str, args: dict) -> str:
         raise RuntimeError("extension offline")
@@ -360,7 +363,7 @@ async def test_executor_failure_falls_back_to_the_card(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_expired_provider_approval_is_not_auto_confirmed(monkeypatch):
-    _grant(monkeypatch, True)
+    _policy(monkeypatch, True)
     execute, calls = _recorder()
     expired = json.dumps(
         {
@@ -395,7 +398,7 @@ async def test_a_gated_retry_does_not_recurse(monkeypatch):
     retry again, forever — the run hung rather than failing. One auto-answer
     per tool call; if the retry is still gated, hand it to the card flow.
     """
-    _grant(monkeypatch, True)
+    _policy(monkeypatch, True)
     calls: list[str] = []
 
     async def always_gated(name: str, args: dict) -> str:
@@ -418,3 +421,21 @@ async def test_a_gated_retry_does_not_recurse(monkeypatch):
     # exactly one confirm + one retry, then stop
     assert calls == ["mcp__chrome__confirm_action", "mcp__chrome__fill_or_select"]
     assert json.loads(out)["status"] == "approval_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["pending", "deny", "human"])
+async def test_saved_provider_rule_cannot_bypass_existing_or_human_requirements(monkeypatch, blocker):
+    _policy(monkeypatch, True, effect="deny" if blocker == "deny" else "allow",
+        pending=blocker == "pending")
+    execute, calls = _recorder()
+    payload = json.loads(_approval_required_result())
+    if blocker == "human":
+        payload["confirmation_mode"] = "handoff_required"
+        payload["policy_category"] = "captcha"
+    original = json.dumps(payload)
+    out = await runtime_auto_confirm_provider_approval(tool_name="mcp__chrome__fill_or_select",
+        arguments=_ARGS, result=original, execute=execute,
+        entity_id="ENT", user_id="USR", workspace_id="WS")
+    assert calls == []
+    assert out == original

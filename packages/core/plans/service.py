@@ -11,17 +11,28 @@ indexed lookup.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import (
     TaskLogType,
+    TaskRuntimeKind,
     TaskStatus,
 )
 from packages.core.constants.execution import (
+    ACTION_EFFECT_GENERATION_PARAM_KEY,
+    COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY,
+    COORDINATOR_CHILD_ITEM_PARAM_KEY,
+    COORDINATOR_CHILD_PARAM_KEY,
+    COORDINATOR_CHILD_RELEASED_PARAM_KEY,
+    COORDINATOR_PARAM_KEY,
+    COORDINATOR_PARENT_STEP_PARAM_KEY,
+    COORDINATOR_TYPED_CHILD_PARAM_KEY,
+    COORDINATOR_WAITING_CHILD_PARAM_KEY,
     ExecutionPlanStatus,
     ExecutionStepStatus,
     PLAN_TERMINAL_STATUSES,
@@ -29,6 +40,14 @@ from packages.core.constants.execution import (
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.plans.schema import Plan, PlanStep
+from packages.core.plans.step_reset import (
+    lock_plan_leases_then_steps,
+    revoke_leases_before_cancelling_steps,
+)
+
+if TYPE_CHECKING:
+    from packages.core.services.task_execution import CoordinatorRuntimeSelection
+    from packages.core.services.task_coordinator_wakeup import TaskCoordinatorClaim
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +68,15 @@ class ActiveTaskPlanError(Exception):
         super().__init__(
             f"task {task_id} already has active plan {plan_id} ({status})"
         )
+
+
+class TaskEffectReplayBlockedError(Exception):
+    """A new Plan would cross a Task-history external-effect boundary."""
+
+    def __init__(self, task_id: str, detail: str) -> None:
+        self.task_id = task_id
+        self.detail = detail
+        super().__init__(detail)
 
 
 async def get_active_task_plan(
@@ -93,6 +121,49 @@ async def raise_for_active_task_plan(
             str(active_plan.id),
             str(active_plan.status),
         )
+
+
+async def _locked_task_coordinator_run_for_plan(
+    db: AsyncSession,
+    *,
+    task: Any,
+    selection: CoordinatorRuntimeSelection,
+    claim: TaskCoordinatorClaim,
+    parent_plan_id: str | None,
+) -> Any:
+    """Fence a V3 Plan write to the exact live Task-loop owner."""
+
+    from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
+
+    run = (await db.execute(
+        select(TaskCoordinatorRun)
+        .where(TaskCoordinatorRun.id == claim.run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    expiry = run.claim_expires_at if run is not None else None
+    if expiry is not None and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if (
+        run is None
+        or run.task_id != task.id
+        or run.entity_id != task.entity_id
+        or run.workspace_id != task.workspace_id
+        or claim.task_id != task.id
+        or run.root_subscription_id != selection.root.subscription_id
+        or run.root_agent_id != selection.root.agent_id
+        or run.selection_fingerprint != selection.stable_fingerprint()
+        or run.phase in TaskCoordinatorPhase.terminal()
+        or run.claim_token != claim.claim_token
+        or run.claim_generation != claim.wake_generation
+        or run.wake_generation != claim.wake_generation
+        or expiry is None
+        or expiry <= datetime.now(timezone.utc)
+    ):
+        raise ValueError("Task coordinator Plan claim or factory selection is stale")
+    if parent_plan_id != run.current_plan_id:
+        raise ValueError("Task coordinator Plan parent does not match the current Plan")
+    return run
 
 
 def bind_task_output_contract(plan: Plan, task_expected_output: Any) -> Plan:
@@ -156,6 +227,9 @@ async def create_plan_from_dag(
     execution_mode: str = "live",
     approval_required: bool = False,
     enforce_contract: bool = False,
+    allow_generated_coordinator: bool = False,
+    expected_selection: CoordinatorRuntimeSelection | None = None,
+    task_coordinator_claim: TaskCoordinatorClaim | None = None,
 ) -> ExecutionPlan:
     """Persist a validated Plan as ExecutionPlan + ExecutionStep rows.
 
@@ -165,6 +239,7 @@ async def create_plan_from_dag(
     runnable, so safe predecessor work can still proceed.
     """
     task_expected_output = None
+    task = None
     if task_id:
         from packages.core.models.task import Task
 
@@ -192,7 +267,126 @@ async def create_plan_from_dag(
             entity_id=entity_id,
         )
 
+        # Final, Task-locked replay fence. Queue-time checks are advisory: a
+        # stale Celery delivery, manual API call, or planner that was already
+        # in provider I/O must all revalidate the complete Task history here
+        # before a new Plan/Step identity can be persisted.
+        from packages.core.dispatcher.effect_safety import (
+            task_execution_effect_block_detail,
+        )
+
+        effect_block = await task_execution_effect_block_detail(db, task_id)
+        if effect_block:
+            raise TaskEffectReplayBlockedError(task_id, effect_block)
+
         task_expected_output = task.expected_output
+
+    # Params are an untrusted Planner/API surface.  Runtime-only markers must
+    # never turn an ordinary step into a hidden child or enable delegation.
+    # The sole exception is the exact plan shape produced by the server's
+    # coordinator fold, and that exception must still be eligible for this
+    # Task through the closed runtime factory.
+    from packages.core.plans.coordinator import (
+        TASK_COORDINATOR_PLAN_VERSION,
+        TASK_COORDINATOR_PLAN_VERSION_KEY,
+        TASK_COORDINATOR_RUN_ID_KEY,
+        assert_no_server_owned_plan_params,
+        is_generated_coordinator_plan,
+        validate_coordinator_source_plan,
+    )
+    from packages.core.services.task_execution import resolve_task_execution
+
+    if expected_selection is not None and (task is None or not task.workspace_id):
+        raise ValueError(
+            "expected coordinator selection requires a Workspace Task"
+        )
+    if task_coordinator_claim is not None and (task is None or not task.workspace_id):
+        raise ValueError("Task coordinator Plan requires a Workspace Task")
+    if task is not None and task.workspace_id and task_coordinator_claim is None:
+        raise ValueError(
+            "New Workspace Task Plans require a live Task coordinator claim; "
+            "submit a planning request instead"
+        )
+
+    supplied_generated_coordinator = is_generated_coordinator_plan(plan)
+    try:
+        assert_no_server_owned_plan_params(plan)
+    except ValueError:
+        if (
+            not allow_generated_coordinator
+            or task is None
+            or not task.workspace_id
+            or not supplied_generated_coordinator
+        ):
+            raise
+    else:
+        supplied_generated_coordinator = False
+
+    coordinator_selection = None
+    task_coordinator_run = None
+    if task is not None and task.workspace_id:
+        if task.status != TaskStatus.IN_PROGRESS.value:
+            raise ValueError(
+                f"Task status {task.status!r} cannot create a new Plan; "
+                f"expected {TaskStatus.IN_PROGRESS.value!r}"
+            )
+        execution = await resolve_task_execution(
+            db,
+            task,
+            lock_subscriptions=True,
+        )
+        current_selection = execution.coordinator
+        if expected_selection is not None:
+            # The Planner generated against this exact immutable selection.
+            # Re-resolve under the Task/subscription locks, then persist and
+            # materialize only the expected identities—not a fresh B/C choice.
+            expected_selection.require_current(current_selection)
+            coordinator_selection = expected_selection
+        else:
+            coordinator_selection = current_selection
+        if (
+            execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN
+            or coordinator_selection is None
+        ):
+            if supplied_generated_coordinator:
+                raise ValueError(
+                    "coordinator services exceed the active Task subscription scope"
+                )
+            raise ValueError(
+                f"Task runtime {execution.runtime_kind.value!r} cannot create "
+                "a new Plan"
+            )
+
+        root_binding = coordinator_selection.root
+        if (
+            agent_subscription_id
+            and str(agent_subscription_id) != root_binding.subscription_id
+        ):
+            raise ValueError(
+                "Plan agent subscription does not match the Task runtime's "
+                "coordinator root"
+            )
+        agent_subscription_id = root_binding.subscription_id
+
+        if task_coordinator_claim is not None:
+            if supplied_generated_coordinator:
+                raise ValueError("Task coordinator Plan requires the source typed DAG")
+            if str(workspace_id or "") != str(task.workspace_id):
+                raise ValueError("Task coordinator Plan Workspace does not match its Task")
+            task_coordinator_run = await _locked_task_coordinator_run_for_plan(
+                db,
+                task=task,
+                selection=coordinator_selection,
+                claim=task_coordinator_claim,
+                parent_plan_id=parent_plan_id,
+            )
+            plan = bind_task_output_contract(plan, task_expected_output)
+            validate_coordinator_source_plan(plan, coordinator=coordinator_selection)
+            # V3 is a server-owned execution path: even an internal caller that
+            # omits the optional generic flag cannot skip its DAG contract gate.
+            enforce_contract = True
+
+    if task is not None:
         plan = bind_task_output_contract(plan, task_expected_output)
 
     if enforce_contract:
@@ -203,6 +397,7 @@ async def create_plan_from_dag(
             plan.topo_order(),
             task_expected_output=task_expected_output,
             require_explicit_agent_outputs=True,
+            require_explicit_execution_contract=True,
         )
         if gaps:
             raise PlanContractError(gaps)
@@ -225,17 +420,47 @@ async def create_plan_from_dag(
         status=initial_status,
         approval_required=plan_needs_approval,
         execution_mode=execution_mode,
+        dispatcher_state=(
+            {
+                TASK_COORDINATOR_PLAN_VERSION_KEY: TASK_COORDINATOR_PLAN_VERSION,
+                TASK_COORDINATOR_RUN_ID_KEY: task_coordinator_run.id,
+            }
+            if task_coordinator_run is not None else {}
+        ),
     )
     db.add(row)
     await db.flush()
+    if task_coordinator_run is not None:
+        from packages.core.models.task_coordinator import TaskCoordinatorPhase
+
+        task_coordinator_run.current_plan_id = row.id
+        task_coordinator_run.phase = TaskCoordinatorPhase.WAITING_PLAN.value
+        task_coordinator_run.state_version += 1
 
     # Materialise immediately so step rows exist as soon as the plan
     # does — keeps the executor path uniform regardless of whether the
     # plan needs approval (approval just gates the status transition,
     # not the existence of step rows).
-    await materialize_plan_steps(db, row.id, plan)
+    await materialize_plan_steps(
+        db,
+        row.id,
+        plan,
+        coordinator=coordinator_selection,
+    )
     if plan_needs_approval and task_id:
         await _surface_pending_plan_approval(db, row)
+    if not plan_needs_approval:
+        # Plan creation and its first runnable cycle are one durable boundary.
+        # Every caller (Planner, manual API, recovery) therefore receives the
+        # same crash-safe admission contract without relying on a post-commit
+        # process callback or direct heavy-task enqueue.
+        from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+        await stage_plan_cycle_wake(
+            db,
+            row.id,
+            reason="plan_created",
+        )
     return row
 
 
@@ -297,7 +522,11 @@ async def _surface_pending_plan_approval(db: AsyncSession, plan_row: ExecutionPl
 
 
 async def materialize_plan_steps(
-    db: AsyncSession, plan_id: str, plan: Plan,
+    db: AsyncSession,
+    plan_id: str,
+    plan: Plan,
+    *,
+    coordinator=None,
 ) -> list[ExecutionStep]:
     """Insert one ExecutionStep row per node in the plan, in topo order.
 
@@ -307,6 +536,108 @@ async def materialize_plan_steps(
     plan_row = (await db.execute(
         select(ExecutionPlan).where(ExecutionPlan.id == plan_id)
     )).scalar_one()
+    from packages.core.plans.coordinator import (
+        TASK_COORDINATOR_PLAN_VERSION,
+        TASK_COORDINATOR_PLAN_VERSION_KEY,
+        TASK_COORDINATOR_RUN_ID_KEY,
+        assert_no_server_owned_plan_params,
+        coordinator_child_idempotency_key,
+        coordinator_child_step_key,
+        is_generated_coordinator_plan,
+        validate_coordinator_source_plan,
+    )
+
+    dispatcher_state = (
+        plan_row.dispatcher_state
+        if isinstance(plan_row.dispatcher_state, dict) else {}
+    )
+    version = dispatcher_state.get(TASK_COORDINATOR_PLAN_VERSION_KEY)
+    if version is not None and version != TASK_COORDINATOR_PLAN_VERSION:
+        raise ValueError("unknown Task coordinator Plan version")
+    task_coordinator_v3 = version == TASK_COORDINATOR_PLAN_VERSION
+    generated_coordinator = is_generated_coordinator_plan(plan)
+    if generated_coordinator and task_coordinator_v3:
+        raise ValueError("Task coordinator Plan cannot contain a V2 coordinator root")
+    try:
+        assert_no_server_owned_plan_params(plan)
+    except ValueError:
+        # Re-materialisation of a persisted coordinator is valid only for the
+        # same strict single-parent shape. Child/runtime markers are never
+        # accepted through Plan materialisation.
+        if not generated_coordinator:
+            raise
+
+    coordinator_bindings: dict[str, Any] = {}
+    if task_coordinator_v3:
+        from packages.core.models.task_coordinator import TaskCoordinatorRun
+
+        run_id = str(dispatcher_state.get(TASK_COORDINATOR_RUN_ID_KEY) or "")
+        run = (await db.execute(
+            select(TaskCoordinatorRun).where(TaskCoordinatorRun.id == run_id)
+        )).scalar_one_or_none()
+        if (
+            run is None or not plan_row.task_id
+            or run.task_id != plan_row.task_id
+            or run.entity_id != plan_row.entity_id
+            or run.workspace_id != plan_row.workspace_id
+            or run.current_plan_id != plan_row.id
+        ):
+            raise ValueError("Task coordinator Plan has no matching current Run")
+
+    if (generated_coordinator or task_coordinator_v3) and plan_row.task_id:
+        from packages.core.models.task import Task
+        from packages.core.services.task_execution import resolve_task_execution
+
+        task = (await db.execute(
+            select(Task).where(
+                Task.id == plan_row.task_id,
+                Task.entity_id == plan_row.entity_id,
+                Task.workspace_id == plan_row.workspace_id,
+            )
+        )).scalar_one_or_none()
+        if task is None:
+            raise ValueError("coordinator Task disappeared before materialization")
+        if coordinator is None:
+            execution = await resolve_task_execution(db, task)
+            coordinator = execution.coordinator
+            if (
+                execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN
+                or coordinator is None
+            ):
+                raise ValueError(
+                    f"Task runtime {execution.runtime_kind.value!r} cannot "
+                    "materialize a coordinator Plan"
+                )
+        coordinator_bindings = {
+            binding.service_key: binding
+            for binding in coordinator.bindings
+        }
+        if task_coordinator_v3:
+            if (
+                run.root_subscription_id != coordinator.root.subscription_id
+                or run.root_agent_id != coordinator.root.agent_id
+                or run.selection_fingerprint != coordinator.stable_fingerprint()
+            ):
+                raise ValueError("Task coordinator Plan factory selection changed")
+            validate_coordinator_source_plan(plan, coordinator=coordinator)
+        else:
+            required_services = {
+                str(value).strip()
+                for value in (
+                    plan.steps[0].params.get("delegate_services") or []
+                )
+                if str(value or "").strip()
+            }
+            required_services.add(str(plan.steps[0].service_key or "").strip())
+            required_services.discard("")
+            if (
+                str(plan.steps[0].service_key or "").strip()
+                != coordinator.root.service_key
+                or not required_services.issubset(coordinator_bindings)
+            ):
+                raise ValueError(
+                    "coordinator services exceed the active Task subscription scope"
+                )
     workspace_retry_config: dict = {}
     if plan_row.workspace_id:
         from packages.core.models.workspace import Workspace
@@ -370,9 +701,144 @@ async def materialize_plan_steps(
             )
         )
 
+    if task_coordinator_v3:
+        for row in rows:
+            if row.service_key:
+                binding = coordinator_bindings.get(str(row.service_key))
+                if binding is None:
+                    raise ValueError(
+                        f"Task coordinator step {row.step_key!r} has no exact "
+                        "active service binding"
+                    )
+                row.resolved_subscription_id = binding.subscription_id
+                row.resolved_agent_id = binding.agent_id
+            # Only the Task loop can release a source Step. The Dispatcher
+            # never leases PAUSED rows, and no model-authored argument becomes
+            # a release marker inside an action's input schema.
+            row.step_status = ExecutionStepStatus.PAUSED.value
+
+    if generated_coordinator:
+        root = rows[0]
+        root_binding = coordinator_bindings.get(str(root.service_key or ""))
+        if coordinator_bindings and root_binding is None:
+            raise ValueError("coordinator root service binding is unavailable")
+        if root_binding is not None:
+            root.resolved_subscription_id = root_binding.subscription_id
+            root.resolved_agent_id = root_binding.agent_id
+            plan_row.agent_subscription_id = root_binding.subscription_id
+        root.params = {
+            **deepcopy(root.params if isinstance(root.params, dict) else {}),
+            # ``None`` means the root is runnable and is not parked for a
+            # particular child. The dispatcher replaces it with the exact
+            # child identity only while the coordinator is suspended.
+            COORDINATOR_WAITING_CHILD_PARAM_KEY: None,
+        }
+        checklist = plan.steps[0].params.get("checklist") or []
+        source_steps = [_coordinator_source_step(item) for item in checklist]
+        # Revalidate the embedded source DAG at the persistence boundary. The
+        # generated-plan predicate proves ownership/shape; Plan validation
+        # additionally proves every dependency and cycle before rows exist.
+        Plan(steps=source_steps).topo_order()
+        child_key_by_source = {
+            source.key: coordinator_child_step_key(root.step_key, source.key)
+            for source in source_steps
+        }
+        if len(set(child_key_by_source.values())) != len(child_key_by_source):
+            raise ValueError("coordinator child step keys are not unique")
+        child_shape_by_key = _resolve_output_shapes(source_steps)
+
+        for source, source_contract in zip(source_steps, checklist, strict=True):
+            # Dormant children carry the immutable source contract, not live
+            # executor arguments. The coordinator release transition resolves
+            # its refs under the parent/child locks, writes those resolved
+            # arguments, and only then marks the child PENDING.
+            child_params = {
+                "source_contract": deepcopy(source_contract),
+                COORDINATOR_CHILD_PARAM_KEY: True,
+                COORDINATOR_TYPED_CHILD_PARAM_KEY: True,
+                COORDINATOR_CHILD_RELEASED_PARAM_KEY: False,
+                COORDINATOR_PARENT_STEP_PARAM_KEY: root.step_key,
+                COORDINATOR_CHILD_ITEM_PARAM_KEY: source.key,
+                COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY: (
+                    coordinator_child_idempotency_key(
+                        plan_row.id,
+                        root.step_key,
+                        source.key,
+                    )
+                ),
+                ACTION_EFFECT_GENERATION_PARAM_KEY: 0,
+            }
+            child_step = source.model_copy(update={
+                "key": child_key_by_source[source.key],
+                "params": child_params,
+                "depends_on": [
+                    child_key_by_source[dependency]
+                    for dependency in source.depends_on
+                ],
+            })
+            step_preview = type("_StepPreview", (), {"params": source.params})()
+            policy = merge_retry_policy_configs(
+                ("workspace", workspace_retry_config),
+                ("plan", plan_retry_config),
+                ("step", step_retry_policy_config(step_preview)),
+            )
+            child_row = _step_from_pydantic(
+                plan_row,
+                child_step,
+                max_attempts=policy.max_attempts,
+                output_shape=child_shape_by_key.get(source.key),
+            )
+            child_binding = coordinator_bindings.get(
+                str(child_row.service_key or "")
+            )
+            if child_row.service_key and child_binding is None and coordinator_bindings:
+                raise ValueError(
+                    f"coordinator child service {child_row.service_key!r} "
+                    "has no exact active subscription binding"
+                )
+            if child_binding is not None:
+                child_row.resolved_subscription_id = child_binding.subscription_id
+                child_row.resolved_agent_id = child_binding.agent_id
+            child_row.step_status = ExecutionStepStatus.PAUSED.value
+            rows.append(child_row)
+
     db.add_all(rows)
     await db.flush()
     return rows
+
+
+def _coordinator_source_step(item: Any) -> PlanStep:
+    """Restore one server-generated checklist item to its typed source step."""
+
+    if not isinstance(item, dict):
+        raise ValueError("coordinator checklist items must be objects")
+    item_key = str(item.get("delegation_key") or item.get("key") or "").strip()
+    params = deepcopy(item.get("params")) if isinstance(item.get("params"), dict) else {}
+    kind = str(item.get("kind") or "").strip()
+    if kind in {"llm", "subagent"} and not params.get("prompt") and item.get("prompt"):
+        # Compatibility with the first generated coordinator payload, which
+        # carried the agent prompt beside (rather than only inside) params.
+        params["prompt"] = str(item["prompt"])
+    return PlanStep.model_validate({
+        "key": item_key,
+        "kind": kind,
+        "service_key": item.get("service_key"),
+        "provider": item.get("provider"),
+        "action_key": item.get("action_key"),
+        "capability_id": item.get("capability_id"),
+        "integration_id": item.get("integration_id"),
+        "params": params,
+        "expected_input_schema": deepcopy(item.get("expected_input_schema")),
+        "expected_output_schema": deepcopy(item.get("expected_output_schema")),
+        "output_shape": item.get("output_shape"),
+        "execution_contract": deepcopy(item.get("execution_contract")),
+        "depends_on": list(item.get("depends_on") or []),
+        "risk_level": item.get("risk_level") or "low",
+        "requires_approval": bool(item.get("requires_approval")),
+        "max_attempts": item.get("max_attempts") or 3,
+        "expects": list(item.get("expects") or []) or None,
+        "description": item.get("description"),
+    })
 
 
 class PlanContractError(Exception):
@@ -392,8 +858,18 @@ def _linker_lite_steps(steps: list[PlanStep]) -> list[dict]:
     """Project plan steps onto the contract fields the linker reads."""
     from packages.core.plans.refs import extract_step_ref_paths, extract_step_refs
 
-    return [
-        {
+    linked: list[dict] = []
+    for s in steps:
+        params = s.params if isinstance(s.params, dict) else {}
+        # A generated coordinator's checklist is a server-owned embedded DAG,
+        # not input consumed by the root itself. Its exact refs are validated
+        # before folding and again when typed children are materialised.
+        linker_params = (
+            {"prompt": params.get("prompt")}
+            if params.get(COORDINATOR_PARAM_KEY) is True
+            else params
+        )
+        linked.append({
             "key": s.key,
             "kind": s.kind,
             "output_shape": s.output_shape,
@@ -403,15 +879,14 @@ def _linker_lite_steps(steps: list[PlanStep]) -> list[dict]:
             # promise a downstream ref that the persisted contract explicitly
             # allows the producer to omit.
             "expected_output_schema": (
-                _strip_receipt_required_fields(s.expected_output_schema)
+                _defang_agent_payload_schema(s.expected_output_schema)
                 if s.kind in ("llm", "subagent")
                 else s.expected_output_schema
             ),
-            "input_refs": extract_step_refs(s.params),
-            "input_ref_paths": extract_step_ref_paths(s.params),
-        }
-        for s in steps
-    ]
+            "input_refs": extract_step_refs(linker_params),
+            "input_ref_paths": extract_step_ref_paths(linker_params),
+        })
+    return linked
 
 
 def plan_contract_gaps(
@@ -419,6 +894,7 @@ def plan_contract_gaps(
     *,
     task_expected_output: Any = None,
     require_explicit_agent_outputs: bool = False,
+    require_explicit_execution_contract: bool = False,
 ) -> list:
     """Return the contract linker's unfixable gaps (``LinkIssue`` list) for a
     plan, after auto-repair. Empty list means the plan is contract-clean (every
@@ -428,6 +904,59 @@ def plan_contract_gaps(
 
     _repaired, remaining = repair_plan(_linker_lite_steps(steps))
     gaps = list(remaining)
+
+    from packages.core.contracts.step_execution import StepDelivery, StepEffects
+
+    for step in steps:
+        contract = step.execution_contract
+        if contract is None:
+            if require_explicit_execution_contract and step.kind in {"llm", "subagent"}:
+                gaps.append(LinkIssue(
+                    "missing_execution_contract", step.key,
+                    "new agent Steps must declare execution_contract.delivery and "
+                    "execution_contract.effects separately from their result payload; "
+                    "declare only this Step's work, not the whole Task's delivery",
+                ))
+            continue
+        if contract.delivery is StepDelivery.INLINE and "files" in (step.expects or []):
+            gaps.append(LinkIssue(
+                "conflicting_delivery_contract", step.key,
+                "execution_contract.delivery=inline conflicts with expects=['files']; "
+                "use artifact delivery for a required file, or remove the file expectation "
+                "from a genuinely inline intermediate Step",
+            ))
+        if contract.effects is not StepEffects.AUTHORIZED and "publish" in (step.expects or []):
+            gaps.append(LinkIssue(
+                "conflicting_effect_contract", step.key,
+                "expects=['publish'] requires execution_contract.effects=authorized; "
+                "read_only/artifact_write cannot publish or send external content",
+            ))
+        if step.kind == "llm" and contract.effects is not StepEffects.READ_ONLY:
+            gaps.append(LinkIssue(
+                "conflicting_effect_contract", step.key,
+                "text-only llm Steps require execution_contract.effects=read_only; "
+                "use a tool-capable subagent for permitted mutations",
+            ))
+
+    for step in steps:
+        if step.kind == "llm" and "publish" in (step.expects or []):
+            gaps.append(LinkIssue(
+                "unexecutable_publish", step.key,
+                "A text-only llm step cannot publish. Use a tool-capable subagent "
+                "with captured publish evidence or an available integration action.",
+            ))
+        if step.kind == "llm" and "files" in (step.expects or []):
+            gaps.append(LinkIssue(
+                "unexecutable_file_creation", step.key,
+                "A text-only llm step cannot create a file. Use a subagent with "
+                "the selected Agent's file tools and captured artifact evidence.",
+            ))
+        if step.kind == "llm" and step.params.get("skill_refs"):
+            gaps.append(LinkIssue(
+                "unexecutable_skill_invocation", step.key,
+                "A text-only llm step cannot invoke a Skill. Use a subagent "
+                "with the selected Agent's Skill configuration.",
+            ))
 
     from packages.core.contracts.task_output import (
         task_expected_output_declares_schema,
@@ -673,6 +1202,48 @@ def _strip_receipt_required_fields(schema: dict | None) -> dict | None:
     return out
 
 
+def _strip_array_cardinality(schema: Any) -> Any:
+    """Relax record-count promises in every array of an agent payload schema.
+
+    How many records a step finds is a fact the run discovers, not a promise
+    the Planner can make: ``prospects: {minItems: 25, maxItems: 25}`` next to
+    "mark unknown fields as null rather than inventing" left the model no
+    schema-valid answer except invented rows (staging, 2026-09-11). ``maxItems``
+    is dropped and ``minItems`` is clamped to at most 1: "at least one" is the
+    guarantee the linker needs to prove a ``files[0]`` reference and a step
+    that found nothing reports failed/partial honestly, while "at least 25"
+    can only be met by invention. The count target stays in the prompt and is
+    reported through the envelope's ``progress``; the contract keeps the
+    fields and their requiredness. Returns the input object untouched when
+    nothing needs relaxing.
+    """
+    if isinstance(schema, list):
+        stripped = [_strip_array_cardinality(item) for item in schema]
+        return stripped if any(a is not b for a, b in zip(stripped, schema)) else schema
+    if not isinstance(schema, dict):
+        return schema
+    out: dict[str, Any] | None = None
+    for key, value in schema.items():
+        if key == "maxItems":
+            out = dict(schema) if out is None else out
+            out.pop(key, None)
+            continue
+        if key == "minItems" and isinstance(value, int) and value > 1:
+            out = dict(schema) if out is None else out
+            out[key] = 1
+            continue
+        replacement = _strip_array_cardinality(value)
+        if replacement is not value:
+            out = dict(schema) if out is None else out
+            out[key] = replacement
+    return schema if out is None else out
+
+
+def _defang_agent_payload_schema(schema: dict | None) -> dict | None:
+    """Remove the promises an llm/subagent step cannot keep by construction."""
+    return _strip_array_cardinality(_strip_receipt_required_fields(schema))
+
+
 def _expected_output_schema_for_plan_step(
     ps: PlanStep,
     *,
@@ -734,7 +1305,7 @@ def _expected_output_schema_for_plan_step(
         # provenance-mark the remaining payload before materialization. Only
         # already-materialized legacy schemas remain unmarked/advisory.
         expected_output_schema = plan_output_contract_schema(
-            _strip_receipt_required_fields(ps.expected_output_schema),
+            _defang_agent_payload_schema(ps.expected_output_schema),
             source=PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
         )
         shape_schema_applied = True
@@ -751,7 +1322,7 @@ def _expected_output_schema_for_plan_step(
     if not shape_schema_applied and ps.kind in ("llm", "subagent"):
         # A planner-authored custom schema survived (no shape resolved):
         # de-fang its receipt requirements before it can OutputSchemaError.
-        expected_output_schema = _strip_receipt_required_fields(expected_output_schema)
+        expected_output_schema = _defang_agent_payload_schema(expected_output_schema)
     return expected_output_schema
 
 
@@ -768,6 +1339,15 @@ def _step_from_pydantic(
         output_shape=output_shape,
         task_output_contract_schema=task_output_contract_schema,
     )
+    params = dict(ps.params)
+    from packages.core.contracts.step_execution import STEP_EXECUTION_CONTRACT_PARAM
+
+    # Only the validated top-level declaration becomes execution context;
+    # model-authored params may not impersonate materializer-owned state.
+    params.pop(STEP_EXECUTION_CONTRACT_PARAM, None)
+    execution_contract = getattr(ps, "execution_contract", None)
+    if execution_contract is not None:
+        params[STEP_EXECUTION_CONTRACT_PARAM] = execution_contract.model_dump(mode="json")
     return ExecutionStep(
         id=generate_ulid(),
         plan_id=plan_row.id,
@@ -780,7 +1360,7 @@ def _step_from_pydantic(
         action_key=ps.action_key,
         capability_id=ps.capability_id,
         integration_id=ps.integration_id,
-        params=ps.params,
+        params=params,
         expected_input_schema=ps.expected_input_schema,
         expected_output_schema=expected_output_schema,
         depends_on=list(ps.depends_on),
@@ -826,7 +1406,10 @@ async def cancel_plan(
     *, reason: Optional[str] = None,
 ) -> Optional[ExecutionPlan]:
     plan = (await db.execute(
-        select(ExecutionPlan).where(ExecutionPlan.id == plan_id)
+        select(ExecutionPlan)
+        .where(ExecutionPlan.id == plan_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if not plan or plan.status in (ExecutionPlanStatus.COMPLETED, ExecutionPlanStatus.CANCELLED, ExecutionPlanStatus.FAILED,):
         return plan
@@ -837,12 +1420,20 @@ async def cancel_plan(
     if reason:
         plan.last_error = {"cancelled": reason}
 
-    # Mark any non-terminal steps as cancelled too.
-    steps = await list_plan_steps(db, plan_id)
-    for s in steps:
-        if s.step_status in (ExecutionStepStatus.PENDING, ExecutionStepStatus.RUNNING, ExecutionStepStatus.WAITING_HUMAN,):
-            s.step_status = ExecutionStepStatus.CANCELLED.value
-            s.finished_at = now
+    # Plan -> Lease -> Step is the same lock suffix used by worker reports.
+    # Revoke every live/suspended lease and clear its claim/credentials before
+    # the corresponding row becomes terminal. Include PAUSED coordinator
+    # roots and dormant children so a parked fold cannot survive Plan cancel.
+    leases, steps = await lock_plan_leases_then_steps(db, plan_id=plan_id)
+    revoke_leases_before_cancelling_steps(
+        db,
+        leases=leases,
+        steps=steps,
+        step_ids={step.id for step in steps},
+        reason=reason or "plan cancelled",
+        now=now,
+        clear_runtime_checkpoint=False,
+    )
 
     await db.flush()
     return plan

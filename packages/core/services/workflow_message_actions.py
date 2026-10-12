@@ -319,6 +319,15 @@ async def _resolve_wait(
         pending_action.get("response_variable")
         or f"{pending_action['step_id']}_response"
     )
+    collection_wait = (
+        kind == PendingActionKind.WORKFLOW_INPUT.value
+        and isinstance(current_config.get("collection_fields"), list)
+        and bool(current_config["collection_fields"])
+    )
+    if collection_wait and not (
+        isinstance(payload, dict) and isinstance(payload.get("inputs"), dict)
+    ):
+        _fail(422, "Workflow input answers are required")
     response_value = {
         "choice": choice,
         **({"note": note} if note else {}),
@@ -357,7 +366,12 @@ async def _resolve_wait(
             )
         except ValueError as exc:
             _fail(400, str(exc))
-    if stage_wait is not None and isinstance(current_step, dict):
+    if collection_wait:
+        # The paused receipt remains reexecutable. The runner merges this
+        # round's answers, then either requests the next missing fields or
+        # completes the node with the full collection.
+        pass
+    elif stage_wait is not None and isinstance(current_step, dict):
         complete_workflow_stage_wait(
             run,
             current_step,

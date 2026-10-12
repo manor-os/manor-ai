@@ -28,6 +28,7 @@ async def test_list_documents_workspace_filter_includes_group_and_artifact_prove
         name="weekly-report.json",
         file_type="json",
         source="agent",
+        visibility="workspace",
         vector_status=VectorStatus.READY,
         metadata_=merge_document_metadata(
             origin={"workspace_id": workspace_id, "task_id": "task_1"},
@@ -40,11 +41,27 @@ async def test_list_documents_workspace_filter_includes_group_and_artifact_prove
         name="other-workspace.json",
         file_type="json",
         source="agent",
+        visibility="workspace",
         vector_status=VectorStatus.READY,
         metadata_=merge_document_metadata(
             origin={"workspace_id": generate_ulid()},
             artifact={"role": "final"},
         ),
+    )
+    personal_doc = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="personal-report.json",
+        source="ai_generated",
+        visibility="private",
+        metadata_=merge_document_metadata(origin={"workspace_id": workspace_id}),
+    )
+    historical_entity_doc = Document(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="historical-report.json",
+        visibility="entity",
+        metadata_=merge_document_metadata(origin={"workspace_id": workspace_id}),
     )
     group = DocumentGroup(
         id=group_id,
@@ -54,7 +71,9 @@ async def test_list_documents_workspace_filter_includes_group_and_artifact_prove
         settings={"default_collection": True},
     )
 
-    db_session.add_all([group_doc, artifact_doc, other_doc, group])
+    db_session.add_all([
+        group_doc, artifact_doc, other_doc, personal_doc, historical_entity_doc, group,
+    ])
     db_session.add(DocumentGroupMember(document_id=group_doc.id, group_id=group_id))
     await db_session.commit()
 
@@ -65,6 +84,8 @@ async def test_list_documents_workspace_filter_includes_group_and_artifact_prove
     assert group_doc.id in ids
     assert artifact_doc.id in ids
     assert other_doc.id not in ids
+    assert personal_doc.id not in ids
+    assert historical_entity_doc.id not in ids
 
 
 @pytest.mark.asyncio

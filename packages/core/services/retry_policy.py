@@ -9,6 +9,11 @@ runtime behavior without a schema migration. Resolution order:
 
 Later sources override earlier ones. Defaults are safe and match the
 existing behavior: 3 attempts, immediate retry, no automatic HITL handoff.
+
+``auto_human_on_exhausted`` and ``human_prompt`` remain parsed for stored
+configuration compatibility. They no longer turn an exhausted execution or
+expired lease into a user-input request; only a durable input, approval, or
+external-effect reconciliation boundary may pause for a person.
 """
 from __future__ import annotations
 
@@ -36,8 +41,8 @@ class RetryPolicy:
     strategy: str = DEFAULT_STRATEGY
     base_delay_seconds: int = DEFAULT_BASE_DELAY_SECONDS
     max_delay_seconds: int = DEFAULT_MAX_DELAY_SECONDS
-    auto_human_on_exhausted: bool = False
-    human_prompt: str | None = None
+    auto_human_on_exhausted: bool = False  # Deprecated compatibility field; no implicit HITL.
+    human_prompt: str | None = None  # Deprecated with auto_human_on_exhausted.
     source: str = "default"
 
 
@@ -225,8 +230,9 @@ def error_with_retry_policy(
 # approving the same step fifteen times without ever learning the cause.
 #
 # So: back off, don't spend the attempt budget, don't re-ask. That trade is
-# only safe because it is bounded — past the bound the step escalates to a
-# normal error card that requires the user. The bound is deliberately NOT
+# only safe because it is bounded — past the bound the step resumes ordinary
+# attempt-budget accounting and eventually reports a terminal failure. It
+# does not invent a user-input request. The bound is deliberately NOT
 # operator-tunable: it is a safety valve on an automatic loop, not a policy.
 #
 # The counter lives inside ``step.last_execution_error`` (JSONB) rather than
@@ -235,7 +241,7 @@ def error_with_retry_policy(
 # moment the streak breaks. A column would need a migration to carry a value
 # whose lifetime is strictly shorter than the field it annotates.
 
-#: Consecutive transient retries before a human must get involved.
+#: Consecutive transient retries before ordinary attempt accounting resumes.
 TRANSIENT_MAX_RETRIES = 6
 #: ...or this much wall-clock since the streak started, whichever comes first.
 #: A paused/backed-up queue can stretch six retries over hours; this caps it.
@@ -284,11 +290,9 @@ def advance_transient_retry(
 ) -> TransientRetry:
     """Extend the streak recorded on ``prior_error`` by one failure.
 
-    An already-``exhausted`` streak starts over: escalating to the user IS
-    the boundary between streaks. Otherwise a step that a human just
-    unblocked would inherit a spent budget and re-escalate immediately —
-    and every restart still costs a human decision, so this can never
-    become a silent infinite loop.
+    An already-``exhausted`` streak starts over after the previous failure
+    consumed an ordinary attempt. Otherwise a later retry would inherit the
+    previous streak's timer. The ordinary attempt budget remains bounded.
     """
     count, started, was_exhausted = read_transient_retry(prior_error)
     if was_exhausted:
@@ -334,6 +338,11 @@ def apply_transient_backoff(
 
 
 def human_prompt_for_exhausted_step(step: ExecutionStep, error: dict[str, Any], policy: RetryPolicy) -> str:
+    """Legacy prompt formatter, retained for compatibility.
+
+    Formatting this text does not create a durable HITL request or justify a
+    WAITING_HUMAN transition from retry exhaustion alone.
+    """
     if policy.human_prompt:
         return policy.human_prompt
     err_type = error.get("type") or "error"

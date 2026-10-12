@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 
 def workspace_relative_from_reference(reference: str) -> str:
@@ -28,13 +29,16 @@ def workspace_relative_from_reference(reference: str) -> str:
     if text.startswith("/workspace/"):
         return text[len("/workspace/") :]
 
+    # Standalone sandbox script: it cannot import Manor's file_refs, so it
+    # mirrors its fs-URL rule (path component only, decoded exactly once).
     marker = "/api/v1/fs/"
-    if text.startswith(marker):
-        rest = text[len(marker) :]
+    url_path = urlsplit(text).path
+    if url_path.startswith(marker):
+        rest = url_path[len(marker) :]
         parts = rest.split("/", 1)
-        if len(parts) != 2 or not parts[1]:
+        if len(parts) != 2 or not parts[1] or parts[0] == "public":
             raise ValueError(f"Cannot extract workspace path from image URL: {text}")
-        return parts[1]
+        return unquote(parts[1])
 
     return text.lstrip("/")
 

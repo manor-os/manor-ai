@@ -7,12 +7,12 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader
 
-pytest.importorskip("fpdf")
-
-from fpdf import FPDF  # noqa: E402
-from packages.core.ai.skills.pdf.scripts.prepare_image_asset import (  # noqa: E402
+from fpdf import FPDF
+from packages.core.ai.skills.pdf.scripts.prepare_image_asset import (
     prepare_image_asset,
 )
+
+pytestmark = pytest.mark.oss_regression
 
 
 def test_prepare_generated_image_resizes_preserves_alpha_and_records_provenance(

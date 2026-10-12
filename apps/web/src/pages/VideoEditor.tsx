@@ -421,6 +421,8 @@ type RenderIssue = {
 type VideoEditRecipe = {
   kind?: string;
   version?: number;
+  created_by?: string;
+  generation?: { include_source_audio?: boolean };
   source_document?: {
     id?: string | null;
     name?: string | null;
@@ -2513,7 +2515,12 @@ function normalizeVideoEditRecipe(recipe: VideoEditRecipe, sourceDuration: numbe
   if (rawClips.length === 0) throw new Error("Recipe has no video clips");
   const maxSourceDuration = sourceDuration || Math.max(...rawClips.map((clip) => numberOr(clip.sourceEnd, 0)), 1);
   const nextClips = rawClips.map((clip, index) => {
-    const clipMaxDuration = typeof clip.assetDuration === "number" && clip.assetDuration > 0 ? clip.assetDuration : maxSourceDuration;
+    const declaredAssetDuration = typeof clip.assetDuration === "number" && clip.assetDuration > 0 ? clip.assetDuration : 0;
+    // Older AI recipes stored the timeline span as the replacement asset's
+    // duration, which trimmed a sourceStart offset twice on import.
+    const clipMaxDuration = clip.assetDocumentId
+      ? Math.max(declaredAssetDuration, numberOr(clip.sourceEnd, 0), 0.05)
+      : declaredAssetDuration || maxSourceDuration;
     const start = clamp(numberOr(clip.sourceStart, 0), 0, Math.max(0, clipMaxDuration - 0.05));
     const end = clamp(numberOr(clip.sourceEnd, clipMaxDuration), start + 0.05, clipMaxDuration);
     const speed = normalizeVideoClipSpeed(clip.speed);
@@ -2539,7 +2546,7 @@ function normalizeVideoEditRecipe(recipe: VideoEditRecipe, sourceDuration: numbe
       speed,
       fadeIn: normalizeVideoClipFade(clip.fadeIn, timelineDuration),
       fadeOut: normalizeVideoClipFade(clip.fadeOut, timelineDuration),
-      muted: Boolean(clip.muted),
+      muted: Boolean(clip.muted) || (recipe.created_by === "compose_video_timeline" && recipe.generation?.include_source_audio === false),
       color: typeof clip.color === "string" ? clip.color : CLIP_COLORS[index % CLIP_COLORS.length],
       fit: clip.fit === "cover" ? "cover" : "contain",
       ...basePose,
@@ -2551,7 +2558,7 @@ function normalizeVideoEditRecipe(recipe: VideoEditRecipe, sourceDuration: numbe
       assetDocumentId: typeof clip.assetDocumentId === "string" ? clip.assetDocumentId : null,
       assetName: typeof clip.assetName === "string" ? clip.assetName : null,
       assetMimeType: typeof clip.assetMimeType === "string" ? clip.assetMimeType : null,
-      assetDuration: typeof clip.assetDuration === "number" ? clip.assetDuration : null,
+      assetDuration: clip.assetDocumentId ? clipMaxDuration : (declaredAssetDuration || null),
       replacementPrompt: typeof clip.replacementPrompt === "string" ? clip.replacementPrompt : "",
       editNotes: typeof clip.editNotes === "string" ? clip.editNotes : "",
     } satisfies ClipSegment;
@@ -3012,7 +3019,12 @@ function waitForVideoEvent(video: HTMLVideoElement, eventName: keyof HTMLMediaEl
       cleanup();
       reject(new Error("Video failed to load"));
     };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("Video loading timed out"));
+    }, 15_000);
     const cleanup = () => {
+      window.clearTimeout(timer);
       video.removeEventListener(eventName, onEvent);
       video.removeEventListener("error", onError);
     };
@@ -3035,7 +3047,12 @@ function waitForAudioReady(audio: HTMLAudioElement) {
       cleanup();
       reject(new Error("Audio failed to load"));
     };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("Audio loading timed out"));
+    }, 15_000);
     const cleanup = () => {
+      window.clearTimeout(timer);
       audio.removeEventListener("canplay", onReady);
       audio.removeEventListener("loadedmetadata", onReady);
       audio.removeEventListener("error", onError);
@@ -3745,6 +3762,8 @@ export default function VideoEditor() {
   const graphicVideoFileInputRef = useRef<HTMLInputElement | null>(null);
   const graphicVideoRefs = useRef<Map<string, HTMLVideoElement>>(new Map());
   const previewAudioRef = useRef<Map<string, PreviewAudioEntry>>(new Map());
+  const previewAudioLoadingRef = useRef<Map<string, Promise<PreviewAudioEntry>>>(new Map());
+  const previewAudioRetryAfterRef = useRef<Map<string, number>>(new Map());
   const mediaAssetPreviewRef = useRef<{ assetId: string; audio: HTMLAudioElement; url: string } | null>(null);
   const mediaAssetPreviewRequestRef = useRef(0);
   const freeMusicPreviewRef = useRef<{ trackId: string; audio: HTMLAudioElement } | null>(null);
@@ -4811,7 +4830,7 @@ export default function VideoEditor() {
     return video;
   }, [downloadUrl, getClipAssetUrl]);
 
-  const syncPreviewAudio = useCallback(async (timelineTime: number, playing: boolean) => {
+  const syncPreviewAudio = useCallback((timelineTime: number, playing: boolean) => {
     if (previewMuted || trackStates.audio.muted) {
       stopPreviewAudio();
       return;
@@ -4824,6 +4843,12 @@ export default function VideoEditor() {
         previewAudioRef.current.delete(cueId);
       }
     });
+    previewAudioRetryAfterRef.current.forEach((_retryAfter, cueId) => {
+      if (!activeIds.has(cueId)) previewAudioRetryAfterRef.current.delete(cueId);
+    });
+    previewAudioLoadingRef.current.forEach((_loading, cueId) => {
+      if (!activeIds.has(cueId)) previewAudioLoadingRef.current.delete(cueId);
+    });
 
     for (const cue of audioCues) {
       const cueDuration = cue.end - cue.start;
@@ -4835,21 +4860,36 @@ export default function VideoEditor() {
         continue;
       }
       if (!preview) {
-        try {
-          const generated = !cue.assetDocumentId;
-          const url = cue.assetDocumentId
-            ? await api.documents.download(cue.assetDocumentId)
-            : createGeneratedAudioPreviewUrl(cue.type);
-          const audio = new Audio(url);
-          audio.preload = "auto";
-          // Trimmed loops are driven by the seek-safe cue window rather than the media element's full-file loop.
-          audio.loop = false;
-          preview = { audio, url, generated };
-          previewAudioRef.current.set(cue.id, preview);
-        } catch (error) {
-          console.warn("Preview audio cue could not be loaded", cue.label, error);
-          continue;
+        if (Date.now() < (previewAudioRetryAfterRef.current.get(cue.id) ?? 0)) continue;
+        if (!previewAudioLoadingRef.current.has(cue.id)) {
+          const loading = (async (): Promise<PreviewAudioEntry> => {
+            const generated = !cue.assetDocumentId;
+            const url = cue.assetDocumentId
+              ? await api.documents.download(cue.assetDocumentId)
+              : createGeneratedAudioPreviewUrl(cue.type);
+            const audio = new Audio(url);
+            audio.preload = "auto";
+            audio.loop = false;
+            return { audio, url, generated };
+          })();
+          previewAudioLoadingRef.current.set(cue.id, loading);
+          void loading.then((loaded) => {
+            if (previewAudioLoadingRef.current.get(cue.id) === loading) {
+              previewAudioLoadingRef.current.delete(cue.id);
+              previewAudioRetryAfterRef.current.delete(cue.id);
+              previewAudioRef.current.set(cue.id, loaded);
+            } else if (!loaded.generated) {
+              revokeObjectUrlSoon(loaded.url);
+            }
+          }).catch((error) => {
+            if (previewAudioLoadingRef.current.get(cue.id) === loading) {
+              previewAudioLoadingRef.current.delete(cue.id);
+              previewAudioRetryAfterRef.current.set(cue.id, Date.now() + 10_000);
+              console.warn("Preview audio cue could not be loaded", cue.label, error);
+            }
+          });
         }
+        continue;
       }
       const audio = preview.audio;
       audio.loop = false;
@@ -4866,7 +4906,7 @@ export default function VideoEditor() {
         audio.currentTime = targetTime;
       }
       if (audio.paused) {
-        await audio.play().catch(() => undefined);
+        void audio.play().catch(() => undefined);
       }
     }
   }, [audioCues, playbackRate, previewMuted, stopPreviewAudio, trackStates.audio.muted]);
@@ -4878,10 +4918,8 @@ export default function VideoEditor() {
     }
     if (previewMuted || trackStates.audio.muted) {
       stopPreviewAudio();
-    } else if (isPlaying) {
-      void syncPreviewAudio(playhead, true);
     }
-  }, [audioCues, clips, isPlaying, playhead, previewMuted, stopPreviewAudio, syncPreviewAudio, trackStates]);
+  }, [audioCues, clips, playhead, previewMuted, stopPreviewAudio, trackStates]);
 
   useEffect(() => {
     if (isPlaying || draggingClipId) return;
@@ -4916,6 +4954,8 @@ export default function VideoEditor() {
       if (!generated) revokeObjectUrlSoon(url);
     });
     previewAudioRef.current.clear();
+    previewAudioLoadingRef.current.clear();
+    previewAudioRetryAfterRef.current.clear();
     const mediaPreview = mediaAssetPreviewRef.current;
     if (mediaPreview) {
       clearMediaElementSource(mediaPreview.audio, mediaPreview.url);
@@ -5602,6 +5642,7 @@ export default function VideoEditor() {
     const clock = {
       activeClipId: activePlaybackMapRef.current?.clip.id ?? null,
       lastTickAt: performance.now(),
+      lastAudioSyncAt: 0,
       rafId: null as number | null,
       switching: false,
     };
@@ -5673,7 +5714,10 @@ export default function VideoEditor() {
       video.playbackRate = clipPreviewPlaybackRate(mapped.clip, playbackRate);
 
       setPlayhead(timelineTime);
-      void syncPreviewAudio(timelineTime, true);
+      if (clock.lastTickAt - clock.lastAudioSyncAt >= 50) {
+        syncPreviewAudio(timelineTime, true);
+        clock.lastAudioSyncAt = clock.lastTickAt;
+      }
 
       if (video.ended || sourceTime >= sourceEnd - 0.04) {
         const nextTimelineTime = mapped.timelineEnd + PLAYBACK_BOUNDARY_EPSILON;
@@ -7513,7 +7557,7 @@ export default function VideoEditor() {
   const addVideoClipFromDocument = useCallback(async (asset: Document, insertIndex?: number) => {
     if (trackStates.video.locked) {
       toast.warning(veText("toast.video_locked"));
-      return;
+      return false;
     }
     setUploadingVideo(true);
     try {
@@ -7561,9 +7605,11 @@ export default function VideoEditor() {
       }
       setSelection({ type: "clip", id: clipId });
       toast.success(veText("toast.video_clip_added"), asset.name);
+      return true;
     } catch (error) {
       console.error(error);
       toast.error(veText("toast.add_video_clip_failed"), error instanceof Error ? error.message : undefined);
+      return false;
     } finally {
       setUploadingVideo(false);
     }
@@ -9012,9 +9058,26 @@ export default function VideoEditor() {
       canvas.height = sourceVideo.videoHeight || mediaSize.height || 1080;
       const ctx = canvas.getContext("2d");
       if (!ctx) throw new Error("Canvas renderer unavailable");
+      const exportAudioCues = audioCues.filter((cue) => !cue.muted && cue.end > exportRangeStart && cue.start < exportRangeEnd);
+      const exportClips = getClipTimelineSpans(clips)
+        .filter((span) => span.end > exportRangeStart && span.start < exportRangeEnd)
+        .map((span) => span.clip);
+      const replacementIds = [...new Set(exportClips.map((clip) => clip.assetDocumentId).filter((id): id is string => Boolean(id)))];
+      const downloadExportAsset = async (documentId: string): Promise<string> => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            return await api.documents.download(documentId);
+          } catch (error) {
+            const status = error && typeof error === "object" ? (error as { status?: unknown }).status : null;
+            if (status === 401 || status === 403 || attempt === 2) throw error;
+            await new Promise<void>((resolve) => window.setTimeout(resolve, 1000 * (attempt + 1)));
+          }
+        }
+        throw new Error("Media download failed");
+      };
       const shouldCaptureAudio = !trackStates.audio.muted && (
-        audioCues.some((cue) => !cue.muted)
-        || (!trackStates.video.muted && clips.some((clip) => !clip.muted))
+        exportAudioCues.length > 0
+        || (!trackStates.video.muted && exportClips.some((clip) => !clip.muted))
       );
       const useExplicitCanvasFrames = !trackStates.video.visible && !shouldCaptureAudio;
       const canvasStream = canvas.captureStream(useExplicitCanvasFrames ? 0 : 30);
@@ -9025,6 +9088,9 @@ export default function VideoEditor() {
 
       const AudioContextCtor = window.AudioContext ?? (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
       const audioContext = shouldCaptureAudio && AudioContextCtor ? new AudioContextCtor() : null;
+      if (exportAudioCues.length > 0 && !trackStates.audio.muted && !audioContext) {
+        throw new Error("This browser cannot mix the audio cues in the selected export range.");
+      }
       const audioDestination = audioContext?.createMediaStreamDestination() ?? null;
       const sourceAudioGain = audioContext?.createGain() ?? null;
       const assetUrls: string[] = [];
@@ -9050,12 +9116,12 @@ export default function VideoEditor() {
           console.warn("Source audio could not be attached to preview mix", error);
         }
 
-        const assetCues = trackStates.audio.muted ? [] : audioCues.filter((cue) => !cue.muted);
+        const assetCues = trackStates.audio.muted ? [] : exportAudioCues;
         for (const cue of assetCues) {
           try {
             const generated = !cue.assetDocumentId;
             const assetUrl = cue.assetDocumentId
-              ? await api.documents.download(cue.assetDocumentId)
+              ? await downloadExportAsset(cue.assetDocumentId)
               : createGeneratedAudioPreviewUrl(cue.type);
             if (!generated) assetUrls.push(assetUrl);
             const audio = new Audio(assetUrl);
@@ -9071,14 +9137,13 @@ export default function VideoEditor() {
             source.connect(gain).connect(audioDestination);
             assetAudioNodes.push({ cue, audio, gain, wasActive: false });
           } catch (error) {
-            console.warn("Audio cue could not be attached to preview mix", cue.label, error);
+            throw new Error(`Audio cue "${cue.label}" could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
 
-        const replacementIds = [...new Set(clips.map((clip) => clip.assetDocumentId).filter((id): id is string => Boolean(id)))];
         for (const replacementId of replacementIds) {
           try {
-            const clipUrl = await api.documents.download(replacementId);
+            const clipUrl = await downloadExportAsset(replacementId);
             clipVideoUrls.push(clipUrl);
             const video = document.createElement("video");
             video.src = clipUrl;
@@ -9095,7 +9160,7 @@ export default function VideoEditor() {
             source.connect(gain).connect(audioDestination);
             replacementClipVideos.set(replacementId, { video, gain });
           } catch (error) {
-            console.warn("Replacement clip could not be attached to preview export", replacementId, error);
+            throw new Error(`Replacement video could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
 
@@ -9110,10 +9175,9 @@ export default function VideoEditor() {
       }
 
       if (replacementClipVideos.size === 0) {
-        const replacementIds = [...new Set(clips.map((clip) => clip.assetDocumentId).filter((id): id is string => Boolean(id)))];
         for (const replacementId of replacementIds) {
           try {
-            const clipUrl = await api.documents.download(replacementId);
+            const clipUrl = await downloadExportAsset(replacementId);
             clipVideoUrls.push(clipUrl);
             const video = document.createElement("video");
             video.src = clipUrl;
@@ -9125,7 +9189,7 @@ export default function VideoEditor() {
             if (video.readyState < 1) await waitForVideoEvent(video, "loadedmetadata");
             replacementClipVideos.set(replacementId, { video, gain: null });
           } catch (error) {
-            console.warn("Replacement clip could not be loaded for preview export", replacementId, error);
+            throw new Error(`Replacement video could not be loaded: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
       }
@@ -9542,7 +9606,8 @@ export default function VideoEditor() {
 
   const addUnifiedMediaAsset = useCallback(async (asset: InsertableMediaAsset) => {
     if (asset.kind === "video") {
-      await addVideoClipFromDocument(asset.document);
+      const inserted = await addVideoClipFromDocument(asset.document);
+      if (!inserted) throw new Error(veText("toast.add_video_clip_failed"));
     } else {
       if (trackStates.graphics.locked) throw new Error(veText("toast.graphics_locked"));
       const image = await loadGraphicImageAsset(asset.document.id);
@@ -12944,6 +13009,7 @@ export default function VideoEditor() {
         onClose={() => setUnifiedMediaInsertOpen(false)}
         allowedKinds={["image", "video"]}
         defaultKind="video"
+        videoAspectRatio={mediaSize.width > mediaSize.height ? "16:9" : mediaSize.width < mediaSize.height ? "9:16" : "1:1"}
         onInsert={addUnifiedMediaAsset}
       />
     </div>
@@ -16123,6 +16189,9 @@ const VIDEO_EDITOR_STYLES = `
     grid-auto-rows: minmax(280px, auto);
     overflow: auto;
     padding-right: 2px;
+  }
+  .ve-preview {
+    min-height: 320px;
   }
   .ve-workspace.is-media-panel-closed {
     grid-template-columns: minmax(320px, 1fr);

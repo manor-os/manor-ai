@@ -57,6 +57,9 @@ class ResolvedUserActor:
     role: str | None
     can_read_documents: bool
     can_read_workspaces: bool
+    can_read_all_documents: bool
+    can_manage_all_documents: bool
+    can_read_all_workspaces: bool
 
 
 async def resolve_current_user_actor(
@@ -220,9 +223,21 @@ async def resolve_current_user_actor(
         permission_keys = {str(permission) for permission in role_permission_values}
         can_read_documents = Permission.DOCS_READ.value in permission_keys
         can_read_workspaces = Permission.WORKSPACES_READ.value in permission_keys
+        can_read_all_documents = Permission.DOCS_READ_ALL.value in permission_keys
+        can_manage_all_documents = Permission.DOCS_MANAGE_ALL.value in permission_keys
+        can_read_all_workspaces = Permission.WORKSPACES_READ_ALL.value in permission_keys
     else:
         can_read_documents = bool(current_role and has_permission(current_role, Permission.DOCS_READ))
         can_read_workspaces = bool(current_role and has_permission(current_role, Permission.WORKSPACES_READ))
+        can_read_all_documents = bool(
+            current_role and has_permission(current_role, Permission.DOCS_READ_ALL)
+        )
+        can_manage_all_documents = bool(
+            current_role and has_permission(current_role, Permission.DOCS_MANAGE_ALL)
+        )
+        can_read_all_workspaces = bool(
+            current_role and has_permission(current_role, Permission.WORKSPACES_READ_ALL)
+        )
 
     # ``User.role`` remains a compatibility/display field in API responses.
     # A custom StaffRole may carry the real authorization role while the
@@ -245,4 +260,7 @@ async def resolve_current_user_actor(
         role=current_role,
         can_read_documents=can_read_documents,
         can_read_workspaces=can_read_workspaces,
+        can_read_all_documents=can_read_all_documents,
+        can_manage_all_documents=can_manage_all_documents,
+        can_read_all_workspaces=can_read_all_workspaces,
     )

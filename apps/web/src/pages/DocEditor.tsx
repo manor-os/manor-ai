@@ -1,8 +1,5 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import "@fontsource/carlito/400.css";
-import "@fontsource/carlito/400-italic.css";
-import "@fontsource/carlito/700.css";
-import "@fontsource/carlito/700-italic.css";
+import { officeCompatibleFontFamily } from "../lib/officeFonts";
 import { createPortal } from "react-dom";
 import {
   useBlocker,
@@ -34,6 +31,14 @@ import EditorLiveInlineDiff from "../components/EditorLiveInlineDiff";
 import MediaInsertDialog from "../components/MediaInsertDialog";
 import MarkdownTable from "../components/MarkdownTable";
 import SpreadsheetChartPreview from "../components/SpreadsheetChartPreview";
+import SpreadsheetImageLayer from "../components/SpreadsheetImageLayer";
+import PresentationShapeOutline from "../components/PresentationShapeOutline";
+import { presentationRoundRectRadius, presentationStrokeDash } from "../lib/presentationShapeStyle";
+import {
+  presentationPresetClipPath,
+  presentationPresetPointsAttribute,
+  presentationPresetPolygonPoints,
+} from "../lib/presentationPresetGeometry";
 import SitePublishAction from "../components/SitePublishAction";
 import CodeProjectExplorer from "../components/code/CodeProjectExplorer";
 import {
@@ -53,6 +58,7 @@ import {
   IconImage,
   IconInfo,
   IconLayers,
+  IconLock,
   IconLink,
   IconList,
   IconPalette,
@@ -83,7 +89,9 @@ import {
   mergeEditorLivePreviewDiff,
   nextEditorLiveChangeCount,
   openEditorLiveChat,
+  updateEditorLiveChat,
   type EditorLiveApplyMeta,
+  type EditorLiveChatDetail,
 } from "../lib/editorLiveChat";
 import {
   buildEditorLiveTextFrames,
@@ -98,8 +106,27 @@ import {
   AiEditDisplayMode,
   resolveAiEditDisplayMode,
 } from "../lib/aiEditPreferences";
+import {
+  AiEditFormatKind,
+  createAiEditFormatAdapter,
+  resolveAiEditFormatKind,
+  type AiEditEditorMode,
+  type AiEditFormatImplementation,
+  type AiEditSnapshotPoint,
+  type AiEditTurnTarget,
+} from "../lib/documentAiEdit";
 import { authPrincipalKey, getAuthToken } from "../lib/authToken";
 import { allocateEditorSaveIntent } from "../lib/auxiliarySaveQueue";
+import { fetchServerSlideList } from "../lib/pptxServerPreview";
+import {
+  createRetainedObjectUrl,
+  readObjectUrlBlob,
+  releaseRetainedObjectUrls,
+} from "../lib/retainedObjectUrls";
+import {
+  shouldSkipQueuedOfficeAutosave,
+  type OfficeSaveOrigin,
+} from "../lib/officeSaveQueue";
 import { codeLanguageForFile, codeLanguageLabel, isCodeLikeFile } from "../lib/codeFiles";
 import {
   fileReferenceKind,
@@ -134,7 +161,6 @@ import {
 } from "../lib/presentationOoxml";
 import {
   findPresentationPlaceholderShape,
-  presentationCompatibleFontFamily,
   presentationInheritedTextStyleLevels,
   presentationPointsToCqh as pptxPointsToCqh,
   type PresentationTextLevelStyle,
@@ -156,7 +182,25 @@ import {
   presentationLiveEditTargetShape,
   type PresentationLiveEditTarget,
 } from "../lib/presentationLiveEdit";
-import { presentationShapesForDuplicateSlide } from "../lib/presentationEditability";
+import {
+  presentationShapeIsEditable,
+  presentationShapeIsLocked,
+  presentationShapesForDuplicateSlide,
+} from "../lib/presentationEditability";
+import {
+  demoteStalePresentationSources,
+  isPresentationStaleSaveError,
+  mergePresentationSaveIntoHistory,
+  mergePresentationSavedIdentity,
+  presentationMovedShape,
+  presentationShapeWithProps,
+  presentationShapeLocalDelta,
+  presentationSlideSize,
+  rebasePresentationEditSourceMap,
+  sanitizePresentationInputText,
+  withoutEditablePlaceholderBreak,
+  type PresentationSlideSize,
+} from "../lib/presentationEditorState";
 import {
   detectDelimitedTextFormat,
   parseDelimitedText,
@@ -174,8 +218,10 @@ import {
   isValidSpreadsheetWorksheetName,
   nextSpreadsheetSheetName,
   spreadsheetMergeAt,
-  spreadsheetChartsFromFile,
-  spreadsheetSheetsFromWorkbook,
+  spreadsheetSheetsFromFile,
+  spreadsheetActiveSheetIndex,
+  spreadsheetCellVisualStyle,
+  type SpreadsheetCellStyle,
   type SpreadsheetEditorChart,
   type SpreadsheetSheetModel,
   type SpreadsheetSheetSnapshot,
@@ -192,7 +238,7 @@ import { useToastStore } from "../stores/toast";
 import { canCommentDocument, canEditDocument } from "../lib/permissions";
 import type { Comment, CommentAnchor } from "../lib/types";
 import type { InsertableMediaAsset } from "../lib/mediaInsertion";
-import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
 import {
   paginateManorDocument,
   renderManorDocument,
@@ -216,7 +262,7 @@ import { t } from "../lib/i18n";
 // Helpers
 // ---------------------------------------------------------------------------
 
-type EditorMode = "richtext" | "markdown" | "code" | "text" | "spreadsheet" | "presentation" | "diagram";
+type EditorMode = AiEditEditorMode;
 type MarkdownViewMode = "source" | "split" | "preview";
 type MarkdownEditResult = { next: string; selectionStart: number; selectionEnd?: number };
 type EditorLivePreviewState = {
@@ -318,6 +364,7 @@ type TextSaveRequest = {
   editRevision: number;
   docxOriginalBuffer: ArrayBuffer | null;
   docxBaselineHtml: string | null;
+  docxExpectedSourceSha256: string | null;
   isDocx: boolean;
   textOriginalBuffer: ArrayBuffer | null;
   textBaseline: string | null;
@@ -334,7 +381,9 @@ type SpreadsheetSaveRequest = {
   authPrincipalKey: string;
   sessionRevision: number;
   revision: number;
+  origin: OfficeSaveOrigin;
   originalBuffer: ArrayBuffer;
+  expectedSourceSha256: string;
   baselineSheets: SpreadsheetSheetSnapshot[];
 };
 
@@ -347,7 +396,9 @@ type PresentationSaveRequest = {
   authPrincipalKey: string;
   sessionRevision: number;
   revision: number;
+  origin: OfficeSaveOrigin;
   originalBuffer: ArrayBuffer | null;
+  expectedSourceSha256: string | null;
   baselineSlides: PptxSlide[] | null;
 };
 
@@ -377,6 +428,7 @@ function createEmptySpreadsheetSheet(name: string): SpreadsheetSheetModel {
     rowHeights: [32],
     merges: [],
     charts: [],
+    images: [],
     editorCharts: [],
     structureOperations: [],
     hidden: false,
@@ -719,9 +771,7 @@ function relativeFsReference(fromFile: string, targetFile: string) {
 }
 
 async function presentationReplacementImageDataUrl(imageUrl: string, expectedMime: string): Promise<string> {
-  const response = await fetch(imageUrl);
-  if (!response.ok) throw new Error(`Unable to read the replacement image (${response.status}).`);
-  const sourceBlob = await response.blob();
+  const sourceBlob = await readObjectUrlBlob(imageUrl);
   if (!sourceBlob.type || sourceBlob.type.toLowerCase() === expectedMime) {
     return blobToDataUrl(new Blob([sourceBlob], { type: expectedMime }));
   }
@@ -786,15 +836,7 @@ type SheetChartConfig = SpreadsheetEditorChart;
 
 type SheetTextAlign = "left" | "center" | "right";
 
-interface SheetCellStyle {
-  bold?: boolean;
-  italic?: boolean;
-  fontSize?: number;
-  fontFamily?: string;
-  color?: string;
-  fill?: string;
-  align?: SheetTextAlign;
-}
+type SheetCellStyle = SpreadsheetCellStyle;
 
 type SheetStyleMap = Record<string, SheetCellStyle>;
 
@@ -1012,12 +1054,20 @@ function normalizeSheetStyles(styles: unknown): SheetStyleMap {
     const next: SheetCellStyle = {};
     if (typeof style.bold === "boolean") next.bold = style.bold;
     if (typeof style.italic === "boolean") next.italic = style.italic;
+    for (const flag of ["underline", "strike", "wrapText"] as const) {
+      if (typeof style[flag] === "boolean") next[flag] = style[flag];
+    }
+    if (style.verticalAlign === "top" || style.verticalAlign === "middle" || style.verticalAlign === "bottom") next.verticalAlign = style.verticalAlign;
+    for (const border of ["borderTop", "borderBottom", "borderLeft", "borderRight"] as const) {
+      const value = style[border];
+      if (typeof value === "string" && /^[123]px (?:solid|dashed|dotted|double) #[a-f\d]{6}$/i.test(value)) next[border] = value;
+    }
     if (typeof style.fontFamily === "string" && style.fontFamily.trim()) next.fontFamily = style.fontFamily.trim();
     if (typeof style.color === "string" && style.color.trim()) next.color = style.color.trim();
     if (typeof style.fill === "string" && style.fill.trim()) next.fill = style.fill.trim();
     if (style.align === "left" || style.align === "center" || style.align === "right") next.align = style.align;
     const fontSize = Number(style.fontSize);
-    if (Number.isFinite(fontSize)) next.fontSize = Math.max(8, Math.min(72, Math.trunc(fontSize)));
+    if (Number.isFinite(fontSize) && fontSize > 0) next.fontSize = Math.max(1, Math.min(409, fontSize));
     if (Object.keys(next).length > 0) normalized[key] = next;
   });
   return normalized;
@@ -1313,8 +1363,10 @@ function SpreadsheetEditor({
   numberFormatter,
   columnWidths = [],
   rowHeights = [],
+  showGridlines = true,
   merges = [],
   nativeCharts = [],
+  nativeImages = [],
   sheetTabs = [],
   activeSheetIndex = 0,
   onSelectSheet,
@@ -1331,8 +1383,10 @@ function SpreadsheetEditor({
   numberFormatter?: SpreadsheetNumberFormatter;
   columnWidths?: number[];
   rowHeights?: number[];
+  showGridlines?: boolean;
   merges?: SpreadsheetSheetModel["merges"];
   nativeCharts?: SpreadsheetSheetModel["charts"];
+  nativeImages?: SpreadsheetSheetModel["images"];
   sheetTabs?: Array<{ index: number; name: string }>;
   activeSheetIndex?: number;
   onSelectSheet?: (sheetIndex: number) => void;
@@ -1352,7 +1406,7 @@ function SpreadsheetEditor({
   const [selected, setSelected] = useState<SheetCellCoord>({ r: 0, c: 0 });
   const [selectionAnchor, setSelectionAnchor] = useState<SheetCellCoord>({ r: 0, c: 0 });
   const [isSelecting, setIsSelecting] = useState(false);
-  const [showChartPanel, setShowChartPanel] = useState(true);
+  const [showChartPanel, setShowChartPanel] = useState(false);
   const [renamingSheetIndex, setRenamingSheetIndex] = useState<number | null>(null);
   const [renamingSheetName, setRenamingSheetName] = useState("");
   const activeInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1396,8 +1450,25 @@ function SpreadsheetEditor({
 
   const actualMaxCols = Math.max(1, ...data.map((r) => r.length));
   const formulaEvaluationState = createSpreadsheetFormulaEvaluationState();
-  const visibleRows = Math.max(MIN_VISIBLE_SHEET_ROWS, data.length, selected.r + 1);
-  const maxCols = Math.max(MIN_VISIBLE_SHEET_COLS, actualMaxCols, selected.c + 1);
+  const imageMaxRow = Math.max(0, ...nativeImages.map((image) => (
+    image.end?.r ?? image.anchor.r + Math.ceil((image.height || 0) / 32)
+  )));
+  const imageMaxColumn = Math.max(0, ...nativeImages.map((image) => (
+    image.end?.c ?? image.anchor.c + Math.ceil((image.width || 0) / 112)
+  )));
+  const visibleRows = Math.max(MIN_VISIBLE_SHEET_ROWS, data.length, selected.r + 1, imageMaxRow + 1);
+  const maxCols = Math.max(MIN_VISIBLE_SHEET_COLS, actualMaxCols, selected.c + 1, imageMaxColumn + 1);
+  const renderedRowHeights = Array.from({ length: visibleRows }, (_, rowIndex) => {
+    const row = data[rowIndex] || [];
+    const natural = Math.max(
+      32,
+      ...row.map((value) => String(value ?? "").split(/\r\n|\r|\n/).length * 18 + 12),
+    );
+    return rowHeights[rowIndex] || natural;
+  });
+  const renderedColumnWidths = Array.from({ length: maxCols }, (_, columnIndex) => (
+    columnWidths[columnIndex] || 112
+  ));
   const selectionRange = useMemo(() => normalizeSheetSelection(selected, selectionAnchor), [selected, selectionAnchor]);
   const selectedRangeLabel = spreadsheetRangeRef(selectionRange);
   const activeCellValue = selected ? String(data[selected.r]?.[selected.c] ?? "") : "";
@@ -1958,6 +2029,7 @@ function SpreadsheetEditor({
       </div>
       <div className="spreadsheet-editor-workspace" style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden" }}>
         <div className="spreadsheet-editor-grid-pane" style={{ flex: 1, overflow: "auto", minWidth: 0 }}>
+          <div style={{ position: "relative", width: "max-content", minWidth: "100%" }}>
           <table style={{ borderCollapse: "separate", borderSpacing: 0, fontSize: 13, minWidth: "100%", userSelect: isSelecting ? "none" : undefined }}>
             <thead>
               <tr>
@@ -1976,7 +2048,7 @@ function SpreadsheetEditor({
                       setSelected({ r: visibleRows - 1, c: i });
                       setIsSelecting(true);
                     }}
-                    style={{ ...shTh, width: columnWidths[i] || 112, minWidth: columnWidths[i] || 112, cursor: "cell" }}
+                    style={{ ...shTh, width: renderedColumnWidths[i], minWidth: renderedColumnWidths[i], cursor: "cell" }}
                   >
                     {colLetter(i)}
                   </th>
@@ -1986,11 +2058,7 @@ function SpreadsheetEditor({
             <tbody>
               {Array.from({ length: visibleRows }, (_, ri) => {
                 const row = data[ri] || [];
-                const naturalRowHeight = Math.max(
-                  32,
-                  ...row.map((value) => String(value ?? "").split(/\r\n|\r|\n/).length * 18 + 12),
-                );
-                const renderedRowHeight = rowHeights[ri] || naturalRowHeight;
+                const renderedRowHeight = renderedRowHeights[ri];
                 return (
                 <tr key={ri} style={{ height: renderedRowHeight }}>
                   <td
@@ -2028,12 +2096,11 @@ function SpreadsheetEditor({
                       ? `linear-gradient(rgba(79,125,117,0.10), rgba(79,125,117,0.10)), ${cellStyle.fill || "#ffffff"}`
                       : cellStyle.fill || "#ffffff";
                     const sharedTextStyle: React.CSSProperties = {
+                      ...spreadsheetCellVisualStyle(cellStyle),
                       color: displayValue === "#ERROR" ? "#c14a44" : cellStyle.color || "#1c1917",
-                      fontFamily: cellStyle.fontFamily || "inherit",
-                      fontSize: cellStyle.fontSize || 13,
-                      fontWeight: cellStyle.bold ? 700 : 400,
-                      fontStyle: cellStyle.italic ? "italic" : "normal",
                       textAlign: cellStyle.align || "left",
+                      border: "none",
+                      borderTop: undefined, borderBottom: undefined, borderLeft: undefined, borderRight: undefined,
                     };
                     return (
                       <td
@@ -2049,12 +2116,14 @@ function SpreadsheetEditor({
                         }}
                         style={{
                           ...shTd,
+                          ...(showGridlines ? {} : { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" }),
+                          ...spreadsheetCellVisualStyle(cellStyle),
                           padding: 0,
                           background: cellBackground,
                           outline: isActive ? "2px solid #4f7d75" : isInRange ? "1px solid rgba(79,125,117,0.35)" : undefined,
                           outlineOffset: -2,
-                          width: columnWidths[ci] || 112,
-                          minWidth: columnWidths[ci] || 112,
+                          width: renderedColumnWidths[ci],
+                          minWidth: renderedColumnWidths[ci],
                           height: renderedRowHeight,
                         }}
                       >
@@ -2081,14 +2150,13 @@ function SpreadsheetEditor({
                               background: "transparent",
                               resize: "none",
                               overflow: "hidden",
-                              lineHeight: "18px",
-                              whiteSpace: "pre-wrap",
+                              lineHeight: "normal",
                             }}
                           />
                         ) : (
                           <div
                             title={isFormulaCell ? rawCellValue : undefined}
-                            style={{ ...sharedTextStyle, padding: "6px 10px", minHeight: renderedRowHeight, cursor: "cell", whiteSpace: "pre-wrap", overflowWrap: "anywhere", overflow: "hidden" }}
+                            style={{ ...sharedTextStyle, padding: "6px 10px", minHeight: renderedRowHeight, cursor: "cell", overflowWrap: "anywhere", overflow: "hidden", display: "flex", flexDirection: "column", justifyContent: cellStyle.verticalAlign === "middle" ? "center" : cellStyle.verticalAlign === "bottom" ? "flex-end" : "flex-start" }}
                           >
                             {displayValue}
                           </div>
@@ -2100,6 +2168,12 @@ function SpreadsheetEditor({
               );})}
             </tbody>
           </table>
+          <SpreadsheetImageLayer
+            images={nativeImages}
+            columnWidths={renderedColumnWidths}
+            rowHeights={renderedRowHeights}
+          />
+          </div>
         </div>
 
         {nativeCharts.length > 0 && (
@@ -2245,9 +2319,10 @@ function colLetter(i: number): string {
 interface PptxTextRun {
   text: string; bold?: boolean; italic?: boolean; underline?: boolean;
   sourceMap?: PresentationTextSourceMap;
+  sourceContainsField?: boolean;
   strikethrough?: boolean;
   fontSize?: number; color?: string; align?: string;
-  fontFamily?: string; bullet?: string; indent?: number; hanging?: number;
+  fontFamily?: string; bullet?: string; indent?: number; indentRight?: number; hanging?: number;
   lineSpacing?: number; // multiplier (1.0 = single)
   spaceBefore?: number; // pt
   spaceAfter?: number; // pt
@@ -2259,7 +2334,8 @@ interface PptxTextRun {
 type PptxInlineTextRun = NonNullable<PptxTextRun["runs"]>[number];
 
 interface PptxTableCell {
-  text: string; bold?: boolean; color?: string; fill?: string;
+  text: string; bold?: boolean; italic?: boolean; color?: string; fill?: string;
+  fontSize?: number; fontFamily?: string;
   sourceMap?: PresentationTextSourceMap;
   gridSpan?: number; vMerge?: boolean;
 }
@@ -2292,15 +2368,18 @@ interface PptxShape {
   rotation?: number;
   stroke?: string;
   strokeWidth?: number;
+  strokeDash?: string;
   presetGeom?: string; // oval, triangle, diamond, etc.
   flipH?: boolean;
   flipV?: boolean;
   shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
   imgCrop?: { l: number; t: number; r: number; b: number };
   vAlign?: "top" | "middle" | "bottom";
+  wordWrap?: boolean;
   padding?: { l: number; t: number; r: number; b: number };
   texts: PptxTextRun[];
   imgUrl?: string;
+  altText?: string;
   videoUrl?: string;
   hyperlink?: string;
   imageFit?: "cover" | "contain" | "fill";
@@ -2311,6 +2390,7 @@ interface PptxShape {
   tableRows?: PptxTableCell[][];
   tableCols?: number;
   tableColWidths?: number[];
+  tableRowHeights?: number[];
   source?: PptxShapeSource;
 }
 
@@ -2326,6 +2406,7 @@ interface PptxSlide {
   bgGrad?: { angle: number; stops: { pos: number; color: string; alpha: number }[] };
   bgImgUrl?: string;
   aspectRatio?: string;
+  heightPoints?: number;
   notes?: string;
   shapes: PptxShape[];
   sourcePart?: string;
@@ -2333,77 +2414,26 @@ interface PptxSlide {
   theme?: PptxEditorThemeSnapshot;
 }
 
-function mergePresentationSavedIdentity(
-  currentSlides: PptxSlide[],
-  savedSlides: PptxSlide[],
-  savingSlides: PptxSlide[],
-): PptxSlide[] {
-  const savedSlideById = new Map(savedSlides.map((slide) => [slide.id, slide]));
-  const savingSlideById = new Map(savingSlides.map((slide) => [slide.id, slide]));
-  return currentSlides.map((slide) => {
-    const savedSlide = savedSlideById.get(slide.id);
-    if (!savedSlide) return slide;
-    const savedShapeById = new Map(savedSlide.shapes.map((shape) => [shape.id, shape]));
-    const savingShapeById = new Map(
-      (savingSlideById.get(slide.id)?.shapes || []).map((shape) => [shape.id, shape]),
-    );
-    return {
-      ...slide,
-      sourcePart: savedSlide.sourcePart || slide.sourcePart,
-      notesPart: savedSlide.notesPart || slide.notesPart,
-      shapes: slide.shapes.map((shape) => {
-        const savedShape = savedShapeById.get(shape.id);
-        if (!savedShape) return shape;
-        const savingShape = savingShapeById.get(shape.id);
-        const texts = shape.texts.map((paragraph, index) => {
-          const savedParagraph = savedShape.texts[index];
-          if (!savedParagraph) return paragraph;
-          if (savedParagraph.text !== paragraph.text) {
-            return {
-              ...paragraph,
-              sourceMap: rebasePresentationTextSourceMap(
-                savedParagraph.text,
-                paragraph.text,
-                savingShape?.texts[index]?.sourceMap,
-                paragraph.sourceMap,
-              ),
-            };
-          }
-          const { sourceMap: _savedEditProvenance, ...savedParagraphState } = paragraph;
-          return savedParagraphState;
-        });
-        const tableRows = shape.tableRows?.map((row, rowIndex) => row.map((cell, cellIndex) => {
-          const savedCell = savedShape.tableRows?.[rowIndex]?.[cellIndex];
-          if (!savedCell) return cell;
-          if (savedCell.text !== cell.text) {
-            return {
-              ...cell,
-              sourceMap: rebasePresentationTextSourceMap(
-                savedCell.text,
-                cell.text,
-                savingShape?.tableRows?.[rowIndex]?.[cellIndex]?.sourceMap,
-                cell.sourceMap,
-              ),
-            };
-          }
-          const { sourceMap: _savedEditProvenance, ...savedCellState } = cell;
-          return savedCellState;
-        }));
-        return {
-          ...shape,
-          texts,
-          ...(tableRows ? { tableRows } : {}),
-          ...(savedShape.source ? { source: structuredClone(savedShape.source) } : {}),
-        };
-      }),
-    };
-  });
-}
+// Parse-time slide size. Only valid inside parsePptxForEditorUnlocked (which
+// is serialized by pptxEditorParseQueue); render/edit math must use the
+// per-slide size from presentationSlideSize(slide) so that two editor
+// instances with different slide sizes never share geometry.
+let PARSE_SLIDE_W = 12192000;
+let PARSE_SLIDE_H = 6858000;
+const emu2pctX = (v: number) => (v / PARSE_SLIDE_W) * 100;
+const emu2pctY = (v: number) => (v / PARSE_SLIDE_H) * 100;
 
-let EDITOR_SLIDE_W = 12192000;
-let EDITOR_SLIDE_H = 6858000;
-const emu2pctX = (v: number) => (v / EDITOR_SLIDE_W) * 100;
-const emu2pctY = (v: number) => (v / EDITOR_SLIDE_H) * 100;
+function pptxShapeRectEmu(shape: PptxShape, size: PresentationSlideSize) {
+  return {
+    x: (shape.x / 100) * size.width,
+    y: (shape.y / 100) * size.height,
+    width: (shape.w / 100) * size.width,
+    height: (shape.h / 100) * size.height,
+    rotation: shape.rotation,
+    flipH: shape.flipH,
+    flipV: shape.flipV,
+  };
+}
 
 function pptxXmlAttr(el: string, attr: string): string | null {
   const m = el.match(new RegExp(`${attr}="([^"]*)"`));
@@ -2539,12 +2569,12 @@ function pptxParseColor(xml: string, phClrOverride?: string): string | null {
 function editorResolveFont(typeface: string | null | undefined): string | undefined {
   if (!typeface) return undefined;
   if (typeface === "+mj-lt" || typeface === "+mj-ea" || typeface === "+mj-cs") {
-    return presentationCompatibleFontFamily(_editorMajorFont || undefined);
+    return officeCompatibleFontFamily(_editorMajorFont || undefined);
   }
   if (typeface === "+mn-lt" || typeface === "+mn-ea" || typeface === "+mn-cs") {
-    return presentationCompatibleFontFamily(_editorMinorFont || undefined);
+    return officeCompatibleFontFamily(_editorMinorFont || undefined);
   }
-  return presentationCompatibleFontFamily(typeface);
+  return officeCompatibleFontFamily(typeface);
 }
 
 function editorShapeStyleReference(
@@ -2636,18 +2666,10 @@ function pptxParseGradient(xml: string, phClrOverride?: string): PptxShape["grad
 let _shapeCounter = 0;
 function genId() { return `s${++_shapeCounter}_${Date.now()}`; }
 
-function pptxShapeAsTopLevel(shape: PptxShape): PptxShape {
+function pptxShapeAsTopLevel(shape: PptxShape, size: PresentationSlideSize): PptxShape {
   const groupTransform = shape.source?.groupTransform;
   if (!groupTransform) return shape;
-  const sourceRect = {
-    x: (shape.x / 100) * EDITOR_SLIDE_W,
-    y: (shape.y / 100) * EDITOR_SLIDE_H,
-    width: (shape.w / 100) * EDITOR_SLIDE_W,
-    height: (shape.h / 100) * EDITOR_SLIDE_H,
-    rotation: shape.rotation,
-    flipH: shape.flipH,
-    flipV: shape.flipV,
-  };
+  const sourceRect = pptxShapeRectEmu(shape, size);
   const transform = presentationShapeTransform(groupTransform, sourceRect);
   const horizontalScale = Math.hypot(transform.a, transform.b);
   const verticalScale = Math.hypot(transform.c, transform.d);
@@ -2664,19 +2686,24 @@ function pptxShapeAsTopLevel(shape: PptxShape): PptxShape {
   const height = verticalScale * sourceRect.height;
   return {
     ...shape,
-    x: emu2pctX(center.x - width / 2),
-    y: emu2pctY(center.y - height / 2),
-    w: emu2pctX(width),
-    h: emu2pctY(height),
+    x: ((center.x - width / 2) / size.width) * 100,
+    y: ((center.y - height / 2) / size.height) * 100,
+    w: (width / size.width) * 100,
+    h: (height / size.height) * 100,
     rotation: Math.atan2(transform.b, transform.a) * 180 / Math.PI,
     flipH: false,
     flipV: transform.a * transform.d - transform.b * transform.c < 0,
   };
 }
 
-function clonePptxShape(shape: PptxShape, offset = 0, preserveEditableSource = true): PptxShape {
+function clonePptxShape(
+  shape: PptxShape,
+  size: PresentationSlideSize,
+  offset = 0,
+  preserveEditableSource = true,
+): PptxShape {
   const preserveSource = preserveEditableSource && Boolean(shape.source?.editable);
-  const clone = JSON.parse(JSON.stringify(preserveSource ? shape : pptxShapeAsTopLevel(shape))) as PptxShape;
+  const clone = JSON.parse(JSON.stringify(preserveSource ? shape : pptxShapeAsTopLevel(shape, size))) as PptxShape;
   const id = genId();
   if (preserveSource && clone.source) {
     clone.source.cloneOfObjectId = shape.source?.cloneOfObjectId || shape.source?.objectId;
@@ -2684,7 +2711,7 @@ function clonePptxShape(shape: PptxShape, offset = 0, preserveEditableSource = t
   } else {
     delete clone.source;
   }
-  const localOffset = preserveSource ? pptxShapeLocalDelta(shape, offset, offset) : { dx: offset, dy: offset };
+  const localOffset = preserveSource ? presentationShapeLocalDelta(shape, offset, offset, size) : { dx: offset, dy: offset };
   return {
     ...clone,
     id,
@@ -2694,16 +2721,16 @@ function clonePptxShape(shape: PptxShape, offset = 0, preserveEditableSource = t
 }
 
 /** Parse shape stroke/border */
-function pptxParseStroke(xml: string, phClrOverride?: string): { color?: string; width?: number } {
+function pptxParseStroke(xml: string, phClrOverride?: string, inherited: { color?: string; width?: number; dash?: string } = {}): { color?: string; width?: number; dash?: string } {
   const ln = pptxXmlInner(xml, "a:ln");
   if (!ln) return {};
   // Check for noFill (no stroke)
   if (ln.includes("<a:noFill")) return {};
   const parsedColor = pptxParseColor(ln, phClrOverride);
-  const color = parsedColor ? presentationColorWithAlpha(parsedColor, ln) : null;
+  const color = parsedColor ? presentationColorWithAlpha(parsedColor, ln) : inherited.color;
   const wAttr = pptxXmlAttr(ln, "w");
-  const width = wAttr ? parseInt(wAttr, 10) / 12700 : 1; // EMU → pt
-  return { color: color && color !== "transparent" ? color : undefined, width: color && color !== "transparent" ? width : undefined };
+  const width = wAttr ? parseInt(wAttr, 10) / 12700 : inherited.width ?? 1; // EMU → pt
+  return { color: color || undefined, width: color ? width : undefined, dash: presentationStrokeDash(ln) ?? inherited.dash };
 }
 
 /** Parse text runs with enhanced properties */
@@ -2716,7 +2743,9 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
     const inherited = inheritedStyles[lvl] || inheritedStyles[0] || {};
     const align = pPr ? (pptxXmlAttr(pPr, "algn") || inherited.align) : inherited.align;
     const marL = pPr ? pptxXmlAttr(pPr, "marL") : null;
-    const indent = marL ? parseInt(marL, 10) / 12700 : inherited.indent ?? lvl * 18;
+    const indent = marL != null ? parseInt(marL, 10) / 12700 : inherited.indent ?? (lvl > 0 ? lvl * 18 : undefined);
+    const marR = pPr ? pptxXmlAttr(pPr, "marR") : null;
+    const indentRight = marR != null ? parseInt(marR, 10) / 12700 : inherited.indentRight;
     const firstLineIndent = pPr ? pptxXmlAttr(pPr, "indent") : null;
     const hanging = firstLineIndent ? parseInt(firstLineIndent, 10) / 12700 : inherited.hanging;
 
@@ -2802,6 +2831,7 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
 
     // Collect runs and line breaks in document order
     const tokens = para.match(/<a:r[\s>][\s\S]*?<\/a:r>|<a:br\s*\/>|<a:br[\s>][\s\S]*?<\/a:br>|<a:fld[\s>][\s\S]*?<\/a:fld>/g) || [];
+    const sourceContainsField = tokens.some((token) => token.startsWith("<a:fld"));
     const runs: NonNullable<PptxTextRun["runs"]> = [];
     let paraText = "";
     let firstBold = defBold, firstItalic = defItalic, firstUnderline = defUnderline, firstStrike = defStrike;
@@ -2857,10 +2887,11 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
     if (paraText.trim() || paraText.includes("\n")) {
       texts.push({
         text: paraText, bold: firstBold, italic: firstItalic, underline: firstUnderline,
+        sourceContainsField: sourceContainsField || undefined,
         strikethrough: firstStrike, baseline: firstBaseline, spacing: firstSpacing,
         fontSize: firstFontSize, color: firstColor, fontFamily: firstFontFamily,
         align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : align === "l" ? "left" : undefined,
-        bullet, indent: indent > 0 ? indent : undefined,
+        bullet, indent, indentRight,
         hanging,
         lineSpacing, spaceBefore, spaceAfter,
         runs: runs.length > 1 ? runs : undefined,
@@ -2871,6 +2902,10 @@ function pptxParseTextRuns(spXml: string, inheritedStyles: PresentationTextLevel
         fontSize: firstFontSize || defFontSize || 12,
         fontFamily: firstFontFamily,
         color: firstColor,
+        bold: firstBold, italic: firstItalic, underline: firstUnderline,
+        strikethrough: firstStrike,
+        align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : align === "l" ? "left" : undefined,
+        bullet, indent, indentRight, hanging,
         lineSpacing,
         spaceBefore,
         spaceAfter,
@@ -2908,7 +2943,7 @@ function pptxParseSpeakerNotes(xml: string): string {
 }
 
 /** Parse a table from graphicFrame */
-function pptxParseTable(xml: string): { rows: PptxTableCell[][]; cols: number; colWidths?: number[] } | null {
+function pptxParseTable(xml: string): { rows: PptxTableCell[][]; cols: number; colWidths?: number[]; rowHeights?: number[] } | null {
   const tbl = pptxXmlInner(xml, "a:tbl");
   if (!tbl) return null;
   // Parse column widths from <a:tblGrid>
@@ -2920,8 +2955,10 @@ function pptxParseTable(xml: string): { rows: PptxTableCell[][]; cols: number; c
   }
   const trMatches = tbl.match(/<a:tr[\s>][\s\S]*?<\/a:tr>/g) || [];
   const rows: PptxTableCell[][] = [];
+  const rowHeights: number[] = [];
   let maxCols = 0;
   for (const tr of trMatches) {
+    rowHeights.push(parseInt((tr.match(/^<a:tr\b[^>]*\bh="(\d+)"/) || [])[1] || "0", 10));
     const tcMatches = tr.match(/<a:tc[\s>][\s\S]*?<\/a:tc>/g) || [];
     const row: PptxTableCell[] = [];
     for (const tc of tcMatches) {
@@ -2932,20 +2969,20 @@ function pptxParseTable(xml: string): { rows: PptxTableCell[][]; cols: number; c
             : pptxDecodeText(token.replace(/^<a:t(?:\s[^>]*)?>|<\/a:t>$/g, ""))
         )).join("")
       )).join("\n");
-      const rPr = pptxXmlElement(tc, "a:rPr");
-      const bold = rPr ? rPr.includes('b="1"') : false;
-      const parsedColor = rPr ? pptxParseColor(rPr) : null;
-      const color = parsedColor && rPr ? presentationColorWithAlpha(parsedColor, rPr) : null;
+      const paragraphs = pptxParseTextRuns(tc);
+      const textStyle = paragraphs.find((paragraph) => paragraph.text.length > 0) || paragraphs[0];
       const tcPr = pptxXmlElement(tc, "a:tcPr");
       const fill = tcPr ? pptxParseColor(tcPr) : null;
       const gridSpanM = tc.match(/gridSpan="(\d+)"/);
       const vMerge = tc.includes('vMerge="1"') || tc.includes('hMerge="1"');
-      row.push({ text, bold, color: color || undefined, fill: fill || undefined, gridSpan: gridSpanM ? parseInt(gridSpanM[1], 10) : undefined, vMerge: vMerge || undefined });
+      row.push({ text, bold: textStyle?.bold, italic: textStyle?.italic, fontSize: textStyle?.fontSize,
+        fontFamily: textStyle?.fontFamily, color: textStyle?.color, fill: fill || undefined,
+        gridSpan: gridSpanM ? parseInt(gridSpanM[1], 10) : undefined, vMerge: vMerge || undefined });
     }
     rows.push(row);
     maxCols = Math.max(maxCols, row.length);
   }
-  return rows.length > 0 ? { rows, cols: maxCols, colWidths } : null;
+  return rows.length > 0 ? { rows, cols: maxCols, colWidths, rowHeights } : null;
 }
 
 /** Parse a single shape XML element into a PptxShape */
@@ -3074,9 +3111,11 @@ function pptxParseShapeXml(
     x, y, w, h,
     texts: [],
   };
+  const nonVisualProperties = sp.match(/<p:cNvPr\b[^>]*\/?\s*>/);
+  const altText = nonVisualProperties ? pptxXmlAttr(nonVisualProperties[0], "descr") : null;
+  if (altText != null) shape.altText = pptxDecodeText(altText);
   if (source) {
-    const cNvPr = sp.match(/<p:cNvPr\b[^>]*\/?\s*>/);
-    const objectId = cNvPr ? pptxXmlAttr(cNvPr[0], "id") : null;
+    const objectId = nonVisualProperties ? pptxXmlAttr(nonVisualProperties[0], "id") : null;
     if (objectId) {
       shape.source = {
         part: source.part,
@@ -3141,18 +3180,15 @@ function pptxParseShapeXml(
 
   // Stroke/border
   const explicitLine = pptxXmlInner(spPr, "a:ln");
-  const lineReference = !explicitLine ? editorShapeStyleReference(sp, "ln") : undefined;
+  const lineReference = editorShapeStyleReference(sp, "ln");
   const themedLine = lineReference ? _editorLineStyles[lineReference.index - 1] : undefined;
-  const stroke = explicitLine
-    ? pptxParseStroke(explicitLine)
-    : themedLine
-      ? pptxParseStroke(themedLine, lineReference?.color)
-      : {};
-  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; }
+  const inheritedStroke = themedLine ? pptxParseStroke(themedLine, lineReference?.color) : {};
+  const stroke = explicitLine ? pptxParseStroke(explicitLine, undefined, inheritedStroke) : inheritedStroke;
+  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; shape.strokeDash = stroke.dash; }
 
   // Shadow (outer shadow)
   const explicitShadow = pptxXmlInner(spPr, "a:outerShdw");
-  const effectReference = !explicitShadow ? editorShapeStyleReference(sp, "effect") : undefined;
+  const effectReference = !/<a:(?:effectLst|effectDag)\b/.test(spPr) ? editorShapeStyleReference(sp, "effect") : undefined;
   const themedEffect = effectReference ? _editorEffectStyles[effectReference.index - 1] : undefined;
   const outerShdw = explicitShadow || (themedEffect ? pptxXmlInner(themedEffect, "a:outerShdw") : null);
   if (outerShdw) {
@@ -3168,7 +3204,7 @@ function pptxParseShapeXml(
   // Border radius
   if (sp.includes('prst="roundRect"')) {
     const adjM = sp.match(/name="adj" fmla="val (\d+)"/);
-    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 8;
+    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 16.667;
   }
 
   // Text body properties (vertical alignment + insets)
@@ -3184,6 +3220,8 @@ function pptxParseShapeXml(
       return null;
     };
     const anchor = inheritedBodyAttr("anchor");
+    const wrap = inheritedBodyAttr("wrap");
+    if (wrap === "none" || wrap === "square") shape.wordWrap = wrap === "square";
     if (anchor === "t") shape.vAlign = "top";
     else if (anchor === "b") shape.vAlign = "bottom";
     else if (anchor === "ctr") shape.vAlign = "middle";
@@ -3211,6 +3249,9 @@ function pptxParseShapeXml(
       if (shape.source) shape.source.mediaPart = source?.mediaParts?.get(blipM[1]);
     }
   }
+  if (shape.imgUrl && (shape.source?.kind === "pic" || /^\s*<p:pic\b/.test(sp))) {
+    shape.type = "image";
+  }
   shape.videoUrl = presentationVideoSource(sp, relsMap);
   // Image cropping (srcRect)
   if (shape.imgUrl) {
@@ -3234,6 +3275,12 @@ function pptxParseShapeXml(
 
 interface PptxEditorParseOptions {
   isCancelled?: () => boolean;
+  /**
+   * Receives every object URL created for package media. The caller owns
+   * them and must revoke them when the parsed slides are discarded. Without
+   * a collector, media is inlined as data URLs.
+   */
+  mediaObjectUrls?: string[];
 }
 
 let pptxEditorParseQueue: Promise<void> = Promise.resolve();
@@ -3255,8 +3302,8 @@ async function parsePptxForEditorUnlocked(
   options: PptxEditorParseOptions,
 ): Promise<PptxSlide[]> {
   if (options.isCancelled?.()) return [];
-  EDITOR_SLIDE_W = 12192000;
-  EDITOR_SLIDE_H = 6858000;
+  PARSE_SLIDE_W = 12192000;
+  PARSE_SLIDE_H = 6858000;
   _activeTheme = DEFAULT_SCHEME;
   _editorMajorFont = "";
   _editorMinorFont = "";
@@ -3281,8 +3328,8 @@ async function parsePptxForEditorUnlocked(
       const presXml = await presEntry.async("text");
       const sldSz = presXml.match(/<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
       if (sldSz) {
-        EDITOR_SLIDE_W = parseInt(sldSz[1], 10);
-        EDITOR_SLIDE_H = parseInt(sldSz[2], 10);
+        PARSE_SLIDE_W = parseInt(sldSz[1], 10);
+        PARSE_SLIDE_H = parseInt(sldSz[2], 10);
       }
       const sldIdLst = presXml.match(/<p:sldId[^/]*\/>/g) || [];
       orderedSlideRIds = sldIdLst.map(s => (s.match(/r:id="([^"]+)"/) || [])[1]).filter(Boolean);
@@ -3330,16 +3377,26 @@ async function parsePptxForEditorUnlocked(
     });
   }
 
-  // Extract media as data URLs so images survive editor saves and reloads.
+  // Expose media as object URLs (typed Blobs) instead of base64 data URLs so
+  // large decks do not keep a second, 33% larger copy of every image and
+  // video in each slide snapshot. The save path and AI capture fetch() these
+  // URLs, which works for blob: and data: URLs alike.
   const mediaCache = new Map<string, string>();
+  const canUseObjectUrls = Boolean(options.mediaObjectUrls) && typeof URL.createObjectURL === "function";
   for (const name of Object.keys(zip.files)) {
     if (name.startsWith("ppt/media/") && !zip.files[name].dir) {
       try {
         const entry = zip.file(name);
         if (!entry) continue;
-        const data = await entry.async("base64");
         const mime = presentationMediaMime(name);
-        mediaCache.set(name, `data:${mime};base64,${data}`);
+        if (canUseObjectUrls) {
+          const url = createRetainedObjectUrl(new Blob([await entry.async("arraybuffer")], { type: mime }));
+          options.mediaObjectUrls!.push(url);
+          mediaCache.set(name, url);
+        } else {
+          const data = await entry.async("base64");
+          mediaCache.set(name, `data:${mime};base64,${data}`);
+        }
       } catch { /* skip bad media */ }
     }
   }
@@ -3453,14 +3510,15 @@ async function parsePptxForEditorUnlocked(
 
       const slide: PptxSlide = {
         id: genId(),
-        aspectRatio: `${EDITOR_SLIDE_W}/${EDITOR_SLIDE_H}`,
+        aspectRatio: `${PARSE_SLIDE_W}/${PARSE_SLIDE_H}`,
+        heightPoints: PARSE_SLIDE_H / 12700,
         shapes: [],
         sourcePart: slidePath,
         notesPart: notesPath,
         theme: {
           colors: { ..._activeTheme },
-          majorFont: presentationCompatibleFontFamily(_editorMajorFont || undefined),
-          minorFont: presentationCompatibleFontFamily(_editorMinorFont || undefined),
+          majorFont: officeCompatibleFontFamily(_editorMajorFont || undefined),
+          minorFont: officeCompatibleFontFamily(_editorMinorFont || undefined),
         },
       };
       if (notesPath) {
@@ -3629,6 +3687,7 @@ async function parsePptxForEditorUnlocked(
               id: genId(), type: "table", x, y, w, h,
               rotation: frameRect.rotation, flipH: frameRect.flipH, flipV: frameRect.flipV,
               texts: [], tableRows: table.rows, tableCols: table.cols, tableColWidths: table.colWidths,
+              tableRowHeights: table.rowHeights,
               source,
             });
             continue;
@@ -3733,12 +3792,13 @@ async function parsePptxForEditorUnlocked(
     } catch {
       slides.push({
         id: genId(),
-        aspectRatio: `${EDITOR_SLIDE_W}/${EDITOR_SLIDE_H}`,
+        aspectRatio: `${PARSE_SLIDE_W}/${PARSE_SLIDE_H}`,
+        heightPoints: PARSE_SLIDE_H / 12700,
         shapes: [],
         theme: {
           colors: { ..._activeTheme },
-          majorFont: presentationCompatibleFontFamily(_editorMajorFont || undefined),
-          minorFont: presentationCompatibleFontFamily(_editorMinorFont || undefined),
+          majorFont: officeCompatibleFontFamily(_editorMajorFont || undefined),
+          minorFont: officeCompatibleFontFamily(_editorMinorFont || undefined),
         },
       });
     }
@@ -3759,6 +3819,30 @@ function slidesToText(slides: PptxSlide[]): string {
       .filter(Boolean);
     return header + "\n" + (texts.length > 0 ? texts.join("\n") : "(empty slide)");
   }).join("\n\n");
+}
+
+async function sha256Hex(buffer: ArrayBuffer): Promise<string> {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("Secure file version checks are unavailable in this browser.");
+  }
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function loadOfficeEditSource(
+  documentId: string,
+  needsLegacyConversion: boolean,
+): Promise<{ buffer: ArrayBuffer; sourceSha256: string }> {
+  if (needsLegacyConversion) {
+    const response = await api.documents.editableResponse(documentId);
+    const sourceSha256 = response.headers.get("X-Manor-Source-SHA256")?.trim().toLowerCase() || "";
+    if (!/^[0-9a-f]{64}$/.test(sourceSha256)) {
+      throw new Error("The editable Office source is missing its version identifier.");
+    }
+    return { buffer: await response.arrayBuffer(), sourceSha256 };
+  }
+  const buffer = await (await api.documents.previewBlob(documentId)).arrayBuffer();
+  return { buffer, sourceSha256: await sha256Hex(buffer) };
 }
 
 const PRESENTATION_FONT_FAMILIES = [
@@ -3828,64 +3912,22 @@ function pptxEditorImageStyle(shape: PptxShape, borderRadius: React.CSSPropertie
   };
 }
 
-type PptxPolygonPoint = readonly [number, number];
-
-function pptxRegularPolygonPoints(sides: number, rotation = -90): PptxPolygonPoint[] {
-  return Array.from({ length: sides }, (_, index) => {
-    const angle = ((rotation + (360 * index) / sides) * Math.PI) / 180;
-    return [50 + Math.cos(angle) * 50, 50 + Math.sin(angle) * 50] as const;
-  });
-}
-
-function pptxPresetPolygonPoints(presetGeom?: string): PptxPolygonPoint[] | undefined {
-  const fixed: Record<string, PptxPolygonPoint[]> = {
-    triangle: [[50, 0], [100, 100], [0, 100]],
-    rtTriangle: [[0, 0], [100, 100], [0, 100]],
-    diamond: [[50, 0], [100, 50], [50, 100], [0, 50]],
-    parallelogram: [[25, 0], [100, 0], [75, 100], [0, 100]],
-    trapezoid: [[20, 0], [80, 0], [100, 100], [0, 100]],
-    pentagon: [[50, 0], [100, 38], [81, 100], [19, 100], [0, 38]],
-    hexagon: [[25, 0], [75, 0], [100, 50], [75, 100], [25, 100], [0, 50]],
-    octagon: [[29, 0], [71, 0], [100, 29], [100, 71], [71, 100], [29, 100], [0, 71], [0, 29]],
-    chevron: [[0, 0], [70, 0], [100, 50], [70, 100], [0, 100], [30, 50]],
-    homePlate: [[0, 0], [75, 0], [100, 50], [75, 100], [0, 100]],
-    rightArrow: [[0, 25], [62, 25], [62, 0], [100, 50], [62, 100], [62, 75], [0, 75]],
-    leftArrow: [[38, 0], [38, 25], [100, 25], [100, 75], [38, 75], [38, 100], [0, 50]],
-    upArrow: [[50, 0], [100, 38], [75, 38], [75, 100], [25, 100], [25, 38], [0, 38]],
-    downArrow: [[25, 0], [75, 0], [75, 62], [100, 62], [50, 100], [0, 62], [25, 62]],
-    plus: [[35, 0], [65, 0], [65, 35], [100, 35], [100, 65], [65, 65], [65, 100], [35, 100], [35, 65], [0, 65], [0, 35], [35, 35]],
-    star5: [[50, 0], [61, 35], [98, 35], [68, 57], [79, 94], [50, 72], [21, 94], [32, 57], [2, 35], [39, 35]],
-  };
-  if (presetGeom && fixed[presetGeom]) return fixed[presetGeom];
-  if (presetGeom === "heptagon") return pptxRegularPolygonPoints(7);
-  if (presetGeom === "decagon") return pptxRegularPolygonPoints(10);
-  if (presetGeom === "dodecagon") return pptxRegularPolygonPoints(12);
-  return undefined;
-}
-
 function pptxShapeClipPath(shape: PptxShape): string | undefined {
-  const points = pptxPresetPolygonPoints(shape.presetGeom);
-  return points ? `polygon(${points.map(([x, y]) => `${x}% ${y}%`).join(", ")})` : undefined;
+  return presentationPresetClipPath(shape.presetGeom);
 }
 
 function pptxShapeBorderRadius(shape: PptxShape): React.CSSProperties["borderRadius"] {
   if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") return "50%";
-  if (shape.presetGeom === "roundRect") return shape.borderRadius ? `${shape.borderRadius}%` : "8%";
+  if (shape.presetGeom === "roundRect") return presentationRoundRectRadius(shape.w, shape.h, shape.borderRadius);
+  if (shape.presetGeom === "flowChartTerminator") return "999px";
+  if (shape.presetGeom === "wedgeRoundRectCallout") return "8%";
   if (shape.presetGeom === "snip1Rect" || shape.presetGeom === "snip2SameRect") return "0 12% 0 0";
   return shape.borderRadius ? `${shape.borderRadius}%` : 0;
 }
 
-function pptxShapeTransform(shape: PptxShape): string | undefined {
+function pptxShapeTransform(shape: PptxShape, size: PresentationSlideSize): string | undefined {
   if (shape.source?.groupTransform) {
-    const sourceRect = {
-      x: (shape.x / 100) * EDITOR_SLIDE_W,
-      y: (shape.y / 100) * EDITOR_SLIDE_H,
-      width: (shape.w / 100) * EDITOR_SLIDE_W,
-      height: (shape.h / 100) * EDITOR_SLIDE_H,
-      rotation: shape.rotation,
-      flipH: shape.flipH,
-      flipV: shape.flipV,
-    };
+    const sourceRect = pptxShapeRectEmu(shape, size);
     const transform = presentationShapeTransform(shape.source.groupTransform, sourceRect);
     return `matrix(${transform.a}, ${transform.b}, ${transform.c}, ${transform.d}, 0, 0)`;
   }
@@ -3906,18 +3948,10 @@ function pptxShapeShadow(shape: PptxShape): string | undefined {
   return `${pptxPointsToCqh(Math.cos(radians) * dist)} ${pptxPointsToCqh(Math.sin(radians) * dist)} ${pptxPointsToCqh(blur)} rgba(${red},${green},${blue},${alpha})`;
 }
 
-function pptxShapeVisualStyle(shape: PptxShape): React.CSSProperties {
+function pptxShapeVisualStyle(shape: PptxShape, size: PresentationSlideSize): React.CSSProperties {
   const isLine = shape.presetGeom === "line";
-  const isPolygon = Boolean(pptxPresetPolygonPoints(shape.presetGeom));
-  const sourceRect = {
-    x: (shape.x / 100) * EDITOR_SLIDE_W,
-    y: (shape.y / 100) * EDITOR_SLIDE_H,
-    width: (shape.w / 100) * EDITOR_SLIDE_W,
-    height: (shape.h / 100) * EDITOR_SLIDE_H,
-    rotation: shape.rotation,
-    flipH: shape.flipH,
-    flipV: shape.flipV,
-  };
+  const isPolygon = Boolean(presentationPresetPolygonPoints(shape.presetGeom));
+  const sourceRect = pptxShapeRectEmu(shape, size);
   const groupedTransform = shape.source?.groupTransform
     ? presentationShapeTransform(shape.source.groupTransform, sourceRect)
     : undefined;
@@ -3926,16 +3960,16 @@ function pptxShapeVisualStyle(shape: PptxShape): React.CSSProperties {
     : undefined;
   return {
     position: "absolute",
-    left: `${groupedOrigin ? emu2pctX(groupedOrigin.x) : shape.x}%`,
-    top: `${groupedOrigin ? emu2pctY(groupedOrigin.y) : shape.y}%`,
-    width: `${shape.w}%`,
+    left: `${groupedOrigin ? (groupedOrigin.x / size.width) * 100 : shape.x}%`,
+    top: `${groupedOrigin ? (groupedOrigin.y / size.height) * 100 : shape.y}%`,
+    width: `${isLine ? Math.max(0.5, shape.w) : shape.w}%`,
     height: `${isLine ? Math.max(0.5, shape.h) : shape.h}%`,
     boxSizing: "border-box",
-    overflow: "hidden",
+    overflow: isLine ? "visible" : "hidden",
     borderRadius: pptxShapeBorderRadius(shape),
     background: isLine || isPolygon ? undefined : shape.gradFill ? pptxGradToCss(shape.gradFill) : shape.fill,
-    border: !isLine && !isPolygon && shape.stroke ? `${Math.max(0.5, shape.strokeWidth || 1)}px solid ${shape.stroke}` : "none",
-    transform: pptxShapeTransform(shape),
+    border: "none",
+    transform: pptxShapeTransform(shape, size),
     transformOrigin: groupedTransform ? "0 0" : undefined,
     boxShadow: isLine || isPolygon ? undefined : pptxShapeShadow(shape),
     display: "flex",
@@ -3949,44 +3983,11 @@ function pptxShapeVisualStyle(shape: PptxShape): React.CSSProperties {
   };
 }
 
-function pptxShapeLocalDelta(shape: PptxShape, dx: number, dy: number): { dx: number; dy: number } {
-  const groupTransform = shape.source?.groupTransform;
-  if (!groupTransform) return { dx, dy };
-  const inverse = presentationInverseTransform(groupTransform);
-  if (!inverse) return { dx: 0, dy: 0 };
-  const deltaX = (dx / 100) * EDITOR_SLIDE_W;
-  const deltaY = (dy / 100) * EDITOR_SLIDE_H;
-  return {
-    dx: emu2pctX(inverse.a * deltaX + inverse.c * deltaY),
-    dy: emu2pctY(inverse.b * deltaX + inverse.d * deltaY),
-  };
-}
-
 function PptxShapeGeometry({ shape }: { shape: PptxShape }) {
-  if (shape.presetGeom === "line") {
-    const diagonal = shape.h > 1;
-    return (
-      <svg
-        viewBox="0 0 100 100"
-        preserveAspectRatio="none"
-        aria-hidden="true"
-        style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }}
-      >
-        <line
-          x1="0"
-          y1={diagonal ? "100" : "50"}
-          x2="100"
-          y2={diagonal ? "0" : "50"}
-          stroke={shape.stroke || shape.fill || "#1c1917"}
-          strokeWidth={Math.max(0.5, shape.strokeWidth || 1)}
-          vectorEffect="non-scaling-stroke"
-        />
-      </svg>
-    );
-  }
-  const points = pptxPresetPolygonPoints(shape.presetGeom);
-  if (!points) return null;
-  const pointList = points.map(([x, y]) => `${x},${y}`).join(" ");
+  if (shape.presetGeom === "line") return <PresentationShapeOutline {...shape} />;
+  const points = presentationPresetPolygonPoints(shape.presetGeom);
+  if (!points) return <PresentationShapeOutline {...shape} />;
+  const pointList = presentationPresetPointsAttribute(shape.presetGeom);
   const clipPath = pptxShapeClipPath(shape);
   const shadow = pptxShapeShadow(shape);
   return (
@@ -4002,22 +4003,7 @@ function PptxShapeGeometry({ shape }: { shape: PptxShape }) {
           pointerEvents: "none",
         }}
       />
-      {shape.stroke && (shape.strokeWidth ?? 0) > 0 && (
-        <svg
-          viewBox="0 0 100 100"
-          preserveAspectRatio="none"
-          aria-hidden="true"
-          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", overflow: "visible", pointerEvents: "none" }}
-        >
-          <polygon
-            points={pointList}
-            fill="none"
-            stroke={shape.stroke}
-            strokeWidth={Math.max(0.5, shape.strokeWidth || 1)}
-            vectorEffect="non-scaling-stroke"
-          />
-        </svg>
-      )}
+      <PresentationShapeOutline {...shape} points={pointList} />
     </>
   );
 }
@@ -4067,10 +4053,11 @@ function pptxGraphicFrameImageUrl(shape: PptxShape): Promise<string> {
 
 async function clonePptxShapeForEditor(
   shape: PptxShape,
+  size: PresentationSlideSize,
   offset = 0,
   preserveEditableSource = true,
 ): Promise<PptxShape> {
-  const clone = clonePptxShape(shape, offset, preserveEditableSource);
+  const clone = clonePptxShape(shape, size, offset, preserveEditableSource);
   if (shape.type !== "graphic" || clone.source) return clone;
   return {
     ...clone,
@@ -4083,13 +4070,15 @@ async function clonePptxShapeForEditor(
   };
 }
 
-function pptxParagraphVisualStyle(paragraph: PptxTextRun, slide: PptxSlide): React.CSSProperties {
+function pptxParagraphVisualStyle(paragraph: PptxTextRun, slide: PptxSlide, shape: PptxShape): React.CSSProperties {
   return {
     position: "relative",
     zIndex: 1,
-    marginTop: paragraph.spaceBefore ? pptxPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
-    marginBottom: paragraph.spaceAfter ? pptxPointsToCqh(paragraph.spaceAfter) : "0.05em",
-    paddingLeft: paragraph.indent ? pptxPointsToCqh(paragraph.indent) : paragraph.bullet ? pptxPointsToCqh(18) : undefined,
+    marginTop: paragraph.spaceBefore != null ? pptxPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
+    marginBottom: paragraph.spaceAfter != null ? pptxPointsToCqh(paragraph.spaceAfter) : "0.05em",
+    paddingLeft: paragraph.indent != null ? pptxPointsToCqh(paragraph.indent) : paragraph.bullet ? pptxPointsToCqh(18) : undefined,
+    paddingRight: paragraph.indentRight != null ? pptxPointsToCqh(paragraph.indentRight) : undefined,
+    textIndent: !paragraph.bullet && paragraph.hanging != null ? pptxPointsToCqh(paragraph.hanging) : undefined,
     color: paragraph.color || slide.theme?.colors.tx1 || DEFAULT_SCHEME.tx1 || "#000000",
     fontFamily: paragraph.fontFamily
       ? `"${paragraph.fontFamily}", sans-serif`
@@ -4103,8 +4092,8 @@ function pptxParagraphVisualStyle(paragraph: PptxTextRun, slide: PptxSlide): Rea
     textAlign: (paragraph.align as React.CSSProperties["textAlign"]) || "left",
     lineHeight: paragraph.lineSpacing || 1.2,
     wordBreak: "normal",
-    overflowWrap: "break-word",
-    whiteSpace: "pre-wrap",
+    overflowWrap: shape.wordWrap === false ? "normal" : "break-word",
+    whiteSpace: shape.wordWrap === false ? "pre" : "pre-wrap",
     minHeight: "1.2em",
   };
 }
@@ -4137,7 +4126,46 @@ function reconcilePptxTextRuns(
 }
 
 function normalizedPptxEditableText(value: string): string {
-  return value.replace(/\r\n?/g, "\n");
+  // Also drops characters that are invalid in XML 1.0 and maps clipboard
+  // soft breaks (U+000B from PowerPoint/Word) to the editor's line break.
+  return sanitizePresentationInputText(value);
+}
+
+/**
+ * Replace the current selection inside the inline PPTX editor with plain text
+ * and fire the input event React listens to, without execCommand's
+ * multi-line artifacts.
+ */
+function insertPptxEditablePlainText(
+  element: HTMLElement,
+  text: string,
+  beforeInput: (selection: NonNullable<ReturnType<typeof pptxContentEditableSelection>>) => void,
+): void {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return;
+  const range = selection.getRangeAt(0);
+  if (!element.contains(range.commonAncestorContainer)) return;
+  const offsets = pptxContentEditableSelection(element);
+  if (offsets) beforeInput(offsets);
+  range.deleteContents();
+  const node = document.createTextNode(text);
+  range.insertNode(node);
+  range.setStartAfter(node);
+  range.collapse(true);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  element.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertFromPaste", data: text }));
+}
+
+/** Text of the inline PPTX editor, without the browser's trailing placeholder <br>. */
+function pptxEditableElementText(element: HTMLElement): string {
+  let last: Node | null = element.lastChild;
+  while (last && last.nodeType === Node.TEXT_NODE && !last.textContent) last = last.previousSibling;
+  while (last && last.nodeType === Node.ELEMENT_NODE && last.nodeName !== "BR" && last.lastChild) last = last.lastChild;
+  return withoutEditablePlaceholderBreak(
+    normalizedPptxEditableText(element.innerText),
+    last?.nodeName === "BR",
+  );
 }
 
 function pptxContentEditablePointOffset(root: HTMLElement, node: Node, offset: number): number | null {
@@ -4246,8 +4274,8 @@ function PptxBulletMarker({ paragraph }: { paragraph: PptxTextRun }) {
       contentEditable={false}
       style={{
         position: "absolute",
-        left: paragraph.indent
-          ? pptxPointsToCqh(paragraph.indent + (paragraph.hanging ?? -14))
+        left: paragraph.indent != null
+          ? pptxPointsToCqh(paragraph.indent + (paragraph.hanging ?? (paragraph.indent === 0 ? 0 : -14)))
           : pptxPointsToCqh(2),
       }}
     >
@@ -4269,9 +4297,21 @@ function pptxTableCellVisualStyle(cell: PptxTableCell, rowIndex: number): React.
   return {
     background: cell.fill || (rowIndex === 0 ? "#f5f5f4" : "#ffffff"),
     color: cell.color || "#292524",
-    fontWeight: cell.bold || rowIndex === 0 ? 700 : 400,
+    fontWeight: (cell.bold ?? rowIndex === 0) ? 700 : 400,
+    fontStyle: cell.italic ? "italic" : "normal",
+    fontFamily: cell.fontFamily || undefined,
+    fontSize: cell.fontSize ? pptxPointsToCqh(cell.fontSize) : undefined,
     whiteSpace: "pre-wrap",
   };
+}
+
+function pptxTableRowVisualStyle(shape: PptxShape, rowIndex: number): React.CSSProperties | undefined {
+  const heights = shape.tableRowHeights;
+  if (!heights || heights.length !== shape.tableRows?.length) return undefined;
+  const totalHeight = heights.reduce((sum, value) => sum + Math.max(0, value), 0);
+  const rowHeight = heights[rowIndex];
+  if (!totalHeight || !rowHeight) return undefined;
+  return { height: `${(rowHeight / totalHeight) * 100}%` };
 }
 
 function PptxReadOnlySlide({
@@ -4281,6 +4321,7 @@ function PptxReadOnlySlide({
   slide: PptxSlide;
   thumbnail?: boolean;
 }) {
+  const slideSize = presentationSlideSize(slide);
   const background: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
   if (slide.bgGrad) background.backgroundImage = pptxGradToCss(slide.bgGrad);
   if (slide.bgImgUrl) {
@@ -4292,10 +4333,10 @@ function PptxReadOnlySlide({
   return (
     <div
       className={thumbnail ? "presentation-editor-thumbnail-slide" : "presentation-editor-present-slide"}
-      style={{ ...background, aspectRatio: slide.aspectRatio || "16/9" }}
+      style={{ ...background, aspectRatio: slide.aspectRatio || "16/9", "--pptx-point-scale": slide.heightPoints ? 540 / slide.heightPoints : undefined } as React.CSSProperties}
     >
       {slide.shapes.map((shape) => {
-        const shapeStyle = pptxShapeVisualStyle(shape);
+        const shapeStyle = pptxShapeVisualStyle(shape, slideSize);
         const radius = shapeStyle.borderRadius;
 
         if (shape.type === "table" && shape.tableRows) {
@@ -4312,7 +4353,7 @@ function PptxReadOnlySlide({
                 )}
                 <tbody>
                   {shape.tableRows.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
+                    <tr key={rowIndex} style={pptxTableRowVisualStyle(shape, rowIndex)}>
                       {row.map((cell, cellIndex) => cell.vMerge ? null : (
                         <td key={cellIndex} colSpan={cell.gridSpan} style={pptxTableCellVisualStyle(cell, rowIndex)}>
                           {cell.text}
@@ -4344,12 +4385,12 @@ function PptxReadOnlySlide({
             ) : shape.imgUrl && (
               <img
                 src={shape.imgUrl}
-                alt=""
+                alt={shape.altText || ""}
                 style={pptxEditorImageStyle(shape, radius)}
               />
             )}
             {shape.texts.map((paragraph, paragraphIndex) => (
-              <div key={paragraphIndex} style={pptxParagraphVisualStyle(paragraph, slide)}>
+              <div key={paragraphIndex} style={pptxParagraphVisualStyle(paragraph, slide, shape)}>
                 <PptxParagraphContent paragraph={paragraph} />
               </div>
             ))}
@@ -4364,12 +4405,61 @@ function PptxReadOnlySlide({
 // Presentation Editor sub-component
 // ---------------------------------------------------------------------------
 
+/**
+ * A finished save as seen by the editor: `slides` is the identity-merged deck
+ * the parent now holds. When the editor receives exactly these slides it
+ * keeps selection, in-progress edits and undo/redo instead of treating the
+ * update as a new document.
+ */
+interface PptxSaveMergeEvent {
+  slides: PptxSlide[];
+  savedSlides: PptxSlide[];
+  savingSlides: PptxSlide[];
+}
+
+function findPptxShape(slides: PptxSlide[], shapeId: string | null | undefined): PptxShape | undefined {
+  if (!shapeId) return undefined;
+  for (const slide of slides) {
+    const shape = slide.shapes.find((candidate) => candidate.id === shapeId);
+    if (shape) return shape;
+  }
+  return undefined;
+}
+
+/** Turn an object whose OOXML source was removed by a save into a new object. */
+function demotePptxShapeSource(shape: PptxShape, slide: PptxSlide): PptxShape | null {
+  let topLevel: PptxShape;
+  try {
+    topLevel = pptxShapeAsTopLevel(shape, presentationSlideSize(slide));
+  } catch {
+    return null;
+  }
+  const { source: _staleSource, ...detached } = topLevel;
+  if (shape.type !== "graphic") return detached;
+  if (!shape.graphicPreviewUrl) return null;
+  return {
+    ...detached,
+    type: "image",
+    imgUrl: shape.graphicPreviewUrl,
+    imageFit: "fill",
+    graphicKind: undefined,
+    graphicPreviewUrl: undefined,
+    graphicPreviewStatus: undefined,
+  };
+}
+
 function PresentationEditor({
   slides: initialSlides,
+  saveMerge = null,
+  getBaselineSlides,
+  banner,
   onLiveEditTargetChange,
   onChange,
 }: {
   slides: PptxSlide[];
+  saveMerge?: PptxSaveMergeEvent | null;
+  getBaselineSlides?: () => PptxSlide[] | null;
+  banner?: React.ReactNode;
   onLiveEditTargetChange?: (target: PresentationLiveEditTarget) => void;
   onChange: (slides: PptxSlide[]) => void;
 }) {
@@ -4427,6 +4517,16 @@ function PresentationEditor({
   const copiedShapeRef = useRef<PptxShape | null>(null);
   const copyShapeRequestRef = useRef(0);
   const [canvasViewportSize, setCanvasViewportSize] = useState({ width: 0, height: 0 });
+  const editingTextRef = useRef(editingText);
+  editingTextRef.current = editingText;
+  const editingTableCellRef = useRef(editingTableCell);
+  editingTableCellRef.current = editingTableCell;
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const isShapeLocked = useCallback(
+    (shapeId: string | null | undefined) => presentationShapeIsLocked(findPptxShape(slidesRef.current, shapeId)),
+    [],
+  );
 
   useEffect(() => {
     slidesRef.current = slides;
@@ -4466,24 +4566,143 @@ function PresentationEditor({
 
   useEffect(() => {
     if (initialSlides === slidesRef.current) return;
+    if (saveMerge && saveMerge.slides === initialSlides) {
+      // A save finished: only object identity changed. Keep what the user is
+      // doing (selection, text being typed, table cell, active slide) and
+      // carry the new identity into the history so undo stays saveable.
+      const { savedSlides, savingSlides } = saveMerge;
+      const mergeHistory = (history: PptxSlide[][]) => mergePresentationSaveIntoHistory(
+        history,
+        savedSlides,
+        savingSlides,
+        demotePptxShapeSource,
+      );
+      slidesRef.current = initialSlides;
+      setSlides(initialSlides);
+      setUndoStack(mergeHistory);
+      setRedoStack(mergeHistory);
+      setDragging((current) => current
+        ? { ...current, baseSlides: mergePresentationSavedIdentity(current.baseSlides, savedSlides, savingSlides) }
+        : current);
+      setResizing((current) => current
+        ? { ...current, baseSlides: mergePresentationSavedIdentity(current.baseSlides, savedSlides, savingSlides) }
+        : current);
+      const session = inlineTextEditSessionRef.current;
+      if (session) {
+        session.sourceMap = rebasePresentationEditSourceMap(
+          savedSlides,
+          savingSlides,
+          session.shapeId,
+          { textIdx: session.textIdx },
+          session.text,
+          session.sourceMap,
+        );
+      }
+      setEditingTableCell((current) => current
+        ? {
+            ...current,
+            sourceMap: rebasePresentationEditSourceMap(
+              savedSlides,
+              savingSlides,
+              current.shapeId,
+              { rowIdx: current.rowIdx, cellIdx: current.cellIdx },
+              current.value,
+              current.sourceMap,
+            ),
+          }
+        : current);
+      return;
+    }
+
+    // A real document replacement (reload, AI accept, rejected edit). Text
+    // the user is still typing lives only in the DOM; carry it onto the new
+    // slides when its paragraph still exists so it is never silently lost.
+    let nextSlides = initialSlides;
+    let carriedEdit = false;
+    const pendingText = editingTextRef.current;
+    if (pendingText) {
+      const session = inlineTextEditSessionRef.current;
+      const domText = inlineTextEditorRef.current
+        ? pptxEditableElementText(inlineTextEditorRef.current)
+        : null;
+      // The DOM is the source of truth while typing (IME compositions update
+      // it before any input bookkeeping); the session copy is the fallback.
+      const typed = domText ?? (
+        session?.shapeId === pendingText.shapeId && session.textIdx === pendingText.textIdx
+          ? session.text
+          : null
+      );
+      if (typed != null && typed !== pendingText.initialValue) {
+        nextSlides = nextSlides.map((slide) => {
+          const shape = slide.shapes.find((candidate) => candidate.id === pendingText.shapeId);
+          const paragraph = shape?.texts[pendingText.textIdx];
+          if (!shape || !paragraph || !presentationShapeIsEditable(shape) || paragraph.text === typed) return slide;
+          carriedEdit = true;
+          const sourceMap = reconcilePresentationTextSourceMap(paragraph.text, typed, paragraph.sourceMap);
+          return {
+            ...slide,
+            shapes: slide.shapes.map((candidate) => {
+              if (candidate !== shape) return candidate;
+              const texts = [...candidate.texts];
+              texts[pendingText.textIdx] = {
+                ...paragraph,
+                text: typed,
+                sourceMap,
+                runs: reconcilePptxTextRuns(paragraph, typed, sourceMap),
+              };
+              return { ...candidate, texts };
+            }),
+          };
+        });
+      }
+    }
+    const pendingCell = editingTableCellRef.current;
+    if (pendingCell && pendingCell.value !== pendingCell.initialValue) {
+      nextSlides = nextSlides.map((slide) => {
+        const shape = slide.shapes.find((candidate) => candidate.id === pendingCell.shapeId);
+        const cell = shape?.tableRows?.[pendingCell.rowIdx]?.[pendingCell.cellIdx];
+        if (!shape || !cell || !presentationShapeIsEditable(shape) || cell.text === pendingCell.value) return slide;
+        carriedEdit = true;
+        return {
+          ...slide,
+          shapes: slide.shapes.map((candidate) => candidate !== shape ? candidate : {
+            ...candidate,
+            tableRows: candidate.tableRows!.map((row, rowIdx) => rowIdx !== pendingCell.rowIdx ? row : row.map(
+              (current, cellIdx) => cellIdx !== pendingCell.cellIdx ? current : {
+                ...current,
+                text: pendingCell.value,
+                sourceMap: reconcilePresentationTextSourceMap(current.text, pendingCell.value, current.sourceMap),
+              },
+            )),
+          }),
+        };
+      });
+    }
+    inlineTextEditSessionRef.current = null;
+    inlineTextBeforeInputRef.current = null;
+    tableCellBeforeInputRef.current = null;
+
     const previousSlideIds = new Set(slidesRef.current.map((slide) => slide.id));
     let createdSlideIndex = -1;
-    initialSlides.forEach((slide, index) => {
+    nextSlides.forEach((slide, index) => {
       if (slide.id.startsWith("ai-slide-") && !previousSlideIds.has(slide.id)) {
         createdSlideIndex = index;
       }
     });
-    slidesRef.current = initialSlides;
-    setSlides(initialSlides);
+    slidesRef.current = nextSlides;
+    setSlides(nextSlides);
     setActiveIdx((index) => createdSlideIndex >= 0
       ? createdSlideIndex
-      : Math.max(0, Math.min(index, initialSlides.length - 1)));
+      : Math.max(0, Math.min(index, nextSlides.length - 1)));
     setSelectedShapeId(null);
     setEditingText(null);
     setEditingTableCell(null);
+    setDragging(null);
+    setResizing(null);
     setUndoStack([]);
     setRedoStack([]);
-  }, [initialSlides]);
+    if (carriedEdit) onChangeRef.current(nextSlides);
+  }, [initialSlides, saveMerge]);
 
   useEffect(() => {
     onLiveEditTargetChange?.({ activeSlideIndex: activeIdx, selectedShapeId });
@@ -4527,25 +4746,40 @@ function PresentationEditor({
     onChange(next);
   }, [onChange, pushUndo]);
 
+  // A history entry can reference OOXML objects that a save has since removed
+  // (for example a deleted object that was saved, then undone). Such objects
+  // become new objects so the next save regenerates them instead of failing.
+  const restoreHistorySlides = useCallback((entry: PptxSlide[]) => (
+    demoteStalePresentationSources(entry, getBaselineSlides?.() ?? null, demotePptxShapeSource)
+  ), [getBaselineSlides]);
+
   const undo = useCallback(() => {
     if (undoStack.length === 0) return;
-    const prev = undoStack[undoStack.length - 1];
-    setRedoStack(s => [...s, slides]);
+    const prev = restoreHistorySlides(undoStack[undoStack.length - 1]);
+    const current = slidesRef.current;
+    setRedoStack(s => [...s, current]);
     setUndoStack(s => s.slice(0, -1));
+    slidesRef.current = prev;
     setSlides(prev);
     onChange(prev);
-  }, [undoStack, slides, onChange]);
+  }, [onChange, restoreHistorySlides, undoStack]);
 
   const redo = useCallback(() => {
     if (redoStack.length === 0) return;
-    const next = redoStack[redoStack.length - 1];
-    setUndoStack(s => [...s, slides]);
+    const next = restoreHistorySlides(redoStack[redoStack.length - 1]);
+    const current = slidesRef.current;
+    setUndoStack(s => [...s, current]);
     setRedoStack(s => s.slice(0, -1));
+    slidesRef.current = next;
     setSlides(next);
     onChange(next);
-  }, [redoStack, slides, onChange]);
+  }, [onChange, redoStack, restoreHistorySlides]);
 
   const activeSlide = slides[activeIdx] || { id: "empty", bg: "#ffffff", aspectRatio: "16/9", shapes: [] };
+  const activeSlideSize = useMemo(
+    () => presentationSlideSize(activeSlide),
+    [activeSlide.aspectRatio, activeSlide.heightPoints],
+  );
   useEffect(() => {
     setNotesDraft(activeSlide.notes || "");
   }, [activeSlide.id, activeSlide.notes]);
@@ -4652,6 +4886,7 @@ function PresentationEditor({
   }, [slides, activeIdx, updateSlides]);
 
   const deleteShape = useCallback((shapeId: string) => {
+    if (isShapeLocked(shapeId)) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return { ...s, shapes: s.shapes.filter(sh => sh.id !== shapeId) };
@@ -4660,7 +4895,7 @@ function PresentationEditor({
     setSelectedShapeId(null);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   // Keyboard shortcuts: undo/redo, delete shape, and nudge selected shapes.
   useEffect(() => {
@@ -4676,6 +4911,7 @@ function PresentationEditor({
         return;
       }
       if (!selectedShapeId || editingText || editingTableCell) return;
+      if (isShapeLocked(selectedShapeId)) return;
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
         deleteShape(selectedShapeId);
@@ -4693,23 +4929,19 @@ function PresentationEditor({
       e.preventDefault();
       const next = slides.map((slide, index) => {
         if (index !== activeIdx) return slide;
+        const size = presentationSlideSize(slide);
         return {
           ...slide,
-          shapes: slide.shapes.map((shape) => {
-            if (shape.id !== selectedShapeId) return shape;
-            return {
-              ...shape,
-              x: Math.max(0, Math.min(100 - shape.w, shape.x + move.dx)),
-              y: Math.max(0, Math.min(100 - shape.h, shape.y + move.dy)),
-            };
-          }),
+          shapes: slide.shapes.map((shape) => shape.id !== selectedShapeId
+            ? shape
+            : presentationMovedShape(shape, shape, move.dx, move.dy, size)),
         };
       });
       updateSlides(next);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [activeIdx, deleteShape, editingTableCell, editingText, presentingIdx, redo, selectedShapeId, slides, undo, updateSlides]);
+  }, [activeIdx, deleteShape, editingTableCell, editingText, isShapeLocked, presentingIdx, redo, selectedShapeId, slides, undo, updateSlides]);
 
   const updateShapeText = useCallback((
     shapeId: string,
@@ -4717,6 +4949,7 @@ function PresentationEditor({
     newText: string,
     sourceMap?: PresentationTextSourceMap,
   ) => {
+    if (isShapeLocked(shapeId)) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return {
@@ -4738,10 +4971,11 @@ function PresentationEditor({
       };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   const beginTextEditing = useCallback((shapeId: string, textIdx: number, value: string) => {
     setSelectedShapeId(shapeId);
+    if (isShapeLocked(shapeId)) return;
     setEditingTableCell(null);
     const paragraph = slidesRef.current[activeIdxRef.current]?.shapes
       .find((shape) => shape.id === shapeId)?.texts[textIdx];
@@ -4753,7 +4987,7 @@ function PresentationEditor({
     };
     inlineTextBeforeInputRef.current = null;
     setEditingText({ shapeId, textIdx, initialValue: value });
-  }, []);
+  }, [isShapeLocked]);
 
   const beginTableCellEditing = useCallback((
     shapeId: string,
@@ -4763,6 +4997,7 @@ function PresentationEditor({
   ) => {
     setSelectedShapeId(shapeId);
     setEditingText(null);
+    if (isShapeLocked(shapeId)) return;
     setEditingTableCell({
       shapeId,
       rowIdx,
@@ -4771,7 +5006,7 @@ function PresentationEditor({
       initialValue: cell.text,
       sourceMap: reconcilePresentationTextSourceMap(cell.text, cell.text, cell.sourceMap),
     });
-  }, []);
+  }, [isShapeLocked]);
 
   const commitTextEditing = useCallback((nextText: string) => {
     if (!editingText) return;
@@ -4800,6 +5035,7 @@ function PresentationEditor({
     value: string,
     sourceMap: PresentationTextSourceMap,
   ) => {
+    if (isShapeLocked(shapeId)) return;
     const next = slides.map((slide, slideIdx) => {
       if (slideIdx !== activeIdx) return slide;
       return {
@@ -4818,7 +5054,7 @@ function PresentationEditor({
       };
     });
     updateSlides(next);
-  }, [activeIdx, slides, updateSlides]);
+  }, [activeIdx, isShapeLocked, slides, updateSlides]);
 
   const commitTableCellEditing = useCallback(() => {
     if (!editingTableCell) return;
@@ -4864,6 +5100,7 @@ function PresentationEditor({
   }, [slides, activeIdx, updateSlides]);
 
   const handleImageFile = useCallback((file: File, replaceShapeId: string | null = null, hyperlink?: string) => {
+    if (replaceShapeId && isShapeLocked(replaceShapeId)) return;
     const reader = new FileReader();
     reader.onload = () => {
       const url = String(reader.result || "");
@@ -4910,7 +5147,7 @@ function PresentationEditor({
       img.src = url;
     };
     reader.readAsDataURL(file);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   const requestImageInsert = useCallback(() => {
     setMediaInsertOpen(true);
@@ -4944,11 +5181,13 @@ function PresentationEditor({
   }, [handleImageFile]);
 
   const requestImageReplacement = useCallback((shapeId: string) => {
+    if (isShapeLocked(shapeId)) return;
     replaceImageShapeIdRef.current = shapeId;
     imageInputRef.current?.click();
-  }, []);
+  }, [isShapeLocked]);
 
   const moveShapeZ = useCallback((shapeId: string, dir: "up" | "down" | "top" | "bottom") => {
+    if (isShapeLocked(shapeId)) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       const shapes = [...s.shapes];
@@ -4983,7 +5222,7 @@ function PresentationEditor({
       return { ...s, shapes };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   const duplicateSlide = useCallback(async () => {
     const src = slides[activeIdx];
@@ -4992,7 +5231,7 @@ function PresentationEditor({
     try {
       duplicatedShapes = await Promise.all(
         presentationShapesForDuplicateSlide(src.shapes, src.sourcePart)
-          .map((shape) => clonePptxShapeForEditor(shape, 0, false)),
+          .map((shape) => clonePptxShapeForEditor(shape, presentationSlideSize(src), 0, false)),
       );
     } catch {
       showPresentationError(t("page.doc_editor.presentation_object_copy_failed"));
@@ -5026,7 +5265,7 @@ function PresentationEditor({
     if (!source) return;
     let duplicate: PptxShape;
     try {
-      duplicate = await clonePptxShapeForEditor(source, 2);
+      duplicate = await clonePptxShapeForEditor(source, activeSlideSize, 2);
     } catch {
       showPresentationError(t("page.doc_editor.presentation_object_copy_failed"));
       return;
@@ -5044,7 +5283,7 @@ function PresentationEditor({
       setEditingText(null);
       setEditingTableCell(null);
     }
-  }, [activeSlide.id, activeSlide.shapes, showPresentationError, updateSlides]);
+  }, [activeSlide.id, activeSlide.shapes, activeSlideSize, showPresentationError, updateSlides]);
 
   const copyShape = useCallback(async (shapeId: string) => {
     const source = activeSlide.shapes.find((shape) => shape.id === shapeId);
@@ -5052,21 +5291,21 @@ function PresentationEditor({
     const requestId = copyShapeRequestRef.current + 1;
     copyShapeRequestRef.current = requestId;
     try {
-      const copy = await clonePptxShapeForEditor(source);
+      const copy = await clonePptxShapeForEditor(source, activeSlideSize);
       if (copyShapeRequestRef.current === requestId) copiedShapeRef.current = copy;
     } catch {
       if (copyShapeRequestRef.current === requestId) {
         showPresentationError(t("page.doc_editor.presentation_object_copy_failed"));
       }
     }
-  }, [activeSlide.shapes, showPresentationError]);
+  }, [activeSlide.shapes, activeSlideSize, showPresentationError]);
 
   const pasteShape = useCallback(async () => {
     if (!copiedShapeRef.current) return;
     const preserveSource = copiedShapeRef.current.source?.part === activeSlide.sourcePart;
     let duplicate: PptxShape;
     try {
-      duplicate = await clonePptxShapeForEditor(copiedShapeRef.current, 2, preserveSource);
+      duplicate = await clonePptxShapeForEditor(copiedShapeRef.current, activeSlideSize, 2, preserveSource);
     } catch {
       showPresentationError(t("page.doc_editor.presentation_object_copy_failed"));
       return;
@@ -5079,7 +5318,7 @@ function PresentationEditor({
     setSelectedShapeId(duplicate.id);
     setEditingText(null);
     setEditingTableCell(null);
-  }, [activeIdx, activeSlide.sourcePart, showPresentationError, slides, updateSlides]);
+  }, [activeIdx, activeSlide.sourcePart, activeSlideSize, showPresentationError, slides, updateSlides]);
 
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
@@ -5106,31 +5345,23 @@ function PresentationEditor({
   }, [copyShape, duplicateShape, pasteShape, presentingIdx, selectedShapeId]);
 
   const updateShapeFill = useCallback((shapeId: string, fill: string) => {
+    if (isShapeLocked(shapeId)) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return { ...s, shapes: s.shapes.map(sh => sh.id === shapeId ? { ...sh, fill, gradFill: undefined } : sh) };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   const updateShapeProps = useCallback((shapeId: string, update: Partial<PptxShape>) => {
+    if (isShapeLocked(shapeId)) return;
     const next = slides.map((s, i) => {
       if (i !== activeIdx) return s;
       return {
         ...s,
         shapes: s.shapes.map((shape) => {
           if (shape.id !== shapeId) return shape;
-          const merged = { ...shape, ...update };
-          const minHeight = merged.presetGeom === "line" ? 0.5 : 1;
-          if (merged.source?.groupTransform) {
-            merged.w = Math.max(1, merged.w);
-            merged.h = Math.max(minHeight, merged.h);
-          } else {
-            merged.w = Math.max(1, Math.min(100, merged.w));
-            merged.h = Math.max(minHeight, Math.min(100, merged.h));
-            merged.x = Math.max(0, Math.min(100 - merged.w, merged.x));
-            merged.y = Math.max(0, Math.min(100 - merged.h, merged.y));
-          }
+          const merged = presentationShapeWithProps(shape, update);
           if (merged.opacity != null) merged.opacity = Math.max(0, Math.min(1, merged.opacity));
           if (merged.imgUrl && merged.imageFit === "contain" && ("w" in update || "h" in update)) {
             merged.imageFit = "fill";
@@ -5140,9 +5371,10 @@ function PresentationEditor({
       };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   const updateImageFit = useCallback(async (shapeId: string, imageFit: "cover" | "contain" | "fill") => {
+    if (isShapeLocked(shapeId)) return;
     const requestedSlideId = slidesRef.current[activeIdx]?.id;
     const requestedShape = slidesRef.current[activeIdx]?.shapes.find((shape) => shape.id === shapeId);
     if (!requestedSlideId || !requestedShape?.imgUrl) return;
@@ -5210,9 +5442,10 @@ function PresentationEditor({
     slidesRef.current = next;
     setSlides(next);
     onChange(next);
-  }, [activeIdx, onChange, pushUndo, showPresentationError]);
+  }, [activeIdx, isShapeLocked, onChange, pushUndo, showPresentationError]);
 
   const updateTextStyle = useCallback((shapeId: string, textIdx: number, update: Partial<PptxTextRun>) => {
+    if (isShapeLocked(shapeId)) return;
     const inlineKeys = ["bold", "italic", "underline", "strikethrough", "fontSize", "color", "fontFamily"] as const;
     const runUpdate = inlineKeys.reduce((result, key) => {
       if (key in update) result[key] = update[key] as never;
@@ -5239,13 +5472,18 @@ function PresentationEditor({
       };
     });
     updateSlides(next);
-  }, [slides, activeIdx, updateSlides]);
+  }, [isShapeLocked, slides, activeIdx, updateSlides]);
 
   const handleDragStart = useCallback((e: React.MouseEvent, shapeId: string) => {
     if (editingText || editingTableCell) return;
     e.stopPropagation();
     const shape = activeSlide.shapes.find(s => s.id === shapeId);
     if (!shape) return;
+    if (!presentationShapeIsEditable(shape)) {
+      // Layout/master objects can be inspected but never moved.
+      setSelectedShapeId(shapeId);
+      return;
+    }
     setDragging({ shapeId, slideIdx: activeIdx, startX: e.clientX, startY: e.clientY, origX: shape.x, origY: shape.y, baseSlides: slides });
     setSelectedShapeId(shapeId);
   }, [activeIdx, activeSlide, editingTableCell, editingText, slides]);
@@ -5261,15 +5499,9 @@ function PresentationEditor({
         if (i !== dragging.slideIdx) return s;
         return {
           ...s,
-          shapes: s.shapes.map((sh) => {
-            if (sh.id !== dragging.shapeId) return sh;
-            const localDelta = pptxShapeLocalDelta(sh, dx, dy);
-            const x = dragging.origX + localDelta.dx;
-            const y = dragging.origY + localDelta.dy;
-            return sh.source?.groupTransform
-              ? { ...sh, x, y }
-              : { ...sh, x: Math.max(0, Math.min(100 - sh.w, x)), y: Math.max(0, Math.min(100 - sh.h, y)) };
-          }),
+          shapes: s.shapes.map((sh) => sh.id !== dragging.shapeId
+            ? sh
+            : presentationMovedShape(sh, { x: dragging.origX, y: dragging.origY }, dx, dy, presentationSlideSize(s))),
         };
       });
       slidesRef.current = next;
@@ -5292,7 +5524,7 @@ function PresentationEditor({
     e.stopPropagation();
     e.preventDefault();
     const shape = activeSlide.shapes.find(s => s.id === shapeId);
-    if (!shape) return;
+    if (!shape || !presentationShapeIsEditable(shape)) return;
     setResizing({ shapeId, slideIdx: activeIdx, handle, startX: e.clientX, startY: e.clientY, origX: shape.x, origY: shape.y, origW: shape.w, origH: shape.h, baseSlides: slides });
   }, [activeIdx, activeSlide, slides]);
 
@@ -5305,6 +5537,7 @@ function PresentationEditor({
       const dy = ((e.clientY - resizing.startY) / rect.height) * 100;
       const next = resizing.baseSlides.map((s, i) => {
         if (i !== resizing.slideIdx) return s;
+        const size = presentationSlideSize(s);
         return {
           ...s,
             shapes: s.shapes.map(sh => {
@@ -5313,31 +5546,31 @@ function PresentationEditor({
               const minH = sh.presetGeom === "line" ? 0.5 : 3;
               const resized = presentationResizeRect(
                 {
-                  x: (resizing.origX / 100) * EDITOR_SLIDE_W,
-                  y: (resizing.origY / 100) * EDITOR_SLIDE_H,
-                  width: (resizing.origW / 100) * EDITOR_SLIDE_W,
-                  height: (resizing.origH / 100) * EDITOR_SLIDE_H,
+                  x: (resizing.origX / 100) * size.width,
+                  y: (resizing.origY / 100) * size.height,
+                  width: (resizing.origW / 100) * size.width,
+                  height: (resizing.origH / 100) * size.height,
                   rotation: sh.rotation,
                   flipH: sh.flipH,
                   flipV: sh.flipV,
                 },
                 resizing.handle,
                 {
-                  x: (dx / 100) * EDITOR_SLIDE_W,
-                  y: (dy / 100) * EDITOR_SLIDE_H,
+                  x: (dx / 100) * size.width,
+                  y: (dy / 100) * size.height,
                 },
                 sh.source?.groupTransform,
                 {
-                  width: (minW / 100) * EDITOR_SLIDE_W,
-                  height: (minH / 100) * EDITOR_SLIDE_H,
+                  width: (minW / 100) * size.width,
+                  height: (minH / 100) * size.height,
                 },
               );
               return {
                 ...sh,
-                x: emu2pctX(resized.x),
-                y: emu2pctY(resized.y),
-                w: emu2pctX(resized.width),
-                h: emu2pctY(resized.height),
+                x: (resized.x / size.width) * 100,
+                y: (resized.y / size.height) * 100,
+                w: (resized.width / size.width) * 100,
+                h: (resized.height / size.height) * 100,
                 imageFit: sh.imgUrl && sh.imageFit === "contain" ? "fill" : sh.imageFit,
               };
             }),
@@ -5388,6 +5621,7 @@ function PresentationEditor({
   }, []);
 
   const selectedShape = activeSlide.shapes.find(s => s.id === selectedShapeId);
+  const selectedShapeLocked = presentationShapeIsLocked(selectedShape);
   const contextMenuShape = shapeContextMenu
     ? activeSlide.shapes.find((shape) => shape.id === shapeContextMenu.shapeId)
     : undefined;
@@ -5438,7 +5672,7 @@ function PresentationEditor({
   );
 
   return (
-    <div className="presentation-editor" style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+    <div className="presentation-editor" style={{ flex: 1, display: "flex", overflow: "hidden", "--pptx-point-scale": 540 / (slides.find((slide) => slide.heightPoints)?.heightPoints || 540) } as React.CSSProperties}>
       {/* Slide thumbnails */}
       <div className="presentation-editor-sidebar" style={{
         width: 180, flexShrink: 0, borderRight: "1px solid rgba(28,25,23,0.06)",
@@ -5508,6 +5742,7 @@ function PresentationEditor({
 
       {/* Main slide canvas */}
       <div className="presentation-editor-main" style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        {banner}
         {/* Toolbar */}
         <div className="presentation-editor-toolbar" style={{
           display: "flex", alignItems: "center", gap: 8, padding: "8px 16px",
@@ -5554,7 +5789,18 @@ function PresentationEditor({
           <button onClick={duplicateSlide} className="btn-manor-ghost" style={{ fontSize: 12, padding: "4px 12px" }} title={t("page.doc_editor.duplicate_slide")}>
             {t("page.doc_editor.duplicate")}
           </button>
-          {selectedShapeId && (
+          {selectedShapeId && selectedShapeLocked && (
+            <div className="presentation-editor-context-tools">
+              <span
+                className="presentation-editor-locked-badge"
+                role="note"
+                title={t("page.doc_editor.presentation_object_locked_hint")}
+              >
+                <IconLock size={13} /> {t("page.doc_editor.presentation_object_locked")}
+              </span>
+            </div>
+          )}
+          {selectedShapeId && !selectedShapeLocked && (
             <div className="presentation-editor-context-tools">
               <span className="presentation-editor-context-title" title={t("page.doc_editor.object")}><IconLayers size={14} /></span>
               {selectedShape && selectedShape.type !== "table" && selectedShape.type !== "graphic" && (
@@ -5762,21 +6008,25 @@ function PresentationEditor({
           }}>
             {activeSlide.shapes.map((shape) => {
               const isSelected = selectedShapeId === shape.id;
-              const shapeStyle = pptxShapeVisualStyle(shape);
+              const shapeStyle = pptxShapeVisualStyle(shape, activeSlideSize);
               const borderRadius = shapeStyle.borderRadius;
+              const shapeLocked = presentationShapeIsLocked(shape);
+              const lockedTitle = shapeLocked ? t("page.doc_editor.presentation_object_locked_hint") : undefined;
 
               // Table rendering
               if (shape.type === "table" && shape.tableRows) {
                 return (
                   <div
                     key={shape.id}
+                    data-presentation-locked={shapeLocked ? "true" : undefined}
+                    title={lockedTitle}
                     onClick={(e) => { e.stopPropagation(); setSelectedShapeId(shape.id); }}
                     onMouseDown={(e) => handleDragStart(e, shape.id)}
                     onContextMenu={(event) => openShapeContextMenu(event, shape.id)}
                     style={{
                       ...shapeStyle,
-                      cursor: editingTableCell?.shapeId === shape.id ? "text" : "move",
-                      outline: isSelected ? "2px solid #4f7d75" : undefined,
+                      cursor: shapeLocked ? "default" : editingTableCell?.shapeId === shape.id ? "text" : "move",
+                      outline: isSelected ? (shapeLocked ? "2px dashed rgba(120,113,108,0.7)" : "2px solid #4f7d75") : undefined,
                       outlineOffset: 2,
                     }}
                   >
@@ -5791,7 +6041,7 @@ function PresentationEditor({
                       )}
                       <tbody>
                         {shape.tableRows.map((row, ri) => (
-                          <tr key={ri}>
+                          <tr key={ri} style={pptxTableRowVisualStyle(shape, ri)}>
                             {row.map((cell, ci) => {
                               if (cell.vMerge) return null;
                               const isEditingCell = editingTableCell?.shapeId === shape.id
@@ -5801,8 +6051,8 @@ function PresentationEditor({
                                 <td
                                   key={ci}
                                   colSpan={cell.gridSpan}
-                                  className="presentation-editor-edit-target"
-                                  tabIndex={isEditingCell ? -1 : 0}
+                                  className={shapeLocked ? undefined : "presentation-editor-edit-target"}
+                                  tabIndex={isEditingCell || shapeLocked ? -1 : 0}
                                   aria-label={`${t("page.doc_editor.table")} ${ri + 1}, ${ci + 1}`}
                                   aria-keyshortcuts="Enter F2"
                                   onDoubleClick={(event) => {
@@ -5887,6 +6137,7 @@ function PresentationEditor({
                                         }
                                       }}
                                       className="presentation-editor-inline-input"
+                                      style={{ color: "inherit", background: "inherit" }}
                                     />
                                   ) : cell.text}
                                 </td>
@@ -5896,7 +6147,7 @@ function PresentationEditor({
                         ))}
                       </tbody>
                     </table>
-                    {isSelected && !editingTableCell && renderResizeHandles(shape.id)}
+                    {isSelected && !shapeLocked && !editingTableCell && renderResizeHandles(shape.id)}
                   </div>
                 );
               }
@@ -5905,16 +6156,23 @@ function PresentationEditor({
                 <div
                   key={shape.id}
                   data-presentation-shape-type={shape.type || "shape"}
+                  data-presentation-locked={shapeLocked ? "true" : undefined}
+                  title={lockedTitle}
                   onClick={(e) => { e.stopPropagation(); setSelectedShapeId(shape.id); }}
                   onMouseDown={(e) => handleDragStart(e, shape.id)}
                   onContextMenu={(event) => openShapeContextMenu(event, shape.id)}
                   style={{
                     ...shapeStyle,
-                    cursor: editingText?.shapeId === shape.id ? "text" : "move",
-                    outline: isSelected ? "2px solid rgba(79,125,117,0.3)" : undefined,
+                    cursor: shapeLocked ? "default" : editingText?.shapeId === shape.id ? "text" : "move",
+                    outline: isSelected ? (shapeLocked ? "2px dashed rgba(120,113,108,0.7)" : "2px solid rgba(79,125,117,0.3)") : undefined,
                     outlineOffset: 2,
                   }}
                 >
+                  {shape.presetGeom === "line" && (
+                    // A straight line is only its stroke tall; give it a
+                    // pointer target wide enough to select and drag.
+                    <span className="presentation-editor-line-hit-area" aria-hidden="true" />
+                  )}
                   <PptxShapeGeometry shape={shape} />
                   {shape.type === "graphic" && (
                     <PptxGraphicFramePreview shape={shape} />
@@ -5937,12 +6195,12 @@ function PresentationEditor({
                         position: "absolute", top: 0, left: 0, width: "100%", height: "100%",
                         overflow: "hidden", zIndex: 0, borderRadius: borderRadius || 0,
                       }}>
-                        <img src={shape.imgUrl} alt="" style={{
+                        <img src={shape.imgUrl} alt={shape.altText || ""} style={{
                           ...pptxEditorImageStyle(shape, borderRadius),
                         }} />
                       </div>
                     ) : (
-                      <img src={shape.imgUrl} alt="" style={pptxEditorImageStyle(shape, borderRadius)} />
+                      <img src={shape.imgUrl} alt={shape.altText || ""} style={pptxEditorImageStyle(shape, borderRadius)} />
                     )
                   )}
                   {shape.texts.map((t, ti) => {
@@ -5950,12 +6208,12 @@ function PresentationEditor({
                     return (
                       <div
                         key={ti}
-                        className="presentation-editor-edit-target"
-                        tabIndex={isEditing ? -1 : 0}
+                        className={shapeLocked ? undefined : "presentation-editor-edit-target"}
+                        tabIndex={isEditing || shapeLocked ? -1 : 0}
                         role={isEditing ? undefined : "textbox"}
                         aria-readonly={isEditing ? undefined : true}
                         aria-label={t.text || shape.type || "text"}
-                        aria-keyshortcuts="Enter F2"
+                        aria-keyshortcuts={shapeLocked ? undefined : "Enter F2"}
                         onDoubleClick={(e) => {
                           e.stopPropagation();
                           beginTextEditing(shape.id, ti, t.text);
@@ -5975,7 +6233,7 @@ function PresentationEditor({
                             beginTextEditing(shape.id, ti, t.text);
                           }
                         }}
-                        style={pptxParagraphVisualStyle(t, activeSlide)}
+                        style={pptxParagraphVisualStyle(t, activeSlide, shape)}
                       >
                         {isEditing ? (
                           <>
@@ -5986,7 +6244,7 @@ function PresentationEditor({
                               suppressContentEditableWarning
                               role="textbox"
                               aria-multiline="true"
-                              onBlur={(event) => commitTextEditing(normalizedPptxEditableText(event.currentTarget.innerText))}
+                              onBlur={(event) => commitTextEditing(pptxEditableElementText(event.currentTarget))}
                               onMouseDown={(event) => event.stopPropagation()}
                               onClick={(event) => event.stopPropagation()}
                               onBeforeInput={(event) => {
@@ -5999,7 +6257,7 @@ function PresentationEditor({
                                 } : null;
                               }}
                               onInput={(event) => {
-                                const nextText = normalizedPptxEditableText(event.currentTarget.innerText);
+                                const nextText = pptxEditableElementText(event.currentTarget);
                                 const session = inlineTextEditSessionRef.current;
                                 if (
                                   !session
@@ -6024,7 +6282,23 @@ function PresentationEditor({
                               }}
                               onPaste={(event) => {
                                 event.preventDefault();
-                                document.execCommand("insertText", false, event.clipboardData.getData("text/plain"));
+                                const pasted = sanitizePresentationInputText(event.clipboardData.getData("text/plain"));
+                                if (!pasted) return;
+                                if (!pasted.includes("\n")) {
+                                  document.execCommand("insertText", false, pasted);
+                                  return;
+                                }
+                                // In this pre-wrap editor Chrome's insertText appends an extra
+                                // "\n" after multi-line text, which would be saved as a stray
+                                // trailing <a:br/>. Insert the exact text instead and report it
+                                // through the same input bookkeeping as a native paste.
+                                insertPptxEditablePlainText(event.currentTarget, pasted, (selection) => {
+                                  inlineTextBeforeInputRef.current = {
+                                    selection,
+                                    inputType: "insertFromPaste",
+                                    data: pasted,
+                                  };
+                                });
                               }}
                               onKeyDown={(event) => {
                                 if (event.key === "Escape") {
@@ -6048,13 +6322,37 @@ function PresentationEditor({
                   {shape.type !== "graphic" && shape.texts.length === 0 && !shape.imgUrl && !shape.tableRows && isSelected && (
                     <div style={{ color: "#a8a29e", fontSize: 12, textAlign: "center" }}>{t("page.doc_editor.empty_shape")}</div>
                   )}
-                  {isSelected && !editingText && renderResizeHandles(shape.id)}
+                  {isSelected && !shapeLocked && !editingText && renderResizeHandles(shape.id)}
                 </div>
               );
             })}
           </div>
           </div>
-          {showFormatOptions && selectedShape && (
+          {showFormatOptions && selectedShape && selectedShapeLocked && (
+            <aside className="presentation-editor-format-panel" onClick={(event) => event.stopPropagation()}>
+              <div className="presentation-editor-format-panel-header">
+                <div>
+                  <strong>{t("page.doc_editor.format_options")}</strong>
+                  <span>{t("page.doc_editor.presentation_object_locked")}</span>
+                </div>
+                <button type="button" onClick={() => setShowFormatOptions(false)} title={t("action.close")} aria-label={t("action.close")}>
+                  <IconClose size={16} />
+                </button>
+              </div>
+              <section className="presentation-editor-format-section">
+                <p className="presentation-editor-locked-note"><IconLock size={14} /> {t("page.doc_editor.presentation_object_locked_hint")}</p>
+              </section>
+              <section className="presentation-editor-format-section presentation-editor-format-actions-section">
+                <button type="button" onClick={() => copyShape(selectedShape.id)}>
+                  <IconCopy size={14} /> {t("action.copy")}
+                </button>
+                <button type="button" onClick={() => duplicateShape(selectedShape.id)}>
+                  <IconCopy size={14} /> {t("page.doc_editor.duplicate_object")}
+                </button>
+              </section>
+            </aside>
+          )}
+          {showFormatOptions && selectedShape && !selectedShapeLocked && (
             <aside className="presentation-editor-format-panel" onClick={(event) => event.stopPropagation()}>
               <div className="presentation-editor-format-panel-header">
                 <div>
@@ -6195,7 +6493,7 @@ function PresentationEditor({
             id="presentation-speaker-notes"
             value={notesDraft}
             placeholder={t("page.doc_editor.speaker_notes_placeholder")}
-            onChange={(event) => setNotesDraft(event.target.value)}
+            onChange={(event) => setNotesDraft(sanitizePresentationInputText(event.target.value))}
             onBlur={commitSpeakerNotes}
             onKeyDown={(event) => {
               if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) event.currentTarget.blur();
@@ -6210,7 +6508,12 @@ function PresentationEditor({
           style={{ left: shapeContextMenu.x, top: shapeContextMenu.y }}
           onMouseDown={(event) => event.stopPropagation()}
         >
-          {contextMenuShape.texts.length > 0 && (
+          {presentationShapeIsLocked(contextMenuShape) && (
+            <div className="presentation-editor-context-menu-note" role="note">
+              <IconLock size={13} /> {t("page.doc_editor.presentation_object_locked_hint")}
+            </div>
+          )}
+          {presentationShapeIsEditable(contextMenuShape) && contextMenuShape.texts.length > 0 && (
             <button type="button" onClick={() => {
               beginTextEditing(contextMenuShape.id, 0, contextMenuShape.texts[0].text);
               setShapeContextMenu(null);
@@ -6218,7 +6521,7 @@ function PresentationEditor({
               <IconText size={15} /> {t("action.edit")}
             </button>
           )}
-          {contextMenuShape.imgUrl && (
+          {presentationShapeIsEditable(contextMenuShape) && contextMenuShape.imgUrl && (
             <button type="button" onClick={() => {
               requestImageReplacement(contextMenuShape.id);
               setShapeContextMenu(null);
@@ -6232,24 +6535,28 @@ function PresentationEditor({
           <button type="button" onClick={() => { duplicateShape(contextMenuShape.id); setShapeContextMenu(null); }}>
             <IconCopy size={15} /> {t("page.doc_editor.duplicate_object")}
           </button>
-          <div className="presentation-editor-context-menu-separator" />
-          <button type="button" onClick={() => { moveShapeZ(contextMenuShape.id, "top"); setShapeContextMenu(null); }}>
-            <IconArrowUp size={15} /> {t("page.doc_editor.bring_to_front")}
-          </button>
-          <button type="button" onClick={() => { moveShapeZ(contextMenuShape.id, "bottom"); setShapeContextMenu(null); }}>
-            <IconArrowDown size={15} /> {t("page.doc_editor.send_to_back")}
-          </button>
-          <button type="button" onClick={() => {
-            setSelectedShapeId(contextMenuShape.id);
-            setShowFormatOptions(true);
-            setShapeContextMenu(null);
-          }}>
-            <IconSettings size={15} /> {t("page.doc_editor.format_options")}
-          </button>
-          <div className="presentation-editor-context-menu-separator" />
-          <button type="button" className="is-danger" onClick={() => { deleteShape(contextMenuShape.id); setShapeContextMenu(null); }}>
-            <IconTrash size={15} /> {t("action.delete")}
-          </button>
+          {presentationShapeIsEditable(contextMenuShape) && (
+            <>
+              <div className="presentation-editor-context-menu-separator" />
+              <button type="button" onClick={() => { moveShapeZ(contextMenuShape.id, "top"); setShapeContextMenu(null); }}>
+                <IconArrowUp size={15} /> {t("page.doc_editor.bring_to_front")}
+              </button>
+              <button type="button" onClick={() => { moveShapeZ(contextMenuShape.id, "bottom"); setShapeContextMenu(null); }}>
+                <IconArrowDown size={15} /> {t("page.doc_editor.send_to_back")}
+              </button>
+              <button type="button" onClick={() => {
+                setSelectedShapeId(contextMenuShape.id);
+                setShowFormatOptions(true);
+                setShapeContextMenu(null);
+              }}>
+                <IconSettings size={15} /> {t("page.doc_editor.format_options")}
+              </button>
+              <div className="presentation-editor-context-menu-separator" />
+              <button type="button" className="is-danger" onClick={() => { deleteShape(contextMenuShape.id); setShapeContextMenu(null); }}>
+                <IconTrash size={15} /> {t("action.delete")}
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -6346,6 +6653,9 @@ export default function DocEditor() {
 
   // For PPTX: parsed structured slides + server-rendered thumbnail references
   const [pptxSlides, setPptxSlides] = useState<PptxSlide[]>([]);
+  const [pptxSaveMerge, setPptxSaveMerge] = useState<PptxSaveMergeEvent | null>(null);
+  const [pptxSaveConflict, setPptxSaveConflict] = useState(false);
+  const [pptxReloadNonce, setPptxReloadNonce] = useState(0);
   const [pptxLoading, setPptxLoading] = useState(false);
   const [pptxLoadError, setPptxLoadError] = useState<string | null>(null);
   const [pptxServerUrls, setPptxServerUrls] = useState<string[]>([]);
@@ -6381,6 +6691,7 @@ export default function DocEditor() {
   const contentRef = useRef("");
   const liveEditPreviewRef = useRef<EditorLivePreviewState | null>(null);
   const editorLiveTurnPreviewCheckpointRef = useRef<EditorLivePreviewState | null>(null);
+  const openedEditorLiveDetailRef = useRef<EditorLiveChatDetail | null>(null);
   const liveEditCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
   const shouldBlockLiveEditNavigation = useCallback<BlockerFunction>(
     ({ currentLocation, nextLocation }) => {
@@ -6411,6 +6722,7 @@ export default function DocEditor() {
   const csvFormatRef = useRef<DelimitedTextFormat>({ delimiter: ",", lineEnding: "\n", finalLineEnding: false });
   const docxOriginalBufferRef = useRef<ArrayBuffer | null>(null);
   const docxBaselineHtmlRef = useRef<string | null>(null);
+  const docxExpectedSourceSha256Ref = useRef<string | null>(null);
   const docxPaginationFrameRef = useRef<number | null>(null);
   const sheetDataRef = useRef<any[][] | null>(null);
   const sheetChartsRef = useRef<SheetChartConfig[]>([]);
@@ -6418,6 +6730,7 @@ export default function DocEditor() {
   const xlsxSheetsRef = useRef<SpreadsheetSheetModel[]>([]);
   const xlsxNumberFormatterRef = useRef<SpreadsheetNumberFormatter | null>(null);
   const xlsxOriginalBufferRef = useRef<ArrayBuffer | null>(null);
+  const xlsxExpectedSourceSha256Ref = useRef<string | null>(null);
   const xlsxBaselineSheetsRef = useRef<SpreadsheetSheetSnapshot[] | null>(null);
   const xlsxActiveSheetIndexRef = useRef(0);
   const xlsxSaveSessionRevisionRef = useRef(0);
@@ -6427,7 +6740,10 @@ export default function DocEditor() {
   const xlsxSaveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
   const pptxSlidesRef = useRef<PptxSlide[]>([]);
   const pptxOriginalBufferRef = useRef<ArrayBuffer | null>(null);
+  const pptxExpectedSourceSha256Ref = useRef<string | null>(null);
   const pptxBaselineSlidesRef = useRef<PptxSlide[] | null>(null);
+  const pptxSaveConflictRef = useRef(false);
+  const getPptxBaselineSlides = useCallback(() => pptxBaselineSlidesRef.current, []);
   const pptxSaveSessionRevisionRef = useRef(0);
   const pptxSaveRevisionRef = useRef(0);
   const pendingPresentationSaveRef = useRef<PresentationSaveRequest | null>(null);
@@ -6436,6 +6752,7 @@ export default function DocEditor() {
   const pptxServerObjectUrlsRef = useRef<string[]>([]);
   const pptxRenderRequestRef = useRef(0);
   const pptxGraphicObjectUrlsRef = useRef<string[]>([]);
+  const pptxMediaObjectUrlsRef = useRef<string[]>([]);
   const pptxGraphicPreviewRequestRef = useRef(0);
   const pptxGraphicPreviewAbortRef = useRef<AbortController | null>(null);
   const knowledgeReturnTo = getKnowledgeReturnTo(location.state);
@@ -6447,7 +6764,7 @@ export default function DocEditor() {
   }, []);
 
   const replacePptxGraphicObjectUrls = useCallback((nextUrls: string[]) => {
-    pptxGraphicObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    releaseRetainedObjectUrls(pptxGraphicObjectUrlsRef.current);
     pptxGraphicObjectUrlsRef.current = nextUrls;
   }, []);
 
@@ -6499,7 +6816,7 @@ export default function DocEditor() {
             controller.signal.aborted
             || requestRevision !== pptxGraphicPreviewRequestRef.current
           ) break;
-          const url = URL.createObjectURL(blob);
+          const url = createRetainedObjectUrl(blob);
           createdUrls.push(url);
           previews.set(task.shapeId, url);
         } catch (error) {
@@ -6517,7 +6834,7 @@ export default function DocEditor() {
       controller.signal.aborted
       || requestRevision !== pptxGraphicPreviewRequestRef.current
     ) {
-      createdUrls.forEach((url) => URL.revokeObjectURL(url));
+      releaseRetainedObjectUrls(createdUrls);
       return null;
     }
     replacePptxGraphicObjectUrls(createdUrls);
@@ -6542,9 +6859,12 @@ export default function DocEditor() {
       const token = getAuthToken();
       const headers: Record<string, string> = {};
       if (token) headers.Authorization = `Bearer ${token}`;
-      const slideRes = await fetchWithTimeout(`/api/v1/documents/${documentId}/slides`, { headers }, 30_000);
-      if (!slideRes.ok) throw new Error("Slide rendering failed");
-      const slideData = await slideRes.json();
+      // Shares the viewer's listing contract: retries a busy render queue
+      // (503 + Retry-After) and a mid-render source change (409).
+      const slideData = await fetchServerSlideList(documentId, {
+        headers,
+        signal: new AbortController().signal,
+      });
       if (!Array.isArray(slideData.slides) || slideData.slides.length === 0) {
         throw new Error("No rendered slides available");
       }
@@ -6580,8 +6900,12 @@ export default function DocEditor() {
     pptxGraphicPreviewAbortRef.current = null;
     pptxServerObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     pptxServerObjectUrlsRef.current = [];
-    pptxGraphicObjectUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    // A save flushed on unmount (or already queued) still reads these images;
+    // release keeps their bytes readable until it has run.
+    releaseRetainedObjectUrls(pptxGraphicObjectUrlsRef.current);
     pptxGraphicObjectUrlsRef.current = [];
+    releaseRetainedObjectUrls(pptxMediaObjectUrlsRef.current);
+    pptxMediaObjectUrlsRef.current = [];
   }, []);
 
   const advancePlainTextGeneration = useCallback(() => {
@@ -6609,8 +6933,8 @@ export default function DocEditor() {
     pendingSpreadsheetSaveRef.current = null;
     pendingPresentationSaveRef.current = null;
     if (pendingTextSave) textSaveMutateRef.current(pendingTextSave);
-    if (pendingSpreadsheetSave) spreadsheetSaveMutateRef.current(pendingSpreadsheetSave);
-    if (pendingPresentationSave) presentationSaveMutateRef.current(pendingPresentationSave);
+    if (pendingSpreadsheetSave) spreadsheetSaveMutateRef.current({ ...pendingSpreadsheetSave, origin: "explicit" });
+    if (pendingPresentationSave) presentationSaveMutateRef.current({ ...pendingPresentationSave, origin: "explicit" });
     textSaveSessionRevisionRef.current += 1;
     textSaveEditRevisionRef.current = 0;
     textSavePersistedRevisionRef.current = 0;
@@ -6631,6 +6955,7 @@ export default function DocEditor() {
     setTextFileFormat(null);
     docxOriginalBufferRef.current = null;
     docxBaselineHtmlRef.current = null;
+    docxExpectedSourceSha256Ref.current = null;
     if (docxPaginationFrameRef.current != null) cancelAnimationFrame(docxPaginationFrameRef.current);
     docxPaginationFrameRef.current = null;
     setDocxHtml(null);
@@ -6639,6 +6964,7 @@ export default function DocEditor() {
     xlsxSheetsRef.current = [];
     xlsxNumberFormatterRef.current = null;
     xlsxOriginalBufferRef.current = null;
+    xlsxExpectedSourceSha256Ref.current = null;
     xlsxBaselineSheetsRef.current = null;
     xlsxSaveSessionRevisionRef.current += 1;
     xlsxSaveRevisionRef.current += 1;
@@ -6647,7 +6973,11 @@ export default function DocEditor() {
     setXlsxActiveSheetIndex(0);
     setXlsxLoadError(null);
     pptxOriginalBufferRef.current = null;
+    pptxExpectedSourceSha256Ref.current = null;
     pptxBaselineSlidesRef.current = null;
+    pptxSaveConflictRef.current = false;
+    setPptxSaveConflict(false);
+    setPptxSaveMerge(null);
     pptxRenderRequestRef.current += 1;
     pptxGraphicPreviewRequestRef.current += 1;
     pptxGraphicPreviewAbortRef.current?.abort();
@@ -6753,12 +7083,17 @@ export default function DocEditor() {
             text,
             documentName,
           );
+          const expectedSourceSha256 = request.docxExpectedSourceSha256;
+          if (!expectedSourceSha256) {
+            throw new Error("The original Word source version is unavailable; reload the document before saving.");
+          }
           return retryDocumentSave(async () => {
             const updatedDocument = await api.documents.replaceFile(
               documentId,
               file,
               saveIntent,
               requireCurrentAuthToken(),
+              expectedSourceSha256,
             );
             return {
               request,
@@ -6775,17 +7110,25 @@ export default function DocEditor() {
         const textOriginalBuffer = request.textOriginalBuffer ?? loadedTextFormat?.originalBuffer ?? null;
         const textBaseline = request.textBaseline ?? loadedTextFormat?.baseline ?? null;
         const textFormat = request.textFormat ?? loadedTextFormat?.format ?? null;
-        if (documentName && textOriginalBuffer && textBaseline != null && textFormat) {
+        if (
+          request.documentPath
+          && documentName
+          && textOriginalBuffer
+          && textBaseline != null
+          && textFormat
+        ) {
           const savedTextFormat = textFileFormatForSave(textFormat);
           const bytes = encodeTextFile(text, textBaseline, textFormat);
           const fileBytes = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
           const file = new File([fileBytes], documentName, { type: documentMimeType || "text/plain;charset=utf-8" });
+          const expectedSourceSha256 = await sha256Hex(textOriginalBuffer);
           return retryDocumentSave(async () => {
             const updatedDocument = await api.documents.replaceFile(
               documentId,
               file,
               saveIntent,
               requireCurrentAuthToken(),
+              expectedSourceSha256,
             );
             return {
               request,
@@ -6886,9 +7229,15 @@ export default function DocEditor() {
   const spreadsheetSaveMutation = useMutation({
     mutationFn: (request: SpreadsheetSaveRequest) => {
       const requireCurrentAuthToken = () => currentDocumentSaveAuthToken(request.authPrincipalKey);
+      // Reserve global write order at dispatch, including across editor instances.
       const saveIntentPromise = allocateEditorSaveIntent();
       const saveTask = xlsxSaveQueueRef.current.catch(() => undefined).then(async () => {
         const saveIntent = await saveIntentPromise;
+        if (shouldSkipQueuedOfficeAutosave(
+          request,
+          xlsxSaveSessionRevisionRef.current,
+          xlsxSaveRevisionRef.current,
+        )) return null;
         if (!request.canEdit) throw new Error("You do not have edit access to this document");
         const { preserveSpreadsheetFile } = await import("../lib/spreadsheetOoxml");
         const file = await preserveSpreadsheetFile(
@@ -6906,14 +7255,26 @@ export default function DocEditor() {
           cellStyles: true,
           cellText: true,
         });
-        const savedWorkbookSheets = spreadsheetSheetsFromWorkbook(XLSX, savedWorkbook);
+        const savedWorkbookSheets = await spreadsheetSheetsFromFile(XLSX, savedWorkbook, savedBuffer);
+        const savedBaselineSheets = savedWorkbookSheets.map((sheet, index) => ({
+          ...sheet,
+          editorCharts: structuredClone(request.sheets[index]?.editorCharts || []),
+          structureOperations: [],
+        }));
+        const savedSourceSha256 = await sha256Hex(savedBuffer);
         return retryDocumentSave(async () => {
           const updatedDocument = await api.documents.replaceFile(
             request.documentId,
             file,
             saveIntent,
             requireCurrentAuthToken(),
+            request.expectedSourceSha256,
           );
+          if (request.sessionRevision === xlsxSaveSessionRevisionRef.current) {
+            xlsxOriginalBufferRef.current = savedBuffer;
+            xlsxExpectedSourceSha256Ref.current = savedSourceSha256;
+            xlsxBaselineSheetsRef.current = savedBaselineSheets.map(spreadsheetSheetSnapshot);
+          }
           return {
             request,
             updatedDocument,
@@ -6931,35 +7292,32 @@ export default function DocEditor() {
         && request.revision === xlsxSaveRevisionRef.current
       ) setSaveStatus("saving");
     },
-    onSuccess: ({ request, updatedDocument, savedBuffer, savedWorkbookSheets }) => {
+    onSuccess: (result) => {
+      if (!result) return;
+      const { request, updatedDocument, savedWorkbookSheets } = result;
       const isCurrentSession = request.sessionRevision === xlsxSaveSessionRevisionRef.current;
       if (isCurrentSession && request.revision === xlsxSaveRevisionRef.current) {
-        const requestedSheets = new Map(request.sheets.map((sheet) => [sheet.name, sheet]));
-        const currentSheets = new Map(xlsxSheetsRef.current.map((sheet) => [sheet.name, sheet]));
-        const nextSheets = savedWorkbookSheets.map((sheet) => ({
-          ...sheet,
-          charts: currentSheets.get(sheet.name)?.charts || [],
-          editorCharts: structuredClone(requestedSheets.get(sheet.name)?.editorCharts || []),
-          structureOperations: [],
-        }));
-        xlsxOriginalBufferRef.current = savedBuffer;
-        xlsxBaselineSheetsRef.current = nextSheets.map(spreadsheetSheetSnapshot);
+        const currentSheets = xlsxSheetsRef.current;
+        const nextSheets = savedWorkbookSheets.map((savedSheet, index) => {
+          const currentSheet = currentSheets[index];
+          const requestedSheet = request.sheets[index];
+          return {
+            ...savedSheet,
+            // Keep the editor's local values. The parsed package is only the
+            // persistence baseline and can lag the visible workbook.
+            data: structuredClone(currentSheet?.data || savedSheet.data),
+            styles: structuredClone(currentSheet?.styles || savedSheet.styles),
+            charts: currentSheet?.charts || savedSheet.charts,
+            editorCharts: structuredClone(
+              requestedSheet?.editorCharts || currentSheet?.editorCharts || [],
+            ),
+            // These were applied to savedBuffer, so replaying them on the next
+            // edit would insert/delete rows or columns a second time.
+            structureOperations: [],
+          };
+        });
         xlsxSheetsRef.current = nextSheets;
         setXlsxSheets(nextSheets);
-        const nextActiveSheet = nextSheets[xlsxActiveSheetIndexRef.current] || nextSheets[0];
-        if (nextActiveSheet) {
-          const nextContent = serializeSpreadsheetContent(
-            nextActiveSheet.data,
-            nextActiveSheet.editorCharts || [],
-            true,
-            nextActiveSheet.styles as SheetStyleMap,
-          );
-          setSheetData(nextActiveSheet.data);
-          setSheetCharts(nextActiveSheet.editorCharts || []);
-          setSheetStyles(nextActiveSheet.styles as SheetStyleMap);
-          contentRef.current = nextContent;
-          setContent(nextContent);
-        }
         setSaveStatus("saved");
       }
       queryClient.setQueryData(["document", request.documentId], updatedDocument);
@@ -6981,35 +7339,56 @@ export default function DocEditor() {
   const presentationSaveMutation = useMutation({
     mutationFn: (request: PresentationSaveRequest) => {
       const requireCurrentAuthToken = () => currentDocumentSaveAuthToken(request.authPrincipalKey);
+      // Reserve global write order at dispatch, including across editor instances.
       const saveIntentPromise = allocateEditorSaveIntent();
       const saveTask = pptxSaveQueueRef.current.catch(() => undefined).then(async () => {
         const saveIntent = await saveIntentPromise;
+        if (shouldSkipQueuedOfficeAutosave(
+          request,
+          pptxSaveSessionRevisionRef.current,
+          pptxSaveRevisionRef.current,
+        )) return null;
         if (!request.canEdit) throw new Error("You do not have edit access to this document");
         if (!request.originalBuffer || !request.baselineSlides) {
           throw new Error("The original PowerPoint package is unavailable; reload the presentation before saving.");
         }
         const { preservePresentationFileWithSnapshot } = await import("../lib/presentationOoxmlPatch");
+        // The baseline can advance between an edit and its save (an earlier
+        // save landed after an undo restored an object that save removed).
+        // Check sources against the package actually being patched so such
+        // objects are regenerated instead of failing every later save.
+        const savingSlides = demoteStalePresentationSources(
+          request.slides,
+          request.baselineSlides,
+          demotePptxShapeSource,
+        );
         const result = await preservePresentationFileWithSnapshot(
           request.originalBuffer,
           request.baselineSlides,
-          request.slides,
+          savingSlides,
           request.documentName,
         );
         const file = result.file;
         const savedSlides = result.slides as PptxSlide[];
         const savedBuffer = await file.arrayBuffer();
+        const expectedSourceSha256 = request.expectedSourceSha256;
+        if (!expectedSourceSha256) {
+          throw new Error("The original PowerPoint source version is unavailable; reload the presentation before saving.");
+        }
         return retryDocumentSave(async () => {
           const updatedDocument = await api.documents.replaceFile(
             request.documentId,
             file,
             saveIntent,
             requireCurrentAuthToken(),
+            expectedSourceSha256,
           );
           return {
             request,
             updatedDocument,
             savedBuffer,
             savedSlides,
+            savingSlides,
           };
         });
       });
@@ -7022,7 +7401,9 @@ export default function DocEditor() {
         && request.revision === pptxSaveRevisionRef.current
       ) setSaveStatus("saving");
     },
-    onSuccess: ({ request, updatedDocument, savedBuffer, savedSlides }) => {
+    onSuccess: (result) => {
+      if (!result) return;
+      const { request, updatedDocument, savedBuffer, savedSlides, savingSlides } = result;
       const isCurrentSession = request.sessionRevision === pptxSaveSessionRevisionRef.current;
       if (isCurrentSession) {
         if (savedBuffer && savedSlides) {
@@ -7037,9 +7418,12 @@ export default function DocEditor() {
             const nextSlides = mergePresentationSavedIdentity(
               pptxSlidesRef.current,
               savedSlides,
-              request.slides,
+              savingSlides,
             );
             pptxSlidesRef.current = nextSlides;
+            // Tell the editor this is an identity merge, not a new document,
+            // so selection, in-progress typing and undo/redo survive.
+            setPptxSaveMerge({ slides: nextSlides, savedSlides, savingSlides });
             setPptxSlides(nextSlides);
           }
           setSaveStatus("saved");
@@ -7051,15 +7435,48 @@ export default function DocEditor() {
       if (isCurrentSession && showVersions) refetchVersions();
     },
     onError: (error, request) => {
+      const isCurrentSession = request.sessionRevision === pptxSaveSessionRevisionRef.current;
       if (
-        request.sessionRevision === pptxSaveSessionRevisionRef.current
+        isCurrentSession
         && request.revision === pptxSaveRevisionRef.current
       ) setSaveStatus("unsaved");
+      if (isPresentationStaleSaveError(error)) {
+        if (!isCurrentSession) return;
+        // Someone else saved this file after it was opened. Retrying this
+        // snapshot can never succeed, so stop autosaving and offer a reload
+        // instead of repeating the same error on every edit.
+        const alreadyReported = pptxSaveConflictRef.current;
+        pptxSaveConflictRef.current = true;
+        setPptxSaveConflict(true);
+        if (saveTimerRef.current) {
+          clearTimeout(saveTimerRef.current);
+          saveTimerRef.current = null;
+        }
+        pendingPresentationSaveRef.current = null;
+        setSaveStatus("unsaved");
+        if (!alreadyReported) showSaveError(t("page.doc_editor.presentation_save_conflict"));
+        return;
+      }
       const message = error instanceof Error ? error.message : t("page.blueprint_detail.save_failed");
       showSaveError(`Failed to save ${request.documentName}: ${message}`);
     },
   });
   presentationSaveMutateRef.current = presentationSaveMutation.mutate;
+
+  const reloadLatestPresentation = useCallback(() => {
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    pendingPresentationSaveRef.current = null;
+    // Queued saves from the stale snapshot must not run after the reload.
+    pptxSaveSessionRevisionRef.current += 1;
+    pptxSaveRevisionRef.current += 1;
+    pptxSaveConflictRef.current = false;
+    setPptxSaveConflict(false);
+    setPptxSaveMerge(null);
+    setPptxReloadNonce((value) => value + 1);
+  }, []);
 
   const buildTextSaveRequest = useCallback((text: string, editRevision: number): TextSaveRequest | null => {
     if (!docId) return null;
@@ -7075,6 +7492,7 @@ export default function DocEditor() {
       editRevision,
       docxOriginalBuffer: docxOriginalBufferRef.current,
       docxBaselineHtml: docxBaselineHtmlRef.current,
+      docxExpectedSourceSha256: docxExpectedSourceSha256Ref.current,
       isDocx,
       textOriginalBuffer: textOriginalBufferRef.current,
       textBaseline: textBaselineRef.current,
@@ -7089,8 +7507,15 @@ export default function DocEditor() {
   const buildSpreadsheetSaveRequest = useCallback((
     sheets: SpreadsheetSheetSnapshot[],
     revision: number,
+    origin: OfficeSaveOrigin = "autosave",
   ): SpreadsheetSaveRequest | null => {
-    if (!docId || !doc?.name || !xlsxOriginalBufferRef.current || !xlsxBaselineSheetsRef.current) return null;
+    if (
+      !docId
+      || !doc?.name
+      || !xlsxOriginalBufferRef.current
+      || !xlsxExpectedSourceSha256Ref.current
+      || !xlsxBaselineSheetsRef.current
+    ) return null;
     return {
       sheets: structuredClone(sheets),
       documentId: docId,
@@ -7100,7 +7525,9 @@ export default function DocEditor() {
       authPrincipalKey: authPrincipalKey(getAuthToken()),
       sessionRevision: xlsxSaveSessionRevisionRef.current,
       revision,
+      origin,
       originalBuffer: xlsxOriginalBufferRef.current,
+      expectedSourceSha256: xlsxExpectedSourceSha256Ref.current,
       baselineSheets: xlsxBaselineSheetsRef.current,
     };
   }, [canEditCurrentDoc, doc?.fs_path, doc?.name, docId]);
@@ -7108,10 +7535,15 @@ export default function DocEditor() {
   const buildPresentationSaveRequest = useCallback((
     slides: PptxSlide[],
     revision: number,
+    origin: OfficeSaveOrigin = "autosave",
   ): PresentationSaveRequest | null => {
     if (!docId || !doc?.name) return null;
     return {
-      slides: structuredClone(slides),
+      // Slide state is immutable (every edit copies only the changed slide
+      // and shape), and the patcher clones its input before writing source
+      // identity, so the request can share structure with editor state
+      // instead of deep-cloning the whole deck on every keystroke.
+      slides,
       documentId: docId,
       documentName: doc.name,
       documentPath: doc.fs_path || null,
@@ -7119,7 +7551,9 @@ export default function DocEditor() {
       authPrincipalKey: authPrincipalKey(getAuthToken()),
       sessionRevision: pptxSaveSessionRevisionRef.current,
       revision,
+      origin,
       originalBuffer: pptxOriginalBufferRef.current,
+      expectedSourceSha256: pptxExpectedSourceSha256Ref.current,
       baselineSlides: pptxBaselineSlidesRef.current,
     };
   }, [canEditCurrentDoc, doc?.fs_path, doc?.name, docId]);
@@ -7150,7 +7584,9 @@ export default function DocEditor() {
       if (!pendingSave && saveStatus === "saved" && !spreadsheetSaveMutation.isPending) return true;
       const revision = xlsxSaveRevisionRef.current;
       const sheets = xlsxSheetsRef.current.map(spreadsheetSheetSnapshot);
-      const request = pendingSave || buildSpreadsheetSaveRequest(sheets, revision);
+      const request = pendingSave
+        ? { ...pendingSave, origin: "explicit" as const }
+        : buildSpreadsheetSaveRequest(sheets, revision, "explicit");
       if (!request) return false;
       try {
         await spreadsheetSaveMutation.mutateAsync(request);
@@ -7160,11 +7596,17 @@ export default function DocEditor() {
       }
     }
     if (doc?.name && isPptx) {
+      if (pptxSaveConflictRef.current) {
+        showSaveError(t("page.doc_editor.presentation_save_conflict"));
+        return false;
+      }
       const pendingSave = pendingPresentationSaveRef.current;
       pendingPresentationSaveRef.current = null;
       if (!pendingSave && saveStatus === "saved" && !presentationSaveMutation.isPending) return true;
       const revision = pptxSaveRevisionRef.current;
-      const request = pendingSave || buildPresentationSaveRequest(pptxSlidesRef.current, revision);
+      const request = pendingSave
+        ? { ...pendingSave, origin: "explicit" as const }
+        : buildPresentationSaveRequest(pptxSlidesRef.current, revision, "explicit");
       if (!request) return false;
       try {
         await presentationSaveMutation.mutateAsync(request);
@@ -7196,6 +7638,7 @@ export default function DocEditor() {
     presentationSaveMutation,
     saveMutation,
     saveStatus,
+    showSaveError,
     spreadsheetSaveMutation,
   ]);
 
@@ -7203,6 +7646,7 @@ export default function DocEditor() {
   const mode: EditorMode = doc
     ? detectMode(doc)
     : "richtext";
+  const aiEditFormatKind = resolveAiEditFormatKind(mode, editorFile.format);
   const docName = doc?.name || "Document";
   const activeXlsxSheet = xlsxSheets[xlsxActiveSheetIndex];
   const xlsxSheetTabs = xlsxSheets.flatMap((sheet, index) => (
@@ -7219,7 +7663,6 @@ export default function DocEditor() {
   useEffect(() => { sheetDataRef.current = sheetData; }, [sheetData]);
   useEffect(() => { sheetChartsRef.current = sheetCharts; }, [sheetCharts]);
   useEffect(() => { sheetStylesRef.current = sheetStyles; }, [sheetStyles]);
-  useEffect(() => { xlsxSheetsRef.current = xlsxSheets; }, [xlsxSheets]);
   useEffect(() => { pptxSlidesRef.current = pptxSlides; }, [pptxSlides]);
 
   // Load text-like files from their original bytes so the editor and viewer
@@ -7231,9 +7674,7 @@ export default function DocEditor() {
     const sessionRevision = textSaveSessionRevisionRef.current;
     const loadPromise = (async (): Promise<TextFileSaveSnapshot | null> => {
       try {
-        const blob = needsLegacyOfficeConversion
-          ? await api.documents.editableBlob(docId)
-          : await api.documents.downloadBlob(docId);
+        const blob = await api.documents.previewBlob(docId);
         const buffer = await blob.arrayBuffer();
         const decoded = decodeTextFile(buffer);
         const snapshot = {
@@ -7283,7 +7724,7 @@ export default function DocEditor() {
     textFormatLoadRef.current = { documentId: docId, sessionRevision, promise: loadPromise };
     void loadPromise;
     return () => { cancelled = true; };
-  }, [doc?.file_type, doc?.fs_path, doc?.mime_type, doc?.name, docId, isCsv, mode, needsLegacyOfficeConversion, resetPlainTextEditorHistory]);
+  }, [doc?.file_type, doc?.fs_path, doc?.mime_type, doc?.name, docId, isCsv, mode, resetPlainTextEditorHistory]);
 
   // Load text content
   useEffect(() => {
@@ -7327,11 +7768,9 @@ export default function DocEditor() {
     setDocxLoading(true);
     (async () => {
       try {
-        const blob = needsLegacyOfficeConversion
-          ? await api.documents.editableBlob(docId)
-          : await api.documents.downloadBlob(docId);
+        const source = await loadOfficeEditSource(docId, needsLegacyOfficeConversion);
         if (cancelled) return;
-        const buf = await blob.arrayBuffer();
+        const { buffer: buf, sourceSha256 } = source;
         if (cancelled) return;
         const bytes = new Uint8Array(buf);
         // Real DOCX starts with PK zip signature (0x50 0x4B)
@@ -7339,18 +7778,10 @@ export default function DocEditor() {
           const rendered = await renderManorDocument(buf);
           if (cancelled) return;
           const sanitizeOptions = { allowDocxEditorAttributes: true, allowDocxLayoutStyles: true };
-          const safeRender = {
-            ...rendered,
-            html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
-            headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
-            footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
-            firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
-            firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
-            evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
-            evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
-          };
+          const safeRender = sanitizeManorDocumentRender(rendered, sanitizeOptions);
           docxOriginalBufferRef.current = buf.slice(0);
           docxBaselineHtmlRef.current = safeRender.html;
+          docxExpectedSourceSha256Ref.current = sourceSha256;
           setDocxRender(safeRender);
           setDocxHtml(safeRender.html);
           setContent(safeRender.html);
@@ -7362,6 +7793,7 @@ export default function DocEditor() {
         console.error("Failed to load DOCX for editing:", e);
         docxOriginalBufferRef.current = null;
         docxBaselineHtmlRef.current = null;
+        docxExpectedSourceSha256Ref.current = null;
         setDocxRender(null);
         setDocxHtml(null);
         setDocxLoadError(t("page.doc_editor.failed_to_load_document_for_editing"));
@@ -7376,19 +7808,16 @@ export default function DocEditor() {
 
   // Load XLSX: download blob → xlsx → data[][] (or CSV fallback)
   useEffect(() => {
-    if (!doc || !docId || !isXlsx) return;
+    if (!docId || !isXlsx) return;
     let cancelled = false;
     setXlsxLoadError(null);
     setXlsxLoading(true);
     (async () => {
       try {
-        const blob = needsLegacyOfficeConversion
-          ? await api.documents.editableBlob(docId)
-          : await api.documents.downloadBlob(docId);
+        const source = await loadOfficeEditSource(docId, needsLegacyOfficeConversion);
         if (cancelled) return;
-        const buf = await blob.arrayBuffer();
+        const { buffer: buf, sourceSha256 } = source;
         if (cancelled) return;
-        const bytes = new Uint8Array(buf);
         const XLSX = await import("xlsx");
         if (cancelled) return;
         xlsxNumberFormatterRef.current = (value, numberFormat) => String(XLSX.SSF.format(numberFormat, value));
@@ -7399,16 +7828,13 @@ export default function DocEditor() {
           cellStyles: true,
           cellText: true,
         });
-        const isOoxmlPackage = bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B;
-        const chartsBySheet = isOoxmlPackage
-          ? await spreadsheetChartsFromFile(buf, XLSX, wb)
-          : new Map<string, SpreadsheetSheetModel["charts"]>();
+        const parsedSheets = await spreadsheetSheetsFromFile(XLSX, wb, buf);
         if (cancelled) return;
-        const parsedSheets = spreadsheetSheetsFromWorkbook(XLSX, wb)
-          .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }));
-        const firstSheetIndex = Math.max(0, parsedSheets.findIndex((sheet) => (
-          !sheet.hidden && sheet.name !== SPREADSHEET_CHARTS_SHEET
-        )));
+        const firstSheetIndex = spreadsheetActiveSheetIndex(
+          wb,
+          parsedSheets,
+          [SPREADSHEET_CHARTS_SHEET],
+        );
         const activeSheet = parsedSheets[firstSheetIndex] || parsedSheets[0];
         if (!activeSheet) throw new Error("The workbook has no worksheets.");
         const metadata = readWorkbookEditorMetadata(wb, activeSheet.data);
@@ -7421,6 +7847,7 @@ export default function DocEditor() {
           : sheet);
         const nextActiveSheet = nextSheets[firstSheetIndex];
         xlsxOriginalBufferRef.current = buf.slice(0);
+        xlsxExpectedSourceSha256Ref.current = sourceSha256;
         xlsxBaselineSheetsRef.current = nextSheets.map(spreadsheetSheetSnapshot);
         xlsxSheetsRef.current = nextSheets;
         setXlsxSheets(nextSheets);
@@ -7433,6 +7860,7 @@ export default function DocEditor() {
         if (cancelled) return;
         console.error("Failed to load XLSX for editing:", e);
         xlsxOriginalBufferRef.current = null;
+        xlsxExpectedSourceSha256Ref.current = null;
         xlsxBaselineSheetsRef.current = null;
         xlsxSheetsRef.current = [];
         setXlsxSheets([]);
@@ -7444,7 +7872,7 @@ export default function DocEditor() {
     return () => {
       cancelled = true;
     };
-  }, [doc, docId, isXlsx, needsLegacyOfficeConversion]);
+  }, [docId, isXlsx, needsLegacyOfficeConversion]);
 
   // Load PPTX:
   // Read from its package. Server-rendered slides are requested only when
@@ -7453,6 +7881,7 @@ export default function DocEditor() {
     if (!docId || !isPptx) return;
     setPptxLoadError(null);
     setPptxLoading(true);
+    setPptxSaveMerge(null);
     let cancelled = false;
     pptxRenderRequestRef.current += 1;
     pptxGraphicPreviewRequestRef.current += 1;
@@ -7463,18 +7892,31 @@ export default function DocEditor() {
 
     (async () => {
       try {
-        const blob = needsLegacyOfficeConversion
-          ? await api.documents.editableBlob(docId)
-          : await api.documents.downloadBlob(docId);
+        const source = await loadOfficeEditSource(docId, needsLegacyOfficeConversion);
         if (cancelled) return;
-        const buf = await blob.arrayBuffer();
+        const { buffer: buf, sourceSha256 } = source;
         if (cancelled) return;
         const bytes = new Uint8Array(buf);
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
-          const parsed = await parsePptxForEditor(buf, { isCancelled: () => cancelled });
-          if (!cancelled) {
+          const mediaObjectUrls: string[] = [];
+          let parsed: PptxSlide[];
+          try {
+            parsed = await parsePptxForEditor(buf, { isCancelled: () => cancelled, mediaObjectUrls });
+          } catch (parseError) {
+            releaseRetainedObjectUrls(mediaObjectUrls);
+            throw parseError;
+          }
+          if (cancelled) {
+            releaseRetainedObjectUrls(mediaObjectUrls);
+          } else {
+            // The previous parse's slides (and every undo snapshot built from
+            // them) are discarded with this replacement; a save flushed for the
+            // previous document may still read them, so release, not revoke.
+            releaseRetainedObjectUrls(pptxMediaObjectUrlsRef.current);
+            pptxMediaObjectUrlsRef.current = mediaObjectUrls;
             const nextSlides = parsed.length > 0 ? parsed : [{ id: genId(), bg: "#ffffff", shapes: [] }];
             pptxOriginalBufferRef.current = buf.slice(0);
+            pptxExpectedSourceSha256Ref.current = sourceSha256;
             pptxBaselineSlidesRef.current = JSON.parse(JSON.stringify(nextSlides)) as PptxSlide[];
             setPptxSlides(nextSlides);
             setContent(slidesToText(nextSlides));
@@ -7502,6 +7944,7 @@ export default function DocEditor() {
         if (cancelled) return;
         console.error("Failed to load PPTX for editing:", e);
         pptxOriginalBufferRef.current = null;
+        pptxExpectedSourceSha256Ref.current = null;
         pptxBaselineSlidesRef.current = null;
         pptxRenderRequestRef.current += 1;
         pptxGraphicPreviewRequestRef.current += 1;
@@ -7525,6 +7968,7 @@ export default function DocEditor() {
     docId,
     isPptx,
     needsLegacyOfficeConversion,
+    pptxReloadNonce,
     refreshPptxGraphicPreviews,
     replacePptxGraphicObjectUrls,
     replacePptxServerUrls,
@@ -7598,6 +8042,11 @@ export default function DocEditor() {
     if (!canEditCurrentDoc) return;
     const revision = pptxSaveRevisionRef.current + 1;
     pptxSaveRevisionRef.current = revision;
+    if (pptxSaveConflictRef.current) {
+      // Keep the edit locally but do not retry a save the server will reject.
+      setSaveStatus("unsaved");
+      return;
+    }
     const request = buildPresentationSaveRequest(newSlides, revision);
     if (!request) return;
     setSaveStatus("unsaved");
@@ -8142,8 +8591,8 @@ export default function DocEditor() {
     pendingSpreadsheetSaveRef.current = null;
     pendingPresentationSaveRef.current = null;
     if (pendingTextSave) textSaveMutateRef.current(pendingTextSave);
-    if (pendingSpreadsheetSave) spreadsheetSaveMutateRef.current(pendingSpreadsheetSave);
-    if (pendingPresentationSave) presentationSaveMutateRef.current(pendingPresentationSave);
+    if (pendingSpreadsheetSave) spreadsheetSaveMutateRef.current({ ...pendingSpreadsheetSave, origin: "explicit" });
+    if (pendingPresentationSave) presentationSaveMutateRef.current({ ...pendingPresentationSave, origin: "explicit" });
   }, []);
 
   // Rich text: sync contentEditable -> state
@@ -9538,9 +9987,7 @@ export default function DocEditor() {
       sourceUrl = renderedUrls?.[pptxLiveEditTarget.activeSlideIndex];
     }
     if (!sourceUrl) return [];
-    const response = await fetch(sourceUrl);
-    if (!response.ok) throw new Error(`Unable to capture slide image (${response.status}).`);
-    const blob = await response.blob();
+    const blob = await readObjectUrlBlob(sourceUrl);
     const expectedMime = shape ? presentationImageMime(shape.source?.mediaPart) : (blob.type || "image/png");
     const extension = shape ? mediaExtension(shape.source?.mediaPart) : expectedMime === "image/jpeg" ? ".jpg" : ".png";
     return [new File(
@@ -9613,26 +10060,29 @@ export default function DocEditor() {
     setLiveEditNotice(t("page.doc_editor.pptx_ai_image_applied"));
   }, [docId, pptxLiveEditTarget, previewPresentationLiveEdit]);
 
-  const getEditorLiveContent = useCallback((targetPath?: string) => {
-    if (mode === "presentation") return getPresentationLiveEditContent();
-    if (mode === "spreadsheet") {
-      return isXlsx
-        ? serializeSpreadsheetContent(
-          normalizeSheetData(sheetDataRef.current),
-          sheetChartsRef.current,
-          true,
-          sheetStylesRef.current,
-        )
-        : serializeDelimitedText(normalizeSheetData(sheetDataRef.current), csvFormatRef.current);
-    }
-    if (mode === "richtext" && editorRef.current) {
-      return editorRef.current.innerHTML;
-    }
-    if (mode === "code" && targetPath && targetPath !== doc?.fs_path) {
-      return codeWorkspace.fileContent(targetPath) || "";
-    }
-    return contentRef.current;
-  }, [codeWorkspace.fileContent, doc?.fs_path, getPresentationLiveEditContent, isXlsx, mode]);
+  const readTextLiveEditContent = useCallback(() => contentRef.current, []);
+
+  const readRichTextLiveEditContent = useCallback(
+    () => editorRef.current?.innerHTML ?? contentRef.current,
+    [],
+  );
+
+  const readSpreadsheetLiveEditContent = useCallback(() => (
+    isXlsx
+      ? serializeSpreadsheetContent(
+        normalizeSheetData(sheetDataRef.current),
+        sheetChartsRef.current,
+        true,
+        sheetStylesRef.current,
+      )
+      : serializeDelimitedText(normalizeSheetData(sheetDataRef.current), csvFormatRef.current)
+  ), [isXlsx]);
+
+  const readCodeLiveEditContent = useCallback((targetPath?: string) => (
+    targetPath && targetPath !== doc?.fs_path
+      ? codeWorkspace.fileContent(targetPath) || ""
+      : contentRef.current
+  ), [codeWorkspace.fileContent, doc?.fs_path]);
 
   const animateEditorLiveText = useCallback(async (
     nextText: string,
@@ -9794,7 +10244,7 @@ export default function DocEditor() {
     meta: EditorLiveApplyMeta,
   ) => {
     if (meta.signal?.aborted) return false;
-    const before = getEditorLiveContent(targetPath);
+    const before = readSpreadsheetLiveEditContent();
     if (before === nextText) return true;
 
     const spreadsheetPayload = parseSpreadsheetPayload(nextText);
@@ -9839,7 +10289,7 @@ export default function DocEditor() {
       handleSheetChange(nextData, nextCharts, nextStyles, undefined, false);
       const deltaPreview: EditorLivePreviewState = {
         ...initialPreview,
-        current: getEditorLiveContent(targetPath),
+        current: readSpreadsheetLiveEditContent(),
         phase: "type",
       };
       liveEditPreviewRef.current = deltaPreview;
@@ -9877,7 +10327,7 @@ export default function DocEditor() {
 
     if (revision !== liveEditAnimationRevisionRef.current || meta.signal?.aborted) return false;
     handleSheetChange(nextData, nextCharts, nextStyles, undefined, false);
-    const current = getEditorLiveContent(targetPath);
+    const current = readSpreadsheetLiveEditContent();
     const streamedPreview: EditorLivePreviewState = {
       ...(liveEditPreviewRef.current || initialPreview),
       current,
@@ -9887,7 +10337,7 @@ export default function DocEditor() {
     liveEditPreviewRef.current = streamedPreview;
     setLiveEditPreview(streamedPreview);
     return true;
-  }, [aiEditDisplayMode, getEditorLiveContent, handleSheetChange, isXlsx, mode, modeLabel, previewEditorLiveSheetFrame]);
+  }, [aiEditDisplayMode, handleSheetChange, isXlsx, mode, modeLabel, previewEditorLiveSheetFrame, readSpreadsheetLiveEditContent]);
 
   const animateEditorLiveRichText = useCallback(async (
     nextText: string,
@@ -10044,42 +10494,296 @@ export default function DocEditor() {
     return true;
   }, [aiEditDisplayMode, isDocx, mode]);
 
+  const previewPresentationLiveEditContent = useCallback((
+    nextText: string,
+    targetId: string,
+    _targetPath: string | undefined,
+    meta: EditorLiveApplyMeta,
+  ) => {
+    const nextSlides = applyPresentationLiveEditContent(pptxSlidesRef.current, nextText);
+    if (!nextSlides) {
+      setLiveEditNotice(t("page.doc_editor.pptx_ai_invalid_edit"));
+      return false;
+    }
+    return previewPresentationLiveEdit(nextSlides, targetId, meta);
+  }, [previewPresentationLiveEdit]);
+
+  const previewDiagramLiveEditContent = useCallback((
+    nextText: string,
+    targetId: string,
+    targetPath: string | undefined,
+    meta: EditorLiveApplyMeta,
+  ) => {
+    const previousPreview = liveEditPreviewRef.current?.targetId === targetId
+      ? liveEditPreviewRef.current
+      : null;
+    const baseline = previousPreview?.baseline ?? readTextLiveEditContent();
+    let current: string;
+    try {
+      const nextDiagram = parseDiagramDocument(
+        nextText,
+        docName.replace(/\.(diagram\.json|diagram)$/i, ""),
+      );
+      current = serializeDiagramDocument(nextDiagram);
+    } catch (error) {
+      setLiveEditNotice(
+        error instanceof Error ? error.message : "AI returned an invalid diagram.",
+      );
+      return false;
+    }
+
+    textLikeEditRevisionRef.current += 1;
+    contentRef.current = current;
+    setContent(current);
+    const nextPreview: EditorLivePreviewState = {
+      baseline,
+      current,
+      mode,
+      status: AiEditPreviewStatus.Animating,
+      phase: "settle",
+      changeCount: nextEditorLiveChangeCount(previousPreview, meta),
+      targetId,
+      targetPath,
+      diff: previousPreview?.diff || meta.diff || meta.patch,
+      modelStreaming: meta.streamEvent === AiEditPatchStreamEventKind.Delta,
+    };
+    liveEditPreviewRef.current = nextPreview;
+    setLiveEditPreview(nextPreview);
+    setLiveDiff(null);
+    setLiveEditNotice(t("page.doc_editor.ai_edit_updated", { mode: modeLabel }));
+    return true;
+  }, [docName, mode, modeLabel, readTextLiveEditContent]);
+
+  const restoreTextLiveEditPreview = useCallback((
+    preview: EditorLivePreviewState,
+    point: AiEditSnapshotPoint,
+  ) => {
+    const value = preview[point];
+    contentRef.current = value;
+    setContent(value);
+    return true;
+  }, []);
+
+  const restoreRichTextLiveEditPreview = useCallback((
+    preview: EditorLivePreviewState,
+    point: AiEditSnapshotPoint,
+  ) => {
+    const value = preview[point];
+    contentRef.current = value;
+    setContent(value);
+    if (editorRef.current) editorRef.current.innerHTML = value;
+    if (isDocx) setDocxHtml(value);
+    return true;
+  }, [isDocx]);
+
+  const restoreCodeLiveEditPreview = useCallback((
+    preview: EditorLivePreviewState,
+    point: AiEditSnapshotPoint,
+  ) => {
+    const value = preview[point];
+    if (preview.targetPath && preview.targetPath !== doc?.fs_path) {
+      if (!codeWorkspace.previewFileContent(preview.targetPath, value)) return false;
+      codeWorkspace.setActivePath(preview.targetPath);
+      return true;
+    }
+    contentRef.current = value;
+    setContent(value);
+    return true;
+  }, [codeWorkspace, doc?.fs_path]);
+
+  const restoreSpreadsheetLiveEditPreview = useCallback((
+    preview: EditorLivePreviewState,
+    point: AiEditSnapshotPoint,
+  ) => {
+    const payload = parseSpreadsheetPayload(preview[point]);
+    const data = payload ? payload.data : parseCsvText(preview[point]);
+    handleSheetChange(
+      data,
+      payload?.charts || [],
+      payload?.styles || {},
+      undefined,
+      false,
+    );
+    return true;
+  }, [handleSheetChange]);
+
+  const restorePresentationLiveEditPreview = useCallback((
+    preview: EditorLivePreviewState,
+    point: AiEditSnapshotPoint,
+  ) => {
+    const slides = point === "baseline" ? preview.baselineSlides : preview.currentSlides;
+    if (!slides) return false;
+    const restoredSlides = structuredClone(slides);
+    pptxSlidesRef.current = restoredSlides;
+    setPptxSlides(restoredSlides);
+    contentRef.current = preview[point];
+    setContent(preview[point]);
+    return true;
+  }, []);
+
+  const persistTextLiveEditPreview = useCallback(async (preview: EditorLivePreviewState) => {
+    const editRevision = textSaveEditRevisionRef.current + 1;
+    textSaveEditRevisionRef.current = editRevision;
+    const request = buildTextSaveRequest(preview.current, editRevision);
+    if (!request) return false;
+    await saveMutation.mutateAsync(request);
+    return true;
+  }, [buildTextSaveRequest, saveMutation]);
+
+  const persistCodeLiveEditPreview = useCallback(async (preview: EditorLivePreviewState) => {
+    if (preview.targetPath && preview.targetPath !== doc?.fs_path) {
+      if (!codeWorkspace.commitFileContent(preview.targetPath, preview.current)) return false;
+      return codeWorkspace.saveActive();
+    }
+    return persistTextLiveEditPreview(preview);
+  }, [codeWorkspace, doc?.fs_path, persistTextLiveEditPreview]);
+
+  const persistSpreadsheetLiveEditPreview = useCallback(async () => {
+    const revision = xlsxSaveRevisionRef.current + 1;
+    xlsxSaveRevisionRef.current = revision;
+    const sheets = xlsxSheetsRef.current.map(spreadsheetSheetSnapshot);
+    const request = buildSpreadsheetSaveRequest(sheets, revision, "explicit");
+    if (!request) return false;
+    await spreadsheetSaveMutation.mutateAsync(request);
+    return true;
+  }, [buildSpreadsheetSaveRequest, spreadsheetSaveMutation]);
+
+  const persistPresentationLiveEditPreview = useCallback(async (
+    preview: EditorLivePreviewState,
+  ) => {
+    if (!preview.currentSlides) return false;
+    const acceptedSlides = structuredClone(preview.currentSlides);
+    const revision = pptxSaveRevisionRef.current + 1;
+    pptxSaveRevisionRef.current = revision;
+    const request = buildPresentationSaveRequest(acceptedSlides, revision, "explicit");
+    if (!request) return false;
+    await presentationSaveMutation.mutateAsync(request);
+    return true;
+  }, [buildPresentationSaveRequest, presentationSaveMutation]);
+
+  const documentAiEditTurnTarget = useCallback((): AiEditTurnTarget => ({
+    documentName: docName,
+    fileType: doc?.file_type,
+    mimeType: doc?.mime_type,
+    sourcePath: doc?.fs_path,
+  }), [doc?.file_type, doc?.fs_path, doc?.mime_type, docName]);
+
+  const codeAiEditTurnTarget = useCallback((
+    preview: EditorLivePreviewState | null,
+    lockedTargetPath?: string,
+  ): AiEditTurnTarget => {
+    const targetPath = lockedTargetPath || (preview?.mode === "code" && preview.targetPath
+      ? preview.targetPath
+      : activeCodePathRef.current);
+    const documentName = targetPath?.split("/").pop() || activeCodeName;
+    return {
+      documentName,
+      fileType: codeLanguageForFile(documentName),
+      sourcePath: targetPath,
+      targetPath,
+    };
+  }, [activeCodeName]);
+
+  const activateCodeAiEditTurnTarget = useCallback((target: AiEditTurnTarget) => {
+    if (!target.targetPath) return false;
+    codeWorkspace.setActivePath(target.targetPath);
+    return true;
+  }, [codeWorkspace]);
+
+  const aiEditFormatImplementations = useMemo(() => {
+    const text: AiEditFormatImplementation<EditorLivePreviewState> = {
+      read: readTextLiveEditContent,
+      preview: animateEditorLiveText,
+      restore: restoreTextLiveEditPreview,
+      persist: persistTextLiveEditPreview,
+      turnTarget: documentAiEditTurnTarget,
+    };
+    const richText: AiEditFormatImplementation<EditorLivePreviewState> = {
+      read: readRichTextLiveEditContent,
+      preview: (next, targetId, _targetPath, meta) => (
+        animateEditorLiveRichText(next, targetId, meta)
+      ),
+      restore: restoreRichTextLiveEditPreview,
+      persist: persistTextLiveEditPreview,
+      turnTarget: documentAiEditTurnTarget,
+    };
+    const delimitedText: AiEditFormatImplementation<EditorLivePreviewState> = {
+      read: readSpreadsheetLiveEditContent,
+      preview: animateEditorLiveSpreadsheet,
+      restore: restoreSpreadsheetLiveEditPreview,
+      persist: persistTextLiveEditPreview,
+      turnTarget: documentAiEditTurnTarget,
+    };
+    return {
+      [AiEditFormatKind.Text]: text,
+      [AiEditFormatKind.Markdown]: text,
+      [AiEditFormatKind.RichText]: richText,
+      [AiEditFormatKind.Word]: richText,
+      [AiEditFormatKind.DelimitedText]: delimitedText,
+      [AiEditFormatKind.Spreadsheet]: {
+        ...delimitedText,
+        persist: persistSpreadsheetLiveEditPreview,
+      },
+      [AiEditFormatKind.Presentation]: {
+        read: getPresentationLiveEditContent,
+        preview: previewPresentationLiveEditContent,
+        restore: restorePresentationLiveEditPreview,
+        persist: persistPresentationLiveEditPreview,
+        turnTarget: documentAiEditTurnTarget,
+      },
+      [AiEditFormatKind.CodeProject]: {
+        read: readCodeLiveEditContent,
+        preview: animateEditorLiveText,
+        restore: restoreCodeLiveEditPreview,
+        persist: persistCodeLiveEditPreview,
+        turnTarget: codeAiEditTurnTarget,
+        activateTurnTarget: activateCodeAiEditTurnTarget,
+      },
+      [AiEditFormatKind.Diagram]: {
+        read: readTextLiveEditContent,
+        preview: previewDiagramLiveEditContent,
+        restore: restoreTextLiveEditPreview,
+        persist: persistTextLiveEditPreview,
+        turnTarget: documentAiEditTurnTarget,
+      },
+    };
+  }, [
+    activateCodeAiEditTurnTarget,
+    animateEditorLiveRichText,
+    animateEditorLiveSpreadsheet,
+    animateEditorLiveText,
+    codeAiEditTurnTarget,
+    documentAiEditTurnTarget,
+    getPresentationLiveEditContent,
+    persistCodeLiveEditPreview,
+    persistPresentationLiveEditPreview,
+    persistSpreadsheetLiveEditPreview,
+    persistTextLiveEditPreview,
+    previewDiagramLiveEditContent,
+    previewPresentationLiveEditContent,
+    readCodeLiveEditContent,
+    readRichTextLiveEditContent,
+    readSpreadsheetLiveEditContent,
+    readTextLiveEditContent,
+    restoreCodeLiveEditPreview,
+    restorePresentationLiveEditPreview,
+    restoreRichTextLiveEditPreview,
+    restoreSpreadsheetLiveEditPreview,
+    restoreTextLiveEditPreview,
+  ]);
+  const aiEditFormatAdapter = useMemo(
+    () => createAiEditFormatAdapter(aiEditFormatKind, aiEditFormatImplementations),
+    [aiEditFormatImplementations, aiEditFormatKind],
+  );
+
   const discardLiveEditPreview = useCallback(() => {
     if (liveEditCommitCoordinator.isCommitting()) return;
     const preview = liveEditPreviewRef.current;
     if (!preview) return;
     liveEditAnimationRevisionRef.current += 1;
-    if (preview.mode === "presentation" && preview.baselineSlides) {
-      const baselineSlides = structuredClone(preview.baselineSlides);
-      pptxSlidesRef.current = baselineSlides;
-      setPptxSlides(baselineSlides);
-      const baselineText = slidesToText(baselineSlides);
-      contentRef.current = baselineText;
-      setContent(baselineText);
-    } else if (
-      preview.mode === "code"
-      && preview.targetPath
-      && preview.targetPath !== doc?.fs_path
-    ) {
-      codeWorkspace.previewFileContent(preview.targetPath, preview.baseline);
-      codeWorkspace.setActivePath(preview.targetPath);
-    } else if (preview.mode === "spreadsheet") {
-      const payload = parseSpreadsheetPayload(preview.baseline);
-      const data = payload ? payload.data : parseCsvText(preview.baseline);
-      handleSheetChange(
-        data,
-        payload?.charts || [],
-        payload?.styles || {},
-        undefined,
-        false,
-      );
-    } else {
-      contentRef.current = preview.baseline;
-      setContent(preview.baseline);
-    }
-    if (preview.mode === "richtext") {
-      if (editorRef.current) editorRef.current.innerHTML = preview.baseline;
-      if (isDocx) setDocxHtml(preview.baseline);
+    if (aiEditFormatAdapter.restore(preview, "baseline") === false) {
+      setLiveEditNotice(t("page.doc_editor.ai_edit_save_blocked"));
+      return;
     }
     liveEditPreviewRef.current = null;
     editorLiveTurnPreviewCheckpointRef.current = null;
@@ -10089,7 +10793,7 @@ export default function DocEditor() {
     if (liveEditNavigationBlocker.state === "blocked") {
       liveEditNavigationBlocker.proceed();
     }
-  }, [codeWorkspace, doc?.fs_path, handleSheetChange, isDocx, liveEditCommitCoordinator, liveEditNavigationBlocker]);
+  }, [aiEditFormatAdapter, liveEditCommitCoordinator, liveEditNavigationBlocker]);
 
   const acceptLiveEditPreview = useCallback(async () => {
     const preview = liveEditPreviewRef.current;
@@ -10102,7 +10806,6 @@ export default function DocEditor() {
     try {
       await liveEditCommitCoordinator.run(async () => {
         const finalContent = preview.current;
-        let persisted = false;
 
         // Prevent an older debounced save from running after the accepted
         // content and overwriting it. In-flight saves remain ordered by each
@@ -10115,43 +10818,7 @@ export default function DocEditor() {
         pendingSpreadsheetSaveRef.current = null;
         pendingPresentationSaveRef.current = null;
 
-        if (preview.mode === "presentation" && preview.currentSlides) {
-          const acceptedSlides = structuredClone(preview.currentSlides);
-          const revision = pptxSaveRevisionRef.current + 1;
-          pptxSaveRevisionRef.current = revision;
-          const request = buildPresentationSaveRequest(acceptedSlides, revision);
-          if (request) {
-            await presentationSaveMutation.mutateAsync(request);
-            persisted = true;
-          }
-        } else if (
-          preview.mode === "code"
-          && preview.targetPath
-          && preview.targetPath !== doc?.fs_path
-        ) {
-          if (codeWorkspace.commitFileContent(preview.targetPath, finalContent)) {
-            persisted = await codeWorkspace.saveActive();
-          }
-        } else if (preview.mode === "spreadsheet" && isXlsx) {
-          const revision = xlsxSaveRevisionRef.current + 1;
-          xlsxSaveRevisionRef.current = revision;
-          const sheets = xlsxSheetsRef.current.map(spreadsheetSheetSnapshot);
-          const request = buildSpreadsheetSaveRequest(sheets, revision);
-          if (request) {
-            await spreadsheetSaveMutation.mutateAsync(request);
-            persisted = true;
-          }
-        } else {
-          const editRevision = textSaveEditRevisionRef.current + 1;
-          textSaveEditRevisionRef.current = editRevision;
-          const request = buildTextSaveRequest(finalContent, editRevision);
-          if (request) {
-            await saveMutation.mutateAsync(request);
-            persisted = true;
-          }
-        }
-
-        if (!persisted) {
+        if (!await aiEditFormatAdapter.persist(preview)) {
           setLiveEditNotice(t("page.doc_editor.ai_edit_save_blocked"));
           return;
         }
@@ -10200,18 +10867,10 @@ export default function DocEditor() {
     }
   }, [
     advancePlainTextGeneration,
-    buildPresentationSaveRequest,
-    buildSpreadsheetSaveRequest,
-    buildTextSaveRequest,
-    codeWorkspace,
-    doc?.fs_path,
-    isXlsx,
+    aiEditFormatAdapter,
     liveEditCommitCoordinator,
     liveEditNavigationBlocker,
     modeLabel,
-    presentationSaveMutation,
-    saveMutation,
-    spreadsheetSaveMutation,
   ]);
 
   const applyEditorLiveContent = useCallback(async (
@@ -10225,84 +10884,8 @@ export default function DocEditor() {
       meta.streamEvent === AiEditPatchStreamEventKind.Delta
       && aiEditDisplayMode === AiEditDisplayMode.InstantPreview
     ) return false;
-    if (mode === "text" || mode === "markdown" || mode === "code") {
-      return animateEditorLiveText(nextText, targetId, targetPath, meta);
-    }
-    if (mode === "richtext") {
-      return animateEditorLiveRichText(nextText, targetId, meta);
-    }
-    if (mode === "spreadsheet") {
-      return animateEditorLiveSpreadsheet(nextText, targetId, targetPath, meta);
-    }
-
-    setLiveDiff(null);
-    setLiveEditNotice(t("page.doc_editor.ai_edit_updated", { mode: modeLabel }));
-
-    if (mode === "presentation") {
-      const nextSlides = applyPresentationLiveEditContent(pptxSlidesRef.current, nextText);
-      if (!nextSlides) {
-        setLiveEditNotice(t("page.doc_editor.pptx_ai_invalid_edit"));
-        return false;
-      }
-      return previewPresentationLiveEdit(nextSlides, targetId, meta);
-    }
-
-    const previousPreview = liveEditPreviewRef.current?.targetId === targetId
-      ? liveEditPreviewRef.current
-      : null;
-    const baseline = previousPreview?.baseline ?? getEditorLiveContent(targetPath);
-    let current = nextText;
-
-    if (mode === "diagram") {
-      try {
-        const nextDiagram = parseDiagramDocument(
-          nextText,
-          docName.replace(/\.(diagram\.json|diagram)$/i, ""),
-        );
-        const serialized = serializeDiagramDocument(nextDiagram);
-        textLikeEditRevisionRef.current += 1;
-        contentRef.current = serialized;
-        setContent(serialized);
-        current = serialized;
-      } catch (error) {
-        setLiveEditNotice(
-          error instanceof Error ? error.message : "AI returned an invalid diagram.",
-        );
-        return false;
-      }
-    } else {
-      textLikeEditRevisionRef.current += 1;
-      contentRef.current = nextText;
-      setContent(nextText);
-    }
-
-    const nextPreview: EditorLivePreviewState = {
-      baseline,
-      current,
-      mode,
-      status: AiEditPreviewStatus.Animating,
-      phase: "settle",
-      changeCount: nextEditorLiveChangeCount(previousPreview, meta),
-      targetId,
-      targetPath,
-      diff: previousPreview?.diff || meta.diff || meta.patch,
-      modelStreaming: meta.streamEvent === AiEditPatchStreamEventKind.Delta,
-    };
-    liveEditPreviewRef.current = nextPreview;
-    setLiveEditPreview(nextPreview);
-    return true;
-  }, [
-    aiEditDisplayMode,
-    animateEditorLiveRichText,
-    animateEditorLiveSpreadsheet,
-    animateEditorLiveText,
-    docName,
-    getEditorLiveContent,
-    handleSheetChange,
-    mode,
-    modeLabel,
-    previewPresentationLiveEdit,
-  ]);
+    return aiEditFormatAdapter.preview(nextText, targetId, targetPath, meta);
+  }, [aiEditDisplayMode, aiEditFormatAdapter]);
 
   const completeEditorLiveContent = useCallback((
     _nextText: string,
@@ -10357,46 +10940,14 @@ export default function DocEditor() {
     ) return false;
 
     liveEditAnimationRevisionRef.current += 1;
-    if (checkpoint.mode === "presentation" && checkpoint.currentSlides) {
-      const restoredSlides = structuredClone(checkpoint.currentSlides);
-      pptxSlidesRef.current = restoredSlides;
-      setPptxSlides(restoredSlides);
-      contentRef.current = checkpoint.current;
-      setContent(checkpoint.current);
-    } else if (
-      checkpoint.mode === "code"
-      && checkpoint.targetPath
-      && checkpoint.targetPath !== doc?.fs_path
-    ) {
-      if (!codeWorkspace.previewFileContent(checkpoint.targetPath, checkpoint.current)) {
-        return false;
-      }
-      codeWorkspace.setActivePath(checkpoint.targetPath);
-    } else if (checkpoint.mode === "spreadsheet") {
-      const payload = parseSpreadsheetPayload(checkpoint.current);
-      const data = payload ? payload.data : parseCsvText(checkpoint.current);
-      handleSheetChange(
-        data,
-        payload?.charts || [],
-        payload?.styles || {},
-        undefined,
-        false,
-      );
-    } else {
-      contentRef.current = checkpoint.current;
-      setContent(checkpoint.current);
-    }
-    if (checkpoint.mode === "richtext") {
-      if (editorRef.current) editorRef.current.innerHTML = checkpoint.current;
-      if (isDocx) setDocxHtml(checkpoint.current);
-    }
+    if (aiEditFormatAdapter.restore(checkpoint, "current") === false) return false;
 
     liveEditPreviewRef.current = checkpoint;
     setLiveEditPreview(checkpoint);
     setLiveDiff(null);
     setLiveEditNotice(null);
     return true;
-  }, [codeWorkspace, doc?.fs_path, handleSheetChange, isDocx]);
+  }, [aiEditFormatAdapter]);
 
   const needsTextByteHydration = Boolean(
     docId
@@ -10411,11 +10962,6 @@ export default function DocEditor() {
 
   const openLiveEdit = useCallback(() => {
     if (!docId || !doc || isLoadingContent) return;
-    const targetKind = mode === "diagram"
-      ? AiEditTargetKind.Diagram
-      : mode === "code"
-        ? AiEditTargetKind.Project
-        : AiEditTargetKind.Document;
     // A project session belongs to the project document, not whichever file
     // happened to be active when the panel opened. read() locks the active
     // file for one streamed turn so switching tabs cannot redirect mid-patch.
@@ -10425,22 +10971,18 @@ export default function DocEditor() {
       editorLiveTurnPreviewCheckpointRef.current = cloneEditorLivePreviewState(
         pendingPreview,
       );
-      const targetPath = mode === "code"
-        ? pendingPreview?.mode === "code" && pendingPreview.targetPath
-          ? pendingPreview.targetPath
-          : activeCodePathRef.current
-        : undefined;
+      const turnTarget = aiEditFormatAdapter.turnTarget(pendingPreview);
       // Follow-up instructions continue the current unaccepted transaction.
       // After Accept/Discard clears it, the next turn may target another tab.
-      if (targetPath && pendingPreview?.mode === "code") {
-        codeWorkspace.setActivePath(targetPath);
+      if (pendingPreview) {
+        aiEditFormatAdapter.activateTurnTarget?.(turnTarget);
       }
-      editorLiveTurnTargetPathRef.current = targetPath;
-      return getEditorLiveContent(targetPath);
+      editorLiveTurnTargetPathRef.current = turnTarget.targetPath;
+      return aiEditFormatAdapter.read(turnTarget.targetPath);
     };
-    const targetDocumentName = mode === "code" ? activeCodeName : docName;
+    const initialTurnTarget = aiEditFormatAdapter.turnTarget(liveEditPreviewRef.current);
     const adapter = createEditorLiveAdapter({
-      target: { kind: targetKind, id: targetId },
+      target: { kind: aiEditFormatAdapter.targetKind, id: targetId },
       read: readTurnContent,
       getTurnPreviewState: () => ({
         changeCount: liveEditPreviewRef.current?.changeCount || 0,
@@ -10449,7 +10991,7 @@ export default function DocEditor() {
       preview: (next, meta) => applyEditorLiveContent(
         next,
         targetId,
-        mode === "code" ? editorLiveTurnTargetPathRef.current : undefined,
+        editorLiveTurnTargetPathRef.current,
         meta,
       ),
       complete: (next, meta) => completeEditorLiveContent(next, targetId, meta),
@@ -10459,25 +11001,35 @@ export default function DocEditor() {
     });
     const baseDetail = {
       documentId: docId,
-      documentName: targetDocumentName,
-      fileType: doc?.file_type,
-      mimeType: doc?.mime_type,
+      documentName: initialTurnTarget.documentName,
+      fileType: initialTurnTarget.fileType,
+      mimeType: initialTurnTarget.mimeType,
       editorType: modeLabel,
+      sourcePath: aiEditFormatAdapter.targetKind === AiEditTargetKind.Project
+        ? undefined
+        : initialTurnTarget.sourcePath,
       getTurnMetadata: () => {
-        const targetPath = mode === "code" ? editorLiveTurnTargetPathRef.current : undefined;
-        const currentDocumentName = targetPath?.split("/").pop() || targetDocumentName;
+        const turnTarget = aiEditFormatAdapter.turnTarget(
+          liveEditPreviewRef.current,
+          editorLiveTurnTargetPathRef.current,
+        );
         return {
-          documentName: currentDocumentName,
-          fileType: mode === "code" ? codeLanguageForFile(currentDocumentName) : doc?.file_type,
-          mimeType: mode === "code" ? undefined : doc?.mime_type,
+          documentName: turnTarget.documentName,
+          fileType: turnTarget.fileType,
+          mimeType: turnTarget.mimeType,
           editorType: modeLabel,
-          sourcePath: targetPath,
+          sourcePath: turnTarget.sourcePath,
         };
       },
       adapter,
+      previewStatus: liveEditPreviewRef.current?.status || null,
+      previewChangeCount: liveEditPreviewRef.current?.changeCount || 0,
+      previewAccepting: liveEditAccepting,
+      acceptPreview: acceptLiveEditPreview,
+      discardPreview: discardLiveEditPreview,
     };
-    if (mode === "presentation") {
-      openEditorLiveChat({
+    if (aiEditFormatAdapter.kind === AiEditFormatKind.Presentation) {
+      const presentationDetail = {
         ...baseDetail,
         fileType: "pptx",
         editorType: "Presentation",
@@ -10493,30 +11045,49 @@ export default function DocEditor() {
           t("page.doc_editor.pptx_ai_example_crop"),
           t("page.doc_editor.pptx_ai_example_text"),
         ],
-      });
+      };
+      openedEditorLiveDetailRef.current = presentationDetail;
+      openEditorLiveChat(presentationDetail);
       return;
     }
+    openedEditorLiveDetailRef.current = baseDetail;
     openEditorLiveChat(baseDetail);
   }, [
-    activeCodeName,
+    acceptLiveEditPreview,
+    aiEditFormatAdapter,
     applyEditorLiveContent,
     applyGeneratedPresentationImage,
     beginEditorLiveTurn,
     completeEditorLiveContent,
-    codeWorkspace,
     doc,
-    doc?.file_type,
-    doc?.mime_type,
     docId,
     docName,
     discardLiveEditPreview,
-    getEditorLiveContent,
     getPresentationLiveEditAttachmentFiles,
+    liveEditAccepting,
     liveEditCommitCoordinator,
     isLoadingContent,
-    mode,
     modeLabel,
     restoreEditorLiveTurnPreview,
+  ]);
+
+  useEffect(() => {
+    const detail = openedEditorLiveDetailRef.current;
+    if (!detail) return;
+    updateEditorLiveChat({
+      ...detail,
+      previewStatus: liveEditPreview?.status || null,
+      previewChangeCount: liveEditPreview?.changeCount || 0,
+      previewAccepting: liveEditAccepting,
+      acceptPreview: acceptLiveEditPreview,
+      discardPreview: discardLiveEditPreview,
+    });
+  }, [
+    acceptLiveEditPreview,
+    discardLiveEditPreview,
+    liveEditAccepting,
+    liveEditPreview?.changeCount,
+    liveEditPreview?.status,
   ]);
   const officeLoadError = isDocx
     ? docxLoadError
@@ -11212,6 +11783,17 @@ export default function DocEditor() {
           <PresentationEditor
             key={docId}
             slides={pptxSlides}
+            saveMerge={pptxSaveMerge}
+            getBaselineSlides={getPptxBaselineSlides}
+            banner={pptxSaveConflict ? (
+              <div className="presentation-editor-conflict-banner" role="alert">
+                <IconInfo size={15} />
+                <span>{t("page.doc_editor.presentation_save_conflict")}</span>
+                <button type="button" className="btn-manor-secondary" onClick={reloadLatestPresentation}>
+                  {t("page.doc_editor.presentation_reload_latest")}
+                </button>
+              </div>
+            ) : null}
             onLiveEditTargetChange={handlePresentationLiveEditTargetChange}
             onChange={handleSlidesChange}
           />
@@ -11240,8 +11822,10 @@ export default function DocEditor() {
             numberFormatter={xlsxNumberFormatterRef.current || undefined}
             columnWidths={activeXlsxSheet?.columnWidths}
             rowHeights={activeXlsxSheet?.rowHeights}
+            showGridlines={activeXlsxSheet?.showGridlines}
             merges={activeXlsxSheet?.merges}
             nativeCharts={activeXlsxSheet?.charts}
+            nativeImages={activeXlsxSheet?.images}
             sheetTabs={xlsxSheetTabs}
             activeSheetIndex={xlsxActiveSheetIndex}
             onSelectSheet={handleSelectXlsxSheet}

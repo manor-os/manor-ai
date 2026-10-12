@@ -44,9 +44,13 @@
 
 ### A button or section is missing
 
-1. Check whether Manor AI is in Chat mode or Workspace mode.
-2. Expand Configure or More.
-3. Confirm that the relevant Workspace is selected.
+A saved mode takes priority. Otherwise, existing users default to Professional;
+new users see User Guide with Simple preselected.
+
+1. Open More → Settings → Appearance → Interface mode. Simple intentionally
+   hides detailed chat controls and general Workspace management pages.
+2. Select Professional when those controls are needed, then use Back to app.
+3. Check the Chat or Workspace navigation area and select the relevant Workspace.
 4. Confirm that the feature is available to the current user.
 5. Ask the Workspace or deployment owner if access appears incorrect.
 
@@ -69,6 +73,10 @@
 5. Verify the created item or artifact.
 
 ### A Skill or Agent is missing
+
+If only the selector is missing, switch to Professional under Settings →
+Appearance → Interface mode. Simple mode displays Workspace Agent names as
+read-only team labels and hides manual Agent and Skill selection.
 
 1. Confirm that the Skill or Agent is active and available.
 2. Confirm that the Skill has been added to the selected Agent.
@@ -103,6 +111,10 @@
 2. Ask one of those people to make the change.
 
 ## Task and Agent issues
+
+Use Professional mode for the detail and configuration pages below. Simple
+mode still shows approval requests, results, and necessary run or failure status
+in Chat; changing mode does not resolve an access or connection failure.
 
 ### Task remains waiting
 

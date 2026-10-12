@@ -527,6 +527,29 @@ async def test_render_response_surface_tool_returns_bounded_surface() -> None:
 
 
 @pytest.mark.asyncio
+async def test_render_response_surface_accepts_serialized_interactive_surface() -> None:
+    envelope = SimpleNamespace(
+        surface=ChatSurface.WORKSPACE_CHAT.value,
+        profile=RuntimeProfile.WORKSPACE_OPERATOR,
+        conversation_id="conv_string_surface",
+    )
+    result = json.loads(await _render_response_surface(
+        title="Choose a direction",
+        render_kind="template",
+        template_id="response.choice",
+        template_props={
+            "prompt": "Choose",
+            "options": [{"id": "a", "label": "A"}, {"id": "b", "label": "B"}],
+        },
+        fallback_markdown="Choose A or B.",
+        conversation_id="conv_string_surface",
+        _runtime_envelope_from_context=envelope,
+    ))
+
+    assert result["ok"] is True
+
+
+@pytest.mark.asyncio
 async def test_render_response_surface_tool_fails_closed_without_runtime_envelope() -> None:
     result = json.loads(await _render_response_surface(
         title="Hidden",
@@ -542,6 +565,12 @@ async def test_render_response_surface_tool_fails_closed_without_runtime_envelop
 
     assert result["ok"] is False
     assert result["error"]["code"] == "response_surface_not_available_on_runtime_surface"
+
+
+def test_render_response_surface_receives_the_runtime_envelope() -> None:
+    from packages.core.ai.runtime.tool_execution import RUNTIME_ENVELOPE_AWARE_TOOLS
+
+    assert "render_response_surface" in RUNTIME_ENVELOPE_AWARE_TOOLS
 
 
 def test_response_surface_submission_is_bounded_and_server_canonicalized() -> None:
@@ -1163,18 +1192,25 @@ async def test_response_surface_runtime_uses_exact_source_subscription_context(
     from packages.core.models.workspace import Agent, AgentSubscription
     from packages.core.services import runtime_chat_context, workspace_runtime
 
-    db_session.add(Agent(
-        id="surface-runtime-agent",
-        entity_id="surface-runtime-entity",
-        name="Surface Agent",
-        status="active",
-    ))
     db_session.add_all([
+        Agent(
+            id="surface-runtime-agent",
+            entity_id="surface-runtime-entity",
+            name="Surface Agent",
+            status="active",
+        ),
+        Agent(
+            id="surface-runtime-conv-agent",
+            entity_id="surface-runtime-entity",
+            name="Conversation Agent",
+            status="active",
+        ),
         AgentSubscription(
             id="surface-source-sub",
             entity_id="surface-runtime-entity",
             workspace_id="surface-runtime-workspace",
             agent_id="surface-runtime-agent",
+            service_key="response_surface_source",
             custom_prompt="Use the role that authored this response surface.",
             status="active",
         ),
@@ -1182,7 +1218,8 @@ async def test_response_surface_runtime_uses_exact_source_subscription_context(
             id="surface-conv-sub",
             entity_id="surface-runtime-entity",
             workspace_id="surface-runtime-workspace",
-            agent_id="surface-runtime-agent",
+            agent_id="surface-runtime-conv-agent",
+            service_key="conversation_fallback",
             custom_prompt="This conversation fallback must not win.",
             status="active",
         ),
@@ -1191,7 +1228,7 @@ async def test_response_surface_runtime_uses_exact_source_subscription_context(
         id="surface-runtime-conv",
         entity_id="surface-runtime-entity",
         workspace_id="surface-runtime-workspace",
-        agent_id="surface-runtime-agent",
+        agent_id="surface-runtime-conv-agent",
         agent_subscription_id="surface-conv-sub",
         scope="workspace_thread",
     ))
@@ -1222,6 +1259,7 @@ async def test_response_surface_runtime_uses_exact_source_subscription_context(
             ),
             tool_schemas=[],
             prompt="surface prompt",
+            envelope=SimpleNamespace(metadata=request.metadata),
         )
 
     async def empty_history(*_args, **_kwargs):
@@ -1281,25 +1319,33 @@ async def test_response_surface_placeholder_preserves_source_subscription(
         save_or_update_assistant_stream_message,
     )
 
-    db_session.add(Agent(
-        id="surface-author-agent",
-        entity_id="surface-author-entity",
-        name="Surface Author",
-        status="active",
-    ))
     db_session.add_all([
+        Agent(
+            id="surface-author-agent",
+            entity_id="surface-author-entity",
+            name="Surface Author",
+            status="active",
+        ),
+        Agent(
+            id="surface-conversation-agent",
+            entity_id="surface-author-entity",
+            name="Conversation Agent",
+            status="active",
+        ),
         AgentSubscription(
             id="surface-author-source-sub",
             entity_id="surface-author-entity",
             workspace_id="surface-author-workspace",
             agent_id="surface-author-agent",
+            service_key="response_surface_author",
             status="active",
         ),
         AgentSubscription(
             id="surface-author-conv-sub",
             entity_id="surface-author-entity",
             workspace_id="surface-author-workspace",
-            agent_id="surface-author-agent",
+            agent_id="surface-conversation-agent",
+            service_key="conversation_host",
             status="active",
         ),
     ])
@@ -1307,7 +1353,7 @@ async def test_response_surface_placeholder_preserves_source_subscription(
         id="surface-author-conv",
         entity_id="surface-author-entity",
         workspace_id="surface-author-workspace",
-        agent_id="surface-author-agent",
+        agent_id="surface-conversation-agent",
         agent_subscription_id="surface-author-conv-sub",
         scope="workspace_thread",
     ))
@@ -1514,7 +1560,7 @@ def test_workspace_message_response_hides_internal_tool_contract_failures() -> N
     assert step["result_preview"] == (
         "This operation is temporarily unavailable. Please try again."
     )
-    assert response.meta["assistant_blocks"][0]["steps"][0] == step
+    assert "assistant_blocks" not in (response.meta or {})
 
 
 @pytest.mark.asyncio

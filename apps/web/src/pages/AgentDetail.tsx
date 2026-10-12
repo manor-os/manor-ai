@@ -1,7 +1,9 @@
+import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useParams, useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
+import { deploymentQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import type { AgentDeploymentResponse } from "../lib/api";
 import type { Agent } from "../lib/types";
 import { relativeTime, formatDateFull } from "../lib/format";
@@ -19,6 +21,7 @@ import Select from "../components/ui/Select";
 import Textarea from "../components/ui/Textarea";
 import Toggle from "../components/ui/Toggle";
 import AgentLearningPanel from "../components/AgentLearningPanel";
+import AgentInitiativePanel from "../components/agents/AgentInitiativePanel";
 import { IconWarning, IconChevronLeft, IconPlus, IconDownload } from "../components/icons";
 
 import { t } from "../lib/i18n";
@@ -62,7 +65,7 @@ const CATEGORIES = [
   { value: "HR", label: t("page.agent_detail.category_hr") },
 ];
 
-type Tab = "overview" | "tools" | "skills" | "executions" | "learning" | "settings";
+type Tab = "overview" | "tools" | "skills" | "executions" | "learning" | "initiative" | "settings";
 
 function objectConfig(value: unknown): Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
@@ -117,6 +120,7 @@ export default function AgentDetail() {
   const { agentId } = useParams<{ agentId: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const catalogScope = useCatalogScope();
 
   const [tab, setTab] = useState<Tab>("overview");
 
@@ -183,9 +187,8 @@ export default function AgentDetail() {
   });
 
   const { data: deployments } = useQuery({
-    queryKey: ["agent-deployments", agentId],
-    queryFn: () => api.agents.deployments(agentId!),
-    enabled: !!agentId && (tab === "overview" || tab === "learning"),
+    ...deploymentQueryOptions(catalogScope, agentId),
+    enabled: !!catalogScope && !!agentId && (tab === "overview" || tab === "learning"),
   });
 
   const {
@@ -221,14 +224,17 @@ export default function AgentDetail() {
     mutationFn: (data: Partial<Agent>) => api.agents.update(agentId!, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["agent", agentId] });
-      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: () => api.agents.delete(agentId!),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       navigate("/agents");
     },
   });
@@ -238,6 +244,7 @@ export default function AgentDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["agent-tools", agentId] });
       queryClient.invalidateQueries({ queryKey: ["agent", agentId] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
       setShowBindModal(false);
       setSelectedToolIds([]);
       setToolSearch("");
@@ -249,6 +256,7 @@ export default function AgentDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["agent-tools", agentId] });
       queryClient.invalidateQueries({ queryKey: ["agent", agentId] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
     },
   });
 
@@ -259,6 +267,8 @@ export default function AgentDetail() {
       queryClient.invalidateQueries({ queryKey: ["agent-skills", agentId] });
       queryClient.invalidateQueries({ queryKey: ["agent-skills-available", agentId] });
       queryClient.invalidateQueries({ queryKey: ["agent", agentId] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
       setShowBindSkillModal(false);
       setSelectedSkillIds([]);
       setSkillSearch("");
@@ -271,6 +281,8 @@ export default function AgentDetail() {
       queryClient.invalidateQueries({ queryKey: ["agent-skills", agentId] });
       queryClient.invalidateQueries({ queryKey: ["agent-skills-available", agentId] });
       queryClient.invalidateQueries({ queryKey: ["agent", agentId] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
     },
   });
 
@@ -335,7 +347,7 @@ export default function AgentDetail() {
         config: agent.config,
       })
       .then((newAgent) => {
-        queryClient.invalidateQueries({ queryKey: ["agents"] });
+        invalidateCatalogQueries(queryClient, "agents");
         navigate(`/agents/${newAgent.id}`);
       });
   };
@@ -401,6 +413,7 @@ export default function AgentDetail() {
     { key: "skills", label: t("page.agent_detail.skills"), count: skillCount },
     { key: "executions", label: t("page.agent_detail.executions"), count: execItems.length },
     { key: "learning", label: t("page.agent_detail.learning"), count: learningCandidates?.length },
+    { key: "initiative", label: t("page.agent_initiative.tab") },
     { key: "settings", label: t("page.agent_detail.actions") },
   ];
 
@@ -1120,6 +1133,9 @@ export default function AgentDetail() {
             onAdjustAgent={() => navigate(`/agents?edit=${agent.id}`)}
           />
         )}
+
+        {/* ====== INITIATIVE ====== */}
+        {tab === "initiative" && <AgentInitiativePanel agentId={agent.id} />}
 
         {/* ====== SETTINGS ====== */}
         {tab === "settings" && (

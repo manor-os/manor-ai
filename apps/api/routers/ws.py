@@ -4,16 +4,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Optional
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
-from sqlalchemy import and_, or_, select
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query, status
+from sqlalchemy import and_, or_, select, tuple_
 
 from packages.core import database as db_module
+from packages.core.database_runtime import DatabaseFailureKind
 from packages.core.services.auth_service import decode_token
 
 logger = logging.getLogger(__name__)
@@ -24,8 +26,17 @@ router = APIRouter(tags=["websocket"])
 class ConnectionManager:
     """Manages active WebSocket connections per user."""
 
-    def __init__(self):
+    def __init__(self, *, send_concurrency: int = 32, send_timeout: float = 2.0):
+        if send_concurrency < 1 or not math.isfinite(send_timeout) or send_timeout <= 0:
+            raise ValueError("WebSocket delivery requires positive limits")
+        self._send_concurrency = send_concurrency
+        self._send_timeout = send_timeout
+        self._send_slots = asyncio.Semaphore(send_concurrency)
+        self._send_locks: dict[WebSocket, asyncio.Lock] = {}
         self._connections: dict[str, list[WebSocket]] = {}  # user_id -> [ws]
+        # Candidate connections only, never an authorization cache. Every
+        # content relay still resolves current membership and token versions.
+        self._entity_users: dict[str, set[str]] = {}
         self._connection_entities: dict[WebSocket, str] = {}
         self._connection_token_versions: dict[WebSocket, int] = {}
         self._session_ids: dict[tuple[str, str], str] = {}
@@ -70,6 +81,8 @@ class ConnectionManager:
         self._connections.setdefault(user_id, []).append(websocket)
         self._connection_entities[websocket] = entity_id
         self._connection_token_versions[websocket] = token_version
+        self._send_locks[websocket] = asyncio.Lock()
+        self._entity_users.setdefault(entity_id, set()).add(user_id)
         logger.info("WS connected: user=%s (total=%d)", user_id, self.count)
         return first_connection
 
@@ -80,15 +93,23 @@ class ConnectionManager:
             conns.remove(websocket)
         self._connection_entities.pop(websocket, None)
         self._connection_token_versions.pop(websocket, None)
+        self._send_locks.pop(websocket, None)
         if not conns:
             self._connections.pop(user_id, None)
         logger.info("WS disconnected: user=%s (total=%d)", user_id, self.count)
         if not entity_id:
             return not conns
-        return not any(
+        last_entity_connection = not any(
             self._connection_entities.get(existing) == entity_id
             for existing in conns
         )
+        if last_entity_connection:
+            users = self._entity_users.get(entity_id)
+            if users is not None:
+                users.discard(user_id)
+                if not users:
+                    self._entity_users.pop(entity_id, None)
+        return last_entity_connection
 
     def set_session_id(self, entity_id: str, user_id: str, session_id: str) -> None:
         self._session_ids[(entity_id, user_id)] = session_id
@@ -230,16 +251,7 @@ class ConnectionManager:
         }
 
     def connected_user_ids_for_entity(self, entity_id: str) -> set[str]:
-        if not entity_id:
-            return set()
-        return {
-            user_id
-            for user_id, conns in tuple(self._connections.items())
-            if any(
-                self._connection_entities.get(ws) == entity_id
-                for ws in tuple(conns)
-            )
-        }
+        return set(self._entity_users.get(entity_id, ()))
 
     def _entity_connection_snapshot(
         self,
@@ -250,10 +262,14 @@ class ConnectionManager:
     ) -> list[tuple[str, WebSocket]]:
         if not entity_id:
             return []
+        # A room's authorized audience is already resolved. Do not scan every
+        # platform connection again for each Entity represented in that room.
+        if user_ids is None:
+            user_ids = self.connected_user_ids_for_entity(entity_id)
+        candidates = ((user_id, self._connections.get(user_id, [])) for user_id in user_ids)
         return [
             (user_id, ws)
-            for user_id, conns in tuple(self._connections.items())
-            if user_ids is None or user_id in user_ids
+            for user_id, conns in candidates
             for ws in tuple(conns)
             if self._connection_entities.get(ws) == entity_id
             and (
@@ -269,18 +285,35 @@ class ConnectionManager:
         data: dict,
     ) -> None:
         message = json.dumps({"event": event, "data": data})
-        for _user_id, ws in targets:
-            try:
-                await ws.send_text(message)
-            except Exception:
-                # The endpoint receive loop owns manager removal and the
-                # corresponding Session/Presence cleanup.  Removing the
-                # socket here would discard its entity metadata before that
-                # cleanup can determine whether this was the last pair.
+        remaining = iter(targets)
+
+        async def deliver() -> None:
+            for _user_id, ws in remaining:
+                lock = self._send_locks.get(ws)
+                if lock is None:
+                    continue  # disconnected after the authorized snapshot
                 try:
-                    await ws.close(code=1011, reason="Delivery failed")
+                    # Serialize frames for each socket; the Redis relay owns
+                    # event order. A bounded worker set avoids creating one
+                    # Task per connection on a large fanout.
+                    async with lock, self._send_slots:
+                        if self._send_locks.get(ws) is not lock:
+                            continue
+                        async with asyncio.timeout(self._send_timeout):
+                            await ws.send_text(message)
                 except Exception:
-                    pass
+                    # Endpoint cleanup owns removal and Session/Presence
+                    # bookkeeping. Bound close too: an unresponsive peer must
+                    # not stall Redis relay indefinitely during cleanup.
+                    try:
+                        async with asyncio.timeout(self._send_timeout):
+                            await ws.close(code=1011, reason="Delivery failed")
+                    except Exception:
+                        pass
+
+        async with asyncio.TaskGroup() as group:
+            for _ in range(min(len(targets), self._send_concurrency)):
+                group.create_task(deliver())
 
     async def broadcast_to_entity(
         self,
@@ -301,7 +334,7 @@ class ConnectionManager:
 
     @property
     def count(self) -> int:
-        return sum(len(c) for c in self._connections.values())
+        return len(self._connection_entities)
 
 
 # Global singleton
@@ -345,6 +378,11 @@ async def _resolve_active_websocket_identity(
             await db.commit()
             return entity_id, current_token_version
     except Exception as exc:
+        if DatabaseFailureKind.from_exception(exc) is not None:
+            # Temporary DB overload/outage is retryable, not revoked identity.
+            # Let the typed handler close with 1013 instead of logging out a
+            # legitimate user as if their credentials were invalid.
+            raise
         logger.warning("WS identity resolution failed for user=%s: %s", user_id, exc)
         return None
 
@@ -584,7 +622,9 @@ async def _entity_broadcast_recipients(
                 str(user_id): int(token_version or 0)
                 for user_id, token_version in rows
             }
-    except Exception:
+    except Exception as exc:
+        if DatabaseFailureKind.from_exception(exc) is not None:
+            raise
         logger.warning(
             "Entity WS recipient resolution failed: entity=%s",
             entity_id,
@@ -609,7 +649,6 @@ async def _workspace_broadcast_recipients(
             from packages.core.models.workspace import Workspace, WorkspaceStaff
             from packages.core.permissions import Permission, has_permission
             from packages.core.services.workspace_access import (
-                ENTITY_ADMIN_ROLES,
                 ENTITY_WORKSPACE_READ_ROLES,
                 WORKSPACE_ACCESS_MODE_ENTITY_VISIBLE,
                 workspace_access_mode,
@@ -691,15 +730,25 @@ async def _workspace_broadcast_recipients(
                 if not staff_history:
                     resolved_role = str(membership.role or "").strip().lower()
                     can_read_entity_workspaces = resolved_role in ENTITY_WORKSPACE_READ_ROLES
+                    can_read_all_workspaces = has_permission(
+                        resolved_role,
+                        Permission.WORKSPACES_READ_ALL,
+                    )
                 elif len(active_staff) != 1:
                     resolved_role = ""
                     can_read_entity_workspaces = False
+                    can_read_all_workspaces = False
                 elif active_staff[0][0].role_id:
                     staff, staff_role = active_staff[0]
                     resolved_role = str(staff_role.name if staff_role else "").strip().lower()
                     can_read_entity_workspaces = bool(
                         staff_role
                         and Permission.WORKSPACES_READ.value in (staff_role.permissions or [])
+                    )
+                    can_read_all_workspaces = bool(
+                        staff_role
+                        and Permission.WORKSPACES_READ_ALL.value
+                        in (staff_role.permissions or [])
                     )
                 else:
                     staff, _staff_role = active_staff[0]
@@ -708,9 +757,13 @@ async def _workspace_broadcast_recipients(
                         resolved_role,
                         Permission.WORKSPACES_READ,
                     )
+                    can_read_all_workspaces = has_permission(
+                        resolved_role,
+                        Permission.WORKSPACES_READ_ALL,
+                    )
 
                 if (
-                    resolved_role in ENTITY_ADMIN_ROLES
+                    can_read_all_workspaces
                     or user_id in active_workspace_members
                     or (entity_visible and can_read_entity_workspaces)
                 ):
@@ -784,6 +837,163 @@ async def _relay_workspace_user_target(payload: dict) -> None:
     )
 
 
+async def _room_message_snapshot(db, room_id: str, message_id: str):
+    """Read one committed message once, before member-scoped WS fanout."""
+    from packages.core.models.chat_room import (
+        ChatRoom, ChatRoomAgentRun, ChatRoomFile, ChatRoomMessage,
+    )
+    from packages.core.models.user import User
+
+    row = (await db.execute(select(ChatRoomMessage, User).join(
+        ChatRoom, ChatRoom.id == ChatRoomMessage.room_id,
+    ).outerjoin(
+        User, User.id == ChatRoomMessage.sender_user_id,
+    ).where(
+        ChatRoomMessage.id == message_id, ChatRoomMessage.room_id == room_id,
+        ChatRoom.status == "active",
+    ))).one_or_none()
+    if row is None or row[0].deleted_at is not None:
+        return None
+    message, sender = row
+    sender_name = message.sender_agent_name or (
+        (sender.display_name or sender.email) if sender else "Deleted user"
+    )
+    previous = (await db.execute(select(
+        ChatRoomMessage.id, ChatRoomMessage.created_at,
+    ).where(
+        ChatRoomMessage.room_id == room_id,
+        tuple_(ChatRoomMessage.created_at, ChatRoomMessage.id) < (message.created_at, message.id),
+    ).order_by(ChatRoomMessage.created_at.desc(), ChatRoomMessage.id.desc()).limit(1))).one_or_none()
+    reply = None
+    if message.reply_to_message_id:
+        reply = (await db.execute(select(ChatRoomMessage, User).outerjoin(
+            User, User.id == ChatRoomMessage.sender_user_id,
+        ).where(
+            ChatRoomMessage.id == message.reply_to_message_id,
+            ChatRoomMessage.room_id == room_id,
+        ))).one_or_none()
+    files = (await db.execute(select(ChatRoomFile).where(
+        ChatRoomFile.message_id == message.id, ChatRoomFile.deleted_at.is_(None),
+    ))).scalars().all()
+    runs = (await db.execute(select(ChatRoomAgentRun).where(
+        ChatRoomAgentRun.source_message_id == message.id,
+    ).order_by(ChatRoomAgentRun.created_at, ChatRoomAgentRun.id))).scalars().all()
+    data = {
+        "id": message.id, "room_id": room_id,
+        "sender_user_id": message.sender_user_id, "sender_name": sender_name,
+        "sender_agent_binding_id": message.sender_agent_binding_id,
+        "sender_agent_name": message.sender_agent_name,
+        "sender_agent_avatar_url": message.sender_agent_avatar_url,
+        "reply_to_message_id": message.reply_to_message_id,
+        "agent_run_status": message.agent_run_status,
+        "content": message.content, "deleted_at": None,
+        "mentioned_user_ids": message.mentioned_user_ids or [],
+        "reactions": [],
+        "agent_runs": [{
+            "id": run.id, "binding_id": run.binding_id,
+            "agent_name": run.agent_name, "status": run.status,
+            **({"approval_kind": (
+                "reply" if isinstance(run.checkpoint, dict) and "pending_reply" in run.checkpoint else "file"
+            )} if run.status == "waiting_approval" else {}),
+            **({"error_code": run.error_code} if run.error_code == "llm_configuration_missing" else {}),
+        } for run in runs],
+        "created_at": message.created_at.isoformat(),
+        "attachments": [{
+            "id": file.id, "message_id": message.id,
+            "name": file.name, "size": file.size, "mime_type": file.mime_type,
+            "sender_name": sender_name, "created_at": file.created_at.isoformat(),
+            "download_url": f"/api/v1/chat/rooms/{room_id}/files/{file.id}",
+        } for file in files],
+    }
+    reply_view = None
+    if reply:
+        target, target_sender = reply
+        reply_view = {
+            "id": target.id,
+            "sender_name": target.sender_agent_name or (
+                (target_sender.display_name or target_sender.email) if target_sender else "Deleted user"
+            ),
+            "content": target.content[:160] if target.deleted_at is None else "Message removed",
+        }
+    return data, previous, (reply[0].created_at if reply else None), reply_view
+
+
+async def _relay_chat_room_target(payload: dict) -> None:
+    """Fan out a room invalidation only to currently active room members.
+
+    Room membership crosses Entity boundaries. Resolve both the room ACL and
+    each socket's current Entity membership/token version at delivery time.
+    """
+    room_id = str(payload.get("room_id") or "")
+    if not room_id or payload.get("event") != "chat_room_changed":
+        logger.warning("Dropping invalid WS chat room event")
+        return
+    if not manager._connections:
+        return
+    try:
+        async with db_module.async_session() as db:
+            from packages.core.models.chat_room import ChatRoom, ChatRoomMember
+            from packages.core.models.user import User, UserMembership
+
+            rows = (await db.execute(
+                select(User.id, User.token_version, UserMembership.entity_id, ChatRoomMember.visible_from)
+                .join(ChatRoomMember, ChatRoomMember.user_id == User.id)
+                .join(ChatRoom, ChatRoom.id == ChatRoomMember.room_id)
+                .join(UserMembership, UserMembership.user_id == User.id)
+                .where(
+                    ChatRoom.id == room_id,
+                    ChatRoomMember.status == "active",
+                    User.status == "active",
+                    User.deleted_at.is_(None),
+                    UserMembership.status == "active",
+                    UserMembership.deleted_at.is_(None),
+                )
+            )).all()
+            data = payload.get("data")
+            message_id = data.get("message_id") if isinstance(data, dict) and data.get("kind") == "message" else None
+            snapshot = await _room_message_snapshot(db, room_id, message_id) if isinstance(message_id, str) else None
+    except Exception:
+        logger.warning("Chat room WS recipient resolution failed: room=%s", room_id, exc_info=True)
+        return
+    recipients_by_entity: dict[tuple[str, str | None, bool], dict[str, int]] = {}
+    message = snapshot[0] if snapshot else None
+    previous = snapshot[1] if snapshot else None
+    reply_created_at = snapshot[2] if snapshot else None
+    connected: dict[str, set[str]] = {}
+    for user_id, token_version, entity_id, visible_from in rows:
+        if user_id not in manager._connections:
+            continue
+        if user_id not in connected:
+            connected[user_id] = manager.connected_entity_ids_for_user(user_id)
+        if entity_id in connected[user_id]:
+            if message is not None:
+                if datetime.fromisoformat(message["created_at"]) < visible_from:
+                    continue
+                previous_id = previous[0] if previous and previous[1] >= visible_from else None
+                show_reply = bool(reply_created_at and reply_created_at >= visible_from)
+            else:
+                previous_id, show_reply = None, False
+            recipients_by_entity.setdefault((entity_id, previous_id, show_reply), {})[user_id] = int(token_version or 0)
+    requested_kind = data.get("kind") if isinstance(data, dict) else None
+    kind = requested_kind if requested_kind in ("retracted", "reaction") else "changed"
+    for (entity_id, previous_id, show_reply), recipients in recipients_by_entity.items():
+        if message is not None:
+            event_data = {
+                "room_id": room_id, "kind": "message", "message": {
+                    **message, "reply_to": snapshot[3] if show_reply else None,
+                }, "previous_message_id": previous_id,
+            }
+        else:
+            event_data = {"room_id": room_id, "kind": kind}
+        await manager.broadcast_to_entity(
+            entity_id,
+            "chat_room_changed",
+            event_data,
+            user_ids=set(recipients),
+            token_versions=recipients,
+        )
+
+
 async def _redis_relay_loop():
     """Subscribe to Redis and relay events to WS clients with reconnect."""
     import redis.asyncio as aioredis
@@ -818,6 +1028,8 @@ async def _redis_relay_loop():
                     target = payload.get("target", "entity")
                     if target == "user":
                         await _relay_user_target(payload)
+                    elif target == "chat_room":
+                        await _relay_chat_room_target(payload)
                     elif target == "workspace_user":
                         await _relay_workspace_user_target(payload)
                     elif target == "workspace":
@@ -1067,7 +1279,12 @@ async def websocket_endpoint(
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.error("WS error: %s", e)
+        failure = DatabaseFailureKind.from_exception(e)
+        if failure is not None:
+            logger.warning("WS temporarily unavailable: reason=%s exception_type=%s", failure.value, type(e).__name__)
+            await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="Database temporarily unavailable. Retry later.")
+        else:
+            logger.error("WS error: %s", e)
     finally:
         last_connection = manager.disconnect(user_id, websocket)
         if last_connection:

@@ -15,6 +15,13 @@ export function connectorAccessState(server) {
   return hasStoredConnection ? "repair" : "connect";
 }
 
+/** Setup readiness never changes an existing account's runtime usability. */
+export function integrationSetupState(server) {
+  if (server?.setup_unavailable) return "unavailable";
+  if (server?.setup_pending) return "checking";
+  return "ready";
+}
+
 export function integrationReadyCount(servers) {
   return (servers || []).filter((server) => Boolean(server?.agent_can_use)).length;
 }

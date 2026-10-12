@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol
 
-from packages.core.ai.runtime.approval_catalog import direct_chat_default_approval_mode
+from packages.core.ai.runtime.capabilities import AGENT_INITIATIVE_TOOL_NAMES
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.events import RuntimeEventType
 
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 
 _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
+    **{name: "initiative.manage" for name in AGENT_INITIATIVE_TOOL_NAMES},
     "workspace_agent": "workspace.operate",
     "workspace_operation": "workspace.operate",
     "workspace_create_task": "workspace.task",
@@ -35,18 +36,26 @@ _ACTION_KEY_CAPABILITY_ALIASES: dict[str, str] = {
     "write_file": "file.write",
     "edit_file": "file.write",
     "patch_file": "file.write",
+    "replace_file": "file.write",
     "delete_file": "file.write",
     "generate_file": "file.write",
+    "code_project": "file.write",
     "sandbox_create": "sandbox.execute",
+    "sandbox": "sandbox.execute",
     "sandbox_exec": "sandbox.execute",
+    "sandbox_status": "sandbox.execute",
+    "sandbox_respond": "sandbox.execute",
+    "sandbox_cancel": "sandbox.execute",
     "sandbox_read_file": "sandbox.execute",
     "sandbox_write_file": "sandbox.execute",
     "sandbox_save_result": "sandbox.execute",
     "sandbox_destroy": "sandbox.execute",
     "video_edit": "sandbox.execute",
     "coding_based_video": "sandbox.execute",
+    "query_entity_agents": "automation.manage",
     "create_scheduled_job": "automation.manage",
     "list_scheduled_jobs": "automation.manage",
+    "query_scheduled_jobs": "automation.manage",
     "cancel_scheduled_job": "automation.manage",
     "toggle_scheduled_job": "automation.manage",
     "run_scheduled_job_now": "automation.manage",
@@ -111,10 +120,13 @@ class RuntimeApprovalRequest:
     workspace_id: str | None = None
     conversation_id: str | None = None
     task_id: str | None = None
+    step_id: str | None = None
     envelope: RuntimeEnvelope | None = None
     declared_effect: str | None = None
     classification: "RuntimeToolClassification | None" = None
     workspace_file_scope: "RuntimeWorkspaceFileScope | None" = None
+    operation_id: str | None = None
+    account_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -163,8 +175,12 @@ def runtime_capability_id_for_action_key(
         return "workspace.governance"
     if key.startswith("workspace.file."):
         return "file.write"
+    if key.startswith("workspace.automation.agent_initiative."):
+        return "initiative.manage"
     if key.startswith("workspace.automation."):
         return "automation.manage"
+    if key.startswith("agent.initiative."):
+        return "initiative.manage"
     if key.startswith("workspace.workflow."):
         return "workflow.manage"
     if key.startswith("sandbox."):
@@ -177,7 +193,7 @@ def runtime_capability_id_for_action_key(
         return "external.message"
     if key == "cli.exec":
         return "cli.execute"
-    if provider_key in {"chrome", "browser_mcp", "local_browser", "browser"}:
+    if provider_key in {"chrome", "browser_mcp"}:
         return "manor.composite"
     if resource in {"file", "workspace_file"}:
         return "file.write"
@@ -209,16 +225,6 @@ def runtime_capability_id_for_action_key(
     return None
 
 
-def runtime_requires_baseline_approval(action: RuntimeApprovalAction) -> bool:
-    """Baseline safety for direct/non-workspace runtime tool calls."""
-    return direct_chat_default_approval_mode(
-        action_key=action.action_key,
-        capability_id=action.capability_id,
-        operation=action.operation,
-        risk_level=action.risk_level,
-    ) == "approval"
-
-
 @dataclass(frozen=True)
 class RuntimeApprovalDecision:
     allowed: bool
@@ -243,6 +249,11 @@ class RuntimeApprovalDecision:
         classification: "RuntimeToolClassification",
         request: RuntimeApprovalRequest | None = None,
     ) -> "RuntimeApprovalDecision":
+        from packages.core.ai.runtime.tool_results import RuntimeGateToolResult
+
+        # The single host mint site for gate outcomes: the handler never ran.
+        if not isinstance(blocked_result, RuntimeGateToolResult):
+            blocked_result = RuntimeGateToolResult(blocked_result)
         return cls(
             allowed=False,
             classification=classification,
@@ -275,6 +286,7 @@ class LegacyWorkspaceApprovalPolicyAdapter:
         request: RuntimeApprovalRequest,
     ) -> "RuntimeToolClassification":
         from packages.core.ai.runtime.approval_classifier import classify_runtime_tool
+        from packages.core.ai.runtime.chrome_routing import chrome_policy_arguments
 
         discovered_grants = getattr(
             request.envelope,
@@ -287,9 +299,14 @@ class LegacyWorkspaceApprovalPolicyAdapter:
             else None
         )
 
-        return classify_runtime_tool(
+        classification_arguments = chrome_policy_arguments(
             request.tool_name,
             request.arguments,
+            getattr(request.envelope, "metadata", None),
+        )
+        return classify_runtime_tool(
+            request.tool_name,
+            classification_arguments,
             entity_id=request.entity_id,
             workspace_id=request.workspace_id,
             task_id=request.task_id,
@@ -306,18 +323,23 @@ class LegacyWorkspaceApprovalPolicyAdapter:
         request: RuntimeApprovalRequest,
     ) -> str | None:
         from packages.core.ai.runtime.approval_service import guard_runtime_tool_action
+        from packages.core.ai.runtime.media_outputs import runtime_media_output_approval_scope
 
-        return await guard_runtime_tool_action(
-            name=request.tool_name,
-            arguments=request.arguments,
-            entity_id=request.entity_id,
-            user_id=request.user_id,
-            workspace_id=request.workspace_id,
-            conversation_id=request.conversation_id,
-            task_id=request.task_id,
-            runtime_envelope=request.envelope,
-            classification=request.classification,
-        )
+        plan = request.workspace_file_scope.media_output_plan if request.workspace_file_scope else None
+        with runtime_media_output_approval_scope(plan):
+            return await guard_runtime_tool_action(
+                name=request.tool_name,
+                arguments=request.arguments,
+                entity_id=request.entity_id,
+                user_id=request.user_id,
+                workspace_id=request.workspace_id,
+                conversation_id=request.conversation_id,
+                task_id=request.task_id,
+                step_id=request.step_id,
+                runtime_envelope=request.envelope,
+                classification=request.classification,
+                operation_id=request.operation_id, account_id=request.account_id,
+            )
 
 
 @dataclass(frozen=True)
@@ -389,6 +411,7 @@ class RuntimeApprovalMiddleware:
         workspace_id: str | None,
         conversation_id: str | None,
         task_id: str | None = None,
+        step_id: str | None = None,
         runtime_envelope: RuntimeEnvelope | None = None,
     ) -> str | None:
         """Run the Manor runtime approval gate for a concrete tool call.
@@ -404,6 +427,7 @@ class RuntimeApprovalMiddleware:
             workspace_id=workspace_id,
             conversation_id=conversation_id,
             task_id=task_id,
+            step_id=step_id,
             envelope=runtime_envelope,
         ))
         return decision.blocked_result
@@ -441,7 +465,12 @@ def runtime_event_from_tool_block_result(
         provider_approval_runtime_event_data,
     )
 
-    provider_approval = normalize_provider_approval(tool_name, None, payload)
+    # Runtime events only need the provider approval's public projection. The
+    # durable continuation path receives the original typed arguments through
+    # ProviderApprovalCollector; this result-only path does not. Use an empty
+    # argument object here so legacy provider receipts still emit a truthful
+    # approval_required event without weakening persisted replay validation.
+    provider_approval = normalize_provider_approval(tool_name, {}, payload)
     if provider_approval is not None:
         return RuntimeToolBlockEvent(
             type="approval_required",

@@ -35,6 +35,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -51,8 +52,10 @@ from packages.core.blueprints.simulation import generate_simulation_experience
 from packages.core.blueprints.workflow_dependencies import (
     WorkflowDependencyError,
     WorkflowDependencyFactory,
+    WorkflowSkillDependencyFactory,
+    WorkflowDocumentDependencyFactory,
 )
-from packages.core.constants.goals import GoalStatus
+from packages.core.constants.agents import is_master_agent
 from packages.core.constants.blueprints import (
     BLUEPRINT_KNOWLEDGE_MAX_DOCUMENT_BYTES,
     BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
@@ -60,7 +63,9 @@ from packages.core.constants.blueprints import (
     BLUEPRINT_KNOWLEDGE_LIST_PAGE_SIZE,
     BLUEPRINT_KNOWLEDGE_LIST_MAX_PAGE_SIZE,
     is_runtime_derived_scheduled_job,
+    installed_blueprint_job_id,
 )
+from packages.core.constants.goals import GoalStatus
 from packages.core.governance.policy import policy_to_dict
 from packages.core.governance.service import get_policy
 from packages.core.goals.numbers import goal_number_to_json
@@ -145,7 +150,8 @@ class _PortableSkillIdentity:
     marketplace_source: str | None
 
 
-def _portable_skill_identity(
+async def _portable_skill_identity(
+    db: AsyncSession,
     skill: Skill,
     *,
     entity_id: str,
@@ -155,21 +161,26 @@ def _portable_skill_identity(
     """Classify one Skill once for bindings and scheduled targets."""
 
     config = dict(skill.config or {})
-    source_skill_id = str(
-        source_link.marketplace_resource_id
-        if source_link is not None
-        else config.get("marketplace_id")
-        or config.get("source_skill_id")
-        or (skill.id if skill.entity_id is None else "")
-    ).strip()
-    marketplace_source = (
-        source_link.marketplace_source
-        if source_link is not None
-        else "manor"
-        if config.get("marketplace_id")
-        else "platform"
-        if source_skill_id
-        else None
+    if skill.entity_id is None and skill.is_public and config.get("source") == "builtin":
+        from packages.core.services.builtin_skill_loader import resolve_packaged_builtin_skill
+
+        try:
+            canonical = await resolve_packaged_builtin_skill(db, str(skill.slug or ""))
+        except ValueError as exc:
+            raise ExportError(str(exc)) from exc
+        if canonical.id != skill.id:
+            raise ExportError(
+                f"Built-in Skill {skill.slug!r} does not match its packaged identity; "
+                "review the source binding before exporting"
+            )
+        return _PortableSkillIdentity(
+            slug=_portable_skill_slug(skill), embedded=False,
+            marketplace_id=f"builtin:{skill.slug}", marketplace_source="platform",
+        )
+    from packages.core.services.marketplace_skill_service import portable_skill_marketplace_source
+
+    marketplace_source, source_skill_id = portable_skill_marketplace_source(
+        skill, source_link=source_link,
     )
     embedded = bool(
         skill.entity_id == entity_id
@@ -200,6 +211,7 @@ _RUNTIME_SETTINGS_KEYS = frozenset({
     "last_briefing_at", # runtime cursor
     "created_by_user_id",
     "provisioning",
+    "collaboration_group_id",  # local Group membership/navigation, never portable
     "ledger_matching",  # creation-time matching provenance, not portable config
 })
 
@@ -226,26 +238,74 @@ _PORTABLE_WORKSPACE_SETTING_KEYS = frozenset({
 })
 
 _NONPORTABLE_REFERENCE_KEYS = LOCAL_RUNTIME_REFERENCE_KEYS | frozenset({
+    "resident_pms", "resident_private", "resident_binding_id",
+    "resident_create_grant", "resident_create_grant_id", "resident_maintenance_drafts",
+    "confirmation_nonce", "submission_key", "confirmed_payload",
     "minio_dir",
     "source_blueprint_id",
     "source_blueprint_component_key",
 })
+_WORKFLOW_TEMPLATE_PATH_RE = re.compile(
+    r"\{\{[A-Za-z_][A-Za-z0-9_]*(?:\.(?:[A-Za-z_][A-Za-z0-9_]*|\d+))*\}\}"
+)
 _BLUEPRINT_SECRET_SCAN_MAX_DEPTH = 64
 
 
-def _without_nonportable_references(value: Any) -> Any:
+def _looks_like_json_schema(value: dict[str, Any]) -> bool:
+    schema_type = value.get("type")
+    properties = value.get("properties")
+    return (
+        (schema_type == "object" or (
+            isinstance(schema_type, list) and "object" in schema_type
+        ))
+        and isinstance(properties, dict)
+        and all(isinstance(item, (dict, bool)) for item in properties.values())
+    )
+
+
+def _without_nonportable_references(
+    value: Any, *, in_schema: bool = False, property_names: bool = False,
+    preserve_config_templates: bool = False, in_config: bool = False,
+) -> Any:
     """Drop source-row references while preserving logical external config."""
     if isinstance(value, dict):
+        schema_context = in_schema or _looks_like_json_schema(value)
         return {
-            key: _without_nonportable_references(item)
+            key: _without_nonportable_references(
+                item,
+                in_schema=schema_context or key in {"input_schema", "output_schema", "state_schema"},
+                property_names=schema_context and key in {"properties", "patternProperties", "$defs", "definitions"},
+                preserve_config_templates=preserve_config_templates,
+                in_config=in_config or key == "config",
+            )
             for key, item in value.items()
             if (
-                key not in _NONPORTABLE_REFERENCE_KEYS
+                # A Schema property called document_id describes a future
+                # receipt, not a source row reference. Preserve its validator;
+                # actual values/default objects still use the normal filter.
+                (
+                    property_names
+                    or key not in _NONPORTABLE_REFERENCE_KEYS
+                    or (
+                        preserve_config_templates
+                        and in_config
+                        and isinstance(item, str)
+                        and _WORKFLOW_TEMPLATE_PATH_RE.fullmatch(item.strip())
+                    )
+                )
                 and not _is_secret_shape(str(key))
             )
         }
     if isinstance(value, list):
-        return [_without_nonportable_references(item) for item in value]
+        return [
+            _without_nonportable_references(
+                item,
+                in_schema=in_schema,
+                preserve_config_templates=preserve_config_templates,
+                in_config=in_config,
+            )
+            for item in value
+        ]
     return value
 
 
@@ -301,6 +361,7 @@ class _ExportedWorkflows:
     payloads: list[dict[str, Any]]
     key_by_workflow_id: dict[str, str]
     key_by_binding_id: dict[str, str]
+    skill_ids: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -312,12 +373,13 @@ class ExportContext:
     include_stats: bool = True
     include_scheduled_jobs: bool = True
     include_workflows: bool = True
+    include_blocking_setup: bool = True
     include_custom_fields: bool = True
     include_governance: bool = True
     include_channel_requirements: bool = True
     include_session_requirements: bool = True
     # Backward-compatible alias used by the original API/UI. When true and no
-    # explicit knowledge_pack_mode is supplied, safe inline Markdown is used.
+    # explicit knowledge_pack_mode is supplied, safe inline text is used.
     include_memory_files: bool = False
     # v1.1 embedded sections. Default-on so a fresh export carries the
     # workspace-private agents/skills the operator built; turn off for a
@@ -350,6 +412,7 @@ async def export_workspace(
     title: str,
     summary: Optional[str] = None,
     description: Optional[str] = None,
+    usage_guide: Optional[str] = None,
     tags: Optional[list[str]] = None,
     author_handle: Optional[str] = None,
     author_display_name: Optional[str] = None,
@@ -370,6 +433,10 @@ async def export_workspace(
     if workspace is None:
         raise ExportError(f"workspace {workspace_id!r} not found")
 
+    if usage_guide is None:
+        installed = (workspace.settings or {}).get("_blueprint") or {}
+        usage_guide = installed.get("usage_guide") if isinstance(installed, dict) else None
+
     # Pre-fetch the sections that depend on toggles. Doing them up front
     # keeps the v1.1 assembly below declarative.
     subscriptions = (
@@ -389,8 +456,43 @@ async def export_workspace(
         await _export_stats(db, workspace.entity_id, workspace_id)
         if ctx.include_stats else []
     )
+    knowledge_pack_mode = (
+        ctx.knowledge_pack_mode
+        or ("inline_text" if ctx.include_memory_files else "skeleton")
+    )
+    if knowledge_pack_mode not in {"skeleton", "inline_text"}:
+        raise ExportError(
+            "knowledge_pack_mode must be 'skeleton' or 'inline_text'"
+        )
+    if ctx.knowledge_document_ids:
+        if not ctx.include_knowledge_packs:
+            raise ExportError(
+                "knowledge_document_ids requires include_knowledge_packs"
+            )
+        if knowledge_pack_mode != "inline_text":
+            raise ExportError(
+                "knowledge_document_ids requires knowledge_pack_mode='inline_text'"
+            )
+    elif ctx.knowledge_document_ids is not None:
+        knowledge_pack_mode = "skeleton"
+    knowledge_packs = (
+        await _export_knowledge_packs(
+            db,
+            workspace.entity_id,
+            workspace_id,
+            mode=knowledge_pack_mode,
+            selected_document_ids=ctx.knowledge_document_ids,
+        )
+        if ctx.include_knowledge_packs else []
+    )
+
     exported_workflows = (
-        await _export_workflows(db, workspace.entity_id, workspace_id)
+        await _export_workflows(
+            db, workspace.entity_id, workspace_id,
+            include_skill_dependencies=ctx.include_workflows,
+            knowledge_packs=knowledge_packs,
+            selected_document_ids=ctx.knowledge_document_ids,
+        )
         if ctx.include_workflows or ctx.include_scheduled_jobs
         else _ExportedWorkflows([], {}, {})
     )
@@ -400,6 +502,11 @@ async def export_workspace(
             db,
             workspace.entity_id,
             workspace_id,
+            portable_agent_service_keys={
+                str(subscription.get("service_key") or "").strip()
+                for subscription in subscriptions
+                if str(subscription.get("service_key") or "").strip()
+            },
             workflow_key_by_id=(
                 exported_workflows.key_by_workflow_id
                 if ctx.include_workflows else {}
@@ -416,7 +523,7 @@ async def export_workspace(
         if ctx.include_custom_fields else []
     )
     governance = (
-        await _export_governance(db, workspace_id) or {}
+        await _export_governance(db, workspace_id, workspace_settings=workspace.settings) or {}
         if ctx.include_governance else {}
     )
     channels = (
@@ -448,10 +555,13 @@ async def export_workspace(
     required_skills: list[dict[str, Any]] = []
     required_agents: list[dict[str, Any]] = []
 
+    required_tools.update(_fixed_workflow_tool_names(workflows))
+
     if (
         ctx.include_embedded_agents
         or ctx.include_embedded_skills
         or any(job.get("execution_type") == "skill" for job in scheduled_jobs)
+        or exported_workflows.skill_ids
     ):
         embed_result = await _export_embedded_agents_and_skills(
             db,
@@ -460,6 +570,7 @@ async def export_workspace(
             include_agents=ctx.include_embedded_agents,
             include_skills=ctx.include_embedded_skills,
             include_starter_memory=ctx.include_starter_memory,
+            workflow_skill_ids=exported_workflows.skill_ids,
         )
         embedded_agents = embed_result["embedded_agents"]
         embedded_skills = embed_result["embedded_skills"]
@@ -467,36 +578,6 @@ async def export_workspace(
         required_mcp_servers = embed_result["required_mcp_servers"]
         required_skills = embed_result["required_skills"]
         required_agents = embed_result["required_agents"]
-
-    knowledge_pack_mode = (
-        ctx.knowledge_pack_mode
-        or ("inline_text" if ctx.include_memory_files else "skeleton")
-    )
-    if knowledge_pack_mode not in {"skeleton", "inline_text"}:
-        raise ExportError(
-            "knowledge_pack_mode must be 'skeleton' or 'inline_text'"
-        )
-    if ctx.knowledge_document_ids:
-        if not ctx.include_knowledge_packs:
-            raise ExportError(
-                "knowledge_document_ids requires include_knowledge_packs"
-            )
-        if knowledge_pack_mode != "inline_text":
-            raise ExportError(
-                "knowledge_document_ids requires knowledge_pack_mode='inline_text'"
-            )
-    elif ctx.knowledge_document_ids is not None:
-        knowledge_pack_mode = "skeleton"
-    knowledge_packs = (
-        await _export_knowledge_packs(
-            db,
-            workspace.entity_id,
-            workspace_id,
-            mode=knowledge_pack_mode,
-            selected_document_ids=ctx.knowledge_document_ids,
-        )
-        if ctx.include_knowledge_packs else []
-    )
 
     # Workspace shell — kind / context / primary_work / settings absorb
     # into operating_model so the v1.1 recipe has one place to read from.
@@ -508,12 +589,40 @@ async def export_workspace(
     # Knowledge packs replace source DocumentGroup ids.
     om.pop("agent_mappings", None)
     om.pop("goals", None)
+    if (workspace.operating_model or {}).get("app_view") is not None:
+        from packages.core.blueprints.app_view import remap_app_view
+
+        app_agents = (await db.execute(select(Agent).join(
+            AgentSubscription, AgentSubscription.agent_id == Agent.id,
+        ).where(
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.entity_id == workspace.entity_id,
+            AgentSubscription.status == "active",
+        ))).scalars().all()
+        included_agent_slugs = {s.get("agent_slug") for s in subscriptions}
+        try:
+            om["app_view"] = remap_app_view(
+                workspace.operating_model["app_view"],
+                workflows=exported_workflows.key_by_binding_id if ctx.include_workflows else {},
+                agents={a.id: _portable_agent_slug(a) for a in app_agents
+                        if _portable_agent_slug(a) in included_agent_slugs},
+                automations={key: j["job_id"] for j in scheduled_jobs
+                             for key in (j["job_id"], installed_blueprint_job_id(j["job_id"], workspace_id))},
+            )
+        except ValueError as exc:
+            raise ExportError(str(exc)) from exc
     knowledge = om.get("knowledge")
     if isinstance(knowledge, dict):
         knowledge = dict(knowledge)
         knowledge.pop("default_group_ids", None)
         knowledge.pop("group_purposes", None)
         om["knowledge"] = knowledge
+    operating_governance = om.get("governance")
+    if isinstance(operating_governance, dict):
+        # GovernancePolicy owns execution settings. This legacy mirror may
+        # still contain retired fields or stale rules, so export the same
+        # current portable snapshot as policy.governance.
+        om["governance"] = deepcopy(governance)
     # The dedicated Workspace columns are the live runtime source of truth.
     # ``operating_model`` can retain an older copy after a direct Workspace
     # edit; allowing that stale copy to win makes export/install roll back the
@@ -534,6 +643,8 @@ async def export_workspace(
     if workspace.heartbeat_cadence:
         om["heartbeat_cadence"] = workspace.heartbeat_cadence
     ws_settings = _portable_workspace_settings(workspace.settings)
+    if not ctx.include_blocking_setup:
+        ws_settings.pop("blocking_setup", None)
     if ws_settings:
         om["settings"] = ws_settings
     else:
@@ -611,7 +722,7 @@ async def export_workspace(
         },
         "recipe": {
             "operating_model": om,
-            "strategist": strategist,
+            "strategist": strategist or None,
             "prompts": blueprint_prompts,
             "subscriptions": subscriptions,
             "scheduled_jobs": scheduled_jobs,
@@ -632,6 +743,9 @@ async def export_workspace(
             "expected_baseline": None,
         },
     }
+
+    if isinstance(usage_guide, str) and usage_guide.strip():
+        payload["manifest"]["usage_guide"] = usage_guide
 
     payload["recipe"]["simulation_experience"] = generate_simulation_experience(payload)
 
@@ -797,6 +911,7 @@ async def _export_stats(
 async def _export_scheduled_jobs(
     db: AsyncSession, entity_id: str, workspace_id: str,
     *,
+    portable_agent_service_keys: set[str],
     workflow_key_by_id: dict[str, str],
     workflow_key_by_binding_id: dict[str, str],
 ) -> list[dict[str, Any]]:
@@ -831,10 +946,14 @@ async def _export_scheduled_jobs(
     ) if rows and scheduled_skill_ids else {}
     subscriptions = list((await db.execute(
         select(AgentSubscription).where(
+            AgentSubscription.entity_id == entity_id,
             AgentSubscription.workspace_id == workspace_id,
             AgentSubscription.status == "active",
         )
     )).scalars().all())
+    subscriptions_by_id = {
+        subscription.id: subscription for subscription in subscriptions
+    }
     service_keys_by_agent_id: dict[str, set[str]] = {}
     for subscription in subscriptions:
         if subscription.agent_id and subscription.service_key:
@@ -854,7 +973,10 @@ async def _export_scheduled_jobs(
         ):
             continue
         raw_target = dict(j.execution_target or {})
-        source_agent_id = raw_target.get("agent_id") or j.agent_id
+        source_agent_id = str(raw_target.get("agent_id") or j.agent_id or "").strip()
+        source_subscription_id = str(
+            raw_target.get("agent_subscription_id") or ""
+        ).strip()
         execution_target = _without_nonportable_references(raw_target)
         source_skill_id = str(raw_target.get("skill_id") or "").strip()
         if j.execution_type == "skill":
@@ -868,8 +990,8 @@ async def _export_scheduled_jobs(
                     f"scheduled Skill job {j.job_id!r} has no portable target: "
                     "the referenced Skill is inactive, missing, or inaccessible"
                 )
-            identity = _portable_skill_identity(
-                source_skill,
+            identity = await _portable_skill_identity(
+                db, source_skill,
                 entity_id=entity_id,
                 source_link=scheduled_skill_links.get(source_skill_id),
                 include_skills=True,
@@ -908,21 +1030,70 @@ async def _export_scheduled_jobs(
                     "include its Flow in the Blueprint export"
                 )
             execution_target["workflow_slug"] = source_workflow_key
-        if not execution_target.get("service_key") and source_agent_id:
-            service_keys = service_keys_by_agent_id.get(source_agent_id, set())
-            if len(service_keys) == 1:
-                execution_target["service_key"] = next(iter(service_keys))
-            elif len(service_keys) > 1 and j.execution_type in {
-                "agent",
-                "agent_message",
-            }:
+        agent_backed = not j.execution_type or j.execution_type in {
+            "agent",
+            "agent_message",
+            "skill",
+        }
+        if (
+            source_agent_id
+            and not is_master_agent(source_agent_id)
+            and agent_backed
+        ):
+            service_key = str(execution_target.get("service_key") or "").strip()
+            if source_subscription_id:
+                subscription = subscriptions_by_id.get(source_subscription_id)
+                if (
+                    subscription is None
+                    or subscription.agent_id != source_agent_id
+                    or not subscription.service_key
+                ):
+                    raise ExportError(
+                        f"scheduled Agent job {j.job_id!r} has no portable "
+                        "Agent deployment target"
+                    )
+                service_key = str(subscription.service_key)
+            elif service_key:
+                matching_subscriptions = [
+                    subscription
+                    for subscription in subscriptions
+                    if subscription.agent_id == source_agent_id
+                    and subscription.service_key == service_key
+                ]
+                if len(matching_subscriptions) != 1:
+                    raise ExportError(
+                        f"scheduled Agent job {j.job_id!r} has no portable "
+                        "Agent deployment target"
+                    )
+            else:
+                service_keys = service_keys_by_agent_id.get(source_agent_id, set())
+                if len(service_keys) != 1:
+                    detail = "ambiguous" if service_keys else "missing"
+                    raise ExportError(
+                        f"scheduled Agent job {j.job_id!r} has a {detail} "
+                        "portable target; bind it to one exact service_key"
+                    )
+                service_key = next(iter(service_keys))
+            service_subscriptions = [
+                subscription
+                for subscription in subscriptions
+                if subscription.service_key == service_key
+            ]
+            if len(service_subscriptions) != 1:
                 raise ExportError(
-                    f"scheduled Agent job {j.job_id!r} has an ambiguous portable "
-                    "target; set execution_target.service_key explicitly"
+                    f"scheduled Agent job {j.job_id!r} has an ambiguous "
+                    f"portable service target {service_key!r}"
                 )
+            if service_key not in portable_agent_service_keys:
+                raise ExportError(
+                    f"scheduled Agent job {j.job_id!r} targets service "
+                    f"{service_key!r}, but that Agent deployment is not "
+                    "portable in this Blueprint export"
+                )
+            execution_target["service_key"] = service_key
         out.append({
-            # job_id is logically a slug — keep it for portability.
-            "job_id": j.job_id,
+            # Remove this installation's generated suffix from the portable key.
+            "job_id": j.job_id.removesuffix(f"-{workspace_id[-8:]}"),
             "name": j.name,
             "job_type": j.job_type,
             "schedule_kind": j.schedule_kind,
@@ -961,12 +1132,41 @@ def _portable_workflow_slug(
     )
 
 
+def _fixed_workflow_tool_names(workflows: list[dict[str, Any]]) -> set[str]:
+    """Collect literal tool names from portable Workflow tool nodes."""
+    names: set[str] = set()
+
+    def collect(steps: Any) -> None:
+        if not isinstance(steps, list):
+            return
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            config = step.get("config")
+            if not isinstance(config, dict):
+                continue
+            if step.get("type") == "tool":
+                tool_name = config.get("tool")
+                if isinstance(tool_name, str):
+                    tool_name = tool_name.strip()
+                    if tool_name and "{{" not in tool_name and "}}" not in tool_name:
+                        names.add(tool_name)
+            collect(config.get("steps"))
+
+    for workflow in workflows:
+        if isinstance(workflow, dict):
+            collect(workflow.get("steps"))
+    return names
+
+
 def _export_workflow_row(
     workflow: WorkflowDefinition,
     *,
     binding: Optional[WorkflowBinding] = None,
     slug: Optional[str] = None,
     workflow_key_by_id: dict[str, str],
+    skill_ref_by_id: Optional[dict[str, dict[str, str]]],
+    document_key_by_id: Optional[dict[str, str]] = None,
     internal: bool = False,
 ) -> dict[str, Any]:
     """Serialize the canonical runtime graph into the workflow shape the
@@ -998,14 +1198,30 @@ def _export_workflow_row(
 
     try:
         portable_steps = WorkflowDependencyFactory.to_portable(
-            list(workflow.steps or []),
+            WorkflowSkillDependencyFactory.to_portable(
+                list(workflow.steps or []), skill_ref_by_id=skill_ref_by_id,
+            ) if skill_ref_by_id is not None else list(workflow.steps or []),
             workflow_key_by_id=workflow_key_by_id,
         )
     except WorkflowDependencyError as exc:
         raise ExportError(str(exc)) from exc
 
+    try:
+        portable_steps = WorkflowDocumentDependencyFactory.to_portable(
+            portable_steps, document_key_by_id=document_key_by_id or {},
+        )
+    except WorkflowDependencyError as exc:
+        raise ExportError(f"Workflow {workflow.name!r}: {exc}") from exc
+
+    # Runtime absence means an empty default route. Emit it explicitly so a
+    # fresh install's canonical graph has the same portable representation.
+    for step in portable_steps:
+        if isinstance(step, dict):
+            step.setdefault("next", [])
+
     payload: dict[str, Any] = {
         "slug": slug or _portable_workflow_slug(workflow, binding),
+        "definition_name": workflow.name,
         "name": (
             binding.name
             if binding is not None and binding.name
@@ -1017,7 +1233,10 @@ def _export_workflow_row(
             {"key": key, "default": _without_nonportable_references(value)}
             for key, value in sorted(variables.items())
         ],
-        "steps": _without_nonportable_references(portable_steps),
+        "steps": _without_nonportable_references(
+            portable_steps,
+            preserve_config_templates=True,
+        ),
         "category": workflow.category,
         "tags": visible_workflow_tags(workflow.tags),
         "version": int(workflow.version or 1),
@@ -1051,12 +1270,12 @@ def _export_workflow_row(
     return payload
 
 
-async def _export_workflows(
+async def _workspace_workflow_export_rows(
     db: AsyncSession,
     entity_id: str,
     workspace_id: str,
-) -> _ExportedWorkflows:
-    """Export workflow deployments belonging to this workspace.
+) -> list[tuple[WorkflowDefinition, Optional[WorkflowBinding], str, bool]]:
+    """Resolve workflow deployments and portable identities for this workspace.
 
     A definition can be entity-scoped and deployed through a Workspace
     binding, or directly scoped to the Workspace. Both forms are included.
@@ -1146,12 +1365,84 @@ async def _export_workflows(
             workflow.id in internal_workflow_ids,
         ))
 
+    return export_rows
+
+
+async def _export_workflows(
+    db: AsyncSession,
+    entity_id: str,
+    workspace_id: str,
+    *, include_skill_dependencies: bool = True,
+    knowledge_packs: Optional[list[dict[str, Any]]] = None,
+    selected_document_ids: Optional[frozenset[str]] = None,
+) -> _ExportedWorkflows:
+    export_rows = await _workspace_workflow_export_rows(db, entity_id, workspace_id)
     workflow_key_by_id: dict[str, str] = {}
     workflow_key_by_binding_id: dict[str, str] = {}
     for workflow, binding, slug, _internal in export_rows:
         workflow_key_by_id.setdefault(workflow.id, slug)
         if binding is not None:
             workflow_key_by_binding_id[binding.id] = slug
+    document_ids = frozenset().union(*(
+        WorkflowDocumentDependencyFactory.local_ids(workflow.steps or [])
+        for workflow, _binding, _slug, _internal in export_rows
+    ))
+    included_starters = {
+        document.get("key"): document
+        for pack in knowledge_packs or [] if pack.get("mode") == "inline_text"
+        for document in pack.get("starter_documents") or []
+    }
+    document_query = (
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+        .where(Document.entity_id == entity_id, Document.id.in_(document_ids),
+               DocumentGroup.workspace_id == workspace_id, DocumentGroup.entity_id == entity_id)
+    )
+    if selected_document_ids is not None:
+        document_query = document_query.where(Document.id.in_(selected_document_ids))
+    documents = list((await db.execute(document_query)).scalars().unique()) if document_ids else []
+    document_key_by_id = {
+        document.id: _document_portable_key(document)
+        for document in documents
+        if _document_safe_to_export(document)
+        and included_starters.get(_document_portable_key(document)) == _document_inline_starter(document)
+        and _document_portable_key(document) in included_starters
+    }
+    skill_ids = frozenset().union(*(
+        WorkflowSkillDependencyFactory.local_ids(workflow.steps or [])
+        for workflow, _binding, _slug, _internal in export_rows
+    )) if include_skill_dependencies else frozenset()
+    skills = list((await db.execute(select(Skill).where(
+        Skill.id.in_(skill_ids),
+        Skill.status == "active",
+        or_(Skill.entity_id == entity_id, and_(
+            Skill.entity_id.is_(None), Skill.is_public.is_(True),
+        )),
+    ))).scalars().all()) if skill_ids else []
+    if {skill.id for skill in skills} != set(skill_ids):
+        raise ExportError("Workflow Skill changed or became inaccessible during export")
+    links = await _installed_marketplace_links_by_local_id(
+        db, entity_id=entity_id, local_resource_type="skill", local_resource_ids=skill_ids,
+    )
+    skill_ref_by_id = {}
+    embedded_ids_by_slug = {}
+    for skill in skills:
+        identity = await _portable_skill_identity(
+            db, skill, entity_id=entity_id, source_link=links.get(skill.id), include_skills=True,
+        )
+        if not identity.slug or (not identity.embedded and not identity.marketplace_id):
+            raise ExportError("Workflow Skill has no portable target")
+        if identity.embedded:
+            previous = embedded_ids_by_slug.setdefault(identity.slug, skill.id)
+            if previous != skill.id:
+                raise ExportError(f"Workflow Skill component {identity.slug!r} is ambiguous")
+        skill_ref_by_id[skill.id] = {
+            "skill_component_key": identity.slug,
+            **({"skill_marketplace_id": identity.marketplace_id,
+                "skill_marketplace_source": identity.marketplace_source}
+               if identity.marketplace_id else {}),
+        }
     return _ExportedWorkflows(
         payloads=[
             _export_workflow_row(
@@ -1159,12 +1450,15 @@ async def _export_workflows(
                 binding=binding,
                 slug=slug,
                 workflow_key_by_id=workflow_key_by_id,
+                skill_ref_by_id=skill_ref_by_id if include_skill_dependencies else None,
+                document_key_by_id=document_key_by_id,
                 internal=internal,
             )
             for workflow, binding, slug, internal in export_rows
         ],
         key_by_workflow_id=workflow_key_by_id,
         key_by_binding_id=workflow_key_by_binding_id,
+        skill_ids=skill_ids,
     )
 
 
@@ -1193,20 +1487,22 @@ async def _export_custom_fields(
     ]
 
 
+def _portable_governance(
+    raw: dict[str, Any], workspace_settings: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    from packages.core.governance.approval_projection import portable_governance
+    return portable_governance(raw)
+
+
 async def _export_governance(
     db: AsyncSession, workspace_id: str,
+    *, workspace_settings: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     policy = await get_policy(db, workspace_id)
-    raw = policy_to_dict(policy)
+    raw = _portable_governance(policy_to_dict(policy), workspace_settings)
     # Skip if the policy is just the default (no need to ship empty rules).
-    if not any(
-        raw.get(k) for k in (
-            "never_allow_actions", "hitl_required_actions",
-            "auto_approve_actions", "never_allow_capabilities",
-            "hitl_required_capabilities", "auto_approve_capabilities",
-            "budget_caps_per_kind",
-        )
-    ) and raw.get("max_risk_level") == "high":
+    approval = raw["approval"]
+    if not approval["rules"] and approval["mode"] is None and not raw["budget_caps_per_kind"] and raw["max_risk_level"] == "high":
         return None
     return raw
 
@@ -1395,6 +1691,7 @@ async def _export_embedded_agents_and_skills(
     include_agents: bool,
     include_skills: bool,
     include_starter_memory: bool,
+    workflow_skill_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Resolve every agent this workspace is subscribed to, split into
     embedded vs external, and walk each embedded agent's 3 binding
@@ -1582,33 +1879,14 @@ async def _export_embedded_agents_and_skills(
                     b.skill_id,
                 )
                 continue
-            source_link = skill_source_links.get(sk.id)
-            source_skill_id = str(
-                source_link.marketplace_resource_id
-                if source_link is not None
-                else (sk.config or {}).get("marketplace_id")
-                or (sk.config or {}).get("source_skill_id")
-                or (sk.id if sk.entity_id is None else "")
-            ).strip()
-            marketplace_source = (
-                source_link.marketplace_source
-                if source_link is not None
-                else "manor"
-                if (sk.config or {}).get("marketplace_id")
-                else "platform"
-                if source_skill_id
-                else None
+            identity = await _portable_skill_identity(
+                db, sk, entity_id=entity_id, source_link=skill_source_links.get(sk.id),
+                include_skills=include_skills,
             )
-            sk_is_embedded = (
-                sk.entity_id == entity_id
-                and not sk.is_public
-                and not source_skill_id
-                and include_skills
-            )
-            sk_slug = (
-                _portable_skill_slug(sk)
-                if sk.slug or sk_is_embedded or source_skill_id else ""
-            )
+            source_skill_id = identity.marketplace_id
+            marketplace_source = identity.marketplace_source
+            sk_is_embedded = identity.embedded
+            sk_slug = identity.slug
             if not sk_slug:
                 logger.warning(
                     "blueprint export: external skill_id %s has no portable slug — skipping binding",
@@ -1673,7 +1951,7 @@ async def _export_embedded_agents_and_skills(
                     "confidence": m.confidence,
                 })
 
-    # A scheduled Skill is executable Blueprint content even when no embedded
+    # A Workflow or scheduled Skill is executable Blueprint content even when no embedded
     # Agent happens to bind it. Include/require it by the same portability
     # rules so recipe.scheduled_jobs can resolve its component key on install.
     scheduled_jobs = list((await db.execute(
@@ -1683,7 +1961,7 @@ async def _export_embedded_agents_and_skills(
             ScheduledJob.execution_type == "skill",
         )
     )).scalars().all())
-    scheduled_skill_ids = sorted({
+    scheduled_skill_ids = sorted(set(workflow_skill_ids) | {
         str((job.execution_target or {}).get("skill_id") or "").strip()
         for job in scheduled_jobs
         if str((job.execution_target or {}).get("skill_id") or "").strip()
@@ -1709,8 +1987,8 @@ async def _export_embedded_agents_and_skills(
         local_resource_ids=scheduled_skill_ids,
     )
     for skill in scheduled_skills:
-        identity = _portable_skill_identity(
-            skill,
+        identity = await _portable_skill_identity(
+            db, skill,
             entity_id=entity_id,
             source_link=scheduled_links.get(skill.id),
             # An executable scheduled target is a required dependency, not an
@@ -1846,11 +2124,11 @@ async def _export_knowledge_packs(
       * Document.pii_detected = true                → drop
       * Document.quarantine_status != 'clean'       → drop
       * Document.is_trashed = true                  → drop
-      * Non-markdown files (mime_type not text/* or .md ext) → drop body
+      * Non-text files (mime_type not text/* or .md/.csv ext) → drop body
         (path still listed under folder_structure)
 
     Skeleton mode emits the directory structure but never any file body;
-    inline_text emits body_md only for surviving .md files.
+    inline_text preserves Markdown and CSV starter paths with UTF-8 body_md.
     """
     groups = list((await db.execute(
         select(DocumentGroup).where(
@@ -1931,6 +2209,7 @@ async def _export_knowledge_packs(
     starter_document_count = 0
     starter_document_bytes = 0
     out: list[dict[str, Any]] = []
+    packs_by_slug: dict[str, dict[str, Any]] = {}
     for g in groups:
         # Group membership is canonical. Older exports looked for a legacy
         # settings.document_ids list, which made normal Knowledge groups appear
@@ -2002,7 +2281,7 @@ async def _export_knowledge_packs(
                 starter_documents.append(exported_document)
                 matched_document_ids.add(d.id)
 
-        out.append({
+        pack = {
             "slug": str(
                 group_settings.get("installed_from_blueprint_slug")
                 or _slugify(g.name)
@@ -2019,7 +2298,16 @@ async def _export_knowledge_packs(
                 if group_settings.get("installed_from_blueprint_slug")
                 else None
             ),
-        })
+        }
+        previous = packs_by_slug.get(pack["slug"])
+        if previous is not None:
+            if previous != pack:
+                raise ExportError(
+                    f"Knowledge groups have conflicting Blueprint slug {pack['slug']!r}"
+                )
+            continue
+        packs_by_slug[pack["slug"]] = pack
+        out.append(pack)
     if requested_document_ids is not None:
         missing = sorted(requested_document_ids - matched_document_ids)
         if missing:
@@ -2096,7 +2384,7 @@ async def list_exportable_knowledge_documents(
     for document_id, name, path, content_bytes, group_id, group_name in rows:
         starter_size = int(content_bytes)
         normalized_path = str(path or name or "document.md").strip()
-        if not normalized_path.lower().endswith(".md"):
+        if not normalized_path.lower().endswith((".md", ".csv")):
             normalized_path = f"{normalized_path}.md"
         candidate = candidates_by_id.setdefault(document_id, {
             "id": document_id,
@@ -2124,7 +2412,7 @@ def _document_blueprint_path(d: Document) -> str:
 
 
 def _document_inline_starter(d: Document) -> Optional[dict[str, Any]]:
-    if not _document_safe_to_export(d) or not _document_is_markdown(d):
+    if not _document_safe_to_export(d) or not _document_is_inline_text(d):
         return None
     metadata = d.metadata_ if isinstance(d.metadata_, dict) else {}
     body = metadata.get("content_text")
@@ -2133,7 +2421,7 @@ def _document_inline_starter(d: Document) -> Optional[dict[str, Any]]:
     path = _document_blueprint_path(d)
     exported_document: dict[str, Any] = {
         "key": _document_portable_key(d),
-        "path": path if path.lower().endswith(".md") else f"{path}.md",
+        "path": path if path.lower().endswith((".md", ".csv")) else f"{path}.md",
         "body_md": body,
     }
     template = metadata.get("blueprint_template")
@@ -2170,11 +2458,11 @@ def _document_safe_to_export(d: Document) -> bool:
     return True
 
 
-def _document_is_markdown(d: Document) -> bool:
+def _document_is_inline_text(d: Document) -> bool:
     if d.mime_type and d.mime_type.startswith("text/"):
         return True
     name = (d.name or "").lower()
-    return name.endswith(".md")
+    return name.endswith((".md", ".csv"))
 
 
 _SLUG_NON_WORD = ("[^a-z0-9]+", "-")

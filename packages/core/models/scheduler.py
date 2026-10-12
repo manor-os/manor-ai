@@ -4,7 +4,18 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Float, Index, Integer, String, Text, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -24,12 +35,26 @@ class ScheduledJob(Base, TimestampMixin):
             "skill_generation_next_attempt_at",
             "id",
         ),
+        Index(
+            "uq_scheduled_jobs_agent_initiative",
+            "agent_initiative_id",
+            unique=True,
+            postgresql_where=text("agent_initiative_id IS NOT NULL"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     job_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     entity_id: Mapped[Optional[str]] = mapped_column(String(26))
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    agent_initiative_id: Mapped[Optional[str]] = mapped_column(
+        String(26),
+        ForeignKey(
+            "agent_initiatives.id",
+            name="fk_scheduled_jobs_agent_initiative",
+            ondelete="CASCADE",
+        ),
+    )
     name: Mapped[Optional[str]] = mapped_column(String(255))
     job_type: Mapped[str] = mapped_column(String(50), default="cron")
     schedule_kind: Mapped[Optional[str]] = mapped_column(String(20))

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import struct
 import wave
 from types import SimpleNamespace
@@ -24,6 +25,16 @@ def _test_pcm_wav(samples: list[int]) -> bytes:
         wav_file.setframerate(24000)
         wav_file.writeframes(frames)
     return buffer.getvalue()
+
+
+def _mock_entity_fs_mount(tmp_path, monkeypatch):
+    original_ismount = os.path.ismount
+    monkeypatch.setattr(
+        os.path,
+        "ismount",
+        lambda path: os.path.abspath(path) == str(tmp_path) or original_ismount(path),
+    )
+    (tmp_path / ".accesschk").touch()
 
 
 class _FakeHTTPStream:
@@ -61,7 +72,7 @@ def test_upload_text_document_alias_is_not_registered():
 
     names = [schema["function"]["name"] for schema, _ in document_tools.get_tools()]
     assert "upload_text_document" not in names
-    assert "generate_document_file" in names
+    assert "generate_document_file" not in names
 
 
 def test_generate_file_document_capability_mentions_editable_diagram_json():
@@ -80,9 +91,12 @@ def test_generate_file_audio_schema_exposes_task_scoped_narrator_mode():
 
     assert properties["narration_voice_mode"]["enum"] == [
         "random_per_task",
+        "random_per_conversation",
         "fixed_per_workspace",
     ]
-    assert "Workspace settings.audio_defaults.language" in properties["language"]["description"]
+    language_description = properties["language"]["description"]
+    assert "BCP-47" in language_description
+    assert "Workspace audio language" in language_description
     assert params_properties["workspace_asset_key"]["type"] == "string"
     assert params_properties["reuse_if_exists"]["type"] == "boolean"
 
@@ -95,6 +109,9 @@ def test_generate_file_forwards_task_scoped_narrator_mode_to_audio_runtime():
     }
     assert _merge_params({"narration_voice_mode": "fixed_per_workspace"}) == {
         "narration_voice_mode": "fixed_per_workspace"
+    }
+    assert _merge_params({"narration_voice_mode": "random_per_conversation"}) == {
+        "narration_voice_mode": "random_per_conversation"
     }
     assert _merge_params({"language": "zh-CN"}) == {"language": "zh-CN"}
 
@@ -245,6 +262,17 @@ async def test_vercel_speech_uses_gateway_v4_protocol_and_decodes_audio(monkeypa
         "outputFormat": "mp3",
         "instructions": "Warm and deliberate.",
     }
+
+    await extended_tools._vercel_speech_bytes(
+        api_key="vck-test-gateway-key",
+        base_url="https://ai-gateway.vercel.sh/v1",
+        model="openai/gpt-4o-mini-tts",
+        prompt="Read this naturally.",
+        voice="marin",
+        audio_format="mp3",
+        voice_instructions="Warm and deliberate.",
+    )
+    assert captured["json"]["instructions"] == "Warm and deliberate."
 
 
 def test_legacy_openai_tts_models_do_not_accept_delivery_instructions():
@@ -520,6 +548,55 @@ async def test_task_narrator_profile_is_persisted_and_reused(db_session):
 
     await db_session.refresh(task)
     assert task.details["stickman_narrator_profile"] == first_profile
+
+
+@pytest.mark.asyncio
+async def test_conversation_narrator_profile_is_persisted_and_reused(
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from packages.core import database
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Conversation
+
+    session_factory = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    monkeypatch.setattr(database, "async_session", session_factory)
+
+    entity_id = generate_ulid()
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        channel="web",
+        meta={},
+    )
+    db_session.add(conversation)
+    await db_session.commit()
+
+    first_profile = await extended_tools._resolve_conversation_narrator_profile(
+        entity_id=entity_id,
+        conversation_id=conversation.id,
+        candidate_model="google/gemini-3.1-flash-tts-preview",
+        voice_instructions="Warm, deliberate delivery.",
+    )
+    reused_profile = await extended_tools._resolve_conversation_narrator_profile(
+        entity_id=entity_id,
+        conversation_id=conversation.id,
+        candidate_model="openai/gpt-4o-mini-tts",
+        voice_instructions="A later turn must not replace the profile.",
+    )
+
+    assert reused_profile == first_profile
+    assert first_profile["provider"] == "google"
+    assert first_profile["voice"] != "random"
+
+    await db_session.refresh(conversation)
+    assert conversation.meta["stickman_narrator_profile"] == first_profile
 
 
 @pytest.mark.asyncio
@@ -799,11 +876,95 @@ async def test_random_per_task_narration_uses_the_persisted_profile_for_every_se
     assert [request["voice"] for request in requests] == [profile["voice"], profile["voice"]]
     assert [result["narration_profile"] for result in results] == [profile, profile]
     assert [item["output_name"] for item in saved] == [
-        "audio/puck/segment-1.wav",
-        "audio/puck/segment-2.wav",
+        "segment-1.wav",
+        "segment-2.wav",
     ]
     assert [item["voice"] for item in saved] == [profile["voice"], profile["voice"]]
     assert [item["narration_profile"] for item in saved] == [profile, profile]
+
+
+@pytest.mark.asyncio
+async def test_random_per_conversation_narration_uses_conversation_profile(monkeypatch):
+    profile = {
+        "version": 1,
+        "provider": "google",
+        "model": "google/gemini-3.1-flash-tts-preview",
+        "voice": "Puck",
+        "voice_instructions": "Warm, deliberate delivery.",
+    }
+    resolved: list[dict] = []
+    saved: list[dict] = []
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return profile["model"], "voice"
+
+    async def fake_resolve_profile(**kwargs):
+        resolved.append(kwargs)
+        return profile
+
+    async def task_profile_must_not_run(**_kwargs):
+        raise AssertionError("Standalone Chat narration must not require a Task")
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-or-test", "", False
+
+    async def fake_primary_credentials(_user_id, _entity_id, *, provider):
+        assert provider == "google"
+        return "", "", False
+
+    async def fake_platform_credential(_provider):
+        return "", ""
+
+    async def fake_speech_bytes(**_kwargs):
+        return b"\x01\x00\x02\x00"
+
+    async def fake_save_audio(**kwargs):
+        saved.append(kwargs)
+        return "/api/v1/fs/entity/audio/puck/segment.wav"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_conversation_narrator_profile",
+        fake_resolve_profile,
+    )
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_task_narrator_profile",
+        task_profile_must_not_run,
+    )
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_primary_byok_media_credentials",
+        fake_primary_credentials,
+    )
+    monkeypatch.setattr(
+        extended_tools,
+        "_platform_native_media_credential_async",
+        fake_platform_credential,
+    )
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_speech_bytes)
+    monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
+
+    result = json.loads(
+        await extended_tools._generate_audio_handler(
+            entity_id="entity",
+            user_id="user",
+            conversation_id="conversation-1",
+            prompt="Narrate this clause.",
+            name="runs/example/audio/segment-001.wav",
+            purpose="narration",
+            narration_voice_mode="random_per_conversation",
+        )
+    )
+
+    assert resolved[0]["conversation_id"] == "conversation-1"
+    assert result["narration_profile"] == profile
+    assert saved[0]["conversation_id"] == "conversation-1"
+    assert saved[0]["task_id"] is None
 
 
 @pytest.mark.asyncio
@@ -1062,7 +1223,10 @@ async def test_generated_image_save_reuses_existing_knowledge_document(
     settings.MANOR_FS_ROOT = str(tmp_path)
     settings.DEPLOYMENT_MODE = "oss"
 
-    async def fake_bill_media(**_kwargs):
+    billing_context: dict = {}
+
+    async def fake_bill_media(**kwargs):
+        billing_context.update(kwargs)
         return None
 
     monkeypatch.setattr(extended_tools, "_bill_media", fake_bill_media)
@@ -1100,7 +1264,7 @@ async def test_generated_image_save_reuses_existing_knowledge_document(
             image_bytes=b"image-bytes",
             mime="image/png",
             is_byok=True,
-            output_name="hero.png",
+            output_name=expected_path,
             workspace_id=workspace_id,
             task_id="task_1",
             agent_id="agent_1",
@@ -1126,16 +1290,15 @@ async def test_generated_image_save_reuses_existing_knowledge_document(
         assert docs[0].file_size == len(b"image-bytes")
         assert docs[0].metadata_["origin"]["workspace_id"] == workspace_id
         assert docs[0].metadata_["generation"]["model"] == "gpt-image-1"
-        from packages.core.services.workspace_artifacts import resolve_workspace_folder_binding
+        assert billing_context["workspace_id"] == workspace_id
+        assert billing_context["agent_id"] == "agent_1"
+        assert billing_context["conversation_id"] == "conv_1"
+        from packages.core.services.document_access import document_workspace_ids
 
-        binding = await resolve_workspace_folder_binding(
-            db_session,
-            entity_id=entity_id,
-            folder_id=docs[0].folder_id,
-        )
-        assert binding is not None
-        assert binding.workspace_id == workspace_id
-        assert binding.relative_parts == ("images",)
+        # Reprojection preserves the existing document's logical placement.
+        # The physical artifact path still gives it Workspace ownership.
+        assert docs[0].folder_id is None
+        assert await document_workspace_ids(db_session, docs[0]) == {workspace_id}
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
@@ -1167,7 +1330,10 @@ async def test_generated_audio_save_records_actual_task_narrator_profile(
     settings.MANOR_FS_ROOT = str(tmp_path)
     settings.DEPLOYMENT_MODE = "oss"
 
-    async def fake_bill_media(**_kwargs):
+    billing_context: dict = {}
+
+    async def fake_bill_media(**kwargs):
+        billing_context.update(kwargs)
         return None
 
     monkeypatch.setattr(extended_tools, "_bill_media", fake_bill_media)
@@ -1227,6 +1393,9 @@ async def test_generated_audio_save_records_actual_task_narrator_profile(
         assert binding.relative_parts == ("audio", "puck")
         assert document.metadata_["generation"]["voice"] == "Puck"
         assert document.metadata_["generation"]["narration_profile"] == narrator_profile
+        assert billing_context["workspace_id"] == workspace_id
+        assert billing_context["agent_id"] == "agent_1"
+        assert billing_context["conversation_id"] == "conv_1"
     finally:
         settings.MANOR_FS_ENABLED = old_enabled
         settings.MANOR_FS_ROOT = old_root
@@ -1306,6 +1475,7 @@ async def test_generate_file_creates_code_bundle_with_real_file_structure(tmp_pa
     old_root = settings.MANOR_FS_ROOT
     settings.MANOR_FS_ENABLED = True
     settings.MANOR_FS_ROOT = str(tmp_path)
+    _mock_entity_fs_mount(tmp_path, monkeypatch)
 
     monkeypatch.setattr(
         "packages.core.services.ai_file_permissions.guard_ai_file_mutation",
@@ -1377,6 +1547,7 @@ async def test_generate_file_rolls_back_entire_code_bundle_when_projection_fails
     settings = get_settings()
     monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
     monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    _mock_entity_fs_mount(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "packages.core.services.ai_file_permissions.guard_ai_file_mutation",
         AsyncMock(return_value=None),
@@ -1457,6 +1628,7 @@ async def test_code_bundle_projection_failure_rolls_back_document_and_folder_row
     settings = get_settings()
     monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
     monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    _mock_entity_fs_mount(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "packages.core.services.ai_file_permissions.guard_ai_file_mutation",
         AsyncMock(return_value=None),
@@ -1544,6 +1716,7 @@ async def test_generate_file_creates_product_video_status_bundle_in_workspace(
     old_root = settings.MANOR_FS_ROOT
     settings.MANOR_FS_ENABLED = True
     settings.MANOR_FS_ROOT = str(tmp_path)
+    _mock_entity_fs_mount(tmp_path, monkeypatch)
 
     entity_id = generate_ulid()
     workspace = Workspace(
@@ -1921,6 +2094,43 @@ async def test_generate_file_routes_audio_to_openrouter_audio_tool(monkeypatch):
     assert captured["kwargs"]["workspace_id"] == "ws_123"
     assert captured["kwargs"]["task_id"] == "task_123"
     assert captured["kwargs"]["agent_id"] == "agent_123"
+
+
+@pytest.mark.asyncio
+async def test_generate_file_workspace_scoped_audio_uses_workspace_artifact_root(
+    monkeypatch,
+):
+    captured: dict = {}
+
+    async def fake_generate_audio_handler(
+        entity_id: str = "", user_id: str = "", **kwargs
+    ):
+        captured.update({"entity_id": entity_id, "user_id": user_id, "kwargs": kwargs})
+        return json.dumps({"kind": "audio", "status": "completed"})
+
+    monkeypatch.setattr(
+        extended_tools,
+        "_generate_audio_handler",
+        fake_generate_audio_handler,
+    )
+
+    result = await generate_file_tool._generate_file_handler(
+        entity_id="entity",
+        user_id="user",
+        conversation_id="conversation",
+        workspace_id="ws_123",
+        task_id="task_123",
+        kind="audio",
+        name="technical/narrator-setup-sample.mp3",
+        prompt="One neutral narration sample.",
+        purpose="narration",
+        narration_voice_mode="fixed_per_workspace",
+        storage_scope="workspace",
+    )
+
+    assert json.loads(result)["status"] == "completed"
+    assert captured["kwargs"]["workspace_id"] == "ws_123"
+    assert captured["kwargs"]["task_id"] is None
 
 
 @pytest.mark.asyncio
@@ -2345,6 +2555,8 @@ async def test_generated_audio_save_rejects_zero_frame_wav_before_persisting():
 
 
 @pytest.mark.asyncio
+@pytest.mark.media_integration
+@pytest.mark.oss_regression
 async def test_audio_conversion_transcodes_wav_to_real_mp3():
     import shutil
 
@@ -2497,15 +2709,21 @@ async def test_openai_tts_excludes_openrouter_base_for_non_openrouter_key(monkey
         calls["chat"] += 1
         return b"unexpected"
 
+    async def fake_openrouter_speech_bytes(**_kwargs):  # pragma: no cover - should not be called
+        calls["speech"] += 1
+        raise AssertionError("OSS must not replace incompatible BYOK with an environment key")
+
     async def fake_save_audio(**_kwargs):  # pragma: no cover - should not be called
         calls["save"] += 1
         return "/api/v1/fs/entity/audio/narration.mp3"
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-platform-key")
     monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
     monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
     monkeypatch.setattr(extended_tools, "_openai_compatible_speech_bytes", fake_openai_speech_bytes)
     monkeypatch.setattr(extended_tools, "_openai_compatible_chat_audio_bytes", fake_chat_audio_bytes)
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_openrouter_speech_bytes)
     monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
 
     result = json.loads(
@@ -2532,10 +2750,8 @@ async def test_openai_tts_excludes_openrouter_base_for_non_openrouter_key(monkey
 
 
 @pytest.mark.asyncio
-async def test_gemini_tts_uses_openrouter_env_without_byok_in_oss(monkeypatch):
+async def test_gemini_tts_rejects_openrouter_env_without_byok_in_oss(monkeypatch):
     from packages.core.ai.tools import extended_tools
-
-    captured: dict = {}
 
     async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
         assert purpose == "narration"
@@ -2545,17 +2761,8 @@ async def test_gemini_tts_uses_openrouter_env_without_byok_in_oss(monkeypatch):
         assert role == "voice"
         return "", "", False
 
-    async def fake_primary_credentials(*_args, **_kwargs):
-        return "", "", False
-
-    async def fake_openrouter_speech_bytes(**kwargs):
-        captured.update(kwargs)
-        return b"\x01\x00" * 24
-
-    async def fake_save_audio(**kwargs):
-        captured["is_byok"] = kwargs["is_byok"]
-        captured["storage_format"] = kwargs["audio_format"]
-        return "/api/v1/fs/entity/audio/narration.wav"
+    async def fake_openrouter_speech_bytes(**_kwargs):  # pragma: no cover - should not be called
+        raise AssertionError("OSS must not use OPENROUTER_API_KEY without BYOK")
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-env-key")
@@ -2563,14 +2770,47 @@ async def test_gemini_tts_uses_openrouter_env_without_byok_in_oss(monkeypatch):
     monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
     monkeypatch.setattr(
         extended_tools,
-        "_resolve_primary_byok_media_credentials",
-        fake_primary_credentials,
-    )
-    monkeypatch.setattr(
-        extended_tools,
         "_openrouter_speech_bytes",
         fake_openrouter_speech_bytes,
     )
+
+    result = json.loads(await extended_tools._generate_audio_handler(
+        entity_id="",
+        user_id="user",
+        prompt="Narrate this line",
+        purpose="narration",
+    ))
+
+    assert result["status"] == "error"
+    assert result["code"] == "provider_key_required"
+    assert result["error"] == "Self-hosted audio generation requires a matching provider API key."
+
+
+@pytest.mark.asyncio
+async def test_openai_tts_uses_saved_openrouter_byok_in_oss(monkeypatch):
+    captured: dict = {}
+
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "narration"
+        return "openai/tts-1-hd", "voice"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "voice"
+        return "sk-or-user-key", "", True
+
+    async def fake_openrouter_speech_bytes(**kwargs):
+        captured.update(kwargs)
+        return b"\x01\x00" * 24
+
+    async def fake_save_audio(**kwargs):
+        captured["is_byok"] = kwargs["is_byok"]
+        return "/api/v1/fs/entity/audio/narration.wav"
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-platform-key")
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(extended_tools, "_openrouter_speech_bytes", fake_openrouter_speech_bytes)
     monkeypatch.setattr(extended_tools, "_save_generated_audio_bytes", fake_save_audio)
 
     result = json.loads(await extended_tools._generate_audio_handler(
@@ -2581,10 +2821,51 @@ async def test_gemini_tts_uses_openrouter_env_without_byok_in_oss(monkeypatch):
     ))
 
     assert result["status"] == "completed"
-    assert captured["api_key"] == "sk-or-env-key"
-    assert captured["model"] == "google/gemini-3.1-flash-tts-preview"
-    assert captured["is_byok"] is False
-    assert captured["storage_format"] == "wav"
+    assert captured["api_key"] == "sk-or-user-key"
+    assert captured["is_byok"] is True
+
+
+
+
+@pytest.mark.asyncio
+async def test_suno_missing_key_in_oss_requires_entity_music_byok(monkeypatch):
+    async def fake_resolve_audio_model(_user_id, _entity_id, *, purpose):
+        assert purpose == "music"
+        return "suno/music", "audio"
+
+    async def fake_credentials(_user_id, _entity_id, *, role):
+        assert role == "audio"
+        return "", "", False
+
+    async def fake_platform_credentials(_provider):
+        assert _provider == "suno"
+        return "", ""
+
+    async def start_job_must_not_run(**_kwargs):  # pragma: no cover - should not be called
+        raise AssertionError("OSS must reject missing Suno BYOK before starting a provider job")
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setenv("SUNO_API_KEY", "platform-suno-key")
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", fake_resolve_audio_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", fake_credentials)
+    monkeypatch.setattr(
+        extended_tools,
+        "_platform_native_media_credential_async",
+        fake_platform_credentials,
+    )
+    monkeypatch.setattr(extended_tools, "_start_suno_audio_job", start_job_must_not_run)
+
+    result = json.loads(await extended_tools._generate_live_audio(
+        entity_id="entity",
+        user_id="user",
+        prompt="Warm synth score",
+        purpose="music",
+    ))
+
+    assert result["status"] == "error"
+    assert result["code"] == "provider_key_required"
+    assert "Music & Score" in result["error"]
+    assert "SUNO_API_KEY" not in result["error"]
 
 
 @pytest.mark.asyncio
@@ -3879,6 +4160,27 @@ async def test_generate_file_routes_quick_document_to_document_generator(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_generate_file_generic_office_type_uses_specialist_skill(monkeypatch):
+    from packages.core.ai.tools.generate_file import tool as generate_file_router
+
+    captured = {}
+
+    async def fake_presentation(**kwargs):
+        captured.update(kwargs)
+        return json.dumps({"status": "sandbox_ready", "skill": "pptx"})
+
+    monkeypatch.setattr(generate_file_router, "handle_presentation", fake_presentation)
+    result = json.loads(await generate_file_tool._generate_file_handler(
+        entity_id="entity", user_id="user", conversation_id="conversation",
+        kind="document", file_type="pptx", name="analysis.pptx",
+        content="Use my attached report for the slides.",
+    ))
+    assert result["skill"] == "pptx"
+    assert captured["name"] == "analysis.pptx"
+    assert captured["kwargs"]["content"] == "Use my attached report for the slides."
+
+
+@pytest.mark.asyncio
 async def test_generate_file_routes_diagram_prompt_to_document_generator(monkeypatch):
     captured: dict = {}
 
@@ -4449,3 +4751,89 @@ async def test_generate_file_document_diagram_name_uses_prompt_generator(monkeyp
     assert captured["name"] == "flow.diagram.json"
     assert [item["kind"] for item in diagram["elements"]].count("shape") >= 4
     assert diagram["groups"][0]["label"] == "Generated flow"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["fixed_per_workspace", "random_per_task", "random_per_conversation"])
+async def test_narration_voice_scope_without_its_scope_uses_the_account_voice(monkeypatch, mode):
+    """A standalone Flow has no Workspace, Task, or Conversation to pin a voice to."""
+    from packages.core.ai.tools import extended_tools
+
+    async def no_profile(*_args, **_kwargs):
+        raise AssertionError("no scoped narrator can be resolved without its scope")
+
+    class ReachedGeneration(Exception):
+        pass
+
+    async def credentials(*_args, **_kwargs):
+        raise ReachedGeneration
+
+    async def actor(*_args):
+        return "user"
+
+    monkeypatch.setattr(extended_tools, "_resolve_media_task_user_id", actor)
+    monkeypatch.setattr(extended_tools, "_resolve_workspace_narrator_profile", no_profile)
+    monkeypatch.setattr(extended_tools, "_resolve_task_narrator_profile", no_profile)
+    monkeypatch.setattr(extended_tools, "_resolve_conversation_narrator_profile", no_profile)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", credentials)
+
+    try:
+        result = json.loads(await extended_tools._generate_audio_handler(
+            entity_id="entity", user_id="user", prompt="One calm breath.",
+            purpose="narration", narration_voice_mode=mode,
+        ))
+    except ReachedGeneration:
+        return
+    assert result.get("code") != "narration_voice_profile_workspace_required", result
+
+
+@pytest.mark.asyncio
+async def test_music_ignores_a_narration_voice_passed_as_its_expected_model(monkeypatch):
+    """A narration model copied into a music call is a mix-up, not a changed selection."""
+    from packages.core.ai.tools import extended_tools
+    from packages.core.contracts.audio_generation import AudioGenerationRole
+
+    class ReachedGeneration(Exception):
+        pass
+
+    async def actor(*_args):
+        return "user"
+
+    async def music_model(*_args, **_kwargs):
+        return "google/lyria-3-clip-preview", AudioGenerationRole.AUDIO
+
+    async def credentials(*_args, **_kwargs):
+        raise ReachedGeneration
+
+    monkeypatch.setattr(extended_tools, "_resolve_media_task_user_id", actor)
+    monkeypatch.setattr(extended_tools, "_resolve_user_audio_model", music_model)
+    monkeypatch.setattr(extended_tools, "_resolve_user_media_credentials", credentials)
+
+    with pytest.raises(ReachedGeneration):
+        await extended_tools._generate_live_audio(
+            entity_id="entity", user_id="user", prompt="calm bed", purpose="music",
+            expected_model="google/gemini-3.1-flash-tts-preview",
+        )
+    # A real change between two music models is still refused.
+    refused = json.loads(await extended_tools._generate_live_audio(
+        entity_id="entity", user_id="user", prompt="calm bed", purpose="music",
+        expected_model="suno/music",
+    ))
+    assert refused["code"] == "audio_model_changed_reinspect_required"
+    assert "Retry with expected_model=google/lyria-3-clip-preview" in refused["error"]
+
+
+def test_code_files_accept_subtitles_and_a_single_named_file():
+    from packages.core.ai.tools.generate_file.code import _single_file_from_name
+    from packages.core.contracts.file_engine import TEXT_CONTENT_TYPES, file_type_from_path
+
+    # Subtitle files are text, like srt and vtt.
+    for name in ("subtitles.ass", "subtitles.ssa", "subtitles.srt", "subtitles.vtt"):
+        assert file_type_from_path(name) in TEXT_CONTENT_TYPES, name
+    # name="folder/file.ext" with content is one file in that folder.
+    assert _single_file_from_name("video/run-1/subtitles.ass", "[Script Info]") == (
+        "video/run-1", [{"path": "subtitles.ass", "content": "[Script Info]"}],
+    )
+    # A project name without a file, or no content, is not a single file.
+    assert _single_file_from_name("rental-website", "<html>") is None
+    assert _single_file_from_name("video/run-1/subtitles.ass", None) is None

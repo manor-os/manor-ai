@@ -1,0 +1,23 @@
+{
+  "id": "remotion-multimedia",
+  "name": "remotion-multimedia",
+  "display_name": "Remotion Multimedia",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Inspect browser-based audio and video media.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "multimedia",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["ffprobe", "media info", "video duration", "audio file", "fonts", "assets", "static files", "staticfile"],
+    "examples": ["get video duration and dimensions", "add local audio file to remotion", "load custom font into composition", "inspect media metadata in browser"]
+  }
+}

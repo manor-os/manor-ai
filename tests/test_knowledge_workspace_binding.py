@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-from sqlalchemy import select
 from httpx import AsyncClient
+from sqlalchemy import select
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, DocumentFolder, DocumentGroup, DocumentGroupMember
+from packages.core.models.user import Entity
 from packages.core.models.workspace import Workspace
 from packages.core.services import artifact_knowledge, knowledge_sync
 
@@ -211,6 +212,224 @@ async def test_sync_file_to_knowledge_preserves_code_type_and_folder(
     assert sorted(folder_by_name) == ["code", "demo-site"]
     assert doc.folder_id == folder_by_name["demo-site"].id
     assert folder_by_name["demo-site"].parent_id == folder_by_name["code"].id
+
+
+@pytest.mark.asyncio
+async def test_reconcile_preserves_existing_logical_folder_for_workspace_storage(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    import packages.core.database as db_module
+    from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
+
+    monkeypatch.setattr(knowledge_sync, "async_session", db_module.async_session)
+    entity_id = generate_ulid()
+    workspace = Workspace(entity_id=entity_id, name="Projection")
+    db_session.add(workspace)
+    await db_session.flush()
+    root = await ensure_workspace_artifact_folder(db_session, workspace)
+    selected = DocumentFolder(entity_id=entity_id, name="Selected", parent_id=root.id)
+    db_session.add(selected)
+    await db_session.flush()
+    rel_path = f"Workspaces/_by_id/{root.id}/tasks/run-1/audio/clip.mp3"
+    file_path = tmp_path / entity_id / rel_path
+    file_path.parent.mkdir(parents=True)
+    file_path.write_bytes(b"audio")
+    document = Document(
+        entity_id=entity_id,
+        name="clip.mp3",
+        fs_path=rel_path,
+        folder_id=selected.id,
+        metadata_={"origin": {"workspace_id": workspace.id}},
+    )
+    db_session.add(document)
+    await db_session.commit()
+
+    result = await knowledge_sync.sync_file_to_knowledge(
+        entity_id=entity_id,
+        abs_path=str(file_path),
+        entity_root=str(tmp_path / entity_id),
+        source="filesystem_reconcile",
+        force=True,
+        visibility="private",
+    )
+
+    assert result.synced is True
+    await db_session.refresh(document)
+    saved = await db_session.get(Document, document.id)
+    assert saved.folder_id == selected.id
+    assert saved.visibility == "workspace"
+
+
+@pytest.mark.asyncio
+async def test_repair_workspace_projection_files_unique_legacy_documents_only(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.services.knowledge_sync import repair_workspace_document_projection
+
+    entity_id = generate_ulid()
+    workspaces = [Workspace(entity_id=entity_id, name=name) for name in ("One", "Two")]
+    db_session.add_all(workspaces)
+    await db_session.flush()
+    groups = [DocumentGroup(entity_id=entity_id, workspace_id=workspace.id, name=workspace.name) for workspace in workspaces]
+    legacy = Document(
+        entity_id=entity_id,
+        name="brand/guide.md",
+        fs_path="legacy/guide.md",
+        metadata_={"origin": {"workspace_id": workspaces[0].id}},
+    )
+    shared = Document(
+        entity_id=entity_id,
+        name="shared/guide.md",
+        fs_path="legacy/shared.md",
+        metadata_={"origin": {"workspace_id": workspaces[0].id}},
+    )
+    db_session.add_all([*groups, legacy, shared])
+    await db_session.flush()
+    db_session.add_all([
+        DocumentGroupMember(document_id=shared.id, group_id=groups[0].id),
+        DocumentGroupMember(document_id=shared.id, group_id=groups[1].id),
+    ])
+    await db_session.flush()
+
+    report = await repair_workspace_document_projection(
+        db_session, entity_id=entity_id, workspace_id=workspaces[0].id,
+    )
+
+    assert report.repaired_documents == 1
+    assert report.skipped_shared_documents == 1
+    assert legacy.name == "guide.md"
+    assert legacy.fs_path == "legacy/guide.md"
+    assert legacy.folder_id is not None
+    assert shared.name == "shared/guide.md"
+    assert shared.fs_path == "legacy/shared.md"
+    assert shared.folder_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("has_user_folder", "has_foreign_origin"),
+    [(True, False), (False, True)],
+)
+async def test_need_input_binding_preserves_existing_folder_or_foreign_origin(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    has_user_folder: bool,
+    has_foreign_origin: bool,
+):
+    from packages.core.models.permission import Capability
+    from packages.core.services import document_access
+    from packages.core.services.file_context import bind_workspace_knowledge_documents
+
+    async def allowed_capabilities(*_args, **_kwargs):
+        return {Capability.VIEW, Capability.SHARE_INTERNAL}
+
+    async def readable(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(document_access, "effective_document_capabilities_for_user", allowed_capabilities)
+    monkeypatch.setattr(document_access, "user_can_read_document", readable)
+
+    entity_id = generate_ulid()
+    entity = Entity(id=entity_id, name="Knowledge binding entity")
+    target_workspace = Workspace(entity_id=entity_id, name="Target")
+    other_workspace = Workspace(entity_id=entity_id, name="Other")
+    user_folder = DocumentFolder(entity_id=entity_id, name="User uploads")
+    db_session.add_all([entity, target_workspace, other_workspace, user_folder])
+    await db_session.flush()
+    original_origin = {
+        "workspace_id": other_workspace.id,
+        "tool_name": "existing_workspace_upload",
+    } if has_foreign_origin else {"user_id": generate_ulid(), "tool_name": "upload"}
+    document = Document(
+        entity_id=entity_id,
+        name="brief.md",
+        fs_path="User uploads/brief.md",
+        folder_id=user_folder.id if has_user_folder else None,
+        visibility="private",
+        metadata_={"origin": original_origin},
+    )
+    db_session.add(document)
+    await db_session.flush()
+
+    bound = await bind_workspace_knowledge_documents(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=target_workspace.id,
+        user_id=generate_ulid(),
+        attachments=[{"document_id": document.id}],
+    )
+
+    assert bound[0]["document_id"] == document.id
+    assert document.folder_id == (user_folder.id if has_user_folder else None)
+    assert document.fs_path == "User uploads/brief.md"
+    assert document.metadata_["origin"] == original_origin
+    assert document.visibility == "private"
+    memberships = list((await db_session.scalars(
+        select(DocumentGroupMember.group_id).where(
+            DocumentGroupMember.document_id == document.id,
+        )
+    )).all())
+    assert memberships
+    groups = list((await db_session.scalars(
+        select(DocumentGroup).where(DocumentGroup.id.in_(memberships))
+    )).all())
+    assert any(group.workspace_id == target_workspace.id for group in groups)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity_state", ["missing", "deleted"])
+async def test_need_input_binding_does_not_publish_from_unavailable_entity(
+    client: AsyncClient,
+    db_session,
+    entity_state: str,
+):
+    from datetime import UTC, datetime
+
+    from packages.core.services.file_context import bind_workspace_knowledge_documents
+
+    entity_id = generate_ulid()
+    if entity_state == "deleted":
+        db_session.add(Entity(
+            id=entity_id,
+            name="Deleted binding entity",
+            deleted_at=datetime.now(UTC),
+        ))
+    workspace = Workspace(entity_id=entity_id, name="Target")
+    document = Document(
+        entity_id=entity_id,
+        name="brief.md",
+        fs_path="User uploads/brief.md",
+        visibility="private",
+        metadata_={"origin": {"tool_name": "upload"}},
+    )
+    db_session.add_all([workspace, document])
+    await db_session.flush()
+    attachment = {"document_id": document.id}
+
+    bound = await bind_workspace_knowledge_documents(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        user_id=generate_ulid(),
+        attachments=[attachment],
+    )
+
+    assert bound == [attachment]
+    assert document.visibility == "private"
+    assert document.folder_id is None
+    assert document.fs_path == "User uploads/brief.md"
+    assert document.metadata_["origin"] == {"tool_name": "upload"}
+    assert not (await db_session.scalars(
+        select(DocumentGroupMember).where(DocumentGroupMember.document_id == document.id)
+    )).all()
+    assert not (await db_session.scalars(
+        select(DocumentGroup).where(DocumentGroup.workspace_id == workspace.id)
+    )).all()
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,7 @@ export default function Checkbox({
       aria-checked={checked}
       aria-label={ariaLabel || (typeof label === "string" ? label : undefined)}
       disabled={disabled}
-      className={className}
+      className={["manor-checkbox", className].filter(Boolean).join(" ")}
       onClick={(event) => {
         event.stopPropagation();
         if (!disabled) onChange(!checked);

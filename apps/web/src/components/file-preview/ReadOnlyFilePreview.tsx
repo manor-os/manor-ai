@@ -3,6 +3,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import MarkdownTable from "../MarkdownTable";
 import { getFilePreviewKind } from "../../lib/filePreviewKind";
+import { createFilePreviewSource, filePreviewMediaBlob } from "../../lib/filePreviewSource";
 import { parseDelimitedText } from "../../lib/delimitedText";
 import {
   assertDiagramPreviewFileSize,
@@ -11,10 +12,12 @@ import {
 import { t } from "../../lib/i18n";
 import OfficePreview, { DocxOfficePreview } from "./OfficePreview";
 import type { ReadOnlyFilePreviewProps } from "./types";
+import Button from "../ui/Button";
 
 const LazyDiagramArtifactViewer = lazy(() => import("../diagram/DiagramArtifactViewer"));
 const LazyXlsxViewer = lazy(() => import("../../pages/FileViewer").then(({ XlsxViewer }) => ({ default: XlsxViewer })));
 const LazyPptxViewer = lazy(() => import("../../pages/FileViewer").then(({ PptxViewer }) => ({ default: PptxViewer })));
+const LazyPdfJsViewer = lazy(() => import("../../pages/FileViewer").then(({ PdfJsViewer }) => ({ default: PdfJsViewer })));
 
 const textKinds = new Set(["text", "markdown", "code", "html", "csv", "json", "diagram"]);
 
@@ -24,31 +27,58 @@ export default function ReadOnlyFilePreview({
   content,
   blob,
   canDownload = false,
+  onDownload,
 }: ReadOnlyFilePreviewProps) {
   const kind = getFilePreviewKind(file);
   const [fetchedContent, setFetchedContent] = useState<string | null>(content ?? null);
-  const [contentError, setContentError] = useState(false);
+  const [contentError, setContentError] = useState("");
+  const [loadedBlob, setLoadedBlob] = useState<Blob | null>(null);
+  const [mediaUrl, setMediaUrl] = useState("");
+  const [retryVersion, setRetryVersion] = useState(0);
   const previewContent = content ?? fetchedContent;
 
   useEffect(() => {
     let cancelled = false;
+    let objectUrl = "";
+    const controller = new AbortController();
     setFetchedContent(content ?? null);
-    setContentError(false);
-    if (content != null || !textKinds.has(kind)) return () => { cancelled = true; };
+    setContentError("");
+    setLoadedBlob(null);
+    setMediaUrl("");
+    if (kind === "unsupported" || (content != null && textKinds.has(kind))) return;
     void (async () => {
       try {
-        const response = await fetch(source.contentUrl);
-        if (!response.ok) throw new Error("Preview content is unavailable");
-        const value = kind === "diagram" ? await readDiagramPreviewText(response) : await response.text();
-        if (!cancelled) setFetchedContent(value);
-      } catch {
-        if (!cancelled) setContentError(true);
+        if (kind === "diagram") assertDiagramPreviewFileSize(file.file_size);
+        const binary = await createFilePreviewSource({
+          blob, url: source.contentUrl,
+          fetchBinary: source.fetchBinary || (kind === "diagram" ? async (signal) => {
+            const response = await fetch(source.contentUrl, { signal });
+            if (!response.ok) throw new Error(`File loading failed (HTTP ${response.status})`);
+            return new Blob([await readDiagramPreviewText(response)]);
+          } : undefined),
+        }).getBlob(controller.signal);
+        if (cancelled) return;
+        setLoadedBlob(binary);
+        if (textKinds.has(kind)) {
+          if (kind === "diagram") assertDiagramPreviewFileSize(binary.size);
+          const value = await binary.text();
+          if (!cancelled) setFetchedContent(value);
+        } else if (["image", "video", "audio"].includes(kind)) {
+          objectUrl = URL.createObjectURL(filePreviewMediaBlob(binary, file));
+          setMediaUrl(objectUrl);
+        }
+      } catch (cause) {
+        if (!cancelled) setContentError(cause instanceof Error ? cause.message : t("page.shared_doc.preview_unavailable"));
       }
     })();
-    return () => { cancelled = true; };
-  }, [content, kind, source.contentUrl]);
+    return () => { cancelled = true; controller.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [blob, content, kind, source.contentUrl, source.fetchBinary, file.name, file.mime_type, file.file_size, retryVersion]);
 
-  if (kind === "docx") return <DocxOfficePreview name={file.name || "Document"} source={source} />;
+  if (kind === "unsupported") return <PreviewFallback message={t(canDownload ? "page.shared_doc.preview_unsupported_downloadable" : "page.shared_doc.preview_unsupported")} />;
+  if (contentError) return <div role="alert"><PreviewFallback message={contentError} /><Button variant="outline" onClick={() => setRetryVersion((value) => value + 1)}>{t("component.workflow_run.action.retry")}</Button></div>;
+  if (!textKinds.has(kind) && !loadedBlob) return <PreviewLoading />;
+
+  if (kind === "docx") return <DocxOfficePreview name={file.name || "Document"} source={source} blob={loadedBlob} />;
   if (kind === "pptx") {
     return (
       <OfficePreview
@@ -57,29 +87,27 @@ export default function ReadOnlyFilePreview({
         source={source}
         fallback={(
           <Suspense fallback={<PreviewLoading />}>
-            <LazyPptxViewer url={source.contentUrl} blob={blob} />
+            <LazyPptxViewer url="" blob={loadedBlob} />
           </Suspense>
         )}
       />
     );
   }
   if (kind === "xlsx") {
-    return <Suspense fallback={<PreviewLoading />}><LazyXlsxViewer url={source.contentUrl} blob={blob} /></Suspense>;
+    return <Suspense fallback={<PreviewLoading />}><LazyXlsxViewer url="" blob={loadedBlob} /></Suspense>;
   }
   if (kind === "pdf") {
-    return <iframe title={file.name || "PDF"} src={source.contentUrl} style={{ width: "100%", height: "75vh", border: "1px solid rgba(28,25,23,0.06)" }} />;
+    return <Suspense fallback={<PreviewLoading />}><LazyPdfJsViewer url="" blob={loadedBlob} docName={file.name || "PDF"} canEdit={false} onDownload={canDownload ? onDownload : undefined} /></Suspense>;
   }
   if (kind === "image") {
-    return <img src={source.contentUrl} alt={file.name || "Image"} style={{ maxWidth: "100%", display: "block", margin: "0 auto" }} />;
+    return <img src={mediaUrl} alt={file.name || "Image"} onError={() => setContentError(t("page.shared_doc.preview_unavailable"))} style={{ maxWidth: "100%", display: "block", margin: "0 auto" }} />;
   }
   if (kind === "video") {
-    return <video src={source.contentUrl} controls controlsList={canDownload ? undefined : "nodownload"} style={{ width: "100%", maxHeight: "75vh", background: "#000" }} />;
+    return <video src={mediaUrl} controls onError={() => setContentError(t("page.shared_doc.preview_unavailable"))} controlsList={canDownload ? undefined : "nodownload"} style={{ width: "100%", maxHeight: "75vh", background: "#000" }} />;
   }
   if (kind === "audio") {
-    return <audio src={source.contentUrl} controls controlsList={canDownload ? undefined : "nodownload"} style={{ width: "100%" }} />;
+    return <audio src={mediaUrl} controls onError={() => setContentError(t("page.shared_doc.preview_unavailable"))} controlsList={canDownload ? undefined : "nodownload"} style={{ width: "100%" }} />;
   }
-  if (kind === "unsupported") return <PreviewFallback message={t("page.shared_doc.preview_unsupported")} />;
-  if (contentError) return <PreviewFallback />;
   if (previewContent == null) return <PreviewLoading />;
 
   if (kind === "markdown") {

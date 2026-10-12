@@ -19,6 +19,7 @@ from packages.core.service_role import (
 def test_service_role_normalizes_supported_roles():
     assert normalize_service_role("chat") == "chat"
     assert normalize_service_role("worker-heavy") == "worker-heavy"
+    assert normalize_service_role("worker-room") == "worker-room"
     assert normalize_service_role("sandbox") == "sandbox"
     assert normalize_service_role("unknown") == "api"
 

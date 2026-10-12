@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import DocxReadOnlyViewer from "../DocxReadOnlyViewer";
 import { t } from "../../lib/i18n";
+import { withFilePreviewTimeout } from "../../lib/filePreviewSource";
 import type { PreviewPage, ReadOnlyPreviewSource } from "./types";
 
 interface OfficePreviewProps {
@@ -23,9 +24,10 @@ export default function OfficePreview({ kind, name, source, fallback }: OfficePr
       setError(true);
       return () => { cancelled = true; };
     }
-    void load()
+    void withFilePreviewTimeout<{ pages: PreviewPage[] } | { slides: PreviewPage[] }>(load(), 30_000, "Office preview timed out")
       .then((result) => {
-        if (cancelled || !("pages" in result ? result.pages : result.slides).length) return;
+        if (cancelled) return;
+        if (!("pages" in result ? result.pages : result.slides).length) { setError(true); return; }
         setPages("pages" in result ? result.pages : result.slides);
       })
       .catch(() => {
@@ -35,7 +37,7 @@ export default function OfficePreview({ kind, name, source, fallback }: OfficePr
   }, [kind, source]);
 
   if (pages == null && !error) return <PreviewLoading />;
-  if (!pages?.length) {
+  if (error || !pages?.length) {
     if (fallback) return <>{fallback}</>;
     return <PreviewFallback />;
   }
@@ -51,6 +53,7 @@ export default function OfficePreview({ kind, name, source, fallback }: OfficePr
           width={page.width || undefined}
           height={page.height || undefined}
           loading={page.index === 0 ? "eager" : "lazy"}
+          onError={() => setError(true)}
           style={{ display: "block", width: "100%", height: "auto", margin: "0 auto", border: "1px solid rgba(28,25,23,0.06)" }}
         />
       ))}
@@ -58,8 +61,8 @@ export default function OfficePreview({ kind, name, source, fallback }: OfficePr
   );
 }
 
-export function DocxOfficePreview({ name, source }: Pick<OfficePreviewProps, "name" | "source">) {
-  return <OfficePreview kind="docx" name={name} source={source} fallback={<DocxReadOnlyViewer url={source.contentUrl} />} />;
+export function DocxOfficePreview({ name, source, blob }: Pick<OfficePreviewProps, "name" | "source"> & { blob?: Blob | null }) {
+  return <OfficePreview kind="docx" name={name} source={source} fallback={<DocxReadOnlyViewer blob={blob} url={source.contentUrl} />} />;
 }
 
 function PreviewLoading() {

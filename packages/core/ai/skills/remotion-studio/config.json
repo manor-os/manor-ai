@@ -1,0 +1,23 @@
+{
+  "id": "remotion-studio",
+  "name": "remotion-studio",
+  "display_name": "Remotion Studio",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Preview a Remotion video.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "studio",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["preview", "timeline", "playback", "dev server", "inspect", "still preview", "editor"],
+    "examples": ["preview remotion video in studio", "open remotion studio for composition", "inspect composition frames", "still preview of remotion scene"]
+  }
+}

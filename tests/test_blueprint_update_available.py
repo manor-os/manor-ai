@@ -22,22 +22,28 @@ import copy
 import pytest
 
 from packages.core.blueprints.freshness import (
+    BLUEPRINT_VERSION_KEY,
     CONTENT_FINGERPRINT_KEY,
+    LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY,
+    LAST_PARTIAL_UPGRADE_VERSION_KEY,
     SECTION_FINGERPRINTS_KEY,
     BlueprintFreshness,
     blueprint_content_fingerprint,
     blueprint_freshness,
     blueprint_section_fingerprints,
     blueprint_update_summary,
+    blueprint_upgrade_unsupported_fingerprint,
+    normalize_blueprint_upgrade_unsupported_fingerprint,
 )
-from packages.core.blueprints.solo_company import get_solo_company_blueprint
+from tests.blueprint_test_payload import load_upgrade_blueprint as load_test_blueprint
 
-SLUG = "solo-video-account-studio-v1"
+SLUG = "test-workspace-upgrade"
+load_upgrade_blueprint = load_test_blueprint
 
 
 @pytest.fixture
 def payload():
-    return get_solo_company_blueprint(SLUG)
+    return load_upgrade_blueprint(SLUG)
 
 
 def _installed(fingerprint=None, *, sections=None, slug=SLUG, blueprint_id=None):
@@ -83,6 +89,32 @@ def test_presentation_copy_is_not_an_update(payload):
     edited["manifest"]["summary"] = "reworded for the marketplace card"
     edited["manifest"]["title"] = "Renamed"
     assert blueprint_content_fingerprint(edited) == blueprint_content_fingerprint(payload)
+
+
+def test_component_release_versions_do_not_require_workspace_reconfiguration(payload):
+    """Published component versions must not turn a surgical upgrade partial."""
+    edited = copy.deepcopy(payload)
+    edited["embedded"]["skills"][0]["version"] = "99.0"
+    edited["embedded"]["agents"][0]["version"] = "99.0"
+    edited["recipe"]["workflows"][0]["version"] = 99
+
+    assert blueprint_content_fingerprint(edited) != blueprint_content_fingerprint(payload)
+    assert (
+        blueprint_upgrade_unsupported_fingerprint(edited)
+        == blueprint_upgrade_unsupported_fingerprint(payload)
+    )
+
+
+def test_existing_component_version_fingerprint_is_normalized(payload):
+    legacy = blueprint_upgrade_unsupported_fingerprint(
+        payload,
+        include_component_versions=True,
+    )
+
+    assert normalize_blueprint_upgrade_unsupported_fingerprint(
+        legacy,
+        payload,
+    ) == blueprint_upgrade_unsupported_fingerprint(payload)
 
 
 @pytest.mark.parametrize("value", [None, {}, "not a payload", []])
@@ -167,17 +199,6 @@ def test_a_current_workspace_lists_no_changes(payload):
 # ── The two ends of the wire ──────────────────────────────────────────
 
 
-def test_installing_records_the_fingerprint():
-    """Without this the next install is as blind as the 07-22 one."""
-    import inspect
-
-    from packages.core.blueprints import installer
-
-    body = inspect.getsource(installer)
-    assert "CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(source_payload)" in body
-    assert "SECTION_FINGERPRINTS_KEY: blueprint_section_fingerprints(source_payload)" in body
-
-
 def test_the_workspace_api_reports_it():
     import inspect
 
@@ -238,18 +259,6 @@ def test_the_workspace_list_looks_payloads_up_once():
     assert "_blueprint_payloads_for(db, workspaces)" in body
 
 
-def test_installing_records_the_fingerprint_for_any_payload():
-    """Recording already worked for both routes — install_blueprint is the
-    single door, and it fingerprints whatever payload it is handed. Only the
-    reading side knew about built-ins."""
-    import inspect
-
-    from packages.core.blueprints import installer
-
-    body = inspect.getsource(installer.install_blueprint)
-    assert "blueprint_content_fingerprint(source_payload)" in body
-
-
 # ── Identity is the id; the version is what moves ─────────────────────
 
 
@@ -257,7 +266,7 @@ def test_publishing_an_edit_bumps_the_version_by_itself():
     """The owner should never have to remember. Publishing IS the intent."""
     from packages.core.blueprints.freshness import next_content_version
 
-    payload = get_solo_company_blueprint(SLUG)
+    payload = load_upgrade_blueprint(SLUG)
     version, fingerprint = next_content_version(
         current_version="1.0.0", stored_fingerprint=None, payload=payload,
     )
@@ -269,7 +278,7 @@ def test_republishing_the_same_content_does_not_bump():
     no-op — the badge people learn to dismiss."""
     from packages.core.blueprints.freshness import next_content_version
 
-    payload = get_solo_company_blueprint(SLUG)
+    payload = load_upgrade_blueprint(SLUG)
     fingerprint = blueprint_content_fingerprint(payload)
     assert next_content_version(
         current_version="1.2.3", stored_fingerprint=fingerprint, payload=payload,
@@ -280,7 +289,7 @@ def test_marketplace_copy_edits_do_not_bump():
     """Retitling a listing changes nothing an install received."""
     from packages.core.blueprints.freshness import next_content_version
 
-    payload = get_solo_company_blueprint(SLUG)
+    payload = load_upgrade_blueprint(SLUG)
     fingerprint = blueprint_content_fingerprint(payload)
     edited = copy.deepcopy(payload)
     edited["manifest"]["summary"] = "reworded for the listing"
@@ -292,7 +301,7 @@ def test_marketplace_copy_edits_do_not_bump():
 def test_editing_installed_content_bumps():
     from packages.core.blueprints.freshness import next_content_version
 
-    payload = get_solo_company_blueprint(SLUG)
+    payload = load_upgrade_blueprint(SLUG)
     fingerprint = blueprint_content_fingerprint(payload)
     edited = copy.deepcopy(payload)
     edited["embedded"]["skills"][0]["system_prompt"] = "a corrected procedure"
@@ -334,14 +343,32 @@ def test_equal_versions_still_detect_content_drift(payload):
 
 
 def test_equal_versions_and_content_are_current(payload):
-    from packages.core.blueprints.freshness import BLUEPRINT_VERSION_KEY
-
     settings = _installed(blueprint_content_fingerprint(payload))
     settings["_blueprint"][BLUEPRINT_VERSION_KEY] = "1.2.3"
 
     assert blueprint_freshness(
         settings, payload, current_version="1.2.3",
     ) is BlueprintFreshness.CURRENT
+
+
+def test_confirmed_partial_upgrade_is_not_advertised_as_the_same_update(payload):
+    fingerprint = blueprint_content_fingerprint(payload)
+    settings = _installed("older-fingerprint")
+    settings["_blueprint"].update({
+        BLUEPRINT_VERSION_KEY: "1.2.2",
+        LAST_PARTIAL_UPGRADE_VERSION_KEY: "1.2.3",
+        LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY: fingerprint,
+    })
+
+    assert blueprint_freshness(
+        settings, payload, current_version="1.2.3",
+    ) is BlueprintFreshness.RECONFIGURE_REQUIRED
+
+    newer = copy.deepcopy(payload)
+    newer["embedded"]["skills"][0]["system_prompt"] += " New release."
+    assert blueprint_freshness(
+        settings, newer, current_version="1.2.4",
+    ) is BlueprintFreshness.UPDATE_AVAILABLE
 
 
 def test_the_version_decides_even_when_the_payload_cannot_be_read(payload):
@@ -388,14 +415,17 @@ def test_builtin_installs_use_the_same_canonical_row_as_marketplace_installs():
     assert "blueprint_version=source_version" in body
 
 
-def test_legacy_builtin_installs_resolve_to_the_platform_row():
-    """Existing workspaces with the old null id stay upgradeable by slug."""
+def test_null_id_blueprint_records_are_not_repaired_from_their_slug():
+    """A display slug cannot establish an upgrade source."""
     from apps.api.routers.workspaces import _workspace_blueprint_id
     from packages.core.blueprints.seed import BlueprintRowReference
 
-    assert _workspace_blueprint_id({
-        "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": None},
-    }) == f"builtin:{SLUG}"
+    assert _workspace_blueprint_id({"_blueprint": {
+        "blueprint_slug": SLUG, "blueprint_id": None,
+    }}) == ""
+    assert _workspace_blueprint_id({"_blueprint": {
+        "blueprint_slug": SLUG, "blueprint_id": None, "source": "marketplace",
+    }}) == ""
     assert _workspace_blueprint_id({
         "_blueprint": {"blueprint_slug": SLUG, "blueprint_id": "01CUSTOM"},
     }) == "01CUSTOM"
@@ -403,7 +433,7 @@ def test_legacy_builtin_installs_resolve_to_the_platform_row():
     assert BlueprintRowReference(None, SLUG).blueprint_slug == SLUG
 
 
-def test_legacy_builtin_summary_exposes_the_repaired_identity(payload):
+def test_null_id_blueprint_summary_is_unbound(payload):
     from types import SimpleNamespace
 
     from apps.api.routers.workspaces import _blueprint_update_for
@@ -420,6 +450,4 @@ def test_legacy_builtin_summary_exposes_the_repaired_identity(payload):
         (payload, "1.0.0", f"builtin:{SLUG}"),
     )
 
-    assert summary is not None
-    assert summary["blueprint_id"] == f"builtin:{SLUG}"
-    assert summary["status"] == BlueprintFreshness.CURRENT.value
+    assert summary is None

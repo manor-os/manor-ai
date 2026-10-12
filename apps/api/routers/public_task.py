@@ -150,19 +150,18 @@ async def public_update_status(
 
     if req.status:
         from packages.core.constants.task import VALID_STATUSES
-        from packages.core.services.task_state_machine import TERMINAL_STATUSES, apply_task_status_transition
+        from packages.core.services.task_service import update_task
 
         if req.status not in VALID_STATUSES:
             raise HTTPException(400, f"Invalid status: {req.status}")
-        await apply_task_status_transition(task, req.status, db=db)
-        if req.status in TERMINAL_STATUSES:
-            from packages.core.services.workspace_operation_service import check_work_batch_completion
-
-            await check_work_batch_completion(
-                db,
-                task,
-                trigger_source="public_task.update_status",
-            )
+        task = await update_task(
+            db,
+            task.id,
+            task.entity_id,
+            status=req.status,
+        )
+        if task is None:
+            raise HTTPException(404, "Task not found")
 
     if req.comment:
         log = TaskLog(
@@ -186,10 +185,16 @@ async def public_complete_task(
     """Mark task as completed (staff finishing on-site)."""
     task = await _get_task_by_code(req.code, db)
 
-    from packages.core.services.task_state_machine import apply_task_status_transition
-    from packages.core.services.workspace_operation_service import check_work_batch_completion
+    from packages.core.services.task_service import update_task
 
-    await apply_task_status_transition(task, "completed", db=db)
+    task = await update_task(
+        db,
+        task.id,
+        task.entity_id,
+        status="completed",
+    )
+    if task is None:
+        raise HTTPException(404, "Task not found")
 
     if req.notes:
         log = TaskLog(
@@ -200,12 +205,6 @@ async def public_complete_task(
             created_by="staff (public)",
         )
         db.add(log)
-    await check_work_batch_completion(
-        db,
-        task,
-        trigger_source="public_task.complete",
-    )
-
     await db.flush()
     return {"status": "completed"}
 

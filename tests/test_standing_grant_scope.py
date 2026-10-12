@@ -1,16 +1,4 @@
-"""Phase 3 §4.3 — "Approve" and "Always" are two different questions.
-
-§4.3 names them: an ``authorize`` request is minted at ``scope=action`` ("may I
-do this one thing, with the content you just read?"), and "Always" is a
-PROMOTION of it to ``scope=tool`` — a standing capability grant. The promotion
-is the existing ``grant_approval(standing=True)``; the scope is what makes the
-audit trail say which question was answered.
-
-Scope DESCRIBES the promotion; it does not restrict it. There is no capability
-class the system withholds "Always" from — the user is the authority on what
-they want standing, and ``never_allow`` (which they can edit) is the only hard
-block. See ``test_unified_approvals`` for the publish-class proof.
-"""
+"""Single-operation approval scope and the versioned saved-rule boundary."""
 from __future__ import annotations
 
 import pytest
@@ -32,11 +20,11 @@ from packages.core.services.hitl_options import (
 # ── the option vocabulary ──────────────────────────────────
 
 
-def test_every_approval_card_offers_always():
-    """No capability tier withholds the button. One vocabulary, no exceptions."""
-    assert approval_options() == ["approve", "always_approve", "reject"]
+def test_approval_cards_filter_retired_always_choice():
+    """Persistent consent is edited through the versioned settings service."""
+    assert approval_options() == ["approve", "reject"]
     assert approval_options(["approve", "always_approve", "reject"]) == [
-        "approve", "always_approve", "reject",
+        "approve", "reject",
     ]
 
 
@@ -62,19 +50,20 @@ def test_a_card_with_no_standing_subject_offers_approve_once():
 
 
 @pytest.mark.asyncio
-async def test_review_request_cannot_be_promoted_to_standing() -> None:
+@pytest.mark.parametrize("hitl_type", [HitlType.REVIEW.value, HitlType.AUTHORIZE.value])
+async def test_unversioned_card_cannot_be_promoted_to_standing(hitl_type) -> None:
     request = HitlRequest(
         entity_id="ent_1",
         workspace_id="ws_1",
         origin_kind="step",
         status="pending",
         dedup_key="step:step_1",
-        hitl_type=HitlType.REVIEW.value,
+        hitl_type=hitl_type,
         payload={},
         context={},
     )
 
-    with pytest.raises(ValueError, match="only valid for authorize"):
+    with pytest.raises(ValueError, match="versioned approval-settings command"):
         await grant_approval(
             None,
             request,
@@ -83,10 +72,13 @@ async def test_review_request_cannot_be_promoted_to_standing() -> None:
             standing=True,
         )
 
+    assert request.status == "pending"
+    assert request.decided_at is None
+
 
 def test_typed_decision_projection_distinguishes_authorize_review_and_error():
     assert decision_options_for_hitl(HitlType.AUTHORIZE.value) == [
-        "approve", "always_approve", "reject",
+        "approve", "reject",
     ]
     assert review_card_options() == ["approve", "request_changes", "reject"]
     assert decision_options_for_hitl(HitlType.REVIEW.value) == [

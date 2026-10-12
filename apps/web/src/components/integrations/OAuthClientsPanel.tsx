@@ -10,6 +10,7 @@ import Modal from "../ui/Modal";
 import { useToastStore } from "../../stores/toast";
 import { IconExternalLink } from "../icons";
 import { t } from "../../lib/i18n";
+import { PLATFORM_OAUTH_CLIENTS_HREF } from "../../lib/integrationSetupLinks";
 
 
 type OAuthClient = {
@@ -55,6 +56,7 @@ export default function OAuthClientsPanel({
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
   const privateApiEnabled = !authLoading && Boolean(authToken);
+  let larkPlatformAdmin = false;
   const [editing, setEditing] = useState<OAuthClient | null>(null);
   const [healthResults, setHealthResults] = useState<Record<string, {
     ok: boolean; status_code: number | null; detail: string;
@@ -221,10 +223,14 @@ export default function OAuthClientsPanel({
                       disabled={!c.configured || health === "loading"}
                     >
                       {t("page.invoke_modal.test")}</Button>
-                    <Button variant="outline" size="sm" onClick={() => setEditing(c)}>
-                      {c.configured ? t("component.oauth_clients_panel.override") : t("page.apps.configure")}
+                    <Button variant="outline" size="sm" onClick={() => {
+                      if (c.server_key === "lark" && larkPlatformAdmin) window.location.href = PLATFORM_OAUTH_CLIENTS_HREF;
+                      else setEditing(c);
+                    }}>
+                      {c.server_key === "lark" && larkPlatformAdmin ? t("page.integrations.lark_admin_configuration")
+                        : c.configured ? t("component.oauth_clients_panel.override") : t("page.apps.configure")}
                     </Button>
-                    {c.source === "ui" && (
+                    {c.source === "ui" && !(c.server_key === "lark" && larkPlatformAdmin) && (
                       <Button
                         variant="ghost"
                         size="sm"

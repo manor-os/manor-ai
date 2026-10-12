@@ -22,7 +22,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx src/cli.ts",
-    "smoke": "tsx test/smoke.ts"
+    "smoke": "tsx test/smoke.ts && tsx --test test/backpressure.ts"
   },
   "engines": {
     "node": ">=20"

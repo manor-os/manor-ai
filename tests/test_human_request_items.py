@@ -9,8 +9,11 @@ Covers:
   with causation_id = item id; chat surfacing is invoked
 * commitment fulfilment flips the item to succeeded (finished_at set);
   decline flips it to cancelled — both via the resolve_commitment hook
-* _post_human_request_chat posts plain informational messages
-  (message_kind="hitl_request", NO pending_action)
+* _post_human_request_chat posts answerable human_input cards
+  (message_kind="hitl_request", pending_action.kind="human_input")
+* POST /workspaces/{id}/chat/messages/{id}/resolve on that card fulfills or
+  declines the commitment and dispatches event Strategist when the queue is
+  empty and no proposal still awaits a decision
 * POST /human-queue/commitments/{id}/respond: fulfill + decline flows,
   409 on double-respond, 403 for a viewer on role-required commitments,
   fallback-allow for role-free commitments, 404 cross-entity
@@ -21,6 +24,9 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+
+from tests.strategist_helpers import proposal_with_execution_review
+from tests.approval_settings_test_utils import initialize_test_approval_owners
 
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -34,6 +40,8 @@ from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
 from packages.core.models.participant import HumanCommitment
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
+from packages.core.models.task import Conversation, Message, Task
+from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace, WorkspaceStaff
 from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.services import feature_flags as feature_flags_service
@@ -76,7 +84,14 @@ async def _seed_workspace(db) -> Workspace:
         service_key="ops",
         status="active",
     )
-    db.add_all([workspace, goal, agent, subscription])
+    db.add_all([
+        User(id=entity_id, entity_id=entity_id, email=f"{entity_id}@example.test",
+             password_hash="fixture", role="owner", status="active"),
+        UserMembership(user_id=entity_id, entity_id=entity_id, role="owner", status="active"),
+        workspace, goal, agent, subscription,
+    ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=entity_id)
     await db.commit()
     return workspace
 
@@ -148,7 +163,7 @@ _TASKS_AND_HUMAN_REQUESTS = {
 
 def _fake_completion(payload: dict):
     async def fake(system_prompt, user_prompt, **kwargs):
-        return SimpleNamespace(content=json.dumps(payload))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payload, user_prompt)))
     return fake
 
 
@@ -332,9 +347,138 @@ async def test_commitment_fulfilment_and_decline_drive_item_status(db_session, m
         assert events[0].actor_id == user_id
 
 
-# ── chat surface (plain informational message) ────────────────────────
+async def test_resolve_commitment_closes_informational_hitl_chat(db_session):
+    """Fulfilled Human-queue answers must close the linked chat card.
 
-async def test_post_human_request_chat_posts_plain_messages(db_session, monkeypatch):
+    The Strategist posts these as message_kind=hitl_request with no
+    pending_action, so the chat UI kept showing Input needed after the
+    queue item was already answered.
+    """
+    workspace = await _seed_workspace(db_session)
+    commitment = await open_commitment(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        request_kind="input",
+        source_kind="proposal_item",
+        source_id=generate_ulid(),
+        expected_input="What genre should Tonight use?",
+    )
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        scope="workspace_main",
+    )
+    message = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content=(
+            "Strategist needs a human input: What genre should Tonight use?\n"
+            "Respond (or decline) from the workspace Human queue."
+        ),
+        author_kind="agent",
+        message_kind="hitl_request",
+        refs=[{"type": "human_commitment", "id": commitment.id}],
+    )
+    other = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content="This task stopped before it finished.",
+        author_kind="agent",
+        message_kind="hitl_request",
+        pending_action={"kind": "task_recovery", "task_id": generate_ulid()},
+        refs=[{"type": "task", "id": generate_ulid()}],
+    )
+    db_session.add_all([conversation, message, other])
+    await db_session.flush()
+
+    await resolve_commitment(
+        db_session,
+        commitment,
+        status="fulfilled",
+        response={"text": "Primary genre: none"},
+        participant_id=generate_ulid(),
+    )
+    await db_session.refresh(message)
+    await db_session.refresh(other)
+
+    assert message.resolved_at is not None
+    assert message.resolution == {"choice": "fulfilled", "source": "human_commitment"}
+    assert message.content.startswith("Answered.")
+    assert "Human queue" not in message.content
+    assert other.resolved_at is None
+    assert other.pending_action["kind"] == "task_recovery"
+
+
+async def test_resolve_commitment_closes_pending_action_hitl_chat(db_session):
+    """Queue answers must also close the chat human_input card."""
+    workspace = await _seed_workspace(db_session)
+    commitment = await open_commitment(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        request_kind="input",
+        source_kind="proposal_item",
+        source_id=generate_ulid(),
+        expected_input="Upload Tonight source files",
+    )
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        scope="workspace_main",
+    )
+    message = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content="Strategist needs a human input: Upload Tonight source files",
+        author_kind="agent",
+        message_kind="hitl_request",
+        pending_action={
+            "kind": "human_input",
+            "hitl_type": "input",
+            "commitment_id": commitment.id,
+            "prompt": "Upload Tonight source files",
+        },
+        refs=[{"type": "human_commitment", "id": commitment.id}],
+    )
+    other = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content="This task stopped before it finished.",
+        author_kind="agent",
+        message_kind="hitl_request",
+        pending_action={"kind": "task_recovery", "task_id": generate_ulid()},
+        refs=[{"type": "task", "id": generate_ulid()}],
+    )
+    db_session.add_all([conversation, message, other])
+    await db_session.flush()
+
+    await resolve_commitment(
+        db_session,
+        commitment,
+        status="fulfilled",
+        response={"text": "files attached"},
+        participant_id=generate_ulid(),
+    )
+    await db_session.refresh(message)
+    await db_session.refresh(other)
+
+    assert message.resolved_at is not None
+    assert message.resolution == {"choice": "fulfilled", "source": "human_commitment"}
+    assert message.content.startswith("Answered.")
+    assert other.resolved_at is None
+    assert other.pending_action["kind"] == "task_recovery"
+
+
+# ── chat surface (answerable human_input card) ────────────────────────
+
+async def test_post_human_request_chat_posts_input_cards(db_session, monkeypatch):
     import packages.core.database as db_module
     from packages.core.workspace_chat import service as chat_service
 
@@ -377,11 +521,16 @@ async def test_post_human_request_chat_posts_plain_messages(db_session, monkeypa
     assert len(posted) == 2
     for call in posted:
         assert call["message_kind"] == "hitl_request"
-        assert call.get("pending_action") is None  # informational only
-        assert "Human queue" in call["body"]
+        action = call.get("pending_action") or {}
+        assert action.get("kind") == "human_input"
+        assert action.get("hitl_type") == "input"
+        assert "Human queue" not in call["body"]
+    assert posted[0]["pending_action"]["commitment_id"] == "hc_1"
+    assert posted[0]["pending_action"]["prompt"] == "Confirm the pivot?"
     assert "Confirm the pivot?" in posted[0]["body"]
     assert posted[0]["refs"] == [{"type": "human_commitment", "id": "hc_1"}]
     assert "Role: workspace_owner" in posted[0]["body"]
+    assert posted[1]["pending_action"]["commitment_id"] == "hc_2"
 
 
 # ── respond endpoint ──────────────────────────────────────────────────
@@ -523,6 +672,10 @@ async def test_respond_endpoint_fulfill_decline_and_auth(client: AsyncClient):
         refreshed_item = await db.get(ProposalItemRecord, item_id)
         assert refreshed_item.status == "succeeded"
         assert refreshed_item.finished_at is not None
+        refreshed_record = await db.get(ProposalRecord, refreshed_item.proposal_id)
+        assert refreshed_record is not None
+        assert refreshed_record.status == "resolved"
+        assert refreshed_record.resolved_at is not None
 
     # Double-respond → 409.
     again = await client.post(
@@ -540,3 +693,678 @@ async def test_respond_endpoint_fulfill_decline_and_auth(client: AsyncClient):
     )
     assert declined.status_code == 200, declined.text
     assert declined.json()["status"] == "declined"
+
+
+async def test_respond_last_fulfill_dispatches_event_strategist(client: AsyncClient, monkeypatch):
+    from packages.core.tasks import ai_tasks
+
+    calls = []
+
+    def _capture(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return SimpleNamespace(id="celery-task")
+
+    monkeypatch.setattr(ai_tasks.run_strategist_review, "apply_async", _capture)
+
+    owner = await _register(client, "hr_last_fulfill")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Last Fulfill WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_only",
+            expected_input="Release facts",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+
+    fulfilled = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/human-queue/commitments/{commitment_id}/respond",
+        headers=owner["headers"],
+        json={"action": "fulfill", "response": "Artist is Alex Chen."},
+    )
+    assert fulfilled.status_code == 200, fulfilled.text
+    assert fulfilled.json()["status"] == "fulfilled"
+    assert len(calls) == 1
+    queued_kwargs = calls[0]["kwargs"]
+    assert queued_kwargs.get("args") == [workspace_id]
+    inner = queued_kwargs.get("kwargs") or {}
+    assert inner.get("trigger_kind") == "event"
+    assert inner.get("trigger_detail", "").startswith("human commitment fulfilled:")
+    assert inner.get("user_id") == owner["user_id"]
+    assert queued_kwargs.get("countdown") == 1
+
+
+
+async def test_respond_last_fulfill_does_not_dispatch_when_proposals_await_decision(
+    client: AsyncClient, monkeypatch,
+):
+    from packages.core.tasks import ai_tasks
+
+    calls = []
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    owner = await _register(client, "hr_open_proposal_fulfill")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Open Proposal Fulfill WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        await _seed_proposed_task(
+            db, entity_id=owner["entity_id"], workspace_id=workspace_id,
+        )
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_facts",
+            expected_input="Release facts",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+
+    fulfilled = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/human-queue/commitments/{commitment_id}/respond",
+        headers=owner["headers"],
+        json={"action": "fulfill", "response": "Artist is Alex Chen."},
+    )
+    assert fulfilled.status_code == 200, fulfilled.text
+    assert fulfilled.json()["status"] == "fulfilled"
+    assert calls == []
+
+
+async def test_respond_fulfill_does_not_dispatch_while_queue_still_waiting(client: AsyncClient, monkeypatch):
+    from packages.core.tasks import ai_tasks
+
+    calls = []
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    owner = await _register(client, "hr_still_waiting")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Still Waiting WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        first = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_first",
+            expected_input="Artist name",
+        )
+        await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_second",
+            expected_input="Release date",
+        )
+        await db.commit()
+        first_id = first.id
+
+    fulfilled = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/human-queue/commitments/{first_id}/respond",
+        headers=owner["headers"],
+        json={"action": "fulfill", "response": "Alex Chen"},
+    )
+    assert fulfilled.status_code == 200, fulfilled.text
+    assert calls == []
+
+
+async def test_respond_fulfill_stays_ok_when_strategist_dispatch_fails(client: AsyncClient, monkeypatch):
+    from packages.core.tasks import ai_tasks
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(ai_tasks.run_strategist_review, "apply_async", _boom)
+
+    owner = await _register(client, "hr_dispatch_fail")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Dispatch Fail WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_fail",
+            expected_input="Cover art",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+
+    fulfilled = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/human-queue/commitments/{commitment_id}/respond",
+        headers=owner["headers"],
+        json={"action": "fulfill", "response": "Cover uploaded."},
+    )
+    assert fulfilled.status_code == 200, fulfilled.text
+    assert fulfilled.json()["status"] == "fulfilled"
+
+
+
+
+async def _seed_proposed_task(db, *, entity_id: str, workspace_id: str) -> Task:
+    task = Task(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        title="Undecided proposal from the last review",
+        description="Waiting on the operator.",
+        status="proposed",
+        details={"strategist_review_id": "rv_prev"},
+    )
+    db.add(task)
+    return task
+
+
+async def _seed_need_input_card(
+    db,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    commitment_id: str,
+    prompt: str,
+) -> str:
+    conversation = Conversation(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scope="workspace_main",
+        channel="web",
+    )
+    message = Message(
+        id=generate_ulid(),
+        conversation_id=conversation.id,
+        role="assistant",
+        content=f"Strategist needs a human input: {prompt}",
+        author_kind="agent",
+        message_kind="hitl_request",
+        pending_action={
+            "kind": "human_input",
+            "hitl_type": "input",
+            "commitment_id": commitment_id,
+            "prompt": prompt,
+        },
+        refs=[{"type": "human_commitment", "id": commitment_id}],
+    )
+    db.add_all([conversation, message])
+    await db.flush()
+    return message.id
+
+
+async def test_chat_resolve_last_human_input_fulfills_and_dispatches_event_strategist(
+    client: AsyncClient, monkeypatch,
+):
+    from packages.core.tasks import ai_tasks
+    from packages.core.models.document import Document
+
+    calls = []
+
+    def _capture(*args, **kwargs):
+        calls.append({"args": args, "kwargs": kwargs})
+        return SimpleNamespace(id="celery-task")
+
+    monkeypatch.setattr(ai_tasks.run_strategist_review, "apply_async", _capture)
+
+    owner = await _register(client, "hr_chat_last_fulfill")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Chat Last Fulfill WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        db.add(Document(
+            id="doc_wav", entity_id=owner["entity_id"], owner_id=owner["user_id"],
+            name="Tonight.wav", source="agent", visibility="private",
+        ))
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_chat_only",
+            expected_input="Upload Tonight source files",
+        )
+        message_id = await _seed_need_input_card(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            commitment_id=commitment.id,
+            prompt="Upload Tonight source files",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
+        headers=owner["headers"],
+        json={
+            "choice": "respond",
+            "note": "here are the files",
+            "payload": {
+                "response": "here are the files",
+                "attachments": [{"name": "Tonight.wav", "id": "doc_wav", "type": "knowledge"}],
+            },
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_at"] is not None
+
+    async with db_module.async_session() as db:
+        stored = await db.get(HumanCommitment, commitment_id)
+        assert stored is not None
+        assert stored.status == "fulfilled"
+        assert (stored.response or {}).get("text") == "here are the files"
+        assert (stored.response or {}).get("attachments") == [
+            {"name": "Tonight.wav", "id": "doc_wav", "document_id": "doc_wav",
+             "type": "knowledge", "viewer_url": "/viewer/doc_wav"},
+        ]
+
+    assert len(calls) == 1
+    queued_kwargs = calls[0]["kwargs"]
+    assert queued_kwargs.get("args") == [workspace_id]
+    inner = queued_kwargs.get("kwargs") or {}
+    assert inner.get("trigger_kind") == "event"
+    assert inner.get("trigger_detail", "").startswith("human commitment fulfilled:")
+    assert inner.get("user_id") == owner["user_id"]
+    assert queued_kwargs.get("countdown") == 1
+
+
+
+async def test_chat_resolve_last_human_input_does_not_dispatch_when_proposals_await_decision(
+    client: AsyncClient, monkeypatch,
+):
+    from packages.core.tasks import ai_tasks
+
+    calls = []
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    owner = await _register(client, "hr_chat_open_proposal")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Chat Open Proposal WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        await _seed_proposed_task(
+            db, entity_id=owner["entity_id"], workspace_id=workspace_id,
+        )
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_chat_open",
+            expected_input="Upload Tonight source files",
+        )
+        message_id = await _seed_need_input_card(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            commitment_id=commitment.id,
+            prompt="Upload Tonight source files",
+        )
+        await db.commit()
+
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
+        headers=owner["headers"],
+        json={
+            "choice": "respond",
+            "note": "here are the files",
+            "payload": {"response": "here are the files"},
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["resolved_at"] is not None
+    assert calls == []
+
+
+async def test_chat_resolve_hitl_attachments_project_into_workspace_knowledge(
+    client: AsyncClient, monkeypatch,
+):
+    from packages.core.models.document import Document, DocumentGroupMember
+    from packages.core.services.document_service import create_document, list_documents
+    from packages.core.tasks import ai_tasks
+    from packages.core.workspace_chat.context import _commitment_answer_text
+
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: SimpleNamespace(id="celery-task"),
+    )
+
+    owner = await _register(client, "hr_chat_hitl_attach")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "HITL Attach WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        doc = await create_document(
+            db,
+            owner["entity_id"],
+            name="Tonight.wav",
+            fs_path="Tonight.wav",
+            source="upload",
+            owner_id=owner["user_id"],
+            skip_storage_check=True,
+            emit_created_event=False,
+        )
+        assert doc.visibility == "private"
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_hitl_attach",
+            expected_input="Upload Tonight source files",
+        )
+        message_id = await _seed_need_input_card(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            commitment_id=commitment.id,
+            prompt="Upload Tonight source files",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+        document_id = doc.id
+
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
+        headers=owner["headers"],
+        json={
+            "choice": "respond",
+            "note": "here are the files",
+            "payload": {
+                "response": "here are the files",
+                "attachments": [{"name": "Tonight.wav", "id": document_id,
+                                 "type": "knowledge", "origin": "input_upload"}],
+            },
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    async with db_module.async_session() as db:
+        stored = await db.get(HumanCommitment, commitment_id)
+        assert stored is not None
+        assert stored.status == "fulfilled"
+        listed, total = await list_documents(
+            db, owner["entity_id"], workspace_id=workspace_id,
+        )
+        assert total >= 1
+        assert any(item.id == document_id for item in listed)
+        projected = await db.get(Document, document_id)
+        assert projected is not None
+        assert projected.visibility == "workspace"
+        origin = (projected.metadata_ or {}).get("origin") or {}
+        assert origin.get("workspace_id") == workspace_id
+        members = (await db.execute(
+            select(DocumentGroupMember).where(DocumentGroupMember.document_id == document_id)
+        )).scalars().all()
+        assert len(members) == 1
+        answer = _commitment_answer_text(stored.response)
+        assert "Tonight.wav" in answer
+        assert document_id in answer
+        assert "Tonight.wav" in answer and "path=Tonight.wav" in answer
+        workspace = await db.get(Workspace, workspace_id)
+        assert workspace is not None
+        assert projected.folder_id == workspace.artifact_folder_id
+        assert projected.fs_path == "Tonight.wav"
+
+
+async def test_chat_resolve_hitl_attachments_keep_physical_path_at_workspace_root(
+    client: AsyncClient, monkeypatch, tmp_path,
+):
+    from packages.core.config import get_settings
+    from packages.core.models.document import Document, DocumentGroupMember
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.document_service import create_document, list_documents
+    from packages.core.tasks import ai_tasks
+    from packages.core.workspace_chat.context import _commitment_answer_text
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: SimpleNamespace(id="celery-task"),
+    )
+
+    owner = await _register(client, "hr_chat_hitl_store")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "HITL Store WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+    entity_root = tmp_path / owner["entity_id"]
+    entity_root.mkdir(parents=True, exist_ok=True)
+    source = entity_root / "Tonight.wav"
+    source.write_bytes(b"RIFF....WAVEfmt ")
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        doc = await create_document(
+            db,
+            owner["entity_id"],
+            name="Tonight.wav",
+            fs_path="Tonight.wav",
+            file_size=source.stat().st_size,
+            source="upload",
+            owner_id=owner["user_id"],
+            skip_storage_check=True,
+            emit_created_event=False,
+        )
+        assert doc.visibility == "private"
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_hitl_store",
+            expected_input="Upload Tonight source files",
+        )
+        message_id = await _seed_need_input_card(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            commitment_id=commitment.id,
+            prompt="Upload Tonight source files",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+        document_id = doc.id
+
+    resolved = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
+        headers=owner["headers"],
+        json={
+            "choice": "respond",
+            "note": "here are the files",
+            "payload": {
+                "response": "here are the files",
+                "attachments": [{"name": "Tonight.wav", "id": document_id,
+                                 "type": "knowledge", "origin": "input_upload"}],
+            },
+        },
+    )
+    assert resolved.status_code == 200, resolved.text
+
+    async with db_module.async_session() as db:
+        stored = await db.get(HumanCommitment, commitment_id)
+        assert stored is not None
+        assert stored.status == "fulfilled"
+        listed, total = await list_documents(
+            db, owner["entity_id"], workspace_id=workspace_id,
+        )
+        assert total >= 1
+        assert any(item.id == document_id for item in listed)
+        projected = await db.get(Document, document_id)
+        workspace = await db.get(Workspace, workspace_id)
+        assert projected is not None
+        assert workspace is not None
+        assert workspace.artifact_folder_id
+        expected_path = "Tonight.wav"
+        assert projected.fs_path == expected_path
+        assert projected.folder_id == workspace.artifact_folder_id
+        assert projected.visibility == "workspace"
+        origin = (projected.metadata_ or {}).get("origin") or {}
+        assert origin.get("workspace_id") == workspace_id
+        members = (await db.execute(
+            select(DocumentGroupMember).where(DocumentGroupMember.document_id == document_id)
+        )).scalars().all()
+        assert len(members) == 1
+        answer = _commitment_answer_text(stored.response)
+        assert document_id in answer
+        assert f"path={expected_path}" in answer
+        assert source.is_file()
+
+
+async def test_chat_resolve_skip_declines_human_input_and_dispatches_review(
+    client: AsyncClient, monkeypatch,
+):
+    from packages.core.tasks import ai_tasks
+
+    calls = []
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    owner = await _register(client, "hr_chat_skip")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Chat Skip WS"},
+    )
+    assert ws_resp.status_code in (200, 201), ws_resp.text
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        commitment = await open_commitment(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            request_kind="input",
+            source_kind="chat",
+            source_id="m_chat_skip",
+            expected_input="Upload Tonight source files",
+        )
+        message_id = await _seed_need_input_card(
+            db,
+            entity_id=owner["entity_id"],
+            workspace_id=workspace_id,
+            commitment_id=commitment.id,
+            prompt="Upload Tonight source files",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+
+    skipped = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
+        headers=owner["headers"],
+        json={"choice": "skip"},
+    )
+    assert skipped.status_code == 200, skipped.text
+
+    async with db_module.async_session() as db:
+        stored = await db.get(HumanCommitment, commitment_id)
+        assert stored is not None
+        assert stored.status == "declined"
+
+    assert len(calls) == 1
+    assert calls[0][1]["kwargs"]["trigger_detail"] == (
+        f"human commitment declined: {commitment_id}"
+    )
+
+
+async def test_human_queue_decline_dispatches_review_when_queue_clears(
+    client: AsyncClient, monkeypatch,
+):
+    from packages.core.tasks import ai_tasks
+
+    calls = []
+    monkeypatch.setattr(
+        ai_tasks.run_strategist_review,
+        "apply_async",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    owner = await _register(client, "hr_queue_decline")
+    ws_resp = await client.post(
+        "/api/v1/workspaces", headers=owner["headers"], json={"name": "Queue Decline WS"},
+    )
+    workspace_id = ws_resp.json()["id"]
+
+    import packages.core.database as db_module
+    async with db_module.async_session() as db:
+        commitment = await open_commitment(
+            db, entity_id=owner["entity_id"], workspace_id=workspace_id,
+            request_kind="input", source_kind="chat", source_id="m_queue_decline",
+            expected_input="Optional artwork",
+        )
+        await db.commit()
+        commitment_id = commitment.id
+
+    declined = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/human-queue/commitments/{commitment_id}/respond",
+        headers=owner["headers"], json={"action": "decline"},
+    )
+    assert declined.status_code == 200, declined.text
+    assert declined.json()["status"] == "declined"
+    assert len(calls) == 1
+    assert calls[0][1]["kwargs"]["trigger_detail"] == (
+        f"human commitment declined: {commitment_id}"
+    )

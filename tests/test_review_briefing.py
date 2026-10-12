@@ -33,6 +33,7 @@ from packages.core.models.workspace import Workspace
 from packages.core.review import begin_review
 from packages.core.review.briefing import (
     BriefingTooLarge,
+    DecisionDigest,
     HARD_LIMIT_CHARS,
     ReviewBriefingModel,
     build_briefing,
@@ -137,7 +138,11 @@ async def test_build_briefing_full_workspace(db_session):
         db_session, workspace.id,
         event_type=et.PROPOSAL_ITEM_REJECTED, source_kind="proposal",
         source_id="task_rejected_1", causation_id="rv_prior",
-        payload={"title": "Rejected task", "rejection_reason": "too risky"},
+        payload={
+            "title": "Rejected task",
+            "rejection_reason": "too risky",
+            "rejection_reason_code": "WRONG_DIRECTION",
+        },
     )
     await _emit(db_session, workspace.id, event_type=et.EXECUTION_COMPLETED)
 
@@ -180,12 +185,16 @@ async def test_build_briefing_full_workspace(db_session):
     assert [d.decision for d in briefing.previous_decisions] == ["rejected", "approved"]
     rejected = briefing.previous_decisions[0]
     assert rejected.task_id == "task_rejected_1"
+    assert rejected.task_title == "Rejected task"
     assert rejected.review_id == "rv_prior"
     assert rejected.reason == "too risky"
+    assert rejected.reason_code == "WRONG_DIRECTION"
     assert rejected.decided_at is not None
     approved = briefing.previous_decisions[1]
     assert approved.task_id == "task_approved_1"
+    assert approved.task_title == "Approved task"
     assert approved.reason is None
+    assert approved.reason_code is None
 
     # open approvals: pending only, oldest first, digest fields present.
     assert len(briefing.open_approvals) == 2
@@ -202,6 +211,55 @@ async def test_build_briefing_full_workspace(db_session):
     dumped = briefing.model_dump(mode="json")
     import json
     json.dumps(dumped)
+
+
+def test_decision_digest_accepts_existing_saved_briefing_shape():
+    decision = DecisionDigest.model_validate({
+        "task_id": "old_task",
+        "review_id": "old_review",
+        "decision": "rejected",
+        "reason": None,
+    })
+    assert decision.task_title is None
+    assert decision.reason_code is None
+
+
+async def test_code_only_rejections_keep_title_and_reason_in_next_briefing(db_session):
+    workspace = await _workspace(db_session)
+    await _emit(
+        db_session, workspace.id,
+        event_type=et.PROPOSAL_ITEM_REJECTED,
+        source_kind="proposal",
+        source_id="score_task",
+        causation_id="prior_review",
+        payload={
+            "title": "Score active Goals from current evidence",
+            "rejection_reason_code": "WRONG_DIRECTION",
+        },
+    )
+    await _emit(
+        db_session, workspace.id,
+        event_type=et.PROPOSAL_ITEM_REJECTED,
+        source_kind="proposal",
+        source_id="legacy_task",
+        causation_id="older_review",
+        payload={"title": "Old proposal", "reason_code": "BAD_TIMING"},
+    )
+    review = await _begin(db_session, workspace.id)
+    briefing = await build_briefing(
+        db_session, review, [_report_row(review, domain="execution")],
+    )
+
+    by_task_id = {decision.task_id: decision for decision in briefing.previous_decisions}
+    assert by_task_id["score_task"].task_title == "Score active Goals from current evidence"
+    assert by_task_id["score_task"].reason_code == "WRONG_DIRECTION"
+    assert by_task_id["score_task"].reason is None
+    assert by_task_id["legacy_task"].reason_code == "BAD_TIMING"
+    rendered = render_briefing_markdown(briefing)
+    assert "title: Score active Goals from current evidence" in rendered
+    assert "reason_code: WRONG_DIRECTION" in rendered
+    assert "title: Old proposal" in rendered
+    assert "reason_code: BAD_TIMING" in rendered
 
 
 # ── top-K + coverage gaps ──────────────────────────────────────────────

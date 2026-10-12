@@ -19,11 +19,12 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.pending_action import LEASE_HITL_CLOSEABLE_KINDS
 from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
+from packages.core.constants.execution import COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY
 from packages.core.models.hitl_request import HitlRequest
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ ANSWERABLE_BLOCKER_KINDS: frozenset[str] = LEASE_HITL_CLOSEABLE_KINDS - {KIND_NE
 def _blocker_pending_kind(request: HitlRequest) -> str:
     context = request.context if isinstance(request.context, dict) else {}
     return str(context.get("pending_kind") or KIND_HUMAN_INPUT)
+
+
+from packages.core.services.task_chat_hitl import TASK_INPUT_ACTION_KEY  # noqa: E402
 
 
 async def list_open_task_blockers(
@@ -67,7 +71,15 @@ async def list_open_task_blockers(
             HitlRequest.entity_id == entity_id,
             HitlRequest.workspace_id == workspace_id,
             HitlRequest.status == ApprovalStatus.PENDING.value,
-            HitlRequest.origin_kind == ApprovalOriginKind.LEASE.value,
+            or_(
+                HitlRequest.origin_kind == ApprovalOriginKind.LEASE.value,
+                # A legacy agent task parked by request_input asks through a
+                # task-origin request; it is answerable the same way.
+                and_(
+                    HitlRequest.origin_kind == ApprovalOriginKind.TASK.value,
+                    HitlRequest.action_key == TASK_INPUT_ACTION_KEY,
+                ),
+            ),
         )
         .order_by(HitlRequest.created_at.asc())
         .limit(max(1, min(limit, 25)))
@@ -91,6 +103,91 @@ async def list_open_task_blockers(
             ),
         })
     return blockers
+
+
+async def _answer_task_input_request(
+    db: AsyncSession,
+    *,
+    request: HitlRequest,
+    user_id: str,
+    user_display: Optional[str],
+    answer: Optional[str],
+    answers: Optional[dict],
+    refuse: bool,
+) -> dict[str, Any]:
+    """Answer the question a legacy agent task asked through ``request_input``.
+
+    Returns ``_task_to_run`` for post-commit dispatch, the task-side twin of
+    ``_plan_to_run``.
+    """
+    from packages.core.governance.approvals import deny_approval
+    from packages.core.models.task import Task
+    from packages.core.services.task_input_resume import apply_task_input_answer
+
+    task = (await db.execute(
+        select(Task).where(
+            Task.id == request.origin_task_id,
+            Task.entity_id == request.entity_id,
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if task is None:
+        return {"resolved": False, "reason": "task_not_found", "request_id": request.id}
+    display = user_display or user_id
+    if refuse:
+        # A refusal is still an answer the agent must hear: deny the request,
+        # then resume the task with an explicit "declined" response so it can
+        # finish (or explain what stays blocked) instead of waiting forever.
+        await deny_approval(
+            db, request, by_user_id=user_id, via="chat_bridge", reason="user refused",
+        )
+        applied = await apply_task_input_answer(
+            db,
+            task=task,
+            user_id=user_id,
+            user_label=display,
+            response_text=(
+                "The user declined to answer this question. Continue without it "
+                "if you can, otherwise finish by stating exactly what is blocked."
+            ),
+            payload={"choice": "refuse", "source": "chat_bridge"},
+        )
+        return {
+            "resolved": True,
+            "outcome": "refused",
+            "request_id": request.id,
+            "task_id": task.id,
+            **(
+                {"_task_to_run": (task.id, applied["dispatch_agent_id"])}
+                if applied["resumed"]
+                else {}
+            ),
+        }
+    text = str(answer or "").strip()
+    if not text and isinstance(answers, dict) and answers:
+        text = "; ".join(f"{key}: {value}" for key, value in answers.items())
+    if not text:
+        return {"resolved": False, "reason": "answer_required", "request_id": request.id}
+    applied = await apply_task_input_answer(
+        db,
+        task=task,
+        user_id=user_id,
+        user_label=display,
+        response_text=text,
+        payload={
+            "response": text,
+            "fields": dict(answers or {}),
+            "source": "chat_bridge",
+        },
+    )
+    if not applied["resumed"]:
+        return {"resolved": False, "reason": "task_not_waiting", "request_id": request.id}
+    return {
+        "resolved": True,
+        "outcome": "answered",
+        "request_id": request.id,
+        "task_id": task.id,
+        "_task_to_run": (task.id, applied["dispatch_agent_id"]),
+    }
 
 
 async def answer_task_blocker(
@@ -140,6 +237,19 @@ async def answer_task_blocker(
             "reason": f"already_{request.status}",
             "request_id": request.id,
         }
+    if (
+        request.origin_kind == ApprovalOriginKind.TASK.value
+        and request.action_key == TASK_INPUT_ACTION_KEY
+    ):
+        return await _answer_task_input_request(
+            db,
+            request=request,
+            user_id=user_id,
+            user_display=user_display,
+            answer=answer,
+            answers=answers,
+            refuse=refuse,
+        )
     if request.origin_kind != ApprovalOriginKind.LEASE.value:
         return {
             "resolved": False,
@@ -160,8 +270,12 @@ async def answer_task_blocker(
         return {"resolved": False, "reason": "request_missing_step"}
 
     display = user_display or user_id
+    request_context = request.context if isinstance(request.context, dict) else {}
+    coordinator_owned = COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY in request_context
 
     if refuse:
+        if coordinator_owned:
+            await deny_approval(db, request, by_user_id=user_id, via="chat_bridge")
         plan_to_run = await cancel_step(
             db,
             entity_id=entity_id,
@@ -173,8 +287,13 @@ async def answer_task_blocker(
             enqueue=False,
         )
         if plan_to_run is None:
+            if coordinator_owned:
+                raise RuntimeError(
+                    "Coordinator approval was decided but its parent could not be cancelled."
+                )
             return {"resolved": False, "reason": "origin_no_longer_waiting"}
-        await deny_approval(db, request, by_user_id=user_id, via="chat_bridge")
+        if not coordinator_owned:
+            await deny_approval(db, request, by_user_id=user_id, via="chat_bridge")
         await _mark_blocker_card_resolved(
             db, request=request, user_id=user_id, choice="skip", note=answer,
         )
@@ -232,6 +351,9 @@ async def answer_task_blocker(
         # ignored by tools that don't recognize them.
         resume_kwargs["params_update"] = {"confirm": True, "confirm_destructive": True}
 
+    if coordinator_owned:
+        await grant_approval(db, request, by_user_id=user_id, via="chat_bridge")
+        await consume_approval(db, request)
     plan_to_run = await resume_step_for_retry(
         db,
         entity_id=entity_id,
@@ -244,11 +366,16 @@ async def answer_task_blocker(
         **resume_kwargs,
     )
     if plan_to_run is None:
+        if coordinator_owned:
+            raise RuntimeError(
+                "Coordinator approval was decided but its parent could not be resumed."
+            )
         return {"resolved": False, "reason": "origin_no_longer_waiting"}
-    await grant_approval(db, request, by_user_id=user_id, via="chat_bridge")
-    # Spend it immediately: the user's answer IS the consumption (see the
-    # chat card resolve endpoint for the full rationale).
-    await consume_approval(db, request)
+    if not coordinator_owned:
+        await grant_approval(db, request, by_user_id=user_id, via="chat_bridge")
+        # Spend it immediately: the user's answer IS the consumption (see the
+        # chat card resolve endpoint for the full rationale).
+        await consume_approval(db, request)
     await _mark_blocker_card_resolved(
         db, request=request, user_id=user_id, choice="respond", note=answer,
     )

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from "react";
+import { lazy, Suspense, useState, useEffect, useCallback, useMemo, useRef, type ImgHTMLAttributes, type ReactNode } from "react";
 import { useLocation, useParams, useNavigate, Link } from "react-router-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
@@ -20,7 +20,10 @@ import { PageHeaderTitle } from "../components/ui/PageHeader";
 import { IconArrowLeft, IconEdit, IconDownload, IconClose, IconDocument, IconPlus, IconShare, IconInfo, IconText, IconSignature, IconTrash, IconCheck, IconUndo, IconRedo, IconHighlighter, IconPenLine, IconEraser, IconCopy, IconRefresh, IconComment, IconPlay } from "../components/icons";
 import CommentThread from "../components/CommentThread";
 import SitePublishAction from "../components/SitePublishAction";
+import SignatureRequestDialog from "../components/permissions/SignatureRequestDialog";
 import SpreadsheetChartPreview from "../components/SpreadsheetChartPreview";
+import SpreadsheetImageLayer from "../components/SpreadsheetImageLayer";
+import PresentationShapeOutline from "../components/PresentationShapeOutline";
 import {
   ClassificationBadge,
   VisibilityIcon,
@@ -30,7 +33,11 @@ import {
 } from "../components/permissions";
 import type { NewExternalShareConfig } from "../components/permissions";
 import { useAuthStore } from "../stores/auth";
-import { canCommentDocument, canEditDocument, canShareDocument } from "../lib/permissions";
+import { useToastStore } from "../stores/toast";
+import { useDocumentDownload } from "../lib/useDocumentDownload";
+import { requestBlobDownload } from "../lib/fileDownload";
+import { canCommentDocument, canEditDocument, canShareDocument, canShareDocumentExternally } from "../lib/permissions";
+import { capabilitiesToShareRole, shareRoleCapabilities, type ShareRole } from "../lib/shareRoles";
 import {
   AiEditPreviewStatus,
   AiEditTargetKind,
@@ -48,17 +55,28 @@ import {
   type EditorLiveChatMetadata,
 } from "../lib/editorLiveChat";
 import { getAuthToken } from "../lib/authToken";
+import {
+  isAbortError,
+  loadServerSlidePreview,
+  serverSlideAspect,
+  slidePriorityPicker,
+  type ServerSlideList,
+} from "../lib/pptxServerPreview";
+import {
+  gradientToCss,
+  parsePptx,
+  type PptxShape,
+  type PptxSlide,
+} from "../lib/pptxViewerParser";
 import { isCodeLikeFile } from "../lib/codeFiles";
 import { getFilePreviewKind, type FilePreviewKind } from "../lib/filePreviewKind";
 import { useHtmlPreviewDocument } from "../lib/useHtmlPreviewDocument";
-import {
-  presentationMediaMime,
-  presentationRelationshipsPart,
-  presentationShapeFillScope,
-  presentationVideoSource,
-  resolvePresentationPartTarget,
-} from "../lib/presentationOoxml";
 import { presentationPointsToCqh } from "../lib/presentationStyleInheritance";
+import { presentationRoundRectRadius, presentationStrokeDash } from "../lib/presentationShapeStyle";
+import {
+  presentationPresetClipPath,
+  presentationPresetPointsAttribute,
+} from "../lib/presentationPresetGeometry";
 import { offsetPdfPlacement, pdfOverlayPlacement, pdfOverlayPoint } from "../lib/pdfOverlayGeometry";
 import { imageCanvasPoint, imageOutputSize, normalizeImageQuarterTurn } from "../lib/imageEditorGeometry";
 import { parseDelimitedText } from "../lib/delimitedText";
@@ -68,7 +86,7 @@ import {
   fileReferenceKind,
   isEditableDiagramReference,
 } from "../lib/fileReferences";
-import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
 import {
   commentActionLabel,
   commentSearchKey,
@@ -89,10 +107,11 @@ import {
 } from "../lib/diagram/previewLimits";
 import {
   spreadsheetMergeAt,
-  spreadsheetChartsFromFile,
-  spreadsheetSheetsFromWorkbook,
+  spreadsheetCellVisualStyle,
   type SpreadsheetSheetModel,
 } from "../lib/spreadsheetOoxml";
+import { spreadsheetAxisOffsets, spreadsheetViewportRange } from "../lib/spreadsheetViewport";
+import { parseSpreadsheetPreview } from "../lib/spreadsheetPreviewParser";
 
 import { t } from "../lib/i18n";
 
@@ -108,6 +127,22 @@ type DocumentPagePreview = {
   height: number | null;
 };
 const DOCUMENT_PAGE_FETCH_CONCURRENCY = 3;
+const PDF_PAGE_RENDER_CONCURRENCY = 2;
+const PDF_PAGE_RENDER_OVERSCAN = 2;
+const PDF_MAX_CANVAS_PIXELS = 16_000_000;
+const EMPTY_SPREADSHEET_SHEET: SpreadsheetSheetModel = {
+  name: "",
+  data: [],
+  displayData: [],
+  numberFormats: {},
+  styles: {},
+  columnWidths: [],
+  rowHeights: [],
+  merges: [],
+  charts: [],
+  images: [],
+  hidden: false,
+};
 type ImageStroke = { id: string; color: string; size: number; points: Array<{ x: number; y: number }> };
 type CommentTextRange = {
   id: string;
@@ -786,7 +821,7 @@ function markQuoteCommentsInElement(root: HTMLElement, comments: Comment[], acti
 }
 
 async function readDocumentTextViaDownload(docId: string): Promise<string> {
-  const blob = await api.documents.downloadBlob(docId);
+  const blob = await api.documents.previewBlob(docId);
   return decodeTextFile(await blob.arrayBuffer()).text;
 }
 
@@ -848,6 +883,29 @@ async function imageUrlToObjectUrl(imageUrl: string, signal?: AbortSignal): Prom
     throw new Error(`Generated image could not be loaded (${response.status}).`);
   }
   return URL.createObjectURL(await response.blob());
+}
+
+let markdownImageLoadTail = Promise.resolve();
+
+async function loadProtectedMarkdownImage(src: string, signal: AbortSignal): Promise<string> {
+  const previous = markdownImageLoadTail;
+  let release!: () => void;
+  markdownImageLoadTail = new Promise<void>((resolve) => { release = resolve; });
+  await previous;
+  try {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      if (signal.aborted) throw new DOMException("Image load cancelled", "AbortError");
+      try {
+        return await imageUrlToObjectUrl(src, signal);
+      } catch (error) {
+        if (signal.aborted || attempt === 2 || !String(error).includes("(503)")) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+      }
+    }
+    throw new Error("Image could not be loaded.");
+  } finally {
+    release();
+  }
 }
 
 function loadImageElement(sourceUrl: string, signal?: AbortSignal): Promise<HTMLImageElement> {
@@ -982,23 +1040,23 @@ function DocxViewer({
     setServerPages([]);
 
     (async () => {
-      if (docId && !preferSelectablePreview && !useClientFallback) {
-        try {
-          const pageData = await api.documents.getPages(
-            docId,
-            abortController.signal,
-          );
-          if (cancelled) return;
-          if (!pageData.pages?.length) throw new Error("No rendered Word pages");
-          setServerPages(pageData.pages);
-          return;
-        } catch (e: any) {
-          if (cancelled || e?.name === "AbortError") return;
-          // Keep older and transiently unrenderable files usable below.
-        }
-      }
-
       try {
+        if (docId && !preferSelectablePreview && !useClientFallback) {
+          try {
+            const pageData = await api.documents.getPages(
+              docId,
+              abortController.signal,
+            );
+            if (cancelled) return;
+            if (!pageData.pages?.length) throw new Error("No rendered Word pages");
+            setServerPages(pageData.pages);
+            return;
+          } catch (e: any) {
+            if (cancelled || e?.name === "AbortError") return;
+            // Keep older and transiently unrenderable files usable below.
+          }
+        }
+
         const buf = blob
           ? await blob.arrayBuffer()
           : await (await fetch(url, { signal: abortController.signal })).arrayBuffer();
@@ -1009,16 +1067,7 @@ function DocxViewer({
           const rendered = await renderManorDocument(buf);
           if (cancelled) return;
           const sanitizeOptions = { allowDocxEditorAttributes: true, allowDocxLayoutStyles: true };
-          const safeRender = {
-            ...rendered,
-            html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
-            headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
-            footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
-            firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
-            firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
-            evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
-            evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
-          };
+          const safeRender = sanitizeManorDocumentRender(rendered, sanitizeOptions);
           setRender(safeRender);
           setHtml(safeRender.html);
         } else {
@@ -1315,13 +1364,19 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
   const [activeSheet, setActiveSheet] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [gridScroll, setGridScroll] = useState({ left: 0, top: 0 });
+  const [gridViewport, setGridViewport] = useState({ width: 0, height: 600 });
+  const gridRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let cancelled = false;
+    const abortController = new AbortController();
     setLoading(true);
     setError("");
     setSheets([]);
     setActiveSheet(0);
+    setGridScroll({ left: 0, top: 0 });
+    gridRef.current?.scrollTo({ left: 0, top: 0 });
 
     (async () => {
       try {
@@ -1335,19 +1390,9 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
         const bytes = new Uint8Array(buf);
         // Real XLSX starts with PK zip signature (0x50 0x4B)
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
-          const XLSX = await import("xlsx");
+          const parsedSheets = await parseSpreadsheetPreview(buf, abortController.signal);
           if (cancelled) return;
-          const wb = XLSX.read(buf, {
-            type: "array",
-            cellFormula: true,
-            cellNF: true,
-            cellStyles: true,
-            cellText: true,
-          });
-          const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
-          if (cancelled) return;
-          const parsed = spreadsheetSheetsFromWorkbook(XLSX, wb)
-            .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }))
+          const parsed = parsedSheets
             .filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts");
           if (!cancelled) setSheets(parsed);
         } else {
@@ -1365,24 +1410,66 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
             rowHeights: Array(rows.length).fill(32),
             merges: [],
             charts: [],
+            images: [],
             hidden: false,
           }]);
         }
       } catch (e: any) {
+        if (cancelled || e?.name === "AbortError") return;
         if (!cancelled) setError(e.message || "Failed to render spreadsheet");
       } finally {
         if (!cancelled) setLoading(false);
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      abortController.abort();
+    };
   }, [blob, url]);
+
+  useEffect(() => {
+    const grid = gridRef.current;
+    if (!grid) return;
+    const updateViewport = () => setGridViewport({ width: grid.clientWidth, height: grid.clientHeight });
+    updateViewport();
+    const observer = new ResizeObserver(updateViewport);
+    observer.observe(grid);
+    return () => observer.disconnect();
+  }, [sheets.length]);
+
+  const sheet = sheets[activeSheet] || EMPTY_SPREADSHEET_SHEET;
+  const rowOffsets = useMemo(() => spreadsheetAxisOffsets(sheet.rowHeights, 32), [sheet.rowHeights]);
+  const columnOffsets = useMemo(() => spreadsheetAxisOffsets(sheet.columnWidths, 112), [sheet.columnWidths]);
+  const baseRowRange = spreadsheetViewportRange(rowOffsets, Math.max(0, gridScroll.top - 34), gridViewport.height, 3);
+  const baseColumnRange = spreadsheetViewportRange(columnOffsets, Math.max(0, gridScroll.left - 48), gridViewport.width, 2);
+  const visibleColumns = Array.from({ length: Math.max(0, baseColumnRange.end - baseColumnRange.start) }, (_, index) => baseColumnRange.start + index);
+  const visibleCells = useMemo(() => {
+    const cells = new Map<string, { row: number; column: number }>();
+    for (let row = baseRowRange.start; row < baseRowRange.end; row += 1) {
+      for (let column = baseColumnRange.start; column < baseColumnRange.end; column += 1) {
+        cells.set(`${row}:${column}`, { row, column });
+      }
+    }
+    sheet.merges.forEach((merge) => {
+      if (merge.s.r < baseRowRange.end && merge.e.r >= baseRowRange.start && merge.s.c < baseColumnRange.end && merge.e.c >= baseColumnRange.start) {
+        cells.set(`${merge.s.r}:${merge.s.c}`, { row: merge.s.r, column: merge.s.c });
+      }
+    });
+    return [...cells.values()].sort((a, b) => a.row - b.row || a.column - b.column);
+  }, [baseColumnRange.end, baseColumnRange.start, baseRowRange.end, baseRowRange.start, sheet.merges]);
+  const gridWidth = 48 + columnOffsets[columnOffsets.length - 1];
+  const gridHeight = 34 + rowOffsets[rowOffsets.length - 1];
+  const visibleCellRows = new Map<number, number[]>();
+  for (const { row, column } of visibleCells) {
+    const columns = visibleCellRows.get(row) || [];
+    columns.push(column);
+    visibleCellRows.set(row, columns);
+  }
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
   if (error) return <p style={{ color: "#c14a44", textAlign: "center", padding: 32 }}>{error}</p>;
   if (sheets.length === 0) return <p style={{ color: "#78716c", textAlign: "center", padding: 32 }}>{t("page.file_viewer.empty_spreadsheet")}</p>;
-
-  const sheet = sheets[activeSheet];
 
   return (
     <div>
@@ -1392,7 +1479,11 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
           {sheets.map((s, i) => (
             <button
               key={s.name}
-              onClick={() => setActiveSheet(i)}
+              onClick={() => {
+                setActiveSheet(i);
+                setGridScroll({ left: 0, top: 0 });
+                gridRef.current?.scrollTo({ left: 0, top: 0 });
+              }}
               style={{
                 padding: "6px 16px",
                 fontSize: 13,
@@ -1411,61 +1502,69 @@ export function XlsxViewer({ url, blob }: { url: string; blob?: Blob | null }) {
         </div>
       )}
 
-      {/* Table */}
-      <div style={{ overflow: "auto", maxHeight: 600, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)" }}>
-        <table style={{ width: "max-content", minWidth: "100%", tableLayout: "fixed", borderCollapse: "collapse", fontSize: 13 }}>
-          <colgroup>
-            <col style={{ width: 48 }} />
-            {sheet.columnWidths.map((width, column) => <col key={column} style={{ width }} />)}
-          </colgroup>
-          {sheet.data.length > 0 && (
-            <thead>
-              <tr>
-                <th style={thStyle}>#</th>
-                {sheet.columnWidths.map((_, ci) => (
-                  <th key={ci} style={thStyle}>{colLetter(ci)}</th>
-                ))}
-              </tr>
-            </thead>
-          )}
-          <tbody>
-            {sheet.data.map((row, ri) => (
-              <tr key={ri} style={{ height: sheet.rowHeights[ri] || 32 }}>
-                <td style={{ ...tdStyle, color: "#a8a29e", fontWeight: 600, background: "#fafaf9", textAlign: "center", width: 48 }}>{ri + 1}</td>
-                {sheet.columnWidths.map((_width, ci) => {
-                  const merge = spreadsheetMergeAt(sheet.merges, ri, ci);
-                  if (merge.covered) return null;
-                  const cellStyle = sheet.styles[`${ri}:${ci}`] || {};
-                  const raw = row[ci];
-                  const display = sheet.displayData[ri]?.[ci] ?? (raw != null ? String(raw) : "");
-                  return (
-                    <td
-                      key={ci}
-                      rowSpan={merge.rowSpan}
-                      colSpan={merge.columnSpan}
-                      title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
-                      style={{
-                        ...tdStyle,
-                        color: cellStyle.color,
-                        background: cellStyle.fill,
-                        fontWeight: cellStyle.bold ? 700 : undefined,
-                        fontStyle: cellStyle.italic ? "italic" : undefined,
-                        fontFamily: cellStyle.fontFamily,
-                        fontSize: cellStyle.fontSize,
-                        textAlign: cellStyle.align,
-                        whiteSpace: "nowrap",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                      }}
-                    >
-                      {display}
-                    </td>
-                  );
-                })}
-              </tr>
+      <div
+        ref={gridRef}
+        data-spreadsheet-preview-grid
+        onScroll={(event) => setGridScroll({ left: event.currentTarget.scrollLeft, top: event.currentTarget.scrollTop })}
+        style={{ overflow: "auto", maxHeight: 600, borderRadius: 12, border: "1px solid rgba(28,25,23,0.06)" }}
+      >
+        <div role="table" aria-label={sheet.name} aria-rowcount={sheet.rowHeights.length + 1} aria-colcount={sheet.columnWidths.length + 1} style={{ position: "relative", width: Math.max(gridWidth, gridViewport.width), height: gridHeight, fontSize: 13 }}>
+          <div role="row" aria-rowindex={1} style={{ position: "sticky", top: 0, zIndex: 4, height: 34 }}>
+            <div role="columnheader" aria-colindex={1} style={{ ...thStyle, position: "sticky", left: 0, width: 48, height: 34, padding: "8px 12px", boxSizing: "border-box", zIndex: 5 }}>#</div>
+            {visibleColumns.map((column) => (
+              <div key={column} role="columnheader" aria-colindex={column + 2} style={{ ...thStyle, position: "absolute", top: 0, left: 48 + columnOffsets[column], width: sheet.columnWidths[column] || 112, height: 34, padding: "8px 12px", boxSizing: "border-box" }}>{colLetter(column)}</div>
             ))}
-          </tbody>
-        </table>
+          </div>
+          {[...visibleCellRows].map(([row, columns]) => (
+            <div key={row} role="row" aria-rowindex={row + 2} style={{ position: "absolute", top: 34 + rowOffsets[row], left: 0, width: "100%", height: sheet.rowHeights[row] || 32 }}>
+              <div role="rowheader" aria-colindex={1} style={{ ...tdStyle, padding: "6px 4px", position: "sticky", left: 0, width: 48, height: "100%", boxSizing: "border-box", color: "#a8a29e", fontWeight: 600, background: "#fafaf9", textAlign: "center", zIndex: 3 }}>{row + 1}</div>
+              {columns.map((column) => {
+            const merge = spreadsheetMergeAt(sheet.merges, row, column);
+            if (merge.covered) return null;
+            const cellStyle = sheet.styles[`${row}:${column}`] || {};
+            const raw = sheet.data[row]?.[column];
+            const display = sheet.displayData[row]?.[column] ?? (raw != null ? String(raw) : "");
+            return (
+              <div
+                key={`${row}:${column}`}
+                role="cell"
+                aria-colindex={column + 2}
+                aria-rowspan={merge.rowSpan > 1 ? merge.rowSpan : undefined}
+                aria-colspan={merge.columnSpan > 1 ? merge.columnSpan : undefined}
+                data-spreadsheet-preview-cell
+                title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
+                style={{
+                  ...tdStyle,
+                  ...(sheet.showGridlines === false ? { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" } : {}),
+                  ...spreadsheetCellVisualStyle(cellStyle),
+                  position: "absolute",
+                  left: 48 + columnOffsets[column],
+                  top: 0,
+                  width: columnOffsets[Math.min(sheet.columnWidths.length, column + merge.columnSpan)] - columnOffsets[column],
+                  maxWidth: "none",
+                  height: rowOffsets[Math.min(sheet.rowHeights.length, row + merge.rowSpan)] - rowOffsets[row],
+                  boxSizing: "border-box",
+                  background: cellStyle.fill,
+                  display: "flex",
+                  flexDirection: "column",
+                  justifyContent: cellStyle.verticalAlign === "bottom" ? "flex-end" : cellStyle.verticalAlign === "middle" ? "center" : "flex-start",
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                }}
+              >
+                {display}
+              </div>
+            );
+              })}
+            </div>
+          ))}
+        <SpreadsheetImageLayer
+          images={sheet.images}
+          columnWidths={sheet.columnWidths}
+          rowHeights={sheet.rowHeights}
+          columnHeaderHeight={34}
+        />
+        </div>
       </div>
       {sheet.charts.length > 0 && (
         <div style={{ marginTop: 16 }}>
@@ -1514,1081 +1613,6 @@ function colLetter(i: number): string {
 // ── PPTX types & helpers ──
 
 /** EMU → percentage of slide (defaults 12192000 × 6858000 EMU for 16:9, overridden per-file) */
-let SLIDE_W = 12192000;
-let SLIDE_H = 6858000;
-const emu2pctX = (v: number) => (v / SLIDE_W) * 100;
-const emu2pctY = (v: number) => (v / SLIDE_H) * 100;
-/** EMU to pt (for font sizes: 1pt = 12700 EMU) */
-const emu2pt = (v: number) => Math.round(v / 12700);
-
-interface PptxTextRun {
-  text: string;
-  bold?: boolean;
-  italic?: boolean;
-  underline?: boolean;
-  strikethrough?: boolean;
-  fontSize?: number;
-  color?: string;
-  fontFamily?: string;
-  baseline?: number; // superscript (+) / subscript (-)
-  spacing?: number; // letter spacing in pt
-}
-
-interface PptxParagraph {
-  text: string; // concatenated plain text (backward compat)
-  bold?: boolean; italic?: boolean; underline?: boolean;
-  fontSize?: number; color?: string; align?: string; fontFamily?: string;
-  bullet?: string; indent?: number;
-  lineSpacing?: number; // multiplier (1.0 = single)
-  spaceBefore?: number; // pt
-  spaceAfter?: number; // pt
-  runs?: PptxTextRun[]; // per-run formatting for rich rendering
-}
-
-interface PptxShape {
-  x: number; y: number; w: number; h: number; // percentages
-  type?: "shape" | "table" | "image" | "line";
-  fill?: string;
-  gradFill?: { angle: number; stops: { pos: number; color: string; alpha: number }[] };
-  borderRadius?: number;
-  rotation?: number;
-  flipH?: boolean;
-  flipV?: boolean;
-  stroke?: string;
-  strokeWidth?: number;
-  presetGeom?: string;
-  texts: PptxParagraph[];
-  imgUrl?: string;
-  videoUrl?: string;
-  imgCrop?: { l: number; t: number; r: number; b: number }; // percentages
-  opacity?: number;
-  shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
-  vAlign?: "top" | "middle" | "bottom"; // text vertical alignment
-  padding?: { l: number; t: number; r: number; b: number }; // text insets in %
-  tableRows?: { text: string; bold?: boolean; color?: string; fill?: string }[][];
-  tableColWidths?: number[]; // column widths in EMU
-  tableCols?: number;
-}
-
-interface PptxSlide {
-  bg?: string;
-  bgGrad?: { angle: number; stops: { pos: number; color: string; alpha: number }[] };
-  bgImgUrl?: string;
-  shapes: PptxShape[];
-  aspectRatio?: string;
-  theme?: PptxThemeSnapshot;
-}
-
-interface PptxParseOptions {
-  isCancelled?: () => boolean;
-  onObjectUrl?: (url: string) => void;
-}
-
-interface PptxThemeSnapshot {
-  colors: Record<string, string>;
-  majorFont?: string;
-  minorFont?: string;
-}
-
-function decodePptxText(value: string): string {
-  return value
-    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => String.fromCodePoint(parseInt(hex, 16)))
-    .replace(/&#(\d+);/g, (_, decimal: string) => String.fromCodePoint(parseInt(decimal, 10)))
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, "&");
-}
-
-function xmlAttr(el: string, attr: string): string | null {
-  const re = new RegExp(`${attr}="([^"]*)"`, "i");
-  const m = el.match(re);
-  return m ? m[1] : null;
-}
-
-/** Find content between an XML open/close tag (non-greedy, first match) */
-function xmlInner(xml: string, tag: string): string | null {
-  // handle <tag ... > ... </tag> or self-closing
-  const re = new RegExp(`<${tag}[\\s>][\\s\\S]*?</${tag}>`, "i");
-  const m = xml.match(re);
-  return m ? m[0] : null;
-}
-
-const _viewerDefaultScheme: Record<string, string> = {
-  dk1: "#000000", dk2: "#292524", lt1: "#ffffff", lt2: "#fafaf9",
-  accent1: "#4472c4", accent2: "#ed7d31", accent3: "#a5a5a5",
-  accent4: "#ffc000", accent5: "#5b9bd5", accent6: "#70ad47",
-  tx1: "#000000", tx2: "#57534e", bg1: "#ffffff", bg2: "#f5f5f4",
-  hlink: "#0563c1", folHlink: "#954f72",
-};
-let _viewerTheme: Record<string, string> = _viewerDefaultScheme;
-// Theme fill styles from <a:fmtScheme>
-let _viewerBgFillStyles: string[] = [];  // <a:bgFillStyleLst> — for bgRef idx 1001+
-let _viewerFillStyles: string[] = [];    // <a:fillStyleLst> — for bgRef idx 1-3
-// Theme fonts
-let _viewerMajorFont = "";  // heading font (for +mj-lt)
-let _viewerMinorFont = "";  // body font (for +mn-lt)
-
-function parseViewerTheme(themeXml: string) {
-  const colors: Record<string, string> = { ..._viewerDefaultScheme };
-  const clrScheme = xmlInner(themeXml, "a:clrScheme");
-  if (!clrScheme) return;
-  for (const tag of ["dk1", "dk2", "lt1", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6", "hlink", "folHlink"]) {
-    const inner = xmlInner(clrScheme, `a:${tag}`);
-    if (inner) {
-      let m = inner.match(/<a:srgbClr val="([A-Fa-f0-9]{6})"/);
-      if (m) { colors[tag] = `#${m[1]}`; continue; }
-      m = inner.match(/<a:sysClr[^>]*lastClr="([A-Fa-f0-9]{6})"/);
-      if (m) { colors[tag] = `#${m[1]}`; }
-    }
-  }
-  colors.tx1 = colors.dk1; colors.tx2 = colors.dk2;
-  colors.bg1 = colors.lt1; colors.bg2 = colors.lt2;
-  _viewerTheme = colors;
-
-  // Parse font scheme
-  _viewerMajorFont = "";
-  _viewerMinorFont = "";
-  try {
-    const fontScheme = xmlInner(themeXml, "a:fontScheme");
-    if (fontScheme) {
-      const majorFont = xmlInner(fontScheme, "a:majorFont");
-      const minorFont = xmlInner(fontScheme, "a:minorFont");
-      if (majorFont) {
-        const m = majorFont.match(/<a:latin typeface="([^"]+)"/);
-        if (m) _viewerMajorFont = m[1];
-      }
-      if (minorFont) {
-        const m = minorFont.match(/<a:latin typeface="([^"]+)"/);
-        if (m) _viewerMinorFont = m[1];
-      }
-    }
-  } catch { /* non-fatal */ }
-
-  // Parse fill styles from theme fmtScheme
-  _viewerBgFillStyles = [];
-  _viewerFillStyles = [];
-  try {
-    const extractFills = (xml: string) => {
-      const fills = xml.match(/<a:(solidFill|gradFill|pattFill|blipFill)[\s>][\s\S]*?<\/a:\1>/g) || [];
-      return [...fills];
-    };
-    const bgFillLst = xmlInner(themeXml, "a:bgFillStyleLst");
-    if (bgFillLst) _viewerBgFillStyles = extractFills(bgFillLst);
-    const fillLst = xmlInner(themeXml, "a:fillStyleLst");
-    if (fillLst) _viewerFillStyles = extractFills(fillLst);
-  } catch { /* non-fatal */ }
-}
-
-function viewerApplyLum(hex: string, mod: number, off: number, tint?: number, shade?: number): string {
-  let r = parseInt(hex.slice(0, 2), 16), g = parseInt(hex.slice(2, 4), 16), b = parseInt(hex.slice(4, 6), 16);
-  if (tint !== undefined) { r = Math.round(r + (255 - r) * (1 - tint)); g = Math.round(g + (255 - g) * (1 - tint)); b = Math.round(b + (255 - b) * (1 - tint)); }
-  if (shade !== undefined) { r = Math.round(r * shade); g = Math.round(g * shade); b = Math.round(b * shade); }
-  if (mod !== 1 || off !== 0) { r = Math.round(Math.min(255, Math.max(0, r * mod + 255 * off))); g = Math.round(Math.min(255, Math.max(0, g * mod + 255 * off))); b = Math.round(Math.min(255, Math.max(0, b * mod + 255 * off))); }
-  return [r, g, b].map(v => Math.min(255, Math.max(0, v)).toString(16).padStart(2, "0")).join("");
-}
-
-/** Resolve font typeface — handles theme font references +mj-lt, +mn-lt */
-function resolveFont(typeface: string | null): string | undefined {
-  if (!typeface) return undefined;
-  if (typeface === "+mj-lt" || typeface === "+mj-ea" || typeface === "+mj-cs") return _viewerMajorFont || undefined;
-  if (typeface === "+mn-lt" || typeface === "+mn-ea" || typeface === "+mn-cs") return _viewerMinorFont || undefined;
-  return typeface;
-}
-
-function parseColor(xml: string): string | null {
-  let m = xml.match(/<a:srgbClr val="([A-Fa-f0-9]{6})"/);
-  if (m) {
-    const lumMod = xml.match(/<a:lumMod val="(\d+)"/);
-    const lumOff = xml.match(/<a:lumOff val="(\d+)"/);
-    let hex = m[1];
-    if (lumMod || lumOff) hex = viewerApplyLum(hex, lumMod ? parseInt(lumMod[1], 10) / 100000 : 1, lumOff ? parseInt(lumOff[1], 10) / 100000 : 0);
-    return `#${hex}`;
-  }
-  // System color
-  m = xml.match(/<a:sysClr[^>]*lastClr="([A-Fa-f0-9]{6})"/);
-  if (m) return `#${m[1]}`;
-  m = xml.match(/<a:sysClr val="([^"]+)"/);
-  if (m) {
-    const sysColors: Record<string, string> = { windowText: "#000000", window: "#ffffff", highlight: "#0078d4", highlightText: "#ffffff" };
-    return sysColors[m[1]] || "#000000";
-  }
-  m = xml.match(/<a:schemeClr val="([^"]+)"/);
-  if (m) {
-    const base = _viewerTheme[m[1]] || _viewerDefaultScheme[m[1]] || "#57534e";
-    const lumMod = xml.match(/<a:lumMod val="(\d+)"/);
-    const lumOff = xml.match(/<a:lumOff val="(\d+)"/);
-    const tint = xml.match(/<a:tint val="(\d+)"/);
-    const shade = xml.match(/<a:shade val="(\d+)"/);
-    if (lumMod || lumOff || tint || shade) {
-      return `#${viewerApplyLum(base.replace("#", ""),
-        lumMod ? parseInt(lumMod[1], 10) / 100000 : 1,
-        lumOff ? parseInt(lumOff[1], 10) / 100000 : 0,
-        tint ? parseInt(tint[1], 10) / 100000 : undefined,
-        shade ? parseInt(shade[1], 10) / 100000 : undefined,
-      )}`;
-    }
-    return base;
-  }
-  return null;
-}
-
-/** Resolve a <p:bgRef> or <p:bg> to background color/gradient. */
-function parseBgFromXml(bgXml: string): { color?: string; grad?: PptxSlide["bgGrad"]; imgRId?: string } {
-  const result: { color?: string; grad?: PptxSlide["bgGrad"]; imgRId?: string } = {};
-
-  // Check for <p:bgPr> with explicit fill
-  const bgPr = xmlInner(bgXml, "p:bgPr");
-  if (bgPr) {
-    result.color = parseColor(bgPr) || undefined;
-    result.grad = parseGradient(bgPr);
-    const blip = bgPr.match(/<a:blip r:embed="([^"]+)"/);
-    if (blip) result.imgRId = blip[1];
-    if (result.color || result.grad || result.imgRId) return result;
-  }
-
-  // Check for <p:bgRef idx="N"> — references theme bgFillStyleLst
-  const bgRef = xmlInner(bgXml, "p:bgRef");
-  if (bgRef) {
-    const idxMatch = bgRef.match(/idx="(\d+)"/);
-    const idx = idxMatch ? parseInt(idxMatch[1], 10) : 0;
-
-    // The <a:schemeClr> inside bgRef provides the color to apply to the fill style
-    const refColor = parseColor(bgRef);
-
-    // idx 1001+ → bgFillStyleLst (1001→0, 1002→1, ...)
-    // idx 1-999 → fillStyleLst (1→0, 2→1, ...)
-    const styleList = idx >= 1001 ? _viewerBgFillStyles : _viewerFillStyles;
-    const fillIdx = idx >= 1001 ? idx - 1001 : idx - 1;
-
-    if (fillIdx >= 0 && fillIdx < styleList.length) {
-      const fillXml = styleList[fillIdx];
-      if (fillXml.includes("<a:solidFill")) {
-        result.color = refColor || parseColor(fillXml) || undefined;
-      } else if (fillXml.includes("<a:gradFill")) {
-        result.grad = parseGradient(fillXml, refColor || undefined);
-        if (!result.grad && refColor) result.color = refColor;
-      }
-    }
-    if (!result.color && !result.grad && refColor) {
-      result.color = refColor;
-    }
-  }
-
-  // Fallback: try direct color/gradient in the <p:bg> block
-  if (!result.color && !result.grad) {
-    result.color = parseColor(bgXml) || undefined;
-    result.grad = parseGradient(bgXml);
-    const blip = bgXml.match(/<a:blip r:embed="([^"]+)"/);
-    if (blip) result.imgRId = blip[1];
-  }
-
-  return result;
-}
-
-function parseGradient(xml: string, phClrOverride?: string): PptxShape["gradFill"] | undefined {
-  const gradXml = xmlInner(xml, "a:gradFill");
-  if (!gradXml) return undefined;
-  const stops: { pos: number; color: string; alpha: number }[] = [];
-  const gsMatches = gradXml.match(/<a:gs[\s>][\s\S]*?<\/a:gs>/g) || [];
-  for (const gs of gsMatches) {
-    const pos = parseInt(xmlAttr(gs, "pos") || "0", 10) / 1000;
-    // If this stop uses phClr (placeholder color), substitute with the override
-    const usesPhClr = /schemeClr val="phClr"/.test(gs);
-    let color: string;
-    if (usesPhClr && phClrOverride) {
-      // Apply tint/shade/lumMod/lumOff modifiers to the override color
-      const lumMod = gs.match(/<a:lumMod val="(\d+)"/);
-      const lumOff = gs.match(/<a:lumOff val="(\d+)"/);
-      const tint = gs.match(/<a:tint val="(\d+)"/);
-      const shade = gs.match(/<a:shade val="(\d+)"/);
-      if (lumMod || lumOff || tint || shade) {
-        color = `#${viewerApplyLum(
-          phClrOverride.replace("#", ""),
-          lumMod ? parseInt(lumMod[1], 10) / 100000 : 1,
-          lumOff ? parseInt(lumOff[1], 10) / 100000 : 0,
-          tint ? parseInt(tint[1], 10) / 100000 : undefined,
-          shade ? parseInt(shade[1], 10) / 100000 : undefined,
-        )}`;
-      } else {
-        color = phClrOverride;
-      }
-    } else {
-      color = parseColor(gs) || "#000000";
-    }
-    const alphaM = gs.match(/<a:alpha val="(\d+)"/);
-    const alpha = alphaM ? parseInt(alphaM[1], 10) / 100000 : 1;
-    stops.push({ pos, color, alpha });
-  }
-  const angMatch = gradXml.match(/<a:lin ang="(\d+)"/);
-  const angle = angMatch ? parseInt(angMatch[1], 10) / 60000 : 0;
-  // Detect radial/path gradient
-  const isRadial = /<a:path\s/.test(gradXml);
-  return stops.length > 0 ? { angle: isRadial ? -1 : angle, stops } : undefined;
-}
-
-function gradientToCss(g: { angle: number; stops: { pos: number; color: string; alpha: number }[] }): string {
-  const stopStr = g.stops
-    .map(s => {
-      const r = parseInt(s.color.slice(1, 3), 16);
-      const gv = parseInt(s.color.slice(3, 5), 16);
-      const b = parseInt(s.color.slice(5, 7), 16);
-      return `rgba(${r},${gv},${b},${s.alpha}) ${s.pos}%`;
-    })
-    .join(", ");
-  // Radial gradient (angle === -1 sentinel)
-  if (g.angle === -1) return `radial-gradient(ellipse at center, ${stopStr})`;
-  // PPTX: 0°=right, CSS: 0°=up → add 90°
-  return `linear-gradient(${g.angle + 90}deg, ${stopStr})`;
-}
-
-function parseXfrm(spXml: string): { x: number; y: number; w: number; h: number } | null {
-  const xfrm = xmlInner(spXml, "a:xfrm");
-  if (!xfrm) return null;
-  const offM = xfrm.match(/<a:off x="(\d+)" y="(\d+)"/);
-  const extM = xfrm.match(/<a:ext cx="(\d+)" cy="(\d+)"/);
-  if (!offM || !extM) return null;
-  return {
-    x: emu2pctX(parseInt(offM[1], 10)),
-    y: emu2pctY(parseInt(offM[2], 10)),
-    w: emu2pctX(parseInt(extM[1], 10)),
-    h: emu2pctY(parseInt(extM[2], 10)),
-  };
-}
-
-function parseTextRuns(spXml: string): PptxShape["texts"] {
-  const texts: PptxShape["texts"] = [];
-  const paras = spXml.match(/<a:p>[\s\S]*?<\/a:p>/g) || spXml.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) || [];
-  for (const para of paras) {
-    const pPr = xmlInner(para, "a:pPr");
-    const align = pPr ? (xmlAttr(pPr, "algn") || undefined) : undefined;
-    const lvl = pPr ? parseInt(xmlAttr(pPr, "lvl") || "0", 10) : 0;
-    const marL = pPr ? xmlAttr(pPr, "marL") : null;
-    const indent = marL ? parseInt(marL, 10) / 12700 : lvl * 18;
-
-    let bullet: string | undefined;
-    if (pPr) {
-      const buChar = pPr.match(/<a:buChar char="([^"]+)"/);
-      if (buChar) bullet = buChar[1];
-      else if (pPr.includes("<a:buAutoNum")) {
-        // Determine numbering type — we'll use a placeholder; actual number is per-slide counter
-        const autoNumType = (pPr.match(/<a:buAutoNum type="([^"]+)"/) || [])[1] || "arabicPeriod";
-        if (autoNumType.startsWith("alpha")) bullet = "a.";
-        else if (autoNumType.startsWith("roman")) bullet = "i.";
-        else bullet = "#."; // resolved to actual number during rendering
-      }
-      else if (!pPr.includes("<a:buNone") && lvl > 0) bullet = "\u2022";
-    }
-
-    // Line/paragraph spacing
-    let lineSpacing: number | undefined, spaceBefore: number | undefined, spaceAfter: number | undefined;
-    if (pPr) {
-      const lnSpc = xmlInner(pPr, "a:lnSpc");
-      if (lnSpc) {
-        const spcPct = lnSpc.match(/<a:spcPct val="(\d+)"/);
-        if (spcPct) lineSpacing = parseInt(spcPct[1], 10) / 100000;
-        const spcPts = lnSpc.match(/<a:spcPts val="(\d+)"/);
-        if (spcPts) lineSpacing = parseInt(spcPts[1], 10) / 100 / 12; // approximate pt → line multiplier
-      }
-      const spcBef = xmlInner(pPr, "a:spcBef");
-      if (spcBef) {
-        const pts = spcBef.match(/<a:spcPts val="(\d+)"/);
-        if (pts) spaceBefore = parseInt(pts[1], 10) / 100;
-      }
-      const spcAft = xmlInner(pPr, "a:spcAft");
-      if (spcAft) {
-        const pts = spcAft.match(/<a:spcPts val="(\d+)"/);
-        if (pts) spaceAfter = parseInt(pts[1], 10) / 100;
-      }
-    }
-
-    // Parse default paragraph-level text properties (defRPr and endParaRPr)
-    let defFontSize: number | undefined, defColor: string | undefined;
-    let defBold = false, defItalic = false, defFontFamily: string | undefined;
-    const defRPr = pPr ? xmlInner(pPr, "a:defRPr") : null;
-    if (defRPr) {
-      const szM = xmlAttr(defRPr, "sz");
-      if (szM) defFontSize = parseInt(szM, 10) / 100;
-      const c = parseColor(defRPr);
-      if (c) defColor = c;
-      defBold = defRPr.includes('b="1"');
-      defItalic = defRPr.includes('i="1"');
-      const latin = defRPr.match(/<a:latin typeface="([^"]+)"/);
-      const ea = defRPr.match(/<a:ea typeface="([^"]+)"/);
-      defFontFamily = resolveFont(latin?.[1] ?? null) || resolveFont(ea?.[1] ?? null) || defFontFamily;
-    }
-    const endParaRPr = xmlInner(para, "a:endParaRPr");
-    if (endParaRPr) {
-      const szM = xmlAttr(endParaRPr, "sz");
-      if (szM && !defFontSize) defFontSize = parseInt(szM, 10) / 100;
-      const c = parseColor(endParaRPr);
-      if (c && !defColor) defColor = c;
-    }
-
-    // Collect runs with individual formatting
-    const tokens = para.match(/<a:r[\s>][\s\S]*?<\/a:r>|<a:br\s*\/>|<a:br[\s>][\s\S]*?<\/a:br>|<a:fld[\s>][\s\S]*?<\/a:fld>/g) || [];
-    const runs: PptxTextRun[] = [];
-    let paraText = "";
-    // Track first run's style for backward-compat paragraph-level props
-    let firstBold = defBold, firstItalic = defItalic, firstUnderline = false;
-    let firstFontSize = defFontSize, firstColor = defColor, firstFontFamily = defFontFamily;
-    let isFirst = true;
-
-    for (const token of tokens) {
-      if (token.startsWith("<a:br")) {
-        paraText += "\n";
-        runs.push({ text: "\n" });
-        continue;
-      }
-      let rBold = defBold, rItalic = defItalic, rUnderline = false;
-      let rFontSize = defFontSize, rColor = defColor, rFontFamily = defFontFamily;
-
-      let rStrike = false, rBaseline: number | undefined, rSpacing: number | undefined;
-      const rPr = xmlInner(token, "a:rPr");
-      if (rPr) {
-        rBold = rPr.includes('b="1"');
-        rItalic = rPr.includes('i="1"');
-        rUnderline = rPr.includes('u="sng"') || rPr.includes('u="dbl"') || rPr.includes('u="heavy"');
-        rStrike = rPr.includes('strike="sngStrike"') || rPr.includes('strike="dblStrike"');
-        const szM = xmlAttr(rPr, "sz");
-        if (szM) rFontSize = parseInt(szM, 10) / 100;
-        const runColor = parseColor(rPr);
-        if (runColor) rColor = runColor;
-        const latin = rPr.match(/<a:latin typeface="([^"]+)"/);
-        const ea = rPr.match(/<a:ea typeface="([^"]+)"/);
-        rFontFamily = resolveFont(latin?.[1] ?? null) || resolveFont(ea?.[1] ?? null) || rFontFamily;
-        const baselineM = xmlAttr(rPr, "baseline");
-        if (baselineM) rBaseline = parseInt(baselineM, 10) / 1000;
-        const spcM = xmlAttr(rPr, "spc");
-        if (spcM) rSpacing = parseInt(spcM, 10) / 100;
-      }
-      const tMatch = token.match(/<a:t(?:\s[^>]*)?>([\s\S]*?)<\/a:t>/);
-      const runText = tMatch ? decodePptxText(tMatch[1]) : "";
-      if (!runText) continue;
-      paraText += runText;
-      runs.push({
-        text: runText,
-        bold: rBold || undefined,
-        italic: rItalic || undefined,
-        underline: rUnderline || undefined,
-        strikethrough: rStrike || undefined,
-        fontSize: rFontSize,
-        color: rColor,
-        fontFamily: rFontFamily,
-        baseline: rBaseline,
-        spacing: rSpacing,
-      });
-      if (isFirst) {
-        firstBold = rBold; firstItalic = rItalic; firstUnderline = rUnderline;
-        firstFontSize = rFontSize; firstColor = rColor; firstFontFamily = rFontFamily;
-        isFirst = false;
-      }
-    }
-
-    if (paraText.trim() || paraText.includes("\n")) {
-      texts.push({
-        text: paraText,
-        bold: firstBold, italic: firstItalic, underline: firstUnderline,
-        fontSize: firstFontSize, color: firstColor, fontFamily: firstFontFamily,
-        align: align === "ctr" ? "center" : align === "r" ? "right" : align === "just" ? "justify" : undefined,
-        bullet, indent: indent > 0 ? indent : undefined,
-        lineSpacing, spaceBefore, spaceAfter,
-        runs: runs.length > 1 ? runs : undefined, // only include runs if mixed formatting
-      });
-    } else {
-      texts.push({ text: "", fontSize: firstFontSize || defFontSize || 12 });
-    }
-  }
-  return texts;
-}
-
-function viewerParseStroke(xml: string): { color?: string; width?: number } {
-  const ln = xmlInner(xml, "a:ln");
-  if (!ln || ln.includes("<a:noFill")) return {};
-  const color = parseColor(ln);
-  const wAttr = xmlAttr(ln, "w");
-  const width = wAttr ? parseInt(wAttr, 10) / 12700 : 1;
-  return { color: color || undefined, width: color ? width : undefined };
-}
-
-function viewerParseTable(xml: string): { rows: { text: string; bold?: boolean; color?: string; fill?: string; gridSpan?: number; vMerge?: boolean }[][]; cols: number; colWidths?: number[] } | null {
-  const tbl = xmlInner(xml, "a:tbl");
-  if (!tbl) return null;
-
-  // Parse column widths from <a:tblGrid>
-  const tblGrid = xmlInner(tbl, "a:tblGrid");
-  let colWidths: number[] | undefined;
-  if (tblGrid) {
-    const gridCols = tblGrid.match(/<a:gridCol[^>]*\/>/g) || [];
-    colWidths = gridCols.map(gc => parseInt((gc.match(/w="(\d+)"/) || [])[1] || "0", 10));
-  }
-
-  const trMatches = tbl.match(/<a:tr[\s>][\s\S]*?<\/a:tr>/g) || [];
-  const rows: { text: string; bold?: boolean; color?: string; fill?: string; gridSpan?: number; vMerge?: boolean }[][] = [];
-  let maxCols = 0;
-  for (const tr of trMatches) {
-    const tcMatches = tr.match(/<a:tc[\s>][\s\S]*?<\/a:tc>/g) || [];
-    const row: { text: string; bold?: boolean; color?: string; fill?: string; gridSpan?: number; vMerge?: boolean }[] = [];
-    for (const tc of tcMatches) {
-      const text = (tc.match(/<a:t>([^<]*)<\/a:t>/g) || []).map(m => m.replace(/<\/?a:t>/g, "")).join(" ");
-      const rPr = xmlInner(tc, "a:rPr");
-      const tcPr = xmlInner(tc, "a:tcPr");
-      const gridSpanM = tc.match(/gridSpan="(\d+)"/);
-      const vMerge = tc.includes('vMerge="1"') || tc.includes("hMerge=\"1\"");
-      row.push({
-        text, bold: rPr?.includes('b="1"'),
-        color: rPr ? parseColor(rPr) || undefined : undefined,
-        fill: tcPr ? parseColor(tcPr) || undefined : undefined,
-        gridSpan: gridSpanM ? parseInt(gridSpanM[1], 10) : undefined,
-        vMerge: vMerge || undefined,
-      });
-    }
-    rows.push(row);
-    maxCols = Math.max(maxCols, row.length);
-  }
-  return rows.length > 0 ? { rows, cols: maxCols, colWidths } : null;
-}
-
-/** Extract placeholder type and idx from a shape XML */
-function parsePlaceholder(spXml: string): { type?: string; idx?: string } | null {
-  const phM = spXml.match(/<p:ph([^/>]*)\/?>/);
-  if (!phM) return null;
-  const type = xmlAttr(phM[0], "type") || undefined;
-  const idx = xmlAttr(phM[0], "idx") || undefined;
-  return { type, idx };
-}
-
-/** Build a map of placeholder key → position from layout/master XML */
-function buildPlaceholderMap(xmlStr: string): Map<string, { x: number; y: number; w: number; h: number }> {
-  const map = new Map<string, { x: number; y: number; w: number; h: number }>();
-  const shapes = xmlStr.match(/<p:sp[\s>][\s\S]*?<\/p:sp>/g) || [];
-  for (const sp of shapes) {
-    const ph = parsePlaceholder(sp);
-    if (!ph) continue;
-    const pos = parseXfrm(sp);
-    if (!pos) continue;
-    const key = ph.type || `idx:${ph.idx}`;
-    map.set(key, pos);
-    if (ph.idx) map.set(`idx:${ph.idx}`, pos);
-  }
-  return map;
-}
-
-function parseShape(spXml: string, relsMap: Map<string, string>, phMap?: Map<string, { x: number; y: number; w: number; h: number }>): PptxShape | null {
-  let pos = parseXfrm(spXml);
-  // Fallback: resolve position from placeholder map (layout/master inheritance)
-  if (!pos && phMap) {
-    const ph = parsePlaceholder(spXml);
-    if (ph) {
-      pos = phMap.get(ph.type || "") || phMap.get(`idx:${ph.idx}`) || null;
-      // For body placeholder, also try "body" key from master
-      if (!pos && ph.idx === "1") pos = phMap.get("body") || null;
-    }
-  }
-  if (!pos) return null;
-
-  const shape: PptxShape = { ...pos, type: "shape", texts: [] };
-
-  // Rotation + flip
-  const xfrm = xmlInner(spXml, "a:xfrm");
-  if (xfrm) {
-    const rotAttr = xmlAttr(xfrm, "rot");
-    if (rotAttr) shape.rotation = parseInt(rotAttr, 10) / 60000;
-    if (xfrm.includes('flipH="1"')) shape.flipH = true;
-    if (xfrm.includes('flipV="1"')) shape.flipV = true;
-  }
-
-  // Preset geometry
-  const geomM = spXml.match(/<a:prstGeom prst="([^"]+)"/);
-  if (geomM) shape.presetGeom = geomM[1];
-
-  // Fill — search only in spPr to avoid matching text color fills
-  const spPr = xmlInner(spXml, "p:spPr");
-  const shapeFillScope = spPr ? presentationShapeFillScope(spPr) : "";
-  if (spPr && !shapeFillScope.includes("<a:noFill")) {
-    const solidFill = xmlInner(shapeFillScope, "a:solidFill");
-    if (solidFill) shape.fill = parseColor(solidFill) || undefined;
-    shape.gradFill = parseGradient(shapeFillScope);
-
-    // Blip fill (texture/image fill on shapes)
-    if (!shape.fill && !shape.gradFill) {
-      const blipFill = xmlInner(spPr, "a:blipFill") || xmlInner(spXml, "p:blipFill");
-      if (blipFill) {
-        const blipM = blipFill.match(/<a:blip r:embed="([^"]+)"/);
-        if (blipM) { const u = relsMap.get(blipM[1]); if (u) shape.imgUrl = u; }
-      }
-    }
-  }
-
-  // Stroke/border — scope to spPr
-  const stroke = viewerParseStroke(spPr || spXml);
-  if (stroke.color) { shape.stroke = stroke.color; shape.strokeWidth = stroke.width; }
-
-  // Alpha
-  const alphaM = spXml.match(/<a:alpha val="(\d+)"/);
-  if (alphaM) shape.opacity = parseInt(alphaM[1], 10) / 100000;
-
-  // Shadow (outer shadow)
-  const outerShdw = xmlInner(spXml, "a:outerShdw");
-  if (outerShdw) {
-    const shdwBlur = parseInt(xmlAttr(outerShdw, "blurRad") || "0", 10) / 12700;
-    const shdwDist = parseInt(xmlAttr(outerShdw, "dist") || "0", 10) / 12700;
-    const shdwAng = parseInt(xmlAttr(outerShdw, "dir") || "0", 10) / 60000;
-    const shdwColor = parseColor(outerShdw) || "#000000";
-    const shdwAlpha = outerShdw.match(/<a:alpha val="(\d+)"/) ? parseInt(outerShdw.match(/<a:alpha val="(\d+)"/)![1], 10) / 100000 : 0.4;
-    shape.shadow = { blur: shdwBlur, dist: shdwDist, angle: shdwAng, color: shdwColor, alpha: shdwAlpha };
-  }
-
-  // Border radius (roundRect preset)
-  if (spXml.includes('prst="roundRect"')) {
-    const adjM = spXml.match(/name="adj" fmla="val (\d+)"/);
-    shape.borderRadius = adjM ? Math.min(50, parseInt(adjM[1], 10) / 1000) : 8;
-  }
-
-  // Text body properties (vertical alignment + insets)
-  const bodyPr = xmlInner(spXml, "a:bodyPr");
-  if (bodyPr) {
-    const anchor = xmlAttr(bodyPr, "anchor");
-    if (anchor === "t") shape.vAlign = "top";
-    else if (anchor === "b") shape.vAlign = "bottom";
-    else if (anchor === "ctr") shape.vAlign = "middle";
-    // Text insets (EMU → % of slide)
-    const lIns = xmlAttr(bodyPr, "lIns");
-    const tIns = xmlAttr(bodyPr, "tIns");
-    const rIns = xmlAttr(bodyPr, "rIns");
-    const bIns = xmlAttr(bodyPr, "bIns");
-    if (lIns || tIns || rIns || bIns) {
-      shape.padding = {
-        l: lIns ? parseInt(lIns, 10) / 12700 : 7,
-        t: tIns ? parseInt(tIns, 10) / 12700 : 4,
-        r: rIns ? parseInt(rIns, 10) / 12700 : 7,
-        b: bIns ? parseInt(bIns, 10) / 12700 : 4,
-      };
-    }
-  }
-
-  // Text
-  shape.texts = parseTextRuns(spXml);
-
-  // Line / connector detection
-  if (spXml.startsWith("<p:cxnSp") || shape.presetGeom === "line" || shape.presetGeom === "straightConnector1") {
-    shape.type = "line";
-  }
-
-  // Image (p:pic)
-  if (!shape.imgUrl) {
-    const blipM = spXml.match(/<a:blip r:embed="([^"]+)"/);
-    if (blipM) {
-      const imgUrl = relsMap.get(blipM[1]);
-      if (imgUrl) { shape.imgUrl = imgUrl; shape.type = "image"; }
-    }
-  }
-  shape.videoUrl = presentationVideoSource(spXml, relsMap);
-  // Image cropping (srcRect)
-  if (shape.imgUrl) {
-    const srcRect = spXml.match(/<a:srcRect\s+([^/]*)\/>/);
-    if (srcRect) {
-      const attrs = srcRect[1];
-      const l = parseInt((attrs.match(/l="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
-      const t = parseInt((attrs.match(/t="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
-      const r = parseInt((attrs.match(/r="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
-      const b = parseInt((attrs.match(/b="(-?\d+)"/) || [])[1] || "0", 10) / 1000;
-      if (l || t || r || b) shape.imgCrop = { l, t, r, b };
-    }
-  }
-
-  return shape;
-}
-
-// The PPTX parser helpers keep slide dimensions and theme data in module
-// state. Serialize parses so navigating between presentations cannot mix the
-// state of an older, still-awaiting parse into the current one.
-let pptxParseQueue: Promise<void> = Promise.resolve();
-
-async function parsePptx(buf: ArrayBuffer, options?: PptxParseOptions): Promise<PptxSlide[]> {
-  const previousParse = pptxParseQueue;
-  let releaseParse!: () => void;
-  pptxParseQueue = new Promise<void>((resolve) => { releaseParse = resolve; });
-  await previousParse;
-  try {
-    if (options?.isCancelled?.()) return [];
-    return await parsePptxUnlocked(buf, options);
-  } finally {
-    releaseParse();
-  }
-}
-
-async function parsePptxUnlocked(buf: ArrayBuffer, options?: PptxParseOptions): Promise<PptxSlide[]> {
-  // Every parse owns a fresh set of module-scoped parser defaults. The queue
-  // prevents concurrent mutation; this reset prevents a theme-less file from
-  // inheriting slide size, colors, fonts, or fill styles from the prior file.
-  SLIDE_W = 12192000;
-  SLIDE_H = 6858000;
-  _viewerTheme = { ..._viewerDefaultScheme };
-  _viewerMajorFont = "";
-  _viewerMinorFont = "";
-  _viewerBgFillStyles = [];
-  _viewerFillStyles = [];
-
-  const JSZip = (await import("jszip")).default;
-  const zip = await JSZip.loadAsync(buf);
-  const slides: PptxSlide[] = [];
-
-  // Read slide size and slide order from presentation.xml
-  let orderedSlideRIds: string[] = [];
-  let presRelsMap = new Map<string, string>(); // rId → ppt/slides/slideN.xml
-  try {
-    const presEntry = zip.file("ppt/presentation.xml");
-    if (presEntry) {
-      const presXml = await presEntry.async("text");
-      const sldSz = presXml.match(/<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"/);
-      if (sldSz) {
-        SLIDE_W = parseInt(sldSz[1], 10);
-        SLIDE_H = parseInt(sldSz[2], 10);
-      }
-      // Extract slide order from <p:sldIdLst>
-      const sldIdLst = presXml.match(/<p:sldId[^/]*\/>/g) || [];
-      orderedSlideRIds = sldIdLst.map(s => (s.match(/r:id="([^"]+)"/) || [])[1]).filter(Boolean);
-    }
-    // Map rId → slide path from presentation.xml.rels
-    const presRelsEntry = zip.file("ppt/_rels/presentation.xml.rels");
-    if (presRelsEntry) {
-      const presRelsXml = await presRelsEntry.async("text");
-      for (const rel of (presRelsXml.match(/<Relationship[^>]*\/>/g) || [])) {
-        const id = xmlAttr(rel, "Id");
-        const target = xmlAttr(rel, "Target");
-        if (id && target) {
-          const resolved = resolvePresentationPartTarget("ppt/presentation.xml", target);
-          presRelsMap.set(id, resolved);
-        }
-      }
-    }
-  } catch { /* use default 16:9, file-number order */ }
-
-  // Parse theme (non-fatal)
-  try {
-    const themeEntry = zip.file("ppt/theme/theme1.xml");
-    if (themeEntry) parseViewerTheme(await themeEntry.async("text"));
-    else _viewerTheme = _viewerDefaultScheme;
-  } catch { _viewerTheme = _viewerDefaultScheme; }
-
-  // Determine slide file order: prefer presentation.xml order, fall back to filename sort
-  let slideFiles: string[];
-  let hasExplicitSlideOrder = orderedSlideRIds.length > 0 && presRelsMap.size > 0;
-  if (hasExplicitSlideOrder) {
-    slideFiles = orderedSlideRIds.map(rId => presRelsMap.get(rId)).filter((p): p is string => !!p && /slide\d+\.xml$/.test(p));
-  } else {
-    slideFiles = Object.keys(zip.files)
-      .filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
-  }
-  if (slideFiles.length === 0) {
-    slideFiles = Object.keys(zip.files).filter(n => /^ppt\/slides\/slide\d+\.xml$/.test(n));
-    hasExplicitSlideOrder = false;
-  }
-  if (!hasExplicitSlideOrder) slideFiles.sort((a, b) => {
-      const na = parseInt(a.match(/slide(\d+)/)?.[1] || "0", 10);
-      const nb = parseInt(b.match(/slide(\d+)/)?.[1] || "0", 10);
-      return na - nb;
-    });
-
-  // Extract all media as blob URLs
-  const mediaCache = new Map<string, string>();
-  for (const name of Object.keys(zip.files)) {
-    if (name.startsWith("ppt/media/") && !zip.files[name].dir) {
-      try {
-        const entry = zip.file(name);
-        if (!entry) continue;
-        const data = await entry.async("blob");
-        const mediaUrl = URL.createObjectURL(new Blob([data], { type: presentationMediaMime(name) }));
-        if (options?.isCancelled?.()) {
-          URL.revokeObjectURL(mediaUrl);
-        } else {
-          mediaCache.set(name, mediaUrl);
-          options?.onObjectUrl?.(mediaUrl);
-        }
-      } catch { /* skip bad media */ }
-    }
-  }
-
-  // Pre-cache layouts and slide masters (non-fatal)
-  const layoutCache = new Map<string, string>();
-  const masterCache = new Map<string, string>();
-  const layoutToMasterPath = new Map<string, string>();
-  const layoutRelsCache = new Map<string, Map<string, string>>();
-  const masterRelsCache = new Map<string, Map<string, string>>();
-  try {
-    for (const name of Object.keys(zip.files)) {
-      if (/^ppt\/slideLayouts\/slideLayout\d+\.xml$/.test(name)) {
-        const e = zip.file(name);
-        if (e) layoutCache.set(name, await e.async("text"));
-      }
-      if (/^ppt\/slideMasters\/slideMaster\d+\.xml$/.test(name)) {
-        const e = zip.file(name);
-        if (e) masterCache.set(name, await e.async("text"));
-      }
-    }
-    // Build layout → master mapping from layout rels
-    for (const layoutPath of layoutCache.keys()) {
-      try {
-        const lrp = presentationRelationshipsPart(layoutPath);
-        const lre = zip.file(lrp);
-        if (lre) {
-          const lrXml = await lre.async("text");
-          const layoutRels = new Map<string, string>();
-          for (const rel of (lrXml.match(/<Relationship[^>]*\/>/g) || [])) {
-            const id = xmlAttr(rel, "Id");
-            const target = xmlAttr(rel, "Target");
-            const type = xmlAttr(rel, "Type");
-            if (target) {
-              const resolved = resolvePresentationPartTarget(layoutPath, target);
-              if (type?.includes("slideMaster")) layoutToMasterPath.set(layoutPath, resolved);
-              if (id && mediaCache.has(resolved)) layoutRels.set(id, mediaCache.get(resolved)!);
-            }
-          }
-          layoutRelsCache.set(layoutPath, layoutRels);
-        }
-      } catch { /* non-fatal */ }
-    }
-    // Pre-cache master rels for media resolution
-    for (const masterPath of masterCache.keys()) {
-      try {
-        const mrp = presentationRelationshipsPart(masterPath);
-        const mre = zip.file(mrp);
-        if (mre) {
-          const mrXml = await mre.async("text");
-          const masterRels = new Map<string, string>();
-          for (const rel of (mrXml.match(/<Relationship[^>]*\/>/g) || [])) {
-            const id = xmlAttr(rel, "Id");
-            const target = xmlAttr(rel, "Target");
-            if (id && target) {
-              const resolved = resolvePresentationPartTarget(masterPath, target);
-              if (mediaCache.has(resolved)) masterRels.set(id, mediaCache.get(resolved)!);
-            }
-          }
-          masterRelsCache.set(masterPath, masterRels);
-        }
-      } catch { /* non-fatal */ }
-    }
-  } catch { /* layouts/masters are optional enhancement */ }
-
-  for (const slidePath of slideFiles) {
-    try {
-      const entry = zip.file(slidePath);
-      if (!entry) continue;
-      let xml = await entry.async("text");
-      // Unwrap <mc:AlternateContent> — prefer <mc:Choice> (modern), fall back to <mc:Fallback>
-      xml = xml.replace(/<mc:AlternateContent[\s>][\s\S]*?<\/mc:AlternateContent>/g, (block) => {
-        const choice = block.match(/<mc:Choice[\s>]([\s\S]*?)<\/mc:Choice>/);
-        if (choice && choice[1].trim()) return choice[1];
-        const fallback = block.match(/<mc:Fallback[\s>]([\s\S]*?)<\/mc:Fallback>/);
-        return fallback ? fallback[1] : "";
-      });
-      const relsMap = new Map<string, string>();
-      let layoutPath: string | undefined;
-      try {
-        const relsEntry = zip.file(presentationRelationshipsPart(slidePath));
-        if (relsEntry) {
-          const relsXml = await relsEntry.async("text");
-          const relMatches = relsXml.match(/<Relationship[^>]*\/>/g) || [];
-          for (const rel of relMatches) {
-            const id = xmlAttr(rel, "Id");
-            const target = xmlAttr(rel, "Target");
-            const type = xmlAttr(rel, "Type");
-            if (id && target) {
-              const resolved = resolvePresentationPartTarget(slidePath, target);
-              if (mediaCache.has(resolved)) relsMap.set(id, mediaCache.get(resolved)!);
-              if (type && type.includes("slideLayout")) layoutPath = resolved;
-            }
-          }
-        }
-        // Also resolve media from layout rels
-        if (layoutPath) {
-          const layoutRelsPath = presentationRelationshipsPart(layoutPath);
-          const lre = zip.file(layoutRelsPath);
-          if (lre) {
-            const lrXml = await lre.async("text");
-            for (const rel of (lrXml.match(/<Relationship[^>]*\/>/g) || [])) {
-              const id = xmlAttr(rel, "Id");
-              const target = xmlAttr(rel, "Target");
-              if (id && target) {
-                const resolved = resolvePresentationPartTarget(layoutPath, target);
-                if (mediaCache.has(resolved) && !relsMap.has(id)) relsMap.set(id, mediaCache.get(resolved)!);
-              }
-            }
-          }
-        }
-      } catch { /* rels parsing non-fatal */ }
-
-      const slide: PptxSlide = { shapes: [] };
-
-      // Build placeholder position map: master → layout → slide (later overrides earlier)
-      const phMap = new Map<string, { x: number; y: number; w: number; h: number }>();
-      try {
-        if (layoutPath) {
-          const masterPath = layoutToMasterPath.get(layoutPath);
-          if (masterPath && masterCache.has(masterPath)) {
-            for (const [k, v] of buildPlaceholderMap(masterCache.get(masterPath)!)) phMap.set(k, v);
-          }
-          if (layoutCache.has(layoutPath)) {
-            for (const [k, v] of buildPlaceholderMap(layoutCache.get(layoutPath)!)) phMap.set(k, v);
-          }
-        }
-      } catch { /* placeholder map non-fatal */ }
-
-      // Background — slide → layout → slide master fallback
-      try {
-        let bgXml = xmlInner(xml, "p:bg");
-        let bgRels = relsMap;
-        if (!bgXml && layoutPath && layoutCache.has(layoutPath)) {
-          bgXml = xmlInner(layoutCache.get(layoutPath)!, "p:bg");
-          bgRels = layoutRelsCache.get(layoutPath) || new Map<string, string>();
-        }
-        if (!bgXml && layoutPath) {
-          const masterPath = layoutToMasterPath.get(layoutPath);
-          if (masterPath && masterCache.has(masterPath)) {
-            bgXml = xmlInner(masterCache.get(masterPath)!, "p:bg");
-            bgRels = masterRelsCache.get(masterPath) || new Map<string, string>();
-          }
-        }
-        if (bgXml) {
-          const bgResult = parseBgFromXml(bgXml);
-          if (bgResult.color) slide.bg = bgResult.color;
-          if (bgResult.grad) slide.bgGrad = bgResult.grad;
-          if (bgResult.imgRId && bgRels.has(bgResult.imgRId)) slide.bgImgUrl = bgRels.get(bgResult.imgRId);
-        }
-      } catch { /* bg parsing non-fatal */ }
-
-      // Parse top-level shapes separately from group children so grouped
-      // objects are not rendered twice.
-      const groupMatches = xml.match(/<p:grpSp[\s>][\s\S]*?<\/p:grpSp>/g) || [];
-      const topLevelXml = xml.replace(/<p:grpSp[\s>][\s\S]*?<\/p:grpSp>/g, "");
-      const spMatches = topLevelXml.match(/<p:sp[\s>][\s\S]*?<\/p:sp>/g) || [];
-      const picMatches = topLevelXml.match(/<p:pic[\s>][\s\S]*?<\/p:pic>/g) || [];
-      const cxnMatches = topLevelXml.match(/<p:cxnSp[\s>][\s\S]*?<\/p:cxnSp>/g) || [];
-      try {
-        for (const grp of groupMatches) {
-          // Parse group transform for coordinate mapping
-          const grpSpPr = xmlInner(grp, "p:grpSpPr");
-          const grpXfrm = grpSpPr ? xmlInner(grpSpPr, "a:xfrm") : null;
-          let grpOffX = 0, grpOffY = 0, grpExtCx = 1, grpExtCy = 1;
-          let chOffX = 0, chOffY = 0, chExtCx = 1, chExtCy = 1;
-          if (grpXfrm) {
-            const off = grpXfrm.match(/<a:off x="(\d+)" y="(\d+)"/);
-            const ext = grpXfrm.match(/<a:ext cx="(\d+)" cy="(\d+)"/);
-            const chOff = grpXfrm.match(/<a:chOff x="(\d+)" y="(\d+)"/);
-            const chExt = grpXfrm.match(/<a:chExt cx="(\d+)" cy="(\d+)"/);
-            if (off) { grpOffX = parseInt(off[1], 10); grpOffY = parseInt(off[2], 10); }
-            if (ext) { grpExtCx = parseInt(ext[1], 10); grpExtCy = parseInt(ext[2], 10); }
-            if (chOff) { chOffX = parseInt(chOff[1], 10); chOffY = parseInt(chOff[2], 10); }
-            if (chExt) { chExtCx = parseInt(chExt[1], 10); chExtCy = parseInt(chExt[2], 10); }
-          }
-          const children = [
-            ...(grp.match(/<p:sp[\s>][\s\S]*?<\/p:sp>/g) || []),
-            ...(grp.match(/<p:pic[\s>][\s\S]*?<\/p:pic>/g) || []),
-            ...(grp.match(/<p:cxnSp[\s>][\s\S]*?<\/p:cxnSp>/g) || []),
-          ];
-          for (const ch of children) {
-            const s = parseShape(ch, relsMap, phMap);
-            if (s && grpXfrm && chExtCx > 0 && chExtCy > 0) {
-              // Transform child coords from group space to slide space
-              const childXEmu = (s.x / 100) * SLIDE_W;
-              const childYEmu = (s.y / 100) * SLIDE_H;
-              const childWEmu = (s.w / 100) * SLIDE_W;
-              const childHEmu = (s.h / 100) * SLIDE_H;
-              const mappedX = grpOffX + (childXEmu - chOffX) * (grpExtCx / chExtCx);
-              const mappedY = grpOffY + (childYEmu - chOffY) * (grpExtCy / chExtCy);
-              const mappedW = childWEmu * (grpExtCx / chExtCx);
-              const mappedH = childHEmu * (grpExtCy / chExtCy);
-              s.x = emu2pctX(mappedX); s.y = emu2pctY(mappedY);
-              s.w = emu2pctX(mappedW); s.h = emu2pctY(mappedH);
-            }
-            if (s) slide.shapes.push(s);
-          }
-        }
-      } catch { /* group extraction non-fatal */ }
-
-      for (const sp of [...spMatches, ...picMatches, ...cxnMatches]) {
-        try {
-          const s = parseShape(sp, relsMap, phMap);
-          if (s) slide.shapes.push(s);
-        } catch { /* individual shape parse non-fatal */ }
-      }
-
-      // Tables (non-fatal)
-      try {
-        const gfMatches = xml.match(/<p:graphicFrame[\s>][\s\S]*?<\/p:graphicFrame>/g) || [];
-        for (const gf of gfMatches) {
-          const xfrm = xmlInner(gf, "a:xfrm") || xmlInner(gf, "p:xfrm");
-          if (!xfrm) continue;
-          const offM = xfrm.match(/<a:off x="(\d+)" y="(\d+)"/) || xfrm.match(/<p:off x="(\d+)" y="(\d+)"/);
-          const extM = xfrm.match(/<a:ext cx="(\d+)" cy="(\d+)"/) || xfrm.match(/<p:ext cx="(\d+)" cy="(\d+)"/);
-          if (!offM || !extM) continue;
-          const table = viewerParseTable(gf);
-          if (table) {
-            slide.shapes.push({
-              type: "table",
-              x: emu2pctX(parseInt(offM[1], 10)), y: emu2pctY(parseInt(offM[2], 10)),
-              w: emu2pctX(parseInt(extM[1], 10)), h: emu2pctY(parseInt(extM[2], 10)),
-              texts: [], tableRows: table.rows, tableCols: table.cols, tableColWidths: table.colWidths,
-            });
-          }
-        }
-      } catch { /* table parsing non-fatal */ }
-
-      // Layout decorative shapes (non-fatal)
-      try {
-        if (layoutPath && layoutCache.has(layoutPath)) {
-          const layoutXml = layoutCache.get(layoutPath)!;
-          for (const sp of [
-            ...(layoutXml.match(/<p:sp[\s>][\s\S]*?<\/p:sp>/g) || []),
-            ...(layoutXml.match(/<p:pic[\s>][\s\S]*?<\/p:pic>/g) || []),
-          ]) {
-            if (sp.includes("<p:ph")) continue;
-            const lShape = parseShape(sp, layoutRelsCache.get(layoutPath) || new Map<string, string>());
-            if (lShape && (lShape.fill || lShape.gradFill || lShape.imgUrl || lShape.stroke)) {
-              slide.shapes.unshift(lShape);
-            }
-          }
-        }
-      } catch { /* layout shapes non-fatal */ }
-
-      // Slide master decorative shapes (non-fatal) — rendered behind layout shapes
-      try {
-        if (layoutPath) {
-          const masterPath = layoutToMasterPath.get(layoutPath);
-          if (masterPath && masterCache.has(masterPath)) {
-            const masterXml = masterCache.get(masterPath)!;
-            const masterRels = masterRelsCache.get(masterPath) || new Map<string, string>();
-            for (const sp of [
-              ...(masterXml.match(/<p:sp[\s>][\s\S]*?<\/p:sp>/g) || []),
-              ...(masterXml.match(/<p:pic[\s>][\s\S]*?<\/p:pic>/g) || []),
-            ]) {
-              if (sp.includes("<p:ph")) continue;
-              const mShape = parseShape(sp, masterRels);
-              if (mShape && (mShape.fill || mShape.gradFill || mShape.imgUrl || mShape.stroke)) {
-                slide.shapes.unshift(mShape);
-              }
-            }
-          }
-        }
-      } catch { /* master shapes non-fatal */ }
-
-      slide.aspectRatio = `${SLIDE_W}/${SLIDE_H}`;
-      slide.theme = {
-        colors: { ..._viewerTheme },
-        majorFont: _viewerMajorFont || undefined,
-        minorFont: _viewerMinorFont || undefined,
-      };
-      slides.push(slide);
-    } catch {
-      // If a single slide fails, add empty slide placeholder and continue
-      slides.push({ shapes: [] });
-    }
-  }
-
-  return slides;
-}
 
 // Slide accent colors for text-based slides
 const SLIDE_ACCENTS = ["#4f7d75", "#4869ac", "#6f4ba8", "#c14a44", "#b27c34", "#437f6b"];
@@ -2709,27 +1733,6 @@ function parseTextSlides(text: string): PptxSlide[] {
   return slides;
 }
 
-/** Map preset geometry names to CSS clip-path polygons */
-function _presetClipPath(geom?: string): string | undefined {
-  switch (geom) {
-    case "triangle": return "polygon(50% 0%, 0% 100%, 100% 100%)";
-    case "rtTriangle": return "polygon(0% 0%, 0% 100%, 100% 100%)";
-    case "diamond": return "polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%)";
-    case "pentagon": return "polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%)";
-    case "hexagon": return "polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%)";
-    case "parallelogram": return "polygon(15% 0%, 100% 0%, 85% 100%, 0% 100%)";
-    case "trapezoid": return "polygon(20% 0%, 80% 0%, 100% 100%, 0% 100%)";
-    case "chevron": return "polygon(0% 0%, 85% 0%, 100% 50%, 85% 100%, 0% 100%, 15% 50%)";
-    case "rightArrow": return "polygon(0% 20%, 70% 20%, 70% 0%, 100% 50%, 70% 100%, 70% 80%, 0% 80%)";
-    case "leftArrow": return "polygon(30% 0%, 30% 20%, 100% 20%, 100% 80%, 30% 80%, 30% 100%, 0% 50%)";
-    case "upArrow": return "polygon(50% 0%, 100% 30%, 80% 30%, 80% 100%, 20% 100%, 20% 30%, 0% 30%)";
-    case "downArrow": return "polygon(20% 0%, 80% 0%, 80% 70%, 100% 70%, 50% 100%, 0% 70%, 20% 70%)";
-    case "star5": return "polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%)";
-    case "ribbon": case "ribbon2": return undefined; // too complex for simple clip-path
-    default: return undefined;
-  }
-}
-
 function PreviewDownloadFallback({
   message,
   onDownload,
@@ -2839,6 +1842,11 @@ interface PdfPageTextHint {
     width: number;
     height: number;
   }>;
+}
+
+interface PdfPageDimensions {
+  width: number;
+  height: number;
 }
 
 interface PdfRectDraft {
@@ -3275,12 +2283,6 @@ function removeSavedPdfSignature() {
   }
 }
 
-async function dataUrlToUint8Array(dataUrl: string): Promise<Uint8Array> {
-  const response = await fetch(dataUrl);
-  const buffer = await response.arrayBuffer();
-  return new Uint8Array(buffer);
-}
-
 async function blobToPdfImage(blob: Blob): Promise<{ dataUrl: string; width: number; height: number }> {
   const objectUrl = URL.createObjectURL(blob);
   try {
@@ -3563,7 +2565,7 @@ function PdfSignatureDialog({
   );
 }
 
-function PdfJsViewer({
+export function PdfJsViewer({
   url,
   blob,
   docId,
@@ -3577,13 +2579,15 @@ function PdfJsViewer({
   blob?: Blob | null;
   docId?: string;
   docName?: string;
-  onDownload: () => void;
+  onDownload?: () => void;
   onSaved?: (savedDoc: Document, savedBlob: Blob) => void | Promise<void>;
   onLiveEditBridgeChange?: (bridge: PdfLiveEditBridge | null) => void;
   canEdit?: boolean;
 }) {
   const [pdfDoc, setPdfDoc] = useState<any>(null);
   const [pageCount, setPageCount] = useState(0);
+  const [pageDimensions, setPageDimensions] = useState<PdfPageDimensions[]>([]);
+  const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([1]));
   const [pageTextHints, setPageTextHints] = useState<PdfPageTextHint[]>([]);
   const [zoom, setZoom] = useState(PDF_DEFAULT_ZOOM);
   const [loading, setLoading] = useState(true);
@@ -3614,6 +2618,28 @@ function PdfJsViewer({
     const textAreaRefs = useRef<Map<string, HTMLTextAreaElement>>(new Map());
     const annotationEditHistoryRef = useRef<Set<string>>(new Set());
     const canvasesRef = useRef<Map<number, HTMLCanvasElement>>(new Map());
+    const pageElementsRef = useRef<Map<number, HTMLDivElement>>(new Map());
+    const canvasRefCallbacks = useRef<Map<number, (canvas: HTMLCanvasElement | null) => void>>(new Map());
+    const pagesContainerRef = useRef<HTMLDivElement>(null);
+    const pdfRenderRevisionRef = useRef(0);
+    const getCanvasRef = useCallback((pageNumber: number) => {
+      let callback = canvasRefCallbacks.current.get(pageNumber);
+      if (!callback) {
+        callback = (canvas) => {
+          if (canvas) canvasesRef.current.set(pageNumber, canvas);
+          else {
+            const existingCanvas = canvasesRef.current.get(pageNumber);
+            if (existingCanvas) {
+              existingCanvas.width = 0;
+              existingCanvas.height = 0;
+            }
+            canvasesRef.current.delete(pageNumber);
+          }
+        };
+        canvasRefCallbacks.current.set(pageNumber, callback);
+      }
+      return callback;
+    }, []);
   const dragRef = useRef<{
     mode: "move" | "resize";
     id: string;
@@ -3674,8 +2700,8 @@ function PdfJsViewer({
     const viewportCenter = window.innerHeight / 2;
     let bestPage = 1;
     let bestDistance = Number.POSITIVE_INFINITY;
-    for (const [page, canvas] of canvasesRef.current) {
-      const rect = canvas.getBoundingClientRect();
+    for (const [page, pageElement] of pageElementsRef.current) {
+      const rect = pageElement.getBoundingClientRect();
       const distance = Math.abs((rect.top + rect.bottom) / 2 - viewportCenter);
       if (distance < bestDistance) {
         bestDistance = distance;
@@ -3704,8 +2730,8 @@ function PdfJsViewer({
       }
     }
     const page = mediaTargetPage();
-    const canvas = canvasesRef.current.get(page);
-    const pageAspect = Math.max(0.2, (canvas?.width || 1) / Math.max(1, canvas?.height || 1));
+    const dimensions = pageDimensions[page - 1];
+    const pageAspect = Math.max(0.2, (dimensions?.width || 1) / Math.max(1, dimensions?.height || 1));
     const imageAspect = image.width / Math.max(1, image.height);
     const width = 0.5;
     const height = Math.min(0.55, Math.max(0.08, (width * pageAspect) / imageAspect));
@@ -3728,7 +2754,7 @@ function PdfJsViewer({
     setEditorMessage(asset.kind === "video"
       ? "Video cover added. The saved PDF will link to the playable video."
       : "Image added to the PDF.");
-  }, [commitAnnotations, mediaTargetPage]);
+  }, [commitAnnotations, mediaTargetPage, pageDimensions]);
 
   const undoAnnotations = useCallback(() => {
     setAnnotationPast((past) => {
@@ -3764,6 +2790,8 @@ function PdfJsViewer({
     setError("");
     setPdfDoc(null);
     setPageCount(0);
+    setPageDimensions([]);
+    setVisiblePages(new Set([1]));
     setPageTextHints([]);
 
     (async () => {
@@ -3819,32 +2847,105 @@ function PdfJsViewer({
   useEffect(() => {
     if (!pdfDoc || pageCount === 0) return;
     let cancelled = false;
-    const renderTasks: any[] = [];
+    const dimensions: PdfPageDimensions[] = Array.from({ length: pageCount }, () => ({ width: 612, height: 792 }));
+    let nextPage = 1;
+
+    const readDimensions = async () => {
+      while (!cancelled) {
+        const pageNumber = nextPage++;
+        if (pageNumber > pageCount) return;
+        try {
+          const page = await pdfDoc.getPage(pageNumber);
+          const viewport = page.getViewport({ scale: 1 });
+          dimensions[pageNumber - 1] = { width: viewport.width, height: viewport.height };
+        } catch {
+          // Keep the standard page placeholder when a page cannot be measured.
+        }
+      }
+    };
+
+    void Promise.all(Array.from({ length: Math.min(PDF_PAGE_RENDER_CONCURRENCY, pageCount) }, readDimensions))
+      .then(() => {
+        if (!cancelled) setPageDimensions(dimensions);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [pageCount, pdfDoc]);
+
+  useEffect(() => {
+    const container = pagesContainerRef.current;
+    if (!container || pageCount === 0) return;
+    const intersecting = new Set<number>();
+    const observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        const pageNumber = Number((entry.target as HTMLElement).dataset.pdfPageNumber);
+        if (entry.isIntersecting) intersecting.add(pageNumber);
+        else intersecting.delete(pageNumber);
+      }
+      const nextVisiblePages = new Set<number>();
+      for (const pageNumber of intersecting) {
+        for (
+          let candidate = Math.max(1, pageNumber - PDF_PAGE_RENDER_OVERSCAN);
+          candidate <= Math.min(pageCount, pageNumber + PDF_PAGE_RENDER_OVERSCAN);
+          candidate += 1
+        ) nextVisiblePages.add(candidate);
+      }
+      setVisiblePages((current) => (
+        current.size === nextVisiblePages.size && [...current].every((pageNumber) => nextVisiblePages.has(pageNumber))
+          ? current
+          : nextVisiblePages
+      ));
+    }, { root: pagesContainerRef.current, rootMargin: "320px 0px" });
+    pageElementsRef.current.forEach((pageElement) => observer.observe(pageElement));
+    return () => observer.disconnect();
+  }, [pageCount]);
+
+  useEffect(() => {
+    if (!pdfDoc || pageCount === 0) return;
+    let cancelled = false;
+    const renderRevision = pdfRenderRevisionRef.current + 1;
+    pdfRenderRevisionRef.current = renderRevision;
+    const renderTasks = new Map<number, any>();
+    const queue = [...visiblePages].filter((pageNumber) => canvasesRef.current.has(pageNumber));
 
     (async () => {
+      if (queue.length === 0) return;
       setRendering(true);
       try {
-        for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
-          if (cancelled) break;
-          const page = await pdfDoc.getPage(pageNumber);
-          const canvas = canvasesRef.current.get(pageNumber);
-          if (!canvas) continue;
-
-          const viewport = page.getViewport({ scale: Math.max(0.25, zoom / 100) });
-          const outputScale = window.devicePixelRatio || 1;
-          canvas.width = Math.floor(viewport.width * outputScale);
-          canvas.height = Math.floor(viewport.height * outputScale);
-          canvas.style.width = `${viewport.width}px`;
-          canvas.style.height = `${viewport.height}px`;
-
-          const context = canvas.getContext("2d");
-          if (!context) continue;
-          context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
-          const task = page.render({ canvasContext: context, viewport });
-          renderTasks.push(task);
-          await task.promise;
-          page.cleanup();
-        }
+        const renderNext = async () => {
+          while (!cancelled && renderRevision === pdfRenderRevisionRef.current) {
+            const pageNumber = queue.shift();
+            if (!pageNumber) return;
+            const canvas = canvasesRef.current.get(pageNumber);
+            if (!canvas) continue;
+            const page = await pdfDoc.getPage(pageNumber);
+            if (cancelled || renderRevision !== pdfRenderRevisionRef.current) {
+              page.cleanup();
+              return;
+            }
+            const viewport = page.getViewport({ scale: Math.max(0.25, zoom / 100) });
+            const requestedScale = window.devicePixelRatio || 1;
+            const outputScale = Math.min(requestedScale, Math.sqrt(PDF_MAX_CANVAS_PIXELS / Math.max(1, viewport.width * viewport.height)));
+            canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+            canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+            canvas.style.width = `${viewport.width}px`;
+            canvas.style.height = canEdit ? `${viewport.height}px` : "auto";
+            const context = canvas.getContext("2d");
+            if (!context) continue;
+            context.setTransform(outputScale, 0, 0, outputScale, 0, 0);
+            const task = page.render({ canvasContext: context, viewport });
+            renderTasks.set(pageNumber, task);
+            try {
+              await task.promise;
+            } finally {
+              renderTasks.delete(pageNumber);
+              page.cleanup();
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(PDF_PAGE_RENDER_CONCURRENCY, queue.length) }, renderNext));
       } catch (e: any) {
         if (!cancelled && e?.name !== "RenderingCancelledException") {
           setError(e?.message || t("page.file_viewer.pdf_preview_requires_downloading_the_file"));
@@ -3858,7 +2959,7 @@ function PdfJsViewer({
       cancelled = true;
       renderTasks.forEach((task) => task.cancel?.());
     };
-  }, [pageCount, pdfDoc, zoom]);
+  }, [canEdit, pageCount, pdfDoc, visiblePages, zoom]);
 
   useEffect(() => {
     if (!pdfDoc || pageCount === 0) return;
@@ -4313,11 +3414,11 @@ function PdfJsViewer({
   const buildEditedPdfBlob = useCallback(async () => {
     if (annotations.length === 0) throw new Error(PDF_EDITOR_COPY.noEdits);
     if (!pdfDoc) throw new Error("PDF preview is not ready");
-    const source = await fetch(url);
-    if (!source.ok) throw new Error("PDF fetch failed");
-    const sourceBytes = await source.arrayBuffer();
+    const sourceBytes = blob
+      ? await blob.arrayBuffer()
+      : await pdfDoc.getData();
     const sourceText = new TextDecoder("latin1").decode(new Uint8Array(sourceBytes));
-    if (/\/FT\s*\/Sig\b|\/Type\s*\/Sig\b|\/ByteRange\s*\[/i.test(sourceText)) {
+    if (/\/FT\s*\/Sig\b|\/Type\s*\/Sig\b|\/ByteRange\s*\[|\/ManorSignatureStatus\s*\(completed\)/i.test(sourceText)) {
       throw new Error(PDF_EDITOR_COPY.signedPdf);
     }
     const { PDFDocument, PDFString, StandardFonts, degrees, rgb } = await import("pdf-lib");
@@ -4377,7 +3478,7 @@ function PdfJsViewer({
           });
         }
       } else if (annotation.kind === "signature") {
-        const signatureImage = await editedPdf.embedPng(await dataUrlToUint8Array(annotation.dataUrl));
+        const signatureImage = await editedPdf.embedPng(annotation.dataUrl);
         const imageScale = Math.min(
           placement.width / Math.max(1, signatureImage.width),
           placement.height / Math.max(1, signatureImage.height),
@@ -4397,7 +3498,7 @@ function PdfJsViewer({
           rotate: rotation,
         });
       } else if (annotation.kind === "image") {
-        const mediaImage = await editedPdf.embedPng(await dataUrlToUint8Array(annotation.dataUrl));
+        const mediaImage = await editedPdf.embedPng(annotation.dataUrl);
         const imageScale = Math.min(
           placement.width / Math.max(1, mediaImage.width),
           placement.height / Math.max(1, mediaImage.height),
@@ -4484,7 +3585,7 @@ function PdfJsViewer({
     const pdfBytes = new Uint8Array(bytes.length);
     pdfBytes.set(bytes);
     return new Blob([pdfBytes], { type: "application/pdf" });
-  }, [annotations, pdfDoc, url]);
+  }, [annotations, blob, pdfDoc]);
 
   const handleDownloadEdited = useCallback(async () => {
     if (pdfAiPreviewRef.current) return;
@@ -5181,28 +4282,39 @@ function PdfJsViewer({
 	          )}
         </aside>
         )}
-        <div className="pdf-editor-pages">
-        {Array.from({ length: pageCount }, (_, i) => i + 1).map((pageNumber) => (
+        <div className="pdf-editor-pages" ref={pagesContainerRef}>
+        {Array.from({ length: pageCount }, (_, i) => i + 1).map((pageNumber) => {
+          const dimensions = pageDimensions[pageNumber - 1] || { width: 612, height: 792 };
+          const pageScale = Math.max(0.25, zoom / 100);
+          return (
           <div
             key={pageNumber}
             data-pdf-page="true"
+            data-pdf-page-number={pageNumber}
             className="pdf-editor-page"
+            ref={(pageElement) => {
+              if (pageElement) pageElementsRef.current.set(pageNumber, pageElement);
+              else pageElementsRef.current.delete(pageNumber);
+            }}
             onClick={handlePageClick}
             onPointerDown={(event) => handlePagePointerDown(pageNumber, event)}
             onPointerMove={(event) => handlePagePointerMove(pageNumber, event)}
             onPointerUp={(event) => handlePagePointerUp(pageNumber, event)}
             onPointerCancel={(event) => handlePagePointerUp(pageNumber, event)}
             style={{
+              width: `${dimensions.width * pageScale}px`,
+              height: canEdit ? `${dimensions.height * pageScale}px` : undefined,
+              aspectRatio: canEdit ? undefined : `${dimensions.width} / ${dimensions.height}`,
+              flex: "0 0 auto",
               cursor: activeTool === "select" ? "default" : "crosshair",
               touchAction: activeTool === "draw" || isPdfRectPlacementTool(activeTool) ? "none" : undefined,
             }}
           >
-            <canvas
-              ref={(canvas) => {
-                if (canvas) canvasesRef.current.set(pageNumber, canvas);
-                else canvasesRef.current.delete(pageNumber);
-              }}
-            />
+            {visiblePages.has(pageNumber) && (
+              <canvas
+                ref={getCanvasRef(pageNumber)}
+              />
+            )}
             {annotations.filter((annotation) => annotation.page === pageNumber).map(renderAnnotation)}
             {rectDraft?.page === pageNumber && renderRectDraft(rectDraft)}
             {drawingDraft?.page === pageNumber && drawingDraft.points.length > 1 && (
@@ -5222,7 +4334,8 @@ function PdfJsViewer({
               </svg>
             )}
           </div>
-        ))}
+          );
+        })}
         </div>
       </div>
       {showSignatureDialog && (
@@ -5464,21 +4577,39 @@ function pptxSlideAspectValue(aspectRatio?: string): number {
   return width > 0 && height > 0 ? width / height : PPTX_THUMBNAIL_FRAME_ASPECT;
 }
 
-function pptxThumbnailFitStyle(aspectRatio?: string): React.CSSProperties {
+function pptxThumbnailFitStyle(aspectRatio?: string, frameAspect = PPTX_THUMBNAIL_FRAME_ASPECT): React.CSSProperties {
   const slideAspect = pptxSlideAspectValue(aspectRatio);
-  return slideAspect >= PPTX_THUMBNAIL_FRAME_ASPECT
-    ? { width: "100%", height: `${(PPTX_THUMBNAIL_FRAME_ASPECT / slideAspect) * 100}%` }
-    : { width: `${(slideAspect / PPTX_THUMBNAIL_FRAME_ASPECT) * 100}%`, height: "100%" };
+  return slideAspect >= frameAspect
+    ? { width: "100%", height: `${(frameAspect / slideAspect) * 100}%` }
+    : { width: `${(slideAspect / frameAspect) * 100}%`, height: "100%" };
+}
+
+/**
+ * Thumbnail buttons take the deck's own shape (fixed height, width from the
+ * aspect) so 4:3 or portrait decks are not letterboxed inside a 16:9 frame.
+ */
+function pptxThumbnailFrameAspect(aspect: number): number {
+  return Math.max(0.5, Math.min(2.5, Number.isFinite(aspect) && aspect > 0 ? aspect : PPTX_THUMBNAIL_FRAME_ASPECT));
+}
+
+function pptxThumbnailButtonStyle(frameAspect: number): React.CSSProperties {
+  return { "--pptx-thumbnail-aspect": frameAspect } as React.CSSProperties;
 }
 
 function PptxCssSlidePreview({
   slide,
   slideIndex,
   thumbnail = false,
+  frameWidth,
+  thumbnailFrameAspect,
 }: {
   slide: PptxSlide;
   slideIndex: number;
   thumbnail?: boolean;
+  /** Aspect of the thumbnail button the preview is fitted into. */
+  thumbnailFrameAspect?: number;
+  /** Stage-fitted width (px) so the whole slide is visible at any aspect. */
+  frameWidth?: number;
 }) {
   const slideTheme = slide.theme;
   const slideBg: React.CSSProperties = { backgroundColor: slide.bg || "#ffffff" };
@@ -5496,17 +4627,18 @@ function PptxCssSlidePreview({
       style={{
         aspectRatio: slide.aspectRatio || "16/9",
         ...slideBg,
-        ...(thumbnail ? pptxThumbnailFitStyle(slide.aspectRatio) : undefined),
-      }}
+        ...(thumbnail ? pptxThumbnailFitStyle(slide.aspectRatio, thumbnailFrameAspect) : undefined),
+        ...(!thumbnail && frameWidth ? { width: frameWidth, maxWidth: "none", flex: "none" } : undefined),
+        "--pptx-point-scale": slide.heightPoints ? 540 / slide.heightPoints : 1,
+      } as React.CSSProperties}
       aria-hidden={thumbnail || undefined}
     >
       {slide.shapes.map((shape, shapeIndex) => {
-        let borderRadius: string | number | undefined = shape.borderRadius ? `${shape.borderRadius}%` : undefined;
+        let borderRadius: string | number | undefined;
         if (shape.presetGeom === "ellipse" || shape.presetGeom === "oval") borderRadius = "50%";
-        else if (shape.presetGeom === "roundRect" && !borderRadius) borderRadius = "8%";
-        const borderStyle = shape.stroke
-          ? `${presentationPointsToCqh(Math.max(0.5, shape.strokeWidth || 1))} solid ${shape.stroke}`
-          : undefined;
+        else if (shape.presetGeom === "roundRect") borderRadius = presentationRoundRectRadius(shape.w, shape.h, shape.borderRadius);
+        else if (shape.presetGeom === "flowChartTerminator") borderRadius = "999px";
+        else if (shape.presetGeom === "wedgeRoundRectCallout") borderRadius = "8%";
 
         if (shape.type === "table" && shape.tableRows) {
           const totalColWidth = shape.tableColWidths?.reduce((sum, width) => sum + width, 0) || 1;
@@ -5550,28 +4682,43 @@ function PptxCssSlidePreview({
           );
         }
 
-        if (shape.type === "line") {
-          const lineColor = shape.stroke || "#57534e";
-          const lineWidth = presentationPointsToCqh(Math.max(1, shape.strokeWidth || 1));
+        if (shape.type === "placeholder") {
+          const label = shape.placeholderKind === "chart"
+            ? t("page.file_viewer.pptx_chart")
+            : shape.placeholderKind === "smartart"
+              ? t("page.file_viewer.pptx_smartart")
+              : t("page.file_viewer.pptx_embedded_object");
           return (
-            <svg key={shapeIndex} style={{
-              position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
-              width: `${shape.w}%`, height: `${shape.h}%`, overflow: "visible", opacity: shape.opacity,
-              transform: shape.rotation ? `rotate(${shape.rotation}deg)` : undefined,
-            }}>
-              <line
-                x1="0"
-                y1={shape.h > shape.w ? "0" : "50%"}
-                x2="100%"
-                y2={shape.h > shape.w ? "100%" : "50%"}
-                stroke={lineColor}
-                strokeWidth={lineWidth}
-              />
-            </svg>
+            <div
+              key={shapeIndex}
+              className="pptx-graphic-placeholder"
+              data-placeholder-kind={shape.placeholderKind}
+              role={thumbnail ? undefined : "img"}
+              aria-label={thumbnail ? undefined : label}
+              style={{
+                position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
+                width: `${shape.w}%`, height: `${shape.h}%`,
+              }}
+            >
+              {!thumbnail && <span className="pptx-graphic-placeholder-label">{label}</span>}
+            </div>
           );
         }
 
-        const clipPath = _presetClipPath(shape.presetGeom);
+        if (shape.type === "line") {
+          return (
+            <div key={shapeIndex} style={{
+              position: "absolute", left: `${shape.x}%`, top: `${shape.y}%`,
+              width: `${Math.max(0.5, shape.w)}%`, height: `${Math.max(0.5, shape.h)}%`, overflow: "visible", opacity: shape.opacity,
+              transform: [shape.rotation ? `rotate(${shape.rotation}deg)` : "", shape.flipH ? "scaleX(-1)" : "", shape.flipV ? "scaleY(-1)" : ""].filter(Boolean).join(" ") || undefined,
+            }}>
+              <PresentationShapeOutline {...shape} presetGeom="line" />
+            </div>
+          );
+        }
+
+        const clipPath = presentationPresetClipPath(shape.presetGeom);
+        const polygonPoints = presentationPresetPointsAttribute(shape.presetGeom);
         const verticalJustify = shape.vAlign === "top"
           ? "flex-start"
           : shape.vAlign === "bottom"
@@ -5625,7 +4772,6 @@ function PptxCssSlidePreview({
               height: `${shape.h}%`,
               background: shape.gradFill ? gradientToCss(shape.gradFill) : shape.fill || undefined,
               borderRadius,
-              border: borderStyle,
               opacity: shape.opacity,
               overflow: "hidden",
               display: "flex",
@@ -5638,6 +4784,7 @@ function PptxCssSlidePreview({
               boxShadow,
             }}
           >
+            <PresentationShapeOutline {...shape} points={polygonPoints} />
             {shape.videoUrl && !thumbnail ? (
               <video
                 className="pptx-native-video pptx-native-video--css"
@@ -5648,7 +4795,7 @@ function PptxCssSlidePreview({
                 preload="metadata"
                 aria-label={`Video on ${t("page.file_viewer.slide")} ${slideIndex + 1}`}
               />
-            ) : shape.imgUrl ? <img src={shape.imgUrl} alt="" style={imageStyle} /> : null}
+            ) : shape.imgUrl ? <img src={shape.imgUrl} alt={shape.altText || ""} style={imageStyle} /> : null}
             {(() => {
               let autoNumberCounter = 0;
               return shape.texts.map((paragraph, paragraphIndex) => {
@@ -5672,10 +4819,12 @@ function PptxCssSlidePreview({
                     style={{
                       position: "relative",
                       margin: 0,
-                      marginTop: paragraph.spaceBefore ? presentationPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
-                      marginBottom: paragraph.spaceAfter ? presentationPointsToCqh(paragraph.spaceAfter) : "0.05em",
+                      marginTop: paragraph.spaceBefore != null ? presentationPointsToCqh(paragraph.spaceBefore) : paragraph.text === "" ? "0.3em" : "0.05em",
+                      marginBottom: paragraph.spaceAfter != null ? presentationPointsToCqh(paragraph.spaceAfter) : "0.05em",
                       minHeight: paragraph.text === "" ? "0.5em" : undefined,
-                      paddingLeft: paragraph.indent ? presentationPointsToCqh(paragraph.indent) : displayBullet ? presentationPointsToCqh(18) : undefined,
+                      paddingLeft: paragraph.indent != null ? presentationPointsToCqh(paragraph.indent) : displayBullet ? presentationPointsToCqh(18) : undefined,
+                      paddingRight: paragraph.indentRight != null ? presentationPointsToCqh(paragraph.indentRight) : undefined,
+                      textIndent: !displayBullet && paragraph.hanging != null ? presentationPointsToCqh(paragraph.hanging) : undefined,
                       fontSize: paragraph.fontSize ? presentationPointsToCqh(paragraph.fontSize) : "2.6cqh",
                       fontWeight: paragraph.bold ? 700 : 400,
                       fontStyle: paragraph.italic ? "italic" : undefined,
@@ -5685,7 +4834,7 @@ function PptxCssSlidePreview({
                       lineHeight: paragraph.lineSpacing || 1.35,
                       wordBreak: "normal",
                       overflowWrap: "break-word",
-                      whiteSpace: "pre-wrap",
+                      whiteSpace: shape.wordWrap === false ? "pre" : "pre-wrap",
                       zIndex: 1,
                       fontFamily: paragraph.fontFamily
                         ? `"${paragraph.fontFamily}", sans-serif`
@@ -5693,7 +4842,7 @@ function PptxCssSlidePreview({
                     }}
                   >
                     {displayBullet && (
-                      <span style={{ position: "absolute", left: presentationPointsToCqh(paragraph.indent ? paragraph.indent - 14 : 2) }}>
+                      <span style={{ position: "absolute", left: presentationPointsToCqh(paragraph.indent != null ? paragraph.indent + (paragraph.hanging ?? (paragraph.indent === 0 ? 0 : -14)) : 2) }}>
                         {displayBullet}
                       </span>
                     )}
@@ -5723,7 +4872,10 @@ function PptxCssSlidePreview({
 // ── PPTX viewer ──
 export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob?: Blob | null; docId?: string; onDownload?: () => void }) {
   const [slides, setSlides] = useState<PptxSlide[]>([]);
-  const [slideImageUrls, setSlideImageUrls] = useState<string[]>([]);
+  const [slideImageUrls, setSlideImageUrls] = useState<Array<string | null>>([]);
+  const [serverSlideList, setServerSlideList] = useState<ServerSlideList | null>(null);
+  const [failedServerSlides, setFailedServerSlides] = useState<ReadonlySet<number>>(() => new Set());
+  const [serverRenderPending, setServerRenderPending] = useState(false);
   const [activeSlide, setActiveSlide] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -5735,15 +4887,18 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
   const thumbnailRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const cssThumbnailStripRef = useRef<HTMLDivElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  // Read by the slide fetch priority picker while the effect below runs.
+  const activeSlideRef = useRef(0);
+  const visibleThumbnailIndexesRef = useRef<ReadonlySet<number>>(new Set([0]));
+  activeSlideRef.current = activeSlide;
+  visibleThumbnailIndexesRef.current = visibleCssThumbnailIndexes;
 
   useEffect(() => {
+    // Every value below belongs to this file generation; a newer file (or
+    // unmount) flips `cancelled`, aborts the server fetches and revokes URLs.
     let cancelled = false;
-    let serverRenderActive = true;
+    let serverShowing = false;
     const serverRenderAbortController = new AbortController();
-    const serverRenderTimeoutId = window.setTimeout(
-      () => serverRenderAbortController.abort(),
-      8000,
-    );
     const createdBlobUrls: string[] = [];
     const serverBlobUrls: string[] = [];
     const parserBlobUrls: string[] = [];
@@ -5760,7 +4915,7 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
       parserBlobUrls.splice(0);
     };
     const trackServerBlobUrl = (blobUrl: string) => {
-      if (cancelled || !serverRenderActive) {
+      if (cancelled) {
         URL.revokeObjectURL(blobUrl);
         return false;
       }
@@ -5773,49 +4928,72 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
     setError("");
     setSlides([]);
     setSlideImageUrls([]);
+    setServerSlideList(null);
+    setFailedServerSlides(new Set());
+    setServerRenderPending(Boolean(docId));
     setActiveSlide(0);
     setRenderMode("css");
     setVisibleCssThumbnailIndexes(new Set([0]));
 
     (async () => {
       try {
+        // Server images are the high-fidelity view. A cold render can take
+        // minutes, so the browser parse is shown as an interim view meanwhile
+        // and the viewer upgrades once the first server image arrives.
         const serverSlidesTask = (async () => {
+          let blobUrls: Array<string | null> = [];
           try {
-            if (!docId) return [] as string[];
+            if (!docId) return [] as Array<string | null>;
             const token = getAuthToken();
             const headers: Record<string, string> = {};
             if (token) headers["Authorization"] = `Bearer ${token}`;
-            const slideRes = await fetch(`/api/v1/documents/${docId}/slides`, {
+            await loadServerSlidePreview({
+              docId,
               headers,
               signal: serverRenderAbortController.signal,
+              pickNext: slidePriorityPicker(
+                () => activeSlideRef.current,
+                () => visibleThumbnailIndexesRef.current,
+              ),
+              onSlideList: (slideData) => {
+                // A re-issued list (file edited mid-load) replaces every slot.
+                revokeTrackedBlobUrls(serverBlobUrls);
+                blobUrls = Array<string | null>(slideData.slides.length).fill(null);
+                if (cancelled) return;
+                setServerSlideList(slideData);
+                setFailedServerSlides(new Set());
+                if (serverShowing) setSlideImageUrls([...blobUrls]);
+              },
+              onSlideImage: (index, imageBlob) => {
+                const blobUrl = URL.createObjectURL(imageBlob);
+                blobUrls[index] = trackServerBlobUrl(blobUrl) ? blobUrl : null;
+                if (cancelled || !blobUrls[index]) return;
+                serverShowing = true;
+                setSlideImageUrls([...blobUrls]);
+                setRenderMode("server");
+                setLoading(false);
+              },
+              onSlideFailed: (index) => {
+                if (cancelled) return;
+                setFailedServerSlides((current) => new Set(current).add(index));
+              },
             });
-            if (slideRes.ok) {
-              const slideData = await slideRes.json();
-              if (cancelled) return [] as string[];
-              if (slideData.slides?.length > 0) {
-                const blobUrls = await Promise.all(
-                  slideData.slides.map(async (s: { url: string }) => {
-                    const res = await fetch(`/api/v1${s.url}`, {
-                      headers,
-                      signal: serverRenderAbortController.signal,
-                    });
-                    if (!res.ok) throw new Error("Slide fetch failed");
-                    const slideBlob = await res.blob();
-                    const blobUrl = URL.createObjectURL(slideBlob);
-                    return trackServerBlobUrl(blobUrl) ? blobUrl : "";
-                  })
-                );
-                return blobUrls.filter(Boolean);
-              }
-            }
-          } catch {
+            if (!blobUrls.some(Boolean)) throw new Error("No rendered slides");
+            return blobUrls;
+          } catch (serverError) {
+            // Only a failure of the whole server render falls back; single
+            // slides that failed are handled per slide above.
             revokeTrackedBlobUrls(serverBlobUrls);
-            // Server rendering unavailable — the editable browser renderer remains usable.
+            serverShowing = false;
+            if (!cancelled && !isAbortError(serverError)) {
+              setSlideImageUrls([]);
+              setServerSlideList(null);
+              setRenderMode("css");
+            }
+            return [] as Array<string | null>;
           } finally {
-            window.clearTimeout(serverRenderTimeoutId);
-            serverRenderActive = false;
+            if (!cancelled) setServerRenderPending(false);
           }
-          return [] as string[];
         })();
 
         const parsedSlidesTask = (async () => {
@@ -5833,12 +5011,27 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
             const parsed = await parsePptx(buf, {
               isCancelled: () => cancelled,
               onObjectUrl: (objectUrl) => {
+                if (cancelled) {
+                  URL.revokeObjectURL(objectUrl);
+                  return;
+                }
                 parserBlobUrls.push(objectUrl);
                 createdBlobUrls.push(objectUrl);
               },
             });
-            return parsed.length > 0 ? parsed : [{ shapes: [] }];
+            const parsedSlides = parsed.length > 0 ? parsed : [{ shapes: [] }];
+            if (!cancelled) {
+              setSlides(parsedSlides);
+              // Interim view while the server render is still running.
+              if (!serverShowing) {
+                setRenderMode("css");
+                setLoading(false);
+              }
+            }
+            return parsedSlides;
           }
+          // Legacy binary decks (.ppt) are not parseable here; their text
+          // fallback is only worth showing when the server render fails.
           const parsedSlides = parseTextSlides(new TextDecoder().decode(bytes));
           return parsedSlides.length > 0 ? parsedSlides : [{ shapes: [] }];
         })();
@@ -5852,17 +5045,15 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
 
         const serverSlides = serverResult.status === "fulfilled" ? serverResult.value : [];
         const parsedSlides = parsedResult.status === "fulfilled" ? parsedResult.value : [];
-        setSlideImageUrls(serverSlides);
         setSlides(parsedSlides);
-        setRenderMode(serverSlides.length > 0 ? "server" : "css");
-        if (serverSlides.length === 0 && parsedSlides.length === 0) {
+        setRenderMode(serverSlides.some(Boolean) ? "server" : "css");
+        if (!serverSlides.some(Boolean) && parsedSlides.length === 0) {
           const reason = parsedResult.status === "rejected" ? parsedResult.reason : serverResult.status === "rejected" ? serverResult.reason : undefined;
           revokeCreatedBlobUrls();
           setError(reason instanceof Error ? reason.message : "Failed to parse presentation");
         }
         setLoading(false);
       } catch (e: any) {
-        serverRenderActive = false;
         revokeCreatedBlobUrls();
         if (!cancelled) setError(e.message || "Failed to parse presentation");
         if (!cancelled) setLoading(false);
@@ -5871,8 +5062,6 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
 
     return () => {
       cancelled = true;
-      serverRenderActive = false;
-      window.clearTimeout(serverRenderTimeoutId);
       serverRenderAbortController.abort();
       revokeCreatedBlobUrls();
     };
@@ -5893,16 +5082,23 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
   const totalSlides = renderMode === "server" ? slideImageUrls.length : slides.length;
 
   useEffect(() => {
-    thumbnailRefs.current[activeSlide]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    // The interim (parsed) and server views can disagree on slide count.
+    if (totalSlides > 0 && activeSlide >= totalSlides) setActiveSlide(totalSlides - 1);
   }, [activeSlide, totalSlides]);
 
   useEffect(() => {
-    if (renderMode !== "css" || slides.length <= 1) return undefined;
+    thumbnailRefs.current[activeSlide]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [activeSlide, totalSlides]);
+
+  // Thumbnails (CSS previews and server images alike) only mount their
+  // content while near the visible strip; the set also steers fetch priority.
+  useEffect(() => {
+    if (totalSlides <= 1) return undefined;
     const strip = cssThumbnailStripRef.current;
     if (!strip) return undefined;
 
     if (typeof IntersectionObserver === "undefined") {
-      setVisibleCssThumbnailIndexes(new Set(slides.map((_, slideIndex) => slideIndex)));
+      setVisibleCssThumbnailIndexes(new Set(Array.from({ length: totalSlides }, (_, slideIndex) => slideIndex)));
       return undefined;
     }
 
@@ -5927,11 +5123,11 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
       rootMargin: "0px 384px",
     });
 
-    thumbnailRefs.current.slice(0, slides.length).forEach((thumbnail) => {
+    thumbnailRefs.current.slice(0, totalSlides).forEach((thumbnail) => {
       if (thumbnail) observer.observe(thumbnail);
     });
     return () => observer.disconnect();
-  }, [renderMode, slides.length]);
+  }, [renderMode, totalSlides, loading]);
 
   const selectSlide = (slideIndex: number) => {
     setActiveSlide(Math.max(0, Math.min(totalSlides - 1, slideIndex)));
@@ -5956,21 +5152,35 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
 
   // Server-rendered mode: show slide images (blob URLs fetched with auth)
   if (renderMode === "server" && slideImageUrls.length > 0) {
-    const parsedSlide = slides[activeSlide];
-    const aspect = pptxSlideAspectValue(parsedSlide?.aspectRatio);
+    // Parsed slides only line up with rendered ones when the counts agree
+    // (hidden slides are skipped by the server render).
+    const parsedMatchesServer = slides.length === slideImageUrls.length;
+    const parsedSlide = parsedMatchesServer ? slides[activeSlide] : undefined;
+    // Prefer the rendered PNG's true size (always right, also for legacy .ppt).
+    const aspect = serverSlideAspect(serverSlideList, activeSlide) ?? pptxSlideAspectValue(parsedSlide?.aspectRatio);
     const frameWidth = Math.max(1, Math.min(1200, stageSize.width || 1200, (stageSize.height || 675) * aspect));
     const frameHeight = frameWidth / aspect;
     const nativeVideos = parsedSlide?.shapes.filter((shape) => Boolean(shape.videoUrl)) || [];
+    const activeSlideFailed = !slideImageUrls[activeSlide] && failedServerSlides.has(activeSlide);
+    const thumbnailAspect = pptxThumbnailFrameAspect(
+      serverSlideAspect(serverSlideList, 0) ?? pptxSlideAspectValue(slides[0]?.aspectRatio),
+    );
     return (
       <div className="pptx-document-viewer">
         <div ref={stageRef} className="pptx-document-stage">
           <div className="pptx-document-rendered-slide" style={{ width: frameWidth, height: frameHeight }}>
-            <img
-              src={slideImageUrls[activeSlide]}
-              alt={`${t("page.file_viewer.slide")} ${activeSlide + 1}`}
-              className="pptx-document-slide-image"
-              draggable={false}
-            />
+            {slideImageUrls[activeSlide] ? (
+              <img
+                src={slideImageUrls[activeSlide]}
+                alt={`${t("page.file_viewer.slide")} ${activeSlide + 1}`}
+                className="pptx-document-slide-image"
+                draggable={false}
+              />
+            ) : activeSlideFailed && parsedSlide ? (
+              <PptxCssSlidePreview slide={parsedSlide} slideIndex={activeSlide} frameWidth={frameWidth} />
+            ) : activeSlideFailed ? (
+              <div className="pptx-document-slide-error" role="status">{t("page.file_viewer.pptx_slide_render_failed")}</div>
+            ) : <LoadingSpinner size={24} />}
             {nativeVideos.map((shape, videoIndex) => (
               <video
                 key={`${activeSlide}-${videoIndex}`}
@@ -5989,12 +5199,13 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
 
         {/* Thumbnail strip */}
         {slideImageUrls.length > 1 && (
-          <div className="pptx-document-thumbnail-strip" aria-label={t("page.doc_editor.slides")}>
+          <div ref={cssThumbnailStripRef} className="pptx-document-thumbnail-strip" aria-label={t("page.doc_editor.slides")}>
             <div className="pptx-document-thumbnail-track" role="tablist">
               {slideImageUrls.map((blobUrl, i) => (
                 <button
                   ref={(button) => { thumbnailRefs.current[i] = button; }}
                   key={i}
+                  data-slide-index={i}
                   type="button"
                   role="tab"
                   aria-selected={i === activeSlide}
@@ -6002,9 +5213,14 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
                   onClick={() => selectSlide(i)}
                   onKeyDown={(event) => handleThumbnailKeyDown(event, i)}
                   className={`pptx-document-thumbnail${i === activeSlide ? " is-active" : ""}`}
+                  style={pptxThumbnailButtonStyle(thumbnailAspect)}
                   title={`${t("page.file_viewer.slide")} ${i + 1}`}
                 >
-                  <img src={blobUrl} alt="" draggable={false} />
+                  {blobUrl && (visibleCssThumbnailIndexes.has(i) || i === activeSlide)
+                    ? <img src={blobUrl} alt="" draggable={false} decoding="async" />
+                    : !blobUrl && failedServerSlides.has(i) && parsedMatchesServer && slides[i] && visibleCssThumbnailIndexes.has(i)
+                      ? <PptxCssSlidePreview slide={slides[i]} slideIndex={i} thumbnail thumbnailFrameAspect={thumbnailAspect} />
+                      : <span className="pptx-document-thumbnail-placeholder" aria-hidden="true" />}
                   <span className="pptx-document-thumbnail-number">{i + 1}</span>
                 </button>
               ))}
@@ -6020,12 +5236,19 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
   // CSS fallback mode
 
   const slide = slides[activeSlide];
+  // Fit the parsed slide into the stage like the server image, so decks that
+  // are not 16:9 (e.g. 4:3) show whole instead of overflowing into a scroll.
+  const cssAspect = pptxSlideAspectValue(slide?.aspectRatio);
+  const cssThumbnailAspect = pptxThumbnailFrameAspect(pptxSlideAspectValue(slides[0]?.aspectRatio));
+  const cssFrameWidth = stageSize.width > 0 && stageSize.height > 0
+    ? Math.max(1, Math.min(1200, stageSize.width, stageSize.height * cssAspect))
+    : undefined;
 
   return (
     <div className="pptx-document-viewer">
       {/* Slide canvas */}
       <div ref={stageRef} className="pptx-document-stage pptx-document-stage--scrollable">
-        <PptxCssSlidePreview slide={slide} slideIndex={activeSlide} />
+        <PptxCssSlidePreview slide={slide} slideIndex={activeSlide} frameWidth={cssFrameWidth} />
       </div>
 
       {/* Thumbnail strip */}
@@ -6048,10 +5271,11 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
                 onClick={() => selectSlide(slideIndex)}
                 onKeyDown={(event) => handleThumbnailKeyDown(event, slideIndex)}
                 className={`pptx-document-thumbnail${slideIndex === activeSlide ? " is-active" : ""}`}
+                style={pptxThumbnailButtonStyle(cssThumbnailAspect)}
                 title={`${t("page.file_viewer.slide")} ${slideIndex + 1}`}
               >
                 {visibleCssThumbnailIndexes.has(slideIndex) || slideIndex === activeSlide ? (
-                  <PptxCssSlidePreview slide={thumbnailSlide} slideIndex={slideIndex} thumbnail />
+                  <PptxCssSlidePreview slide={thumbnailSlide} slideIndex={slideIndex} thumbnail thumbnailFrameAspect={cssThumbnailAspect} />
                 ) : (
                   <span
                     className="pptx-document-thumbnail-placeholder"
@@ -6064,6 +5288,13 @@ export function PptxViewer({ url, blob, docId, onDownload }: { url: string; blob
             ))}
           </div>
         </div>
+      )}
+
+      {serverRenderPending && docId && (
+        <span className="pptx-document-render-status" role="status">
+          <LoadingSpinner size={12} />
+          {t("page.file_viewer.pptx_rendering_full_preview")}
+        </span>
       )}
 
       <PptxViewerNavigation activeSlide={activeSlide} slideCount={slides.length} onChange={selectSlide} />
@@ -6402,7 +5633,11 @@ function AudioViewer({
     const nextDuration = Number.isFinite(audio.duration) ? audio.duration : 0;
     setDuration(nextDuration);
     if (nextDuration > 0 && audioEditRef.current.duration !== nextDuration && !audioAiPreviewRef.current) {
-      applyAudioEditToPlayer(normalizeAudioEditState(audioEditRef.current, nextDuration));
+      const previousEdit = audioEditRef.current;
+      // The zero-duration state predates media metadata. Reusing its trimEnd=0
+      // would turn an unedited file into a 0.05-second preview.
+      const editAtKnownDuration = normalizeAudioEditState(previousEdit.duration > 0 ? previousEdit : {}, nextDuration);
+      applyAudioEditToPlayer(editAtKnownDuration);
     }
   };
 
@@ -6573,23 +5808,12 @@ function DetailRow({ label, children }: { label: string; children: React.ReactNo
 // while the backend stores ResourceGrant rows with capability arrays + opaque
 // subject_id. Map between the two here so the dialog stays UI-agnostic.
 
-type ShareRole = "viewer" | "commenter" | "editor" | "curator";
-
 function _capabilitiesToRole(caps: string[]): ShareRole {
-  const set = new Set(caps);
-  if (set.has("manage_metadata") || set.has("grant_access")) return "curator";
-  if (set.has("edit")) return "editor";
-  if (set.has("comment")) return "commenter";
-  return "viewer";
+  return capabilitiesToShareRole(caps);
 }
 
 function _roleToCapabilities(role: ShareRole): string[] {
-  switch (role) {
-    case "viewer":    return ["view"];
-    case "commenter": return ["view", "comment"];
-    case "editor":    return ["view", "comment", "edit"];
-    case "curator":   return ["view", "comment", "edit", "manage_metadata", "grant_access", "share_internal"];
-  }
+  return shareRoleCapabilities(role);
 }
 
 function _grantToInternalGrant(
@@ -6711,6 +5935,52 @@ function AccessLogSection({ docId }: { docId: string }) {
   );
 }
 
+function MarkdownImage({ src, alt, ...props }: ImgHTMLAttributes<HTMLImageElement>) {
+  const protectedSource = src?.startsWith("/api/v1/fs/") || src?.startsWith("/api/v1/documents/");
+  const placeholderRef = useRef<HTMLSpanElement>(null);
+  const [shouldLoad, setShouldLoad] = useState(!protectedSource);
+  const [resolvedSrc, setResolvedSrc] = useState<string | null>(protectedSource ? null : src || null);
+
+  useEffect(() => {
+    if (shouldLoad || !protectedSource || !placeholderRef.current) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) setShouldLoad(true);
+    }, { rootMargin: "400px" });
+    observer.observe(placeholderRef.current);
+    return () => observer.disconnect();
+  }, [protectedSource, shouldLoad]);
+
+  useEffect(() => {
+    if (!protectedSource || !src) {
+      setResolvedSrc(src || null);
+      return;
+    }
+    if (!shouldLoad) return;
+    const controller = new AbortController();
+    let objectUrl: string | null = null;
+    setResolvedSrc(null);
+    loadProtectedMarkdownImage(src, controller.signal)
+      .then((url) => {
+        if (controller.signal.aborted) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url;
+        setResolvedSrc(url);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setResolvedSrc(null);
+      });
+    return () => {
+      controller.abort();
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [protectedSource, shouldLoad, src]);
+
+  if (!resolvedSrc) return <span ref={placeholderRef} role="img" aria-label={alt || undefined} className="md-image" style={{ display: "block", width: "100%", aspectRatio: "9 / 16" }}>{alt}</span>;
+  return <img {...props} src={resolvedSrc} alt={alt || ""} className="md-image" loading="lazy" />;
+}
+
 function MarkdownViewer({
   content,
   commentAnchors = [],
@@ -6791,7 +6061,7 @@ function MarkdownViewer({
               return <MarkdownTable>{children}</MarkdownTable>;
             },
             img({ alt, ...props }: any) {
-              return <img {...props} alt={alt || ""} className="md-image" loading="lazy" />;
+              return <MarkdownImage {...props} alt={alt || ""} />;
             },
             input({ ...props }: any) {
               return <input {...props} disabled className="md-task-checkbox" />;
@@ -7655,6 +6925,8 @@ export default function FileViewer() {
   const { docId } = useParams<{ docId: string }>();
   const navigate = useNavigate();
   const currentUser = useAuthStore((s) => s.user);
+  const toast = useToastStore();
+  const { activeIds: downloadingIds, downloadDocument } = useDocumentDownload();
   const location = useLocation();
   const taskOutputPreview = useMemo(() => getTaskOutputPreview(location.state), [location.state]);
   const viewerSurfaceRef = useRef<HTMLDivElement | null>(null);
@@ -7673,6 +6945,7 @@ export default function FileViewer() {
   const [commentAnchor, setCommentAnchor] = useState<CommentAnchor | null>(null);
   const [activeCommentId, setActiveCommentId] = useState<string | null>(null);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [signatureDialogOpen, setSignatureDialogOpen] = useState(false);
   const [pdfLiveEditBridge, setPdfLiveEditBridge] = useState<PdfLiveEditBridge | null>(null);
   const [imageLiveEditBridge, setImageLiveEditBridge] = useState<ImageLiveEditBridge | null>(null);
   const [audioLiveEditBridge, setAudioLiveEditBridge] = useState<AudioLiveEditBridge | null>(null);
@@ -7693,6 +6966,7 @@ export default function FileViewer() {
   const canEditCurrentDoc = canEditDocument(currentUser, doc);
   const canCommentCurrentDoc = canCommentDocument(currentUser, doc);
   const canShareCurrentDoc = canShareDocument(currentUser, doc);
+  const canSendSignatureRequest = canShareDocumentExternally(currentUser, doc);
   const currentDocumentId = doc?.source === "task_output_preview" ? docId : doc?.id || docId;
 
   // Live grants + shares — only fetched when the dialog opens (saves a
@@ -7749,13 +7023,21 @@ export default function FileViewer() {
     if (category !== "image") setImageLiveEditBridge(null);
   }, [category, currentDocumentId]);
 
+  const parentFolderPath = doc?.folder_id
+    ? `/knowledge?folder_id=${encodeURIComponent(doc.folder_id)}`
+    : "/knowledge";
+
   const goBack = useCallback(() => {
+    if (viewerReturnTo) {
+      navigate(viewerReturnTo, { replace: true });
+      return;
+    }
     const historyIndex = Number(window.history.state?.idx);
     if (Number.isFinite(historyIndex) && historyIndex > 0) {
       navigate(-1);
       return;
     }
-    navigate(viewerReturnTo || "/knowledge", { replace: true });
+    navigate("/knowledge", { replace: true });
   }, [navigate, viewerReturnTo]);
 
   // ── Permission-v1: derive flags from doc metadata ──────────────────────
@@ -7764,6 +7046,7 @@ export default function FileViewer() {
   const watermarkDensity: "normal" | "dense" =
     doc?.classification === "restricted" ? "dense" : "normal";
   const restrictDownload =
+    (!isTaskOutputPreview && !doc?.current_user_capabilities?.includes("download")) ||
     doc?.classification === "restricted" ||
     (doc?.quarantine_status && doc.quarantine_status !== "clean");
   const bannerReason: "quarantine" | "pii" | null =
@@ -7792,7 +7075,7 @@ export default function FileViewer() {
       if (cat === "diagram") {
         try {
           assertDiagramPreviewFileSize(meta.file_size);
-          const response = await api.documents.downloadResponse(resolvedDocumentId);
+          const response = await api.documents.previewResponse(resolvedDocumentId);
           const text = await readDiagramPreviewText(response);
           if (!isCurrentRequest()) return;
           setContent(text);
@@ -7838,7 +7121,7 @@ export default function FileViewer() {
               if (!isCurrentRequest()) return;
               replaceDownloadUrl(streamUrl);
             } else {
-              const url = await api.documents.download(resolvedDocumentId);
+              const url = await api.documents.preview(resolvedDocumentId);
               if (!isCurrentRequest()) {
                 if (url.startsWith("blob:")) URL.revokeObjectURL(url);
                 return;
@@ -7846,7 +7129,7 @@ export default function FileViewer() {
               replaceDownloadUrl(url);
             }
           } else {
-            const blob = await api.documents.downloadBlob(resolvedDocumentId);
+            const blob = await api.documents.previewBlob(resolvedDocumentId);
             if (!isCurrentRequest()) return;
             const url = URL.createObjectURL(blob);
             setDownloadBlob(blob);
@@ -7997,31 +7280,24 @@ export default function FileViewer() {
   }, [replaceDownloadUrl]);
 
 
-  const handleDownload = async () => {
-    if (!currentDocumentId) return;
+  const downloadInProgress = downloadingIds.includes(currentDocumentId || "");
+  const handleDownload = () => {
+    if (!currentDocumentId || restrictDownload || downloadInProgress) return;
     try {
       if (isTaskOutputPreview && taskOutputPreview) {
-        const url = URL.createObjectURL(
+        requestBlobDownload(
           taskOutputPreviewBlob(taskOutputPreview, doc?.mime_type || "text/plain;charset=utf-8"),
+          doc?.name || taskOutputPreview.name || "generated-output.txt",
         );
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = doc?.name || taskOutputPreview.name || "generated-output.txt";
-        a.click();
-        window.setTimeout(() => URL.revokeObjectURL(url), 0);
+        toast.info(t("download.requested"), t("download.check_browser"));
         return;
       }
-      const ownsDownloadUrl = !downloadUrl;
-      const url = downloadUrl || await api.documents.download(currentDocumentId);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = doc?.name || "download";
-      a.click();
-      if (ownsDownloadUrl && url.startsWith("blob:")) {
-        window.setTimeout(() => URL.revokeObjectURL(url), 0);
-      }
-    } catch {
-      // silently fail
+      void downloadDocument({ id: currentDocumentId, name: doc?.name || "download" });
+    } catch (error) {
+      toast.error(
+        t("download.failed"),
+        error instanceof Error ? error.message : undefined,
+      );
     }
   };
 
@@ -8165,13 +7441,26 @@ export default function FileViewer() {
             <PageHeaderTitle variant="editor" title={doc?.name || t("page.file_viewer.document")}>
               {doc?.name || t("page.file_viewer.document")}
             </PageHeaderTitle>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 2 }}>
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, rowGap: 4, marginTop: 2 }}>
               <StatusBadge type={categoryBadgeType(category)}>{categoryLabel(category)}</StatusBadge>
               {doc?.file_size != null && (
                 <span style={{ fontSize: 12, color: "#a8a29e" }}>
                   {doc.file_size < 1024 ? `${doc.file_size} B` :
                    doc.file_size < 1048576 ? `${(doc.file_size / 1024).toFixed(1)} KB` :
                    `${(doc.file_size / 1048576).toFixed(1)} MB`}
+                </span>
+              )}
+              {!isTaskOutputPreview && doc && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                  <span aria-hidden="true" style={{ fontSize: 12, color: "var(--text-muted)" }}>&middot;</span>
+                  <Link
+                    to={parentFolderPath}
+                    title={doc.folder_id ? t("page.file_viewer.go_to_parent_folder") : t("page.file_viewer.open_library")}
+                    className="hover:underline focus-visible:underline underline-offset-2"
+                    style={{ fontSize: 12, fontWeight: 500, color: "var(--accent)", whiteSpace: "nowrap" }}
+                  >
+                    {doc.folder_id ? t("page.file_viewer.parent_folder") : t("page.file_viewer.open_library")}
+                  </Link>
                 </span>
               )}
             </div>
@@ -8210,6 +7499,18 @@ export default function FileViewer() {
           )}
           {!isTaskOutputPreview && canEditCurrentDoc && category === "html" && (
             <SitePublishAction doc={doc} />
+          )}
+          {!isTaskOutputPreview && canSendSignatureRequest && (
+            category === "pdf" && (
+              <button
+                onClick={() => setSignatureDialogOpen(true)}
+                className={editorToolButtonClass({ icon: true })}
+                aria-label={t("signature.send")}
+                title={t("signature.send")}
+              >
+                <IconSignature size={16} />
+              </button>
+            )
           )}
           {!isTaskOutputPreview && canShareCurrentDoc && (
             <button
@@ -8251,23 +7552,24 @@ export default function FileViewer() {
             <IconInfo size={16} />
           </button>
           <button
-            onClick={restrictDownload ? undefined : handleDownload}
-            disabled={!!restrictDownload}
+            onClick={restrictDownload || downloadInProgress ? undefined : handleDownload}
+            disabled={Boolean(restrictDownload || downloadInProgress)}
+            aria-busy={downloadInProgress}
             aria-label={t("page.file_viewer.download")}
-            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : t("page.file_viewer.download_blocked.quarantine")) : t("page.file_viewer.download")}
+            title={restrictDownload ? (doc?.classification === "restricted" ? t("page.file_viewer.download_blocked.restricted") : doc?.quarantine_status && doc.quarantine_status !== "clean" ? t("page.file_viewer.download_blocked.quarantine") : t("permissions.banner.viewer_only")) : t("page.file_viewer.download")}
             className={editorToolButtonClass({ icon: true })}
             style={{
-              opacity: restrictDownload ? 0.45 : 1,
-              cursor: restrictDownload ? "not-allowed" : "pointer",
+              opacity: restrictDownload || downloadInProgress ? 0.45 : 1,
+              cursor: restrictDownload || downloadInProgress ? "not-allowed" : "pointer",
             }}
           >
-            <IconDownload size={16} />
+            {downloadInProgress ? <LoadingSpinner size={16} /> : <IconDownload size={16} />}
           </button>
           <button
             type="button"
             onClick={goBack}
-            aria-label={t("page.file_viewer.go_back")}
-            title={t("page.file_viewer.go_back")}
+            aria-label={t("action.close")}
+            title={t("action.close")}
             style={{
               width: 36, height: 36, borderRadius: 10, background: "transparent",
               border: "none", cursor: "pointer", display: "flex", alignItems: "center",
@@ -8368,6 +7670,8 @@ export default function FileViewer() {
             <video
               src={downloadUrl}
               controls
+              playsInline
+              preload="metadata"
               className="manor-editor-video-preview"
             />
           </div>
@@ -8610,6 +7914,15 @@ export default function FileViewer() {
       </div>
 
       {/* Share dialog */}
+      {doc && canSendSignatureRequest && category === "pdf" && (
+        <SignatureRequestDialog
+          open={signatureDialogOpen}
+          onClose={() => setSignatureDialogOpen(false)}
+          documentId={doc.id}
+          documentName={doc.name}
+        />
+      )}
+
       {doc && canShareCurrentDoc && (
         <ShareDialog
           open={shareDialogOpen}

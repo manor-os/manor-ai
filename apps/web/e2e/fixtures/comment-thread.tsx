@@ -9,7 +9,7 @@ import { useAuthStore } from "../../src/stores/auth";
 import "../../src/index.css";
 
 // Isolated UI fixture: no login, comment, or mutation reaches the backend.
-setLocale("en");
+await setLocale("en");
 useAuthStore.setState({ user: { id: "reviewer" } as User });
 const makeComment = (id: string, content: string, anchor: Comment["anchor"]): Comment => ({
   id, content, anchor, user_id: "reviewer", user_display_name: "Alex Chen",
@@ -60,7 +60,7 @@ function Fixture() {
       <button onClick={() => { document.documentElement.dataset.theme = dark ? "light" : "dark"; setDark(!dark); }}>Theme</button>
       <button onClick={() => setWide(!wide)}>Width</button>
       <button onClick={() => setReadOnly(!readOnly)}>Permissions</button>
-      <button onClick={() => { const next = locale === "en" ? "zh" : "en"; setLocale(next); updateLocale(next); }}>Language</button>
+      <button onClick={async () => { const next = locale === "en" ? "zh" : "en"; await setLocale(next); updateLocale(next); }}>Language</button>
       <button onClick={() => { failMutation = !failMutation; }}>Fail save</button>
       <output aria-label="Selected comment">{selected || "none"}</output>
     </header>

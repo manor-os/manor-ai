@@ -100,7 +100,9 @@ async def resolve_official_model_route(
     bypassing an OpenRouter key explicitly configured in Admin -> Models.
     """
 
-    if not provider_for_model_id(model_id):
+    from packages.core.constants.plans import is_cloud
+
+    if not is_cloud() or not provider_for_model_id(model_id):
         return None
 
     gateway_chain = (

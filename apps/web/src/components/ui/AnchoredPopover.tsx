@@ -14,6 +14,43 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 
+const POPOVER_FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled])",
+  'input:not([disabled]):not([type="hidden"])',
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(", ");
+
+function visibleFocusableElements(root: ParentNode): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(POPOVER_FOCUSABLE_SELECTOR)).filter(
+    (element) => {
+      if (
+        element.hidden
+        || element.getAttribute("aria-disabled") === "true"
+        || element.closest('[aria-hidden="true"], [hidden], [inert]')
+      ) {
+        return false;
+      }
+      const style = window.getComputedStyle(element);
+      return style.display !== "none"
+        && style.visibility !== "hidden"
+        && element.getClientRects().length > 0;
+    },
+  );
+}
+
+function focusAfterTrigger(anchor: HTMLElement, panel: HTMLElement): HTMLElement | null {
+  const trigger = anchor.querySelector<HTMLElement>(POPOVER_FOCUSABLE_SELECTOR);
+  if (!trigger) return null;
+  const pageControls = visibleFocusableElements(document).filter(
+    (element) => !panel.contains(element),
+  );
+  const triggerIndex = pageControls.indexOf(trigger);
+  return triggerIndex >= 0 ? pageControls[triggerIndex + 1] ?? null : null;
+}
+
 interface AnchoredPopoverRenderContext {
   close: () => void;
 }
@@ -22,6 +59,7 @@ interface AnchoredPopoverProps {
   trigger: ReactElement;
   children: ReactNode | ((context: AnchoredPopoverRenderContext) => ReactNode);
   ariaLabel: string;
+  open?: boolean;
   align?: "left" | "right";
   width?: number;
   panelClassName?: string;
@@ -46,6 +84,7 @@ export default function AnchoredPopover({
   trigger,
   children,
   ariaLabel,
+  open: controlledOpen,
   align = "right",
   width = 360,
   panelClassName = "",
@@ -56,7 +95,8 @@ export default function AnchoredPopover({
   persistentPlacement = "align-anchor",
   persistentInlineInset = 0,
 }: AnchoredPopoverProps) {
-  const [open, setOpen] = useState(false);
+  const [internalOpen, setInternalOpen] = useState(false);
+  const open = controlledOpen ?? internalOpen;
   const [persistent, setPersistent] = useState(false);
   const [position, setPosition] = useState<{
     top: number;
@@ -71,12 +111,16 @@ export default function AnchoredPopover({
   const interactionPinnedRef = useRef(false);
   const openRef = useRef(false);
 
+  useLayoutEffect(() => {
+    openRef.current = open;
+  }, [open]);
+
   const setPopoverOpen = useCallback((nextOpen: boolean) => {
     if (openRef.current === nextOpen) return;
     openRef.current = nextOpen;
-    setOpen(nextOpen);
+    if (controlledOpen === undefined) setInternalOpen(nextOpen);
     onOpenChange?.(nextOpen);
-  }, [onOpenChange]);
+  }, [controlledOpen, onOpenChange]);
 
   const clearHoverCloseTimer = useCallback(() => {
     if (hoverCloseTimerRef.current === null) return;
@@ -113,6 +157,17 @@ export default function AnchoredPopover({
         ?.focus();
     });
   }, [clearHoverCloseTimer, setPopoverOpen]);
+  const toggleFromTrigger = useCallback(() => {
+    if (openOnHover) {
+      openFromTrigger();
+      return;
+    }
+    if (openRef.current) {
+      close();
+      return;
+    }
+    openFromTrigger();
+  }, [close, openFromTrigger, openOnHover]);
   const recomputePosition = useCallback(() => {
     const anchor = anchorRef.current;
     if (!anchor) return;
@@ -146,19 +201,22 @@ export default function AnchoredPopover({
       return;
     }
 
-    const measuredHeight = panelRef.current?.getBoundingClientRect().height || 360;
-    const maxAvailableHeight = Math.max(180, viewportHeight - viewportGutter * 2);
+    // Use content height: the rendered panel may already be capped by maxHeight.
+    const measuredHeight = panelRef.current?.scrollHeight || 360;
+    const maxAvailableHeight = Math.max(1, viewportHeight - viewportGutter * 2);
     const desiredHeight = Math.min(measuredHeight, maxAvailableHeight);
     const roomBelow = viewportHeight - rect.bottom - gap - viewportGutter;
     const roomAbove = rect.top - gap - viewportGutter;
-    const openAbove = roomBelow < desiredHeight && roomAbove > roomBelow;
-    const maxHeight = Math.max(160, Math.min(maxAvailableHeight, openAbove ? roomAbove : roomBelow));
-    const desiredTop = openAbove
-      ? rect.top - gap - Math.min(measuredHeight, maxHeight)
-      : rect.bottom + gap;
+    const openBelow = roomBelow >= desiredHeight;
+    const openAbove = !openBelow && roomAbove >= desiredHeight;
+    // When neither side fits, overlay within the viewport instead of clipping to one side.
+    const maxHeight = openBelow ? roomBelow : openAbove ? roomAbove : maxAvailableHeight;
+    const desiredTop = openBelow ? rect.bottom + gap
+      : openAbove ? rect.top - gap - desiredHeight
+      : viewportGutter;
     const desiredLeft = align === "right" ? rect.right - effectiveWidth : rect.left;
     setPosition({
-      top: Math.max(viewportGutter, Math.min(desiredTop, viewportHeight - viewportGutter - maxHeight)),
+      top: desiredTop,
       left: Math.max(viewportGutter, Math.min(desiredLeft, viewportWidth - viewportGutter - effectiveWidth)),
       maxHeight,
       width: effectiveWidth,
@@ -193,6 +251,14 @@ export default function AnchoredPopover({
     if (!open) return;
     recomputePosition();
   }, [open, recomputePosition]);
+
+  useEffect(() => {
+    if (!open || controlledOpen === undefined) return;
+    const frame = window.requestAnimationFrame(() => {
+      panelRef.current?.querySelector<HTMLElement>(POPOVER_FOCUSABLE_SELECTOR)?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [controlledOpen, open]);
 
   useEffect(() => {
     if (!open) return;
@@ -235,11 +301,7 @@ export default function AnchoredPopover({
       onClick: (event: ReactMouseEvent<HTMLElement>) => {
         typedTrigger.props.onClick?.(event);
         if (!event.defaultPrevented) {
-          if (openOnHover) {
-            openFromTrigger();
-          } else {
-            setPopoverOpen(!openRef.current);
-          }
+          toggleFromTrigger();
         }
       },
       ...(
@@ -251,11 +313,7 @@ export default function AnchoredPopover({
               typedTrigger.props.onKeyDown?.(event);
               if (!event.defaultPrevented && (event.key === "Enter" || event.key === " ")) {
                 event.preventDefault();
-                if (openOnHover) {
-                  openFromTrigger();
-                } else {
-                  setPopoverOpen(!openRef.current);
-                }
+                toggleFromTrigger();
               }
             },
           }
@@ -288,6 +346,30 @@ export default function AnchoredPopover({
             clearHoverCloseTimer();
             interactionPinnedRef.current = true;
           } : undefined}
+          onKeyDown={(event) => {
+            if (persistent || event.key !== "Tab") return;
+            const panel = panelRef.current;
+            const anchor = anchorRef.current;
+            if (!panel || !anchor) return;
+            const focusableElements = visibleFocusableElements(panel);
+            const first = focusableElements[0];
+            const last = focusableElements[focusableElements.length - 1];
+            const activeElement = document.activeElement;
+            if (event.shiftKey && activeElement === first) {
+              event.preventDefault();
+              event.stopPropagation();
+              close();
+              anchor.querySelector<HTMLElement>(POPOVER_FOCUSABLE_SELECTOR)?.focus();
+            } else if (!event.shiftKey && activeElement === last) {
+              event.preventDefault();
+              event.stopPropagation();
+              const nextControl = focusAfterTrigger(anchor, panel);
+              close();
+              (nextControl
+                ?? anchor.querySelector<HTMLElement>(POPOVER_FOCUSABLE_SELECTOR))
+                ?.focus();
+            }
+          }}
           className={`anchored-popover-panel${persistent ? " anchored-popover-panel--persistent" : ""}${panelClassName ? ` ${panelClassName}` : ""}`}
           style={{
             top: position?.top ?? 0,

@@ -18,6 +18,15 @@ class WorkerProtocolVersion(IntEnum):
 CURRENT_WORKER_PROTOCOL_VERSION = WorkerProtocolVersion.V2
 
 
+class WorkerLeaseFencingVersion(IntEnum):
+    """Optional, backwards-compatible lease mutation fencing contracts."""
+
+    ATTEMPT_TOKEN_V1 = 1
+
+
+LEASE_ATTEMPT_TOKEN_CAPABILITY = "lease_attempt_token_version"
+
+
 class UnsupportedWorkerProtocol(ValueError):
     """An external worker does not declare the current wire protocol."""
 
@@ -35,3 +44,13 @@ def require_current_worker_protocol(capabilities: Mapping[str, Any]) -> None:
 
 def worker_protocol_header_value() -> str:
     return str(int(CURRENT_WORKER_PROTOCOL_VERSION))
+
+
+def supports_lease_attempt_token(capabilities: Mapping[str, Any] | None) -> bool:
+    """Whether an external worker opted into the v1 per-attempt token."""
+
+    if not isinstance(capabilities, Mapping):
+        return False
+    return capabilities.get(LEASE_ATTEMPT_TOKEN_CAPABILITY) == int(
+        WorkerLeaseFencingVersion.ATTEMPT_TOKEN_V1
+    )

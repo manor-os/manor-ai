@@ -165,5 +165,15 @@ async def apply_task_status_transition(
             actor_kind=actor_kind, actor_id=actor_id, occurred_at=ts,
             config_versions=config_versions,
         )
+        if new_status in TERMINAL_STATUSES:
+            from packages.core.services import scheduled_task_terminal_delivery
+
+            # Same transaction as the status write: a scheduled occurrence is
+            # re-delivered to the gateway exactly when its Task becomes
+            # terminal, whichever path finalized it. The gateway then settles
+            # it with the Task's real result (written after this call).
+            await scheduled_task_terminal_delivery.stage_scheduled_task_terminal_delivery(
+                db, task, new_status,
+            )
 
     return transition

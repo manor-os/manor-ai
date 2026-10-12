@@ -53,6 +53,46 @@ REPEATED_EDIT_THRESHOLD = 3
 MAX_EDIT_EVIDENCE_REFS = 20
 
 
+
+def _clip_text(text: str, limit: int) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    if limit <= 1:
+        return compact[:limit]
+    return compact[: limit - 1] + "…"
+
+
+def _commitment_answer_text(response) -> str:
+    if not isinstance(response, dict):
+        return ""
+    text = response.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    attachments = response.get("attachments")
+    if not isinstance(attachments, list) or not attachments:
+        return text
+    parts: list[str] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        doc_id = str(item.get("id") or item.get("document_id") or "").strip()
+        path = str(item.get("fs_path") or "").strip()
+        if not name and not doc_id:
+            continue
+        label = name or doc_id
+        extras = []
+        if doc_id:
+            extras.append(f"id={doc_id}")
+        if path:
+            extras.append(f"path={path}")
+        parts.append(f"{label} ({', '.join(extras)})" if extras else label)
+    if not parts:
+        return text
+    suffix = "attachments: " + ", ".join(parts)
+    return f"{text} | {suffix}" if text else suffix
+
+
 class HumanParticipationConsolidator:
     domain = "human_participation"
     # v3 — adds the opt-in L1 edit-pattern layer (L0 output unchanged).
@@ -62,7 +102,10 @@ class HumanParticipationConsolidator:
     #      carrying the rest. The bump is load-bearing: analyzer_version is
     #      part of the cache input_hash, so without it a report computed under
     #      the old (everything-is-an-approval) semantics would be reused.
-    analyzer_version = "human_participation-consolidator-v4"
+    # v5 — fulfilled HumanCommitment answers are user-confirmed Need Input.
+    #      Privacy still forbids per-person scores and edit diffs; the
+    #      requested answer text is a workspace fact, not a scorecard.
+    analyzer_version = "human_participation-consolidator-v5"
     critical = True
 
     async def run(self, db: AsyncSession, ctx: SnapshotContext) -> ConsolidationReportModel:
@@ -154,6 +197,31 @@ class HumanParticipationConsolidator:
                 evidence_refs=[f"human_commitment:{commitment.id}"],
             ))
 
+        fulfilled_commitments = list((await db.execute(
+            select(HumanCommitment).where(
+                HumanCommitment.workspace_id == ctx.review.workspace_id,
+                HumanCommitment.status == "fulfilled",
+            ).order_by(
+                HumanCommitment.fulfilled_at.desc().nullslast(),
+                HumanCommitment.requested_at.desc(),
+            ).limit(8)
+        )).scalars().all())
+        answered_commitments = []
+        for commitment in fulfilled_commitments:
+            answer = _commitment_answer_text(commitment.response)
+            if not answer:
+                continue
+            answered_commitments.append(commitment)
+            question = (commitment.expected_input or commitment.request_kind).strip()
+            observations.append(Observation(
+                type="operator_input_recorded",
+                description=(
+                    f"Need Input answered {commitment.request_kind}: "
+                    f"{_clip_text(question, 160)} → {_clip_text(answer, 400)}"
+                ),
+                evidence_refs=[f"human_commitment:{commitment.id}"],
+            ))
+
         # ── contribution edit aggregate (L0) ───────────────────────────
         # Window-scoped through the ledger: the contribution ids come from
         # the frozen events, so this stays replayable.
@@ -233,6 +301,7 @@ class HumanParticipationConsolidator:
             "open_information_requests": len(open_information_requests),
             "active_human_commitments": len(open_commitments),
             "blocking_commitments": len(blocking_commitments),
+            "fulfilled_operator_answers": len(answered_commitments),
             "contributions_since_last_review": len(contribution_events),
             "edited_fields": edited_fields,
         }
@@ -246,6 +315,7 @@ class HumanParticipationConsolidator:
                 f"{len(open_information_requests)} open information request(s); "
                 f"{len(open_commitments)} open commitment(s) "
                 f"({len(blocking_commitments)} blocking); "
+                f"{len(answered_commitments)} fulfilled operator answer(s); "
                 f"{len(contribution_events)} human contribution(s)"
             ),
             metrics=metrics,
@@ -254,7 +324,8 @@ class HumanParticipationConsolidator:
             coverage=Coverage(
                 records_examined=(
                     len(decision_events) + len(open_hitl_requests)
-                    + len(open_commitments) + len(contribution_events)
+                    + len(open_commitments) + len(answered_commitments)
+                    + len(contribution_events)
                 ),
                 sources={
                     "l1": l1_marker,
@@ -262,6 +333,7 @@ class HumanParticipationConsolidator:
                     "open_approvals": len(open_approvals),
                     "open_information_requests": len(open_information_requests),
                     "open_commitments": len(open_commitments),
+                    "fulfilled_commitments": len(answered_commitments),
                     "contribution_events": len(contribution_events),
                     "contributions_with_edits": len(edited_contributions),
                     "proposal_edits": "no edit tracking yet (M9.3 card edit)",

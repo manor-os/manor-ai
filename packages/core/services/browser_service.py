@@ -12,6 +12,7 @@ Optional dependency: playwright
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -19,6 +20,7 @@ from typing import Any
 from packages.core.models.base import generate_ulid
 
 logger = logging.getLogger(__name__)
+EVALUATE_TIMEOUT_SECONDS = 45
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,9 @@ class BrowserSession:
         self._pw: Any = None
         self.browser: Any = None
         self.page: Any = None
+        # A tool round may dispatch several calls concurrently. All actions on
+        # this single Playwright page must remain one ordered operation stream.
+        self.operation_lock = asyncio.Lock()
 
     async def start(self, headless: bool = True) -> None:
         """Launch browser instance.
@@ -62,7 +67,7 @@ class BrowserSession:
     async def navigate(self, url: str) -> dict[str, Any]:
         """Navigate to URL, return page info."""
         self._ensure_running()
-        response = await self.page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+        response = await self.page.goto(url, wait_until="domcontentloaded", timeout=90_000)
         self.current_url = self.page.url
         return {
             "url": self.page.url,
@@ -93,7 +98,10 @@ class BrowserSession:
     async def evaluate(self, script: str) -> Any:
         """Execute JavaScript in page context and return the result."""
         self._ensure_running()
-        return await self.page.evaluate(script)
+        try:
+            return await asyncio.wait_for(self.page.evaluate(script), timeout=EVALUATE_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            raise RuntimeError(f"Page evaluate timed out after {EVALUATE_TIMEOUT_SECONDS} seconds") from exc
 
     async def pdf(self) -> bytes:
         """Generate PDF of current page.

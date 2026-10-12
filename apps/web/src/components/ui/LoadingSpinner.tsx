@@ -1,11 +1,14 @@
 interface LoadingSpinnerProps {
   size?: number;
   className?: string;
+  ariaLabel?: string;
 }
 
-export default function LoadingSpinner({ size = 24, className = "" }: LoadingSpinnerProps) {
+export default function LoadingSpinner({ size = 24, className = "", ariaLabel }: LoadingSpinnerProps) {
   return (
     <svg
+      role={ariaLabel ? "status" : undefined}
+      aria-label={ariaLabel}
       className={`animate-spin ${className}`}
       width={size}
       height={size}

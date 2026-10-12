@@ -298,7 +298,14 @@ async def test_embedding_protocol_uses_values_envelope(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_video_adapter_uses_vercel_start_and_status_protocol(monkeypatch):
+@pytest.mark.parametrize("resolution,aspect_ratio,expected", [
+    ("720p", "16:9", "1280x720"),
+    ("720p", "9:16", "720x1280"),
+    ("1080p", "9:16", "1080x1920"),
+    ("480p", "9:16", "480x864"),
+    ("1080p", "3:4", "1248x1664"),
+])
+async def test_video_adapter_uses_vercel_start_and_status_protocol(monkeypatch, resolution, aspect_ratio, expected):
     from packages.core.services import vercel_ai_gateway
     from packages.core.tasks import video_adapters
 
@@ -365,8 +372,8 @@ async def test_video_adapter_uses_vercel_start_and_status_protocol(monkeypatch):
         model="bytedance/seedance-2.0",
         params={
             "duration": 5,
-            "resolution": "720p",
-            "aspect_ratio": "16:9",
+            "resolution": resolution,
+            "aspect_ratio": aspect_ratio,
         },
     )
 
@@ -379,7 +386,8 @@ async def test_video_adapter_uses_vercel_start_and_status_protocol(monkeypatch):
 
     assert result["result_url"].endswith("result.mp4")
     assert [call["endpoint_suffix"] for call in calls] == ["start", "status"]
-    assert calls[0]["payload"]["resolution"] == "1280x720"
+    assert calls[0]["payload"]["resolution"] == expected
+    assert calls[0]["payload"]["aspectRatio"] == aspect_ratio
     assert remembered["provider"] == "vercel"
     assert json.loads(remembered["generation_id"]) == {"id": "operation-1"}
 
@@ -474,3 +482,71 @@ async def test_openrouter_video_adapter_inlines_local_first_frame_as_base64():
             "frame_type": "first_frame",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_vercel_video_request_shares_one_inline_budget_across_images(monkeypatch):
+    """The gateway caps the whole request, so two near-limit images cannot both go inline."""
+    import base64
+
+    from packages.core.services import vercel_ai_gateway
+    from packages.core.tasks import video_adapters
+
+    calls = []
+
+    async def gateway_post(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("endpoint_suffix") == "start":
+            return {"operation": {"id": "operation-1"}}
+        return {"status": "completed", "videos": [{"type": "url", "url": "https://cdn.example.test/v.mp4", "mediaType": "video/mp4"}]}
+
+    async def no_sleep(_seconds):
+        return None
+
+    async def remember(*_args, **_kwargs):
+        return None
+
+    async def download(*_args, **_kwargs):
+        return {"result_url": "/api/v1/fs/entity/videos/result.mp4"}
+
+    async def ensure_public_url(value, *_args, **_kwargs):
+        return f"https://signed.example.test/{value}"
+
+    limits = []
+
+    async def inline_data_url(value, _entity_id, *, max_bytes):
+        # Every image compresses to just under the allowance it is given.
+        limits.append(max_bytes)
+        size = max_bytes - 1024
+        if size <= 0:
+            raise video_adapters.InlineMediaReferenceLimitError("too small")
+        return "data:image/jpeg;base64," + base64.b64encode(b"x" * size).decode()
+
+    monkeypatch.setattr(vercel_ai_gateway, "vercel_gateway_post", gateway_post)
+    monkeypatch.setattr(video_adapters.asyncio, "sleep", no_sleep)
+    runtime = video_adapters.VideoAdapterRuntime(
+        http_client_cls=None, media_api_timeout=None, ensure_public_url=ensure_public_url,
+        public_url_kwargs=lambda _url: {}, remember_provider_poll=remember,
+        poll_openrouter_generation=None, poll_volcengine_task=None, poll_generic_video_task=None,
+        download_and_save=download, extract_video_url=lambda _value: "", extract_task_id=lambda _value: "",
+        provider_error_message=lambda _value: "", openrouter_api_url=lambda value: value,
+        normalize_duration=lambda value: int(value), normalize_resolution=lambda _model, value: str(value),
+        ensure_inline_data_url=inline_data_url,
+    )
+    job = SimpleNamespace(
+        id="job-1", entity_id="entity", prompt="Continue the shot", model="bytedance/seedance-2.0",
+        params={
+            "duration": 10, "resolution": "1080p", "aspect_ratio": "9:16",
+            "first_frame_url": "frames/end.png", "reference_urls": ["Brand/ui.png", "Brand/logo.png"],
+        },
+    )
+
+    await video_adapters.VercelGatewayVideoAdapter().submit(job, "vck_test", None, runtime)
+
+    payload = calls[0]["payload"]
+    images = [payload["frameImages"][0]["image"], *payload["inputReferences"]]
+    inline_bytes = sum(len(image["data"]) * 3 // 4 for image in images if image["type"] == "file")
+    assert inline_bytes <= video_adapters.VERCEL_VIDEO_INLINE_REFERENCE_MAX_BYTES
+    # The start frame goes inline; what no longer fits travels as a signed URL.
+    assert images[0]["type"] == "file"
+    assert any(image["type"] == "url" for image in images[1:])

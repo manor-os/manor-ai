@@ -24,7 +24,12 @@ from packages.core.ai.runtime.agent_provisioning import (
     runtime_query_agent_capabilities_action,
     runtime_query_entity_agents_action,
 )
+from packages.core.ai.runtime.tool_context import (
+    runtime_tool_call_context_from_kwargs,
+    runtime_trusted_workspace_id_from_context,
+)
 from packages.core.constants.agent_capabilities import AGENT_CAPABILITY_SELECTION_LIMIT
+from packages.core.constants.agents import is_master_agent
 
 
 PROVISION_AGENT_SCHEMA = {
@@ -153,8 +158,14 @@ QUERY_ENTITY_AGENTS_SCHEMA = {
     "function": {
         "name": "query_entity_agents",
         "description": (
-            "Return structured, read-only Agent metadata visible to the current entity. "
-            "Includes status, category, bindings, and deployment counts, but never system prompts."
+            "Query read-only Agents by statuses, categories, sources, Workspaces, owners, "
+            "created or updated dates, and deployment count in one call. Values in plural "
+            "filters are ORed; different filters and inclusive ranges are ANDed. Filtering "
+            "happens before pagination and total is exact. Never returns system prompts. "
+            "When selecting an Agent for create_scheduled_job, call this first and copy "
+            "an exact returned id; custom Agents see only Agents with one active "
+            "deployment in their current Workspace or personal scope, and automation "
+            "creation revalidates that scope."
         ),
         "parameters": {
             "type": "object",
@@ -166,16 +177,76 @@ QUERY_ENTITY_AGENTS_SCHEMA = {
                 "statuses": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "minItems": 1,
                     "maxItems": 10,
+                    "uniqueItems": True,
+                    "description": "Match any listed Agent status (OR).",
+                },
+                "categories": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
+                    "description": "Match any listed category (OR).",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "uniqueItems": True,
+                    "description": "Match any stored source or the virtual source 'template' (OR).",
+                },
+                "workspace_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
+                },
+                "owner_user_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
                 },
                 "include_templates": {
                     "type": "boolean",
                     "description": "Include public platform templates when true.",
                 },
+                "deployment_count_min": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Inclusive active-deployment lower bound.",
+                },
+                "deployment_count_max": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Inclusive active-deployment upper bound.",
+                },
+                **{
+                    field: {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": f"Inclusive {label} bound.",
+                    }
+                    for field, label in (
+                        ("created_after", "created-at lower"),
+                        ("created_before", "created-at upper"),
+                        ("updated_after", "updated-at lower"),
+                        ("updated_before", "updated-at upper"),
+                    )
+                },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 100,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
                 },
             },
         },
@@ -196,12 +267,38 @@ async def _provision_agent_handler(
 async def _query_entity_agents_handler(
     entity_id: str = "", user_id: str = "", **kwargs: Any,
 ) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    query_kwargs: dict[str, Any] = {
+        "entity_id": entity_id,
+        "query": str(kwargs.get("query") or ""),
+        "statuses": list(kwargs.get("statuses") or []),
+        "categories": list(kwargs.get("categories") or []),
+        "sources": list(kwargs.get("sources") or []),
+        "workspace_ids": list(kwargs.get("workspace_ids") or []),
+        "owner_user_ids": list(kwargs.get("owner_user_ids") or []),
+        "include_templates": bool(kwargs.get("include_templates", False)),
+        "created_after": str(kwargs.get("created_after") or ""),
+        "created_before": str(kwargs.get("created_before") or ""),
+        "updated_after": str(kwargs.get("updated_after") or ""),
+        "updated_before": str(kwargs.get("updated_before") or ""),
+        "deployment_count_min": kwargs.get("deployment_count_min"),
+        "deployment_count_max": kwargs.get("deployment_count_max"),
+        "limit": int(kwargs.get("limit") or 50),
+        "offset": int(kwargs.get("offset") or 0),
+        "viewer_user_id": runtime_context.user_id or user_id or None,
+        "runtime_workspace_id": runtime_trusted_workspace_id_from_context(
+            runtime_context
+        ),
+        "enforce_viewer_scope": True,
+    }
+    if runtime_context.agent_id and not is_master_agent(runtime_context.agent_id):
+        query_kwargs.update({
+            "require_schedulable_scope": True,
+            "schedulable_workspace_id": runtime_context.workspace_id,
+            "schedulable_user_id": runtime_context.user_id,
+        })
     return await runtime_query_entity_agents_action(
-        entity_id=entity_id,
-        query=str(kwargs.get("query") or ""),
-        statuses=list(kwargs.get("statuses") or []),
-        include_templates=bool(kwargs.get("include_templates", False)),
-        limit=int(kwargs.get("limit") or 50),
+        **query_kwargs,
     )
 
 

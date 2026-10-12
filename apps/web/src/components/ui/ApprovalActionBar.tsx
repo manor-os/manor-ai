@@ -14,7 +14,7 @@
  *   This bar pulls all pending approvals to a single, persistent
  *   surface above the composer. Each approval shows a one-line,
  *   human-readable description (built backend-side by
- *   _describe_action) and approve-once / always-approve / reject actions.
+ *   _describe_action) and approve-once / reject actions.
  *
  * Used by EmbeddedChat + FloatingChat. Rendering rules:
  *   - Hidden when there are zero pending approvals.
@@ -43,6 +43,7 @@ import WorkflowApprovalReview, {
   workflowReviewIsEditable,
 } from "../workflows/WorkflowApprovalReview";
 import InlineFileReferenceCard from "../InlineFileReferenceCard";
+import TikTokPublishReview, { isTikTokPublishApproval } from "../workflows/TikTokPublishReview";
 import IconTile from "./IconTile";
 import { closeDetail, openDetail } from "../../stores/detail";
 import {
@@ -51,14 +52,15 @@ import {
   friendlyApprovalToolLabel,
 } from "../../lib/approvalCopy";
 import { t } from "../../lib/i18n";
-import { DEFAULT_APPROVAL_OPTIONS } from "../../lib/approvalOptions";
+import { workflowReferencePath } from "../../lib/workflowRoutes";
+import { currentApprovalOptions } from "../../lib/approvalOptions";
 import { chatMessageAnchorId } from "../../lib/chatMessageAnchor";
 import { preserveReturnToInHistory } from "../../lib/chatRouteReferences";
 import { looksLikeFileReference } from "../../lib/fileReferences";
 import Button from "./Button";
 import CompactCard from "./CompactCard";
 import Textarea from "./Textarea";
-import Tooltip from "./Tooltip";
+import ApprovalSaveRuleAction from "../approvals/ApprovalSaveRuleAction";
 
 export interface ApprovalHITLRequest {
   id: string;
@@ -74,6 +76,7 @@ export interface ApprovalHITLRequest {
   operation?: unknown;
   review?: unknown;
   review_title?: string;
+  review_read_only?: boolean;
   workflow?: {
     id?: string;
     name?: string;
@@ -93,7 +96,6 @@ export interface ChatMessageWithHITL {
   hitl_requests?: ApprovalHITLRequest[];
 }
 
-type ApprovalDetail = { label: string; value: string };
 type PendingApproval = {
   hitl: ApprovalHITLRequest;
   sourceAnchorId: string;
@@ -124,7 +126,8 @@ export default function ApprovalActionBar({
 }: Props) {
   const location = useLocation();
   const navigate = useNavigate();
-  const pending = useMemo(() => collectPendingApprovals(messages), [messages]);
+  const [completedIds, setCompletedIds] = useState<Set<string>>(() => new Set());
+  const pending = useMemo(() => collectPendingApprovals(messages).filter(item => !completedIds.has(item.hitl.id)), [messages, completedIds]);
   const [selectedApprovalId, setSelectedApprovalId] = useState<string | null>(null);
 
   const requestedIndex = selectedApprovalId
@@ -144,14 +147,13 @@ export default function ApprovalActionBar({
   if (pending.length === 0) return null;
 
   const current = currentItem.hitl;
-  const details = approvalDetails(current);
   const hasReview = current.review != null;
   const materialFiles = approvalMaterialFiles(current);
   const editablePublishReview = isEditablePublishApproval(current);
-  const options = current.options?.length
-    ? current.options
-    : DEFAULT_APPROVAL_OPTIONS;
+  const options = currentApprovalOptions(current.options);
   const workflowHref = workflowApprovalHref(current);
+  const chromePublication = chromePublicationSummary(current);
+  const hasCompactSummary = !workflowHref && (chromePublication !== null || materialFiles.length === 0);
   const sourceReturnTo = `${location.pathname}${location.search}#${currentItem.sourceAnchorId}`;
 
   const description = friendlyApprovalDescription({
@@ -185,9 +187,7 @@ export default function ApprovalActionBar({
     >
       <div className="approval-action-bar__inner">
         <div className="approval-action-bar__header">
-          <div className="approval-action-bar__icon" aria-hidden>
-            !
-          </div>
+          <span className="approval-action-bar__status" aria-hidden />
           <div className="approval-action-bar__heading">
             <div className="approval-action-bar__title">
               {t("component.approval_action_bar.action_requires_approval")}
@@ -245,7 +245,7 @@ export default function ApprovalActionBar({
                 }}
               />
             )}
-            {hasReview && (
+            {hasReview && !hasCompactSummary && (
               <CompactCard
                 className="approval-action-bar__material-card approval-action-bar__material-card--review"
                 icon={(
@@ -270,34 +270,43 @@ export default function ApprovalActionBar({
                 className="approval-action-bar__material-card approval-action-bar__material-card--document"
               />
             ))}
-            {!workflowHref && !hasReview && materialFiles.length === 0 && (
-              <CompactCard
-                className="approval-action-bar__material-card approval-action-bar__material-card--operation"
-                icon={(
-                  <IconTile size={34}>
-                    <IconSettings size={17} />
-                  </IconTile>
+            {hasCompactSummary && (
+              <div className="approval-action-bar__summary">
+                <div className="approval-action-bar__action">
+                  {chromePublication
+                    ? chromePublication.destination
+                      ? t("component.approval_action_bar.publish_content_to")
+                        .replace("{destination}", chromePublication.destination)
+                      : t("component.approval_action_bar.publish_content")
+                    : friendlyApprovalActionLabel(current.action || current.capability_id || current.tool)}
+                </div>
+                {chromePublication?.account && (
+                  <div className="approval-action-bar__context">
+                    {t("component.approval_action_bar.publish_as")
+                      .replace("{account}", chromePublication.account)}
+                  </div>
                 )}
-                title={friendlyApprovalActionLabel(current.action || current.capability_id || current.tool)}
-                subtitle={approvalContentSummary(current) || description}
-                meta={friendlyApprovalToolLabel(current.tool)}
-                onClick={() => openApprovalContent(current, description)}
-              />
+                <p className="approval-action-bar__preview">
+                  {chromePublication?.text
+                    || approvalReviewSummary(current.review)
+                    || approvalContentSummary(current)
+                    || description}
+                </p>
+                <button
+                  type="button"
+                  className="approval-action-bar__review-link approval-action-bar__view-details"
+                  onClick={() => hasReview
+                    ? openApprovalReview(current, onResolve, disabled)
+                    : openApprovalContent(current, description)}
+                >
+                  {t("component.approval_action_bar.view_details")}
+                </button>
+              </div>
             )}
           </div>
-          {details.length > 0 && (
-            <div className="approval-action-bar__details">
-              {details.map((detail) => (
-                <div key={detail.label} className="approval-action-bar__detail">
-                  <span>{detail.label}</span>
-                  <code>{detail.value}</code>
-                </div>
-              ))}
-            </div>
-          )}
         </div>
         <div className="approval-action-bar__buttons">
-          {editablePublishReview ? (
+          {isTikTokPublishApproval(current) || editablePublishReview ? (
             <Button
               variant="primary"
               size="sm"
@@ -310,7 +319,7 @@ export default function ApprovalActionBar({
           ) : (
             options.map((option) => {
               const tone = approvalOptionTone(option);
-              const variant = tone === "approve" ? "primary" : "outline";
+              const variant = tone === "approve" ? "primary" : tone === "reject" ? "ghost" : "outline";
               const button = (
                 <Button
                   variant={variant}
@@ -328,28 +337,17 @@ export default function ApprovalActionBar({
                   {approvalOptionLabel(option)}
                 </Button>
               );
-              if (option !== "always_approve") {
-                return (
-                  <span
-                    key={option}
-                    className={`approval-action-bar__button-slot approval-action-bar__button-slot--${tone}`}
-                  >
-                    {button}
-                  </span>
-                );
-              }
               return (
-                <Tooltip
+                <span
                   key={option}
-                  className="approval-action-bar__standing-tooltip"
-                  content={standingApprovalDescription(current)}
-                  position="top"
+                  className={`approval-action-bar__button-slot approval-action-bar__button-slot--${tone}`}
                 >
                   {button}
-                </Tooltip>
+                </span>
               );
             })
           )}
+          {!hasReview && <ApprovalSaveRuleAction key={current.id} requestId={current.id} scopeLabel={current.workspace?.name} disabled={disabled} onCompleted={() => setCompletedIds(ids => new Set([...ids, current.id]))} />}
         </div>
       </div>
     </div>
@@ -443,40 +441,38 @@ function approvalContentSummary(hitl: ApprovalHITLRequest): string {
     || approvalReviewSummary(hitl.operation);
 }
 
-function approvalDetails(hitl: ApprovalHITLRequest): ApprovalDetail[] {
-  const details: ApprovalDetail[] = [];
-  if (hitl.action) details.push({ label: "Operation", value: friendlyApprovalActionLabel(hitl.action) });
-  if (hitl.tool && hitl.tool !== "workflow") {
-    details.push({ label: "Tool", value: friendlyApprovalToolLabel(hitl.tool) });
+function chromePublicationSummary(hitl: ApprovalHITLRequest) {
+  if (hitl.action !== "chrome.publication.publish") return null;
+  const review = hitl.review && typeof hitl.review === "object" && !Array.isArray(hitl.review)
+    ? hitl.review as Record<string, unknown>
+    : {};
+  let destination = "";
+  if (typeof review.destination_url === "string") {
+    try {
+      const url = new URL(review.destination_url);
+      if (url.protocol === "https:" || url.protocol === "http:") {
+        destination = url.hostname.replace(/^www\./, "");
+      }
+    } catch {
+      // An invalid URL should not become a misleading publication destination.
+    }
   }
-  const workspace = hitl.workspace?.name || hitl.workspace?.id;
-  if (workspace) details.push({ label: "Workspace", value: workspace });
-  return details;
+  return {
+    destination,
+    account: typeof review.account === "string" ? review.account.trim() : "",
+    text: typeof review.text === "string" ? review.text.trim() : "",
+  };
 }
 
 function workflowApprovalHref(hitl: ApprovalHITLRequest): string | null {
-  const declared = String(hitl.workflow?.url || "").trim();
-  if (/^\/flows(?:[?#]|$)/.test(declared)) return declared;
   const workflowId = hitl.workflow?.id;
   if (!workflowId) return null;
-  const query = new URLSearchParams();
-  query.set("workflow", workflowId);
   const runId = hitl.workflow?.run_id || hitl.workflow_run_id;
-  if (runId) query.set("run", runId);
-  return `/flows?${query.toString()}`;
-}
-
-function standingApprovalDescription(hitl: ApprovalHITLRequest): string {
-  const operation = friendlyApprovalActionLabel(
-    hitl.action || hitl.capability_id || hitl.tool,
-  );
-  const workspace = hitl.workspace?.name || hitl.workspace?.id;
-  const key = workspace
-    ? "component.approval_action_bar.always_approve_scope_workspace"
-    : "component.approval_action_bar.always_approve_scope_chat";
-  return t(key)
-    .replace("{operation}", operation)
-    .replace("{workspace}", workspace || "");
+  return workflowReferencePath({
+    workflow_id: workflowId,
+    run_id: runId,
+    url: hitl.workflow?.url,
+  });
 }
 
 function openApprovalContent(hitl: ApprovalHITLRequest, description: string) {
@@ -516,8 +512,19 @@ function openApprovalReview(
   onResolve: Props["onResolve"],
   disabled?: boolean,
 ) {
+  if (isTikTokPublishApproval(hitl)) {
+    openDetail({
+      key: `tiktok-review:${hitl.id}`,
+      title: "Review TikTok post",
+      body: <TikTokPublishReview hitlId={hitl.id} disabled={disabled}
+        onApprove={(review) => { closeDetail(); onResolve(hitl.id, "approve", review); }}
+        onReject={() => { closeDetail(); onResolve(hitl.id, "reject"); }} />,
+      width: 680,
+    });
+    return;
+  }
   const editable = isEditablePublishApproval(hitl);
-  const options = (hitl.options?.length ? hitl.options : DEFAULT_APPROVAL_OPTIONS)
+  const options = currentApprovalOptions(hitl.options)
     .filter((choice) => !editable || choice !== "revise");
   let currentDraft = cloneReviewRecord(hitl.review);
   let currentDraftIsValid = true;
@@ -585,7 +592,7 @@ function isEditablePublishApproval(hitl: ApprovalHITLRequest): boolean {
   // Editorial packets need the same edit-in-place review as a final publish
   // packet. Requiring a separate "revise" branch makes the operator leave
   // the material they are judging and start another run for a typo.
-  return workflowReviewIsEditable(hitl.review);
+  return hitl.review_read_only !== true && workflowReviewIsEditable(hitl.review);
 }
 
 function cloneReviewRecord(review: unknown): Record<string, unknown> {

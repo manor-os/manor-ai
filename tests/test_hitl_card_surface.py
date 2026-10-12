@@ -15,6 +15,8 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
+from tests.auth_helpers import register_user_and_get_token
+
 from packages.core.constants.approvals import HitlType
 from packages.core.governance.service import post_hitl_card
 from packages.core.models.hitl_request import HitlRequest
@@ -23,17 +25,21 @@ from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Message
 from packages.core.models.worker import SubscriptionWorker, Worker
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
-from packages.core.models.user import User, UserMembership
+from packages.core.models.user import Entity, User, UserMembership
+from packages.core.governance.approval_policy_service import account_defaults, initialize_workspace_approval
+from approval_settings_test_utils import initialize_test_approval_owners
 
 
 
 async def _workspace(db):
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
-    db.add(Workspace(
-        id=workspace_id, entity_id=entity_id, name="WS", status="active",
-    ))
+    workspace = Workspace(id=workspace_id, entity_id=entity_id, name="WS", status="active")
+    db.add(Entity(id=entity_id, name="Approval card account",
+        settings={"approval_defaults": account_defaults()}))
+    db.add(workspace)
     await db.flush()
+    await initialize_workspace_approval(db, workspace)
     return entity_id, workspace_id
 
 
@@ -66,20 +72,14 @@ async def test_authorize_card_carries_its_type(db_session):
     assert pa["hitl_type"] == HitlType.AUTHORIZE.value
     assert pa["payload"] == {}
     assert pa["task_id"] == task_id, "每张卡片都要能跳回它的任务"
-    assert pa["options"] == ["approve", "always_approve", "reject"], (
+    assert pa["options"] == ["approve", "reject"], (
         "authorize 卡片的按钮不能被 error 分支改掉"
     )
 
 
 @pytest.mark.asyncio
-async def test_publish_card_offers_always_too(db_session):
-    """发布类能力同样提供「始终批准」—— 用户说 always 就是 always。
-
-    曾经有过一档「可批准一次、不可永久」的能力分级（publish/email/message
-    不给 Always 按钮）。该产品决策已被否决：门禁的作用是让用户知情并做主，
-    不是替用户判断哪一类授权他「其实不该想要」。唯一的硬阻断是
-    ``never_allow``，而那一条用户自己也能改。
-    """
+async def test_publish_card_offers_one_time_approval(db_session):
+    """Publishing cards approve one action; saved rules use unified settings."""
     entity_id, workspace_id = await _workspace(db_session)
 
     await post_hitl_card(
@@ -95,7 +95,7 @@ async def test_publish_card_offers_always_too(db_session):
     assert card is not None
     pa = card.pending_action
     assert pa["hitl_type"] == HitlType.AUTHORIZE.value
-    assert pa["options"] == ["approve", "always_approve", "reject"]
+    assert pa["options"] == ["approve", "reject"]
     # 卡片上不再挂能力分级标记 —— 没有这一档了。
     assert "standing_grant_eligible" not in pa
 
@@ -239,6 +239,8 @@ async def _gated_scenario(db):
         ),
     ])
     await db.flush()
+    workspace = await db.get(Workspace, workspace_id)
+    await initialize_test_approval_owners(db, workspace, user_id=approval_actor_id)
     return {
         "entity_id": entity_id, "step_id": step_id,
         "task_id": task_id, "worker": worker,
@@ -252,12 +254,12 @@ async def _gated_scenario(db):
 
 
 async def _register(client, username: str) -> dict:
-    resp = await client.post(
-        "/api/v1/auth/register",
+    resp = await register_user_and_get_token(
+        client,
         json={
             "username": username,
             "email": f"{username}@test.com",
-            "password": "pass123",
+            "password": "HitlCardApprovalTest123!",
             "entity_name": f"{username} Corp",
         },
     )
@@ -352,7 +354,8 @@ async def test_retry_on_an_error_card_resumes_the_step(client, db_session):
 
     assert step.step_status == "pending", "重试后步骤必须回到队列"
     assert step.error is None
-    assert request.status == "granted"
+    assert request.status == "consumed"
+    assert step.approval_operation_revision == 1
 
 
 @pytest.mark.asyncio

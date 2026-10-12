@@ -1,0 +1,18 @@
+{
+  "id": "marketing-method",
+  "name": "marketing-method",
+  "display_name": "Marketing Method",
+  "type": "runtime_guidance",
+  "description": "Choose and detail the requested growth mechanism: organic content, paid acquisition, search/local discovery, lifecycle CRM, creators/referrals, or conversion and launch work.",
+  "category": "marketing",
+  "output_format": "guidance",
+  "tags": ["marketing", "method", "organic", "paid", "seo", "crm", "runtime-guidance", "builtin"],
+  "bundle_roots": ["references"],
+  "tools": ["read_file"],
+  "max_rounds": 8,
+  "temperature": 0.2,
+  "search": {
+    "terms": ["seo", "ads", "email marketing", "affiliate", "influencer", "funnel", "cro", "referral program", "growth hacking", "conversion rate", "landing page"],
+    "examples": ["choose growth channel for startup", "plan paid ads versus organic", "referral program to get customers", "improve landing page conversion rate"]
+  }
+}

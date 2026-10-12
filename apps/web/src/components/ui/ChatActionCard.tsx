@@ -4,20 +4,23 @@
  * Variants:
  *   <ProposalCard>   — Approve + Feedback input (strategist proposals)
  *   <HitlInputCard>  — Text input + Submit (agent needs human info)
- *   <ApprovalCard>   — Simple approve-once / always-approve / reject (plan approval, generic)
+ *   <ApprovalCard>   — Simple approve-once / reject (plan approval, generic)
  *   <ResolvedBadge>  — Shows resolution state after action taken
  *
  * Used by: EmbeddedChat, FloatingChat, WorkspaceChat
  */
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useId } from "react";
 import {
   friendlyApprovalActionLabel,
   friendlyApprovalDescription,
+  friendlyApprovalToolLabel,
   isErrorHitlCard,
   structuredApprovalCopy,
 } from "../../lib/approvalCopy";
 import { t } from "../../lib/i18n";
 import Chip from "./Chip";
+import AnchoredPopover from "./AnchoredPopover";
+import HitlKnowledgePicker from "./HitlKnowledgePicker";
 import Input from "./Input";
 import Modal from "./Modal";
 import Select from "./Select";
@@ -27,6 +30,7 @@ import {
   APPROVAL_CHOICE_APPROVE,
   APPROVAL_CHOICE_REJECT,
   DEFAULT_APPROVAL_OPTIONS,
+  currentApprovalOptions,
   oneTimeApprovalOptions,
   reviewApprovalOptions,
 } from "../../lib/approvalOptions";
@@ -43,6 +47,7 @@ import {
   type WorkflowInputSchema,
 } from "../workflows/WorkflowSchemaFields";
 import WorkflowApprovalReview from "../workflows/WorkflowApprovalReview";
+import ApprovalSaveRuleAction from "../approvals/ApprovalSaveRuleAction";
 import {
   proposalApprovedRowIds,
   proposalImpactExplainer,
@@ -91,21 +96,22 @@ function normalizeChoice(choice: string): string {
 
 function approvalTone(choice: string): ApprovalTone {
   const normalized = normalizeChoice(choice);
-  if (normalized.includes("always")) return "always";
+  if (normalized === APPROVAL_CHOICE_ALWAYS_APPROVE) return "always";
+  if (["approve", "approved", "approve_all", "approve_selected", "accept", "yes", "confirm", "continue_after_login"].includes(normalized)) return "approve";
   if (
     normalized === "revise"
     || normalized === "request_changes"
     || normalized === "cancel"
+    || normalized === "confirm_effect_not_applied"
   ) return "secondary";
   if (
-    normalized.includes("reject")
-    || normalized.includes("skip")
+    ["reject", "rejected", "reject_all", "skip"].includes(normalized)
     || normalized === "no"
     || normalized === "deny"
     || normalized === "decline"
     || normalized === "stopped"
   ) return "reject";
-  return "approve";
+  return "secondary";
 }
 
 function approvalLabel(choice: string): string {
@@ -123,6 +129,8 @@ function approvalLabel(choice: string): string {
   if (normalized === "sign_in") return t("component.chat_action_card.sign_in");
   if (normalized === "continue_after_login") return t("component.chat_action_card.continue");
   if (normalized === "retry" || normalized === "retry_now") return t("component.chat_action_card.retry");
+  if (normalized === "confirm_effect_applied") return t("component.chat_action_card.effect_applied");
+  if (normalized === "confirm_effect_not_applied") return t("component.chat_action_card.effect_not_applied");
   const tone = approvalTone(choice);
   if (tone === "always") return t("component.chat_action_card.always");
   if (tone === "reject") return t("component.approval_action_bar.reject");
@@ -172,6 +180,22 @@ function stringList(value: unknown): string[] {
 
 function humanizeKey(value: string): string {
   return formatUserFacingLabel(value || "workspace changes");
+}
+
+function integrationEffectProviders(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((provider): provider is string => typeof provider === "string")
+    .map((provider) => provider.trim())
+    .filter(Boolean))];
+}
+
+function integrationProviderFromBinding(value: unknown): string | null {
+  const binding = asRecord(value);
+  if (binding?.capability_type === "mcp") {
+    return String(binding.integration_key || "").trim() || null;
+  }
+  return String(binding?.tool_name || "").match(/^mcp__(.+?)__/)?.[1] || null;
 }
 
 /** Deep link back to the task a card came from.
@@ -235,7 +259,7 @@ export function ApprovalSummary({ prompt, action, tool, hasWorkspace, paths, con
   });
   if (structured) {
     // Typed card: say what this is, why, and what to do — in the request's
-    // own words. No prompt rewriting runs here, so nothing can be swallowed.
+    // own words, with shared display formatting applied to internal labels.
     return (
       <div className="chat-hitl-summary">
         <div className="chat-hitl-title">{structured.headline}</div>
@@ -325,10 +349,58 @@ export function WorkspaceOperationReviewCard({ action, onResolve, disabled }: {
   // draft?" while the draft dropped the hard block on billing.*.
   const reviewPayload = asRecord(action.payload);
   const reviewDiff = asRecord(reviewPayload?.diff);
+  // Only the effective before/after diff proves a provider will change. A
+  // patch or the integration_scope category alone may be an invalid/no-op draft.
+  const integrationEffects = [
+    { key: "disable", providers: integrationEffectProviders(reviewDiff?.disabled_integrations) },
+    { key: "restore", providers: integrationEffectProviders(reviewDiff?.enabled_integrations) },
+  ].filter(({ providers }) => providers.length > 0);
+  const bindingDiff = asRecord(asRecord(asRecord(operation.diff)?.changes)?.capability_bindings);
+  const beforeBindingKeys = new Set(
+    (Array.isArray(bindingDiff?.before) ? bindingDiff.before : [])
+      .map((row) => String(asRecord(row)?.binding_key || "")),
+  );
+  const afterBindingKeys = new Set(
+    (Array.isArray(bindingDiff?.after) ? bindingDiff.after : [])
+      .map((row) => String(asRecord(row)?.binding_key || "")),
+  );
+  const proposedBindings = bindingDiff
+    ? (Array.isArray(bindingDiff.after) ? bindingDiff.after : [])
+      .filter((row) => !beforeBindingKeys.has(String(asRecord(row)?.binding_key || "")))
+    : patches.flatMap((patch) => {
+      const entry = asRecord(patch);
+      if (entry?.op !== "capability_binding.upsert") return [];
+      const payload = asRecord(entry.payload);
+      return Array.isArray(payload?.bindings) ? payload.bindings : [payload?.binding];
+    });
+  const addedIntegrations = changedKeys.includes("capability_bindings")
+    ? integrationEffectProviders(proposedBindings.map(integrationProviderFromBinding))
+    : [];
+  const removedIntegrations = changedKeys.includes("capability_bindings") && bindingDiff
+    ? integrationEffectProviders(
+        (Array.isArray(bindingDiff.before) ? bindingDiff.before : [])
+          .filter((row) => !afterBindingKeys.has(String(asRecord(row)?.binding_key || "")))
+          .map(integrationProviderFromBinding),
+      )
+    : [];
+  const integrationChanges = [
+    { key: "add", providers: addedIntegrations },
+    { key: "remove", providers: removedIntegrations },
+    ...integrationEffects,
+  ].filter(({ providers }) => providers.length > 0);
   const removedHardBlocks = stringList(
     reviewDiff?.removed_hard_blocks ?? operation.removed_hard_blocks,
   );
   const reviewWhy = String(reviewPayload?.why || "").trim();
+  const disconnectedIntegrations = integrationEffectProviders(errors.flatMap((issue) => {
+    const row = asRecord(issue);
+    if (row?.code !== "integration_not_connected") return [];
+    const provider = String(row.message || "").match(/Integration ['\"]([^'\"]+)['\"]/i)?.[1];
+    return provider ? [provider] : addedIntegrations;
+  }));
+  const otherErrors = errors.filter((issue) => (
+    asRecord(issue)?.code !== "integration_not_connected" || disconnectedIntegrations.length === 0
+  ));
 
   const renderIssue = (issue: unknown, idx: number) => {
     const row = asRecord(issue);
@@ -342,13 +414,35 @@ export function WorkspaceOperationReviewCard({ action, onResolve, disabled }: {
   };
 
   return (
-    <div className="chat-hitl-summary">
+    <div className="chat-hitl-summary chat-workspace-review">
       <div className="chat-hitl-title">
         {t("component.chat_action_card.workspace_changes_title")}
       </div>
-      <div className="chat-hitl-description">
-        {formatUserFacingText(summary) || t("component.chat_action_card.workspace_changes_desc")}
-      </div>
+      {integrationChanges.length > 0 ? (
+        <dl className="chat-workspace-review__changes">
+          {integrationChanges.map(({ key, providers }) => (
+            <div className="chat-workspace-review__change" key={key}>
+              <dt>{t(`component.chat_action_card.integrations_${key}_workspace`)}</dt>
+              <dd>
+                {providers.map((provider) => <Chip key={provider}>{humanizeKey(provider)}</Chip>)}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      ) : (
+        <div className="chat-hitl-description">
+          {formatUserFacingText(
+            removedHardBlocks.length > 0 ? summary : reviewWhy || summary,
+          ) || t("component.chat_action_card.workspace_changes_desc")}
+        </div>
+      )}
+
+      {(removedIntegrations.length > 0 || integrationEffects.some(({ key }) => key === "disable")) && (
+        <div className="chat-hitl-description">{t("component.chat_action_card.integrations_disable_scope_note")}</div>
+      )}
+      {integrationEffects.some(({ key }) => key === "restore") && (
+        <div className="chat-hitl-description">{t("component.chat_action_card.integrations_restore_scope_note")}</div>
+      )}
 
       {removedHardBlocks.length > 0 && (
         <div
@@ -376,72 +470,41 @@ export function WorkspaceOperationReviewCard({ action, onResolve, disabled }: {
         </div>
       )}
 
-      {reviewWhy && removedHardBlocks.length === 0 && (
-        <div className="chat-hitl-description" style={{ marginTop: 6 }}>
-          {reviewWhy}
+      {disconnectedIntegrations.length > 0 && (
+        <div className="chat-workspace-review__issue" role="alert">
+          <strong>{t("component.chat_action_card.integration_connect_first", {
+            names: disconnectedIntegrations.map(humanizeKey).join(", "),
+          })}</strong>
+          <div>{t("component.chat_action_card.integration_connect_hint")}</div>
+          <a href="/integrations">{t("component.chat_action_card.open_integrations")}</a>
         </div>
       )}
-
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 10 }}>
-        {(changedKeys.length ? changedKeys : ["workspace changes"]).map((key) => (
-          <code key={key} style={{
-            padding: "4px 8px",
-            borderRadius: 999,
-            background: "#f5f5f4",
-            color: "#78716c",
-            fontSize: 11,
-            fontWeight: 600,
-          }}>
-            {humanizeKey(key)}
-          </code>
-        ))}
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginTop: 10 }}>
-        <div style={{ padding: "8px 10px", borderRadius: 10, background: "#fafaf9", border: "1px solid #e7e5e4" }}>
-          <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", color: "#a8a29e", fontWeight: 800 }}>{t("component.chat_action_card.changes")}</div>
-          <div style={{ fontSize: 16, color: "#0f172a", fontWeight: 900 }}>{patches.length || "1+"}</div>
-        </div>
-        <div style={{ padding: "8px 10px", borderRadius: 10, background: invalid ? "#fef2f2" : "#f0fdf4", border: `1px solid ${invalid ? "#fecaca" : "#bbf7d0"}` }}>
-          <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", color: invalid ? "#b91c1c" : "#15803d", fontWeight: 800 }}>{t("component.chat_action_card.review")}</div>
-          <div style={{ fontSize: 13, color: invalid ? "#991b1b" : "#166534", fontWeight: 900 }}>{invalid ? t("component.chat_action_card.issue_count").replace("{count}", String(errors.length)) : t("component.chat_action_card.passed")}</div>
-        </div>
-        <div style={{ padding: "8px 10px", borderRadius: 10, background: "#fff7ed", border: "1px solid #fed7aa" }}>
-          <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.08em", color: "#c2410c", fontWeight: 800 }}>{t("component.chat_action_card.decision")}</div>
-          <div style={{ fontSize: 13, color: "#9a3412", fontWeight: 900 }}>{t("component.chat_action_card.required")}</div>
-        </div>
-      </div>
-
-
-      {errors.length > 0 && (
-        <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 10, background: "#fef2f2", border: "1px solid #fecaca", color: "#991b1b", fontSize: 12 }}>
+      {otherErrors.length > 0 && (
+        <div className="chat-workspace-review__issue" role="alert">
           <strong>{t("component.chat_action_card.fix_before_applying")}</strong>
-          <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
-            {errors.slice(0, 4).map(renderIssue)}
-          </ul>
+          <ul>{otherErrors.slice(0, 4).map(renderIssue)}</ul>
         </div>
       )}
-
       {(warnings.length > 0 || missingSetup.length > 0) && (
-        <div style={{ marginTop: 10, padding: "10px 12px", borderRadius: 10, background: "#fffbeb", border: "1px solid #fde68a", color: "#92400e", fontSize: 12 }}>
-          <strong>{t("component.chat_action_card.notes")}</strong>
-          <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+        <details className="chat-workspace-review__notes">
+          <summary>{t("component.chat_action_card.notes")}</summary>
+          <ul>
             {missingSetup.slice(0, 3).map((item, idx) => (
               <li key={`missing-${item}-${idx}`}>{t("component.chat_action_card.missing_setup").replace("{item}", humanizeKey(item))}</li>
             ))}
             {warnings.slice(0, 3).map(renderIssue)}
           </ul>
-        </div>
+        </details>
       )}
 
       <ApprovalCard
         // A review is a verdict on THIS diff. There is no coherent standing
         // version of "yes to whatever the next draft says", so the one-time
         // vocabulary is applied to whatever the blob carries.
-        options={oneTimeApprovalOptions(action.options)}
+        options={invalid ? ["reject"] : oneTimeApprovalOptions(action.options)}
         onResolve={onResolve}
         disabled={disabled}
-        blockApprove={invalid}
+        rejectLabel={invalid ? t("component.chat_action_card.discard_change") : undefined}
       />
     </div>
   );
@@ -573,7 +636,6 @@ export function ProposalCard({
   const [showRejectDialog, setShowRejectDialog] = useState(false);
   const [rejectReason, setRejectReason] = useState<string>("");
   const [rejectComment, setRejectComment] = useState("");
-  const [showAlwaysConfirm, setShowAlwaysConfirm] = useState(false);
 
   const updateSelected = (next: Set<string>) => {
     if (onSelectedRowIdsChange) {
@@ -604,15 +666,9 @@ export function ProposalCard({
     }
   };
 
-  const handleAlwaysApprove = () => {
-    setShowAlwaysConfirm(true);
-  };
 
-  const confirmAlwaysApprove = () => {
-    setShowAlwaysConfirm(false);
-    setSubmitting(true);
-    onResolve(APPROVAL_CHOICE_ALWAYS_APPROVE);
-  };
+
+
 
   const handleReject = () => {
     setShowRejectDialog(true);
@@ -715,14 +771,6 @@ export function ProposalCard({
             : selectedCount === rows.length
               ? t("component.chat_action_card.approve_all")
               : t("component.chat_action_card.approve_count").replace("{selected}", String(selectedCount)).replace("{total}", String(rows.length))}
-        </button>
-        <button
-          type="button"
-          className="chat-hitl-btn-secondary chat-hitl-btn-quiet"
-          onClick={handleAlwaysApprove}
-          disabled={disabled || submitting || rows.length === 0}
-        >
-          {t("component.chat_action_card.always_approve")}
         </button>
         <button
           type="button"
@@ -834,58 +882,24 @@ export function ProposalCard({
         </div>
       </Modal>
 
-      {/* Always-approve confirmation — states the standing scope (M8) */}
-      <Modal
-        open={showAlwaysConfirm}
-        onClose={() => setShowAlwaysConfirm(false)}
-        title={t("component.chat_action_card.always_approve")}
-        maxWidth="440px"
-        footer={
-          <>
-            <button
-              type="button"
-              className="chat-hitl-btn-secondary"
-              onClick={() => setShowAlwaysConfirm(false)}
-            >
-              {t("component.chat_action_card.cancel")}
-            </button>
-            <button
-              type="button"
-              className="chat-hitl-btn-primary"
-              onClick={confirmAlwaysApprove}
-            >
-              {t("component.chat_action_card.always_approve")}
-            </button>
-          </>
-        }
-      >
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <p style={{ color: "#57534e", fontSize: 14, lineHeight: 1.6, margin: 0 }}>
-            {t("component.chat_action_card.always_approve_scope")}
-          </p>
-          <p style={{ color: "#78716c", fontSize: 13, lineHeight: 1.6, margin: 0 }}>
-            {t("component.chat_action_card.always_approve_scope_manage")}
-          </p>
-        </div>
-      </Modal>
+
     </div>
   );
 }
 
-/* ── Simple Approval Card (approve once / always approve / reject) ── */
+/* ── Simple Approval Card (approve once / reject) ── */
 
-export function ApprovalCard({ options, onResolve, disabled, blockApprove }: {
+export function ApprovalCard({ options, onResolve, disabled, blockApprove, rejectLabel }: {
   options?: string[];
   onResolve: (choice: string, note?: string, payload?: Record<string, any>) => void;
   disabled?: boolean;
   /** Disable only the affirmative (approve) button — e.g. when a draft has
    *  validation errors — while keeping reject/dismiss clickable. */
   blockApprove?: boolean;
+  rejectLabel?: string;
 }) {
-  // The card renders exactly the vocabulary the producer posted. "Always" is
-  // the user's to give for any capability they are shown a card for; only
-  // `never_allow` is a hard block, and it never produces a card at all.
-  const opts = options && options.length ? options : DEFAULT_APPROVAL_OPTIONS;
+  // Historical cards cannot restore the retired, unscoped Always action.
+  const opts = currentApprovalOptions(options);
   const [revisionRequest, setRevisionRequest] = useState("");
   const [revisionChoice, setRevisionChoice] = useState<string | null>(null);
   const showRevisionRequest = revisionChoice !== null;
@@ -923,13 +937,18 @@ export function ApprovalCard({ options, onResolve, disabled, blockApprove }: {
                 onResolve(opt);
               }}
               disabled={disabled || (blockApprove && isApprove)}
+              title={
+                blockApprove && isApprove
+                  ? t("component.chat_action_card.approve_blocked_by_validation")
+                  : undefined
+              }
               aria-expanded={
                 ["revise", "request_changes"].includes(normalizeChoice(opt))
                   ? showRevisionRequest
                   : undefined
               }
             >
-              {approvalLabel(opt)}
+              {tone === "reject" && rejectLabel ? rejectLabel : approvalLabel(opt)}
             </button>
           );
         })}
@@ -978,19 +997,243 @@ export const ERROR_CARD_OPTIONS = ["retry", "cancel"];
 /** An allowlist, not a denylist. Every card in flight was posted with the
  *  approval vocabulary, and a denylist that forgets one of approve / always /
  *  reject puts that exact button back on a failure card. */
-const ERROR_CARD_CHOICES = new Set(["retry", "retry_now", "cancel", "skip"]);
+const ERROR_CARD_CHOICES = new Set([
+  "retry",
+  "retry_now",
+  "confirm_effect_applied",
+  "confirm_effect_not_applied",
+  "cancel",
+  "skip",
+]);
 
-export function HitlErrorCard({ action, onResolve, disabled }: {
+type ReconciliationEffect = {
+  effect_digest: string;
+  action_group_id?: string;
+  applied_result_required?: boolean;
+  step_id?: string;
+  tool_call_id?: string;
+  arguments_hash?: string;
+  effect?: string;
+  tool?: string;
+  action_key?: string;
+  provider?: string;
+};
+
+function reconciliationEffects(action: PendingAction): ReconciliationEffect[] {
+  const raw = action.payload?.reconciliation?.effects;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((effect): effect is ReconciliationEffect => (
+    effect && typeof effect === "object"
+    && typeof effect.effect_digest === "string"
+    && Boolean(effect.effect_digest.trim())
+  ));
+}
+
+function reconciliationGroups(effects: ReconciliationEffect[]) {
+  const groups = new Map<string, ReconciliationEffect[]>();
+  for (const effect of effects) {
+    // New cards carry the server's exact grouping identity. For cards already
+    // posted, group only receipts with the same Step and concrete tool call;
+    // the resolver still validates every original digest before changing state.
+    const legacyIdentity = effect.step_id && effect.tool && effect.tool_call_id
+      && effect.arguments_hash
+      ? JSON.stringify([
+        effect.step_id, effect.tool, effect.tool_call_id,
+        effect.arguments_hash, effect.effect, effect.action_key, effect.provider,
+      ])
+      : "";
+    const key = effect.action_group_id || legacyIdentity || effect.effect_digest;
+    groups.set(key, [...(groups.get(key) || []), effect]);
+  }
+  return [...groups].map(([key, members]) => ({ key, members }));
+}
+
+function EffectReconciliationCard({ action, onResolve, disabled, hasTaskReference }: {
   action: PendingAction;
-  onResolve: (choice: string, note?: string) => void;
+  onResolve: (choice: string, note?: string, payload?: Record<string, any>) => void;
   disabled?: boolean;
+  hasTaskReference?: boolean;
 }) {
-  // Retry without changed input re-runs the exact attempt that just failed —
-  // a deterministic blocker then fails identically forever. The guidance box
-  // lets the user say what to change; the backend writes it into the step's
-  // human_input_response so the retried model actually sees it.
+  const formId = useId();
+  const groups = reconciliationGroups(reconciliationEffects(action));
+  const [decisions, setDecisions] = useState<Record<string, string>>({});
+  const [results, setResults] = useState<Record<string, string>>({});
   const [guidance, setGuidance] = useState("");
+  const [error, setError] = useState("");
+  const ready = groups.every(({ key, members }) => (
+    Boolean(decisions[key])
+    && (
+      decisions[key] !== "applied"
+      || members.every((effect) => effect.applied_result_required === false)
+      || Boolean(String(results[key] || "").trim())
+    )
+  ));
+  const retrySelected = groups.some(({ key }) => decisions[key] === "not_applied");
+
+  const submit = () => {
+    if (!ready || disabled) return;
+    const byDigest: Record<string, string> = {};
+    const resultsByDigest: Record<string, unknown> = {};
+    for (const { key, members } of groups) {
+      const raw = String(results[key] || "").trim();
+      let parsed: unknown;
+      if (decisions[key] === "applied" && raw) {
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          setError(t("component.chat_action_card.effect_result_invalid"));
+          return;
+        }
+      }
+      for (const effect of members) {
+        byDigest[effect.effect_digest] = decisions[key];
+        if (decisions[key] === "applied" && raw) {
+          resultsByDigest[effect.effect_digest] = parsed;
+        }
+      }
+    }
+    setError("");
+    onResolve("reconcile_effects", guidance.trim() || undefined, {
+      decisions: byDigest,
+      results: resultsByDigest,
+    });
+  };
+
+  return (
+    <div className="chat-hitl-effect-card">
+      <div className="chat-hitl-effect-header">
+        <div className="chat-hitl-effect-title">{t("component.chat_action_card.effect_title")}</div>
+        <p className="chat-hitl-effect-explanation">
+          {t("component.chat_action_card.effect_explainer")}
+        </p>
+      </div>
+      {groups.map(({ key, members }, index) => {
+        const effect = members[0];
+        const resultRequired = members.some((member) => member.applied_result_required !== false);
+        const label = effect.action_key === "workspace.task.create"
+          ? t("component.chat_action_card.effect_create_task")
+          : effect.action_key
+            ? friendlyApprovalActionLabel(effect.action_key)
+            : effect.tool
+              ? friendlyApprovalToolLabel(effect.tool)
+              : t("component.chat_action_card.effect_unknown");
+        const fieldId = `${formId}-result-${index}`;
+        const resultLabel = t(resultRequired
+          ? "component.chat_action_card.effect_result_required"
+          : "component.chat_action_card.effect_result_optional");
+        const resultField = (
+          <Textarea
+            id={fieldId}
+            label={resultRequired ? resultLabel : undefined}
+            ariaLabel={resultLabel}
+            ariaDescribedBy={resultRequired ? `${fieldId}-help` : undefined}
+            required={resultRequired}
+            value={results[key] || ""}
+            onChange={(event) => {
+              setResults((current) => ({ ...current, [key]: event.target.value }));
+              setError("");
+            }}
+            rows={2}
+            disabled={disabled}
+            className="chat-hitl-effect-field"
+          />
+        );
+        return (
+          <fieldset className="chat-hitl-effect-item" key={key} disabled={disabled}>
+            <legend className="chat-hitl-effect-item-title">{label}</legend>
+            <div className="chat-hitl-effect-choices">
+              {(["applied", "not_applied"] as const).map((choice) => (
+                <label className={`chat-hitl-effect-choice${decisions[key] === choice ? " is-selected" : ""}`} key={choice}>
+                  <input
+                    type="radio"
+                    name={`effect-${key}`}
+                    value={choice}
+                    checked={decisions[key] === choice}
+                    onChange={() => {
+                      setDecisions((current) => ({ ...current, [key]: choice }));
+                      setError("");
+                    }}
+                  />
+                  <span>{t(`component.chat_action_card.${choice === "applied" ? "effect_happened" : "effect_not_happened"}`)}</span>
+                </label>
+              ))}
+            </div>
+            {decisions[key] === "applied" && (resultRequired ? (
+              <div className="chat-hitl-effect-field">
+                {resultField}
+                <p id={`${fieldId}-help`} className="chat-hitl-effect-explanation">
+                  {t("component.chat_action_card.effect_result_help")}
+                </p>
+              </div>
+            ) : (
+              <details className="chat-hitl-effect-details">
+                <summary>{resultLabel}</summary>
+                {resultField}
+              </details>
+            ))}
+          </fieldset>
+        );
+      })}
+      {retrySelected && (
+        <details className="chat-hitl-effect-details">
+          <summary>{t("component.chat_action_card.effect_guidance")}</summary>
+          <Textarea
+            ariaLabel={t("component.chat_action_card.effect_guidance")}
+            value={guidance}
+            onChange={(event) => setGuidance(event.target.value)}
+            rows={2}
+            disabled={disabled}
+            className="chat-hitl-effect-field"
+          />
+        </details>
+      )}
+      {error && <p className="chat-hitl-effect-error" role="alert">{error}</p>}
+      <div className="chat-hitl-effect-actions">
+        <button type="button" className="chat-hitl-btn-primary" onClick={submit} disabled={disabled || !ready}>
+          {t("component.chat_action_card.effect_verify")}
+        </button>
+        <button type="button" className="chat-hitl-btn-secondary" onClick={() => onResolve("cancel")} disabled={disabled}>
+          {t("component.chat_action_card.effect_stop")}
+        </button>
+        {!hasTaskReference && <CardOriginLink taskId={action.task_id} />}
+      </div>
+    </div>
+  );
+}
+
+function taskRecoveryCopy(action: PendingAction) {
   const structured = structuredApprovalCopy(action.payload);
+  if (action.kind !== PendingActionKind.TASK_RECOVERY) return structured;
+  const issue = typeof action.payload?.why === "string" ? action.payload.why.trim() : "";
+  const recordedAction = issue.match(
+    /^Step ['"](.+?)['"] recorded an external action\. A new plan cannot safely reuse its prior idempotency identity; reconcile that action before replanning\.?$/i,
+  );
+  if (!recordedAction) return structured;
+  return {
+    headline: t("component.chat_action_card.recorded_action_title"),
+    detail: t("component.chat_action_card.recorded_action_detail", {
+      step: formatUserFacingText(recordedAction[1]),
+    }),
+    actionToTake: null,
+    actionLink: structured?.actionLink || null,
+  };
+}
+
+export function HitlErrorCard({ action, onResolve, disabled, hasTaskReference }: {
+  action: PendingAction;
+  /** Omitted for read-only recovery history. */
+  onResolve?: (choice: string, note?: string, payload?: Record<string, any>) => void;
+  disabled?: boolean;
+  /** Workspace Chat already renders this task as a card below the action. */
+  hasTaskReference?: boolean;
+}) {
+  // Optional guidance can change the next attempt's input. The server still
+  // decides whether recovery is safe; rendering Retry does not grant replay.
+  const [guidance, setGuidance] = useState("");
+  if (onResolve && reconciliationEffects(action).length > 0) {
+    return <EffectReconciliationCard action={action} onResolve={onResolve} disabled={disabled} hasTaskReference={hasTaskReference} />;
+  }
+  const structured = taskRecoveryCopy(action);
   const headline =
     structured?.headline
     || (typeof action.prompt === "string" && action.prompt.trim())
@@ -998,43 +1241,49 @@ export function HitlErrorCard({ action, onResolve, disabled }: {
   const options = (action.options || []).filter((opt) =>
     ERROR_CARD_CHOICES.has(normalizeChoice(opt)),
   );
+  const taskLink = action.task_id ? `/tasks/${String(action.task_id).trim()}` : null;
+  const actionLink = structured?.actionLink;
+  const hasSeparateActionLink = actionLink && actionLink.replace(/\/+$/, "") !== taskLink;
   return (
-    <>
-      <div className="chat-hitl-summary">
-        <div className="chat-hitl-title">{headline}</div>
-        {structured?.detail && (
-          <div className="chat-hitl-description">{structured.detail}</div>
+    <div className="chat-hitl-error-card">
+      <p className="chat-hitl-error-title">{headline}</p>
+      {(structured?.detail || structured?.actionToTake) && (
+        <details className="chat-hitl-error-details">
+          <summary>{t("component.chat_action_card.error_details")}</summary>
+          {structured.detail && <p>{structured.detail}</p>}
+          {structured.actionToTake && <p>{structured.actionToTake}</p>}
+        </details>
+      )}
+      {onResolve && (
+        <details className="chat-hitl-error-details">
+          <summary>{t("component.chat_action_card.effect_guidance")}</summary>
+          <Textarea
+            ariaLabel={t("component.chat_action_card.effect_guidance")}
+            value={guidance}
+            onChange={(e) => setGuidance(e.target.value)}
+            placeholder={t("component.chat_action_card.retry_guidance_placeholder")}
+            rows={2}
+            disabled={disabled}
+            className="chat-hitl-retry-guidance"
+          />
+        </details>
+      )}
+      <div className="chat-hitl-error-actions">
+        {onResolve && (
+          <ApprovalCard
+            options={options.length ? options : ERROR_CARD_OPTIONS}
+            onResolve={(choice) => onResolve(choice, guidance.trim() || undefined)}
+            disabled={disabled}
+          />
         )}
-        {structured?.actionToTake && (
-          <div className="chat-hitl-action-to-take">
-            <strong>{t("component.chat_action_card.what_to_do")}</strong>{" "}
-            {structured.actionToTake}
-          </div>
+        {hasSeparateActionLink && (
+          <a className="chat-hitl-action-link" href={actionLink}>
+            {routeLinkLabel(actionLink)}
+          </a>
         )}
-        <div className="chat-hitl-links">
-          {structured?.actionLink && (
-            <a className="chat-hitl-action-link" href={structured.actionLink}>
-              {routeLinkLabel(structured.actionLink)}
-            </a>
-          )}
-          <CardOriginLink taskId={action.task_id} />
-        </div>
+        {!hasTaskReference && <CardOriginLink taskId={action.task_id} />}
       </div>
-      <Textarea
-        ariaLabel={t("component.chat_action_card.retry_guidance_placeholder")}
-        value={guidance}
-        onChange={(e) => setGuidance(e.target.value)}
-        placeholder={t("component.chat_action_card.retry_guidance_placeholder")}
-        rows={3}
-        disabled={disabled}
-        className="chat-hitl-retry-guidance"
-      />
-      <ApprovalCard
-        options={options.length ? options : ERROR_CARD_OPTIONS}
-        onResolve={(choice) => onResolve(choice, guidance.trim() || undefined)}
-        disabled={disabled}
-      />
-    </>
+    </div>
   );
 }
 
@@ -1148,10 +1397,12 @@ function formatWorkflowInputValue(value: unknown, type: string): string {
   return String(value);
 }
 
-function WorkflowStarterInputCard({ action, onResolve, disabled }: {
+function WorkflowStarterInputCard({ action, onResolve, disabled, workspaceId, submitChoice = "run" }: {
   action: PendingAction;
   onResolve: (choice: string, note?: string, payload?: Record<string, any>) => void;
   disabled?: boolean;
+  workspaceId?: string;
+  submitChoice?: "run" | "respond";
 }) {
   const inputs = (Array.isArray(action.inputs) ? action.inputs : [])
     .filter((item: unknown): item is WorkflowStarterInput => Boolean(
@@ -1185,8 +1436,10 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
     ]),
   ));
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [fileBusy, setFileBusy] = useState(false);
 
   const submit = () => {
+    if (fileBusy) return;
     const parsed: Record<string, unknown> = {};
     const nextErrors: Record<string, string> = {};
     for (const input of inputs) {
@@ -1223,7 +1476,7 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
     }
     setErrors(nextErrors);
     if (Object.keys(nextErrors).length > 0) return;
-    onResolve("run", undefined, { inputs: parsed });
+    onResolve(submitChoice, undefined, { inputs: parsed });
   };
 
   const visibleFieldCount = visibleInputs.reduce(
@@ -1256,6 +1509,8 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
               value={values}
               errors={errors}
               disabled={disabled}
+              workspaceId={workspaceId}
+              onFileBusyChange={setFileBusy}
               onChange={(path, nextValue) => {
                 setValues((current) => (
                   setWorkflowValueAtPath(current, path, nextValue) as Record<string, unknown>
@@ -1270,6 +1525,30 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
           {!useUnifiedSchemaGrid && visibleInputs.map((input) => {
             const type = input.type || "string";
             const id = `workflow-starter-input-${input.key}`;
+            if (input.schema?.["x-ui"]?.control === "knowledge_file") {
+              return <WorkflowSchemaFields
+                key={input.key}
+                rootKey=""
+                schema={{
+                  type: "object",
+                  properties: { [input.key]: {
+                    ...input.schema,
+                    title: input.label || input.schema.title || humanizeKey(input.key),
+                    description: input.description || input.schema.description,
+                  } },
+                  required: input.required ? [input.key] : [],
+                }}
+                value={values}
+                errors={errors}
+                disabled={disabled}
+                workspaceId={workspaceId}
+                onFileBusyChange={setFileBusy}
+                onChange={(path, nextValue) => {
+                  setValues((current) => setWorkflowValueAtPath(current, path, nextValue) as Record<string, unknown>);
+                  setErrors((current) => ({ ...current, [workflowInputErrorPath("", path)]: "" }));
+                }}
+              />;
+            }
             if (input.schema && workflowSchemaType(input.schema) === "object") {
               return (
                 <div key={input.key} className="workflow-starter-input-object">
@@ -1283,6 +1562,7 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
                     value={values[input.key]}
                     errors={errors}
                     disabled={disabled}
+                    workspaceId={workspaceId}
                     onChange={(path, nextValue) => {
                       setValues((current) => ({
                         ...current,
@@ -1337,8 +1617,8 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
             <button type="button" className="chat-hitl-btn-secondary" onClick={() => onResolve("cancel")} disabled={disabled}>
               {t("component.chat_action_card.cancel")}
             </button>
-            <button type="button" className="chat-hitl-btn-primary" onClick={submit} disabled={disabled}>
-              {t("component.workspace_chat.run_workflow")}
+            <button type="button" className="chat-hitl-btn-primary" onClick={submit} disabled={disabled || fileBusy}>
+              {submitChoice === "respond" ? t("component.chat_action_card.submit") : t("component.workspace_chat.run_workflow")}
             </button>
           </div>
         </div>
@@ -1347,10 +1627,11 @@ function WorkflowStarterInputCard({ action, onResolve, disabled }: {
   );
 }
 
-function WorkflowRetryCard({ action, onResolve, disabled }: {
+function WorkflowRetryCard({ action, onResolve, disabled, workspaceId }: {
   action: PendingAction;
   onResolve: (choice: string, note?: string, payload?: Record<string, any>) => void;
   disabled?: boolean;
+  workspaceId?: string;
 }) {
   const schema = asRecord(action.editable_input_schema) as WorkflowInputSchema | null;
   const suppliedValues = {
@@ -1409,6 +1690,7 @@ function WorkflowRetryCard({ action, onResolve, disabled }: {
           value={values}
           errors={errors}
           disabled={disabled}
+          workspaceId={workspaceId}
           onChange={(path, nextValue) => {
             setValues((current: unknown) => setWorkflowValueAtPath(current, path, nextValue));
             setErrors((current) => ({
@@ -1430,7 +1712,8 @@ function WorkflowRetryCard({ action, onResolve, disabled }: {
   );
 }
 
-export function HitlInputCard({ onResolve, placeholder, disabled }: {
+export function HitlInputCard({ action, onResolve, placeholder, disabled, resetToken, showSkip = true }: {
+  action?: PendingAction;
   onResolve: (
     choice: string,
     note?: string,
@@ -1439,16 +1722,34 @@ export function HitlInputCard({ onResolve, placeholder, disabled }: {
   ) => void;
   placeholder?: string;
   disabled?: boolean;
+  resetToken?: number;
+  showSkip?: boolean;
 }) {
   const [value, setValue] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [submitting, setSubmitting] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [knowledgeOpen, setKnowledgeOpen] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
-  const menuRef = useRef<HTMLDivElement>(null);
+  const attachButtonRef = useRef<HTMLButtonElement>(null);
+  // Keep the note and File objects while a failed upload/resolve becomes retryable.
+  useEffect(() => { setSubmitting(false); }, [resetToken]);
+  const inputPayload = asRecord(action?.payload);
+  const question = typeof inputPayload?.question === "string"
+    ? inputPayload.question.trim()
+    : typeof action?.prompt === "string" ? action.prompt.trim() : "";
+  const context = typeof inputPayload?.context === "string"
+    ? inputPayload.context.trim()
+    : typeof inputPayload?.why === "string" ? inputPayload.why.trim() : "";
+  // Inline metadata HITL synthesizes approval options without a Task/Step
+  // origin. Only persisted input cards may use their top-level options.
+  const rawOptions = inputPayload?.options
+    || ((action?.task_id || action?.step_id) ? action.options : []);
+  const options = Array.isArray(rawOptions)
+    ? rawOptions.filter((option): option is string => typeof option === "string" && Boolean(option.trim()))
+    : [];
 
   const handleSubmit = () => {
-    if ((!value.trim() && attachments.length === 0) || submitting) return;
+    if ((!value.trim() && attachments.length === 0) || submitting || disabled) return;
     setSubmitting(true);
     const localFiles = attachments.flatMap((attachment) =>
       attachment.file ? [attachment.file] : [],
@@ -1471,7 +1772,7 @@ export function HitlInputCard({ onResolve, placeholder, disabled }: {
       const newFiles: Attachment[] = Array.from(e.target.files).map((f) => ({
         name: f.name, type: "file" as const, file: f,
       }));
-      setAttachments((prev) => [...prev, ...newFiles]);
+      setAttachments((prev) => [...prev, ...newFiles.filter((next) => !prev.some((existing) => existing.file === next.file))]);
     }
     e.target.value = "";
   };
@@ -1480,93 +1781,95 @@ export function HitlInputCard({ onResolve, placeholder, disabled }: {
 
   return (
     <div className="chat-hitl-input-card">
-      <input ref={fileRef} type="file" multiple accept="*/*" style={{ display: "none" }} onChange={handleFiles} />
+      {(question || context) && (
+        <div className="chat-hitl-summary">
+          {question && <div className="chat-hitl-title">{question}</div>}
+          {context && <div className="chat-hitl-description">{context}</div>}
+        </div>
+      )}
+      {options.length > 0 && (
+        <div className="chat-hitl-input-options" role="group" aria-label={question || t("component.chat_action_card.type_your_response")}>
+          {options.map((option) => (
+            <button
+              key={option}
+              type="button"
+              className="chat-hitl-input-option"
+              aria-pressed={value.trim() === option}
+              onClick={() => setValue(option)}
+              disabled={disabled || submitting}
+            >
+              {option}
+            </button>
+          ))}
+        </div>
+      )}
+      <input ref={fileRef} type="file" multiple accept="*/*" hidden disabled={disabled || submitting} onChange={handleFiles} />
       {/* Attachment pills */}
       {attachments.length > 0 && (
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 6 }}>
+        <div className="chat-hitl-attachments">
           {attachments.map((a, i) => (
-            <span key={i} style={{
-              display: "inline-flex", alignItems: "center", gap: 4,
-              padding: "2px 8px", borderRadius: 6, fontSize: 11, fontWeight: 600,
-              background: a.type === "knowledge" ? "rgba(95,132,189,0.08)" : "rgba(28,25,23,0.08)",
-              color: a.type === "knowledge" ? "#4869ac" : "#436b65",
-            }}>
+            <span key={a.id || `${a.name}-${i}`} className="chat-hitl-attachment">
               {a.type === "knowledge" ? (
                 <svg width="10" height="10" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" /></svg>
               ) : (
                 <svg width="10" height="10" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M18.375 12.739l-7.693 7.693a4.5 4.5 0 01-6.364-6.364l10.94-10.94A3 3 0 1119.5 7.372L8.552 18.32" /></svg>
               )}
-              {a.name}
-              <span style={{ cursor: "pointer", opacity: 0.5 }} onClick={() => removeAttachment(i)}>&times;</span>
+              <span className="chat-hitl-attachment-name" title={a.name}>{a.name}</span>
+              <button type="button" disabled={disabled || submitting} aria-label={`${t("page.public_chat.remove_attachment")}: ${a.name}`} onClick={() => removeAttachment(i)}>&times;</button>
             </span>
           ))}
         </div>
       )}
       <div className="chat-hitl-input-row">
-        {/* Attach dropdown — same as EmbeddedChat */}
-        <div style={{ position: "relative" }} ref={menuRef}>
+        <AnchoredPopover
+          ariaLabel={t("component.chat_action_card.attach")}
+          align="left"
+          width={210}
+          panelClassName="chat-hitl-attach-menu"
+          trigger={
           <button
-            onClick={() => setMenuOpen(!menuOpen)}
+            ref={attachButtonRef}
+            type="button"
             disabled={disabled || submitting}
             title={t("component.chat_action_card.attach")}
-            style={{
-              width: 32, height: 32, borderRadius: 8, border: "none",
-              background: "transparent", cursor: "pointer",
-              display: "flex", alignItems: "center", justifyContent: "center",
-              color: menuOpen ? "#436b65" : "#a8a29e", flexShrink: 0, transition: "color 0.15s",
-            }}
-            onMouseEnter={(e) => { if (!menuOpen) e.currentTarget.style.color = "#436b65"; }}
-            onMouseLeave={(e) => { if (!menuOpen) e.currentTarget.style.color = "#a8a29e"; }}
+            aria-label={t("component.chat_action_card.attach")}
+            className="chat-hitl-attach-trigger"
           >
             <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round">
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
-          {menuOpen && (
-            <div style={{
-              position: "absolute", bottom: 40, left: 0, width: 190,
-              background: "#fff", borderRadius: 12,
-              boxShadow: "0 8px 24px rgba(0,0,0,0.12)", border: "1px solid rgba(28,25,23,0.06)",
-              overflow: "hidden", zIndex: 10,
-            }}>
+          }
+        >
+          {({ close }) => (
+            <>
               <button
-                onClick={() => { setMenuOpen(false); fileRef.current?.click(); }}
-                style={{
-                  width: "100%", display: "flex", alignItems: "center", gap: 8,
-                  padding: "10px 14px", border: "none", background: "transparent",
-                  cursor: "pointer", fontSize: 13, fontWeight: 500, color: "#44403c", fontFamily: "inherit",
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "#fafaf9"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                type="button"
+                disabled={disabled || submitting}
+                onClick={() => { close(); fileRef.current?.click(); }}
               >
-                <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="#436b65" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" /></svg>
+                <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" /></svg>
                 {t("component.chat_action_card.local_file")}
               </button>
-              <div style={{ height: 1, background: "rgba(231,229,228,0.5)" }} />
               <button
+                type="button"
+                disabled={disabled || submitting}
                 onClick={() => {
-                  setMenuOpen(false);
-                  // Emit a custom event that the parent can listen to for KB picker
-                  window.dispatchEvent(new CustomEvent("hitl-kb-picker-open"));
+                  close();
+                  setKnowledgeOpen(true);
                 }}
-                style={{
-                  width: "100%", display: "flex", alignItems: "center", gap: 8,
-                  padding: "10px 14px", border: "none", background: "transparent",
-                  cursor: "pointer", fontSize: 13, fontWeight: 500, color: "#44403c", fontFamily: "inherit",
-                }}
-                onMouseEnter={(e) => { e.currentTarget.style.background = "#fafaf9"; }}
-                onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
               >
-                <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="#4869ac" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" /></svg>
+                <svg width="16" height="16" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}><path strokeLinecap="round" strokeLinejoin="round" d="M12 6.042A8.967 8.967 0 006 3.75c-1.052 0-2.062.18-3 .512v14.25A8.987 8.987 0 016 18c2.305 0 4.408.867 6 2.292m0-14.25a8.966 8.966 0 016-2.292c1.052 0 2.062.18 3 .512v14.25A8.987 8.987 0 0018 18a8.967 8.967 0 00-6 2.292m0-14.25v14.25" /></svg>
                 {t("component.chat_action_card.knowledge_base")}
               </button>
-            </div>
+            </>
           )}
-        </div>
+        </AnchoredPopover>
         <textarea
           value={value}
+          aria-label={question || t("component.chat_action_card.type_your_response")}
           onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); } }}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); handleSubmit(); } }}
           placeholder={placeholder || t("component.chat_action_card.type_your_response")}
           rows={1}
           disabled={disabled || submitting}
@@ -1579,23 +1882,28 @@ export function HitlInputCard({ onResolve, placeholder, disabled }: {
         >
           {submitting ? t("component.chat_action_card.sending") : t("component.chat_action_card.submit")}
         </button>
-        <button
-          onClick={() => onResolve("skip")}
-          disabled={submitting || disabled}
-          className="chat-hitl-btn-secondary"
-        >
-          {t("component.chat_action_card.skip")}
-        </button>
+        {showSkip && (
+          <button
+            onClick={() => onResolve("skip")}
+            disabled={submitting || disabled}
+            className="chat-hitl-btn-secondary"
+          >
+            {t("component.chat_action_card.skip")}
+          </button>
+        )}
       </div>
+      {knowledgeOpen && (
+        <HitlKnowledgePicker
+          selectedIds={new Set(attachments.flatMap((attachment) => attachment.id ? [attachment.id] : []))}
+          onToggle={(document) => setAttachments((current) => current.some((attachment) => attachment.id === document.id)
+            ? current.filter((attachment) => attachment.id !== document.id)
+            : [...current, { id: document.id, name: document.name, type: "knowledge" }])}
+          onClose={() => setKnowledgeOpen(false)}
+          restoreFocus={() => attachButtonRef.current?.focus()}
+        />
+      )}
     </div>
   );
-}
-
-/** Helper to add a knowledge base document to a HitlInputCard from outside */
-export function addKnowledgeAttachment(name: string, docId: string) {
-  window.dispatchEvent(new CustomEvent("hitl-kb-attachment", {
-    detail: { name, id: docId, type: "knowledge" },
-  }));
 }
 
 /* ── Tool-level pending actions ── */
@@ -1808,9 +2116,13 @@ export function NeedsConfirmationCard({ action, onResolve, disabled }: {
 
 /* ── Resolved Badge (shows after action taken) ── */
 
-function ResolvedActionSummary({ action }: { action: PendingAction }) {
+function ResolvedActionSummary({ action, hasTaskReference }: { action: PendingAction; hasTaskReference?: boolean }) {
   if (!action?.kind || action.kind === "unknown" || action.kind === "approve_proposals") {
     return null;
+  }
+
+  if (isErrorHitlCard(action.hitl_type) && reconciliationEffects(action).length === 0) {
+    return <HitlErrorCard action={action} hasTaskReference={hasTaskReference} />;
   }
 
   if (
@@ -1871,31 +2183,34 @@ export function ResolvedBadge({ resolution, by }: { resolution: Resolution; by?:
   const choice = resolution.choice || "";
   const tone = approvalTone(choice);
   const normalized = normalizeChoice(choice);
-  const isRetry = choice === "retry" || choice === "retry_now";
-  const isSkipped = normalized.includes("skip");
-  const isCancelled = normalized.includes("cancel") || normalized === "stopped";
+  const isRetry = normalized === "retry" || normalized === "retry_now";
+  const isSkipped = normalized === "skip";
+  const isCancelled = normalized === "cancel" || normalized === "stopped";
   const isApprove = tone === "approve" || tone === "always";
-  const isFeedback = choice === "feedback";
-  const isRespond = choice === "respond" || normalized === "provide_answers";
+  const isFeedback = normalized === "feedback";
+  const isRespond = ["respond", "provide_answers", "submit"].includes(normalized);
   const isReject = tone === "reject";
   const isRevise = normalized === "revise" || normalized === "request_changes";
+  const isNeutral = !isApprove && !isReject && !isFeedback && !isRespond && !isCancelled;
 
-  const label = isRetry ? t("component.chat_action_card.retry_requested")
+  const label = normalized === "superseded" ? t("component.chat_action_card.superseded")
+    : normalized === "expired" ? t("component.chat_action_card.expired")
+    : isRetry ? t("component.chat_action_card.retry_requested")
     : isCancelled ? t("component.status.cancelled")
     : isSkipped ? t("component.chat_action_card.skipped")
     : isRevise ? t("component.chat_action_card.revision_requested")
-    : tone === "always" ? t("component.chat_action_card.always_approved")
-    : isApprove ? (choice === "approve_selected" ? t("component.chat_action_card.partially_approved") : t("component.chat_action_card.approved"))
     : isFeedback ? t("component.chat_action_card.feedback_sent")
     : isRespond ? t("component.chat_action_card.responded")
+    : tone === "always" ? t("component.chat_action_card.always_approved")
+    : isApprove ? (normalized === "approve_selected" ? t("component.chat_action_card.partially_approved") : t("component.chat_action_card.approved"))
     : isReject ? t("component.chat_action_card.rejected")
-    : choice;
-  const variant = isRevise
+    : t("component.chat_action_card.status_unknown");
+  const variant = isNeutral
     ? "chat-hitl-resolved--revised"
     : (isApprove || isFeedback || isRespond)
       ? "chat-hitl-resolved--approved"
       : "chat-hitl-resolved--rejected";
-  const icon = isRevise ? "↻ " : (isApprove || isFeedback || isRespond) ? "✓ " : "✗ ";
+  const icon = isRevise ? "↻ " : isNeutral ? "— " : (isApprove || isFeedback || isRespond) ? "✓ " : "✗ ";
 
   return (
     <div className={`chat-hitl-resolved ${variant}`}>
@@ -1977,7 +2292,7 @@ export function ProposalResolution({ action, resolution, by }: {
 
 /* ── Composite: renders the right card based on pending_action ── */
 
-export default function ChatActionCard({ action, resolved, resolution, onResolve, disabled, resolvedByName, currentUserName, resetToken, proposalSelectedRowIds, onProposalSelectedRowIdsChange, proposalRowsRenderedElsewhere }: {
+export default function ChatActionCard({ action, resolved, resolution, onResolve, disabled, resolvedByName, currentUserName, resetToken, proposalSelectedRowIds, onProposalSelectedRowIdsChange, proposalRowsRenderedElsewhere, workspaceId, hasTaskReference }: {
   action: PendingAction;
   resolved?: boolean;
   resolution?: Resolution | null;
@@ -1993,6 +2308,8 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
   proposalSelectedRowIds?: Set<string>;
   onProposalSelectedRowIdsChange?: (selected: Set<string>) => void;
   proposalRowsRenderedElsewhere?: boolean;
+  workspaceId?: string;
+  hasTaskReference?: boolean;
   onResolve: (
     choice: string,
     note?: string,
@@ -2003,7 +2320,10 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
   const [localResolution, setLocalResolution] = useState<Resolution | null>(null);
   const submittedRef = useRef(false);
   const previousResetTokenRef = useRef(resetToken);
-  const effectiveResolution = resolution || localResolution || (resolved ? { choice: "resolved" } : null);
+  // Uploading is not resolved. Keep input cards mounted until server confirmation
+  // so an error can unlock the same draft, including its original File objects.
+  const isInputCard = action.kind === PendingActionKind.HUMAN_INPUT || action.kind === PendingActionKind.WORKFLOW_INPUT;
+  const effectiveResolution = resolution || ((resolved || !isInputCard) ? localResolution : null) || (resolved ? { choice: "resolved" } : null);
   const locked = Boolean(disabled || resolved || localResolution || submittedRef.current);
 
   useEffect(() => {
@@ -2034,7 +2354,7 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
     }
     return (
       <div className="chat-hitl-resolved-card">
-        <ResolvedActionSummary action={action} />
+        <ResolvedActionSummary action={action} hasTaskReference={hasTaskReference} />
         <ResolvedBadge resolution={effectiveResolution} by={by} />
       </div>
     );
@@ -2050,30 +2370,35 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
     return (
       <HitlErrorCard
         action={action}
-        onResolve={(choice, note) => resolveOnce(choice, note)}
+        onResolve={resolveOnce}
         disabled={locked}
+        hasTaskReference={hasTaskReference}
       />
     );
   }
 
   if (action.kind === PendingActionKind.HUMAN_INPUT) {
-    return <HitlInputCard onResolve={resolveOnce} disabled={locked} />;
+    return <HitlInputCard action={action} onResolve={resolveOnce} disabled={locked} resetToken={resetToken} showSkip={false} />;
   }
 
   if (action.kind === PendingActionKind.WORKFLOW_STARTER_INPUT) {
-    return <WorkflowStarterInputCard action={action} onResolve={resolveOnce} disabled={locked} />;
+    return <WorkflowStarterInputCard action={action} onResolve={resolveOnce} disabled={locked} workspaceId={workspaceId} />;
   }
 
   if (action.kind === PendingActionKind.WORKFLOW_RETRY) {
-    return <WorkflowRetryCard action={action} onResolve={resolveOnce} disabled={locked} />;
+    return <WorkflowRetryCard action={action} onResolve={resolveOnce} disabled={locked} workspaceId={workspaceId} />;
   }
 
   if (action.kind === PendingActionKind.WORKFLOW_INPUT) {
+    if (Array.isArray(action.inputs) && action.inputs.length > 0) {
+      return <WorkflowStarterInputCard action={action} onResolve={resolveOnce} disabled={locked} workspaceId={workspaceId} submitChoice="respond" />;
+    }
     return (
       <HitlInputCard
         onResolve={resolveOnce}
         placeholder={typeof action.prompt === "string" ? action.prompt : undefined}
         disabled={locked}
+        resetToken={resetToken}
       />
     );
   }
@@ -2170,6 +2495,7 @@ export default function ChatActionCard({ action, resolved, resolution, onResolve
         onResolve={resolveOnce}
         disabled={locked}
       />
+      {action.approval_request_id && action.hitl_type !== "review" && <ApprovalSaveRuleAction key={action.approval_request_id} requestId={action.approval_request_id} scopeLabel={action.workspace?.name} disabled={locked} onCompleted={() => setLocalResolution({ choice: "approve", note: t("approval_settings.approve_save_rule") })} />}
     </>
   );
 }

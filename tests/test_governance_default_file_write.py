@@ -1,92 +1,59 @@
-"""file.write is auto-approved by DEFAULT so workspaces stop prompting for
-file writes — while a raw ``WorkspacePolicy()`` stays "no opinion" (empty)."""
+"""Default file behavior derives from the account mode, never a missing row."""
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
-from __future__ import annotations
+import pytest
 
-import asyncio
-
-from packages.core.governance.policy import DEFAULT_POLICY, WorkspacePolicy, policy_auto_approves
+from packages.core.governance.approval_facts import action_facts
+from packages.core.governance.approval_policy import ApprovalPolicyOverride, ApprovalScope, evaluate_policy
+from packages.core.governance.approval_policy_service import ApprovalPolicyIntegrityError, build_policy_chain
+from packages.core.governance.approval_projection import policy_override
+from packages.core.governance.policy import DEFAULT_POLICY, WorkspacePolicy
 from packages.core.governance.presets import apply_preset
 
 
-def test_default_policy_auto_approves_file_write():
-    assert policy_auto_approves(DEFAULT_POLICY, capability_id="file.write") is True
+@pytest.mark.parametrize("mode,action,outcome", [
+    ("risk_based", "workspace.file.modify", "allow"),
+    ("risk_based", "workspace.file.delete", "ask"),
+    ("confirm_changes", "workspace.file.modify", "ask"),
+    ("automatic", "workspace.file.modify", "allow"),
+    # The chosen mode decides even when the effect is unnamed.
+    ("automatic", "provider.unknown", "allow"),
+    ("confirm_changes", "provider.unknown", "ask"),
+])
+def test_account_mode_controls_file_operations(mode, action, outcome):
+    chain = build_policy_chain(scope=ApprovalScope(kind="account", id="entity", entity_id="entity"),
+        root={"revision": 1, "policy": {"mode": mode, "rules": []}})
+    assert evaluate_policy(chain, action_facts(action_key=action, resource_kind="file", risk_level="low")).outcome == outcome
 
 
-def test_raw_policy_still_no_opinion():
-    from packages.core.governance.policy import WorkspacePolicy
-
-    assert policy_auto_approves(WorkspacePolicy(), capability_id="file.write") is False
-
-
-def test_get_policy_falls_back_to_file_write_granting_default():
-    """A workspace with no persisted row gets DEFAULT_POLICY, which grants
-    file.write — so the dispatcher's intrinsic gate is overridden by default."""
-    import packages.core.governance.service as gov
-
-    class _FakeResult:
-        def one_or_none(self):
-            return None
-
-        def scalar_one_or_none(self):
-            return None
-
-    class _FakeDB:
-        async def execute(self, *args, **kwargs):
-            return _FakeResult()
-
-    policy = asyncio.run(gov.get_policy(_FakeDB(), "ws-no-row"))
-    assert policy_auto_approves(policy, capability_id="file.write") is True
+def test_raw_policy_has_no_implicit_capability_grants():
+    assert DEFAULT_POLICY.approval is None
+    assert WorkspacePolicy().approval is None
 
 
-def test_standard_preset_grants_file_write():
-    out = apply_preset(WorkspacePolicy(), "standard")
-    assert policy_auto_approves(out, capability_id="file.write") is True
+@pytest.mark.asyncio
+async def test_missing_persisted_policy_fails_closed(monkeypatch):
+    from packages.core.governance import service
+    cache = SimpleNamespace(get_current=AsyncMock(return_value=None))
+    monkeypatch.setattr(service.GovernancePolicyCacheFactory, "create_default", lambda: cache)
+    db = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(one_or_none=lambda: None)))
+    with pytest.raises(ApprovalPolicyIntegrityError, match="missing"):
+        await service.get_policy(db, "ws-no-row")
 
 
-def test_aggressive_preset_grants_file_write():
-    out = apply_preset(WorkspacePolicy(), "aggressive")
-    assert policy_auto_approves(out, capability_id="file.write") is True
+@pytest.mark.parametrize("preset,mode", [("follow_default", None), ("risk_based", "risk_based"), ("confirm_changes", "confirm_changes")])
+def test_install_mode_choices_preserve_explicit_rules(preset, mode):
+    base = WorkspacePolicy(approval=ApprovalPolicyOverride(mode="automatic", rules=[{
+        "id": "review", "effect": "ask", "selector": {"kind": "action", "action_key": "workspace.file.modify"},
+    }]))
+    out = apply_preset(base, preset)
+    assert policy_override(out).mode == mode
+    assert policy_override(out).rules == policy_override(base).rules
+    assert policy_override(base).mode == "automatic"
 
 
-def test_safe_preset_does_not_grant_file_write():
-    base = WorkspacePolicy(auto_approve_capabilities=["file.write"])
-    out = apply_preset(base, "safe")
-    assert policy_auto_approves(out, capability_id="file.write") is False
-
-
-# ── manor.composite default-grant (composite gateway: workspace doc/knowledge) ──
-
-
-def test_default_policy_auto_approves_manor_composite():
-    from packages.core.governance.policy import DEFAULT_POLICY, policy_auto_approves
-
-    assert policy_auto_approves(DEFAULT_POLICY, capability_id="manor.composite") is True
-
-
-def test_standard_preset_grants_manor_composite():
-    from packages.core.governance.policy import WorkspacePolicy, policy_auto_approves
-    from packages.core.governance.presets import apply_preset
-
-    out = apply_preset(WorkspacePolicy(), "standard")
-    assert policy_auto_approves(out, capability_id="manor.composite") is True
-    # file.write still granted too (both default caps)
-    assert policy_auto_approves(out, capability_id="file.write") is True
-
-
-def test_aggressive_preset_grants_manor_composite():
-    from packages.core.governance.policy import WorkspacePolicy, policy_auto_approves
-    from packages.core.governance.presets import apply_preset
-
-    out = apply_preset(WorkspacePolicy(), "aggressive")
-    assert policy_auto_approves(out, capability_id="manor.composite") is True
-
-
-def test_safe_preset_strips_manor_composite():
-    from packages.core.governance.policy import WorkspacePolicy, policy_auto_approves
-    from packages.core.governance.presets import apply_preset
-
-    base = WorkspacePolicy(auto_approve_capabilities=["file.write", "manor.composite"])
-    out = apply_preset(base, "safe")
-    assert policy_auto_approves(out, capability_id="manor.composite") is False
-    assert policy_auto_approves(out, capability_id="file.write") is False
+@pytest.mark.parametrize("preset", ["standard", "aggressive", "safe", "no_default_grants"])
+def test_retired_install_presets_require_current_client(preset):
+    with pytest.raises(KeyError, match="refresh the client"):
+        apply_preset(WorkspacePolicy(), preset)

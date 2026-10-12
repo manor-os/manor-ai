@@ -25,6 +25,27 @@ def test_md_ignores_non_https_image():
     assert "<img" not in out
 
 
+def test_unavailable_protected_image_keeps_authenticated_fallback(monkeypatch):
+    monkeypatch.setenv("APP_URL", "https://app.example.test")
+    media_id = "01K4A1B2C3D4E5F6G7H8J9KMNP"
+    source_url = f"/api/v1/platform/announcement-media/{media_id}/shot.png"
+
+    out = _render_announcement_body_html(f"![Screenshot]({source_url})")
+
+    assert source_url not in out
+    assert "https://app.example.test/announcements" in out
+    assert "view in Manor AI" in out
+
+
+def test_md_renders_linked_image_as_video_poster():
+    out = _render_announcement_body_html(
+        "[![Watch the demo](https://x.com/poster.png)](https://x.com/demo)"
+    )
+    assert '<a href="https://x.com/demo"><img' in out
+    assert 'src="https://x.com/poster.png"' in out
+    assert 'alt="Watch the demo"' in out
+
+
 def test_md_renders_table():
     md = "| Plan | Price |\n|---|---|\n| Pro | $20 |"
     out = _render_announcement_body_html(md)

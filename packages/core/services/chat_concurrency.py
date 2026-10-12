@@ -121,17 +121,39 @@ class ChatConcurrencyLease:
         heartbeat_task: asyncio.Task | None = None
         if self._redis_token and self._gate.config.heartbeat_interval_seconds > 0:
             heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        iterator = source.__aiter__()
+        next_task: asyncio.Future[str] | None = None
         try:
-            async for chunk in source:
+            while True:
+                next_task = asyncio.ensure_future(anext(iterator))
+                try:
+                    if heartbeat_task:
+                        done, _ = await asyncio.wait(
+                            (next_task, heartbeat_task),
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if heartbeat_task in done:
+                            raise ChatConcurrencyExceeded("Chat capacity lease was lost; please reconnect.")
+                    chunk = await next_task
+                except StopAsyncIteration:
+                    break
+                finally:
+                    if next_task:
+                        if not next_task.done():
+                            next_task.cancel()
+                        await asyncio.gather(next_task, return_exceptions=True)
+                    next_task = None
                 yield chunk
         finally:
             if heartbeat_task:
                 heartbeat_task.cancel()
-                try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
-            await self.release()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            try:
+                close = getattr(iterator, "aclose", None)
+                if close:
+                    await close()
+            finally:
+                await self.release()
 
     async def _heartbeat_loop(self) -> None:
         interval = max(0.001, min(

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, resolveDisplayMediaUrl } from "../lib/api";
 import type { ChatMessage } from "../lib/chatStream";
-import { t } from "../lib/i18n";
+import { getLocale, t } from "../lib/i18n";
 import type { Document } from "../lib/types";
 import {
   filterGeneratedFileRecordsAlreadyLinkedInMarkdown,
@@ -10,8 +10,11 @@ import {
   generatedFileOpenReference,
   isOpenableFileReference,
   markdownContentWithRenderedAssistantFinalText,
+  normalizeFileRef,
 } from "../lib/fileReferences";
 import InlineFileReferenceCard from "./InlineFileReferenceCard";
+import GeneratedResultFiles from "./GeneratedResultFiles";
+import { partitionGeneratedResultFiles, prioritizeGeneratedResultFiles } from "../lib/resultFiles";
 import {
   displayContentForAssistantMessage,
   isRetryableAssistantMessage,
@@ -39,6 +42,8 @@ export type ChatMessageDisplayReference = {
   previewUrl?: string;
   openUrl?: string;
   fsPath?: string;
+  isOutput?: boolean;
+  file?: File;
 };
 
 export type ParsedUserMessageDisplay = {
@@ -48,6 +53,8 @@ export type ParsedUserMessageDisplay = {
 };
 
 export type ChatMessageDisplayProjectionOptions = {
+  /** Override visible source text while retaining the original message identity. */
+  content?: string;
   renderedContent?: unknown;
   streaming?: boolean;
 };
@@ -251,7 +258,6 @@ function pushReference(
     ? `${name}:${ref.previewUrl.length}:${ref.previewUrl.slice(-32)}`
     : "";
   const key = ref.document_id || openReference || ref.url || previewKey || name;
-  const normalized = key.toLowerCase();
   const candidate: ChatMessageDisplayReference = {
     key,
     name,
@@ -263,9 +269,10 @@ function pushReference(
     previewUrl: ref.previewUrl,
     openUrl: ref.openUrl,
     fsPath: ref.fsPath,
+    file: ref.file,
   };
   if (
-    references.some((item) => item.key.toLowerCase() === normalized)
+    references.some((item) => item.key === key)
     || filterGeneratedFileRecordsAlreadyRepresented([candidate], references).length === 0
   ) return;
   references.push(candidate);
@@ -321,27 +328,19 @@ export function chatMessageReferencesFromAttachments(
   for (const value of attachments) {
     if (!value || typeof value !== "object" || Array.isArray(value)) continue;
     const attachment = value as Record<string, unknown>;
+    const ref = normalizeFileRef(attachment);
     pushReference(references, {
-      name: String(attachment.name || attachment.filename || attachment.title || ""),
-      document_id: attachment.document_id == null
-        ? undefined
-        : String(attachment.document_id),
-      fileType: attachment.fileType == null
-        ? String(attachment.file_type || attachment.type || "") || undefined
-        : String(attachment.fileType),
-      mimeType: attachment.mimeType == null
-        ? String(attachment.mime_type || "") || undefined
-        : String(attachment.mimeType),
-      url: String(attachment.url || attachment.public_url || "") || undefined,
-      previewUrl: attachment.previewUrl == null
-        ? String(attachment.preview_url || attachment.file_url || attachment.document_url || "") || undefined
-        : String(attachment.previewUrl),
-      openUrl: attachment.openUrl == null
-        ? String(attachment.open_url || attachment.viewer_url || "") || undefined
-        : String(attachment.openUrl),
-      fsPath: attachment.fsPath == null
-        ? String(attachment.fs_path || attachment.path || "") || undefined
-        : String(attachment.fsPath),
+      name: ref.name,
+      document_id: ref.document_id,
+      fileType: ref.file_type || String(attachment.type || "") || undefined,
+      mimeType: ref.mime,
+      // These are file addresses, not thumbnails. Keep their identity even
+      // when a Document ID or an independent preview image is also present.
+      url: ref.url,
+      previewUrl: ref.preview_url,
+      openUrl: ref.open_url,
+      fsPath: ref.fs_path,
+      file: typeof File !== "undefined" && attachment.file instanceof File ? attachment.file : undefined,
     });
   }
   return references;
@@ -402,7 +401,47 @@ export async function resolveChatMessageReferenceDocument(
   }
 }
 
+const messageDisplayCache = new WeakMap<ChatMessage, {
+  source: ChatMessage;
+  locale: string;
+  variants: Array<{
+    content: string | undefined;
+    renderedContent: unknown;
+    streaming: boolean;
+    display: ParsedUserMessageDisplay;
+  }>;
+}>();
+
 export function parseUserMessageDisplay(
+  msg: ChatMessage,
+  options: ChatMessageDisplayProjectionOptions = {},
+): ParsedUserMessageDisplay {
+  const locale = getLocale();
+  let cached = messageDisplayCache.get(msg);
+  // Stream/history writers replace changed nested values. Also compare top-level
+  // fields so an updated content/status on the same envelope never reuses old UI.
+  if (!cached || cached.locale !== locale
+    || Object.keys(msg).length !== Object.keys(cached.source).length
+    || Object.entries(msg).some(([key, value]) => cached!.source[key as keyof ChatMessage] !== value)) {
+    cached = { source: { ...msg }, locale, variants: [] };
+    messageDisplayCache.set(msg, cached);
+  }
+  const streaming = Boolean(options.streaming);
+  const hit = cached.variants.find((entry) => entry.content === options.content
+    && entry.renderedContent === options.renderedContent && entry.streaming === streaming);
+  if (hit) return hit.display;
+  const display = computeUserMessageDisplay(
+    options.content === undefined ? msg : { ...msg, content: options.content },
+    options,
+  );
+  // A row can have both a visible bubble and an artifact/reference projection.
+  // Keep that small working set; weak keys release history when it is discarded.
+  if (cached.variants.length >= 3) cached.variants.shift();
+  cached.variants.push({ content: options.content, renderedContent: options.renderedContent, streaming, display });
+  return display;
+}
+
+function computeUserMessageDisplay(
   msg: ChatMessage,
   options: ChatMessageDisplayProjectionOptions = {},
 ): ParsedUserMessageDisplay {
@@ -411,7 +450,6 @@ export function parseUserMessageDisplay(
   const keptLines: string[] = [];
   const chips: ChatMessageDisplayChip[] = [];
   const references: ChatMessageDisplayReference[] = [];
-  let referenceCount = 0;
   let attachmentLineCount = 0;
   let parsedPayload: Record<string, unknown> = safeParsePayload(msg.chatModePayload);
 
@@ -483,7 +521,6 @@ export function parseUserMessageDisplay(
         url: referenceLineMatch[3],
         kind: referenceLineMatch[1].toLowerCase() as ChatMessageDisplayReference["kind"],
       });
-      referenceCount += 1;
       continue;
     }
 
@@ -535,15 +572,6 @@ export function parseUserMessageDisplay(
     references,
   );
 
-  const visibleReferenceCount = visibleReferences.length || referenceCount;
-  if (visibleReferenceCount > 0) {
-    pushUnique(chips, {
-      key: "references",
-      kind: "reference",
-      label: t("component.chat_message.refs_count", { count: visibleReferenceCount }),
-      title: t("component.chat_message.references"),
-    });
-  }
   if (attachmentLineCount > 0 && !(msg.attachments || []).length) {
     pushUnique(chips, {
       key: "attachments",
@@ -557,7 +585,9 @@ export function parseUserMessageDisplay(
   return {
     cleanContent,
     chips,
-    references: visibleReferences,
+    references: msg.role === "assistant"
+      ? prioritizeGeneratedResultFiles(visibleReferences).map((ref) => ({ ...ref, isOutput: true }))
+      : visibleReferences,
   };
 }
 
@@ -669,6 +699,14 @@ export function ChatMessageReferenceStrip({
   returnTo?: string;
 }) {
   if (!references.length) return null;
+  if (inlineFileCards && references.some((ref) => ref.isOutput)) {
+    const files = references.slice(0, CHAT_MESSAGE_REFERENCE_CARD_LIMIT).flatMap((ref) => {
+      const reference = generatedFileOpenReference({ ...ref, open_url: ref.openUrl, fs_path: ref.fsPath })
+        || [ref.url, ref.previewUrl].find(isOpenableFileReference) || "";
+      return reference ? [{ ...ref, reference }] : [];
+    });
+    if (partitionGeneratedResultFiles(files).primary.length) return <GeneratedResultFiles returnTo={returnTo} files={files} />;
+  }
   return (
     <div
       className={`chat-message-reference-strip ${

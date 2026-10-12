@@ -1,3 +1,4 @@
+import { invalidateCatalogQueries } from "../../lib/catalogInvalidation";
 import React, { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import Modal from "../../components/ui/Modal";
@@ -31,7 +32,7 @@ export function CredentialModal({ skill, open, onClose }: CredentialModalProps) 
     mutationFn: ({ skillId, vals }: { skillId: string; vals: Record<string, string> }) =>
       api.skills.saveCredentials(skillId, vals),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      invalidateCatalogQueries(queryClient, "skills");
       toast.success(t("page.credential_modal.credentials_saved"));
       onClose();
     },

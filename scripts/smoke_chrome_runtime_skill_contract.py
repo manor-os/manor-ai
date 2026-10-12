@@ -53,7 +53,15 @@ def _assert_chrome_reference_bundle(skill_path: pathlib.Path) -> dict[str, int]:
         "interactions": ["Required Interaction Recipe", "resolve_target", "expect", "fallbackReason"],
         "workflows": ["Composer And Publishing Workflow", "Media Upload Workflow", "Search And Result Workflows"],
         "confirmations": ["always_action_time", "preapproval_allowed", "handoff_required", "no_confirmation"],
-        "file_uploads": ["upload_candidates", "upload_targets", "shadow DOM"],
+        "file_uploads": [
+            "upload_candidates",
+            "upload_targets",
+            "shadow DOM",
+            "Not allowed",
+            "action_executed=true",
+            "chrome://extensions",
+            "Allow access to file URLs",
+        ],
         "screenshots": ["mcp__chrome__screenshot", "visual confirmation", "read_page first"],
         "troubleshooting": ["extension reload", "native host", "stale", "mcp__chrome__status"],
     }
@@ -62,6 +70,17 @@ def _assert_chrome_reference_bundle(skill_path: pathlib.Path) -> dict[str, int]:
         for needle in needles:
             if needle not in text:
                 raise AssertionError(f"Chrome reference {label} missing phrase: {needle!r}")
+    skill_text = skill_path.read_text(encoding="utf-8")
+    for phrase in (
+        "Not allowed",
+        "action_executed=true",
+        "chrome://extensions",
+        "Allow access to file URLs",
+    ):
+        if phrase not in skill_text:
+            raise AssertionError(
+                f"Chrome skill missing local upload permission guidance: {phrase!r}"
+            )
     return sizes
 
 
@@ -95,9 +114,9 @@ def _assert_semantic_strategy_contract(skill_path: pathlib.Path, config: dict) -
     prompt_source = (ROOT / "packages/core/ai/runtime/prompt_guidance.py").read_text(encoding="utf-8")
     if "should read the runtime-contract documentation before acting" in prompt_source:
         raise AssertionError("Chrome prompt guidance still requires obsolete documentation bootstrap")
-    for phrase in ("diagnostic", "not a bootstrap"):
-        if phrase not in prompt_source:
-            raise AssertionError(f"Chrome prompt guidance missing bootstrap policy concept: {phrase}")
+    for phrase in ("diagnostic", "must not bootstrap"):
+        if phrase not in skill_text:
+            raise AssertionError(f"Chrome skill missing bootstrap policy concept: {phrase}")
 
 
 

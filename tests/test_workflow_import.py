@@ -116,7 +116,9 @@ def test_dify_maps_node_types():
     result = import_workflow(DIFY_DSL)
     by_id = {n.id: n for n in result.graph.nodes}
     assert by_id["start1"].type == "trigger"
-    assert by_id["kr1"].type == "rag"
+    # Knowledge retrieval is hidden while indexing is paused: imported as a
+    # placeholder that keeps the original node.
+    assert by_id["kr1"].type == "unsupported"
     assert by_id["llm1"].type == "llm"
     assert by_id["if1"].type == "condition"
     assert by_id["end1"].type == "end"
@@ -136,7 +138,7 @@ def test_dify_unknown_node_becomes_unsupported():
     assert weird.type == "unsupported"
     assert weird.unmapped
     assert weird.meta["original_type"] == "some-future-node"
-    assert result.report.unmapped_count == 1
+    assert result.report.unmapped_count == 2  # weird1 + the hidden rag node
     assert 0.0 < result.report.coverage < 1.0
 
 
@@ -178,7 +180,7 @@ def test_n8n_broad_coverage_mapping():
     assert by_id["Bright"] == "connector"      # third-party package
     assert by_id["Agent"] == "agent"
     assert by_id["Model"] == "llm"             # langchain prefix
-    assert by_id["Vec"] == "rag"
+    assert by_id["Vec"] == "unsupported"   # rag is hidden
     assert by_id["Tool"] == "tool"
     assert by_id["PG"] == "connector"
     assert by_id["CRM"] == "connector"         # base integration
@@ -654,12 +656,12 @@ def test_dify_translates_http_config():
     assert http.config["body"] == '{"x": 1}'
 
 
-def test_dify_translates_rag_and_code():
+def test_dify_keeps_hidden_rag_as_placeholder_and_translates_code():
     result = import_workflow(DIFY_RICH)
     rag = next(n for n in result.graph.nodes if n.id == "kr1")
-    assert rag.type == "rag"
-    assert rag.config["query"] == "{{query}}"
-    assert rag.config["dataset_ids"] == ["ds_1"]
+    assert rag.type == "unsupported"
+    assert rag.meta["original_type"] == "knowledge-retrieval"
+    assert rag.meta["original_raw"]["data"]["type"] == "knowledge-retrieval"
     code = next(n for n in result.graph.nodes if n.id == "code1")
     assert code.config["language"] == "python3"
     assert "def main" in code.config["code"]

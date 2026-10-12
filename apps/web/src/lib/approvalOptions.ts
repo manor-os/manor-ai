@@ -5,7 +5,6 @@ export const APPROVAL_CHOICE_REJECT = "reject";
 
 export const DEFAULT_APPROVAL_OPTIONS = [
   APPROVAL_CHOICE_APPROVE,
-  APPROVAL_CHOICE_ALWAYS_APPROVE,
   APPROVAL_CHOICE_REJECT,
 ];
 
@@ -53,4 +52,11 @@ export function reviewApprovalOptions(options?: string[] | null): string[] {
     (opt) => String(opt || "").trim().toLowerCase() !== APPROVAL_CHOICE_ALWAYS_APPROVE,
   );
   return filtered.length ? filtered : [...REVIEW_APPROVAL_OPTIONS];
+}
+
+/** Stored cards may predate the scoped, versioned policy editor. */
+export function currentApprovalOptions(options?: string[] | null): string[] {
+  const chosen = options?.length ? options : DEFAULT_APPROVAL_OPTIONS;
+  const filtered = chosen.filter((value) => String(value || "").trim().toLowerCase() !== APPROVAL_CHOICE_ALWAYS_APPROVE);
+  return filtered.length ? filtered : [...DEFAULT_APPROVAL_OPTIONS];
 }

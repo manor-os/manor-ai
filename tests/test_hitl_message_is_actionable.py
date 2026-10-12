@@ -134,6 +134,20 @@ def test_failed_steps_are_reported_with_their_error():
     assert "render finished video" in message
 
 
+def test_missing_artifact_does_not_hide_the_failure_that_prevented_creation():
+    failed = SimpleNamespace(
+        step_key="create_diagnostic_packet", step_status="failed", result=None,
+        error={"message": "search_tools was blocked by permission.agent_tool_binding"},
+    )
+    message = _hitl_request_message(
+        _task(), [failed], structured_issue=None,
+        artifact_issue="missing deliverable", failed_steps=[failed],
+    )
+    assert "permission.agent_tool_binding" in message
+    assert "Missing:" in message
+    assert message.index("permission.agent_tool_binding") < message.index("Missing:")
+
+
 def test_unverified_completion_says_so_plainly():
     message = _hitl_request_message(
         _task(), [_step("do_it", summary="did the thing", status="succeeded")],

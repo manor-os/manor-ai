@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any
 
-from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs, runtime_tool_call_context_is_external_customer
 from packages.core.ai.runtime.ledger_access import (
     WorkspaceLedgerConfigurationError,
     runtime_workspace_ledger_config,
@@ -103,7 +103,7 @@ READ_RELATIONSHIP_LEDGER_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_relationship_ledger",
-        "description": "Read the validated current relationship projection and recent interaction events.",
+        "description": "Read the validated current relationship projection and recent interaction events. Explicitly linked company CRM subjects include current profile and contacts for authorized internal company users.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -216,6 +216,16 @@ async def _read_relationship_ledger(entity_id: str = "", **kwargs: Any) -> str:
             directory=str(config["directory"]),
             recent_limit=kwargs.get("recent_limit", 100),
         )
+        if context.user_id and not runtime_tool_call_context_is_external_customer(kwargs):
+            from packages.core.database import async_session
+            from packages.core.ai.runtime.crm_actions import crm_actor
+            from packages.core.services.crm_relationships import enrich_relationships
+            from packages.core.services.workspace_access import user_can_read_workspace_id
+            async with async_session() as db:
+                user = await crm_actor(db, entity_id=entity_id, user_id=context.user_id)
+                if not await user_can_read_workspace_id(db, workspace_id=context.workspace_id, entity_id=entity_id, user_id=user.id, role=user.role):
+                    raise RelationshipLedgerError("workspace_access_denied", "Workspace read access is required")
+                result = await enrich_relationships(db, user, context.workspace_id, result)
     except WorkspaceLedgerConfigurationError as exc:
         return _service_error(RelationshipLedgerError(exc.code, str(exc)))
     except RelationshipLedgerError as exc:

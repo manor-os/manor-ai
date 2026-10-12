@@ -197,6 +197,10 @@ def _render_previous_decisions(briefing: ReviewBriefingModel) -> list[str]:
                 f"- {decision.decision}: task={decision.task_id} "
                 f"review={decision.review_id} at={decision.decided_at}"
             )
+            if decision.task_title:
+                line += f' — title: {" ".join(decision.task_title.split())[:240]}'
+            if decision.reason_code:
+                line += f" — reason_code: {decision.reason_code[:64]}"
             if decision.reason:
                 line += f" — reason: {decision.reason[:300]}"
             lines.append(line)

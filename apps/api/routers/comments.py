@@ -13,7 +13,7 @@ from packages.core.database import get_db
 from packages.core.models.comment import Comment
 from packages.core.models.permission import Capability, ResourceType
 from packages.core.models.user import User
-from packages.core.permissions import user_is_effective_entity_admin
+from packages.core.permissions import Permission, effective_user_has_permission
 from packages.core.services.document_access import (
     effective_document_capabilities_for_user,
     get_visible_document,
@@ -295,7 +295,7 @@ async def _user_is_document_manager(
     user: User,
     doc,
 ) -> bool:
-    if await user_is_effective_entity_admin(db, user):
+    if await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
         return True
     if getattr(doc, "owner_id", None) == user.id:
         return True

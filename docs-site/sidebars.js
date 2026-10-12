@@ -14,6 +14,7 @@ const sidebars = {
         "concepts/goal-driven-ai-workspace",
         "concepts/workspaces-knowledge",
         "concepts/agents",
+        "concepts/group-chat",
         "concepts/tasks",
         "concepts/goals",
         "concepts/workflows",

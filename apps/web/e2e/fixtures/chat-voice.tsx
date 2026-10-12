@@ -10,7 +10,7 @@ import { setLocale } from "../../src/lib/i18n";
 import "../../src/index.css";
 
 const params = new URLSearchParams(location.search);
-setLocale(params.get("locale") === "zh" ? "zh" : "en");
+await setLocale(params.get("locale") === "zh" ? "zh" : "en");
 const isPublic = params.get("surface") === "public";
 if (isPublic) localStorage.setItem("manor_public_chat_session:voice-demo", "voice-session");
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

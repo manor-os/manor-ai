@@ -81,6 +81,27 @@ def test_visibility_timeout_outranks_the_celery_limits_and_the_step_ceiling():
     )
 
 
+def test_task_agent_loop_limits_sit_under_visibility_and_above_its_slice():
+    """visibility > hard > soft > the agent loop's own time slice.
+
+    The loop yields at a round boundary once its slice is spent and re-stages
+    its own wake. If the slice reached the soft limit, Celery would interrupt
+    a round instead; if the hard limit reached visibility, the broker would
+    hand the same wake to a second worker.
+    """
+    from packages.core.tasks.runtime_tasks import run_task_agent_loop_task
+    from packages.core.workers.task_agent_loop import TASK_AGENT_LOOP_SLICE_SECONDS
+
+    assert queue_for_task("runtime.run_task_agent_loop") is CeleryQueue.HEAVY
+    assert (
+        CELERY_BROKER_VISIBILITY_TIMEOUT_SECONDS
+        > run_task_agent_loop_task.time_limit
+        > run_task_agent_loop_task.soft_time_limit
+        > TASK_AGENT_LOOP_SLICE_SECONDS
+    )
+    assert run_task_agent_loop_task.max_retries == 0
+
+
 @pytest.mark.asyncio
 async def test_stale_external_workers_become_offline_without_touching_live_workers(
     db_session,
@@ -467,14 +488,15 @@ async def test_fresh_mcp_write_effect_reenters_dispatcher_approval_gate(
 
 
 @pytest.mark.asyncio
-async def test_a_claim_whose_heartbeat_lapsed_is_reclaimable_and_runs_once(
-    db_session, monkeypatch,
+async def test_a_claim_whose_heartbeat_lapsed_requires_lease_expiry_first(
+    db_session,
 ):
     """Worker lost mid-flight: the lease outlives the process that held it.
 
-    The heartbeat thread dies with the process but the row stays ``active``
-    until its TTL, so the redelivery must be able to take over — and must then
-    run exactly once, not race the ghost.
+    A redelivery must not steal the same active lease: the dead process may
+    have crossed external I/O after recording an intent. The expiry sweeper is
+    the only component allowed to close that attempt and decide whether clean
+    work can retry or an observed effect needs reconciliation.
     """
     seeded = await _seed_lease(db_session, params={"max_runtime_seconds": 30})
     dead_claim = generate_ulid()
@@ -500,24 +522,31 @@ async def test_a_claim_whose_heartbeat_lapsed_is_reclaimable_and_runs_once(
         "reason": CLAIM_DENIED_HELD,
     }
 
-    # Heartbeat lapses past the lease TTL → reclaimable.
+    # Heartbeat lapses past the lease TTL, but same-lease takeover remains
+    # forbidden until the expiry state machine has inspected its evidence.
     await _age_heartbeat(db_session, seeded["lease_id"], seconds=60)
-
-    runs: list[str] = []
-
-    async def _body(snapshot):
-        runs.append(snapshot["lease_id"])
-        return {"result": {"text": "recovered"}}
-
-    monkeypatch.setattr(internal, "_execute_by_kind", _body)
     outcome = await internal.execute_lease_inproc(seeded["lease_id"])
 
-    assert outcome["outcome"] == "completed"
-    assert runs == [seeded["lease_id"]]
+    assert outcome == {
+        "lease_id": seeded["lease_id"],
+        "skipped": True,
+        "reason": CLAIM_DENIED_HELD,
+    }
+
+    from packages.core.dispatcher.service import Dispatcher
+
+    expired_plan_ids: set[str] = set()
+    assert await Dispatcher().expire_leases(
+        db_session,
+        plan_ids=expired_plan_ids,
+    ) >= 1
+    assert seeded["plan_id"] in expired_plan_ids
+    await db_session.commit()
 
     step, lease = await _reload(db_session, seeded)
-    assert step.step_status == "done"
-    assert lease.execution_claim_id is None
+    assert step.step_status == "pending"
+    assert lease.status == "expired"
+    assert lease.execution_claim_id == dead_claim
 
 
 @pytest.mark.asyncio
@@ -666,13 +695,8 @@ async def test_claim_is_refused_once_the_lease_is_no_longer_active(db_session):
 
 
 @pytest.mark.asyncio
-async def test_release_only_clears_a_claim_we_still_hold(db_session):
-    """A straggler must not wipe the reclaiming execution's claim.
-
-    Sequence: A claims → A's heartbeat lapses → B reclaims → A finally unwinds
-    and releases. If A's release were unconditional it would hand the row back
-    to the world while B is still executing.
-    """
+async def test_lapsed_claim_cannot_be_stolen_and_only_holder_can_release(db_session):
+    """A second delivery cannot take over the same active lease."""
     seeded = await _seed_lease(db_session)
     straggler, reclaimer = generate_ulid(), generate_ulid()
 
@@ -682,21 +706,23 @@ async def test_release_only_clears_a_claim_we_still_hold(db_session):
     await db_session.commit()
 
     await _age_heartbeat(db_session, seeded["lease_id"], seconds=60)
-    assert await claim_lease_for_execution(
+    takeover = await claim_lease_for_execution(
         db_session, seeded["lease_id"], claim_id=reclaimer,
     )
     await db_session.commit()
+    assert not takeover
+    assert takeover.reason == CLAIM_DENIED_HELD
 
     assert not await release_execution_claim(
-        db_session, seeded["lease_id"], claim_id=straggler,
+        db_session, seeded["lease_id"], claim_id=reclaimer,
     )
     await db_session.commit()
 
     _step, lease = await _reload(db_session, seeded)
-    assert lease.execution_claim_id == reclaimer
+    assert lease.execution_claim_id == straggler
 
     assert await release_execution_claim(
-        db_session, seeded["lease_id"], claim_id=reclaimer,
+        db_session, seeded["lease_id"], claim_id=straggler,
     )
     await db_session.commit()
     _step, lease = await _reload(db_session, seeded)

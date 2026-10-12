@@ -1,0 +1,16 @@
+{
+  "name": "manor-remotion-sandbox-runtime",
+  "version": "4.0.506",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@remotion/captions": "4.0.506",
+    "@remotion/cli": "4.0.506",
+    "@remotion/media-utils": "4.0.506",
+    "@remotion/zod-types": "4.0.506",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "remotion": "4.0.506",
+    "zod": "4.4.3"
+  }
+}

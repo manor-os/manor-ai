@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
+from packages.core import config
+from packages.core.services import chat_upload_cleanup
 from packages.core.services.chat_upload_cleanup import (
     cleanup_chat_uploads_on_disk,
     local_upload_rel_path,
@@ -46,6 +50,54 @@ def test_cleanup_deletes_only_expired_hidden_chat_uploads(tmp_path):
     assert knowledge_file.exists()
     assert report.skipped_recent == 1
     assert report.skipped_active == 1
+
+
+@pytest.mark.asyncio
+async def test_scheduled_cleanup_protects_workspace_knowledge_uploads(
+    tmp_path,
+    monkeypatch,
+):
+    class Settings:
+        MANOR_CHAT_UPLOAD_CLEANUP_ENABLED = True
+        MANOR_FS_ENABLED = True
+        MANOR_CHAT_UPLOAD_RETENTION_DAYS = 30
+        MANOR_FS_ROOT = str(tmp_path)
+
+    monkeypatch.setattr(config, "get_settings", lambda: Settings())
+    monkeypatch.setattr(
+        chat_upload_cleanup,
+        "load_active_media_upload_refs",
+        lambda: _async_value({("entity_1", "uploads/chat/media.png")}),
+    )
+    monkeypatch.setattr(
+        chat_upload_cleanup,
+        "load_workspace_knowledge_upload_refs",
+        lambda: _async_value({("entity_1", "uploads/chat/release.wav")}),
+        raising=False,
+    )
+    captured = {}
+
+    def _cleanup(_root, *, retention_days, active_refs):
+        captured["retention_days"] = retention_days
+        captured["active_refs"] = set(active_refs)
+        return chat_upload_cleanup.ChatUploadCleanupReport()
+
+    monkeypatch.setattr(chat_upload_cleanup, "cleanup_chat_uploads_on_disk", _cleanup)
+
+    result = await chat_upload_cleanup.cleanup_expired_chat_uploads()
+
+    assert result["ok"] is True
+    assert captured == {
+        "retention_days": 30,
+        "active_refs": {
+            ("entity_1", "uploads/chat/media.png"),
+            ("entity_1", "uploads/chat/release.wav"),
+        },
+    }
+
+
+async def _async_value(value):
+    return value
 
 
 def test_media_param_upload_refs_extracts_only_local_chat_uploads():

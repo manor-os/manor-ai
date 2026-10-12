@@ -27,14 +27,16 @@ from packages.core.workers.registry import (
     register_external_worker,
     rotate_worker_secret,
     update_worker_status,
-    verify_worker_secret,
 )
 from packages.core.workers.protocol import (
     CURRENT_WORKER_PROTOCOL_VERSION,
+    LEASE_ATTEMPT_TOKEN_CAPABILITY,
     UnsupportedWorkerProtocol,
     WORKER_PROTOCOL_HEADER,
+    WorkerLeaseFencingVersion,
     WorkerProtocolVersion,
     require_current_worker_protocol,
+    supports_lease_attempt_token,
     worker_protocol_header_value,
 )
 
@@ -44,16 +46,18 @@ __all__ = [
     "ensure_internal_worker",
     "register_external_worker",
     "rotate_worker_secret",
-    "verify_worker_secret",
     "bind_subscription",
     "list_workers_for_subscription",
     "mark_stale_external_workers_offline",
     "get_worker",
     "update_worker_status",
     "CURRENT_WORKER_PROTOCOL_VERSION",
+    "LEASE_ATTEMPT_TOKEN_CAPABILITY",
     "UnsupportedWorkerProtocol",
     "WORKER_PROTOCOL_HEADER",
+    "WorkerLeaseFencingVersion",
     "WorkerProtocolVersion",
     "require_current_worker_protocol",
+    "supports_lease_attempt_token",
     "worker_protocol_header_value",
 ]

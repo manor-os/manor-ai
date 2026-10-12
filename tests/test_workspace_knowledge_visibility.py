@@ -1,10 +1,8 @@
-"""Regression: internal workspace knowledge search must honor Document.visibility.
+"""Regression: Workspace search follows explicit links and staff access.
 
-`workspace_search(category="knowledge")` → `_search_knowledge` listed every
-document in a workspace's Knowledge Nets (name + fs_path) with no per-user
-filter, so a member could see another member's PRIVATE document placed in a
-shared net. The internal path now filters by `user_can_read_document` when a
-user_id is present.
+A document placed in a Workspace Knowledge Net is explicitly shared with
+Workspace staff. An artifact origin tag alone does not share a private file;
+its name stays out of member search results.
 """
 
 from __future__ import annotations
@@ -52,10 +50,11 @@ async def _make_user(entity_id: str, name: str, role: str) -> str:
 
 
 @pytest.mark.asyncio
-async def test_workspace_knowledge_search_hides_private_docs_from_member():
+async def test_workspace_knowledge_search_shares_group_docs_with_staff():
     entity_id = generate_ulid()
     owner_id = await _make_user(entity_id, "wsk_owner", "owner")
     member_id = await _make_user(entity_id, "wsk_member", "member")
+    outsider_id = await _make_user(entity_id, "wsk_outsider", "member")
 
     async with db_module.async_session() as db:
         ws = Workspace(entity_id=entity_id, name="Ops")
@@ -63,10 +62,8 @@ async def test_workspace_knowledge_search_hides_private_docs_from_member():
         await db.flush()
         ws_id = ws.id
 
-        # Both owner and member are workspace members: this test exercises the
-        # per-document visibility filter, not the workspace-read gate (a
-        # non-member is blocked earlier and is covered by
-        # test_workspace_authz_holes).
+        # The document owner and viewer can both read explicitly shared group
+        # members. A same-entity user outside this Workspace cannot search it.
         from packages.core.models.workspace import WorkspaceStaff
         db.add(WorkspaceStaff(
             workspace_id=ws_id, staff_id=None, user_id=owner_id,
@@ -97,11 +94,106 @@ async def test_workspace_knowledge_search_hides_private_docs_from_member():
         out_owner = await workspace_search(
             db, ws_id, entity_id, category="knowledge", user_id=owner_id,
         )
+        out_outsider = await workspace_search(
+            db, ws_id, entity_id, category="knowledge", user_id=outsider_id,
+        )
 
-    # As MEMBER: private doc name must not appear; shared doc does.
-    assert "board-comp.md" not in out_member, f"private doc leaked to member:\n{out_member}"
-    assert "handbook.md" in out_member, out_member
-    assert "Ops Net** (1 docs)" in out_member, out_member
-    # Owner sees both.
+    assert "board-comp.md" in out_member and "handbook.md" in out_member, out_member
+    assert "Ops Net** (2 docs)" in out_member, out_member
     assert "board-comp.md" in out_owner and "handbook.md" in out_owner, out_owner
-    assert "Ops Net** (2 docs)" in out_owner, out_owner
+    assert out_outsider == "Workspace not found."
+
+
+@pytest.mark.asyncio
+async def test_workspace_artifact_search_resolves_document_id_within_workspace():
+    entity_id = generate_ulid()
+    owner_id = await _make_user(entity_id, "artifact_owner", "owner")
+
+    async with db_module.async_session() as db:
+        workspace = Workspace(entity_id=entity_id, name="Release A")
+        other_workspace = Workspace(entity_id=entity_id, name="Release B")
+        db.add_all([workspace, other_workspace])
+        await db.flush()
+        from packages.core.models.workspace import WorkspaceStaff
+        db.add(WorkspaceStaff(
+            workspace_id=workspace.id, user_id=owner_id,
+            role="owner", status="active",
+        ))
+        current = await create_document(
+            db, entity_id, name="current.md", fs_path="release-a/current.md",
+            metadata={"origin": {"workspace_id": workspace.id}},
+            visibility="entity", owner_id=owner_id,
+        )
+        foreign = await create_document(
+            db, entity_id, name="foreign.md", fs_path="release-b/foreign.md",
+            metadata={"origin": {"workspace_id": other_workspace.id}},
+            visibility="entity", owner_id=owner_id,
+        )
+        workspace_id, current_id, foreign_id = workspace.id, current.id, foreign.id
+        await db.commit()
+
+    async with db_module.async_session() as db:
+        found = await workspace_search(
+            db, workspace_id, entity_id, category="artifacts",
+            query=current_id, user_id=owner_id,
+        )
+        described = await workspace_search(
+            db, workspace_id, entity_id, category="artifacts",
+            query=f"Release State Document ID {current_id}", user_id=owner_id,
+        )
+        foreign_result = await workspace_search(
+            db, workspace_id, entity_id, category="artifacts",
+            query=f"Foreign Document ID {foreign_id}", user_id=owner_id,
+        )
+
+    assert f"document_id={current_id}" in found
+    assert "fs_path=release-a/current.md" in found
+    assert f"document_id={current_id}" in described
+    assert "foreign.md" not in foreign_result
+
+
+@pytest.mark.asyncio
+async def test_workspace_artifact_search_hides_private_document_from_member():
+    entity_id = generate_ulid()
+    owner_id = await _make_user(entity_id, "artifact_private_owner", "owner")
+    member_id = await _make_user(entity_id, "artifact_private_member", "member")
+
+    async with db_module.async_session() as db:
+        workspace = Workspace(entity_id=entity_id, name="Private Release")
+        db.add(workspace)
+        await db.flush()
+        from packages.core.models.workspace import WorkspaceStaff
+        db.add(WorkspaceStaff(
+            workspace_id=workspace.id, user_id=member_id,
+            role="viewer", status="active",
+        ))
+        private = await create_document(
+            db, entity_id, name="secret-master.wav", fs_path="release/secret-master.wav",
+            metadata={"origin": {"workspace_id": workspace.id}},
+            visibility="private", owner_id=owner_id,
+        )
+        shared = await create_document(
+            db, entity_id, name="shared-master.wav", fs_path="release/shared-master.wav",
+            metadata={"origin": {"workspace_id": workspace.id}},
+            visibility="entity", owner_id=owner_id,
+        )
+        workspace_id, private_id, shared_id = workspace.id, private.id, shared.id
+        await db.commit()
+
+    async with db_module.async_session() as db:
+        by_name = await workspace_search(
+            db, workspace_id, entity_id, category="artifacts",
+            query="master.wav", user_id=member_id,
+        )
+        by_private_id = await workspace_search(
+            db, workspace_id, entity_id, category="artifacts",
+            query=f"Private Document ID {private_id}", user_id=member_id,
+        )
+        by_shared_id = await workspace_search(
+            db, workspace_id, entity_id, category="artifacts",
+            query=shared_id, user_id=member_id,
+        )
+
+    assert "secret-master.wav" not in by_name
+    assert private_id not in by_private_id
+    assert f"document_id={shared_id}" in by_shared_id

@@ -60,6 +60,20 @@ class DefaultAuthorizationService(AuthorizationService):
                 "Workspace is outside the actor's entity or no longer exists.",
                 AuthorizationRule.WORKSPACE_SCOPE,
             )
+        if request.workspace_id:
+            from packages.core.services.workspace_integration_scope import (
+                integration_provider_for_tool,
+                load_disabled_workspace_providers,
+            )
+
+            provider = integration_provider_for_tool(request.tool_name)
+            if provider and provider in await load_disabled_workspace_providers(
+                db, workspace_id=request.workspace_id, entity_id=request.entity_id,
+            ):
+                return PermissionDecision.deny(
+                    "This integration is disabled for the current Workspace.",
+                    AuthorizationRule.WORKSPACE_INTEGRATION_DISABLED,
+                )
         strategy = self._runtime_factory.create(request)
         return await strategy.authorize(db, request)
 

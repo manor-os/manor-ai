@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { t } from "../../lib/i18n";
-import type { ChatMessage } from "../../lib/chatStream";
+import {
+  LLM_CONFIGURATION_ERROR_MESSAGE,
+  formatByokProviderErrorMessage,
+  formatFilePermissionErrorMessage,
+  type ChatMessage,
+} from "../../lib/chatStream";
 import { IconCheck, IconCopy, IconRefresh, IconThumbDown, IconThumbUp } from "../icons";
 import ChatActionButton from "./ChatActionButton";
 import { ReadAloudButton } from "./ChatVoiceControls";
@@ -112,29 +117,95 @@ export default function ChatMessageActions({
   );
 }
 
+function assistantContentLooksLikeFailure(text: string): boolean {
+  const normalized = text.trim().toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("request failed") ||
+    normalized.includes("couldn't generate a response") ||
+    normalized.includes("could not generate a response") ||
+    normalized.includes("before the model could respond") ||
+    normalized.startsWith("error:") ||
+    normalized.startsWith("request failed")
+  );
+}
+
+function assistantMessageHasSpecialFailureDisplay(
+  message: ChatMessage,
+  content: string,
+): boolean {
+  return (
+    message.meta?.error === "llm_configuration_missing"
+    || message.meta?.error === "byok_provider_error"
+    || content === LLM_CONFIGURATION_ERROR_MESSAGE
+    || content.endsWith(`\n\nError detail: ${LLM_CONFIGURATION_ERROR_MESSAGE}`)
+    || Boolean(formatByokProviderErrorMessage(content))
+    || Boolean(formatFilePermissionErrorMessage(content))
+  );
+}
+
+function recoverableAssistantAnswer(
+  message: ChatMessage,
+  visibleContent?: string,
+): string {
+  const content = (visibleContent || message.content || "").trim();
+  if (content && !assistantContentLooksLikeFailure(content)) return content;
+  const finalText = (message.assistant_blocks || [])
+    .filter((block) => block.type === "text" && block.phase === "final")
+    .map((block) => ("text" in block ? block.text.trim() : ""))
+    .filter(Boolean)
+    .join("\n\n")
+    .trim();
+  if (finalText && !assistantContentLooksLikeFailure(finalText)) return finalText;
+  return "";
+}
+
 export function isRetryableAssistantMessage(
   message: ChatMessage,
   visibleContent?: string,
 ): boolean {
   if (message.role !== "assistant") return false;
+  if (message.meta?.error === "final_response_validation_failed") return true;
+  const content = visibleContent || message.content || "";
+  if (
+    !assistantMessageHasSpecialFailureDisplay(message, content)
+    && recoverableAssistantAnswer(message, visibleContent)
+  ) {
+    return false;
+  }
   if (message.stream_error || message.stop_reason === "error") return true;
-  const text = (visibleContent || message.content || "").trim().toLowerCase();
-  return (
-    text.includes("request failed") ||
-    text.includes("couldn't generate a response") ||
-    text.includes("could not generate a response") ||
-    text.includes("before the model could respond") ||
-    text.startsWith("error:") ||
-    text.startsWith("request failed")
-  );
+  return assistantContentLooksLikeFailure(content);
 }
 
 export function displayContentForAssistantMessage(
   message: ChatMessage,
   visibleContent?: string,
 ): string {
+  const content = visibleContent || message.content || "";
+  if (message.role === "assistant" && (
+    message.meta?.error === "llm_configuration_missing"
+    || content === LLM_CONFIGURATION_ERROR_MESSAGE
+    || content.endsWith(`\n\nError detail: ${LLM_CONFIGURATION_ERROR_MESSAGE}`)
+  )) {
+    // This fixed public recovery instruction contains no provider diagnostic.
+    // Other failures retain the existing generic summary and redaction path.
+    return LLM_CONFIGURATION_ERROR_MESSAGE;
+  }
+  if (message.role === "assistant") {
+    const permissionContent = formatFilePermissionErrorMessage(content);
+    if (permissionContent) return permissionContent;
+    // The owner's own provider failed: say so, with the structured detail,
+    // instead of the generic "did not finish" summary.
+    const byokContent = formatByokProviderErrorMessage(content)
+      ?? (message.meta?.error === "byok_provider_error"
+        ? formatByokProviderErrorMessage("byok_provider_error")
+        : null);
+    if (byokContent) return byokContent;
+  }
+  const recovered = recoverableAssistantAnswer(message, visibleContent);
+  if (recovered) return recovered;
   if (!isRetryableAssistantMessage(message, visibleContent)) {
-    return visibleContent || message.content || "";
+    return content;
   }
   return t("component.chat_message_actions.request_failed_summary");
 }

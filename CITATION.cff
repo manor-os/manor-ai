@@ -5,7 +5,7 @@ abstract: "The source-available, self-hosted edition of Manor AI, connecting age
 type: software
 authors:
   - name: "Manor AI"
-version: 0.1.0
+version: 0.1.1
 repository-code: "https://github.com/manor-os/manor-ai"
 url: "https://manorai.xyz"
 keywords:

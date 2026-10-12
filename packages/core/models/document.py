@@ -42,8 +42,20 @@ class Document(Base, TimestampMixin):
     __tablename__ = "documents"
     __table_args__ = (
         Index("ix_documents_entity", "entity_id"),
+        Index("ix_documents_entity_owner", "entity_id", "owner_id"),
+        Index("ix_documents_browse_date", "entity_id", "is_trashed", "created_at", "id"),
+        Index("ix_documents_browse_folder_date", "entity_id", "folder_id", "is_trashed", "created_at", "id"),
         Index("ix_documents_name", "entity_id", "name"),
         Index("ix_documents_fs_path", "fs_path"),
+        Index(
+            "uq_documents_upload_idempotency",
+            "entity_id",
+            "owner_id",
+            "upload_idempotency_key",
+            unique=True,
+            postgresql_where=text("upload_idempotency_key IS NOT NULL"),
+            sqlite_where=text("upload_idempotency_key IS NOT NULL"),
+        ),
         Index(
             "uq_documents_entity_fs_path_active",
             "entity_id",
@@ -70,6 +82,10 @@ class Document(Base, TimestampMixin):
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, server_default="{}")
     created_by: Mapped[Optional[str]] = mapped_column(String(100))
     folder_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Stable browser-upload receipt. A retry with the same key and fingerprint
+    # returns this row instead of creating a second filesystem projection.
+    upload_idempotency_key: Mapped[Optional[str]] = mapped_column(String(128))
+    upload_request_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
 
     # Trash / soft-delete fields
     is_trashed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
@@ -77,7 +93,7 @@ class Document(Base, TimestampMixin):
     trashed_by: Mapped[Optional[str]] = mapped_column(String(100))
 
     # ── Permission-v1 fields (see docs/PERMISSIONS_DESIGN_ZH.md §13) ─────
-    visibility: Mapped[str] = mapped_column(String(20), nullable=False, server_default="entity")
+    visibility: Mapped[str] = mapped_column(String(20), nullable=False, server_default="private")
     # private | workspace | entity | public
     classification: Mapped[str] = mapped_column(String(20), nullable=False, server_default="internal")
     # public | internal | confidential | restricted
@@ -121,6 +137,7 @@ class DocumentFolder(Base, TimestampMixin):
     __tablename__ = "document_folders"
     __table_args__ = (
         Index("ix_document_folders_entity", "entity_id"),
+        Index("ix_document_folders_entity_owner", "entity_id", "owner_id"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -129,16 +146,17 @@ class DocumentFolder(Base, TimestampMixin):
     parent_id: Mapped[Optional[str]] = mapped_column(String(26))
 
     # ── Permission-v1 fields ─────────────────────────────────────────────
-    visibility: Mapped[str] = mapped_column(String(20), nullable=False, server_default="entity")
+    visibility: Mapped[str] = mapped_column(String(20), nullable=False, server_default="private")
     classification: Mapped[str] = mapped_column(String(20), nullable=False, server_default="internal")
     owner_id: Mapped[Optional[str]] = mapped_column(String(26))
     client_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
 
 
 Index(
-    "uq_document_folders_entity_parent_name",
+    "uq_document_folders_entity_parent_owner_name",
     DocumentFolder.entity_id,
     func.coalesce(DocumentFolder.parent_id, ""),
+    func.coalesce(DocumentFolder.owner_id, ""),
     DocumentFolder.name,
     unique=True,
 )

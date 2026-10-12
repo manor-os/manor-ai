@@ -52,6 +52,7 @@ async def test_verified_knowledge_evidence_matches_immutable_version(
         id="version-1",
         document_id="document-1",
         version_number=1,
+        workspace_id="workspace-1",
         fs_path=".versions/documents/document-1/v000001_receipt.pdf",
     )
     monkeypatch.setattr(

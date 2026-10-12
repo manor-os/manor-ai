@@ -169,6 +169,8 @@ def _build_metadata(entry: MemoryEntry) -> dict:
     for key in ("original_body_chars", "body_truncated_for_memory_store"):
         if hasattr(fm, key):
             metadata[key] = getattr(fm, key)
+    from packages.core.memory.policy import content_fingerprint
+    metadata["content_fingerprint"] = content_fingerprint(entry.body)
     body_chars = len((entry.body or "").strip())
     if body_chars > _SYNCED_WORKSPACE_MEMORY_CONTENT_MAX_CHARS:
         metadata.setdefault("original_body_chars", body_chars)

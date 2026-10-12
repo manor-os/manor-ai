@@ -1,0 +1,23 @@
+{
+  "id": "remotion-interactivity",
+  "name": "remotion-interactivity",
+  "display_name": "Remotion Interactivity",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Make compositions editable in Remotion Studio.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "interactivity",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["props", "zod schema", "input controls", "parameters", "customize video", "editable fields", "template variables"],
+    "examples": ["make remotion video editable with props", "add schema controls in studio", "expose text fields for remotion template", "parameterize composition inputs"]
+  }
+}

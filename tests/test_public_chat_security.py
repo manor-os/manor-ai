@@ -18,6 +18,7 @@ from packages.core.services.auth_service import create_access_token
 @pytest.fixture
 async def public_chat_case(monkeypatch):
     db = AsyncMock()
+    db.scalar.return_value = None  # No resident authorization row in this legacy channel fixture.
     user = User(
         id="customer", entity_id="customer-entity", role="external",
         status="active", token_version=2, display_name="Customer",
@@ -292,3 +293,20 @@ async def test_stream_bounds_client_turn_ids(public_chat_case):
     )
     assert response.status_code == 422
     assert not public_chat_case.runtime_calls
+
+
+async def test_stream_names_the_saved_visitor_message_for_the_transcript(public_chat_case, monkeypatch):
+    from packages.core.services.file_context import FileAttachments
+    from packages.core.services.runtime_file_context import RuntimeFileContextTurn
+
+    prepare = AsyncMock(return_value=RuntimeFileContextTurn(cleaned_message="Hello", attachments=FileAttachments()))
+    monkeypatch.setattr(public_chat, "prepare_runtime_file_context_turn", prepare)
+    monkeypatch.setattr(conversation_messages, "add_message", AsyncMock(return_value=SimpleNamespace(id="visitor-turn")))
+    response = await public_chat_case.client.post(
+        "/api/v1/public/chat/token/message/stream",
+        data={"session_id": "session", "message": "Hello"},
+    )
+    assert response.status_code == 200
+    # The run writes this turn itself; unnamed, it would also be synced in as a
+    # row no run wrote and the model would see the request twice.
+    assert public_chat_case.runtime_calls[0][1]["runtime_metadata"]["origin_user_message_id"] == "visitor-turn"

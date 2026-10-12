@@ -27,6 +27,7 @@ from packages.core.models.channel import (
     ChannelContact,
 )
 from packages.core.models.notification import (
+    Notification,
     NotificationDelivery,
 )
 from packages.core.services import notify as notify_module
@@ -280,12 +281,23 @@ def test_match_action_empty_or_no_match():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_scoped", [False, True])
 async def test_notify_with_actions_writes_delivery(
     client: AsyncClient,
     db_session: AsyncSession,
     fake_telegram: _RecordingAdapter,
+    workspace_scoped: bool,
 ):
     ctx = await _register(client, "actions_user")
+    workspace_id = None
+    if workspace_scoped:
+        response = await client.post(
+            "/api/v1/workspaces",
+            headers=ctx["headers"],
+            json={"name": "Actionable notification"},
+        )
+        assert response.status_code == 201, response.text
+        workspace_id = response.json()["id"]
     _cc, contact = await _link_telegram(
         db_session,
         entity_id=ctx["entity_id"],
@@ -297,18 +309,24 @@ async def test_notify_with_actions_writes_delivery(
         json={"default_channels": ["telegram"]},
     )
 
-    await notify_module.notify(
-        entity_id=ctx["entity_id"],
-        user_id=ctx["user_id"],
-        type="task_hitl_requested",
-        title="Approve external reply?",
-        body="Customer asked X. Draft: Y.",
-        actions=[
-            {"key": "approve", "label": "Approve"},
-            {"key": "reject", "label": "Reject"},
-        ],
-        callback_kind="test.hitl",
-        callback_payload={"task_id": "TASK-1"},
+    # The outbox's parent lock must allow the separate delivery transaction's
+    # foreign-key check. Bound this regression so a self-blocking lock fails.
+    await asyncio.wait_for(
+        notify_module.notify(
+            entity_id=ctx["entity_id"],
+            user_id=ctx["user_id"],
+            type="task_hitl_requested",
+            title="Approve external reply?",
+            body="Customer asked X. Draft: Y.",
+            actions=[
+                {"key": "approve", "label": "Approve"},
+                {"key": "reject", "label": "Reject"},
+            ],
+            callback_kind="test.hitl",
+            callback_payload={"task_id": "TASK-1"},
+            workspace_id=workspace_id,
+        ),
+        timeout=10,
     )
 
     # Delivery row should exist, status=sent (adapter succeeded)
@@ -341,6 +359,83 @@ async def test_notify_with_actions_writes_delivery(
     assert "Reply with:" in rendered
     assert "1. Approve" in rendered
     assert "2. Reject" in rendered
+
+
+@pytest.mark.asyncio
+async def test_actionable_delivery_allows_receipt_while_cancellation_waits(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+    monkeypatch,
+):
+    from packages.core import database as db_module
+    from packages.core.services.notification_scheduler import cancel_scheduled
+
+    ctx = await _register(client, "actions_cancel_user")
+    await _link_telegram(
+        db_session, entity_id=ctx["entity_id"], user_id=ctx["user_id"],
+    )
+    await client.put(
+        "/api/v1/notifications/preferences",
+        headers=ctx["headers"],
+        json={"default_channels": ["telegram"]},
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    cancel_started = asyncio.Event()
+    original_send = fake_telegram.send_text
+
+    async def blocked_send(*args, **kwargs):
+        entered.set()
+        await asyncio.wait_for(release.wait(), timeout=10)
+        return await original_send(*args, **kwargs)
+
+    monkeypatch.setattr(fake_telegram, "send_text", blocked_send)
+    sending = asyncio.create_task(notify_module.notify(
+        entity_id=ctx["entity_id"], user_id=ctx["user_id"],
+        type="task_hitl_requested", title="Approve before cancellation?",
+        actions=[{"key": "approve", "label": "Approve"}],
+        callback_kind="test.hitl", callback_payload={},
+    ))
+    cancelling = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        notification = (await db_session.execute(
+            select(Notification).where(Notification.user_id == ctx["user_id"])
+        )).scalar_one()
+
+        async def cancel_in_separate_session():
+            async with db_module.async_session() as db:
+                cancel_started.set()
+                result = await cancel_scheduled(db, notification_id=notification.id)
+                await db.commit()
+                return result
+
+        cancelling = asyncio.create_task(cancel_in_separate_session())
+        await asyncio.wait_for(cancel_started.wait(), timeout=10)
+        done, _ = await asyncio.wait({cancelling}, timeout=0.1)
+        assert not done, "cancellation must wait for the active delivery gate"
+        release.set()
+        _, cancelled = await asyncio.wait_for(
+            asyncio.gather(sending, cancelling), timeout=10,
+        )
+        # The parent became visible before external send; cancellation cannot
+        # retract it, and its queued parent lock must not block the receipt FK.
+        assert cancelled is False
+        delivery = (await db_session.execute(
+            select(NotificationDelivery).where(
+                NotificationDelivery.notification_id == notification.id,
+            )
+        )).scalar_one()
+        assert delivery.status == "sent"
+        assert len(fake_telegram.sent) == 1
+    finally:
+        release.set()
+        tasks = [task for task in (sending, cancelling) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ── Reply on the channel fires the callback ────────────────────────────────

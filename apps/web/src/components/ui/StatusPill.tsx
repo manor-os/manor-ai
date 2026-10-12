@@ -7,7 +7,7 @@
  */
 import {
   IconPlus, IconClock, IconCalendar, IconPlay, IconHeadphones, IconPause,
-  IconWarning, IconCheckCircle, IconClose, IconError, IconCircleDot,
+  IconWarning, IconCheckCircle, IconClose, IconError, IconCircleDot, IconBell,
 } from "../icons";
 import { t } from "../../lib/i18n";
 
@@ -23,6 +23,12 @@ const STATUS_CONFIG: Record<string, StatusEntry> = {
   proposed:             { labelKey: "component.status.proposed",    color: "#6f4ba8", bg: "#ece9f5", Icon: IconCircleDot },
   pending:              { labelKey: "component.status.pending",     color: "#b27c34", bg: "#f3ecd6", Icon: IconClock },
   scheduled:            { labelKey: "component.status.scheduled",   color: "#6f4ba8", bg: "#ece9f5", Icon: IconCalendar },
+  running:              { labelKey: "component.status.running",     color: "#426c87", bg: "#e8eff4", Icon: IconPlay },
+  active:               { labelKey: "component.status.active",      color: "#437f6b", bg: "#dceae3", Icon: IconCircleDot },
+  muted:                { labelKey: "component.status.muted",       color: "#b27c34", bg: "#f3ecd6", Icon: IconBell },
+  paused:               { labelKey: "component.status.paused",      color: "#78716c", bg: "#f5f5f4", Icon: IconPause },
+  needs_setup:          { labelKey: "component.status.needs_setup", color: "#b27c34", bg: "#f3ecd6", Icon: IconWarning },
+  error:                { labelKey: "component.status.error",       color: "#c14a44", bg: "#f1dddb", Icon: IconError },
   in_progress:          { labelKey: "component.status.in_progress", color: "#426c87", bg: "#e8eff4", Icon: IconPlay },
   waiting_on_customer:  { labelKey: "component.status.waiting",     color: "#b66a3c", bg: "#ffedd5", Icon: IconHeadphones },
   on_hold:              { labelKey: "component.status.on_hold",     color: "#6f4ba8", bg: "#ece9f5", Icon: IconPause },
@@ -41,7 +47,7 @@ interface StatusPillProps {
 }
 
 // Statuses that warrant colour on the label itself — they need attention.
-const ALERT_STATUSES = new Set(["blocked", "failed"]);
+const ALERT_STATUSES = new Set(["blocked", "failed", "needs_setup", "error"]);
 
 export default function StatusPill({ status, label, color, bg, size = "md" }: StatusPillProps) {
   const cfg = status ? STATUS_CONFIG[status] : null;

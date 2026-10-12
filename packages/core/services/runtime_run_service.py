@@ -8,6 +8,11 @@ import logging
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime.control import (
+    HUMAN_INPUT_ANSWERED_REASON,
+    HUMAN_INPUT_SUSPENSION_REASON,
+    is_human_input_suspension_control,
+)
 from packages.core.constants.agents import is_master_agent
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_run import (
@@ -18,9 +23,17 @@ from packages.core.models.runtime_run import (
     SandboxReservationStatus,
     SandboxRunner,
 )
+from packages.core.services.runtime_run_terminal import (
+    finish_runtime_run_out_of_loop,
+    settle_terminal_runtime_run_message,
+    stage_runtime_run_terminal_notice,
+)
 from packages.core.services.reusable_resource_locks import (
+    lock_reusable_resource_lifecycle,
     lock_reusable_resource_references,
 )
+from packages.core.services.workspace_access import lock_workspace_access_boundary
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 
 class RuntimeRunNotFoundError(LookupError):
@@ -28,6 +41,9 @@ class RuntimeRunNotFoundError(LookupError):
 
 
 logger = logging.getLogger(__name__)
+
+
+MAX_RUNTIME_RUN_RECOVERY_ATTEMPTS = 3
 
 
 async def create_runtime_run(
@@ -44,6 +60,17 @@ async def create_runtime_run(
     root_run_id: str | None = None,
 ) -> RuntimeRun:
     """Stage a new durable run; the active-root index arbitrates races."""
+
+    if workspace_id:
+        # Master-Agent Chat has no reusable Agent definition to lock. It still
+        # needs the same admission boundary as Blueprint apply/undo, before a
+        # queued run is staged and configuration can be consumed by its worker.
+        await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+        workspace = await lock_workspace_access_boundary(
+            db, workspace_id=workspace_id, entity_id=entity_id,
+        )
+        if workspace is None or workspace.deleted_at is not None or not workspace_allows_manual_work(workspace):
+            raise RuntimeRunNotFoundError("Workspace is no longer available for Chat execution")
 
     if agent_id and not is_master_agent(agent_id):
         await lock_reusable_resource_references(
@@ -103,15 +130,27 @@ async def claim_runtime_run_execution(
     if run is None or run.status in RuntimeRunStatus.terminal():
         return None
     if run.status in {RuntimeRunStatus.CANCEL_REQUESTED.value, RuntimeRunStatus.CANCELLING.value}:
-        run.status = RuntimeRunStatus.CANCELLED.value
-        run.completed_at = current_time
-        run.lease_owner = None
-        run.lease_expires_at = None
-        run.version += 1
+        # No loop will run for it: the cancel lands before any worker owns it.
+        await finish_runtime_run_out_of_loop(
+            db,
+            run,
+            status=RuntimeRunStatus.CANCELLED,
+            reason=run.status_reason or "user_cancelled",
+            now=current_time,
+        )
         return None
     if run.lease_expires_at is not None and run.lease_expires_at > current_time:
         return None
-    if run.status == RuntimeRunStatus.WAITING_RESOURCE.value:
+    if run.status == RuntimeRunStatus.WAITING_RESOURCE.value and run.human_input_request_id:
+        # Parked on a question: resumable only once the answer has been
+        # written into the checkpoint as the pending call's result.
+        if not run.checkpoint or run.status_reason not in {HUMAN_INPUT_ANSWERED_REASON, "capability_approval_resolved"}:
+            return None
+        stored = dict(run.checkpoint).get("pending_tool_result")
+        if run.status_reason != "capability_approval_resolved" and (not isinstance(stored, dict) or not stored.get("id")):
+            return None
+        run.status = RuntimeRunStatus.RESUMING.value
+    elif run.status == RuntimeRunStatus.WAITING_RESOURCE.value:
         if not run.checkpoint or not run.reservation_id:
             return None
         reservation = await db.get(SandboxReservation, run.reservation_id)
@@ -164,6 +203,124 @@ async def renew_runtime_run_lease(
     return True
 
 
+async def recover_expired_runtime_run_leases(
+    db: AsyncSession,
+    *,
+    now: datetime | None = None,
+    batch_size: int = 20,
+    max_recovery_attempts: int = MAX_RUNTIME_RUN_RECOVERY_ATTEMPTS,
+) -> tuple[int, int]:
+    """Requeue root Runtime runs whose executing worker stopped renewing.
+
+    Redis can retain a late-acked Celery delivery until the global visibility
+    timeout expires. Runtime leases are intentionally much shorter, so a
+    rolling deploy must create a fresh delivery instead of leaving the chat in
+    ``running`` for that entire broker window. Versioned outbox keys make the
+    recovery idempotent; a bounded attempt count prevents repeated worker loss
+    from becoming an automatic retry loop.
+    """
+
+    current_time = now or datetime.now(timezone.utc)
+    limit = max(1, min(int(batch_size), 100))
+    attempts_limit = max(0, int(max_recovery_attempts))
+    runs = list(
+        (
+            await db.execute(
+                select(RuntimeRun)
+                .where(
+                    RuntimeRun.parent_run_id.is_(None),
+                    RuntimeRun.status.in_(
+                        (
+                            RuntimeRunStatus.RUNNING.value,
+                            RuntimeRunStatus.RESUMING.value,
+                            RuntimeRunStatus.CANCEL_REQUESTED.value,
+                            RuntimeRunStatus.CANCELLING.value,
+                        )
+                    ),
+                    RuntimeRun.lease_expires_at.is_not(None),
+                    RuntimeRun.lease_expires_at <= current_time,
+                )
+                .order_by(RuntimeRun.lease_expires_at.asc(), RuntimeRun.id.asc())
+                .limit(limit)
+                .with_for_update(skip_locked=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    recovery_counts: dict[str, int] = {}
+    if runs:
+        count_rows = (
+            await db.execute(
+                select(
+                    RuntimeOutboxEvent.aggregate_id,
+                    func.count(RuntimeOutboxEvent.id),
+                )
+                .where(
+                    RuntimeOutboxEvent.aggregate_id.in_([run.id for run in runs]),
+                    RuntimeOutboxEvent.event_type == "runtime.execute_run",
+                    RuntimeOutboxEvent.dedupe_key.contains(":recovery:"),
+                )
+                .group_by(RuntimeOutboxEvent.aggregate_id)
+            )
+        ).all()
+        recovery_counts = {
+            aggregate_id: int(count) for aggregate_id, count in count_rows
+        }
+
+    recovered = 0
+    failed = 0
+    for run in runs:
+        if run.status in {
+            RuntimeRunStatus.CANCEL_REQUESTED.value,
+            RuntimeRunStatus.CANCELLING.value,
+        }:
+            await finish_runtime_run_out_of_loop(
+                db,
+                run,
+                status=RuntimeRunStatus.CANCELLED,
+                reason="user_cancelled",
+                now=current_time,
+            )
+            continue
+
+        recovery_attempts = recovery_counts.get(run.id, 0)
+        if recovery_attempts >= attempts_limit:
+            # The worker that held the lease is gone and will not finalize it.
+            await finish_runtime_run_out_of_loop(
+                db,
+                run,
+                status=RuntimeRunStatus.FAILED,
+                reason="runtime_recovery_exhausted",
+                now=current_time,
+                error={
+                    "code": "runtime_recovery_exhausted",
+                    "message": "The runtime worker stopped before the request completed.",
+                },
+            )
+            failed += 1
+            continue
+
+        run.lease_owner = None
+        run.lease_expires_at = None
+        run.version += 1
+        run.status = RuntimeRunStatus.QUEUED.value
+        run.status_reason = None
+        db.add(
+            RuntimeOutboxEvent(
+                event_type="runtime.execute_run",
+                aggregate_id=run.id,
+                dedupe_key=f"runtime.execute_run:{run.id}:recovery:{run.version}",
+                payload={"run_id": run.id},
+                available_at=current_time,
+                created_at=current_time,
+            )
+        )
+        recovered += 1
+    return recovered, failed
+
+
 async def complete_runtime_run_execution(
     db: AsyncSession,
     *,
@@ -207,6 +364,11 @@ async def complete_runtime_run_execution(
     run.active_sandbox_id = None
     run.active_execution_id = None
     run.version += 1
+    # The loop saves its own failure or interruption before reporting it. A
+    # loop that crashed first left its Message streaming: settle it here, and
+    # since that loop emitted no terminal frames either, announce it.
+    if await settle_terminal_runtime_run_message(db, run):
+        stage_runtime_run_terminal_notice(db, run, now=current_time)
     return run
 
 
@@ -224,9 +386,10 @@ async def set_runtime_run_active_execution(
     ).scalar_one_or_none()
     if run is None or run.status in RuntimeRunStatus.terminal():
         return
+    # Execution pointers do not change the claim generation. Context archive
+    # writers keep the same lease/version fence across successful sandbox calls.
     run.active_sandbox_id = sandbox_id
     run.active_execution_id = execution_id
-    run.version += 1
 
 
 async def clear_runtime_run_active_execution(
@@ -244,7 +407,6 @@ async def clear_runtime_run_active_execution(
         return
     run.active_sandbox_id = None
     run.active_execution_id = None
-    run.version += 1
 
 
 async def project_runtime_run_status(
@@ -256,7 +418,8 @@ async def project_runtime_run_status(
     """Build the stable public status projection without exposing checkpoints."""
 
     queue: dict[str, Any] | None = None
-    if run.reservation_id:
+    # A terminal run waits on nothing; its last ticket is history, not a queue.
+    if run.reservation_id and run.status not in RuntimeRunStatus.terminal():
         reservation = (
             await db.execute(
                 select(SandboxReservation).where(
@@ -301,13 +464,17 @@ async def project_runtime_run_status(
                 "deadline_at": reservation.deadline_at.isoformat(),
             }
 
+    from packages.core.services.runtime_human_input import human_input_projection
+
     return {
         "id": run.id,
         "root_run_id": run.root_run_id,
         "conversation_id": run.conversation_id,
+        "assistant_message_id": run.assistant_message_id,
         "status": run.status,
         "status_reason": run.status_reason,
         "queue": queue,
+        "human_input": await human_input_projection(db, run),
         "cancel_requested_at": (
             run.cancel_requested_at.isoformat() if run.cancel_requested_at else None
         ),
@@ -366,20 +533,34 @@ async def request_runtime_run_cancel(
     if requested is None:
         raise RuntimeRunNotFoundError(run_id)
     now = datetime.now(timezone.utc)
+    from packages.core.services.runtime_human_input import (
+        close_runtime_human_input_request,
+    )
+
     for run in runs:
         if run.status in RuntimeRunStatus.terminal():
+            # Placeholders of runs cancelled before terminal settlement
+            # existed are repaired by a repeated cancel too.
+            if run.status == RuntimeRunStatus.CANCELLED.value:
+                await settle_terminal_runtime_run_message(db, run)
             continue
+        if run.human_input_request_id:
+            await close_runtime_human_input_request(
+                db, run=run, user_id=user_id, reason=reason,
+            )
         run.cancel_requested_at = run.cancel_requested_at or now
         if run.status in {
             RuntimeRunStatus.QUEUED.value,
             RuntimeRunStatus.WAITING_RESOURCE.value,
         }:
-            run.status = RuntimeRunStatus.CANCELLED.value
-            run.completed_at = now
-            run.lease_owner = None
-            run.lease_expires_at = None
-        else:
-            run.status = RuntimeRunStatus.CANCEL_REQUESTED.value
+            # Queued/waiting runs stop before any worker writes a final
+            # Message; the transition settles the placeholder and tells the
+            # client in the same transaction.
+            await finish_runtime_run_out_of_loop(
+                db, run, status=RuntimeRunStatus.CANCELLED, reason=reason, now=now,
+            )
+            continue
+        run.status = RuntimeRunStatus.CANCEL_REQUESTED.value
         run.status_reason = reason
         run.version += 1
 
@@ -417,18 +598,39 @@ async def persist_runtime_run_suspension(
 
     checkpoint = control.get("checkpoint")
     reservation_id = str(control.get("reservation_id") or "")
-    if not isinstance(checkpoint, dict) or not reservation_id:
+    human_input = is_human_input_suspension_control(control)
+    capability_approval = False
+    if not isinstance(checkpoint, dict) or (not reservation_id and not human_input and not capability_approval):
         raise ValueError("invalid Runtime suspension control")
     run = (
         await db.execute(
             select(RuntimeRun)
             .where(RuntimeRun.id == run_id)
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if run is None:
         raise RuntimeRunNotFoundError(run_id)
     if run.status in RuntimeRunStatus.terminal():
+        return run
+    if human_input:
+        # Parked on a question rather than on sandbox capacity: the open
+        # HitlRequest is the ticket, and nothing needs scheduling until the
+        # answer arrives.
+        from packages.core.services.runtime_human_input import (
+            mint_runtime_human_input_request,
+        )
+
+        request = await mint_runtime_human_input_request(db, run=run, control=control)
+        run.checkpoint = dict(checkpoint)
+        run.reservation_id = None
+        run.human_input_request_id = request.id
+        run.status = RuntimeRunStatus.WAITING_RESOURCE.value
+        run.status_reason = HUMAN_INPUT_SUSPENSION_REASON
+        run.version += 1
+        run.lease_owner = None
+        run.lease_expires_at = None
         return run
     reservation = (
         await db.execute(
@@ -444,6 +646,7 @@ async def persist_runtime_run_suspension(
         raise ValueError("Runtime suspension reservation does not belong to run")
     run.checkpoint = dict(checkpoint)
     run.reservation_id = reservation.id
+    run.human_input_request_id = None
     run.status = RuntimeRunStatus.WAITING_RESOURCE.value
     run.status_reason = str(control.get("reason") or "sandbox_capacity")
     run.version += 1
@@ -465,7 +668,10 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
         return
     from packages.core.database import async_session
     from packages.core.models.runtime_run import SandboxInstance, SandboxRunner
-    from packages.core.services.sandbox_queue_service import release_sandbox_instance
+    from packages.core.services.sandbox_queue_service import (
+        release_sandbox_instance,
+        restore_consumed_reservation,
+    )
     from packages.core.services.sandbox_sdk import SandboxClient
     from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
 
@@ -505,6 +711,26 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
                             instance.sandbox_id,
                             exc_info=True,
                         )
+                from packages.core.services.sandbox_session_service import is_sandbox_kept_warm
+
+                if await is_sandbox_kept_warm(instance.sandbox_id):
+                    # Owned by the owner's warm registry now: the execution
+                    # above was cancelled, the container stays for reuse, and
+                    # its instance row stays active because that row is how
+                    # a later turn resolves the container's runner. The
+                    # cancel marked the ticket release_pending, which pins a
+                    # runner slot; a kept container is a consumed ticket.
+                    async with async_session() as restore_db:
+                        await restore_consumed_reservation(
+                            restore_db, sandbox_id=instance.sandbox_id,
+                        )
+                        await restore_db.commit()
+                    logger.info(
+                        "Cancelled run leaves warm Sandbox in place run=%s sandbox=%s",
+                        run.id,
+                        instance.sandbox_id,
+                    )
+                    continue
                 try:
                     await client.destroy(instance.sandbox_id)
                 except SandboxNotFoundError:
@@ -529,6 +755,7 @@ async def cancel_runtime_run_resources(run: RuntimeRun) -> None:
 
 
 __all__ = [
+    "MAX_RUNTIME_RUN_RECOVERY_ATTEMPTS",
     "RuntimeRunNotFoundError",
     "claim_runtime_run_execution",
     "cancel_runtime_run_resources",
@@ -536,6 +763,7 @@ __all__ = [
     "complete_runtime_run_execution",
     "create_runtime_run",
     "project_runtime_run_status",
+    "recover_expired_runtime_run_leases",
     "renew_runtime_run_lease",
     "persist_runtime_run_suspension",
     "request_runtime_run_cancel",

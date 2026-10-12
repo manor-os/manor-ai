@@ -19,6 +19,10 @@ docker compose --profile nango up -d nango-postgres nango-server
 Open the Nango UI, create or copy keys, and place them in your Manor AI
 configuration.
 
+Create your own provider OAuth applications and configure their callback URLs
+for this deployment. Leaving the profile or provider unset disables only the
+dependent connector; no hosted Nango account or Manor credentials are assumed.
+
 ## When to Use Nango
 
 Use Nango when:

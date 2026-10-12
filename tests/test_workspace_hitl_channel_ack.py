@@ -23,12 +23,15 @@ from typing import Any
 from datetime import datetime, timezone
 
 import pytest
+
+from tests.auth_helpers import register_user_and_get_token
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.governance.policy import WorkspacePolicy
-from packages.core.governance.service import update_policy
 from packages.core.models.channel import ChannelConfig, ChannelContact
 from packages.core.models.document import Channel
 from packages.core.models.notification import NotificationDelivery
@@ -86,12 +89,12 @@ def stub_agent(monkeypatch):
 
 
 async def _register(client: AsyncClient, username: str) -> dict:
-    resp = await client.post(
-        "/api/v1/auth/register",
+    resp = await register_user_and_get_token(
+        client,
         json={
             "username": username,
             "email": f"{username}@test.com",
-            "password": "pass123",
+            "password": "HitlChannelApprovalTest123!",
             "entity_name": f"Org {username}",
         },
     )
@@ -204,12 +207,10 @@ async def test_workspace_hitl_resolves_via_telegram_reply(
     ws = await _seed_workspace(db_session, entity_id=entity_id)
 
     # Governance: require HITL for external_message.send
-    await update_policy(
-        db_session,
-        entity_id=entity_id,
-        workspace_id=ws.id,
-        policy=WorkspacePolicy(hitl_required_actions=["external_message.send"]),
-        changed_by=owner_user_id,
+    await initialize_test_approval_owners(db_session, ws, user_id=owner_user_id)
+    await set_workspace_test_approval(
+        db_session, entity_id=entity_id, workspace_id=ws.id,
+        actor_id=owner_user_id, user_rules=[action_rule("external_message.send", effect="ask")],
     )
     await db_session.commit()
 
@@ -369,12 +370,10 @@ async def test_workspace_hitl_reject_does_not_send_to_customer(
     entity_id = owner["entity_id"]
     owner_user_id = owner["user_id"]
     ws = await _seed_workspace(db_session, entity_id=entity_id)
-    await update_policy(
-        db_session,
-        entity_id=entity_id,
-        workspace_id=ws.id,
-        policy=WorkspacePolicy(hitl_required_actions=["external_message.send"]),
-        changed_by=owner_user_id,
+    await initialize_test_approval_owners(db_session, ws, user_id=owner_user_id)
+    await set_workspace_test_approval(
+        db_session, entity_id=entity_id, workspace_id=ws.id,
+        actor_id=owner_user_id, user_rules=[action_rule("external_message.send", effect="ask")],
     )
     await db_session.commit()
     cc = await _seed_telegram_cc(db_session, entity_id=entity_id, workspace_id=ws.id)
@@ -475,12 +474,10 @@ async def test_workspace_hitl_settings_override_default_recipients(
     }
     await db_session.commit()
 
-    await update_policy(
-        db_session,
-        entity_id=entity_id,
-        workspace_id=ws.id,
-        policy=WorkspacePolicy(hitl_required_actions=["external_message.send"]),
-        changed_by=owner_user_id,
+    await initialize_test_approval_owners(db_session, ws, user_id=owner_user_id)
+    await set_workspace_test_approval(
+        db_session, entity_id=entity_id, workspace_id=ws.id,
+        actor_id=owner_user_id, user_rules=[action_rule("external_message.send", effect="ask")],
     )
     await db_session.commit()
     cc = await _seed_telegram_cc(db_session, entity_id=entity_id, workspace_id=ws.id)

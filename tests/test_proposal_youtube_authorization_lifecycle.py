@@ -4,12 +4,28 @@ import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from tests.approval_settings_test_utils import initialize_test_approval_owners
 
 from packages.core.ai.runtime.approval_service import (
     runtime_auto_confirm_provider_approval,
 )
 from packages.core.models.base import generate_ulid
 from packages.core.models.task import Task
+from packages.core.models.user import User, UserMembership
+from packages.core.models.workspace import Workspace
+
+
+async def _initialize_approval_scope(db, *, entity_id, workspace_id, user_id):
+    workspace = Workspace(id=workspace_id, entity_id=entity_id,
+                          name="Proposal publication scope", status="active")
+    db.add_all([
+        workspace,
+        User(id=user_id, entity_id=entity_id, email=f"{user_id}@example.test",
+             password_hash="fixture", role="owner", status="active"),
+        UserMembership(user_id=user_id, entity_id=entity_id, role="owner", status="active"),
+    ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=user_id)
 
 
 def _provider_block(*, approval_id: str, target_label: str) -> str:
@@ -122,6 +138,8 @@ async def test_proposal_authorization_covers_upload_entry_then_one_public_publis
         details={"proposal_external_authorization": authorization},
     )
     db_session.add_all([predecessor, publish_task])
+    await _initialize_approval_scope(db_session, entity_id=entity_id,
+        workspace_id=workspace_id, user_id="operator-lifecycle")
     await db_session.commit()
 
     calls: list[tuple[str, dict]] = []
@@ -222,6 +240,14 @@ async def test_proposal_authorization_covers_upload_entry_then_one_public_publis
         "mcp__chrome__confirm_action",
         "mcp__chrome__click_element",
     ]
+    repeated_publish = _provider_block(approval_id="chrome-second-publish", target_label="Publish")
+    assert await runtime_auto_confirm_provider_approval(
+        tool_name="mcp__chrome__click_element", arguments={"label": "Publish"},
+        result=repeated_publish, execute=execute, entity_id=entity_id,
+        user_id="operator-lifecycle", workspace_id=workspace_id,
+        task_id=publish_task.id, runtime_metadata=runtime_metadata,
+    ) == repeated_publish
+    assert len(calls) == 6
 
 
 @pytest.mark.asyncio
@@ -253,6 +279,7 @@ async def test_upload_entry_is_not_recorded_until_chrome_executes_action(
         actual_output={"files": [{"name": "daily-stickman-video.mp4"}]},
     )
     publish_task_id = generate_ulid()
+    user_id = generate_ulid()
     authorization = {
         "version": 1,
         "authorization_id": f"proposal-item-failure:{publish_task_id}",
@@ -270,7 +297,7 @@ async def test_upload_entry_is_not_recorded_until_chrome_executes_action(
         "max_executions": 1,
         "approved_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=24)).isoformat(),
-        "approved_by": "operator-failure",
+        "approved_by": user_id,
         "consumed_at": None,
     }
     publish_task = Task(
@@ -282,9 +309,14 @@ async def test_upload_entry_is_not_recorded_until_chrome_executes_action(
         details={"proposal_external_authorization": authorization},
     )
     db_session.add_all([predecessor, publish_task])
+    await _initialize_approval_scope(db_session, entity_id=entity_id,
+        workspace_id=workspace_id, user_id=user_id)
     await db_session.commit()
 
+    calls: list[str] = []
+
     async def execute(name: str, args: dict) -> str:
+        calls.append(name)
         if name == "mcp__chrome__confirm_action":
             confirmation = {
                 "ok": True,
@@ -309,7 +341,7 @@ async def test_upload_entry_is_not_recorded_until_chrome_executes_action(
         result=original,
         execute=execute,
         entity_id=entity_id,
-        user_id="operator-failure",
+        user_id=user_id,
         workspace_id=workspace_id,
         task_id=publish_task_id,
         runtime_metadata={
@@ -318,6 +350,8 @@ async def test_upload_entry_is_not_recorded_until_chrome_executes_action(
     )
 
     assert json.loads(result)["status"] == "approval_required"
+    assert calls == (["mcp__chrome__confirm_action"] if failure_mode == "missing_token" else
+                     ["mcp__chrome__confirm_action", "mcp__chrome__click_element"])
     await db_session.refresh(publish_task)
     stored = publish_task.details["proposal_external_authorization"]
     assert stored.get("started_at") is None

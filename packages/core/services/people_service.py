@@ -62,6 +62,8 @@ async def get_client(db: AsyncSession, client_id: str, entity_id: str) -> Option
 
 
 async def create_client(db: AsyncSession, entity_id: str, **fields) -> Client:
+    if "meta" in fields:
+        fields["meta"] = {k: v for k, v in (fields["meta"] or {}).items() if k not in {"crm_invite_version", "relationship_links"}}
     client = Client(id=generate_ulid(), entity_id=entity_id, **fields)
     db.add(client)
     await db.flush()
@@ -69,9 +71,19 @@ async def create_client(db: AsyncSession, entity_id: str, **fields) -> Client:
 
 
 async def update_client(db: AsyncSession, client_id: str, entity_id: str, **fields) -> Optional[Client]:
-    client = await get_client(db, client_id, entity_id)
+    client = await db.scalar(select(Client).where(Client.id == client_id, Client.entity_id == entity_id, Client.deleted_at.is_(None)).with_for_update())
     if not client:
         return None
+    version = (client.meta or {}).get("crm_invite_version", 0)
+    if client.status == "active" and "status" in fields and fields["status"] != "active":
+        version += 1
+        fields["meta"] = fields.get("meta") or client.meta or {}
+    if "meta" in fields:
+        # Only the explicit, Workspace-authorized linker may change these refs.
+        fields["meta"] = {k: v for k, v in (fields["meta"] or {}).items() if k != "relationship_links"}
+        if "relationship_links" in (client.meta or {}):
+            fields["meta"]["relationship_links"] = client.meta["relationship_links"]
+        fields["meta"]["crm_invite_version"] = version
     for k, v in fields.items():
         if hasattr(client, k) and v is not None:
             setattr(client, k, v)

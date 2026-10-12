@@ -14,12 +14,18 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.ai.runtime import runtime_assert_credit_available, runtime_generate_audio_media
+from packages.core.ai.runtime import (
+    RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+    RUNTIME_FLOATING_CHAT_VOICE_SOURCE,
+    runtime_assert_credit_available,
+    runtime_generate_audio_media,
+)
 from packages.core.services.model_resolver import resolve_llm_metadata_for_user, resolve_model_for_user
 from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
 from packages.core.services.usage_service import record_media_usage
 from packages.core.services.voice.profiles import VoiceProfile
 from packages.core.services.voice.whisper import WhisperError, transcribe_blob, whisper_cost_usd
+from packages.core.services.workspace_audio_defaults import normalize_workspace_audio_language
 
 logger = logging.getLogger(__name__)
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
@@ -100,6 +106,7 @@ class ChatAudioScope:
 class SpeechRequest(BaseModel):
     text: str = Field(min_length=1, max_length=SPEECH_CHUNK_LENGTH)
     voice: str | None = Field(default=None, max_length=80)
+    language: str | None = Field(default=None, max_length=35)
     conversation_id: str | None = None
     workspace_id: str | None = None
 
@@ -155,7 +162,10 @@ async def transcribe_chat_upload(
     metadata = metadata or {}
     key = metadata.get("llm_api_key")
     if not key:
-        await runtime_assert_credit_available(scope.entity_id, source="chat:voice:transcribe")
+        await runtime_assert_credit_available(
+            scope.entity_id,
+            source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
+        )
     try:
         result = await transcribe_blob(
             blob,
@@ -182,7 +192,7 @@ async def transcribe_chat_upload(
         if getattr(result, "cost_usd", None) is not None
         else whisper_cost_usd(result.duration_seconds, result.model),
         units=int(result.duration_seconds),
-        source="chat:voice:transcribe",
+        source=RUNTIME_AUDIO_TRANSCRIBE_SOURCE,
         byok=bool(key),
     )
     await db.commit()
@@ -222,6 +232,7 @@ async def chat_speech_response(
     from packages.core.services.model_pricing_gateway import estimate_audio_cost_usd
 
     text = speech_text(text)
+    language = normalize_workspace_audio_language(language) if str(language or "").strip() else None
     if not text:
         raise HTTPException(400, "No readable text in this reply")
     if len(text) > SPEECH_CHUNK_LENGTH:
@@ -243,7 +254,7 @@ async def chat_speech_response(
             model=result["model"],
             cost_usd=estimate_audio_cost_usd(result["model"], purpose="speech"),
             units=len(text),
-            source="chat:voice:speech",
+            source=RUNTIME_FLOATING_CHAT_VOICE_SOURCE,
             byok=result["is_byok"],
         )
         await db.commit()

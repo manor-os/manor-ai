@@ -36,6 +36,8 @@ UPGRADE_UNSUPPORTED_FINGERPRINT_KEY = "upgrade_unsupported_fingerprint"
 MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY = (
     "materialized_upgrade_unsupported_fingerprint"
 )
+LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY = "last_partial_upgrade_fingerprint"
+LAST_PARTIAL_UPGRADE_VERSION_KEY = "last_partial_upgrade_version"
 
 #: Payload sections that decide what a workspace actually gets. Anything
 #: outside these (presentation copy, marketplace pricing) can change without
@@ -51,6 +53,10 @@ class BlueprintFreshness(str, Enum):
 
     #: The blueprint has changed since this workspace was installed.
     UPDATE_AVAILABLE = "update_available"
+
+    #: Safe changes from the current Blueprint release were applied, but some
+    #: portable Workspace configuration still needs manual reconciliation.
+    RECONFIGURE_REQUIRED = "reconfigure_required"
 
     #: Installed before fingerprints were recorded. It may or may not be
     #: behind; claiming either would be a guess, so the UI says so plainly
@@ -105,6 +111,7 @@ def blueprint_upgrade_unsupported_fingerprint(
     payload: dict[str, Any] | None,
     *,
     include_channels: bool = False,
+    include_component_versions: bool = False,
 ) -> str:
     """Fingerprint portable content the surgical upgrader cannot reconcile.
 
@@ -113,18 +120,25 @@ def blueprint_upgrade_unsupported_fingerprint(
     stay unchanged or the operator needs a reinstall/reconfiguration path;
     marking it current would be a false parity claim.
 
-    ``include_channels`` reproduces the legacy digest only for verifying
-    persisted baselines from before channel upgrades were supported.
+    The two ``include_*`` switches reproduce legacy digests only for verifying
+    persisted baselines from before those fields were made upgrade-safe.
     """
 
     if not isinstance(payload, dict):
         return ""
 
+    # Component versions describe the published definition. They are not
+    # mutable Workspace behavior, so a release-number bump must not turn an
+    # otherwise surgical update into a permanently partial one.
     agent_supported = {"system_prompt", "config", "status"}
     skill_supported = {
         "system_prompt", "tools", "input_schema", "output_format", "config", "status",
     }
     workflow_supported = {"steps", "variables"}
+    if not include_component_versions:
+        agent_supported.add("version")
+        skill_supported.add("version")
+        workflow_supported.add("version")
 
     def unsupported_components(
         values: Any,
@@ -184,9 +198,22 @@ def normalize_blueprint_upgrade_unsupported_fingerprint(
     A mismatch must remain a mismatch: today's source or personalization
     cannot stand in for unknown installed content. This helper writes nothing.
     """
-    if fingerprint and fingerprint == blueprint_upgrade_unsupported_fingerprint(
-        comparison_payload, include_channels=True,
-    ):
+    legacy_fingerprints = {
+        blueprint_upgrade_unsupported_fingerprint(
+            comparison_payload,
+            include_channels=True,
+        ),
+        blueprint_upgrade_unsupported_fingerprint(
+            comparison_payload,
+            include_component_versions=True,
+        ),
+        blueprint_upgrade_unsupported_fingerprint(
+            comparison_payload,
+            include_channels=True,
+            include_component_versions=True,
+        ),
+    }
+    if fingerprint and fingerprint in legacy_fingerprints:
         return blueprint_upgrade_unsupported_fingerprint(comparison_payload)
     return fingerprint
 
@@ -289,6 +316,27 @@ def blueprint_freshness(
     if not record.get(BLUEPRINT_ID_KEY):
         return BlueprintFreshness.NOT_FROM_BLUEPRINT
 
+    current_fingerprint = blueprint_content_fingerprint(current_payload)
+    partial_version = record.get(LAST_PARTIAL_UPGRADE_VERSION_KEY)
+    partial_fingerprint = str(
+        record.get(LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY) or ""
+    ).strip()
+    partial_release_matches = False
+    if partial_version is not None and current_version is not None:
+        partial_release_matches = (
+            parse_content_version(partial_version)
+            == parse_content_version(current_version)
+            and (
+                not partial_fingerprint
+                or not current_fingerprint
+                or partial_fingerprint == current_fingerprint
+            )
+        )
+    elif partial_fingerprint and current_fingerprint:
+        partial_release_matches = partial_fingerprint == current_fingerprint
+    if partial_release_matches:
+        return BlueprintFreshness.RECONFIGURE_REQUIRED
+
     # Version first: it is what publishing moves, and it survives a payload
     # the reader cannot fetch. When the versions are equal, still compare the
     # fingerprints when both are available. This repairs an install whose
@@ -305,7 +353,6 @@ def blueprint_freshness(
             return BlueprintFreshness.CURRENT
 
         installed_fingerprint = str(record.get(CONTENT_FINGERPRINT_KEY) or "").strip()
-        current_fingerprint = blueprint_content_fingerprint(current_payload)
         if (
             installed_fingerprint
             and current_fingerprint
@@ -318,7 +365,7 @@ def blueprint_freshness(
     if not installed:
         return BlueprintFreshness.UNKNOWN
 
-    current = blueprint_content_fingerprint(current_payload)
+    current = current_fingerprint
     if not current:
         # The blueprint it names is gone or unreadable — not something the
         # workspace can act on, and certainly not "up to date".
@@ -353,6 +400,7 @@ def blueprint_update_summary(
         "blueprint_id": record.get(BLUEPRINT_ID_KEY),
         "installed_version": record.get(BLUEPRINT_VERSION_KEY),
         "current_version": current_version,
+        "synchronization_status": record.get("synchronization_status"),
         "installed_at": record.get("installed_at"),
         "installed_fingerprint": record.get(CONTENT_FINGERPRINT_KEY) or None,
         "current_fingerprint": blueprint_content_fingerprint(current_payload) or None,

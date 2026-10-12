@@ -44,6 +44,9 @@ def _prompt() -> str:
                 "instruction": "Send the report to the operator",
                 "result": "Status: sent",
                 "artifacts": [],
+                "evidence_refs": [{"kind": "tool_effect", "effect": "action", "fields": {
+                    "provider": "gmail", "action_key": "send_email", "message_id": "sent-123",
+                }}],
             },
         ],
     )
@@ -93,6 +96,8 @@ def test_prompt_shows_instructions_results_and_artifact_receipts():
     # that separates "claimed to save" from "verifiably saved".
     assert "artifacts: (none recorded)" in prompt
     assert "do not take the step's own prose as proof of delivery" in prompt
+    assert "captured tool evidence:" in prompt and '"message_id": "sent-123"' in prompt
+    assert "tool receipt without a saved file" in prompt
 
 
 def test_prompt_shows_the_same_task_and_step_contracts_used_by_runtime():

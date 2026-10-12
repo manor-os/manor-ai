@@ -1,12 +1,13 @@
 """Workflow service — CRUD for definitions & runs, step execution engine."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from copy import deepcopy
 import logging
 from datetime import datetime, timezone
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only, with_expression
+from sqlalchemy.orm import aliased, load_only, with_expression
 
 from packages.core.ai.workflow_import import import_workflow
 from packages.core.ai.workflow_import.model import CANONICAL_NODE_TYPES
@@ -22,6 +23,7 @@ from packages.core.models.workflow import (
     WorkflowTemplateInstallation,
 )
 from packages.core.models.workspace import Workspace
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 from packages.core.workspaces import is_sandbox_workspace
 from packages.core.services.workflow_run_trace import (
     WORKFLOW_IMPORT_PROOF_TAG_PREFIX,
@@ -51,19 +53,42 @@ from packages.core.constants.workflow import (
     WORKFLOW_TERMINAL_EFFECTS_TRIGGER_FIELD,
     WorkflowRunStatus,
 )
+from packages.core.services.workflow_retry import (
+    RETRY_CONTEXT_KEY,
+    build_retry_context,
+    merge_retry_evidence,
+    retry_target,
+)
 
 logger = logging.getLogger(__name__)
 
 
 SUPPORTED_WORKFLOW_STEP_TYPES = set(CANONICAL_NODE_TYPES) | {"webhook", "note"}
 RUN_FAMILY_MAX_RUNS = 200
+MANUAL_WORKFLOW_TRIGGER_SOURCES = {
+    "manual", "workspace_chat", "global_chat", "agent_test",
+    "public_webchat", "site_form",
+}
+DIRECT_RUN_INPUT_CHECKED_SOURCES = {"manual", "schedule"}
 RUN_RESERVED_TRIGGER_FIELDS = {
+    RETRY_CONTEXT_KEY,
     "retry_of_run_id",
     "retry_from_step_id",
     "attempt_number",
     "_workflow_history_summary",
+    "_workspace_user_request",
     WORKFLOW_TERMINAL_EFFECTS_TRIGGER_FIELD,
 }
+
+
+def workflow_run_is_user_requested(run: WorkflowRun) -> bool:
+    """Read server-owned manual admission from this exact durable run."""
+    request = (run.trigger_data or {}).get("_workspace_user_request")
+    return bool(
+        isinstance(request, dict)
+        and run.started_by
+        and request.get("user_id") == run.started_by
+    )
 
 
 async def _assert_workspace_workflow_execution_ready(
@@ -71,6 +96,8 @@ async def _assert_workspace_workflow_execution_ready(
     *,
     workspace_id: str | None,
     entity_id: str,
+    trigger_source: str = "manual",
+    user_requested: bool = False,
 ) -> None:
     if not workspace_id:
         return
@@ -85,7 +112,10 @@ async def _assert_workspace_workflow_execution_ready(
     )).scalar_one_or_none()
     if workspace is None:
         raise ValueError("Workspace not found")
-    if workspace.status != "active":
+    manual_trigger = user_requested or trigger_source in MANUAL_WORKFLOW_TRIGGER_SOURCES
+    if not workspace_allows_manual_work(workspace) or (
+        not manual_trigger and workspace.status != "active"
+    ):
         raise ValueError("Workflow execution requires an active Workspace")
     if is_sandbox_workspace(workspace):
         raise ValueError("Workspace simulation cannot start an ordinary Workflow run")
@@ -517,6 +547,52 @@ def _validate_stage_config(
     return list(dict.fromkeys(route_targets))
 
 
+def _validate_tool_operation_denylist(
+    node_id: str, node_type: str, config: dict, errors: list[dict[str, str]],
+) -> None:
+    """A denylist must name real tool operations; a misspelt one would deny nothing."""
+    from difflib import get_close_matches
+
+    from packages.core.contracts.step_execution import (
+        TOOL_OPERATION_DENYLIST_KEY, parse_tool_operation_denylist,
+    )
+
+    def fail(message: str) -> None:
+        errors.append({"code": "invalid_tool_operation_denylist", "message": f"Node '{node_id}' {message}"})
+
+    for key in config:
+        if key != TOOL_OPERATION_DENYLIST_KEY and get_close_matches(
+            str(key), [TOOL_OPERATION_DENYLIST_KEY], n=1, cutoff=0.85,
+        ):
+            fail(f"has config.{key}; did you mean config.{TOOL_OPERATION_DENYLIST_KEY}?")
+    if TOOL_OPERATION_DENYLIST_KEY not in config:
+        return
+    if node_type != "agent":
+        fail(f"config.{TOOL_OPERATION_DENYLIST_KEY} only applies to agent nodes")
+        return
+    try:
+        denylist = parse_tool_operation_denylist(config[TOOL_OPERATION_DENYLIST_KEY])
+    except ValueError as exc:
+        fail(f"config.{TOOL_OPERATION_DENYLIST_KEY} {exc}")
+        return
+    from packages.core.ai.runtime.tool_registry import runtime_tool_schema
+
+    for tool_name, operations in denylist.items():
+        schema = runtime_tool_schema(tool_name) or {}
+        parameters = (schema.get("function") or schema).get("parameters") or {}
+        operation = (parameters.get("properties") or {}).get("operation") or {}
+        known = {str(value).lower() for value in operation.get("enum") or ()}
+        if not schema:
+            fail(f"config.{TOOL_OPERATION_DENYLIST_KEY} names unknown tool '{tool_name}'")
+        elif not known:
+            fail(f"config.{TOOL_OPERATION_DENYLIST_KEY}: tool '{tool_name}' has no enumerated operation argument")
+        elif unknown := sorted(operations - known):
+            fail(
+                f"config.{TOOL_OPERATION_DENYLIST_KEY}: '{tool_name}' has no operation "
+                + ", ".join(f"'{value}'" for value in unknown)
+            )
+
+
 def _validate_workflow_schema_contracts(
     nodes: object,
     errors: list[dict[str, str]],
@@ -533,6 +609,20 @@ def _validate_workflow_schema_contracts(
         node_id = str(node.get("id") or index)
         qualified_id = f"{parent_id}.{node_id}" if parent_id else node_id
         config = node.get("config") if isinstance(node.get("config"), dict) else {}
+        try:
+            from packages.core.services.workflow_timeout_config import (
+                resolve_workflow_node_timeout,
+            )
+
+            resolve_workflow_node_timeout(config)
+        except ValueError as exc:
+            errors.append({
+                "code": "invalid_node_timeout",
+                "message": f"Node '{qualified_id}' {exc}",
+            })
+        _validate_tool_operation_denylist(
+            qualified_id, str(node.get("type") or "").strip().lower(), config, errors,
+        )
         for side in ("input", "output"):
             key = f"{side}_schema"
             schema = config.get(key)
@@ -784,6 +874,80 @@ async def list_workflows(db: AsyncSession, entity_id: str) -> list[WorkflowDefin
         .order_by(WorkflowDefinition.created_at.desc())
     )
     return list(result.scalars().all())
+
+
+async def query_workflows(
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    query: str | None = None,
+    statuses: Sequence[str] | None = None,
+    categories: Sequence[str] | None = None,
+    workspace_ids: Sequence[str] | None = None,
+    created_by_ids: Sequence[str] | None = None,
+    active: bool | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    version_min: int | None = None,
+    version_max: int | None = None,
+    limit: int | None = 50,
+    offset: int = 0,
+) -> tuple[list[WorkflowDefinition], int]:
+    """Query definitions with OR-within-field and AND-across-field semantics."""
+    conditions = [WorkflowDefinition.entity_id == entity_id]
+    search = str(query or "").strip()
+    if search:
+        pattern = f"%{search}%"
+        conditions.append(or_(
+            WorkflowDefinition.name.ilike(pattern),
+            WorkflowDefinition.description.ilike(pattern),
+            WorkflowDefinition.category.ilike(pattern),
+        ))
+    for column, values, lowercase in (
+        (WorkflowDefinition.status, statuses, True),
+        (WorkflowDefinition.category, categories, True),
+        (WorkflowDefinition.workspace_id, workspace_ids, False),
+        (WorkflowDefinition.created_by, created_by_ids, False),
+    ):
+        normalized = _workflow_query_values(values, lowercase=lowercase)
+        if normalized:
+            expression = func.lower(column) if lowercase else column
+            conditions.append(expression.in_(normalized))
+    if active is not None:
+        conditions.append(WorkflowDefinition.is_active.is_(active))
+    _append_workflow_numeric_range(
+        conditions,
+        WorkflowDefinition.version,
+        version_min,
+        version_max,
+        "version",
+    )
+    for column, after, before, field_name in (
+        (WorkflowDefinition.created_at, created_after, created_before, "created"),
+        (WorkflowDefinition.updated_at, updated_after, updated_before, "updated"),
+    ):
+        _append_workflow_datetime_range(
+            conditions,
+            column,
+            after,
+            before,
+            field_name,
+        )
+    page = (
+        select(WorkflowDefinition)
+        .where(*conditions)
+        .order_by(WorkflowDefinition.created_at.desc(), WorkflowDefinition.id.desc())
+    )
+    if limit is not None:
+        page = page.limit(limit).offset(max(0, offset))
+    elif offset:
+        page = page.offset(max(0, offset))
+    count_query = select(func.count()).select_from(WorkflowDefinition).where(*conditions)
+    rows = list((await db.execute(page)).scalars().all())
+    total = int((await db.execute(count_query)).scalar_one())
+    return rows, total
 
 
 async def get_workflow(db: AsyncSession, workflow_id: str, entity_id: str) -> WorkflowDefinition | None:
@@ -1292,6 +1456,19 @@ async def binding_automation_references(
     return references
 
 
+class ScheduledWorkflowInputsError(ValueError):
+    """A cron trigger has no one to supply the workflow's required inputs."""
+
+    def __init__(self, labels: list[str]):
+        self.labels = labels
+        super().__init__(
+            "A schedule can't supply required inputs ("
+            + ", ".join(labels)
+            + "). Give them default values on the start node, or run this "
+            "workflow manually or from a Workspace instead."
+        )
+
+
 async def schedule_workflow(
     db: AsyncSession,
     entity_id: str,
@@ -1313,6 +1490,16 @@ async def schedule_workflow(
     independent — this is just the timer that calls it.
     """
     from packages.core.services.scheduler_service import create_scheduled_job
+    from packages.core.services.workspace_workflow_router import (
+        required_workflow_run_inputs_without_default,
+    )
+
+    wf = await get_workflow(db, workflow_id, entity_id)
+    if not wf:
+        raise ValueError("Workflow not found")
+    missing = required_workflow_run_inputs_without_default(wf)
+    if missing:
+        raise ScheduledWorkflowInputsError(missing)
 
     job = await create_scheduled_job(
         db, entity_id,
@@ -1504,15 +1691,30 @@ def retry_inherited_step_ids(
     }
 
 
+def _is_declarative_workflow_schema(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and "type" in value
+        and any(key in value for key in ("properties", "items", "required"))
+    )
+
+
 def _retry_variables(
     workflow: WorkflowDefinition,
     prior: WorkflowRun,
     inherited_step_ids: set[str],
     variables: dict | None,
     retry_from_step_id: str | None = None,
+    *,
+    retry_step_ids: set[str] | None = None,
 ) -> dict:
     prior_variables = prior.variables or {}
-    updated = deepcopy(prior_variables)
+    definition_variables = getattr(workflow, "variables", None) or {}
+    updated = deepcopy(definition_variables)
+    updated.update(deepcopy(prior_variables))
+    for key, value in definition_variables.items():
+        if _is_declarative_workflow_schema(value):
+            updated[key] = deepcopy(value)
     declared_input_roots: set[str] = set()
     for step in workflow.steps or []:
         if step.get("type") not in {"trigger", "webhook"}:
@@ -1536,21 +1738,15 @@ def _retry_variables(
         if isinstance(updated.get("__stage_execution"), dict)
         else {}
     )
-    retry_stage_id = str(retry_from_step_id or "").strip()
-    retained_stage_state = stage_execution.get(retry_stage_id)
-    retry_stage_result = prior_results.get(retry_stage_id) or {}
-    if (
-        isinstance(retained_stage_state, dict)
-        and (
-            retry_stage_result.get("status") == "completed"
-            or retained_stage_state.get("status") == "completed"
-        )
-    ):
-        retained_stage_state = None
-    if retry_stage_id and isinstance(retained_stage_state, dict):
-        updated["__stage_execution"] = {
-            retry_stage_id: deepcopy(retained_stage_state),
-        }
+    retry_stage_ids = retry_step_ids if retry_step_ids is not None else {str(retry_from_step_id or "").strip()}
+    retained_stage_states = {
+        sid: state for sid, state in stage_execution.items()
+        if sid in retry_stage_ids and isinstance(state, dict)
+        and (prior_results.get(sid) or {}).get("status") != "completed"
+        and state.get("status") != "completed"
+    }
+    if retained_stage_states:
+        updated["__stage_execution"] = deepcopy(retained_stage_states)
     else:
         updated.pop("__stage_execution", None)
 
@@ -1573,17 +1769,12 @@ def _retry_variables(
             step.get("type") == "transform"
             and (
                 operation_result.get("status") == "completed"
+                or operation_result.get("status") == "invalidated"
                 or operation_result.get("continued") is True
             )
         ):
             for key in config.get("set") or {}:
                 updated.pop(str(key), None)
-        output = operation_result.get("output")
-        if isinstance(output, dict):
-            for key, value in output.items():
-                if updated.get(key) == value:
-                    updated.pop(key, None)
-
     missing_output = object()
 
     def resolve_inherited_named_output(
@@ -1624,6 +1815,10 @@ def _retry_variables(
         if not step_id or step_id in inherited_step_ids:
             continue
         step_result = prior_results.get(step_id)
+        if step_result is None and step.get("type") != "stage":
+            # A node that never ran (an unselected branch) never wrote its
+            # outputs; the value under a shared name belongs to its sibling.
+            continue
         if step.get("type") == "stage" and isinstance(step_result, dict):
             step_result = {
                 key: value for key, value in step_result.items()
@@ -1633,11 +1828,8 @@ def _retry_variables(
         config = step.get("config") if isinstance(step.get("config"), dict) else {}
         if step.get("type") != "stage":
             continue
-        stage_state = (
-            retained_stage_state
-            if step_id == retry_stage_id
-            else stage_execution.get(step_id)
-        )
+        retained_stage_state = retained_stage_states.get(step_id)
+        stage_state = retained_stage_state if step_id in retry_stage_ids else stage_execution.get(step_id)
         operation_results = (
             stage_state.get("operation_results")
             if isinstance(stage_state, dict)
@@ -1650,8 +1842,7 @@ def _retry_variables(
             operation_id = str(operation.get("id") or "")
             operation_result = operation_results.get(operation_id)
             keep_completed_retry_operation = (
-                step_id == retry_stage_id
-                and isinstance(retained_stage_state, dict)
+                isinstance(retained_stage_state, dict)
                 and isinstance(operation_result, dict)
                 and (
                     operation_result.get("status") == "completed"
@@ -1667,11 +1858,16 @@ def _retry_variables(
         config = step.get("config") if isinstance(step.get("config"), dict) else {}
         output_var = str(config.get("output_var") or "").strip()
         result = prior_results.get(step_id) or {}
-        if result.get("status") == "completed" and "output" in result:
+        if (result.get("status") == "completed" or result.get("continued") is True) and "output" in result:
             step_output = deepcopy(result["output"])
             updated[step_id] = step_output
             if output_var:
                 updated[output_var] = deepcopy(step_output)
+            if step.get("type") == "transform" and isinstance(step_output, dict):
+                # A Set transform's receipt is the variable bag it produced.
+                for key in config.get("set") or {}:
+                    if str(key) in step_output:
+                        updated[str(key)] = deepcopy(step_output[str(key)])
             for item in config.get("outputs") or []:
                 if not isinstance(item, dict):
                     continue
@@ -1839,7 +2035,7 @@ def _validate_retry_variable_patch(
         workflow_id=workflow.id,
         workspace_id=prior.workspace_id or "",
         title=workflow.name,
-        description=workflow.description or "",
+        description=getattr(workflow, "description", "") or "",
         placeholder="",
         order=0,
         run_inputs=run_inputs,
@@ -1913,20 +2109,40 @@ async def start_workflow(
         db,
         workspace_id=workspace_id,
         entity_id=entity_id,
+        trigger_source=trigger_source,
     )
     await _validate_workspace_service_dependencies(
         db, workflow=wf, workspace_id=workspace_id,
     )
+    if trigger_source in DIRECT_RUN_INPUT_CHECKED_SOURCES:
+        # The Run dialog enforces these client-side; API, MCP and scheduled
+        # starts must not reach paid nodes with a required input missing.
+        from packages.core.services.workspace_workflow_router import (
+            check_declared_workflow_run_inputs,
+        )
+
+        check_declared_workflow_run_inputs(
+            wf, variables=variables, trigger_data=trigger_data,
+        )
 
     # Merge workflow-level default variables with runtime overrides
     merged_vars = dict(wf.variables or {})
     if variables:
         merged_vars.update(variables)
+    from packages.core.services.workspace_workflow_router import (
+        apply_declared_run_input_values,
+    )
+
+    merged_vars = apply_declared_run_input_values(
+        wf, merged_vars, trigger_data, explicit_keys=(variables or {}).keys(),
+    )
 
     steps = wf.steps or []
     first_step_id = require_entry_step_id(steps)
     _require_runtime_workflow(wf)
     attempt_trigger_data = _attempt_trigger_data(wf, trigger_data)
+    if started_by and trigger_source in MANUAL_WORKFLOW_TRIGGER_SOURCES:
+        attempt_trigger_data["_workspace_user_request"] = {"user_id": started_by}
 
     run_id = generate_ulid()
     run = WorkflowRun(
@@ -1971,6 +2187,7 @@ async def start_workflow_from_binding(
     trigger_source: str | None = None,
     started_by: str | None = None,
     execution_workspace_id: str | None = None,
+    user_requested: bool = False,
 ) -> WorkflowRun:
     """Start a run from a binding, resolving its run context.
 
@@ -1987,7 +2204,10 @@ async def start_workflow_from_binding(
     wf = await get_workflow(db, binding.workflow_id, binding.entity_id)
     if not wf:
         raise ValueError("Workflow not found for binding")
-    if not binding.enabled or binding.status != "active":
+    manual_binding_run = trigger_source == "manual" and bool(started_by)
+    if (not binding.enabled or binding.status != "active") and not (
+        manual_binding_run and binding.status in {"active", "paused"}
+    ):
         raise ValueError("Workflow binding is inactive")
     if not wf.is_active or wf.status != "active":
         raise ValueError("Workflow is inactive")
@@ -2002,6 +2222,8 @@ async def start_workflow_from_binding(
         db,
         workspace_id=effective_workspace_id,
         entity_id=binding.entity_id,
+        trigger_source=trigger_source or binding.trigger_type,
+        user_requested=user_requested,
     )
     await _validate_workspace_service_dependencies(
         db, workflow=wf, workspace_id=effective_workspace_id,
@@ -2021,6 +2243,12 @@ async def start_workflow_from_binding(
     first_step_id = require_entry_step_id(steps)
     _require_runtime_workflow(wf)
     attempt_trigger_data = _attempt_trigger_data(wf, trigger_data)
+    if started_by and (
+        user_requested or (trigger_source or binding.trigger_type) in MANUAL_WORKFLOW_TRIGGER_SOURCES
+    ):
+        # Only the trusted launch argument can stamp manual admission; request
+        # payloads cannot forge this reserved continuation provenance.
+        attempt_trigger_data["_workspace_user_request"] = {"user_id": started_by}
 
     run_id = generate_ulid()
     run = WorkflowRun(
@@ -2285,11 +2513,28 @@ async def retry_workflow_run(
     started_by: str,
     from_step_id: str | None = None,
     variables: dict | None = None,
+    expected_latest_run_id: str | None = None,
+    owner_run_id: str | None = None,
+    expected_owner_run_id: str | None = None,
+    expected_owner_status: str | None = None,
 ) -> WorkflowRun:
-    """Create a linked attempt that resumes from a prior run checkpoint."""
+    """Create a linked attempt that resumes from a prior run checkpoint.
+
+    ``expected_latest_run_id`` lets internal continuations atomically refuse to
+    replace a newer family attempt or revive one explicitly cancelled after a
+    crash. Interactive retries retain their existing cancelled-attempt policy.
+    """
     prior = await get_run(db, run_id, entity_id)
     if prior is None:
         raise ValueError("Workflow run not found")
+    owner = None
+    if owner_run_id is not None:
+        owner = await get_run(db, owner_run_id, entity_id)
+        if owner is None:
+            raise ValueError("Workflow retry owner not found")
+        if owner.workspace_id != prior.workspace_id:
+            raise ValueError("Workflow retry owner is outside the target workspace")
+    user_requested = expected_latest_run_id is None or workflow_run_is_user_requested(prior)
     await lock_reusable_resource_reference(
         db,
         entity_id=entity_id,
@@ -2301,12 +2546,40 @@ async def retry_workflow_run(
             db,
             workspace_id=prior.workspace_id,
             entity_id=entity_id,
+            trigger_source=(
+                prior.trigger_source if expected_latest_run_id is not None else "manual"
+            ),
+            user_requested=user_requested,
         )
+    if owner is not None:
+        latest_owner_attempt = await latest_workflow_run_family_attempt(
+            db,
+            owner,
+            lock_root=True,
+        )
+        await db.refresh(latest_owner_attempt)
+        if (
+            latest_owner_attempt.id != expected_owner_run_id
+            or latest_owner_attempt.status != expected_owner_status
+        ):
+            raise ValueError("A newer workflow attempt already exists")
     latest_family_attempt = await latest_workflow_run_family_attempt(
         db,
         prior,
         lock_root=True,
     )
+    # The selected row may already exist in this Session's identity map from
+    # before another transaction cancelled it. Reload it while the family lock
+    # is held so an internal continuation cannot revive stale failed state.
+    await db.refresh(latest_family_attempt)
+    if (
+        expected_latest_run_id is not None
+        and (
+            latest_family_attempt.id != expected_latest_run_id
+            or latest_family_attempt.status != WorkflowRunStatus.FAILED
+        )
+    ):
+        raise ValueError("A newer workflow attempt already exists")
     if latest_family_attempt.id != prior.id and latest_family_attempt.status != "cancelled":
         raise ValueError("A newer workflow attempt already exists")
     business_outcome, retry_state = await _retry_business_state(db, prior)
@@ -2316,22 +2589,6 @@ async def retry_workflow_run(
     )
     if prior.status not in {"failed", "cancelled"} and not retryable_business_outcome:
         raise ValueError("Workflow run is not retryable")
-    blocked_step_id = next(
-        (
-            str(step_id)
-            for step_id, result in (prior.step_results or {}).items()
-            if isinstance(result, dict)
-            and result.get("producer_completed") is True
-            and result.get("retry_blocked") is True
-        ),
-        None,
-    )
-    if blocked_step_id is not None:
-        raise ValueError(
-            f"Workflow retry is blocked: producer already completed at step "
-            f"'{blocked_step_id}', but its output failed the contract"
-        )
-
     workflow = await get_workflow(db, prior.workflow_id, entity_id)
     if workflow is None:
         raise ValueError("Workflow not found")
@@ -2361,6 +2618,42 @@ async def retry_workflow_run(
     else:
         execution_workflow = workflow_execution_view(workflow, prior)
 
+    workflow_steps = {
+        str(step.get("id") or ""): step
+        for step in execution_workflow.steps or []
+        if isinstance(step, dict)
+    }
+
+    def agent_recovery_checkpoint(step_id: str, result: dict) -> bool:
+        step = workflow_steps.get(step_id) or {}
+        return (
+            step.get("type") == "agent"
+            and result.get("producer_completed") is not True
+            and isinstance(result.get("chrome_outcome"), dict)
+        )
+
+    blocked_retry = next(
+        (
+            (str(step_id), result)
+            for step_id, result in (prior.step_results or {}).items()
+            if isinstance(result, dict)
+            and result.get("retry_blocked") is True
+            and not agent_recovery_checkpoint(str(step_id), result)
+        ),
+        None,
+    )
+    if blocked_retry is not None:
+        blocked_step_id, blocked_result = blocked_retry
+        if blocked_result.get("producer_completed") is True:
+            raise ValueError(
+                f"Workflow retry is blocked: producer already completed at step "
+                f"'{blocked_step_id}', but its output failed the contract"
+            )
+        raise ValueError(
+            f"Workflow retry is blocked at step '{blocked_step_id}': its external "
+            "effect may already have executed and must be reconciled first"
+        )
+
     _require_runtime_workflow(
         workflow,
         steps=execution_workflow.steps or [],
@@ -2377,12 +2670,7 @@ async def retry_workflow_run(
         prior,
         variables,
     )
-    retry_step_id = str(
-        from_step_id
-        or retry_state.get("retry_from_step_id")
-        or prior.current_step_id
-        or ""
-    ).strip()
+    retry_step_id = retry_target(execution_workflow.steps or [], prior, retry_state, from_step_id)
     step_ids = {
         str(step.get("id"))
         for step in execution_workflow.steps or []
@@ -2391,23 +2679,109 @@ async def retry_workflow_run(
     if retry_step_id not in step_ids:
         raise ValueError("Retry step is not part of the workflow")
 
-    inherited_ids = retry_inherited_step_ids(
-        execution_workflow.steps or [],
-        prior.step_results or {},
-        retry_step_id,
+    evidence_runs = [prior]
+    seen_evidence_ids = {prior.id}
+    # New attempts carry a complete recovery frontier. Hydrate historical
+    # ancestor-only retries once, without rewriting their immutable records.
+    if RETRY_CONTEXT_KEY not in (prior.trigger_data or {}):
+        while evidence_runs[-1].effective_retry_of_run_id:
+            ancestor_id = evidence_runs[-1].effective_retry_of_run_id
+            if ancestor_id in seen_evidence_ids or len(evidence_runs) >= RUN_FAMILY_MAX_RUNS:
+                raise ValueError("Workflow retry history is cyclic or exceeds the recovery limit")
+            ancestor = await db.scalar(select(WorkflowRun).where(
+                WorkflowRun.id == ancestor_id,
+                WorkflowRun.entity_id == prior.entity_id,
+                WorkflowRun.workflow_id == prior.workflow_id,
+                WorkflowRun.workspace_id == prior.workspace_id,
+            ))
+            if ancestor is None:
+                raise ValueError("Workflow retry history is incomplete")
+            snapshot = execution_snapshot_for_run(workflow, ancestor)
+            if snapshot is None or snapshot["fingerprint"] != prior_execution_snapshot["fingerprint"]:
+                raise ValueError("Workflow retry history has a different or missing execution snapshot")
+            if (ancestor.lineage_root_run_id or ancestor.id) != (prior.lineage_root_run_id or prior.id):
+                raise ValueError("Workflow retry history is outside the current lineage")
+            seen_evidence_ids.add(ancestor.id)
+            evidence_runs.append(ancestor)
+    retry_evidence = merge_retry_evidence(execution_workflow.steps or [], list(reversed(evidence_runs)))
+    # Recovery cannot erase an older uncertain external effect merely because
+    # a broken intermediate attempt omitted that node's receipt.
+    for step_id, result in retry_evidence.executed_results.items():
+        if result.get("retry_blocked") is True and not agent_recovery_checkpoint(step_id, result):
+            raise ValueError(f"Workflow retry is blocked at step '{step_id}': its prior effect must be reconciled first")
+    retry_context = build_retry_context(
+        execution_workflow.steps or [], retry_evidence.step_results, retry_step_id,
+        explicit_checkpoint=bool(from_step_id),
     )
+    inherited_ids = set(retry_context["inherited_step_ids"])
+    if normalized_variables:
+        # Do not newly reuse parallel outputs across changed inputs. Existing
+        # explicit upstream checkpoint semantics remain authoritative.
+        ancestors = retry_inherited_step_ids(execution_workflow.steps or [], prior.step_results or {}, retry_step_id)
+        if inherited_ids - ancestors:
+            raise ValueError("Retry with changed inputs requires an upstream checkpoint before the parallel branches")
     inherited_results = {
-        step_id: deepcopy((prior.step_results or {})[step_id])
+        step_id: deepcopy(retry_evidence.step_results[step_id])
         for step_id in inherited_ids
     }
+    step_types = {
+        str(step.get("id") or ""): str(step.get("type") or "")
+        for step in execution_workflow.steps or []
+    }
+    for recovery_step_id in retry_context["invalidated_step_ids"]:
+        prior_retry_result = retry_evidence.executed_results.get(recovery_step_id)
+        if (
+            step_types.get(recovery_step_id) != "agent"
+            or not isinstance(prior_retry_result, dict)
+            or prior_retry_result.get("status") == "invalidated"
+        ):
+            continue
+        from packages.core.services.workflow_agent_recovery import agent_retry_context
+
+        # Old attempts predate durable recovery context. Hydrate their actual
+        # retry chain once, keeping immutable snapshots and historical results.
+        evidence_runs = [prior]
+        evidence_result = prior_retry_result
+        seen_run_ids = {prior.id}
+        while not isinstance(evidence_result.get("agent_recovery"), dict):
+            ancestor_id = evidence_runs[-1].effective_retry_of_run_id
+            if not ancestor_id or ancestor_id in seen_run_ids:
+                break
+            if len(evidence_runs) >= RUN_FAMILY_MAX_RUNS:
+                raise ValueError("Workflow agent retry history exceeds the recovery limit")
+            ancestor = await db.scalar(select(WorkflowRun).where(
+                WorkflowRun.id == ancestor_id,
+                WorkflowRun.entity_id == prior.entity_id,
+                WorkflowRun.workflow_id == prior.workflow_id,
+                WorkflowRun.workspace_id == prior.workspace_id,
+            ))
+            if ancestor is None:
+                break
+            seen_run_ids.add(ancestor.id)
+            evidence_runs.append(ancestor)
+            evidence_result = (ancestor.step_results or {}).get(recovery_step_id) or {}
+        receipts_by_run = {}
+        recovery = None
+        for evidence_run in reversed(evidence_runs):
+            evidence_result = (evidence_run.step_results or {}).get(recovery_step_id)
+            if not isinstance(evidence_result, dict):
+                continue
+            recovery = agent_retry_context(
+                {**evidence_result, **({"agent_recovery": recovery} if recovery else {})},
+                run_id=evidence_run.id, step_id=recovery_step_id, error=evidence_run.error,
+                receipts=receipts_by_run.get(evidence_run.id),
+            )
+        inherited_results[recovery_step_id] = {
+            **deepcopy(prior_retry_result),
+            "agent_recovery": recovery,
+            "status": "failed",
+            "resume_strategy": "reexecute",
+            "agent_retry_recovery": True,
+        }
     prior_trigger = {
         key: deepcopy(value)
         for key, value in (prior.trigger_data or {}).items()
         if key not in {
-            "parent_run_id",
-            "parent_step_id",
-            "parent_foreach_item_key",
-            "parent_foreach_progress_key",
             "_workflow_history_summary",
         }
     }
@@ -2417,15 +2791,23 @@ async def retry_workflow_run(
         latest_family_attempt.effective_attempt_number,
     ) + 1
     retry_trigger = _attempt_trigger_data(execution_workflow, prior_trigger)
+    retry_trigger[RETRY_CONTEXT_KEY] = {
+        **retry_context,
+        "fingerprint": prior_execution_snapshot["fingerprint"],
+        "source_run_ids": {sid: retry_evidence.source_run_ids[sid] for sid in inherited_ids},
+    }
+    if user_requested and started_by:
+        retry_trigger["_workspace_user_request"] = {"user_id": started_by}
     if prior_snapshot:
         retry_trigger.update(_snapshot_display_metadata(prior_snapshot))
     retry_trigger["input_patch"] = deepcopy(variables or {})
     retry_variables = _retry_variables(
         execution_workflow,
-        prior,
+        retry_evidence,
         inherited_ids,
         normalized_variables,
         retry_step_id,
+        retry_step_ids=set(retry_context["entry_step_ids"]),
     )
     retry_variables = await _refresh_retry_workflow_project(
         db,
@@ -2481,10 +2863,25 @@ async def list_runs(
     limit: int = 50,
     readable_workspace_ids: set[str] | None = None,
     summary: bool = False,
+    top_level_only: bool = False,
 ) -> list[WorkflowRun]:
-    q = select(WorkflowRun).where(WorkflowRun.entity_id == entity_id)
+    q = select(WorkflowRun).where(
+        WorkflowRun.entity_id == entity_id,
+        _NOT_A_NODE_TEST,
+    )
     if summary:
         q = q.options(*_run_summary_options())
+    if top_level_only:
+        lineage_root = aliased(WorkflowRun)
+        nested_lineage = select(lineage_root.id).where(
+            lineage_root.id == func.coalesce(
+                WorkflowRun.lineage_root_run_id,
+                WorkflowRun.id,
+            ),
+            lineage_root.entity_id == WorkflowRun.entity_id,
+            lineage_root.trigger_data["parent_run_id"].as_string().is_not(None),
+        ).exists()
+        q = q.where(~nested_lineage)
     if readable_workspace_ids is not None:
         q = q.where(or_(
             WorkflowRun.workspace_id.is_(None),
@@ -2503,7 +2900,220 @@ async def list_runs(
     return list(result.scalars().all())
 
 
+async def query_runs(
+    db: AsyncSession,
+    entity_id: str,
+    *,
+    workflow_ids: Sequence[str] | None = None,
+    workspace_ids: Sequence[str] | None = None,
+    binding_ids: Sequence[str] | None = None,
+    statuses: Sequence[str] | None = None,
+    trigger_sources: Sequence[str] | None = None,
+    started_by_ids: Sequence[str] | None = None,
+    readable_workspace_ids: set[str] | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    started_after: str | datetime | None = None,
+    started_before: str | datetime | None = None,
+    completed_after: str | datetime | None = None,
+    completed_before: str | datetime | None = None,
+    attempt_number_min: int | None = None,
+    attempt_number_max: int | None = None,
+    summary: bool = False,
+    limit: int | None = 50,
+    offset: int = 0,
+) -> tuple[list[WorkflowRun], int]:
+    """Query runs with all predicates applied before deterministic pagination."""
+    conditions = [WorkflowRun.entity_id == entity_id]
+    if readable_workspace_ids is not None:
+        conditions.append(or_(
+            WorkflowRun.workspace_id.is_(None),
+            WorkflowRun.workspace_id.in_(readable_workspace_ids),
+        ))
+    for column, values, lowercase in (
+        (WorkflowRun.workflow_id, workflow_ids, False),
+        (WorkflowRun.workspace_id, workspace_ids, False),
+        (WorkflowRun.binding_id, binding_ids, False),
+        (WorkflowRun.status, statuses, True),
+        (WorkflowRun.trigger_source, trigger_sources, True),
+        (WorkflowRun.started_by, started_by_ids, False),
+    ):
+        normalized = _workflow_query_values(values, lowercase=lowercase)
+        if normalized:
+            expression = func.lower(column) if lowercase else column
+            conditions.append(expression.in_(normalized))
+    _append_workflow_numeric_range(
+        conditions,
+        WorkflowRun.attempt_number,
+        attempt_number_min,
+        attempt_number_max,
+        "attempt_number",
+    )
+    for column, after, before, field_name in (
+        (WorkflowRun.created_at, created_after, created_before, "created"),
+        (WorkflowRun.updated_at, updated_after, updated_before, "updated"),
+        (WorkflowRun.started_at, started_after, started_before, "started"),
+        (WorkflowRun.completed_at, completed_after, completed_before, "completed"),
+    ):
+        _append_workflow_datetime_range(
+            conditions,
+            column,
+            after,
+            before,
+            field_name,
+        )
+    conditions.append(_NOT_A_NODE_TEST)
+    page = select(WorkflowRun).where(*conditions)
+    if summary:
+        page = page.options(*_run_summary_options())
+    page = page.order_by(WorkflowRun.created_at.desc(), WorkflowRun.id.desc())
+    if limit is not None:
+        page = page.limit(limit).offset(max(0, offset))
+    elif offset:
+        page = page.offset(max(0, offset))
+    count_query = select(func.count()).select_from(WorkflowRun).where(*conditions)
+    rows = list((await db.execute(page)).scalars().all())
+    total = int((await db.execute(count_query)).scalar_one())
+    return rows, total
+
+
+def _workflow_query_values(
+    values: Sequence[object] | None,
+    *,
+    lowercase: bool = False,
+) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for value in values or ():
+        text = str(value or "").strip()
+        if lowercase:
+            text = text.lower()
+        if text and text not in normalized:
+            normalized.append(text)
+    return tuple(normalized)
+
+
+def _workflow_datetime_bound(
+    value: str | datetime | None,
+    field_name: str,
+) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(
+                str(value).strip().replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} range endpoints must be ISO-8601 datetimes"
+            ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _append_workflow_datetime_range(
+    conditions: list,
+    column: object,
+    after: str | datetime | None,
+    before: str | datetime | None,
+    field_name: str,
+) -> None:
+    after_dt = _workflow_datetime_bound(after, field_name)
+    before_dt = _workflow_datetime_bound(before, field_name)
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(
+            f"{field_name}_after must be less than or equal to {field_name}_before"
+        )
+    if after_dt is not None:
+        conditions.append(column >= after_dt)
+    if before_dt is not None:
+        conditions.append(column <= before_dt)
+
+
+def _append_workflow_numeric_range(
+    conditions: list,
+    column: object,
+    minimum: int | None,
+    maximum: int | None,
+    field_name: str,
+) -> None:
+    if minimum is not None and maximum is not None and minimum > maximum:
+        raise ValueError(
+            f"{field_name}_min must be less than or equal to {field_name}_max"
+        )
+    if minimum is not None:
+        conditions.append(column >= minimum)
+    if maximum is not None:
+        conditions.append(column <= maximum)
+
+
 # ── Step Execution Engine ──
+
+NODE_TEST_WORKFLOW_ID = "node-test"
+NODE_TEST_TRIGGER_SOURCE = "node_test"
+# Node tests are not Flow runs; run lists and history leave them out.
+_NOT_A_NODE_TEST = or_(
+    WorkflowRun.trigger_source.is_(None),
+    WorkflowRun.trigger_source != NODE_TEST_TRIGGER_SOURCE,
+)
+
+
+async def execute_node_test(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    step: dict,
+    variables: dict | None = None,
+) -> dict:
+    """Run one node on its own ("Test node") as a real, short-lived run.
+
+    Tools a node calls check that their Workflow run exists, is running, and
+    belongs to the caller. An in-memory stand-in run failed that check, so
+    every tool-using node (image, video, tool calls) could not be tested. The
+    test run is committed before the node runs, marked terminal afterwards,
+    and filed under its own id so it never shows in a Flow's history.
+    """
+    from packages.core.ai.workflow_runner import WorkflowRunner
+
+    run_id = generate_ulid()
+    run = WorkflowRun(
+        id=run_id,
+        workflow_id=NODE_TEST_WORKFLOW_ID,
+        entity_id=entity_id,
+        lineage_root_run_id=run_id,
+        lineage_is_legacy=False,
+        attempt_number=1,
+        status="running",
+        current_step_id=str(step.get("id") or "") or None,
+        variables=dict(variables or {}),
+        step_results={},
+        trigger_data={},
+        trigger_source=NODE_TEST_TRIGGER_SOURCE,
+        started_by=user_id or None,
+        started_at=datetime.now(timezone.utc),
+    )
+    db.add(run)
+    await db.commit()
+    try:
+        result = await WorkflowRunner()._execute_step_safe(step, run, db)
+    finally:
+        await db.refresh(run)
+        if run.status == "running":
+            run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc)
+        await db.commit()
+    if result.get("status") == "failed":
+        run.status = "failed"
+        run.error = summarize_trace_text(result.get("error"), fallback="Node test failed")
+        await db.commit()
+    return result
+
 
 async def execute_workflow_step(db: AsyncSession, run_id: str, entity_id: str) -> dict:
     """Execute one ready node through the canonical workflow runner.
@@ -2622,9 +3232,12 @@ async def _execute_claimed_workflow_step(
     from packages.core.ai.workflow_runner import (
         WorkflowRunner,
         _continue_failed_result,
+        apply_workflow_approval_revision,
     )
 
     runner = WorkflowRunner()
+    # Same scheduling as the full runner: a revise decision rewinds first.
+    apply_workflow_approval_revision(execution_workflow.steps or [], run)
     runnable = runner._find_runnable_steps(execution_workflow, run)
     if not runnable:
         if runner._all_steps_done(execution_workflow, run):

@@ -1,6 +1,7 @@
 """E2E tests: documents CRUD, upload, groups."""
 
 import asyncio
+import hashlib
 import io
 import json
 import os
@@ -82,6 +83,706 @@ async def test_upload_document(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_upload_document_returns_structured_server_size_limit(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from apps.api.routers import documents
+
+    headers = await _auth(client, "docuploadlimit")
+    monkeypatch.setattr(documents.settings, "MANOR_MAX_UPLOAD_MB", 1)
+
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("too-large.bin", b"x" * (1024 * 1024 + 1), "application/octet-stream")},
+    )
+
+    assert response.status_code == 413, response.text
+    assert response.json()["detail"] == {
+        "code": "page.knowledge.file_too_large_max_mb",
+        "message": "File too large. Max 1MB",
+        "vars": {"max": 1},
+    }
+
+
+@pytest.mark.asyncio
+async def test_upload_document_streams_size_check_without_filesystem(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from apps.api.routers import documents
+    from starlette.datastructures import UploadFile
+
+    headers = await _auth(client, "docuploadbounded")
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", False)
+    monkeypatch.setattr(documents.settings, "MANOR_MAX_UPLOAD_MB", 1)
+    original_read = UploadFile.read
+    requested_sizes: list[int] = []
+
+    async def record_read_size(self, size: int = -1):
+        requested_sizes.append(size)
+        return await original_read(self, size)
+
+    monkeypatch.setattr(UploadFile, "read", record_read_size)
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("too-large.bin", b"x" * (1024 * 1024 + 1), "application/octet-stream")},
+    )
+
+    assert response.status_code == 413, response.text
+    assert requested_sizes
+    assert -1 not in requested_sizes
+    assert max(requested_sizes) <= 1024 * 256
+
+
+@pytest.mark.asyncio
+async def test_filesystem_upload_reconciles_lost_commit_ack_without_deleting_bytes(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploadlostcommitack")
+    headers["Idempotency-Key"] = "upload-lost-commit-ack-0001"
+
+    original_commit = AsyncSession.commit
+    lost_ack = False
+
+    async def commit_then_lose_ack(self):
+        nonlocal lost_ack
+        commits_target_upload = any(
+            isinstance(instance, Document)
+            and instance.upload_idempotency_key == "upload-lost-commit-ack-0001"
+            for instance in [*self.new, *self.dirty, *self.identity_map.values()]
+        )
+        await original_commit(self)
+        if commits_target_upload and not lost_ack:
+            lost_ack = True
+            raise RuntimeError("commit acknowledgement lost")
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_lose_ack)
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("interview.txt", b"durable upload bytes", "text/plain")},
+    )
+
+    assert response.status_code == 201, response.text
+    row = await db_session.scalar(
+        select(Document).where(
+            Document.upload_idempotency_key == "upload-lost-commit-ack-0001"
+        )
+    )
+    assert row is not None
+    assert row.id == response.json()["id"]
+    stored = tmp_path / row.entity_id / row.fs_path
+    assert stored.read_bytes() == b"durable upload bytes"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_upload_waits_for_delayed_commit_visibility(
+    client: AsyncClient,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploaddelayedvisibility")
+    headers["Idempotency-Key"] = "upload-delayed-visibility-0001"
+    original_commit = AsyncSession.commit
+    original_load = documents._load_committed_document_upload
+    lost_ack = False
+    reconciliation_reads = 0
+
+    async def commit_then_lose_ack(self):
+        nonlocal lost_ack
+        commits_target_upload = any(
+            isinstance(instance, Document)
+            and instance.upload_idempotency_key == "upload-delayed-visibility-0001"
+            for instance in [*self.new, *self.dirty, *self.identity_map.values()]
+        )
+        await original_commit(self)
+        if commits_target_upload and not lost_ack:
+            lost_ack = True
+            raise RuntimeError("commit acknowledgement lost before replica visibility")
+
+    async def delayed_visibility(**kwargs):
+        nonlocal reconciliation_reads
+        reconciliation_reads += 1
+        if reconciliation_reads < 3:
+            return None
+        return await original_load(**kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", commit_then_lose_ack)
+    monkeypatch.setattr(
+        documents,
+        "_load_committed_document_upload",
+        delayed_visibility,
+    )
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("delayed.txt", b"delayed durable bytes", "text/plain")},
+    )
+
+    assert response.status_code == 201, response.text
+    assert reconciliation_reads == 3
+    stored = tmp_path / response.json()["entity_id"] / response.json()["fs_path"]
+    assert stored.read_bytes() == b"delayed durable bytes"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_upload_retry_reuses_recovery_intent_after_uncertain_rollback(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploadintent")
+    headers["Idempotency-Key"] = "upload-recovery-intent-0001"
+    request = {
+        "headers": headers,
+        "files": {"file": ("recover.txt", b"recover the same bytes", "text/plain")},
+    }
+    original_commit = AsyncSession.commit
+    original_load = documents._load_committed_document_upload
+    failed_once = False
+    reconciliation_reads = 0
+
+    async def fail_first_target_commit(self):
+        nonlocal failed_once
+        commits_target_upload = any(
+            isinstance(instance, Document)
+            and instance.upload_idempotency_key == "upload-recovery-intent-0001"
+            for instance in [*self.new, *self.dirty, *self.identity_map.values()]
+        )
+        if commits_target_upload and not failed_once:
+            failed_once = True
+            raise RuntimeError("connection dropped before commit outcome was known")
+        await original_commit(self)
+
+    async def hide_first_attempt(**kwargs):
+        nonlocal reconciliation_reads
+        reconciliation_reads += 1
+        if reconciliation_reads <= 5:
+            return None
+        return await original_load(**kwargs)
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_first_target_commit)
+    monkeypatch.setattr(documents, "_load_committed_document_upload", hide_first_attempt)
+    uncertain = await client.post("/api/v1/documents/upload", **request)
+
+    async def recovery_must_not_reenter_route_storage_gate(*_args, **_kwargs):
+        raise AssertionError("the same pending upload attempt must not re-enter the route storage gate")
+
+    async def recovery_must_not_reenter_document_storage_gate(*_args, **_kwargs):
+        raise AssertionError("the same pending upload attempt must not re-enter the document storage gate")
+
+    from packages.core.services import document_service
+
+    monkeypatch.setattr(
+        documents,
+        "enforce_plan_resource",
+        recovery_must_not_reenter_route_storage_gate,
+    )
+    monkeypatch.setattr(
+        document_service,
+        "_enforce_storage_limit",
+        recovery_must_not_reenter_document_storage_gate,
+    )
+    retry = await client.post("/api/v1/documents/upload", **request)
+
+    assert uncertain.status_code == 503, uncertain.text
+    assert uncertain.json()["detail"]["code"] == "document_upload_commit_uncertain"
+    assert retry.status_code == 201, retry.text
+    entity_root = tmp_path / retry.json()["entity_id"]
+    assert (entity_root / retry.json()["fs_path"]).read_bytes() == b"recover the same bytes"
+    assert len(list(entity_root.rglob("recover.txt"))) == 1
+    assert not list((entity_root / ".ai" / "document-upload-intents").rglob("*.json"))
+    rows = (
+        await db_session.execute(
+            select(Document).where(
+                Document.upload_idempotency_key == "upload-recovery-intent-0001"
+            )
+        )
+    ).scalars().all()
+    assert [row.id for row in rows] == [retry.json()["id"]]
+
+
+@pytest.mark.asyncio
+async def test_expired_anonymous_upload_recovery_removes_unreferenced_source(
+    client: AsyncClient,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploadanonymouscleanup")
+    original_commit = AsyncSession.commit
+
+    async def fail_target_commit(self):
+        commits_target_upload = any(
+            isinstance(instance, Document)
+            and instance.name == "anonymous-orphan.txt"
+            for instance in [*self.new, *self.dirty, *self.identity_map.values()]
+        )
+        if commits_target_upload:
+            raise RuntimeError("database connection dropped during anonymous upload commit")
+        await original_commit(self)
+
+    async def fail_reconciliation(**_kwargs):
+        raise RuntimeError("receipt database is unavailable")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_target_commit)
+    monkeypatch.setattr(documents, "_load_committed_document_upload", fail_reconciliation)
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("anonymous-orphan.txt", b"anonymous orphan bytes", "text/plain")},
+    )
+
+    assert response.status_code == 503, response.text
+    markers = list(tmp_path.rglob("document-upload-intents/**/*.json"))
+    sources = list(tmp_path.rglob("anonymous-orphan.txt"))
+    assert len(markers) == 1
+    assert len(sources) == 1
+    marker_payload = json.loads(markers[0].read_text())
+    assert marker_payload["idempotency_key"] is None
+    marker_payload["expires_at"] = 0
+    markers[0].write_text(json.dumps(marker_payload))
+    os.utime(markers[0], (0, 0))
+
+    report = await documents.cleanup_expired_document_upload_recovery_intents(
+        now=2 * 86400,
+        limit=10,
+    )
+
+    assert report == {"examined": 1, "cleaned": 1, "sources_removed": 1, "failed": 0}
+    assert not sources[0].exists()
+    assert not markers[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_expired_upload_recovery_preserves_committed_document_source(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploadcommittedcleanup")
+    headers["Idempotency-Key"] = "upload-committed-cleanup-0001"
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("committed-source.txt", b"committed source bytes", "text/plain")},
+    )
+    assert response.status_code == 201, response.text
+    document = await db_session.scalar(
+        select(Document).where(Document.id == response.json()["id"])
+    )
+    assert document is not None
+    source_path = tmp_path / document.entity_id / document.fs_path
+
+    async with documents._document_filesystem_mutation(document.entity_id):
+        intent = await documents._create_document_upload_recovery_intent(
+            entity_id=document.entity_id,
+            owner_id=document.owner_id,
+            idempotency_key="upload-stale-marker-0001",
+            request_fingerprint="f" * 64,
+            fs_path=document.fs_path,
+        )
+    assert intent is not None
+    marker_path = tmp_path / document.entity_id / intent.rel_path
+    marker_payload = json.loads(marker_path.read_text())
+    marker_payload["expires_at"] = 0
+    marker_path.write_text(json.dumps(marker_payload))
+    os.utime(marker_path, (0, 0))
+
+    report = await documents.cleanup_expired_document_upload_recovery_intents(
+        now=2 * 86400,
+        limit=10,
+    )
+
+    assert report == {"examined": 1, "cleaned": 1, "sources_removed": 0, "failed": 0}
+    assert source_path.read_bytes() == b"committed source bytes"
+    assert not marker_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_filesystem_upload_keeps_committed_bytes_when_post_commit_work_fails(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+
+    async def fail_post_commit_dispatch(*_args, **_kwargs):
+        raise RuntimeError("embedding dispatcher unavailable")
+
+    monkeypatch.setattr(
+        documents,
+        "_dispatch_document_embeddings_and_invalidate_cache",
+        fail_post_commit_dispatch,
+    )
+    headers = await _auth(client, "docuploadpostcommit")
+    headers["Idempotency-Key"] = "upload-post-commit-failure-0001"
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("interview.txt", b"committed upload bytes", "text/plain")},
+    )
+
+    assert response.status_code == 201, response.text
+    row = await db_session.scalar(
+        select(Document).where(
+            Document.upload_idempotency_key == "upload-post-commit-failure-0001"
+        )
+    )
+    assert row is not None
+    assert (tmp_path / row.entity_id / row.fs_path).read_bytes() == b"committed upload bytes"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_upload_preserves_bytes_while_commit_outcome_is_uncertain(
+    client: AsyncClient,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploaduncertain")
+    headers["Idempotency-Key"] = "upload-uncertain-commit-0001"
+    original_commit = AsyncSession.commit
+
+    async def fail_target_commit(self):
+        commits_target_upload = any(
+            isinstance(instance, Document)
+            and instance.upload_idempotency_key == "upload-uncertain-commit-0001"
+            for instance in [*self.new, *self.dirty, *self.identity_map.values()]
+        )
+        if commits_target_upload:
+            raise RuntimeError("database connection dropped during commit")
+        await original_commit(self)
+
+    async def fail_reconciliation(**_kwargs):
+        raise RuntimeError("database is unavailable for receipt lookup")
+
+    monkeypatch.setattr(AsyncSession, "commit", fail_target_commit)
+    monkeypatch.setattr(
+        documents,
+        "_load_committed_document_upload",
+        fail_reconciliation,
+    )
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("uncertain.txt", b"uncertain upload bytes", "text/plain")},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "document_upload_commit_uncertain"
+    preserved = list(tmp_path.rglob("uncertain.txt"))
+    assert len(preserved) == 1
+    assert preserved[0].read_bytes() == b"uncertain upload bytes"
+
+
+@pytest.mark.asyncio
+async def test_upload_document_replays_same_idempotency_key_without_duplicate(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+
+    headers = await _auth(client, "docuploadreplay")
+    headers["Idempotency-Key"] = "upload-replay-0001"
+    request = {
+        "headers": headers,
+        "files": {"file": ("interview.txt", b"stable upload bytes", "text/plain")},
+    }
+
+    first = await client.post("/api/v1/documents/upload", **request)
+
+    async def replay_must_not_consume_storage_gate(*_args, **_kwargs):
+        raise AssertionError("a committed upload replay must bypass the storage gate")
+
+    monkeypatch.setattr(
+        documents,
+        "enforce_plan_resource",
+        replay_must_not_consume_storage_gate,
+    )
+    replay = await client.post("/api/v1/documents/upload", **request)
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    rows = (
+        await db_session.execute(
+            select(Document).where(
+                Document.upload_idempotency_key == "upload-replay-0001"
+            )
+        )
+    ).scalars().all()
+    assert [row.id for row in rows] == [first.json()["id"]]
+    assert rows[0].upload_request_fingerprint
+
+
+@pytest.mark.asyncio
+async def test_filesystem_upload_replay_reuses_document_and_payload(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents.settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "docuploadfsreplay")
+    headers["Idempotency-Key"] = "upload-fs-replay-0001"
+    request = {
+        "headers": headers,
+        "files": {"file": ("interview.txt", b"filesystem upload bytes", "text/plain")},
+    }
+
+    first = await client.post("/api/v1/documents/upload", **request)
+    replay = await client.post("/api/v1/documents/upload", **request)
+
+    assert first.status_code == 201, first.text
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    entity_root = tmp_path / first.json()["entity_id"]
+    assert (entity_root / first.json()["fs_path"]).read_bytes() == b"filesystem upload bytes"
+    rows = (
+        await db_session.execute(
+            select(Document).where(
+                Document.upload_idempotency_key == "upload-fs-replay-0001"
+            )
+        )
+    ).scalars().all()
+    assert [row.id for row in rows] == [first.json()["id"]]
+    assert len(list(entity_root.rglob("interview.txt"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_receipt_is_read_reconciliation_not_new_upload_permission(
+    client: AsyncClient,
+    monkeypatch,
+):
+    from apps.api.routers import documents
+
+    headers = await _auth(client, "docuploadreceiptread")
+    headers["Idempotency-Key"] = "upload-receipt-read-0001"
+    first = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("receipt.txt", b"receipt bytes", "text/plain")},
+    )
+    assert first.status_code == 201, first.text
+
+    async def upload_permission_must_not_be_rechecked(*_args, **_kwargs):
+        raise AssertionError("receipt reconciliation is not a new upload")
+
+    monkeypatch.setattr(
+        documents,
+        "_require_document_upload",
+        upload_permission_must_not_be_rechecked,
+    )
+    receipt = await client.get(
+        "/api/v1/documents/upload-receipts/upload-receipt-read-0001",
+        headers=headers,
+    )
+
+    assert receipt.status_code == 200, receipt.text
+    assert receipt.json()["id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_upload_document_replay_uses_stable_client_intent_fingerprint(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+):
+    from packages.core.models.document import DocumentFolder
+
+    headers = await _auth(client, "docuploadstableintent")
+    headers["Idempotency-Key"] = "upload-stable-intent-0001"
+    folder_response = await client.post(
+        "/api/v1/documents/folders",
+        headers=headers,
+        json={"name": "Policy changes"},
+    )
+    assert folder_response.status_code == 201, folder_response.text
+    folder_id = folder_response.json()["id"]
+    request = {
+        "headers": headers,
+        "files": {"file": ("interview.txt", b"stable upload bytes", "text/plain")},
+    }
+
+    first = await client.post(
+        f"/api/v1/documents/upload?folder_id={folder_id}",
+        **request,
+    )
+    assert first.status_code == 201, first.text
+
+    folder = await db_session.get(DocumentFolder, folder_id)
+    assert folder is not None
+    folder.visibility = "private"
+    folder.classification = "restricted"
+    await db_session.commit()
+
+    async def changed_mime_inference(*_args, **_kwargs):
+        return "application/x-changed-detector-result"
+
+    monkeypatch.setattr(
+        "packages.core.services.upload_security.inspect_upload_content",
+        changed_mime_inference,
+    )
+    replay = await client.post(
+        f"/api/v1/documents/upload?folder_id={folder_id}",
+        **request,
+    )
+
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_upload_receipt_and_replay_survive_workspace_delete(
+    client: AsyncClient,
+    db_session,
+):
+    from packages.core.models.document import Document
+
+    headers = await _auth(client, "docuploaddeletedworkspace")
+    headers["Idempotency-Key"] = "upload-deleted-workspace-0001"
+    request = {
+        "headers": headers,
+        "files": {"file": ("workspace.txt", b"workspace upload", "text/plain")},
+    }
+    first = await client.post("/api/v1/documents/upload", **request)
+    assert first.status_code == 201, first.text
+
+    receipt = await client.get(
+        "/api/v1/documents/upload-receipts/upload-deleted-workspace-0001",
+        headers=headers,
+    )
+    assert receipt.status_code == 200, receipt.text
+    assert receipt.json()["id"] == first.json()["id"]
+
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Deleted upload receipt"},
+    )
+    assert workspace.status_code == 201, workspace.text
+    workspace_data = workspace.json()
+    document = await db_session.get(Document, first.json()["id"])
+    assert document is not None
+    document.folder_id = workspace_data["artifact_folder_id"]
+    await db_session.commit()
+
+    deleted = await client.delete(
+        f"/api/v1/workspaces/{workspace_data['id']}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+
+    replay = await client.post("/api/v1/documents/upload", **request)
+    hidden_receipt = await client.get(
+        "/api/v1/documents/upload-receipts/upload-deleted-workspace-0001",
+        headers=headers,
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == first.json()["id"]
+    assert hidden_receipt.status_code == 200, hidden_receipt.text
+    assert hidden_receipt.json()["id"] == first.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_upload_document_rejects_reused_key_for_different_intent(
+    client: AsyncClient,
+):
+    headers = await _auth(client, "docuploadconflict")
+    headers["Idempotency-Key"] = "upload-conflict-0001"
+    first = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("interview.txt", b"first bytes", "text/plain")},
+    )
+    conflict = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("interview.txt", b"changed bytes", "text/plain")},
+    )
+
+    assert first.status_code == 201, first.text
+    assert conflict.status_code == 409, conflict.text
+    assert "different document upload" in conflict.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_upload_document_rejects_invalid_idempotency_key(client: AsyncClient):
+    headers = await _auth(client, "docuploadbadkey")
+    headers["Idempotency-Key"] = "bad key"
+
+    response = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        files={"file": ("notes.txt", b"notes", "text/plain")},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "Idempotency-Key" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
 async def test_upload_document_into_current_folder(client: AsyncClient):
     headers = await _auth(client, "docfolderupload")
     folder_resp = await client.post(
@@ -111,6 +812,48 @@ async def test_upload_document_into_current_folder(client: AsyncClient):
     root_list = await client.get("/api/v1/documents?folder_id=root", headers=headers)
     assert root_list.status_code == 200
     assert all(item["id"] != doc["id"] for item in root_list.json()["items"])
+
+
+@pytest.mark.asyncio
+async def test_upload_document_into_workspace_folder_uses_workspace_storage(
+    client: AsyncClient, db_session, monkeypatch, tmp_path,
+):
+    from apps.api.routers import documents
+    from packages.core.models.document import Document
+    from packages.core.models.user import User
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+    from packages.core.services.workspace_artifacts import (
+        ensure_workspace_artifact_folder,
+        workspace_artifact_storage_base,
+    )
+
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents.settings, "MANOR_FS_ROOT", str(tmp_path))
+    headers = await _auth(client, "docworkspacefolderupload")
+    user = (await db_session.execute(select(User).where(
+        User.email == "docworkspacefolderupload@test.com",
+    ))).scalar_one()
+    workspace = Workspace(entity_id=user.entity_id, name="Upload target", status="active")
+    db_session.add(workspace)
+    await db_session.flush()
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace.id, user_id=user.id, role="owner", status="active",
+    ))
+    folder = await ensure_workspace_artifact_folder(db_session, workspace)
+    folder_id = folder.id
+    storage_base = workspace_artifact_storage_base(workspace.artifact_folder_id)
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/v1/documents/upload?folder_id={folder_id}&visibility=workspace",
+        headers=headers,
+        files={"file": ("release-source.txt", b"source bytes", "text/plain")},
+    )
+    assert response.status_code == 201, response.text
+    document = await db_session.get(Document, response.json()["id"])
+    assert document.folder_id == folder_id
+    assert document.fs_path == f"{storage_base}/release-source.txt"
+    assert (tmp_path / user.entity_id / document.fs_path).read_bytes() == b"source bytes"
 
 
 @pytest.mark.asyncio
@@ -150,6 +893,9 @@ async def test_browse_documents_returns_root_direct_folders_and_files(client: As
     assert payload["total"] == 1
     assert payload["total_documents"] == 1
     assert payload["total_files"] == 2
+    from packages.core.config import get_settings
+
+    assert payload["max_upload_mb"] == get_settings().MANOR_MAX_UPLOAD_MB
 
 
 @pytest.mark.asyncio
@@ -467,6 +1213,59 @@ async def test_move_document_to_folder_moves_filesystem_payload(client: AsyncCli
         settings.DEPLOYMENT_MODE = old_mode
 
 
+@pytest.mark.asyncio
+async def test_file_document_in_folder_preserves_canonical_source(client: AsyncClient, tmp_path):
+    import packages.core.database as db_module
+    from packages.core.config import get_settings
+    from packages.core.services.document_service import create_document, get_document
+
+    settings = get_settings()
+    old_enabled, old_root, old_mode = (
+        settings.MANOR_FS_ENABLED, settings.MANOR_FS_ROOT, settings.DEPLOYMENT_MODE,
+    )
+    settings.MANOR_FS_ENABLED = True
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.DEPLOYMENT_MODE = "oss"
+    try:
+        headers = await _auth(client, "docfiling")
+        me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+        entity_id = me["entity_id"]
+        source = tmp_path / entity_id / "Old" / "brief.md"
+        source.parent.mkdir(parents=True)
+        source.write_text("# Brief\n", encoding="utf-8")
+        async with db_module.async_session() as db:
+            doc = await create_document(
+                db, entity_id, name="brief.md", fs_path="Old/brief.md",
+                file_size=source.stat().st_size, file_type="md",
+                mime_type="text/markdown", source="upload",
+            )
+            await db.commit()
+            doc_id = doc.id
+        folder_resp = await client.post(
+            "/api/v1/documents/folders", headers=headers, json={"name": "New"},
+        )
+        folder_id = folder_resp.json()["id"]
+
+        response = await client.post(
+            f"/api/v1/documents/{doc_id}/move", headers=headers,
+            json={"folder_id": folder_id, "filing_only": True},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["folder_id"] == folder_id
+        assert response.json()["fs_path"] == "Old/brief.md"
+        assert source.read_text(encoding="utf-8") == "# Brief\n"
+        assert not (tmp_path / entity_id / "New" / "brief.md").exists()
+        async with db_module.async_session() as db:
+            stored = await get_document(db, doc_id, entity_id)
+            assert stored.folder_id == folder_id
+            assert stored.fs_path == "Old/brief.md"
+    finally:
+        settings.MANOR_FS_ENABLED = old_enabled
+        settings.MANOR_FS_ROOT = old_root
+        settings.DEPLOYMENT_MODE = old_mode
+
+
 
 
 @pytest.mark.asyncio
@@ -508,6 +1307,7 @@ async def test_list_documents_keeps_missing_filesystem_payload_visible_without_s
         )
         doc = Document(
             entity_id=entity_id,
+            owner_id=user_id,
             name="missing.md",
             fs_path="docs/missing.md",
             file_type="md",
@@ -975,6 +1775,43 @@ async def test_create_blank_pptx_document_downloads_real_powerpoint(client: Asyn
 
 
 @pytest.mark.asyncio
+async def test_create_blank_xlsx_document_downloads_editable_workbook(client: AsyncClient, tmp_path):
+    from openpyxl import load_workbook
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    old_root = settings.MANOR_FS_ROOT
+    old_enabled = settings.MANOR_FS_ENABLED
+    settings.MANOR_FS_ROOT = str(tmp_path)
+    settings.MANOR_FS_ENABLED = True
+    try:
+        headers = await _auth(client, "xlsx_blank_user")
+        created = await client.post(
+            "/api/v1/documents/create-blank",
+            headers=headers,
+            json={"name": "Budget", "file_type": "xlsx"},
+        )
+
+        assert created.status_code == 201
+        doc = created.json()
+        assert doc["name"] == "Budget.xlsx"
+        assert doc["file_type"] == "xlsx"
+        assert doc["mime_type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        assert doc["file_size"] > 0
+
+        download = await client.get(
+            f"/api/v1/documents/{doc['id']}/download",
+            headers=headers,
+        )
+        assert download.status_code == 200
+        workbook = load_workbook(io.BytesIO(download.content))
+        assert workbook.active.title == "Sheet"
+    finally:
+        settings.MANOR_FS_ROOT = old_root
+        settings.MANOR_FS_ENABLED = old_enabled
+
+
+@pytest.mark.asyncio
 async def test_downloading_legacy_ppt_never_rebuilds_or_overwrites_original(client: AsyncClient, tmp_path):
     from packages.core.config import get_settings
 
@@ -1096,6 +1933,7 @@ async def test_legacy_office_file_exposes_editable_copy_without_overwriting_orig
         assert editable.status_code == 200, editable.text
         assert editable.content == b"PK\x03\x04editable-pptx"
         assert "legacy-deck.pptx" in editable.headers["content-disposition"]
+        assert editable.headers["x-manor-source-sha256"] == hashlib.sha256(legacy_bytes).hexdigest()
 
         object_image = await client.get(
             f"/api/v1/documents/{upload.json()['id']}/slides/0/objects/42",
@@ -1292,7 +2130,10 @@ async def test_slide_images_accept_pptx_metadata_without_name_extension(
         cache_dir: str,
         *,
         source_ext: str | None = None,
+        admission_timeout: float | None = None,
+        should_abandon=None,
     ):
+        assert admission_timeout is not None and admission_timeout > 0
         nonlocal render_calls
         render_calls += 1
         assert pptx_path.endswith("Personal Deck")
@@ -1461,6 +2302,103 @@ async def test_slide_render_failure_does_not_expose_internal_error(
 
     assert exc_info.value.status_code == 502
     assert exc_info.value.detail == "Slide rendering failed"
+
+
+@pytest.mark.asyncio
+async def test_slide_images_busy_render_is_a_retryable_503(tmp_path, monkeypatch):
+    from apps.api.routers import documents as documents_router
+    from packages.core.services.slide_renderer import OfficeRenderBusyError
+
+    entity_id = "slide-busy"
+    document_id = "01M0SLIDEBUSY00000000000"
+    source_path = tmp_path / entity_id / "Deck.pptx"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"PK\x03\x04pptx")
+    doc = SimpleNamespace(
+        id=document_id,
+        entity_id=entity_id,
+        name="Deck.pptx",
+        fs_path="Deck.pptx",
+        file_type="pptx",
+        mime_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    )
+    user = SimpleNamespace(id="user-id", entity_id=entity_id, role="admin")
+    observed = {}
+
+    class FakeDb:
+        async def rollback(self):
+            return None
+
+    async def visible_document(*_args, **_kwargs):
+        return doc
+
+    async def busy_render(*_args, **kwargs):
+        observed.update(kwargs)
+        raise OfficeRenderBusyError("all slots busy")
+
+    monkeypatch.setattr(documents_router.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents_router.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents_router, "get_visible_document", visible_document)
+    monkeypatch.setattr("packages.core.services.slide_renderer.render_slides", busy_render)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await documents_router.get_slide_images(document_id, user=user, db=FakeDb())
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["code"] == "office_render_busy"
+    assert exc_info.value.headers["Retry-After"].isdigit()
+    assert observed["admission_timeout"] > 0
+
+
+@pytest.mark.asyncio
+async def test_slide_images_report_rendered_pixel_size(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from apps.api.routers import documents as documents_router
+
+    entity_id = "slide-size"
+    document_id = "01M0SLIDESIZE00000000000"
+    source_path = tmp_path / entity_id / "Legacy.ppt"
+    source_path.parent.mkdir(parents=True)
+    source_path.write_bytes(b"legacy")
+    doc = SimpleNamespace(
+        id=document_id,
+        entity_id=entity_id,
+        name="Legacy.ppt",
+        fs_path="Legacy.ppt",
+        file_type="ppt",
+        mime_type="application/vnd.ms-powerpoint",
+    )
+    user = SimpleNamespace(id="user-id", entity_id=entity_id, role="admin")
+    version_dir = tmp_path / "render" / "0123456789abcdef"
+    version_dir.mkdir(parents=True)
+    rendered = version_dir / "slide-1.png"
+    Image.new("RGB", (1500, 1125), "white").save(rendered, format="PNG")
+
+    class FakeDb:
+        async def rollback(self):
+            return None
+
+    async def visible_document(*_args, **_kwargs):
+        return doc
+
+    async def render(*_args, **_kwargs):
+        return [str(rendered)]
+
+    async def finish_preview(operation, **_kwargs):
+        return await operation
+
+    monkeypatch.setattr(documents_router.settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(documents_router.settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(documents_router, "get_visible_document", visible_document)
+    monkeypatch.setattr(documents_router, "_finish_document_preview", finish_preview)
+    monkeypatch.setattr("packages.core.services.slide_renderer.render_slides", render)
+
+    payload = await documents_router.get_slide_images(document_id, user=user, db=FakeDb())
+
+    assert payload["width"] == 1500 and payload["height"] == 1125
+    assert payload["slides"][0]["width"] == 1500
+    assert payload["slides"][0]["height"] == 1125
 
 
 @pytest.mark.asyncio
@@ -2032,6 +2970,62 @@ async def test_document_thumbnail_uses_authorized_redis_hot_cache(client: AsyncC
 
 
 @pytest.mark.asyncio
+async def test_document_thumbnail_hot_cache_rechecks_access_after_rollback(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from apps.api.routers import documents as documents_router
+    from packages.core.services.knowledge_hot_cache import CachedKnowledgeBlob
+
+    document = SimpleNamespace(id="doc-1")
+    user = SimpleNamespace(id="user-1", entity_id="entity-1", role="member")
+
+    async def rollback():
+        del user.id, user.entity_id, user.role
+
+    db = SimpleNamespace(rollback=rollback)
+    get_visible = AsyncMock(return_value=document)
+    monkeypatch.setattr(documents_router, "get_visible_document", get_visible)
+    monkeypatch.setattr(documents_router, "document_hot_cache_key", lambda *_: "same-version")
+    monkeypatch.setattr(
+        documents_router,
+        "get_cached_document_blob",
+        AsyncMock(return_value=CachedKnowledgeBlob(data=b"jpeg", media_type="image/jpeg")),
+    )
+
+    response = await documents_router.document_thumbnail("doc-1", user=user, db=db)
+
+    assert response.body == b"jpeg"
+    assert get_visible.await_count == 2
+    get_visible.assert_awaited_with(
+        db, "doc-1", "entity-1", user_id="user-1", role="member",
+    )
+
+
+@pytest.mark.asyncio
+async def test_document_thumbnail_generated_file_rechecks_access_after_rollback(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from apps.api.routers import documents as documents_router
+
+    document = SimpleNamespace(id="doc-1")
+    user = SimpleNamespace(id="user-1", entity_id="entity-1", role="member")
+
+    async def rollback():
+        del document.id, user.id, user.entity_id, user.role
+
+    db = SimpleNamespace(rollback=rollback)
+    get_visible = AsyncMock(return_value=SimpleNamespace(id="doc-1"))
+    monkeypatch.setattr(documents_router, "get_visible_document", get_visible)
+    monkeypatch.setattr(documents_router, "document_hot_cache_key", lambda *_: "same-version")
+
+    await documents_router._revalidate_thumbnail_response(db, document=document, user=user)
+
+    get_visible.assert_awaited_once_with(
+        db, "doc-1", "entity-1", user_id="user-1", role="member",
+    )
+
+
+@pytest.mark.asyncio
 async def test_generate_image_thumbnail_is_bounded_jpeg(tmp_path):
     from PIL import Image
 
@@ -2327,7 +3321,7 @@ async def test_delete_document_serializes_against_comment_create(client: AsyncCl
     )
     doc_id = upload.json()["id"]
     loop = asyncio.get_running_loop()
-    cleanup_reached = asyncio.Event()
+    release_comment = asyncio.Event()
     release_delete = asyncio.Event()
     delete_query_pid: asyncio.Future[int] = loop.create_future()
     comment_query_pid: asyncio.Future[int] = loop.create_future()
@@ -2338,7 +3332,6 @@ async def test_delete_document_serializes_against_comment_create(client: AsyncCl
         count = await original_cleanup(db, *args, **kwargs)
         pid = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
         delete_query_pid.set_result(int(pid))
-        cleanup_reached.set()
         await release_delete.wait()
         return count
 
@@ -2346,7 +3339,23 @@ async def test_delete_document_serializes_against_comment_create(client: AsyncCl
         pid = (await db.execute(text("SELECT pg_backend_pid()"))).scalar_one()
         if not comment_query_pid.done():
             comment_query_pid.set_result(int(pid))
+        await release_comment.wait()
         return await original_get_document_for_update(db, *args, **kwargs)
+
+    async def wait_for_pid(pid_future, request_task, phase):
+        done, _ = await asyncio.wait(
+            {pid_future, request_task},
+            timeout=10,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request_task in done:
+            response = await request_task
+            pytest.fail(
+                f"{phase}: request returned {response.status_code} before the barrier: "
+                f"{response.text}"
+            )
+        assert pid_future in done, f"Timed out reaching {phase}"
+        return pid_future.result()
 
     monkeypatch.setattr(document_service, "delete_resource_comments", paused_cleanup)
     monkeypatch.setattr(
@@ -2354,10 +3363,10 @@ async def test_delete_document_serializes_against_comment_create(client: AsyncCl
         "get_document_for_update",
         tracked_get_document_for_update,
     )
-    delete_task = asyncio.create_task(
-        client.delete(f"/api/v1/documents/{doc_id}", headers=headers)
-    )
-    await asyncio.wait_for(cleanup_reached.wait(), timeout=2)
+    # Get the real comment request ready before taking the deletion locks.
+    # Request startup/connection latency is not the concurrency invariant;
+    # the PostgreSQL blocking relationship below is.
+    delete_task = None
     comment_task = asyncio.create_task(
         client.post(
             "/api/v1/comments",
@@ -2370,26 +3379,57 @@ async def test_delete_document_serializes_against_comment_create(client: AsyncCl
         )
     )
     try:
-        delete_pid = await asyncio.wait_for(delete_query_pid, timeout=2)
-        comment_pid = await asyncio.wait_for(comment_query_pid, timeout=2)
+        comment_pid = await wait_for_pid(
+            comment_query_pid, comment_task, "comment lock entry"
+        )
+        delete_task = asyncio.create_task(
+            client.delete(f"/api/v1/documents/{doc_id}", headers=headers)
+        )
+        delete_pid = await wait_for_pid(
+            delete_query_pid, delete_task, "document comment cleanup"
+        )
+        release_comment.set()
         async with db_module.async_session() as observer_db:
             blocking_pids: list[int] = []
-            deadline = loop.time() + 2
+            deadline = loop.time() + 10
             while loop.time() < deadline:
+                if comment_task.done():
+                    response = await comment_task
+                    pytest.fail(
+                        "Comment request completed before deletion released its lock: "
+                        f"{response.status_code} {response.text}"
+                    )
                 blocking_pids = list(
-                    await observer_db.scalar(
-                        text("SELECT pg_blocking_pids(:pid)"),
-                        {"pid": comment_pid},
+                    await asyncio.wait_for(
+                        observer_db.scalar(
+                            text("SELECT pg_blocking_pids(:pid)"),
+                            {"pid": comment_pid},
+                        ),
+                        timeout=10,
                     )
                     or []
                 )
                 if delete_pid in blocking_pids:
                     break
                 await asyncio.sleep(0.01)
-            assert delete_pid in blocking_pids
-    finally:
+            assert delete_pid in blocking_pids, (
+                f"Comment backend {comment_pid} was not blocked by deletion backend "
+                f"{delete_pid}; observed blockers: {blocking_pids}"
+            )
         release_delete.set()
-        delete_response, comment_response = await asyncio.gather(delete_task, comment_task)
+        delete_response, comment_response = await asyncio.wait_for(
+            asyncio.gather(delete_task, comment_task), timeout=10
+        )
+    finally:
+        release_comment.set()
+        release_delete.set()
+        request_tasks = [task for task in (delete_task, comment_task) if task is not None]
+        for task in request_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.wait_for(
+            asyncio.gather(*request_tasks, return_exceptions=True), timeout=10
+        )
     assert delete_response.status_code == 204
     assert comment_response.status_code == 404
     db_session.expire_all()

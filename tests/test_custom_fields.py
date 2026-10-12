@@ -165,7 +165,8 @@ async def test_workspace_dashboard(client: AsyncClient):
     ws_id = ws_resp.json()["id"]
 
     # Create tasks in this workspace
-    for i, status in enumerate(["pending", "pending", "in_progress", "completed"]):
+    # A Workspace task without a service scope cannot enter in_progress.
+    for i, status in enumerate(["pending", "pending", "cancelled", "completed"]):
         t = await client.post(
             "/api/v1/tasks",
             headers=headers,
@@ -179,7 +180,10 @@ async def test_workspace_dashboard(client: AsyncClient):
         assert t.status_code == 201
         if status != "pending":
             task_id = t.json()["id"]
-            await client.put(f"/api/v1/tasks/{task_id}", headers=headers, json={"status": status})
+            updated = await client.put(
+                f"/api/v1/tasks/{task_id}", headers=headers, json={"status": status},
+            )
+            assert updated.status_code == 200, updated.text
 
     # Get workspace dashboard
     resp = await client.get(f"/api/v1/workspaces/{ws_id}/dashboard", headers=headers)
@@ -189,7 +193,7 @@ async def test_workspace_dashboard(client: AsyncClient):
     assert dash["workspace_id"] == ws_id
     assert dash["tasks"]["total"] == 4
     assert dash["tasks"]["by_status"]["pending"] == 2
-    assert dash["tasks"]["by_status"]["in_progress"] == 1
+    assert dash["tasks"]["by_status"]["cancelled"] == 1
     assert dash["tasks"]["by_status"]["completed"] == 1
     assert dash["documents"]["total"] == 0
     assert dash["agents"]["total"] == 0

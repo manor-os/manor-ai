@@ -19,6 +19,8 @@ from packages.core.models.workspace import Workspace
 from packages.core.services.channels import ADAPTERS
 from packages.core.services.channels.base import ChannelAdapter
 from tests.test_document_permissions import _create_entity_user
+from packages.core.governance.approval_policy_service import initialize_workspace_approval
+from tests.approval_settings_test_utils import set_workspace_test_approval
 
 
 # ── Fakes ───────────────────────────────────────────────────────────────────
@@ -104,6 +106,8 @@ async def _seed_workspace(
         settings=settings,
     )
     db.add(ws)
+    await db.flush()
+    await initialize_workspace_approval(db, ws)
     await db.commit()
     return ws
 
@@ -126,6 +130,14 @@ async def _seed_cc(
         status="active",
     )
     db.add(cc)
+    await db.flush()
+    # This fixture exercises notification/history, with consent limited to
+    # replies through the one channel configuration created above.
+    await set_workspace_test_approval(db, workspace_id=workspace_id, entity_id=entity_id,
+        actor_id=owner_user_id, user_rules=[{"effect": "allow", "selector": {
+            "kind": "resource", "action_key": "external_message.send",
+            "account_id": None, "resource_kind": "resource", "resource_ids": [cc.id],
+        }}])
     await db.commit()
     return cc
 
@@ -576,3 +588,113 @@ async def test_workspace_inbound_recipients_override(
     # No owner-targeted telegram push (only the customer's agent reply went out)
     owner_pushes = [s for s in fake_telegram.sent if s["to"] == owner_contact.source_id]
     assert owner_pushes == []
+
+
+@pytest.mark.asyncio
+async def test_inbound_turn_is_not_repeated_in_agent_history(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+    monkeypatch,
+):
+    """The agent loop appends the current message itself; history stops before it."""
+    from packages.core.services import channel_gateway
+
+    calls: list[dict[str, Any]] = []
+
+    async def _record_agent(**kwargs):
+        calls.append(kwargs)
+        return channel_gateway.ChannelAgentRunResult(content=f"reply {len(calls)}")
+
+    monkeypatch.setattr(channel_gateway, "run_channel_agent_turn", _record_agent)
+    owner = await _register(client, "history_owner")
+    ws = await _seed_workspace(db_session, entity_id=owner["entity_id"])
+    cc = await _seed_cc(
+        db_session, entity_id=owner["entity_id"], workspace_id=ws.id, owner_user_id=owner["user_id"],
+    )
+    await _seed_binding(
+        db_session, entity_id=owner["entity_id"], workspace_id=ws.id, user_id=owner["user_id"], cc=cc,
+    )
+    customer = await _seed_contact(
+        db_session, entity_id=owner["entity_id"], cc=cc, source_id="tg_history_customer",
+    )
+
+    for content in ("first ping", "second ping"):
+        await channel_gateway.dispatch_inbound(
+            entity_id=owner["entity_id"],
+            channel_config_id=cc.id,
+            channel_type="telegram",
+            sender_id=customer.source_id,
+            sender_name="Customer",
+            chat_id=customer.source_id,
+            content=content,
+        )
+
+    assert [call["current_message"] for call in calls] == ["first ping", "second ping"]
+    assert calls[0]["history"] == []
+    assert calls[1]["history"] == [
+        {"role": "user", "content": "first ping"},
+        {"role": "assistant", "content": "reply 1"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_channel_agent_sees_its_previous_tool_output_on_the_next_inbound(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _RecordingAdapter,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from packages.core.services import channel_agent_runtime, workspace_runtime
+    from packages.core.services.channel_gateway import dispatch_inbound
+
+    call = {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_order", "type": "function", "function": {"name": "lookup_order", "arguments": "{\"id\": \"A7\"}"}},
+    ]}
+    output = {"role": "tool", "tool_call_id": "call_order", "content": "Order A7: shipped 2026-09-30 via UPS 1Z999"}
+    seen: list[dict] = []
+
+    async def resolve_runtime(*_args, **kwargs):
+        return SimpleNamespace(
+            tool_profile="workspace_agent", workspace_id=kwargs.get("workspace_id"), task_id=None,
+            thread_ref_kind=None, thread_ref_id=None, bound_tool_names=None, is_master=False,
+            mcp_allowed_names=None, extra_context="",
+        )
+
+    async def prepare_appendix(*_args, **_kwargs):
+        return SimpleNamespace(tool_schemas=[], allowed_tool_names=set(), envelope=SimpleNamespace(metadata={}))
+
+    async def execute_loop(**kwargs):
+        seen.append(kwargs)
+        reply = f"reply {len(seen)}"
+        return SimpleNamespace(content=reply, stop_reason="end_turn", messages=[
+            {"role": "system", "content": kwargs["system_prompt"]}, *(kwargs["initial_messages"] or []),
+            {"role": "user", "content": kwargs["user_message"]}, call, output, {"role": "assistant", "content": reply},
+        ])
+
+    monkeypatch.setattr(workspace_runtime, "resolve_workspace_runtime", resolve_runtime)
+    monkeypatch.setattr(channel_agent_runtime, "resolve_channel_base_prompt", AsyncMock(return_value="base"))
+    monkeypatch.setattr(channel_agent_runtime, "runtime_prepare_prompt_appendix_for_turn", prepare_appendix)
+    monkeypatch.setattr(channel_agent_runtime, "runtime_execute_channel_agent_loop", execute_loop)
+
+    owner = await _register(client, "transcript_channel_owner")
+    ws = await _seed_workspace(db_session, entity_id=owner["entity_id"])
+    cc = await _seed_cc(db_session, entity_id=owner["entity_id"], workspace_id=ws.id, owner_user_id=owner["user_id"])
+    await _seed_binding(db_session, entity_id=owner["entity_id"], workspace_id=ws.id, user_id=owner["user_id"], cc=cc)
+    customer = await _seed_contact(db_session, entity_id=owner["entity_id"], cc=cc, source_id="tg_transcript_customer")
+
+    for content in ("where is order A7?", "which carrier?"):
+        result = await dispatch_inbound(
+            entity_id=owner["entity_id"], channel_config_id=cc.id, channel_type="telegram",
+            sender_id=customer.source_id, sender_name="Customer", chat_id=customer.source_id, content=content,
+        )
+        assert result["status"] == "ok", result
+
+    assert seen[0]["initial_messages"] is None
+    follow_up = seen[1]["initial_messages"]
+    assert call in follow_up and output in follow_up
+    assert [m["content"] for m in follow_up if m["role"] == "user"] == ["where is order A7?"]
+    assert seen[1]["carry_previous_checkpoint"] is False

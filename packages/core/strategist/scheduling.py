@@ -49,6 +49,7 @@ async def install_strategist_schedule(
     workspace: Workspace,
     *,
     cadence: str,
+    user_id: str | None = None,
 ) -> ScheduledJob:
     """Install / refresh the workspace's Strategist review cron. Caller
     commits."""
@@ -75,6 +76,8 @@ async def install_strategist_schedule(
             "enabled": True,
             "consecutive_errors": 0,
         }
+        if user_id and not existing.user_id:
+            updates["user_id"] = user_id
         result = await ScheduledJobMutationFactory.apply(db, existing, updates)
         if result is None:
             raise ValueError(f"scheduled job {job_id} no longer exists")
@@ -84,6 +87,7 @@ async def install_strategist_schedule(
         id=generate_ulid(),
         job_id=job_id,
         entity_id=workspace.entity_id,
+        user_id=user_id,
         workspace_id=workspace.id,
         name=f"Strategist review: {workspace.name}",
         job_type="interval" if schedule_kind in {"every", "interval"} else "cron",

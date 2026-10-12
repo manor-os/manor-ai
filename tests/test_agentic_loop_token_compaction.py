@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,9 +11,13 @@ from packages.core.ai.agentic_loop import (
     _add_usage,
     _compact_messages,
     _compact_search_tools_result_for_context,
+    PAGED_TEXT_RESULT_MAX_CHARS,
+    SKILL_HANDOFF_RESULT_MAX_CHARS,
+    TOOL_RESULT_MAX_CHARS,
     _compact_tool_result_for_context,
     _context_compaction_token_threshold,
     _estimate_context_attribution,
+    _strip_inapplicable_integration_continuations,
     LOOP_COMPACT_RATIO,
     MAX_CONTEXT_TOKENS,
 )
@@ -22,9 +27,21 @@ from packages.core.ai.llm_client import (
     _openai_content_to_anthropic_blocks,
 )
 from packages.core.ai.runtime.tool_visibility import MASTER_ALWAYS_LOADED
+from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
 from packages.core.ai.runtime import RUNTIME_AGENTIC_MAX_TOKENS
 from packages.core.ai.tool_pool import ToolPool
 from packages.core.services.usage_service import log_token_usage
+
+
+@pytest.fixture
+def compaction_model(monkeypatch):
+    from packages.core.ai.runtime.context_compaction import CHECKPOINT_FIELDS
+    response = {key: [] for key in CHECKPOINT_FIELDS}
+    response["evidence"] = ["Historical assistant records summarized for budget test."]
+    model = AsyncMock(return_value=(json.dumps(response), {}))
+    module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(module, "runtime_execute_agentic_compaction_completion", model)
+    return model
 
 
 def test_default_agentic_loop_budget_is_200_rounds() -> None:
@@ -223,6 +240,27 @@ def test_compact_search_tools_result_preserves_mcp_option_status():
     assert options["linkedin"]["execution_mode"] == "official_api"
 
 
+def test_compact_search_tools_result_preserves_permission_failure():
+    compact = json.loads(
+        _compact_search_tools_result_for_context(
+            {
+                "error": "blocked_by_permission",
+                "message": "The delegated agent's current tool binding has been revoked.",
+                "matched_rule": "permission.agent_tool_binding",
+                "action_key": "runtime.discovery",
+                "capability_id": "runtime.discovery",
+                "tool": "search_tools",
+            },
+            [],
+        )
+    )
+
+    assert compact["error"] == "blocked_by_permission"
+    assert compact["matched_rule"] == "permission.agent_tool_binding"
+    assert compact["message"].endswith("revoked.")
+    assert compact["tool"] == "search_tools"
+
+
 def test_compact_search_tools_result_keeps_servers_and_bounded_suppressed_mcp():
     """Review #2 (tool_discovery_v2 B1): servers[] and suppressed_mcp used
     to be dropped entirely by this compaction step, silently discarding
@@ -264,27 +302,151 @@ def test_compact_search_tools_result_keeps_servers_and_bounded_suppressed_mcp():
         assert len(item["matched_tools"]) <= 3
 
 
-def test_compact_tool_result_preserves_json_metadata():
+def test_compact_paged_read_keeps_pagination_honest():
+    """A cut page must say where the visible text stops, not where the tool's
+    page stopped: the docx run read 20 000 chars of SKILL.md, saw 1 680 after
+    compaction, trusted next_offset=20000 and never saw the docx-js section."""
     raw = json.dumps(
         {
-            "path": "big.md",
+            "path": "/skill/SKILL.md",
             "content": "A" * 10_000,
-            "next_offset": 120,
-            "hint": "Call read_file with offset=next_offset.",
+            "size": 20_000,
+            "offset": 0,
+            "returned_chars": 10_000,
+            "next_offset": 10_000,
+            "truncated": True,
+            "hint": "More content is available; call read_file again with offset=10000.",
         },
         ensure_ascii=False,
     )
 
-    compact = _compact_tool_result_for_context("read_file", raw, max_chars=1400)
+    compact = _compact_tool_result_for_context("sandbox", raw, max_chars=1400)
     data = json.loads(compact)
 
-    assert len(compact) < 1400
-    assert data["path"] == "big.md"
-    assert data["next_offset"] == 120
-    assert data["hint"] == "Call read_file with offset=next_offset."
-    assert len(data["content"]) < 1200
-    assert data["_tool_result_truncated"]["tool"] == "read_file"
+    assert len(compact) <= 1400
+    kept = len(data["content"])
+    assert 0 < kept < 1400
+    assert data["content"] == "A" * kept, "a clean prefix, so the continuation is exact"
+    assert data["returned_chars"] == kept
+    assert data["next_offset"] == kept
+    assert data["truncated"] is True
+    assert f"offset={kept}" in data["hint"]
+    assert data["_tool_result_truncated"]["strategy"] == "paged_text"
     assert data["_tool_result_truncated"]["original_chars"] == len(raw)
+
+
+def test_compact_paged_read_rewrites_web_fetch_and_host_read_shapes():
+    fetched = json.dumps(
+        {
+            "url": "https://example.test",
+            "offset": 500,
+            "chars_returned": 6_000,
+            "total_chars": 9_000,
+            "next_offset": 6_500,
+            "truncated": True,
+            "hint": "continue",
+            "content": "B" * 6_000,
+        }
+    )
+    data = json.loads(_compact_tool_result_for_context("web_fetch", fetched, max_chars=1200))
+    kept = len(data["content"])
+    assert data["chars_returned"] == kept
+    assert data["next_offset"] == 500 + kept
+    assert f"offset={500 + kept}" in data["hint"]
+
+    host = json.dumps(
+        {
+            "path": "notes.md",
+            "mode": "lines",
+            "offset": 0,
+            "char_offset": 0,
+            "lines_returned": 300,
+            "next_offset": 300,
+            "next_char_offset": None,
+            "truncated": False,
+            "char_truncated": False,
+            "hint": None,
+            "content": "C" * 8_000,
+        }
+    )
+    data = json.loads(_compact_tool_result_for_context("read_file", host, max_chars=1500))
+    kept = len(data["content"])
+    assert data["next_char_offset"] == kept
+    assert data["char_truncated"] is True
+    assert data["next_offset"] is None, "a line-based continuation would skip the cut lines"
+    assert f"char_offset={kept}" in data["hint"]
+
+
+def test_paged_reads_get_the_expanded_budget_on_first_delivery():
+    raw = json.dumps(
+        {
+            "path": "/skill/SKILL.md",
+            "content": "D" * 9_000,
+            "size": 9_000,
+            "offset": 0,
+            "returned_chars": 9_000,
+            "next_offset": None,
+            "truncated": False,
+            "hint": None,
+        }
+    )
+    assert _compact_tool_result_for_context("sandbox", raw) == raw
+    assert PAGED_TEXT_RESULT_MAX_CHARS > len(raw) > TOOL_RESULT_MAX_CHARS
+
+
+def _handoff(skill_md: str) -> str:
+    content = "\n".join(
+        [
+            "✓ Sandbox ready for skill **docx**",
+            "## Runtime Skill Execution Contract",
+            "- The complete `/skill/SKILL.md` is provided below and is authoritative.",
+            "",
+            "## Skill Instructions",
+            "The following is the complete `/skill/SKILL.md` loaded for this run. Follow it exactly.",
+            "",
+            skill_md,
+        ]
+    )
+    return json.dumps(
+        {
+            "status": "sandbox_ready",
+            "skill": "docx",
+            "content": content,
+            "sandbox_id": "sbx-1",
+            "loaded_tools": ["sandbox"],
+        },
+        ensure_ascii=False,
+    )
+
+
+def test_skill_handoff_delivers_the_whole_skill_md():
+    """The handoff declares SKILL.md authoritative; a 20 KB skill must reach
+    the model whole instead of being compacted to the default budget."""
+    raw = _handoff("# docx\n" + ("workflow line\n" * 1_400))
+    assert TOOL_RESULT_MAX_CHARS < len(raw) < SKILL_HANDOFF_RESULT_MAX_CHARS
+    assert _compact_tool_result_for_context("invoke_skill", raw) == raw
+
+
+def test_skill_handoff_over_the_cap_is_cut_at_the_tail_with_a_skill_offset():
+    skill_md = "# docx\n" + ("workflow line\n" * 4_000)
+    raw = _handoff(skill_md)
+    assert len(raw) > SKILL_HANDOFF_RESULT_MAX_CHARS
+
+    data = json.loads(_compact_tool_result_for_context("invoke_skill", raw))
+    content = data["content"]
+    assert len(json.dumps(data, ensure_ascii=False)) <= SKILL_HANDOFF_RESULT_MAX_CHARS
+    assert content.startswith("✓ Sandbox ready"), "the contract at the head survives"
+    assert "## Skill Instructions" in content
+    assert "/skill/SKILL.md is cut here at char" in content
+    assert f"of {len(skill_md)}." in content
+    # The marker's offset points at the first char the model did not see.
+    import re
+
+    offset = int(re.search(r"offset=(\d+)", content).group(1))
+    shown = content.split("\n\n[Context limit")[0]
+    skill_shown = shown.split("Follow it exactly.\n\n", 1)[1]
+    assert skill_md[:offset] == skill_shown
+    assert data["_tool_result_truncated"]["strategy"] == "skill_handoff_tail"
 
 
 def test_compact_tool_result_hides_internal_truncation_marker_for_paginated_document_lists():
@@ -375,6 +537,68 @@ def test_compact_tool_result_truncates_plain_text_with_digest():
     assert "truncated 5000 chars" in compact
 
 
+@pytest.mark.parametrize("budget", [1000, 1500])
+def test_compact_successful_source_update_keeps_structured_contract_diagnostics(budget):
+    from packages.core.ai.runtime.streams import runtime_tool_call_error
+
+    result = {
+        "status": "source_updated",
+        "source_saved": True,
+        "session_id": "session-123",
+        "project_path": "video/project",
+        "source_revision": 4,
+        "contract_valid": False,
+        "contract_violations": [{
+            "file": "index.motion.json",
+            "rule": "motion_assertions",
+            "pointer": "/assertions/0",
+            "expected": "appearsBy or keepsMoving",
+            "repair_hint": "Replace the unsupported assertion kind",
+        }],
+        "authoring_contract": {"minimal_example": "x" * 4000},
+        "events": [{"message": "verbose progress " * 400}],
+    }
+    raw = json.dumps(result)
+    assert runtime_tool_call_error(raw) is None
+
+    compact = _compact_tool_result_for_context("video_edit", raw, max_chars=budget)
+    payload = json.loads(compact)
+
+    assert len(compact) <= budget
+    assert payload["status"] == "source_updated"
+    assert payload["source_saved"] is True
+    assert payload["session_id"] == "session-123"
+    assert payload["contract_valid"] is False
+    assert payload["contract_violations"][0]["file"] == "index.motion.json"
+    assert payload["contract_violations"][0]["pointer"] == "/assertions/0"
+    assert "preview" not in payload
+    assert payload.get("contract") != "tool_error"
+    assert runtime_tool_call_error(compact) is None
+    assert _compact_tool_result_for_context("video_edit", compact, max_chars=budget) == compact
+
+
+def test_compact_successful_diagnostics_omits_oversized_identity_without_partial_value():
+    result = {
+        "status": "source_updated",
+        "source_saved": True,
+        "session_id": "session-" + "s" * 1000,
+        "project_path": "project/" + "p" * 1000,
+        "source_revision": 2,
+        "contract_valid": False,
+        "contract_violations": [{"file": "index.motion.json", "pointer": "/assertions/0"}],
+    }
+
+    compact = _compact_tool_result_for_context("video_edit", json.dumps(result), max_chars=1000)
+    payload = json.loads(compact)
+
+    assert len(compact) <= 1000
+    assert payload["omitted_identity_fields"] == ["session_id", "project_path"]
+    assert "session_id" not in payload
+    assert "project_path" not in payload
+    assert payload["source_revision"] == 2
+    assert payload["contract_violations"][0]["pointer"] == "/assertions/0"
+
+
 def test_context_compaction_threshold_reserves_output_tokens():
     base_threshold = int(MAX_CONTEXT_TOKENS * LOOP_COMPACT_RATIO)
 
@@ -384,11 +608,64 @@ def test_context_compaction_threshold_reserves_output_tokens():
 
 
 @pytest.mark.asyncio
-async def test_compact_messages_summarizes_long_non_tool_history():
+async def test_compact_messages_accounts_for_tool_schemas_below_message_limit(monkeypatch):
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(loop_module, "MAX_CONTEXT_TOKENS", 10_000)
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(9):
+        messages.extend([
+            {"role": "user", "content": f"question {index}"},
+            {"role": "assistant", "content": "answer " * 150},
+        ])
+    messages.append({"role": "user", "content": "Keep working on this request."})
+    assert await _compact_messages(
+        messages, model=None, temperature=0, output_reserve_tokens=500,
+    ) == messages
+    async def summarize(prompt, **kwargs):
+        from packages.core.ai.runtime.context_compaction import CHECKPOINT_FIELDS
+        return json.dumps({field: ["Prior conversation"] if field == "objective" else [] for field in CHECKPOINT_FIELDS}), {}
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_compaction_completion", summarize)
+    compacted = await _compact_messages(
+        messages, model=None, temperature=0, output_reserve_tokens=500,
+        tools=[{"type": "function", "function": {
+            "name": "large_schema", "description": "schema " * 4000,
+        }}],
+    )
+    assert len(compacted) < len(messages)
+    assert compacted[0] == messages[0]
+    assert compacted[-1] == messages[-1]
+    assert any("[Earlier conversation compacted" in str(m.get("content")) for m in compacted)
+
+
+@pytest.mark.asyncio
+async def test_compaction_preserves_followup_request_after_prior_tool_turns(monkeypatch):
+    # Exercises the opt-in message-count guard (lossless path); the loop default is token-only.
+    monkeypatch.setattr("packages.core.ai.agentic_loop.MESSAGE_COUNT_COMPACT_THRESHOLD", 40)
+    current_request = "Follow up on the saved finding. " * 30
+    messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "Old task"}]
+    for index in range(20):
+        if index == 4:
+            messages.append({"role": "user", "content": current_request})
+        messages.extend([
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": f"call_{index}", "function": {"name": "lookup", "arguments": "{}"},
+            }]},
+            {"role": "tool", "tool_call_id": f"call_{index}", "content": "result"},
+            {"role": "assistant", "content": "checked"},
+        ])
+    compacted = await _compact_messages(
+        messages, model=None, temperature=0, active_user_message=current_request,
+    )
+    assert len(compacted) < len(messages)
+    assert any(m.get("content") == current_request for m in compacted)
+
+
+@pytest.mark.asyncio
+async def test_compact_messages_summarizes_long_non_tool_history(compaction_model):
     messages = [{"role": "system", "content": "system"}]
     for index in range(25):
         messages.append({"role": "user", "content": f"old question {index}"})
-        messages.append({"role": "assistant", "content": f"old answer {index}"})
+        messages.append({"role": "assistant", "content": f"old answer {index}" + "x" * 14_000})
     messages.append({"role": "user", "content": "fresh request"})
 
     compacted = await _compact_messages(messages, model=None, temperature=0)
@@ -402,10 +679,12 @@ async def test_compact_messages_summarizes_long_non_tool_history():
 
 
 @pytest.mark.asyncio
-async def test_compact_messages_anchors_on_current_user_message_not_first():
+async def test_compact_messages_anchors_on_current_user_message_not_first(monkeypatch):
     """Regression: with long chat history plus >3 tool rounds, compaction must
     preserve the *current* turn's user message verbatim — not resurrect the
     conversation's first (stale) question as the active task."""
+    # Exercises the opt-in message-count guard (lossless path); the loop default is token-only.
+    monkeypatch.setattr("packages.core.ai.agentic_loop.MESSAGE_COUNT_COMPACT_THRESHOLD", 40)
     messages = [{"role": "system", "content": "system"}]
     for index in range(30):
         messages.append({"role": "user", "content": f"stale topic {index}"})
@@ -435,7 +714,140 @@ async def test_compact_messages_anchors_on_current_user_message_not_first():
 
 
 @pytest.mark.asyncio
-async def test_agentic_loop_compacts_initial_history_before_first_llm_call(monkeypatch):
+async def test_compact_messages_preserves_fresh_tool_result_after_long_history(compaction_model):
+    messages = [{"role": "system", "content": "system"}]
+    for index in range(20):
+        messages.append({"role": "user", "content": f"old question {index}"})
+        messages.append({"role": "assistant", "content": f"old answer {index}" + "x" * 18_000})
+    messages.append({"role": "user", "content": "update the current record"})
+    messages.append({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_fresh",
+            "type": "function",
+            "function": {"name": "update_record", "arguments": "{}"},
+        }],
+    })
+    fresh_result = json.dumps({
+        "ok": True,
+        "padding": "x" * 2500,
+        "record": {"id": "record-42", "revision": 7, "status": "updated"},
+    })
+    assert 1000 < len(fresh_result) < 4000
+    messages.append({
+        "role": "tool",
+        "tool_call_id": "call_fresh",
+        "content": fresh_result,
+    })
+
+    compacted = await _compact_messages(messages, model=None, temperature=0)
+
+    assert len(compacted) < len(messages)
+    assert any(
+        "[Earlier conversation compacted" in str(message.get("content", ""))
+        for message in compacted
+    )
+    assert compacted[-2]["tool_calls"][0]["id"] == "call_fresh"
+    assert compacted[-1]["content"] == fresh_result
+
+
+@pytest.mark.asyncio
+async def test_approval_resume_summary_receives_complete_fresh_tool_result(monkeypatch):
+    pending_call = {
+        "id": "call_approved_update",
+        "name": "update_record",
+        "arguments": {"record_id": "record-42"},
+    }
+    checkpoint_messages = [{"role": "system", "content": "system"}]
+    for index in range(20):
+        checkpoint_messages.append({"role": "user", "content": f"old question {index}"})
+        checkpoint_messages.append({"role": "assistant", "content": f"old answer {index}"})
+    checkpoint_messages.extend([
+        {"role": "user", "content": "approve the record update"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": pending_call["id"],
+                "type": "function",
+                "function": {
+                    "name": pending_call["name"],
+                    "arguments": json.dumps(pending_call["arguments"]),
+                },
+            }],
+        },
+    ])
+    checkpoint = RuntimeAgentCheckpoint(
+        messages=checkpoint_messages,
+        usage={},
+        rounds=1,
+        tool_calls_made=[],
+        pending_tool_call=pending_call,
+        disable_followup_tools=True,
+    )
+    fresh_result = json.dumps({
+        "ok": True,
+        "padding": "x" * 2500,
+        "record": {"id": "record-42", "revision": 7, "status": "updated"},
+    })
+    observed_tool_result = ""
+
+    async def tool_executor(name, args):
+        assert name == "update_record"
+        assert args["record_id"] == "record-42"
+        return fresh_result
+
+    async def fake_text_completion(messages, **kwargs):
+        nonlocal observed_tool_result
+        del kwargs
+        observed_tool_result = next(
+            message["content"]
+            for message in reversed(messages)
+            if message.get("role") == "tool"
+        )
+        payload = json.loads(observed_tool_result)
+        record = payload["record"]
+        return (
+            f"Record {record['id']} updated to revision {record['revision']}.",
+            {"prompt": 10, "completion": 5, "total": 15},
+        )
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    tool_completion = AsyncMock()
+    monkeypatch.setattr(
+        loop_module,
+        "runtime_execute_agentic_round_text_completion",
+        fake_text_completion,
+    )
+    monkeypatch.setattr(
+        loop_module,
+        "runtime_execute_agentic_round_tool_completion",
+        tool_completion,
+    )
+
+    result = await loop_module.agentic_loop(
+        system_prompt="system",
+        user_message="approve the record update",
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "update_record",
+                "parameters": {"type": "object"},
+            },
+        }],
+        tool_executor=tool_executor,
+        resume_checkpoint=checkpoint.to_dict(),
+        max_rounds=3,
+    )
+
+    assert observed_tool_result == fresh_result
+    assert result.content == "Record record-42 updated to revision 7."
+    tool_completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agentic_loop_compacts_initial_history_before_first_llm_call(monkeypatch, compaction_model):
     observed_message_count = 0
     observed_compacted = False
 
@@ -453,7 +865,7 @@ async def test_agentic_loop_compacts_initial_history_before_first_llm_call(monke
     initial_messages = []
     for index in range(25):
         initial_messages.append({"role": "user", "content": f"history question {index}"})
-        initial_messages.append({"role": "assistant", "content": f"history answer {index}"})
+        initial_messages.append({"role": "assistant", "content": f"history answer {index}" + "x" * 14_000})
 
     loop_module = importlib.import_module("packages.core.ai.agentic_loop")
     monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_text_completion", fake_chat_completion)
@@ -473,7 +885,7 @@ async def test_agentic_loop_compacts_initial_history_before_first_llm_call(monke
 
 
 @pytest.mark.asyncio
-async def test_agentic_loop_compacts_before_max_rounds_summary(monkeypatch):
+async def test_agentic_loop_compacts_before_max_rounds_summary(monkeypatch, compaction_model):
     tool_calls_done = 0
     summary_observed_compacted = False
 
@@ -505,7 +917,8 @@ async def test_agentic_loop_compacts_before_max_rounds_summary(monkeypatch):
         return json.dumps({"path": args["path"], "content": "x" * 2000})
 
     loop_module = importlib.import_module("packages.core.ai.agentic_loop")
-    monkeypatch.setattr(loop_module, "MESSAGE_COUNT_COMPACT_THRESHOLD", 8)
+    # Token pressure is the only trigger; a small window makes three reads enough.
+    monkeypatch.setattr(loop_module, "MAX_CONTEXT_TOKENS", 24_000)
     monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_chat_completion_with_tools)
     monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", fake_chat_completion)
 
@@ -523,7 +936,7 @@ async def test_agentic_loop_compacts_before_max_rounds_summary(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agentic_loop_auto_executes_recommended_next_calls(monkeypatch):
+async def test_agentic_loop_model_selects_recommended_tool_after_observing_result(monkeypatch):
     llm_calls = 0
     executed: list[tuple[str, dict]] = []
 
@@ -540,6 +953,17 @@ async def test_agentic_loop_auto_executes_recommended_next_calls(monkeypatch):
                         "arguments": {"diagnostic": True},
                     }
                 ],
+                {"prompt": 10, "completion": 1, "total": 11},
+            )
+        if llm_calls == 2:
+            assert any(
+                message.get("role") == "tool"
+                and "recommended_next_calls" in str(message.get("content") or "")
+                for message in messages
+            )
+            return (
+                "",
+                [{"id": "call_model_selected", "name": "mcp__chrome__click_ref", "arguments": {"ref": "btn_1"}}],
                 {"prompt": 10, "completion": 1, "total": 11},
             )
         return "done", None, {"prompt": 10, "completion": 1, "total": 11}
@@ -582,13 +1006,58 @@ async def test_agentic_loop_auto_executes_recommended_next_calls(monkeypatch):
 
     assert result.content == "done"
     assert result.rounds == 3
-    assert [name for name, _ in executed] == [
-        "mcp__chrome__observe",
-        "mcp__chrome__click_ref",
-        "mcp__chrome__observe",
-    ]
+    assert [name for name, _ in executed] == ["mcp__chrome__observe", "mcp__chrome__click_ref"]
     assert executed[1][1]["ref"] == "btn_1"
-    assert executed[2][1]["diagnostic"] is True
+
+
+@pytest.mark.asyncio
+async def test_agentic_loop_does_not_force_provider_recommended_calls(monkeypatch):
+    executed: list[str] = []
+    llm_calls = 0
+
+    async def fake_chat_completion_with_tools(messages, tools, **kwargs):
+        nonlocal llm_calls
+        llm_calls += 1
+        if llm_calls == 1:
+            return (
+                "",
+                [{"id": "call_observe", "name": "mcp__chrome__observe", "arguments": {}}],
+                {"prompt": 10, "completion": 1, "total": 11},
+            )
+        assert any(
+            message.get("role") == "tool"
+            and "recommended_next_calls" in str(message.get("content") or "")
+            for message in messages
+        )
+        return "No further action needed.", None, {"prompt": 10, "completion": 1, "total": 11}
+
+    async def fake_executor(name, args):
+        executed.append(name)
+        return json.dumps({
+            "status": "recovery_allowed",
+            "recovery_allowed": True,
+            "recommended_next_calls": [
+                {"name": "mcp__chrome__click_ref", "arguments": {"ref": "btn_1"}},
+            ],
+        })
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_chat_completion_with_tools)
+
+    result = await loop_module.agentic_loop(
+        system_prompt="test",
+        user_message="inspect browser",
+        tools=[
+            {"type": "function", "function": {"name": "mcp__chrome__observe", "parameters": {"type": "object"}}},
+            {"type": "function", "function": {"name": "mcp__chrome__click_ref", "parameters": {"type": "object"}}},
+        ],
+        tool_executor=fake_executor,
+        max_rounds=3,
+    )
+
+    assert result.content == "No further action needed."
+    assert executed == ["mcp__chrome__observe"]
+    assert llm_calls == 2
 
 
 @pytest.mark.asyncio
@@ -636,6 +1105,54 @@ async def test_agentic_loop_deduplicates_identical_tool_results(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_agentic_loop_keeps_repeated_successful_validation_diagnostics(monkeypatch):
+    calls = 0
+    observed_tool_messages: list[dict] = []
+
+    async def fake_chat_completion_with_tools(messages, tools, **kwargs):
+        nonlocal calls, observed_tool_messages
+        calls += 1
+        if calls in (1, 2):
+            return (
+                "",
+                [{"id": f"call_{calls}", "name": "video_edit", "arguments": {"operation": "save"}}],
+                {"prompt": 10, "completion": 1, "total": 11},
+            )
+        observed_tool_messages = [message for message in messages if message.get("role") == "tool"]
+        return "done", None, {"prompt": 10, "completion": 1, "total": 11}
+
+    async def fake_executor(_name, _args):
+        return json.dumps({
+            "status": "source_updated",
+            "source_saved": True,
+            "session_id": "session-123",
+            "contract_valid": False,
+            "contract_violations": [{"file": "index.motion.json", "pointer": "/assertions/0"}],
+            "authoring_contract": {"minimal_example": "x" * 4000},
+        })
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_chat_completion_with_tools)
+
+    result = await loop_module.agentic_loop(
+        system_prompt="test",
+        user_message="save video source",
+        tools=[{"type": "function", "function": {"name": "video_edit", "parameters": {"type": "object"}}}],
+        tool_executor=fake_executor,
+        max_rounds=5,
+    )
+
+    assert result.content == "done"
+    assert len(observed_tool_messages) == 2
+    for message in observed_tool_messages:
+        payload = json.loads(message["content"])
+        assert payload["status"] == "source_updated"
+        assert payload["contract_valid"] is False
+        assert payload["contract_violations"][0]["pointer"] == "/assertions/0"
+        assert "repeated_tool_result" not in payload
+
+
+@pytest.mark.asyncio
 async def test_agentic_loop_preserves_executor_failure_in_model_context_for_recovery(monkeypatch):
     calls = 0
     observed_tool_content = ""
@@ -648,8 +1165,8 @@ async def test_agentic_loop_preserves_executor_failure_in_model_context_for_reco
                 "",
                 [{
                     "id": "call_private",
-                    "name": "mcp__private_server__private_action",
-                    "arguments": {},
+                    "name": "read_file",
+                    "arguments": {"path": "project/script.md"},
                 }],
                 {"prompt": 10, "completion": 1, "total": 11},
             )
@@ -662,8 +1179,7 @@ async def test_agentic_loop_preserves_executor_failure_in_model_context_for_reco
 
     async def failing_executor(_name, _args):
         raise RuntimeError(
-            "Tool key mcp__private_server__private_action does not match "
-            "registered handler mcp__other__action"
+            "Tool key read_file does not match registered handler test_reader"
         )
 
     loop_module = importlib.import_module("packages.core.ai.agentic_loop")
@@ -679,7 +1195,7 @@ async def test_agentic_loop_preserves_executor_failure_in_model_context_for_reco
         tools=[{
             "type": "function",
             "function": {
-                "name": "mcp__private_server__private_action",
+                "name": "read_file",
                 "parameters": {"type": "object"},
             },
         }],
@@ -688,11 +1204,151 @@ async def test_agentic_loop_preserves_executor_failure_in_model_context_for_reco
     )
 
     assert result.content == "done"
-    assert observed_tool_content.startswith(
-        "Tool error (mcp__private_server__private_action):"
-    )
-    assert "mcp__other__action" in observed_tool_content
+    error = json.loads(observed_tool_content)
+    assert error["contract"] == "tool_error"
+    assert error["tool"] == "read_file"
+    assert "Tool error (read_file):" in error["message"]
+    assert "test_reader" in observed_tool_content
     assert "registered handler" in observed_tool_content
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [
+        ({"integration_account_continuation": "invented"}, {}),
+        (
+            {
+                "integration_account_selection": "all",
+                "integration_account_continuation": "/",
+            },
+            {
+                "integration_account_selection": "all",
+            },
+        ),
+    ],
+)
+def test_agentic_loop_normalizes_model_integration_continuations(arguments, expected):
+    calls = [{"name": "mcp__email__list_folders", "arguments": arguments}]
+
+    _strip_inapplicable_integration_continuations(calls)
+
+    assert calls[0]["arguments"] == expected
+
+
+@pytest.mark.asyncio
+async def test_agentic_loop_replays_all_account_continuation_without_model_token_access(
+    monkeypatch,
+):
+    model_calls = 0
+    final_model_messages = ""
+
+    async def fake_chat_completion_with_tools(messages, tools, **kwargs):
+        nonlocal model_calls, final_model_messages
+        model_calls += 1
+        if model_calls == 1:
+            return (
+                "",
+                [{
+                    "id": "email-folders",
+                    "name": "mcp__email__list_folders",
+                    "arguments": {
+                        "integration_account_selection": "all",
+                        "integration_account_continuation": "/",
+                    },
+                }],
+                {"prompt": 10, "completion": 1, "total": 11},
+            )
+        final_model_messages = json.dumps(messages, ensure_ascii=False)
+        return "done", None, {"prompt": 10, "completion": 1, "total": 11}
+
+    executor_calls: list[tuple[str, dict]] = []
+    observed_results: list[str] = []
+
+    async def fake_executor(name, arguments):
+        executor_calls.append((name, dict(arguments)))
+        if len(executor_calls) == 1:
+            return json.dumps({
+                "server": "email",
+                "tool": "list_folders",
+                "integration_account_selection": "all",
+                "status": "partial",
+                "omitted_account_count": 1,
+                "continuation": {
+                    "mode": "all",
+                    "argument": "integration_account_continuation",
+                    "token": "runtime-signed-token",
+                    "instruction": "Send this token back.",
+                },
+                "results": [{"integration_account_id": "account-1", "ok": True}],
+            })
+        return json.dumps({
+            "server": "email",
+            "tool": "list_folders",
+            "integration_account_selection": "all",
+            "status": "complete",
+            "omitted_account_count": 0,
+            "continuation": None,
+            "results": [{"integration_account_id": "account-2", "ok": True}],
+        })
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    monkeypatch.setattr(
+        loop_module,
+        "runtime_execute_agentic_round_tool_completion",
+        fake_chat_completion_with_tools,
+    )
+
+    result = await loop_module.agentic_loop(
+        system_prompt="test",
+        user_message="list folders across all connected email accounts",
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "mcp__email__list_folders",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "integration_account_selection": {"type": "string"},
+                        "integration_account_continuation": {"type": "string"},
+                    },
+                },
+            },
+        }],
+        tool_executor=fake_executor,
+        on_tool_end=lambda _name, result, *_args: observed_results.append(str(result)),
+        max_rounds=5,
+    )
+
+    assert result.content == "done"
+    assert result.tool_calls_made == [
+        "mcp__email__list_folders",
+        "mcp__email__list_folders",
+    ]
+    call_ids = [arguments["_runtime_tool_call_id_from_context"] for _, arguments in executor_calls]
+    assert call_ids[0] == "email-folders"
+    assert call_ids[1].startswith("auto_2_0_")
+    assert call_ids[1] != call_ids[0]
+    assert [
+        (name, {key: value for key, value in arguments.items() if key != "_runtime_tool_call_id_from_context"})
+        for name, arguments in executor_calls
+    ] == [
+        (
+            "mcp__email__list_folders",
+            {"integration_account_selection": "all"},
+        ),
+        (
+            "mcp__email__list_folders",
+            {
+                "integration_account_selection": "all",
+                "integration_account_continuation": "runtime-signed-token",
+            },
+        ),
+    ]
+    assert model_calls == 2
+    assert "runtime-signed-token" not in final_model_messages
+    assert "_runtime_tool_call_id_from_context" not in final_model_messages
+    assert "runtime-signed-token" not in "".join(observed_results)
+    assert "runtime_managed" in final_model_messages
 
 
 def test_prompt_cache_counts_reusable_history_prefix():
@@ -846,10 +1502,12 @@ async def test_anthropic_native_tool_completion_streams_text_before_tool_use(mon
     assert usage["finish_reason"] == "tool_use"
     assert usage["total"] == 15
     assert captured["payload"]["stream"] is True
-    assert events == [
+    assert [event for event in events if event[0] == "text_delta"] == [
         ("text_delta", {"content": "我先查看"}),
         ("text_delta", {"content": "一下当前任务。"}),
     ]
+    # The tool call is announced (display only) once its name streams in.
+    assert [payload["name"] for kind, payload in events if kind == "tool_call_draft"] == ["manor"]
 
 
 @pytest.mark.asyncio
@@ -875,21 +1533,12 @@ async def test_anthropic_native_stream_resets_text_before_buffered_fallback(monk
         def stream(self, *_args, **_kwargs):
             return FakeStreamContext()
 
-    class FakeBufferedResponse:
-        def json(self):
-            return {
-                "content": [{"type": "text", "text": "new"}],
-                "usage": {"input_tokens": 2, "output_tokens": 1},
-                "stop_reason": "end_turn",
-                "model": "claude-sonnet-4-6",
-            }
-
     async def fake_get_llm_client():
         return FakeClient()
 
     async def fake_post_with_retry(url, headers, payload):
         del url, headers, payload
-        return FakeBufferedResponse()
+        raise AssertionError("buffered fallback must not run after a stalled stream")
 
     async def stream_handler(event_name: str, payload: dict):
         events.append((event_name, payload))
@@ -903,23 +1552,20 @@ async def test_anthropic_native_stream_resets_text_before_buffered_fallback(monk
         fake_post_with_retry,
     )
 
-    content, tool_calls, usage = await _anthropic_messages_completion(
-        api_key="sk-ant-api03-test-key-1234567890",
-        base_url="https://api.anthropic.com/v1",
-        model="anthropic/claude-sonnet-4.6",
-        messages=[{"role": "user", "content": "hello"}],
-        temperature=0,
-        max_tokens=16,
-        stream_handler=stream_handler,
-    )
+    with pytest.raises(TimeoutError, match="stalled"):
+        await _anthropic_messages_completion(
+            api_key="sk-ant-api03-test-key-1234567890",
+            base_url="https://api.anthropic.com/v1",
+            model="anthropic/claude-sonnet-4.6",
+            messages=[{"role": "user", "content": "hello"}],
+            temperature=0,
+            max_tokens=16,
+            stream_handler=stream_handler,
+        )
 
-    assert content == "new"
-    assert tool_calls is None
-    assert usage["total"] == 3
     assert events == [
         ("text_delta", {"content": "old"}),
         ("text_reset", {}),
-        ("text_delta", {"content": "new"}),
     ]
 
 

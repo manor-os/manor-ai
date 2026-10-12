@@ -6,9 +6,20 @@ from typing import Optional
 
 from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, Numeric, String
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Index,
+    Integer,
+    Numeric,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
+
+from packages.core.constants.workspace_operations import WorkspaceOperationDraftStatus
 
 from .base import Base, SoftDeleteMixin, TimestampMixin, generate_ulid
 
@@ -176,11 +187,41 @@ class AgentSubscription(Base, TimestampMixin):
     can serve multiple workspaces without cross-talk.
     """
     __tablename__ = "agent_subscriptions"
+    __table_args__ = (
+        UniqueConstraint(
+            "entity_id",
+            "agent_id",
+            "workspace_id",
+            "service_key",
+            name="uq_agent_subscriptions_workspace_service_agent",
+        ),
+        Index(
+            "uq_agent_subscriptions_workspace_default_agent",
+            "entity_id",
+            "agent_id",
+            "workspace_id",
+            unique=True,
+            postgresql_where=text(
+                "workspace_id IS NOT NULL AND service_key IS NULL"
+            ),
+        ),
+        Index(
+            "uq_agent_subscriptions_personal_owner",
+            "entity_id",
+            "agent_id",
+            "owner_user_id",
+            unique=True,
+            postgresql_where=text(
+                "workspace_id IS NULL AND owner_user_id IS NOT NULL"
+            ),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     agent_id: Mapped[str] = mapped_column(String(26), nullable=False)
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
+    owner_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     name: Mapped[Optional[str]] = mapped_column(String(255))  # friendly label shown in pickers
     service_key: Mapped[Optional[str]] = mapped_column(String(100))  # which workspace service this agent is bound to
     custom_prompt: Mapped[Optional[str]] = mapped_column(String)
@@ -228,7 +269,11 @@ class WorkspaceOperationDraft(Base, TimestampMixin):
     created_by_user_id: Mapped[Optional[str]] = mapped_column(String(26))
     source_event_id: Mapped[Optional[str]] = mapped_column(String(100))
     base_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
-    status: Mapped[str] = mapped_column(String(20), nullable=False, default="open", server_default="open")
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False,
+        default=WorkspaceOperationDraftStatus.OPEN.value,
+        server_default=WorkspaceOperationDraftStatus.OPEN.value,
+    )
     current_state: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     patches: Mapped[list] = mapped_column(JSONB, nullable=False, server_default="[]")
     validation: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")

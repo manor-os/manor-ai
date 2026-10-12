@@ -130,6 +130,37 @@ class TaskOutputProtocolError(ValueError):
     """A Task completion omitted or violated its representation contract."""
 
 
+class SubmittedStepFailure(RuntimeError):
+    """Validated failure control, never a value of a step's output schema."""
+
+    def __init__(self, *, summary: str, failure: dict[str, Any]) -> None:
+        super().__init__(summary)
+        self.summary = summary
+        self.failure = deepcopy(failure)
+
+    @classmethod
+    def from_submission(cls, payload: dict[str, Any]) -> SubmittedStepFailure:
+        schema = {
+            "type": "object",
+            "required": ["summary", "failure"],
+            "properties": {
+                "summary": {"type": "string"},
+                "failure": task_failure_control_schema(),
+            },
+            "not": {"required": ["result"]},
+        }
+        error = next(SchemaContractValidatorFactory.build(schema).iter_errors(payload), None)
+        if error is not None:
+            # Report the rule, not model-authored values that may be sensitive.
+            raise TaskOutputProtocolError(
+                f"invalid failed submit_result: {error.json_path} violates {error.validator}"
+            )
+        return cls(
+            summary=payload["summary"].strip() or payload["failure"]["reason"],
+            failure=payload["failure"],
+        )
+
+
 @dataclass(frozen=True)
 class OutputContract:
     """Immutable view of one materialized ``expected_output_schema``.
@@ -232,8 +263,8 @@ class OutputContract:
         intentionally separate from ``result is None`` because JSON ``null``
         may be a valid value under a custom schema; the dispatcher must still
         run the schema validator to distinguish omission from allowed null.
-        A failed Task envelope is the sole exception: it carries control
-        failure evidence instead of pretending to have produced a deliverable.
+        A validated failed submission carries control evidence instead of
+        pretending to have produced a deliverable.
         """
 
         return self.is_hard
@@ -250,29 +281,45 @@ class OutputContract:
             return True
         return self.has_schema and _normalize_step_kind(step_kind) not in {"llm", "subagent"}
 
-    def require_submission_result(self, payload: Any) -> None:
-        """Reject an omitted result while preserving explicit JSON ``null``.
+    def require_submission_result(self, payload: Any) -> SubmittedStepFailure | None:
+        """Require a success result or return validated failure control.
 
         The submit tool remains tolerant so malformed model arguments can be
         captured for diagnostics.  The worker calls this gate immediately
         after capture; a payload containing ``result: null`` is deliberately
         allowed through to JSON Schema validation, where a ``type: null``
-        contract can accept it. Failed Task envelopes may omit the deliverable
-        because their failure block is the authoritative terminal evidence.
+        contract can accept it. Failed submissions omit the deliverable and
+        must instead provide a valid, exclusive failure-control branch.
         """
 
-        failed_task_envelope = (
-            self.kind is OutputContractKind.TASK_ENVELOPE
+        if (
+            self.requires_result
             and isinstance(payload, dict)
             and normalize_step_result_status(payload.get("status"))
             is StepResultStatus.FAILED
-        )
-        if self.requires_result and not failed_task_envelope and (
+        ):
+            return SubmittedStepFailure.from_submission(payload)
+        if self.requires_result and (
             not isinstance(payload, dict) or "result" not in payload
         ):
             raise MissingOutputContract(
                 f"{self.kind.value} requires submit_result.result"
             )
+        if self.requires_result:
+            status = normalize_step_result_status(payload.get("status"))
+            branch_payload = {
+                **payload,
+                "status": (status or StepResultStatus.SUCCEEDED).value,
+            }
+            # Validate only the representation branch here. The declared
+            # success payload is still validated by Dispatcher after evidence
+            # capture; model-facing and Runtime exclusivity share one schema.
+            branch = task_output_terminal_branch_schema("result")
+            if not SchemaContractValidatorFactory.build(branch).is_valid(branch_payload):
+                raise TaskOutputProtocolError(
+                    "successful submit_result must not include failure control"
+                )
+        return None
 
     def require_task_output_value_kind(
         self,
@@ -534,15 +581,31 @@ def task_expected_output_json_schema(value: Any) -> dict[str, Any] | None:
     return schema
 
 
+#: One entry of ``failure.blockers`` — the model-facing words that turn a vague
+#: "could not proceed" into something the operator can act on. Shared by the
+#: tolerant default ``submit_result`` failure block and the hard contract.
+TASK_FAILURE_BLOCKER_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "One concrete thing that is missing or must change before this step "
+        "can produce its deliverable: the input, evidence, permission, "
+        "credential, or human decision it is waiting on."
+    ),
+}
+
+
 def task_failure_control_schema() -> dict[str, Any]:
-    """Return the strict failure branch for a Task terminal result."""
+    """Return the shared failure control for Task and Plan step submissions."""
 
     return {
         "type": "object",
         "required": ["reason", "retryable"],
         "properties": {
-            "reason": {"type": "string", "minLength": 1},
-            "blockers": {"type": "array", "items": {"type": "string"}},
+            "reason": {"type": "string", "minLength": 1, "pattern": r"\S"},
+            "blockers": {
+                "type": "array",
+                "items": deepcopy(TASK_FAILURE_BLOCKER_ITEM_SCHEMA),
+            },
             "retryable": {"type": "boolean"},
             "requires_human": {"type": "boolean"},
         },
@@ -562,11 +625,11 @@ def task_output_terminal_branch_schema(
     *,
     success_properties: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the exclusive success/failure branch for a Task result.
+    """Build the exclusive success/failure branch for a step result.
 
-    Both the model-facing ``submit_result`` tool and the persisted StepResult
-    envelope use this factory so their required and forbidden members cannot
-    drift. An omitted tool status intentionally follows the success branch;
+    The model-facing ``submit_result`` tool for every hard contract and the
+    persisted Task StepResult envelope use this factory so their required and
+    forbidden members cannot drift. An omitted status follows the success branch;
     ``step_result_from_submit`` normalizes that omission to ``succeeded``.
     """
 

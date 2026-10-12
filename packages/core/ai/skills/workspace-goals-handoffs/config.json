@@ -1,0 +1,61 @@
+{
+  "name": "workspace-goals-handoffs",
+  "display_name": "Workspace Goals Handoffs",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Read and measure Workspace goals/stats, request Strategist planning and handle human input, Task blockers or configuration review decisions.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "manor"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [
+      "get_goal_status",
+      "update_goal_value",
+      "get_stat_status",
+      "record_stat_assessment",
+      "request_strategist_review",
+      "resolve_hitl",
+      "answer_task_blocker",
+      "visualize_ledgers",
+      "operation"
+    ],
+    "patch_ops": [
+      "goals.replace",
+      "goal.upsert",
+      "goal.measurement_sources.update"
+    ],
+    "route_terms": [
+      "goal",
+      "stat",
+      "metric",
+      "approve",
+      "approval",
+      "blocker",
+      "hitl",
+      "continue",
+      "目标",
+      "指标",
+      "复盘",
+      "继续",
+      "审批",
+      "批准",
+      "阻塞",
+      "待处理",
+      "拒绝"
+    ]
+  },
+  "search": {
+    "terms": ["okr", "kpi", "metrics", "stats", "approval", "human in the loop", "blocked task", "strategist", "review decision", "goal progress"],
+    "examples": ["show workspace goal progress", "task blocked needs my input", "ask strategist to plan goals", "review configuration approval decision"]
+  }
+}

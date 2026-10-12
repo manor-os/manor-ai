@@ -242,6 +242,8 @@ async def classify_general_chat_intent(
             ),
             timeout=GENERAL_CHAT_INTENT_TIMEOUT_SECONDS,
         )
+        if (result.usage or {}).get("error"):
+            return GeneralChatIntentDecision.agent_chat()
         payload = json.loads(str(result.content or ""))
         return GeneralChatIntentDecision.from_payload(
             payload,

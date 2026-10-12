@@ -4,9 +4,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import Response
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
+from packages.core.models.task import Task
 from packages.core.models.user import User
 from packages.core.services.bulk_service import (
     bulk_update_tasks,
@@ -16,7 +18,8 @@ from packages.core.services.bulk_service import (
     export_clients_csv,
     import_tasks_csv,
 )
-from apps.api.deps import get_current_user
+from packages.core.services.task_state_machine import TaskStatusTransitionError
+from apps.api.deps import get_current_user, require_workspace_writable
 
 router = APIRouter(prefix="/api/v1/bulk", tags=["bulk"])
 
@@ -43,6 +46,27 @@ class BulkResultResponse(BaseModel):
 
 # ── Endpoints ──
 
+async def _require_bulk_task_workspaces_writable(
+    db: AsyncSession,
+    *,
+    user: User,
+    task_ids: list[str],
+) -> None:
+    """Authorize the complete batch before mutating any Task."""
+
+    workspace_ids = {
+        str(workspace_id)
+        for workspace_id in (await db.execute(
+            select(Task.workspace_id).where(
+                Task.id.in_(task_ids),
+                Task.entity_id == user.entity_id,
+            )
+        )).scalars()
+        if workspace_id
+    }
+    for workspace_id in sorted(workspace_ids):
+        await require_workspace_writable(db, user, workspace_id)
+
 @router.post("/tasks/update", response_model=BulkResultResponse)
 async def bulk_update_tasks_endpoint(
     req: BulkUpdateTasksRequest,
@@ -52,7 +76,15 @@ async def bulk_update_tasks_endpoint(
     """Bulk update tasks — change status, priority, or assignee for multiple tasks."""
     if not req.task_ids:
         raise HTTPException(400, "task_ids must not be empty")
-    count = await bulk_update_tasks(db, user.entity_id, req.task_ids, req.updates)
+    await _require_bulk_task_workspaces_writable(
+        db,
+        user=user,
+        task_ids=req.task_ids,
+    )
+    try:
+        count = await bulk_update_tasks(db, user.entity_id, req.task_ids, req.updates)
+    except TaskStatusTransitionError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"count": count}
 
 
@@ -65,7 +97,20 @@ async def bulk_status_change(
     """Bulk status change for tasks."""
     if not req.task_ids:
         raise HTTPException(400, "task_ids must not be empty")
-    count = await bulk_update_task_status(db, user.entity_id, req.task_ids, req.status)
+    await _require_bulk_task_workspaces_writable(
+        db,
+        user=user,
+        task_ids=req.task_ids,
+    )
+    try:
+        count = await bulk_update_task_status(
+            db,
+            user.entity_id,
+            req.task_ids,
+            req.status,
+        )
+    except TaskStatusTransitionError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"count": count}
 
 

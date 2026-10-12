@@ -29,7 +29,6 @@ from packages.core.consolidators.contract import (
 )
 from packages.core.ledger import event_types as et
 from packages.core.models.hitl_request import HitlRequest
-from packages.core.models.governance import GovernancePolicy
 
 POLICY_BLOCK_RECURRING_THRESHOLD = 2
 
@@ -80,13 +79,11 @@ class RiskGovernanceConsolidator:
         denied = [e for e in approval_events if e.event_type == et.APPROVAL_DENIED]
         consumed = [e for e in approval_events if e.event_type == et.APPROVAL_CONSUMED]
 
-        policy_row = (await db.execute(
-            select(GovernancePolicy).where(GovernancePolicy.workspace_id == ws_id)
-        )).scalar_one_or_none()
-        standing_grants = list(
-            ((policy_row.policy or {}).get("auto_approve_actions") or [])
-            if policy_row is not None else []
-        )
+        from packages.core.governance.approval_policy_service import load_policy_chain
+        chain = await load_policy_chain(db, entity_id=ctx.review.entity_id, workspace_id=ws_id)
+        rules = [*chain.root.policy.rules, *(chain.local.policy.rules if chain.local else [])]
+        standing_grants = [rule.model_dump(mode="json") for rule in rules if rule.effect == "allow"]
+
 
         observations: list[Observation] = []
 
@@ -166,7 +163,7 @@ class RiskGovernanceConsolidator:
                 records_examined=(
                     len(approval_events) + len(policy_events)
                     + len(open_hitl_requests)
-                    + (1 if policy_row is not None else 0)
+                    + len(chain.root.policy_versions) + (1 if chain.local else 0)
                 ),
                 sources={
                     "approval_events": len(approval_events),

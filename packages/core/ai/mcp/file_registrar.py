@@ -248,18 +248,28 @@ async def _register_local(
         ext = path.suffix.lower()
         file_type, mime_type = _EXT_TO_TYPE.get(ext, ("", "application/octet-stream"))
         workspace_id = str(origin.get("workspace_id") or "").strip()
-        if workspace_id:
-            from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+        from packages.core.services.workspace_artifacts import (
+            ensure_workspace_document_folder,
+            infer_workspace_id_from_storage_path,
+        )
+        target_workspace_id = await infer_workspace_id_from_storage_path(
+            entity_id=entity_id, rel_path=rel_path,
+        )
+        if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+            return False
+        if target_workspace_id:
             folder_id = await ensure_workspace_document_folder(
                 entity_id=entity_id,
-                workspace_id=workspace_id,
+                workspace_id=target_workspace_id,
                 rel_path=rel_path,
             )
         else:
             from packages.core.services.knowledge_sync import ensure_folder_path
             rel_dir = str(Path(rel_path).parent).replace("\\", "/")
             rel_dir = "" if rel_dir == "." else rel_dir
-            folder_id = await ensure_folder_path(entity_id, rel_dir)
+            folder_id = await ensure_folder_path(
+                entity_id, rel_dir, owner_id=user_id or None,
+            )
 
         async with async_session() as db:
             existing = await db.execute(
@@ -279,6 +289,8 @@ async def _register_local(
                 mime_type=mime_type,
                 source=source,
                 created_by=user_id or None,
+                owner_id=user_id or None,
+                visibility="workspace" if target_workspace_id else "private",
                 folder_id=folder_id,
             )
             doc.source = source
@@ -326,15 +338,9 @@ async def _register_url(
         ext = Path(name).suffix.lower()
         file_type, mime_type = _EXT_TO_TYPE.get(ext, ("", "application/octet-stream"))
         origin = dict(origin or {})
-        workspace_id = str(origin.get("workspace_id") or "").strip()
+        # A runtime Workspace ID is provenance, not an instruction to share
+        # a remote result that has no Workspace destination folder.
         folder_id = None
-        if workspace_id:
-            from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
-            folder_id = await ensure_workspace_document_folder(
-                entity_id=entity_id,
-                workspace_id=workspace_id,
-                rel_path="",
-            )
 
         async with async_session() as db:
             # Check if already registered (by file_url)
@@ -371,6 +377,8 @@ async def _register_url(
                 mime_type=mime_type,
                 source=source,
                 created_by=user_id or None,
+                owner_id=user_id or None,
+                visibility="private",
                 folder_id=folder_id,
                 metadata=merge_document_metadata(
                     origin=origin,

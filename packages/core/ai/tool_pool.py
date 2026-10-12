@@ -38,7 +38,12 @@ from packages.core.ai.runtime.tool_search import (
 from packages.core.ai.runtime.tool_execution import (
     runtime_execute_registered_tool,
     runtime_preflight_tool_resolution,
+    runtime_settle_provider_approval_preflight_failure,
 )
+from packages.core.ai.runtime.tool_input_validation import (
+    runtime_tool_input_validation_result,
+)
+from packages.core.ai.runtime.tool_results import RuntimePreflightValidationError
 from packages.core.ai.runtime.tool_visibility import (
     runtime_tool_is_deferred,
 )
@@ -75,6 +80,7 @@ class ToolPool:
 
         register_all_tools(self)
         self._register_search_tools()
+        self._register_call_tool()
         self._initialized = True
         logger.info(
             "Tool pool initialized with %d tools (%d always-loaded, %d deferred)",
@@ -83,21 +89,53 @@ class ToolPool:
             sum(1 for n in self._tools if is_deferred(n)),
         )
 
-    def register(self, name: str, schema: dict, handler, deferred: bool = False):
-        self._tools[name] = {"schema": schema, "handler": handler, "deferred": deferred}
+    def register(
+        self,
+        name: str,
+        schema: dict,
+        handler,
+        deferred: bool = False,
+        *,
+        discoverable: bool = True,
+        guidance_skill: str | None = None,
+    ):
+        self._tools[name] = {
+            "schema": schema,
+            "handler": handler,
+            "deferred": deferred,
+            "discoverable": discoverable,
+            "guidance_skill": guidance_skill,
+        }
 
     @property
     def tool_count(self) -> int:
         return len(self._tools)
 
-    def registered_tool_names(self, *, prefix: str | None = None) -> tuple[str, ...]:
-        names = tuple(self._tools.keys())
+    def registered_tool_names(
+        self,
+        *,
+        prefix: str | None = None,
+        include_undiscoverable: bool = False,
+    ) -> tuple[str, ...]:
+        names = tuple(
+            name
+            for name, entry in self._tools.items()
+            if include_undiscoverable or entry.get("discoverable", True)
+        )
         if prefix is None:
             return names
         return tuple(name for name in names if name.startswith(prefix))
 
-    def registered_tool_schemas(self) -> tuple[tuple[str, dict], ...]:
-        return tuple((name, copy.deepcopy(entry.get("schema") or {})) for name, entry in self._tools.items())
+    def registered_tool_schemas(
+        self,
+        *,
+        include_undiscoverable: bool = False,
+    ) -> tuple[tuple[str, dict], ...]:
+        return tuple(
+            (name, copy.deepcopy(entry.get("schema") or {}))
+            for name, entry in self._tools.items()
+            if include_undiscoverable or entry.get("discoverable", True)
+        )
 
     def _prune_dynamic_mcp_tools(self, *, now: float | None = None) -> None:
         """Remove expired actor-scoped handlers from the process-local cache."""
@@ -125,6 +163,39 @@ class ToolPool:
                 schemas.append(schema)
         return schemas
 
+    async def get_schema_for_actor(
+        self,
+        name: str,
+        *,
+        entity_id: str,
+        user_id: str,
+    ) -> Optional[dict]:
+        """Resolve the exact current schema at an actor-scoped runtime boundary.
+
+        Static tools come from the process registry. Dynamically discovered MCP
+        actions are rehydrated against the actor's current account registry, so
+        approval resolution never treats a stale or missing schema as valid.
+        """
+
+        registered = self.get_schema(name)
+        if registered is not None:
+            return registered
+        resolution = await self._ensure_dynamic_mcp_tool_binding(
+            name,
+            entity_id=entity_id,
+            user_id=user_id,
+            allowed_tool_names={name},
+            runtime_envelope=None,
+        )
+        if (
+            resolution is None
+            or resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND
+            or resolution.binding is None
+            or not isinstance(resolution.binding.schema, dict)
+        ):
+            return None
+        return copy.deepcopy(resolution.binding.schema)
+
     async def execute(
         self,
         name: str,
@@ -147,8 +218,10 @@ class ToolPool:
         llm_metadata: dict[str, Any] | None = None,
         llm_model: str | None = None,
         runtime_envelope: Any | None = None,
+        chrome_sequence_child: bool = False,
     ) -> Any:
         """Execute a registered tool through the Runtime Harness."""
+        validation_started_at = time.perf_counter()
         resolution_preflight = runtime_preflight_tool_resolution(
             tool_name=name,
             arguments=arguments,
@@ -160,8 +233,33 @@ class ToolPool:
             task_id=task_id,
             runtime_envelope=runtime_envelope,
         )
+
+        async def settle_early_failure(result: str) -> str:
+            """Close a provider grant before any handler or provider I/O runs."""
+
+            harness = resolution_preflight.harness
+            envelope = harness.envelope if harness is not None else runtime_envelope
+            context = resolution_preflight.context
+            return await runtime_settle_provider_approval_preflight_failure(
+                harness=harness,
+                tool_name=name,
+                arguments=arguments,
+                result=result,
+                entity_id=(
+                    getattr(envelope, "entity_id", None)
+                    or (context.entity_id if context is not None else None)
+                    or entity_id
+                    or ""
+                ),
+                conversation_id=(
+                    getattr(envelope, "conversation_id", None)
+                    or (context.conversation_id if context is not None else None)
+                    or conversation_id
+                ),
+            )
+
         if resolution_preflight.blocked_result is not None:
-            return resolution_preflight.blocked_result
+            return await settle_early_failure(resolution_preflight.blocked_result)
         dynamic_resolution = await self._ensure_dynamic_mcp_tool_binding(
             name,
             entity_id=entity_id,
@@ -189,13 +287,35 @@ class ToolPool:
 
         blocked_result = blocked_dynamic_result(dynamic_resolution)
         if blocked_result is not None:
-            return blocked_result
+            return await settle_early_failure(blocked_result)
         dynamic_binding = (
             dynamic_resolution.binding
             if dynamic_resolution is not None
             and dynamic_resolution.status is RuntimeDynamicMCPRehydrationStatus.BOUND
             else None
         )
+
+        selected_schema = (
+            dynamic_binding.schema
+            if dynamic_binding is not None
+            else self.get_schema(name)
+        )
+        validation_result = (
+            runtime_tool_input_validation_result(
+                tool_name=name,
+                arguments=arguments,
+                tool_schema=selected_schema,
+            )
+            if selected_schema is not None
+            else None
+        )
+        if validation_result is not None:
+            if resolution_preflight.harness is not None:
+                resolution_preflight.harness.record_tool_block_result(
+                    name,
+                    validation_result,
+                )
+            return await settle_early_failure(validation_result)
 
         async def execute_registered(
             binding: RuntimeDynamicMCPToolBinding | None,
@@ -216,6 +336,7 @@ class ToolPool:
                 workspace_id=workspace_id,
                 conversation_id=conversation_id,
                 task_id=task_id,
+                step_id=step_id,
                 active_user_message=active_user_message,
                 manual_skill_selected=manual_skill_selected,
                 manual_skill_ids=manual_skill_ids,
@@ -225,6 +346,10 @@ class ToolPool:
                 llm_metadata=llm_metadata,
                 llm_model=llm_model,
                 runtime_envelope=runtime_envelope,
+                runtime_validation_duration_ms=(
+                    time.perf_counter() - validation_started_at
+                ) * 1000,
+                chrome_sequence_child=chrome_sequence_child,
                 discovered_tool_grant=(
                     RuntimeDynamicMCPToolGrantFactory.from_binding(name, binding)
                     if binding is not None
@@ -234,8 +359,16 @@ class ToolPool:
             )
 
         result = await execute_registered(dynamic_binding)
-        if dynamic_binding is None or not runtime_dynamic_mcp_result_is_stale(result):
+        if (
+            dynamic_binding is None
+            or not isinstance(result, RuntimePreflightValidationError)
+            or not runtime_dynamic_mcp_result_is_stale(result)
+        ):
             return result
+
+        # Only a host preflight rejection can refresh and revalidate in this
+        # call. Handler-side drift may own a pending effect; provider JSON and
+        # serialized results cannot authorize another dispatch.
 
         self._dynamic_mcp_tools.pop(
             (str(entity_id or ""), str(user_id or ""), name),
@@ -250,13 +383,25 @@ class ToolPool:
         )
         blocked_result = blocked_dynamic_result(refreshed_resolution)
         if blocked_result is not None:
-            return blocked_result
+            return await settle_early_failure(blocked_result)
         if (
             refreshed_resolution is None
             or refreshed_resolution.status is not RuntimeDynamicMCPRehydrationStatus.BOUND
             or refreshed_resolution.binding is None
         ):
             return result
+        validation_result = runtime_tool_input_validation_result(
+            tool_name=name,
+            arguments=arguments,
+            tool_schema=refreshed_resolution.binding.schema,
+        )
+        if validation_result is not None:
+            if resolution_preflight.harness is not None:
+                resolution_preflight.harness.record_tool_block_result(
+                    name,
+                    validation_result,
+                )
+            return await settle_early_failure(validation_result)
         return await execute_registered(refreshed_resolution.binding)
 
     def search(
@@ -327,8 +472,8 @@ class ToolPool:
                 entity_id=entity_id,
                 user_id=user_id,
                 tool_schemas=self.registered_tool_schemas(),
-                available_tool_names=self._tools.keys(),
-                total_tool_count=len(self._tools),
+                available_tool_names=self.registered_tool_names(),
+                total_tool_count=len(self.registered_tool_names()),
                 live_mcp_schema_loader=_load_live_schemas,
             )
             try:
@@ -349,6 +494,43 @@ class ToolPool:
             return result
 
         self.register("search_tools", runtime_search_tools_schema(), _search_handler)
+
+    def _register_call_tool(self):
+        """Register call_tool, the fixed entry point for discovered tools.
+
+        The agentic loop unwraps valid calls before execution (see
+        runtime/tool_gateway.py). This handler covers the rest: it reports a
+        rejected or malformed call without executing anything, or runs the
+        target through the same governed path as a direct call.
+        """
+        from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+        from packages.core.ai.runtime.tool_gateway import (
+            CALL_TOOL_NAME,
+            call_tool_schema,
+            runtime_gateway_target,
+        )
+
+        async def _call_tool_handler(entity_id: str = "", user_id: str = "", **kwargs) -> str:
+            target = runtime_gateway_target({"name": kwargs.get("name"), "arguments": kwargs.get("arguments", {})})
+            rejected = kwargs.get("rejected_reason")
+            if rejected or target is None:
+                return json.dumps(tool_error_payload(
+                    tool_name=CALL_TOOL_NAME, code="gateway_call_rejected",
+                    message=str(rejected or "call_tool needs a loaded tool name and an arguments object."),
+                    details={"action_executed": False, "discovery_tool": "search_tools"},
+                ), ensure_ascii=False)
+            name, arguments = target
+            return await self.execute(
+                name, arguments,
+                entity_id=entity_id or None,
+                user_id=user_id or kwargs.get("_user_id_from_context"),
+                agent_id=kwargs.get("_agent_id_from_context"),
+                active_user_message=kwargs.get("_active_user_message_from_context"),
+                tool_profile=kwargs.get("_tool_profile_from_context"),
+                runtime_envelope=kwargs.get("_runtime_envelope_from_context"),
+            )
+
+        self.register(CALL_TOOL_NAME, call_tool_schema(), _call_tool_handler)
 
     @staticmethod
     def _grant_dynamic_mcp_tool_binding(

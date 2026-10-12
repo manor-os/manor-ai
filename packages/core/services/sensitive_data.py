@@ -1,11 +1,18 @@
 """Helpers for redacting credentials before data leaves trusted runtime paths."""
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 REDACTED = "<redacted>"
+
+_APPROVAL_CREDENTIAL_KEYS = {"approval_token", "approvaltoken"}
+_APPROVAL_CREDENTIAL_TEXT_RE = re.compile(
+    r"(?i)(['\"]?approval(?:[_-]?token)['\"]?\s*[:=]\s*['\"]?)"
+    r"([^'\"\s,}&;]+)"
+)
 
 _SENSITIVE_KEYS = {
     "api_key",
@@ -137,6 +144,56 @@ def redact_sensitive_text(text: str | None, *, replacement: str = REDACTED) -> s
     for pattern, repl in _SECRET_TEXT_PATTERNS:
         redacted = pattern.sub(repl.replace(REDACTED, replacement), redacted)
     return redacted
+
+
+def _is_approval_credential_key(key: object) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    return normalized in _APPROVAL_CREDENTIAL_KEYS
+
+
+def _strip_approval_credentials(value: Any) -> Any:
+    if isinstance(value, str):
+        return _APPROVAL_CREDENTIAL_TEXT_RE.sub(
+            rf"\1{REDACTED}",
+            value,
+        )
+    if isinstance(value, Mapping):
+        return {
+            key: _strip_approval_credentials(item)
+            for key, item in value.items()
+            if not _is_approval_credential_key(key)
+        }
+    if isinstance(value, tuple):
+        return tuple(_strip_approval_credentials(item) for item in value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_strip_approval_credentials(item) for item in value]
+    return value
+
+
+def sanitize_approval_credentials(value: Any) -> Any:
+    """Remove one-time approval credentials from a public or replay projection.
+
+    Manor's public HITL request id also uses ``approval_token`` in its own
+    event envelope, so callers apply this narrower sanitizer only to tool
+    arguments/results, never to the whole approval event.
+    """
+
+    if not isinstance(value, str):
+        return _strip_approval_credentials(value)
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return _APPROVAL_CREDENTIAL_TEXT_RE.sub(
+            rf"\1{REDACTED}",
+            value,
+        )
+    sanitized = _strip_approval_credentials(parsed)
+    if sanitized == parsed:
+        return _APPROVAL_CREDENTIAL_TEXT_RE.sub(
+            rf"\1{REDACTED}",
+            value,
+        )
+    return json.dumps(sanitized, ensure_ascii=False)
 
 
 def sanitize_sensitive_payload(

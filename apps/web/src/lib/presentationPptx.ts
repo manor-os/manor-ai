@@ -1,4 +1,6 @@
+import { readObjectUrlBlob } from "./retainedObjectUrls";
 import PptxGenJS from "pptxgenjs";
+import { normalizeOfficeSoftBreaks, stripInvalidXmlCharacters } from "./xmlText";
 
 const PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 const DEFAULT_LAYOUT_WIDTH = 13.333;
@@ -106,9 +108,7 @@ async function resolveImageData(url: string, cache: Map<string, string>): Promis
     cache.set(url, url);
     return url;
   }
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`Unable to read presentation image (${response.status})`);
-  const data = await toDataUrl(await response.blob());
+  const data = await toDataUrl(await readObjectUrlBlob(url));
   cache.set(url, data);
   return data;
 }
@@ -186,6 +186,11 @@ function line(shape: PresentationShape): PptxGenJS.ShapeLineProps {
   };
 }
 
+/** PptxGenJS escapes markup but not XML-illegal characters; sanitize every string it serializes. */
+function xmlSafeText(value: string): string {
+  return stripInvalidXmlCharacters(normalizeOfficeSoftBreaks(value));
+}
+
 function textOptions(run: PresentationInlineRun): PptxGenJS.TextPropsOptions {
   return {
     bold: Boolean(run.bold),
@@ -194,7 +199,7 @@ function textOptions(run: PresentationInlineRun): PptxGenJS.TextPropsOptions {
     strike: run.strikethrough ? "sngStrike" : undefined,
     fontSize: Math.max(1, run.fontSize || 16),
     color: hexColor(run.color),
-    fontFace: run.fontFamily || undefined,
+    fontFace: run.fontFamily ? stripInvalidXmlCharacters(run.fontFamily) : undefined,
     superscript: (run.baseline || 0) > 0 || undefined,
     subscript: (run.baseline || 0) < 0 || undefined,
     charSpacing: run.spacing,
@@ -215,7 +220,7 @@ function textRuns(shape: PresentationShape): PptxGenJS.TextProps[] {
           : { type: "bullet" as const, characterCode: paragraph.bullet.codePointAt(0)?.toString(16).toUpperCase(), indent: paragraph.indent }
         : undefined;
       output.push({
-        text: run.text,
+        text: xmlSafeText(run.text),
         options: {
           ...textOptions({ ...paragraph, ...run }),
           align: (paragraph.align === "center" || paragraph.align === "right" || paragraph.align === "justify") ? paragraph.align : "left",
@@ -246,12 +251,12 @@ async function addShapeToSlide(
     flipH: model.flipH,
     flipV: model.flipV,
     shadow: shadow(model),
-    objectName: `Manor ${model.id}`,
+    objectName: stripInvalidXmlCharacters(`Manor ${model.id}`),
   };
 
   if (model.type === "table" && model.tableRows?.length) {
     const rows: PptxGenJS.TableRow[] = model.tableRows.map((row) => row.map((cell) => ({
-      text: cell.vMerge ? "" : cell.text,
+      text: cell.vMerge ? "" : xmlSafeText(cell.text),
       options: {
         bold: Boolean(cell.bold),
         color: hexColor(cell.color),
@@ -273,7 +278,7 @@ async function addShapeToSlide(
       colW: totalColWidth > 0
         ? model.tableColWidths!.map((width) => (width / totalColWidth) * rect.w)
         : undefined,
-      objectName: `Manor ${model.id}`,
+      objectName: stripInvalidXmlCharacters(`Manor ${model.id}`),
     });
     return;
   }
@@ -288,7 +293,7 @@ async function addShapeToSlide(
         : { sizing: { type: model.imageFit || (model.imgCrop ? "cover" : "contain"), w: rect.w, h: rect.h } }),
       transparency: Math.round((1 - Math.max(0, Math.min(1, model.opacity ?? 1))) * 100),
       rounding: model.presetGeom === "ellipse" || model.presetGeom === "oval",
-      hyperlink: model.hyperlink ? { url: model.hyperlink } : undefined,
+      hyperlink: model.hyperlink ? { url: stripInvalidXmlCharacters(model.hyperlink) } : undefined,
     });
   }
 
@@ -326,13 +331,13 @@ export async function buildPresentationBlob(slides: PresentationSlide[], title =
   presentation.author = "Manor AI";
   presentation.company = "Manor AI";
   presentation.subject = "Edited in Manor AI";
-  presentation.title = title.replace(/\.pptx?$/i, "");
+  presentation.title = stripInvalidXmlCharacters(title.replace(/\.pptx?$/i, ""));
   presentation.revision = "1";
 
   const imageCache = new Map<string, string>();
   for (const model of slides) {
     const slide = presentation.addSlide();
-    if (model.notes?.trim()) slide.addNotes(model.notes);
+    if (model.notes?.trim()) slide.addNotes(xmlSafeText(model.notes));
     if (model.bgImgUrl) {
       slide.background = { data: await resolveImageData(model.bgImgUrl, imageCache) };
     } else if (model.bg) {

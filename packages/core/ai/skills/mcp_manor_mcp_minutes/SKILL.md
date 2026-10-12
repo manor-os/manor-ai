@@ -6,7 +6,7 @@ version: 1.0.0
 
 # Manor Minutes Runtime Skill
 
-Use this skill for Manor's first-party meeting-notes layer (the Minutes app): recorded meetings, their transcripts, AI summaries, key points, action items, and meeting Q&A. All tools are scoped to the current entity; they require the entity to be subscribed to the Meeting Minutes app in Apps.
+Use this skill for Minutes meeting notes: recorded meetings, transcripts, AI summaries, key points, action items, and meeting Q&A. Connect Minutes with OAuth in `/integrations?provider=manor_mcp_minutes`. Tools use an account accessible to the current actor in the current entity; select `integration_account_id` when needed. Never request or expose access tokens in chat.
 
 ## When To Use
 
@@ -38,5 +38,5 @@ Reading one meeting (ids come from the discovery tools):
 ## Guardrails
 
 - Meeting content is tenant-scoped; never imply access to another entity's meetings.
-- If tools report that the Meeting Minutes app is not subscribed, tell the user to subscribe in Apps rather than retrying.
+- If a connection is missing, expired, revoked, or bound to another deployment, direct the user to reconnect Minutes in Integrations. Reconnecting does not grant an action approval or bypass existing policy.
 - Transcripts may contain sensitive discussion — share externally only when the user explicitly asks.

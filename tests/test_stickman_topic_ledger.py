@@ -135,6 +135,32 @@ async def test_topic_ledger_is_append_only_and_rejects_normalized_duplicates(
             "visibility": "public",
         },
     )
+    second_youtube_event = await module.record_topic_event(
+        entity_id="entity-1",
+        workspace_id="workspace-1",
+        event="youtube_saved",
+        reservation_id=reservation["entry_id"],
+        selected_topic="Fresh topic 1",
+        details={
+            "success": True,
+            "video_id": "video-2",
+            "watch_url": "https://www.youtube.com/watch?v=video-2",
+            "visibility": "public",
+        },
+    )
+    repeated_second_event = await module.record_topic_event(
+        entity_id="entity-1",
+        workspace_id="workspace-1",
+        event="youtube_saved",
+        reservation_id=reservation["entry_id"],
+        selected_topic="Fresh topic 1",
+        details={
+            "success": True,
+            "video_id": "video-2",
+            "watch_url": "https://www.youtube.com/watch?v=video-2",
+            "visibility": "public",
+        },
+    )
     backfill = await module.backfill_used_topic(
         entity_id="entity-1",
         workspace_id="workspace-1",
@@ -155,36 +181,36 @@ async def test_topic_ledger_is_append_only_and_rejects_normalized_duplicates(
 
     assert video_event["status"] == "video_ready"
     assert youtube_event["status"] == "youtube_saved"
+    assert second_youtube_event["status"] == "youtube_saved"
+    assert second_youtube_event["idempotent"] is False
+    assert repeated_second_event["idempotent"] is True
+    assert repeated_second_event["event_id"] == second_youtube_event["event_id"]
     assert backfill["status"] == "used_backfill"
     assert set(history["used_topics"]) == {
         "Fresh topic 1",
         "A verified historical Topic",
     }
     assert history["used_topic_count"] == 2
-    assert history["entry_count"] == 4
+    assert history["entry_count"] == 5
     assert history["video_ready_count"] == 1
     assert history["youtube_saved_count"] == 1
     topic_rows = {row["selected_topic"]: row for row in history["topics"]}
     assert topic_rows["Fresh topic 1"]["status"] == "youtube_saved"
     assert topic_rows["Fresh topic 1"]["video_source"] == "final.mp4"
     assert topic_rows["Fresh topic 1"]["watch_url"] == (
-        "https://www.youtube.com/watch?v=video-1"
+        "https://www.youtube.com/watch?v=video-2"
     )
     assert topic_rows["A verified historical Topic"]["status"] == "used_backfill"
-    assert len(publications) == 1
-    assert publications[0]["video_id"] == "video-1"
-    assert publications[0]["watch_url"] == (
-        "https://www.youtube.com/watch?v=video-1"
-    )
-    assert publications[0]["recorded_at"]
-    assert publications[0]["source_task_id"] is None
+    assert {item["video_id"] for item in publications} == {"video-1", "video-2"}
+    assert all(item["recorded_at"] for item in publications)
+    assert all(item["source_task_id"] is None for item in publications)
     assert {entry["status"] for entry in history["recent_entries"]} == {
         "reserved",
         "used_backfill",
         "video_ready",
         "youtube_saved",
     }
-    assert len(synced) == 4
+    assert len(synced) == 5
 
     reservation_file = tmp_path / reservation["path"]
     stored = json.loads(reservation_file.read_text())
@@ -199,8 +225,28 @@ async def test_topic_ledger_is_append_only_and_rejects_normalized_duplicates(
     assert "| Topic | Video | Status | Created |" in markdown
     assert "Fresh topic 1" in markdown
     assert "YouTube saved · Public" in markdown
-    assert "[Watch on YouTube](https://www.youtube.com/watch?v=video-1)" in markdown
+    assert "[Watch on YouTube](https://www.youtube.com/watch?v=video-2)" in markdown
     assert "Topics created or reserved: 2" in markdown
+
+
+@pytest.mark.asyncio
+async def test_topic_ledger_read_does_not_initialize_storage(tmp_path, monkeypatch):
+    module = _module()
+    storage_path = "Workspaces/_by_id/folder-1/topic-ledger"
+
+    async def resolve_directory(**_kwargs):
+        return SimpleNamespace(storage_path=storage_path)
+
+    async def initialize_directory(**_kwargs):
+        pytest.fail("A ledger read tried to initialize its Workspace directory")
+
+    monkeypatch.setattr(module, "resolve_workspace_artifact_directory", resolve_directory)
+    monkeypatch.setattr(module, "ensure_workspace_artifact_directory", initialize_directory)
+    monkeypatch.setattr(module, "runtime_entity_file_root", lambda _entity_id: str(tmp_path))
+    ledger = await module.read_topic_ledger(entity_id="entity-1", workspace_id="workspace-1")
+    assert ledger["used_topic_count"] == 0
+    assert ledger["topics"] == []
+    assert not (tmp_path / storage_path).exists()
 
 
 def test_live_ledger_document_requires_exact_blueprint_provenance() -> None:

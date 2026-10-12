@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from packages.core.constants.task import AI_LOG_TYPES, TaskLogType
+from packages.core.ai.runtime.human_input import (
+    HUMAN_INPUT_MODE_END_TURN,
+    REQUEST_INPUT_TOOL_NAME,
+    input_request_from_tool_result,
+)
 from packages.core.ai.engine import ChatMessage
 from packages.core.ai.llm_client import CreditExhaustedError
 from packages.core.ai.runtime.artifacts import (
@@ -15,7 +20,18 @@ from packages.core.ai.runtime.artifacts import (
     runtime_record_tool_result_artifacts,
 )
 from packages.core.ai.runtime.billing import runtime_llm_billing_context
+from packages.core.ai.runtime.control import (
+    runtime_sequence_child_owner,
+    runtime_terminal_uncertainty_control,
+)
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
+from packages.core.ai.runtime.human_gate import runtime_detect_blocking_human_gate
+from packages.core.ai.runtime.provider_approvals import (
+    followup_tool_names_from_forced_calls,
+    pop_tool_continuation,
+    restrict_provider_followup_tools,
+    retry_call_after_tool_continuation,
+)
 from packages.core.ai.runtime.sources import RUNTIME_TASK_RUNNER_SOURCE
 from packages.core.ai.runtime.task_llm import (
     runtime_execute_task_agent_chat,
@@ -28,6 +44,7 @@ from packages.core.ai.runtime.task_llm import (
 from packages.core.ai.runtime.task_requirements import task_runtime_requirements_prompt
 from packages.core.ai.runtime.tool_registry import runtime_execute_tool, runtime_tool_schema
 from packages.core.ai.runtime.tool_schema import runtime_tool_schema_resolver
+from packages.core.services.sensitive_data import sanitize_approval_credentials
 
 
 RUNTIME_TASK_VERDICT_CONTINUE = "continue"
@@ -239,6 +256,12 @@ def runtime_task_supervisor_feedback_message(instruction: Any) -> ChatMessage:
     return ChatMessage(role="user", content=f"Supervisor feedback: {text}")
 
 
+def runtime_task_followup_message(content: Any) -> ChatMessage:
+    """Build a Runtime-owned user message for a scheduled-task follow-up."""
+
+    return ChatMessage(role="user", content=str(content or ""))
+
+
 @dataclass(frozen=True)
 class RuntimeTaskAgentTurnResult:
     """Result for one scheduled-task agent turn."""
@@ -251,6 +274,14 @@ class RuntimeTaskAgentTurnResult:
     usage: dict[str, Any]
     had_tool_calls: bool
     supervisor_evidence: list[dict[str, str]] = field(default_factory=list)
+    blocking_control: dict[str, Any] | None = None
+    blocking_tool_arguments: dict[str, Any] | None = None
+    remaining_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    disable_followup_tools: bool = False
+    terminal_control: dict[str, Any] | None = None
+    #: Set when the agent called ``request_input`` this turn: the normalized
+    #: question. The task loop parks the task on it instead of continuing.
+    input_request: dict[str, Any] | None = None
 
 
 class RuntimeTaskProviderError(RuntimeError):
@@ -304,12 +335,34 @@ class RuntimeTaskUserPromptResult:
     hitl_by: str | None = None
 
 
+def _hitl_question_text(question: Any) -> str:
+    """Render the question the agent asked (a request_input payload or text)."""
+    if isinstance(question, dict):
+        lines = [str(question.get("question") or "").strip()]
+        options = question.get("options")
+        if isinstance(options, list) and options:
+            lines.append("Options offered: " + " / ".join(str(item) for item in options))
+        fields = question.get("fields")
+        if isinstance(fields, list) and fields:
+            labels = [
+                str(item.get("label") or item.get("name") or "").strip()
+                for item in fields
+                if isinstance(item, dict)
+            ]
+            if any(labels):
+                lines.append("Fields requested: " + ", ".join(label for label in labels if label))
+        return "\n".join(line for line in lines if line)
+    return str(question or "").strip()
+
+
 def runtime_task_user_prompt(
     *,
     base_prompt: str,
     task_logs: Iterable[Any] | None = None,
     hitl_response: Any | None = None,
     hitl_responded_by: Any | None = None,
+    hitl_question: Any | None = None,
+    hitl_payload: Any | None = None,
     max_history_entries: int = 10,
     max_log_chars: int = 500,
 ) -> RuntimeTaskUserPromptResult:
@@ -338,9 +391,22 @@ def runtime_task_user_prompt(
         prompt = f"{prompt}\n\n" + "\n\n".join(convo_lines)
 
     response = str(hitl_response or "").strip()
+    attachments = hitl_payload.get("attachments") if isinstance(hitl_payload, dict) else None
+    if isinstance(attachments, list) and attachments:
+        response = "\n\n".join(part for part in (
+            response,
+            "Attached Knowledge documents (read as needed):\n"
+            + json.dumps(attachments, ensure_ascii=False),
+        ) if part)
     hitl_by = str(hitl_responded_by or "Human").strip() or "Human"
     if response:
-        prompt = f"{prompt}\n\n## Human Response (from {hitl_by})\n{response}"
+        question_text = _hitl_question_text(hitl_question)
+        if question_text:
+            prompt = f"{prompt}\n\n## Question you asked the user\n{question_text}"
+        prompt = (
+            f"{prompt}\n\n## Human Response (from {hitl_by})\n{response}\n\n"
+            "Continue the task using this answer. Do not ask the same question again."
+        )
 
     return RuntimeTaskUserPromptResult(
         prompt=prompt,
@@ -373,6 +439,19 @@ def _parse_tool_args(raw_args: Any) -> dict[str, Any]:
     return {}
 
 
+def _parse_tool_result_object(result: Any) -> dict[str, Any] | None:
+    if isinstance(result, dict):
+        return result
+    text = str(result or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _supervisor_tool_names_for_call(tool_name: str, tool_args: Mapping[str, Any]) -> list[str]:
     """Return supervisor-visible tool evidence for gateway-style tool calls."""
 
@@ -381,6 +460,12 @@ def _supervisor_tool_names_for_call(tool_name: str, tool_args: Mapping[str, Any]
         action = str(tool_args.get("action") or "").strip()
         if action:
             names.append(f"{tool_name}:{action}")
+        if tool_name == "manor" and action == "workspace":
+            raw_params = tool_args.get("params")
+            params = raw_params if isinstance(raw_params, Mapping) else {}
+            workspace_action = str(params.get("action") or "").strip()
+            if workspace_action:
+                names.append(f"manor:workspace:{workspace_action}")
     return names
 
 
@@ -502,22 +587,56 @@ async def runtime_execute_task_agent_turn(
     temperature: float | None = None,
     max_tokens: int | None = None,
     forced_tool_calls: list[dict[str, Any]] | None = None,
+    performance_tool_call_id: str | None = None,
 ) -> RuntimeTaskAgentTurnResult:
     """Run one scheduled-task agent turn through Runtime-owned tool plumbing."""
 
+    forced_tool_continuations: dict[str, dict[str, Any]] = {}
+    private_provider_tool_call_ids: set[str] = set()
+    disable_followup_tools = False
+    followup_tool_names = followup_tool_names_from_forced_calls(forced_tool_calls)
+
+    def _followup_tool_surface() -> tuple[list[dict[str, Any]], set[str]]:
+        return restrict_provider_followup_tools(
+            tools,
+            loaded_tool_names,
+            disable_followup_tools=disable_followup_tools,
+            followup_tool_names=followup_tool_names,
+        )
+
     if forced_tool_calls:
+        response_tool_calls: list[dict[str, Any]] = []
+        disable_followup_tools = any(
+            bool(call.get("disable_followup_tools"))
+            for call in forced_tool_calls
+            if isinstance(call, dict)
+        )
+        for index, call in enumerate(forced_tool_calls, start=1):
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "").strip()
+            if not name:
+                continue
+            raw_arguments = call.get("arguments") or call.get("args") or {}
+            arguments = (
+                dict(raw_arguments)
+                if isinstance(raw_arguments, dict)
+                else {}
+            )
+            continuation = pop_tool_continuation(arguments)
+            tool_call_id = f"scheduled-skill-{index}"
+            if continuation is not None:
+                forced_tool_continuations[tool_call_id] = continuation
+                private_provider_tool_call_ids.add(tool_call_id)
+            response_tool_calls.append({
+                "id": tool_call_id,
+                "name": name,
+                "arguments": arguments,
+            })
         response = ChatMessage(
             role="assistant",
             content="",
-            tool_calls=[
-                {
-                    "id": f"scheduled-skill-{index}",
-                    "name": str(call.get("name") or ""),
-                    "arguments": dict(call.get("arguments") or {}),
-                }
-                for index, call in enumerate(forced_tool_calls, start=1)
-                if str(call.get("name") or "").strip()
-            ],
+            tool_calls=response_tool_calls,
             usage={},
         )
     else:
@@ -529,19 +648,23 @@ async def runtime_execute_task_agent_turn(
             metadata=metadata,
             temperature=temperature,
             max_tokens=max_tokens,
+            performance_run_id=task_id,
+            performance_tool_call_id=performance_tool_call_id,
         )
     usage = dict(response.usage or {})
     _raise_task_provider_error(usage)
     tool_calls = list(response.tool_calls or [])
     if not tool_calls:
+        followup_tools, followup_loaded = _followup_tool_surface()
         return RuntimeTaskAgentTurnResult(
             messages=messages,
-            tools=tools,
-            loaded_tool_names=loaded_tool_names,
+            tools=followup_tools,
+            loaded_tool_names=followup_loaded,
             response_text=response.content or "",
             tool_names=[],
             usage=usage,
             had_tool_calls=False,
+            disable_followup_tools=disable_followup_tools,
         )
 
     prior_artifact_urls: set[str] = set()
@@ -555,61 +678,278 @@ async def runtime_execute_task_agent_turn(
         messages.append(response)
         tool_names: list[str] = []
         supervisor_evidence: list[dict[str, str]] = []
-        for tool_call in tool_calls:
-            if not isinstance(tool_call, dict):
-                continue
-            tool_name, raw_args, tool_call_id = _tool_call_parts(tool_call)
-            if not tool_name:
-                continue
-            tool_args = _parse_tool_args(raw_args)
-            tool_names.extend(_supervisor_tool_names_for_call(tool_name, tool_args))
-            tool_result = await runtime_execute_tool(
-                tool_name,
-                tool_args,
-                entity_id=entity_id,
-                user_id=user_id,
-                agent_id=agent_id,
-                workspace_id=workspace_id,
-                conversation_id=conversation_id,
-                task_id=task_id,
-                active_user_message=active_user_message,
-                tool_profile=tool_profile,
-                allowed_tool_names=allowed_tool_names,
-                runtime_envelope=runtime_envelope,
-            )
-            runtime_record_tool_result_artifacts(tool_result)
-            supervisor_evidence.append(
-                _supervisor_tool_evidence_for_call(tool_name, tool_result)
-            )
-            messages.append(
-                ChatMessage(
-                    role="tool",
-                    content=tool_result,
-                    tool_call_id=tool_call_id,
+        continuation_index = 0
+        phase_calls = tool_calls
+        current_response = response
+        while phase_calls:
+            next_phase_calls: list[dict[str, Any]] = []
+            executed_assistant_calls: list[dict[str, Any]] = []
+            for phase_index, tool_call in enumerate(phase_calls):
+                if not isinstance(tool_call, dict):
+                    continue
+                tool_name, raw_args, tool_call_id = _tool_call_parts(tool_call)
+                if not tool_name:
+                    continue
+                normalized_tool_call_id = str(tool_call_id or "")
+                visible_tool_call = (
+                    (current_response.tool_calls or [])[phase_index]
+                    if phase_index < len(current_response.tool_calls or [])
+                    else tool_call
                 )
-            )
-            if tool_name == "search_tools" and str(tool_result).startswith("{"):
-                try:
-                    search_result = json.loads(tool_result)
-                    if isinstance(search_result, dict):
-                        _load_search_result_tool_schemas(
-                            tools=tools,
-                            loaded_tool_names=loaded_tool_names,
-                            search_result=search_result,
-                            allowed_tool_names=allowed_tool_names,
-                        )
-                except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
-                    pass
+                if normalized_tool_call_id in private_provider_tool_call_ids:
+                    visible_tool_call = sanitize_approval_credentials(
+                        visible_tool_call
+                    )
+                executed_assistant_calls.append(dict(visible_tool_call))
 
+                tool_args = _parse_tool_args(raw_args)
+                if tool_name == REQUEST_INPUT_TOOL_NAME:
+                    # This loop parks the task on the marker result; tell the
+                    # tool so it answers in end-turn mode rather than
+                    # "unavailable".
+                    tool_args = {
+                        **tool_args,
+                        "_runtime_human_input_from_context": HUMAN_INPUT_MODE_END_TURN,
+                    }
+                tool_names.extend(
+                    _supervisor_tool_names_for_call(tool_name, tool_args)
+                )
+                runtime_tool_args = dict(tool_args)
+                for context_key in ("_runtime_run_id_from_context", "_performance_run_id_from_context", "_runtime_tool_call_id_from_context", "_runtime_tool_attempt_from_context"):
+                    runtime_tool_args.pop(context_key, None)
+                if task_id:
+                    runtime_tool_args.update({
+                        "_performance_run_id_from_context": task_id,
+                        "_runtime_tool_call_id_from_context": normalized_tool_call_id,
+                    })
+                tool_result = await runtime_execute_tool(
+                    tool_name,
+                    runtime_tool_args,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    active_user_message=active_user_message,
+                    tool_profile=tool_profile,
+                    allowed_tool_names=allowed_tool_names,
+                    runtime_envelope=runtime_envelope,
+                )
+                runtime_record_tool_result_artifacts(tool_result)
+                visible_tool_result = (
+                    sanitize_approval_credentials(tool_result)
+                    if normalized_tool_call_id in private_provider_tool_call_ids
+                    else tool_result
+                )
+                supervisor_evidence.append(
+                    _supervisor_tool_evidence_for_call(
+                        tool_name,
+                        visible_tool_result,
+                    )
+                )
+                messages.append(
+                    ChatMessage(
+                        role="tool",
+                        content=visible_tool_result,
+                        tool_call_id=tool_call_id,
+                    )
+                )
+                input_request = (
+                    input_request_from_tool_result(tool_result)
+                    if tool_name == REQUEST_INPUT_TOOL_NAME
+                    else None
+                )
+                if input_request is not None:
+                    # The agent asked the user something: park here. Calls
+                    # issued alongside the question are not executed; each one
+                    # already on the assistant message gets a synthetic result
+                    # so the transcript stays well-formed, scheduled
+                    # continuations are only named, and the resumed run can
+                    # reissue them.
+                    skipped: list[str] = []
+                    later_visible_calls: list[dict[str, Any]] = []
+                    for later_index in range(phase_index + 1, len(phase_calls)):
+                        later_call = phase_calls[later_index]
+                        if not isinstance(later_call, dict):
+                            continue
+                        later_name, _, later_id = _tool_call_parts(later_call)
+                        if not later_name:
+                            continue
+                        skipped.append(later_name)
+                        visible_later_call = (
+                            (current_response.tool_calls or [])[later_index]
+                            if later_index < len(current_response.tool_calls or [])
+                            else later_call
+                        )
+                        if str(later_id or "") in private_provider_tool_call_ids:
+                            visible_later_call = sanitize_approval_credentials(visible_later_call)
+                        later_visible_calls.append(dict(visible_later_call))
+                        messages.append(
+                            ChatMessage(
+                                role="tool",
+                                content=json.dumps({
+                                    "ok": False,
+                                    "error": "not_executed",
+                                    "reason": "the run paused on request_input before this call; reissue it after the answer",
+                                }),
+                                tool_call_id=later_id,
+                            )
+                        )
+                    for pending_call in next_phase_calls:
+                        if isinstance(pending_call, dict):
+                            pending_name, _, _ = _tool_call_parts(pending_call)
+                            if pending_name:
+                                skipped.append(pending_name)
+                    if skipped:
+                        input_request = {**input_request, "skipped_tool_calls": skipped}
+                    current_response.tool_calls = [*executed_assistant_calls, *later_visible_calls]
+                    return RuntimeTaskAgentTurnResult(
+                        messages=messages,
+                        tools=tools,
+                        loaded_tool_names=loaded_tool_names,
+                        response_text="",
+                        tool_names=tool_names,
+                        usage=usage,
+                        had_tool_calls=True,
+                        supervisor_evidence=supervisor_evidence,
+                        input_request=input_request,
+                    )
+                blocking_control = runtime_detect_blocking_human_gate(
+                    tool_name,
+                    tool_args,
+                    tool_result,
+                )
+                if blocking_control is not None:
+                    # The assistant may have proposed sibling calls in one
+                    # batch. Keep only the calls that actually ran so a durable
+                    # approval checkpoint never contains unmatched tool calls.
+                    current_response.tool_calls = executed_assistant_calls
+                    remaining_tool_calls: list[dict[str, Any]] = []
+                    for remaining_call in [
+                        *phase_calls[phase_index + 1 :],
+                        *next_phase_calls,
+                    ]:
+                        if not isinstance(remaining_call, dict):
+                            continue
+                        remaining_id = str(remaining_call.get("id") or "")
+                        visible_remaining_call = (
+                            sanitize_approval_credentials(remaining_call)
+                            if remaining_id in private_provider_tool_call_ids
+                            else dict(remaining_call)
+                        )
+                        remaining_tool_calls.append(dict(visible_remaining_call))
+                    sequence_owner = runtime_sequence_child_owner(
+                        tool_name,
+                        tool_result,
+                    )
+                    blocking_tool_arguments = (
+                        sequence_owner["arguments"]
+                        if sequence_owner is not None
+                        else dict(tool_args)
+                    )
+                    followup_tools, followup_loaded = _followup_tool_surface()
+                    return RuntimeTaskAgentTurnResult(
+                        messages=messages,
+                        tools=followup_tools,
+                        loaded_tool_names=followup_loaded,
+                        response_text="",
+                        tool_names=tool_names,
+                        usage=usage,
+                        had_tool_calls=True,
+                        supervisor_evidence=supervisor_evidence,
+                        blocking_control=blocking_control,
+                        blocking_tool_arguments=blocking_tool_arguments,
+                        remaining_tool_calls=remaining_tool_calls,
+                        disable_followup_tools=disable_followup_tools,
+                    )
+                terminal_control = runtime_terminal_uncertainty_control(tool_result)
+                if terminal_control is not None:
+                    current_response.tool_calls = executed_assistant_calls
+                    return RuntimeTaskAgentTurnResult(
+                        messages=messages,
+                        tools=[],
+                        loaded_tool_names=set(),
+                        response_text=str(
+                            terminal_control.get("content")
+                            or terminal_control.get("message")
+                            or terminal_control.get("error")
+                            or terminal_control.get("stop_reason")
+                            or ""
+                        ),
+                        tool_names=tool_names,
+                        usage=usage,
+                        had_tool_calls=True,
+                        supervisor_evidence=supervisor_evidence,
+                        disable_followup_tools=True,
+                        terminal_control=terminal_control,
+                    )
+                continuation = forced_tool_continuations.get(
+                    normalized_tool_call_id
+                )
+                parsed_tool_result = _parse_tool_result_object(tool_result)
+                retry_call = (
+                    retry_call_after_tool_continuation(
+                        parsed_tool_result,
+                        continuation,
+                        set(loaded_tool_names),
+                    )
+                    if parsed_tool_result is not None
+                    else None
+                )
+                if retry_call is not None:
+                    continuation_index += 1
+                    generated_call = {
+                        "id": f"scheduled-continuation-{continuation_index}",
+                        "name": retry_call["name"],
+                        "arguments": retry_call["arguments"],
+                    }
+                    private_provider_tool_call_ids.add(generated_call["id"])
+                    next_phase_calls.append(generated_call)
+                if tool_name == "search_tools" and str(tool_result).startswith("{"):
+                    try:
+                        search_result = json.loads(tool_result)
+                        if isinstance(search_result, dict):
+                            _load_search_result_tool_schemas(
+                                tools=tools,
+                                loaded_tool_names=loaded_tool_names,
+                                search_result=search_result,
+                                allowed_tool_names=allowed_tool_names,
+                            )
+                    except (
+                        json.JSONDecodeError,
+                        KeyError,
+                        TypeError,
+                        AttributeError,
+                    ):
+                        pass
+
+            current_response.tool_calls = executed_assistant_calls
+            if not next_phase_calls:
+                break
+            phase_calls = next_phase_calls
+            current_response = ChatMessage(
+                role="assistant",
+                content="",
+                tool_calls=[
+                    dict(sanitize_approval_credentials(call))
+                    for call in phase_calls
+                ],
+                usage={},
+            )
+            messages.append(current_response)
+
+        followup_tools, followup_loaded = _followup_tool_surface()
         return RuntimeTaskAgentTurnResult(
             messages=messages,
-            tools=tools,
-            loaded_tool_names=loaded_tool_names,
+            tools=followup_tools,
+            loaded_tool_names=followup_loaded,
             response_text="",
             tool_names=tool_names,
             usage=usage,
             had_tool_calls=True,
             supervisor_evidence=supervisor_evidence,
+            disable_followup_tools=disable_followup_tools,
         )
 
 
@@ -733,6 +1073,8 @@ async def runtime_review_task_agent_output(
     tool_evidence: list[dict[str, str]] | None = None,
     worker_model: str | None = None,
     metadata: dict[str, Any] | None = None,
+    performance_run_id: str | None = None,
+    performance_tool_call_id: str | None = None,
 ) -> dict[str, Any]:
     """Run the scheduled-task supervisor review through Runtime helpers."""
 
@@ -751,6 +1093,8 @@ async def runtime_review_task_agent_output(
             prompt=prompt,
             worker_model=worker_model,
             metadata=metadata,
+            performance_run_id=performance_run_id,
+            performance_tool_call_id=performance_tool_call_id,
         )
         _raise_task_provider_error(response.usage)
     except RuntimeTaskProviderError as exc:
@@ -778,6 +1122,8 @@ async def runtime_execute_task_final_response(
     metadata: dict[str, Any] | None = None,
     temperature: float | None = None,
     max_tokens: int | None = None,
+    performance_run_id: str | None = None,
+    performance_tool_call_id: str | None = None,
 ) -> RuntimeTaskFinalResponseResult:
     """Force a final no-tools scheduled-task response after max tool rounds."""
 
@@ -796,6 +1142,8 @@ async def runtime_execute_task_final_response(
         metadata=metadata,
         temperature=temperature,
         max_tokens=max_tokens,
+        performance_run_id=performance_run_id,
+        performance_tool_call_id=performance_tool_call_id,
     )
     _raise_task_provider_error(response.usage)
     content = response.content or ""

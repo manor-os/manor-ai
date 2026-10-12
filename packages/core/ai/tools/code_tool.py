@@ -144,10 +144,22 @@ def get_code_action_names() -> set[str]:
     return set(_ALL_ACTIONS.keys())
 
 
-def _search_actions(query: str, max_results: int = 8) -> list[dict]:
+def _visible_actions(runtime_invocation: bool) -> dict[str, str]:
+    """Actions this caller can execute; agent runs only reach the safe subset."""
+    if not runtime_invocation:
+        return _ALL_ACTIONS
+    return {name: desc for name, desc in _ALL_ACTIONS.items() if name in _RUNTIME_CODE_SAFE_ACTIONS}
+
+
+def _search_actions(
+    query: str,
+    max_results: int = 8,
+    *,
+    runtime_invocation: bool = False,
+) -> list[dict]:
     query_lower = query.lower()
     scored: list[tuple[int, str, str, str]] = []
-    for name, desc in _ALL_ACTIONS.items():
+    for name, desc in _visible_actions(runtime_invocation).items():
         dept = _ACTION_DEPT[name]
         score = 0
         for word in query_lower.split():
@@ -1033,7 +1045,7 @@ async def _handle_refactor_rename(params: dict, entity_id: str) -> str:
             "occurrences": len(lines),
             "files": sorted(files),
             "preview": "\n".join(lines[:20]),
-            "hint": "Set dry_run=false to apply the rename, or use write_file for precise control.",
+            "hint": "Set dry_run=false to apply the rename, or use patch_file for precise control.",
         }, ensure_ascii=False)
 
     for fpath in sorted(files):
@@ -1466,16 +1478,17 @@ CODE_SCHEMA = {
     "function": {
         "name": "code",
         "description": (
-            "Execute coding actions for git, tests, review, refactors, LSP, plans, "
-            "monitors, agents, and notebooks. Use action='search' with query to "
-            "discover actions, or action='<name>' with params to run one."
+            "Validate a Manor Dashboard module bundle with "
+            "action='dashboard_module_validate' and params.code. This tool does not "
+            "run git, tests, or other filesystem commands in agent runs; use "
+            "sandbox_create + sandbox_exec for those."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Action name, or 'search'.",
+                    "description": "'dashboard_module_validate', or 'search'.",
                 },
                 "query": {
                     "type": "string",
@@ -1508,13 +1521,14 @@ async def _code_handler(entity_id: str = "", **kwargs: Any) -> str:
             "_runtime_tool_call_id_from_context",
         )
     )
-    if runtime_invocation and action not in _RUNTIME_CODE_SAFE_ACTIONS:
+    if runtime_invocation and action != "search" and action not in _RUNTIME_CODE_SAFE_ACTIONS:
         return json.dumps({
             "error": "code_action_requires_sandbox",
             "action": action,
+            "available_actions": sorted(_RUNTIME_CODE_SAFE_ACTIONS),
             "message": (
                 "Filesystem and subprocess code actions are unavailable on the API host. "
-                "Use an isolated sandbox tool."
+                "Run the command in an isolated sandbox with sandbox_create + sandbox_exec."
             ),
         })
 
@@ -1535,17 +1549,22 @@ async def _code_handler(entity_id: str = "", **kwargs: Any) -> str:
     # Search mode
     if action == "search":
         query = (kwargs.get("query") or "").strip()
+        visible = _visible_actions(runtime_invocation)
         if not query:
-            summary = {dept: [a[0] for a in actions] for dept, actions in _ACTIONS.items()}
-            return json.dumps({"categories": summary, "total_actions": len(_ALL_ACTIONS)})
-        results = _search_actions(query)
+            summary = {
+                dept: [name for name, _ in actions if name in visible]
+                for dept, actions in _ACTIONS.items()
+            }
+            summary = {dept: names for dept, names in summary.items() if names}
+            return json.dumps({"categories": summary, "total_actions": len(visible)})
+        results = _search_actions(query, runtime_invocation=runtime_invocation)
         if not results:
             return json.dumps({"matches": [], "query": query, "hint": "Try broader keywords."})
         return json.dumps({"matches": results, "query": query}, ensure_ascii=False)
 
     # Validate action exists
     if action not in _ALL_ACTIONS:
-        suggestions = _search_actions(action, max_results=5)
+        suggestions = _search_actions(action, max_results=5, runtime_invocation=runtime_invocation)
         return json.dumps({
             "error": f"Unknown action: '{action}'",
             "suggestions": [s["action"] for s in suggestions],
@@ -1554,7 +1573,7 @@ async def _code_handler(entity_id: str = "", **kwargs: Any) -> str:
     params = _extract_action_params(kwargs)
     handler = _DISPATCH.get(action)
     if not handler:
-        return json.dumps({"error": f"Action '{action}' handler not yet implemented."})
+        raise RuntimeError(f"Cataloged code action lacks dispatch: {action}")
 
     context_token = _CURRENT_ENTITY_ID.set(entity_id)
     try:

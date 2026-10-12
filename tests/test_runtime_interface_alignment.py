@@ -8,7 +8,7 @@ from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
 from packages.core.ai.tool_pool import ToolPool
 
 
-def test_tool_pool_forwards_manual_skill_ids_without_legacy_step_id() -> None:
+def test_tool_pool_forwards_manual_skill_ids_and_step_scope() -> None:
     pool = ToolPool()
     seen: dict[str, object] = {}
 
@@ -34,7 +34,7 @@ def test_tool_pool_forwards_manual_skill_ids_without_legacy_step_id() -> None:
     assert result == "ok"
     assert seen["manual_skill_ids"] == ["skill-1"]
     assert seen["manual_skill_slugs"] == ["research"]
-    assert "step_id" not in seen
+    assert seen["step_id"] == "step-1"
 
 
 def test_runtime_agentic_loop_forwards_cancellation_without_dead_policy_fields() -> None:

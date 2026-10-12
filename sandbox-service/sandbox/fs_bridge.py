@@ -14,6 +14,23 @@ from .docker_backend import DockerSandbox
 
 logger = logging.getLogger(__name__)
 
+# File commands include Docker exec startup, even when the command itself is small.
+_FILE_COMMAND_TIMEOUT = 30
+
+
+_PATH_ERROR_MARKERS = (
+    "Read-only file system",
+    "No such file or directory",
+    "Directory nonexistent",
+    "Permission denied",
+    "Not a directory",
+    "Is a directory",
+)
+
+
+def _is_path_error(message: str) -> bool:
+    return any(marker in message for marker in _PATH_ERROR_MARKERS)
+
 
 class FsBridge:
     """Read/write files inside a running sandbox container."""
@@ -34,7 +51,7 @@ class FsBridge:
         safe_path = shlex.quote(self._resolve(path))
         result = await self._sandbox.exec(
             f"head -c {max_size + 1} {safe_path}",
-            timeout=10,
+            timeout=_FILE_COMMAND_TIMEOUT,
         )
         if result.exit_code != 0:
             stderr = result.stderr.strip()
@@ -59,8 +76,10 @@ class FsBridge:
         """
         safe_path = shlex.quote(self._resolve(path))
 
+        # This budget includes Docker exec startup, which can exceed five
+        # seconds after rendering under load. Keep binary delivery bounded.
         size_result = await self._sandbox.exec(
-            f"stat -c '%s' {safe_path}", timeout=5,
+            f"stat -c '%s' {safe_path}", timeout=_FILE_COMMAND_TIMEOUT,
         )
         if size_result.exit_code != 0:
             stderr = size_result.stderr.strip()
@@ -89,8 +108,7 @@ class FsBridge:
         safe_path = self._resolve(path)
 
         if mkdir:
-            parent = str(_posix_parent(safe_path))
-            await self._sandbox.exec(f"mkdir -p {shlex.quote(parent)}", timeout=5)
+            await self._ensure_parent_dir(safe_path)
 
         data = content.encode("utf-8")
         await self._pipe_bytes_to_file(safe_path, data)
@@ -108,8 +126,7 @@ class FsBridge:
 
         safe_path = self._resolve(path)
         if mkdir:
-            parent = str(_posix_parent(safe_path))
-            await self._sandbox.exec(f"mkdir -p {shlex.quote(parent)}", timeout=5)
+            await self._ensure_parent_dir(safe_path)
 
         try:
             data = base64.b64decode(content_base64, validate=True)
@@ -121,6 +138,25 @@ class FsBridge:
         await self._pipe_bytes_to_file(safe_path, data)
         return len(data)
 
+    async def _ensure_parent_dir(self, safe_path: str) -> None:
+        """Create the parent directory, or explain why the path is not writable.
+
+        The container root is read-only; only the skill workdir and ``/tmp``
+        accept writes. A silent ``mkdir`` failure used to surface later as an
+        opaque 500 from ``cat >``; the agent needs the real reason to pick a
+        writable path instead.
+        """
+        parent = str(_posix_parent(safe_path))
+        # Include Docker exec startup, as in the subsequent bounded byte transfer.
+        result = await self._sandbox.exec(f"mkdir -p {shlex.quote(parent)}", timeout=_FILE_COMMAND_TIMEOUT)
+        if result.exit_code != 0:
+            detail = (result.stderr or result.stdout or "").strip() or f"exit {result.exit_code}"
+            raise IOError(
+                f"Cannot create directory {parent} for {safe_path}: {detail}. "
+                "Writable locations are the skill working directory, /tmp, and any "
+                "mounted workspace path listed in the sandbox contract."
+            )
+
     async def _pipe_bytes_to_file(self, safe_path: str, data: bytes) -> None:
         """Stream raw bytes into a container file via `docker exec -i cat >`."""
         from .docker_backend import _run_docker
@@ -131,9 +167,16 @@ class FsBridge:
             self._sandbox.container_name,
             "sh", "-c", f"cat > {shlex.quote(safe_path)}",
         ]
-        await asyncio.to_thread(
-            _run_docker, args, input_data=data, timeout=30,
-        )
+        try:
+            await asyncio.to_thread(
+                _run_docker, args, input_data=data, timeout=120,
+            )
+        except RuntimeError as exc:
+            # Only a path problem the caller can fix becomes a caller error;
+            # a dead daemon, a vanished container, or a timeout stays a fault.
+            if _is_path_error(str(exc)):
+                raise IOError(f"Cannot write {safe_path}: {exc}") from exc
+            raise
 
     async def stat(self, path: str) -> dict | None:
         """
@@ -142,7 +185,7 @@ class FsBridge:
         safe_path = shlex.quote(self._resolve(path))
         result = await self._sandbox.exec(
             f"stat -c '%F|%s|%Y' {safe_path}",
-            timeout=5,
+            timeout=_FILE_COMMAND_TIMEOUT,
         )
         if result.exit_code != 0:
             return None
@@ -159,7 +202,7 @@ class FsBridge:
     async def list_dir(self, path: str) -> list[str]:
         """List files in a directory inside the container."""
         safe_path = shlex.quote(self._resolve(path))
-        result = await self._sandbox.exec(f"ls -1 {safe_path}", timeout=5)
+        result = await self._sandbox.exec(f"ls -1 {safe_path}", timeout=_FILE_COMMAND_TIMEOUT)
         if result.exit_code != 0:
             return []
         return [f for f in result.stdout.strip().split("\n") if f]
@@ -167,7 +210,7 @@ class FsBridge:
     async def remove(self, path: str, *, recursive: bool = False) -> None:
         safe_path = shlex.quote(self._resolve(path))
         flags = "-rf" if recursive else "-f"
-        result = await self._sandbox.exec(f"rm {flags} {safe_path}", timeout=10)
+        result = await self._sandbox.exec(f"rm {flags} {safe_path}", timeout=_FILE_COMMAND_TIMEOUT)
         if result.exit_code != 0:
             raise IOError(f"Failed to remove {path}: {result.stderr.strip()}")
 

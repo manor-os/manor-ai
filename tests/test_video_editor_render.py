@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 
@@ -9,7 +10,10 @@ import pytest
 from packages.core.services.video_editor_render import finalize_video_editor_preview
 
 
-def test_finalize_video_editor_preview_outputs_cfr_h264_aac_mp4(tmp_path):
+@pytest.mark.parametrize("color_range", ["tv", "pc"])
+@pytest.mark.media_integration
+@pytest.mark.oss_regression
+def test_finalize_video_editor_preview_outputs_cfr_h264_aac_mp4(tmp_path, color_range):
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if not ffmpeg or not ffprobe:
@@ -37,6 +41,14 @@ def test_finalize_video_editor_preview_outputs_cfr_h264_aac_mp4(tmp_path):
             "libx264",
             "-pix_fmt",
             "yuv420p",
+            "-color_range",
+            color_range,
+            "-colorspace",
+            "bt709",
+            "-color_trc",
+            "iec61966-2-1",
+            "-color_primaries",
+            "bt709",
             "-c:a",
             "pcm_s16le",
             "-shortest",
@@ -46,8 +58,7 @@ def test_finalize_video_editor_preview_outputs_cfr_h264_aac_mp4(tmp_path):
         text=True,
         check=False,
     )
-    if generated.returncode != 0:
-        pytest.skip(f"ffmpeg fixture generation unavailable: {generated.stderr[-240:]}")
+    assert generated.returncode == 0, generated.stderr[-240:]
 
     result = asyncio.run(
         finalize_video_editor_preview(
@@ -66,6 +77,17 @@ def test_finalize_video_editor_preview_outputs_cfr_h264_aac_mp4(tmp_path):
     assert result.fps == pytest.approx(30, abs=0.01)
     assert result.duration_seconds == pytest.approx(1.5, abs=(1 / 30) + 0.002)
     assert result.file_size > 0
+
+    video_probe = json.loads(subprocess.check_output([
+        ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+        "stream=pix_fmt,color_range,color_space,color_transfer,color_primaries",
+        "-of", "json", str(final),
+    ]))["streams"][0]
+    assert video_probe["pix_fmt"] == "yuv420p"
+    assert video_probe["color_range"] == "tv"
+    assert video_probe["color_space"] == "bt709"
+    assert video_probe["color_transfer"] == "bt709"
+    assert video_probe["color_primaries"] == "bt709"
 
     decoded = subprocess.run(
         [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(final), "-f", "null", "-"],

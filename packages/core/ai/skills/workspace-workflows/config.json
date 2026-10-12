@@ -1,0 +1,52 @@
+{
+  "name": "workspace-workflows",
+  "display_name": "Workspace Workflows",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Inspect, author, validate, deploy, run and diagnose Workspace Flows and Workflow definitions; distinguish connecting from execution.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "list_workspace_flows",
+    "start_workspace_flow",
+    "list_workflow_definitions",
+    "get_workflow",
+    "create_workflow",
+    "ai_edit_workflow",
+    "update_workflow",
+    "validate_workflow",
+    "deploy_workflow",
+    "delete_workflow",
+    "test_workflow",
+    "test_workflow_node",
+    "list_workflows",
+    "run_workflow",
+    "list_workflow_runs",
+    "get_workflow_run",
+    "cancel_workflow_run",
+    "resume_workflow_run",
+    "import_workflow"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [],
+    "patch_ops": [],
+    "route_terms": [
+      "workflow",
+      "flow",
+      "工作流",
+      "流程"
+    ]
+  },
+  "search": {
+    "terms": ["flow", "pipeline builder", "automation flow", "debug workflow", "failed run", "deploy flow", "steps", "node graph"],
+    "examples": ["author new workflow definition", "why did my flow fail", "validate and deploy workflow", "run workspace flow with inputs"]
+  }
+}

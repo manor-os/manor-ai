@@ -215,7 +215,7 @@ export function AssigneePicker({
     && task.session_host_available === true
     && isMasterAgent(task.session_host_agent_id)
   );
-  const isWorkspaceAgentTeam = Boolean(task.workspace_id && !task.agent_id && !task.assignee_id && !isManor);
+  const isWorkspaceAgentTeam = Boolean(task.workspace_id && !task.agent_id && !task.owner_agent_id && !task.assignee_id && !isManor);
   const ownerServiceLabel = humanizeServiceKey(task.owner_service_key);
   const workspaceTeamName = workspaceAgentTeamName(task);
 
@@ -238,8 +238,8 @@ export function AssigneePicker({
     : isManor
       ? MANOR_AGENT_NAME
       : isWorkspaceAgentTeam
-        ? workspaceTeamName
-        : matchedAgent?.name
+        ? task.owner_agent_name || workspaceTeamName
+        : task.owner_agent_name || matchedAgent?.name
           || task.assignee_name
           || (matchedUser?.display_name || matchedUser?.email)
           || (matchedStaff?.display_name || matchedStaff?.name || matchedStaff?.email)
@@ -261,7 +261,7 @@ export function AssigneePicker({
         ? "manor"
         : isWorkspaceAgentTeam
           ? "workspace"
-          : (task.agent_id || matchedAssigneeAgent)
+          : (task.owner_agent_id || task.agent_id || matchedAssigneeAgent)
             ? "agent"
             : displayName ? "user" : "none";
 
@@ -277,7 +277,7 @@ export function AssigneePicker({
         || (task.assignee_id === currentUser?.id || task.assignee_id === currentUser?.entity_id ? currentUser?.avatar_url : null)
     : isManor
       ? null
-      : matchedAgent?.avatar_url
+      : task.owner_agent_avatar || matchedAgent?.avatar_url
         || task.assignee_avatar
         || matchedUser?.avatar_url
         || matchedStaff?.avatar_url

@@ -162,6 +162,26 @@ class TestCheckLinks:
         snap = sp.collect_snapshot(str(root / "s"))
         assert sp.check_links(str(root / "s"), snap) == []
 
+    def test_root_and_clean_urls_resolve_like_the_site_host(self, entity_fs):
+        root, eid = entity_fs
+        _mk(
+            root,
+            "s/index.html",
+            b'<a href="/">home</a><a href="/about">a</a><a href="about/">a2</a>'
+            b'<a href="/pricing/">p</a><a href="blog/post">b</a><link href="/styles.css">',
+        )
+        for rel in ("about.html", "pricing/index.html", "blog/post.html", "styles.css"):
+            _mk(root, f"s/{rel}")
+        snap = sp.collect_snapshot(str(root / "s"))
+        assert sp.check_links(str(root / "s"), snap) == []
+
+    def test_clean_url_without_a_page_still_fails(self, entity_fs):
+        root, eid = entity_fs
+        _mk(root, "s/index.html", b'<a href="/team">t</a>')
+        snap = sp.collect_snapshot(str(root / "s"))
+        errors = sp.check_links(str(root / "s"), snap)
+        assert errors and "/team" in errors[0]
+
     def test_placeholder_and_missing_anchor_destinations_fail(self, entity_fs):
         root, eid = entity_fs
         _mk(root, "s/index.html", b'<a href="#">one</a><a>two</a>')

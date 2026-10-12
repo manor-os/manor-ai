@@ -18,6 +18,7 @@ Supported providers (refresh endpoint + client credentials from env):
   linkedin        LINKEDIN_CLIENT_ID / LINKEDIN_CLIENT_SECRET
   github          GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET
   twitter_x       X_CLIENT_ID / X_CLIENT_SECRET
+  tiktok          TIKTOK_CLIENT_ID / TIKTOK_CLIENT_SECRET
   quickbooks      QUICKBOOKS_CLIENT_ID / QUICKBOOKS_CLIENT_SECRET
 
 ``stripe`` uses static API keys, not OAuth → skipped here.
@@ -49,6 +50,8 @@ logger = logging.getLogger(__name__)
 # ── Provider config ─────────────────────────────────────────────────────────
 
 _PROVIDER_CONFIG: dict[str, dict[str, str]] = {
+    "manor_pms": {"client_id_env": "PMS_OAUTH_CLIENT_ID", "client_secret_env": "PMS_OAUTH_CLIENT_SECRET"},
+    "manor_mcp_minutes": {"client_id_env": "MINUTES_OAUTH_CLIENT_ID", "client_secret_env": "MINUTES_OAUTH_CLIENT_SECRET"},
     "robinhood": {
         "token_url": "https://api.robinhood.com/oauth2/token/",
         "client_id_env": "ROBINHOOD_CLIENT_ID",
@@ -79,6 +82,11 @@ _PROVIDER_CONFIG: dict[str, dict[str, str]] = {
         "client_id_env": "LINKEDIN_CLIENT_ID",
         "client_secret_env": "LINKEDIN_CLIENT_SECRET",
     },
+    "lark": {
+        "token_url": "https://open.larksuite.com/open-apis/authen/v2/oauth/token",
+        "client_id_env": "LARK_APP_ID",
+        "client_secret_env": "LARK_APP_SECRET",
+    },
     "github": {
         "token_url": "https://github.com/login/oauth/access_token",
         "client_id_env": "GITHUB_CLIENT_ID",
@@ -88,6 +96,11 @@ _PROVIDER_CONFIG: dict[str, dict[str, str]] = {
         "token_url": "https://api.x.com/2/oauth2/token",
         "client_id_env": "X_CLIENT_ID",
         "client_secret_env": "X_CLIENT_SECRET",
+    },
+    "tiktok": {
+        "token_url": "https://open.tiktokapis.com/v2/oauth/token/",
+        "client_id_env": "TIKTOK_CLIENT_ID",
+        "client_secret_env": "TIKTOK_CLIENT_SECRET",
     },
     "quickbooks": {
         "token_url": "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
@@ -126,6 +139,8 @@ async def refresh_token_via_provider(
     provider: str,
     refresh_token: str,
     db: Optional[AsyncSession] = None,
+    *,
+    expected_client_id: str | None = None,
 ) -> Optional[dict]:
     """Exchange a refresh_token for a new access_token at the provider's URL.
 
@@ -141,11 +156,14 @@ async def refresh_token_via_provider(
         build_token_request_auth,
         resolve_oauth_config,
     )
+    from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
 
     if db is None:
         from packages.core.database import async_session
         async with async_session() as _db:
-            return await refresh_token_via_provider(provider, refresh_token, db=_db)
+            return await refresh_token_via_provider(
+                provider, refresh_token, db=_db, expected_client_id=expected_client_id,
+            )
 
     provider = canonical_provider_key(provider)
     oauth_cfg = await resolve_oauth_config(db, provider)
@@ -155,6 +173,11 @@ async def refresh_token_via_provider(
             provider,
         )
         return None
+    if provider == "lark" and expected_client_id and oauth_cfg.client_id != expected_client_id:
+        return {_PERMANENT_REFRESH_ERROR_KEY: {
+            "error": "oauth_app_changed",
+            "description": "The Lark app configuration changed; connect this account again.",
+        }}
 
     headers, body = build_token_request_auth(
         oauth_cfg,
@@ -167,30 +190,63 @@ async def refresh_token_via_provider(
     )
 
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                oauth_cfg.token_url,
-                data=body,
-                headers=headers,
-            )
-    except Exception as e:
-        logger.warning("oauth_refresh: %s token endpoint unreachable: %s", provider, e)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False, trust_env=False) as client:
+            request_body = {"json": body} if provider == "lark" else {"data": body}
+            resp = await client.post(oauth_cfg.token_url, headers=headers, **request_body)
+    except Exception:
+        logger.warning("oauth_refresh: %s token endpoint unreachable", provider)
+        from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
+
+        if is_manor_oauth_provider(provider) or provider == "lark":
+            return {_PERMANENT_REFRESH_ERROR_KEY: {"error": "refresh_outcome_unknown", "description": "OAuth refresh outcome is unknown; reconnect before further use."}}
         return None
 
-    if resp.status_code >= 400:
+    if not 200 <= resp.status_code < 300:
         permanent_error = _permanent_refresh_error_from_response(resp)
         logger.warning(
-            "oauth_refresh: %s refresh returned %d: %s",
-            provider, resp.status_code, resp.text[:200],
+            "oauth_refresh: %s refresh returned HTTP %d",
+            provider, resp.status_code,
         )
+        if provider == "lark":
+            return {_PERMANENT_REFRESH_ERROR_KEY: {
+                "error": "invalid_grant" if permanent_error else "refresh_outcome_unknown",
+                "description": "Lark OAuth refresh was not confirmed; reconnect before further use.",
+            }}
         if permanent_error:
+            from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
+
+            if is_manor_oauth_provider(provider):
+                permanent_error = {"error": "invalid_grant", "description": "OAuth refresh was rejected; reconnect."}
             return {_PERMANENT_REFRESH_ERROR_KEY: permanent_error}
+        if is_manor_oauth_provider(provider):
+            return {_PERMANENT_REFRESH_ERROR_KEY: {"error": "refresh_outcome_unknown", "description": "OAuth refresh was not confirmed; reconnect before further use."}}
         return None
 
     try:
-        return resp.json()
+        data = resp.json()
     except Exception:
+        if is_manor_oauth_provider(provider) or provider == "lark":
+            return {_PERMANENT_REFRESH_ERROR_KEY: {"error": "invalid_refresh_response", "description": "OAuth refresh returned an invalid response; reconnect."}}
         return None
+    if provider == "lark":
+        from packages.core.services.lark_oauth import lark_token_response_is_valid
+
+        if not lark_token_response_is_valid(data, scopes=oauth_cfg.scopes):
+            return {_PERMANENT_REFRESH_ERROR_KEY: {
+                "error": "invalid_refresh_response",
+                "description": "Lark OAuth refresh returned an incomplete or rejected grant; reconnect.",
+            }}
+    if is_manor_oauth_provider(provider) and (
+        not isinstance(data, dict)
+        or not isinstance(data.get("access_token"), str) or not data["access_token"]
+        or not data["access_token"].isascii() or any(char.isspace() for char in data["access_token"])
+        or not isinstance(data.get("refresh_token"), str) or not data["refresh_token"]
+        or not isinstance(data.get("expires_in"), int) or isinstance(data["expires_in"], bool)
+        or data["expires_in"] <= 0
+        or not set(oauth_cfg.scopes.split()).issubset(str(data.get("scope") or "").split())
+    ):
+        return {_PERMANENT_REFRESH_ERROR_KEY: {"error": "invalid_refresh_response", "description": "OAuth refresh returned an incomplete grant; reconnect."}}
+    return data
 
 
 def _permanent_refresh_error_from_response(resp: httpx.Response) -> dict[str, Any] | None:
@@ -268,7 +324,12 @@ def _mark_oauth_account_reauth_required(
         "checked_at": refresh_state["checked_at"],
     }
     row.profile = profile
-    clear_oauth_account_tokens(row)
+    from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
+
+    # Retain only encrypted grant material for an explicit remote Disconnect.
+    # A failed/ambiguous rotating grant cannot execute or automatically refresh.
+    if not is_manor_oauth_provider(provider):
+        clear_oauth_account_tokens(row)
     row.token_expires_at = None
 
 
@@ -315,6 +376,45 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
     changed = False
     for row in rows:
         provider = canonical_provider_key(row.provider)
+        from packages.core.services.manor_integration_oauth import (
+            is_manor_oauth_provider, manor_oauth_account_matches, manor_oauth_binding,
+            verify_manor_oauth_account,
+        )
+
+        if provider == "lark":
+            from packages.core.services.lark_oauth import lark_oauth_account_matches
+            from packages.core.services.oauth_account_credentials import _oauth_account_requires_reconnect
+
+            # Lark refresh tokens can be used only once. Keep the row locked
+            # until the rotated encrypted grant is persisted, and recheck it.
+            await db.refresh(row, with_for_update=True)
+            if (
+                row.token_expires_at is None or row.token_expires_at > deadline
+                or _oauth_account_requires_reconnect(row)
+            ):
+                continue
+            if not await lark_oauth_account_matches(db, row):
+                _mark_oauth_account_reauth_required(row, provider, {
+                    "error": "oauth_app_changed",
+                    "description": "The Lark app configuration changed; connect this account again.",
+                })
+                changed = True
+                continue
+
+        if is_manor_oauth_provider(provider):
+            # Serialize rotating grants with refresh and disconnect. Re-read
+            # after the lock: another worker may already have refreshed it.
+            await db.refresh(row, with_for_update=True)
+            if not manor_oauth_account_matches(row):
+                continue
+            if row.token_expires_at is None or row.token_expires_at > deadline:
+                continue
+            from packages.core.services.integration_access import _is_active_entity_member
+
+            if not await _is_active_entity_member(
+                db, user_id=row.user_id, entity_id=manor_oauth_binding(row)["entity_id"],
+            ):
+                continue
         try:
             creds = lease_oauth_account_tokens(
                 row,
@@ -345,6 +445,7 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
             provider,
             refresh_token,
             db=db,
+            **({"expected_client_id": (row.profile or {}).get("app_id")} if provider == "lark" else {}),
         )
         if _is_permanent_refresh_error(data):
             _mark_oauth_account_reauth_required(
@@ -356,6 +457,35 @@ async def _refresh_oauth_accounts(db: AsyncSession) -> int:
             continue
         if not data or not data.get("access_token"):
             continue
+        if provider == "lark":
+            from packages.core.services.oauth_flow import OAuthFlowError, TokenSet, resolve_oauth_identity
+
+            try:
+                refreshed_id, _ = await resolve_oauth_identity(
+                    "lark", TokenSet(data["access_token"], data.get("refresh_token"), None, "", data),
+                    application_id=(row.profile or {}).get("app_id"),
+                )
+                if refreshed_id != row.provider_user_id:
+                    raise OAuthFlowError(502, "Lark identity changed")
+            except OAuthFlowError:
+                _mark_oauth_account_reauth_required(row, provider, {
+                    "error": "identity_verification_failed",
+                    "description": "The refreshed Lark OAuth grant could not be verified; reconnect.",
+                })
+                changed = True
+                continue
+        if is_manor_oauth_provider(provider):
+            from packages.core.services.oauth_flow import OAuthFlowError
+
+            try:
+                await verify_manor_oauth_account(row, data["access_token"])
+            except OAuthFlowError:
+                _mark_oauth_account_reauth_required(row, provider, {
+                    "error": "identity_verification_failed",
+                    "description": "The refreshed OAuth grant could not be verified; reconnect.",
+                })
+                changed = True
+                continue
         store_oauth_account_tokens(
             row,
             access_token=data["access_token"],
@@ -396,6 +526,10 @@ async def _refresh_integrations(db: AsyncSession) -> int:
     refreshed = 0
     changed = False
     for row in rows:
+        # Lark's new user grants live only in encrypted OAuthAccount rows.
+        # Legacy Integration rows retain their app/Feishu credentials.
+        if canonical_provider_key(row.provider) == "lark":
+            continue
         creds = row.credentials or {}
         refresh_token = creds.get("refresh_token")
         if not refresh_token:

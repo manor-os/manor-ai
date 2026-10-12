@@ -6,6 +6,7 @@ import os
 SERVICE_ROLE_API = "api"
 SERVICE_ROLE_CHAT = "chat"
 SERVICE_ROLE_WORKER = "worker"
+SERVICE_ROLE_WORKER_ROOM = "worker-room"
 SERVICE_ROLE_WORKER_HEAVY = "worker-heavy"
 SERVICE_ROLE_BEAT = "beat"
 SERVICE_ROLE_MIGRATION = "migration"
@@ -15,6 +16,7 @@ SUPPORTED_SERVICE_ROLES = {
     SERVICE_ROLE_API,
     SERVICE_ROLE_CHAT,
     SERVICE_ROLE_WORKER,
+    SERVICE_ROLE_WORKER_ROOM,
     SERVICE_ROLE_WORKER_HEAVY,
     SERVICE_ROLE_BEAT,
     SERVICE_ROLE_MIGRATION,
@@ -88,6 +90,8 @@ def otel_service_name_for_role(role: str | None = None) -> str:
         return "manor-chat"
     if normalized == SERVICE_ROLE_WORKER_HEAVY:
         return "manor-worker-heavy"
+    if normalized == SERVICE_ROLE_WORKER_ROOM:
+        return "manor-worker-room"
     if normalized == SERVICE_ROLE_WORKER:
         return "manor-worker"
     if normalized == SERVICE_ROLE_BEAT:

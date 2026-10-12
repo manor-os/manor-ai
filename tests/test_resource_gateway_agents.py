@@ -201,7 +201,9 @@ async def test_member_cannot_edit_agent_owned_by_someone_else(client: AsyncClien
 
 
 @pytest.mark.asyncio
-async def test_entity_admin_keeps_firm_wide_override(client: AsyncClient):
+async def test_entity_admin_without_global_workspace_permission_has_no_override(
+    client: AsyncClient,
+):
     owner_headers = await _auth(client, "gwagent_admin_owner")
     owner = await _me(client, owner_headers)
     ws_id = await _make_workspace(owner["entity_id"], "Locked WS", owner["id"])
@@ -212,13 +214,13 @@ async def test_entity_admin_keeps_firm_wide_override(client: AsyncClient):
 
     admin = await _create_entity_user(owner["entity_id"], "gwagent_admin", "admin")
     r = await client.get(f"/api/v1/agents/{agent_id}", headers=admin["headers"])
-    assert r.status_code == 200, r.text
+    assert r.status_code == 404, r.text
     r = await client.put(
         f"/api/v1/agents/{agent_id}",
         headers=admin["headers"],
         json={"name": "Admin edit"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 404, r.text
 
 
 @pytest.mark.asyncio

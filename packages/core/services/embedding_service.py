@@ -68,6 +68,9 @@ EMBEDDING_CACHE_TTL_SECONDS = _nonnegative_int_env(
     "EMBEDDING_CACHE_TTL_SECONDS",
     86_400,
 )
+# This is intentionally not deployment-configurable. Embeddings are paused
+# system-wide until the queue architecture can safely absorb generated files.
+_EMBEDDINGS_TEMPORARILY_PAUSED = True
 
 
 class _IndexingClaimLost(RuntimeError):
@@ -169,6 +172,9 @@ async def _resolve_embedding_config() -> dict | None:
 
     Returns config dict or None if no embedding provider is available.
     """
+    if _EMBEDDINGS_TEMPORARILY_PAUSED:
+        return None
+
     cfg = await _resolve_embedding_config_from_billing_context()
     if cfg:
         return cfg
@@ -298,6 +304,9 @@ async def generate_embedding(text_input: str, *, model: str | None = None) -> li
     Fallback chain: OpenAI API → Ollama local → raises RuntimeError.
     If the input exceeds the model's context length, truncate and retry once.
     """
+    if _EMBEDDINGS_TEMPORARILY_PAUSED:
+        return []
+
     cfg = await _resolve_embedding_config()
     if not cfg:
         raise RuntimeError("No embedding provider available (set OPENAI_API_KEY, EMBEDDING_API_KEY, or run Ollama)")
@@ -350,6 +359,9 @@ async def generate_embeddings_batch(
     processing texts one-by-one via generate_embedding() which handles
     truncation retries.
     """
+    if _EMBEDDINGS_TEMPORARILY_PAUSED:
+        return []
+
     cfg = await _resolve_embedding_config()
     if not cfg:
         raise RuntimeError("No embedding provider available")
@@ -915,98 +927,32 @@ async def _complete_document_indexing_without_vectors(
     await db.commit()
 
 
-async def _defer_document_indexing_for_deleted_workspace(
+async def _document_entity_is_unavailable(
     db: AsyncSession,
     document: Document,
     *,
-    run_id: str | None = None,
-) -> None:
-    """Leave deleted-Workspace indexing pending for a later restore."""
-    deferred_at = datetime.now(timezone.utc)
-    blocked_data = {
-        "step": "blocked",
-        "progress": 0,
-        "blocked_at": deferred_at.isoformat(),
-        "blocked_reason": "workspace_deleted",
-    }
-    if run_id is None:
-        if document.vector_status not in {
-            VectorStatus.PENDING,
-            VectorStatus.PROCESSING,
-            VectorStatus.FAILED,
-        }:
-            return
-        metadata = dict(document.metadata_ or {})
-        indexing = dict(metadata.get("indexing") or {})
-        indexing.update(blocked_data)
-        indexing.pop("run_id", None)
-        indexing.pop("heartbeat_at", None)
-        indexing.pop("heartbeat_epoch", None)
-        metadata["indexing"] = indexing
-        document.metadata_ = metadata
-        document.vector_status = VectorStatus.PENDING
-        await db.commit()
-        return
-
-    result = await db.execute(
-        text(
-            """
-            UPDATE documents
-               SET vector_status = :pending,
-                   metadata = jsonb_set(
-                       COALESCE(metadata, '{}'::jsonb),
-                       '{indexing}',
-                       (COALESCE(metadata->'indexing', '{}'::jsonb) - 'run_id'
-                           - 'heartbeat_at' - 'heartbeat_epoch')
-                           || CAST(:blocked_data AS jsonb),
-                       true
-                   ),
-                   updated_at = :deferred_at
-             WHERE id = :doc_id
-               AND is_trashed = false
-               AND vector_status = :processing
-               AND metadata->'indexing'->>'run_id' = :run_id
-            """
-        ),
-        {
-            "doc_id": document.id,
-            "run_id": run_id,
-            "pending": VectorStatus.PENDING,
-            "processing": VectorStatus.PROCESSING,
-            "blocked_data": json.dumps(blocked_data),
-            "deferred_at": deferred_at,
-        },
-    )
-    if result.rowcount != 1:
-        await db.rollback()
-        raise _IndexingClaimLost(document.id)
-    await db.commit()
-
-
-async def _defer_indexing_if_workspace_deleted(
-    db: AsyncSession,
-    document: Document,
-    *,
-    run_id: str | None = None,
     lock_for_read: bool = False,
 ) -> bool:
-    from packages.core.services.document_access import (
-        document_is_owned_by_deleted_workspace,
-    )
-
     await db.refresh(document)
-    if not await document_is_owned_by_deleted_workspace(
+    if lock_for_read:
+        from packages.core.models.user import Entity
+
+        entity_id = await db.scalar(
+            select(Entity.id)
+            .where(
+                Entity.id == document.entity_id,
+                Entity.deleted_at.is_(None),
+            )
+            .with_for_update(read=True)
+        )
+        return entity_id is None
+
+    from packages.core.services.document_access import document_entity_is_unavailable
+
+    return await document_entity_is_unavailable(
         db,
         document,
-        lock_for_read=lock_for_read,
-    ):
-        return False
-    await _defer_document_indexing_for_deleted_workspace(
-        db,
-        document,
-        run_id=run_id,
     )
-    return True
 
 
 async def _mark_document_indexing_failed(
@@ -1070,6 +1016,9 @@ async def index_document(
 
     Returns True on success, False on failure.
     """
+    if _EMBEDDINGS_TEMPORARILY_PAUSED:
+        return True
+
     result = await db.execute(select(Document).where(Document.id == document_id))
     doc = result.scalar_one_or_none()
     if not doc:
@@ -1080,8 +1029,8 @@ async def index_document(
         doc.vector_status = VectorStatus.SKIPPED
         await db.commit()
         return True
-    if await _defer_indexing_if_workspace_deleted(db, doc):
-        logger.info("Deferring embedding for deleted-Workspace document %s", document_id)
+    if await _document_entity_is_unavailable(db, doc):
+        logger.info("Skipping embedding for unavailable-Entity document %s", document_id)
         return True
 
     run_id = await _claim_document_indexing(db, doc, allow_ready=allow_ready)
@@ -1110,9 +1059,8 @@ async def index_document(
         )
 
     try:
-        if await _defer_indexing_if_workspace_deleted(db, doc, run_id=run_id):
-            logger.info("Deferring embedding for deleted-Workspace document %s", document_id)
-            return True
+        if await _document_entity_is_unavailable(db, doc):
+            raise _IndexingClaimLost(document_id)
         # File availability is checked only after this delivery owns the run.
         # Otherwise a duplicate delivery could cancel a healthy active worker.
         _ensure_document_file_available(doc)
@@ -1121,32 +1069,30 @@ async def index_document(
         # still work, so this is a successful terminal state.
         cfg = await _resolve_embedding_config()
         if not cfg:
-            if await _defer_indexing_if_workspace_deleted(
+            if await _document_entity_is_unavailable(
                 db,
                 doc,
-                run_id=run_id,
                 lock_for_read=True,
             ):
-                return True
+                raise _IndexingClaimLost(document_id)
             logger.info("No embedding provider available — skipping vectorization for document %s", document_id)
             await _complete_document_indexing_without_vectors(db, document_id, run_id)
             return True
 
         await _update_progress("reading", 10)
-        if await _defer_indexing_if_workspace_deleted(
+        if await _document_entity_is_unavailable(
             db,
             doc,
-            run_id=run_id,
             lock_for_read=True,
         ):
-            return True
-        # The shared Workspace lifecycle lock only protects the ownership
-        # decision.  Release it before filesystem I/O so delete/restore is not
-        # blocked by a slow remote object-store read.
+            raise _IndexingClaimLost(document_id)
+        # The Entity lifecycle lock only protects the ownership decision.
+        # Release it before filesystem I/O so a slow remote object-store read
+        # does not block lifecycle work.
         await db.commit()
         content = await _read_document_content(doc)
-        if await _defer_indexing_if_workspace_deleted(db, doc, run_id=run_id):
-            return True
+        if await _document_entity_is_unavailable(db, doc):
+            raise _IndexingClaimLost(document_id)
 
         await _update_progress("chunking", 20)
         # Use smaller chunks for Ollama (limited context window)
@@ -1163,14 +1109,13 @@ async def index_document(
         batch_size = 100
         chunk_embeddings: list[list[float]] = []
         for i in range(0, total, batch_size):
-            if await _defer_indexing_if_workspace_deleted(
+            if await _document_entity_is_unavailable(
                 db,
                 doc,
-                run_id=run_id,
                 lock_for_read=True,
             ):
-                return True
-            # Never carry a Workspace lifecycle lock into provider I/O.  The
+                raise _IndexingClaimLost(document_id)
+            # Never carry an Entity lifecycle lock into provider I/O. The
             # final storing check below reacquires it for the atomic write.
             await db.commit()
             batch = chunks[i : i + batch_size]
@@ -1186,10 +1131,9 @@ async def index_document(
                     total_chunks=total,
                     current_chunk=reported_done,
                 )
-                if await _defer_indexing_if_workspace_deleted(
+                if await _document_entity_is_unavailable(
                     db,
                     doc,
-                    run_id=run_id,
                     lock_for_read=True,
                 ):
                     raise _IndexingClaimLost(document_id)
@@ -1216,13 +1160,12 @@ async def index_document(
                 await _update_progress("embedding", pct, total_chunks=total, current_chunk=done)
 
         await _update_progress("storing", 95, total_chunks=total, current_chunk=total)
-        if await _defer_indexing_if_workspace_deleted(
+        if await _document_entity_is_unavailable(
             db,
             doc,
-            run_id=run_id,
             lock_for_read=True,
         ):
-            return True
+            raise _IndexingClaimLost(document_id)
 
         conn = await db.connection()
         # Replace this document's chunks wholesale — reindexing must not
@@ -1321,6 +1264,9 @@ async def index_document(
 
 async def index_documents_for_entity(db: AsyncSession, entity_id: str) -> int:
     """Index all pending documents for an entity. Returns count indexed."""
+    if _EMBEDDINGS_TEMPORARILY_PAUSED:
+        return 0
+
     result = await db.execute(
         select(Document).where(
             Document.entity_id == entity_id,

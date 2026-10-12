@@ -16,5 +16,9 @@
     "mcp__amazon__get_listing_item",
     "mcp__amazon__patch_listing",
     "mcp__amazon__put_listing"
-  ]
+  ],
+  "search": {
+    "terms": ["seller central", "sp-api", "asin", "sku", "amazon seller", "fulfillment by amazon", "product listing"],
+    "examples": ["check amazon fba inventory levels", "list my recent amazon seller orders", "update amazon listing price", "search amazon catalog by asin"]
+  }
 }

@@ -1,5 +1,7 @@
 """E2E tests: document versioning and trash/restore."""
 
+import asyncio
+import hashlib
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -9,12 +11,16 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from packages.core.models.document import Document
+from packages.core.models.document_version import DocumentVersion
 from packages.core.models.comment import Comment
 from packages.core.models.artifact_purge import WorkspaceArtifactPurgeJob
 from packages.core.models.user import User
+from packages.core.config import get_settings
 from packages.core.services.auth_service import create_access_token, hash_password
 import packages.core.services.version_service as version_service
 from packages.core.services.version_service import _dedupe_dest
+from packages.core.services.ledger_evidence import verify_evidence_refs
+from packages.core.ai.runtime.manor_actions import runtime_manor_delete_document
 
 
 def test_restore_destination_deduplication_never_reuses_an_existing_suffix(
@@ -85,6 +91,283 @@ async def test_create_version(client: AsyncClient):
     assert data["name"] == "file.txt"
     assert data["change_summary"] == "Initial snapshot"
     assert data["created_by"] == "veruser"
+
+
+@pytest.mark.asyncio
+async def test_filesystem_version_keeps_immutable_bytes_after_source_edit(
+    db_session, tmp_path, monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    entity_id = "version-snapshot-entity"
+    source = tmp_path / entity_id / "release" / "master.wav"
+    source.parent.mkdir(parents=True)
+    original = b"original master bytes"
+    source.write_bytes(original)
+    doc = Document(
+        entity_id=entity_id,
+        name="master.wav",
+        fs_path="release/master.wav",
+        file_size=len(original),
+    )
+    db_session.add(doc)
+    await db_session.commit()
+
+    version = await version_service.create_version(db_session, doc.id, entity_id)
+    await db_session.commit()
+
+    assert version.fs_path.startswith(f".versions/documents/{doc.id}/")
+    assert version.snapshot_key == version.id
+    assert version.content_sha256 == hashlib.sha256(original).hexdigest()
+    snapshot = tmp_path / entity_id / version.fs_path
+    assert snapshot.read_bytes() == original
+
+    source.write_bytes(b"revised master bytes")
+    assert snapshot.read_bytes() == original
+
+
+@pytest.mark.asyncio
+async def test_version_copy_does_not_reopen_descriptor_symlink(
+    db_session, tmp_path, monkeypatch,
+):
+    from packages.core.services import entity_fs
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    entity_id = "descriptor-copy-entity"
+    source = tmp_path / entity_id / "master.wav"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"pinned source")
+    doc = Document(entity_id=entity_id, name="master.wav", fs_path="master.wav")
+    db_session.add(doc)
+    await db_session.commit()
+    original_open = entity_fs.os.open
+
+    def reject_descriptor_symlink(path, flags, *args, **kwargs):
+        if str(path).startswith(("/dev/fd/", "/proc/self/fd/")):
+            raise OSError("descriptor symlink cannot be opened with O_NOFOLLOW")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(entity_fs.os, "open", reject_descriptor_symlink)
+    version = await version_service.create_version(db_session, doc.id, entity_id)
+    await db_session.commit()
+
+    assert (tmp_path / entity_id / version.fs_path).read_bytes() == b"pinned source"
+
+
+@pytest.mark.asyncio
+async def test_document_editor_creates_snapshot_while_holding_mutation_lock(
+    client: AsyncClient, db_session, tmp_path, monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "versioneditor")
+    doc = await _upload(client, headers)
+
+    response = await asyncio.wait_for(
+        client.put(
+            f"/api/v1/documents/{doc['id']}/content",
+            headers=headers,
+            json={"content": "edited content"},
+        ),
+        timeout=3,
+    )
+
+    assert response.status_code == 200, response.text
+    versions = await client.get(f"/api/v1/documents/{doc['id']}/versions", headers=headers)
+    assert versions.status_code == 200
+    assert versions.json()[0]["fs_path"].startswith(f".versions/documents/{doc['id']}/")
+
+
+@pytest.mark.asyncio
+async def test_workspace_ledger_verifies_version_after_document_changes(
+    client: AsyncClient, tmp_path, monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "versionledger")
+    workspace_response = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Version evidence"},
+    )
+    assert workspace_response.status_code == 201, workspace_response.text
+    workspace = workspace_response.json()
+    upload = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        params={"folder_id": workspace["artifact_folder_id"]},
+        files={"file": ("master.wav", b"original master", "audio/wav")},
+    )
+    assert upload.status_code == 201, upload.text
+    doc = upload.json()
+    created = await client.post(f"/api/v1/documents/{doc['id']}/versions", headers=headers)
+    assert created.status_code == 201, created.text
+    version = created.json()
+    assert version["content_sha256"] == hashlib.sha256(b"original master").hexdigest()
+    revised = await client.put(
+        f"/api/v1/documents/{doc['id']}/file",
+        headers=headers,
+        files={"file": ("master.wav", b"revised master", "audio/wav")},
+    )
+    assert revised.status_code == 200, revised.text
+
+    reference = {
+        "workspace_id": workspace["id"],
+        "role": "master",
+        "document_id": doc["id"],
+        "version_id": version["id"],
+        "version_number": version["version_number"],
+        "sha256": hashlib.sha256(b"original master").hexdigest(),
+        "verification_status": "verified",
+        "verified_at": "2026-09-24T00:00:00Z",
+    }
+    verified = await verify_evidence_refs(
+        [reference], entity_id=doc["entity_id"], workspace_id=workspace["id"],
+    )
+    assert verified[0]["source"] == "knowledge_hash"
+
+
+@pytest.mark.asyncio
+async def test_ledger_version_scope_survives_document_move(
+    client: AsyncClient, db_session, tmp_path, monkeypatch,
+):
+    from packages.core.services.ledger_evidence import EvidenceReferenceError
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "versionmove")
+    first = (await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "First evidence"},
+    )).json()
+    second = (await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Second evidence"},
+    )).json()
+    uploaded = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        params={"folder_id": first["artifact_folder_id"]},
+        files={"file": ("master.wav", b"first workspace master", "audio/wav")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    doc = uploaded.json()
+    created = await client.post(f"/api/v1/documents/{doc['id']}/versions", headers=headers)
+    assert created.status_code == 201, created.text
+    version = created.json()
+    stored = await db_session.get(DocumentVersion, version["id"])
+    assert stored.workspace_id == first["id"]
+
+    current = await db_session.get(Document, doc["id"])
+    current.metadata_ = {"origin": {"workspace_id": second["id"]}}
+    current.folder_id = second["artifact_folder_id"]
+    current.fs_path = f"Workspaces/_by_id/{second['artifact_folder_id']}/master.wav"
+    await db_session.commit()
+    reference = {
+        "workspace_id": first["id"],
+        "role": "master",
+        "document_id": doc["id"],
+        "version_id": version["id"],
+        "sha256": version["content_sha256"],
+        "verification_status": "verified",
+        "verified_at": "2026-09-24T00:00:00Z",
+    }
+    assert (await verify_evidence_refs(
+        [reference], entity_id=doc["entity_id"], workspace_id=first["id"],
+    ))[0]["source"] == "knowledge_hash"
+    with pytest.raises(EvidenceReferenceError) as exc:
+        await verify_evidence_refs(
+            [{**reference, "workspace_id": second["id"]}],
+            entity_id=doc["entity_id"], workspace_id=second["id"],
+        )
+    assert exc.value.code == "evidence_scope_invalid"
+
+
+@pytest.mark.asyncio
+async def test_version_captures_workspace_folder_without_origin(
+    client: AsyncClient, db_session, tmp_path, monkeypatch,
+):
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(settings, "DEPLOYMENT_MODE", "oss")
+    headers = await _auth(client, "versionfolder")
+    response = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Folder evidence"},
+    )
+    assert response.status_code == 201, response.text
+    workspace = response.json()
+    uploaded = await client.post(
+        "/api/v1/documents/upload",
+        headers=headers,
+        params={"folder_id": workspace["artifact_folder_id"]},
+        files={"file": ("master.wav", b"folder master", "audio/wav")},
+    )
+    assert uploaded.status_code == 201, uploaded.text
+    doc = uploaded.json()
+    current = await db_session.get(Document, doc["id"])
+    current.metadata_ = {}
+    await db_session.commit()
+
+    version = await version_service.create_version(db_session, doc["id"], doc["entity_id"])
+    await db_session.commit()
+
+    assert version.workspace_id == workspace["id"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_delete_queues_version_snapshot_cleanup(
+    client: AsyncClient, db_session, tmp_path, monkeypatch,
+):
+    from packages.core.services.workspace_artifact_purge import drain_workspace_artifact_purge_jobs
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    await _auth(client, "runtimeversiondelete")
+    user = (await db_session.execute(
+        select(User).where(User.email == "runtimeversiondelete@test.com")
+    )).scalar_one()
+    entity_id = user.entity_id
+    source = tmp_path / entity_id / "master.wav"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"runtime master")
+    doc = Document(
+        entity_id=entity_id, owner_id=user.id, name="master.wav", fs_path="master.wav",
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    version = await version_service.create_version(db_session, doc.id, entity_id)
+    await db_session.commit()
+    snapshot = tmp_path / entity_id / version.fs_path
+    assert snapshot.is_file()
+
+    result = await runtime_manor_delete_document(
+        db_session, entity_id=entity_id, user_id=user.id,
+        params={"document_id": doc.id},
+    )
+
+    assert '"deleted": true' in result
+    assert await db_session.get(DocumentVersion, version.id) is None
+    cleanup_base = f".versions/documents/{doc.id}"
+    job = (await db_session.execute(
+        select(WorkspaceArtifactPurgeJob).where(
+            WorkspaceArtifactPurgeJob.entity_id == entity_id,
+            WorkspaceArtifactPurgeJob.storage_base == cleanup_base,
+        )
+    )).scalar_one()
+    assert job.target_kind == "tree"
+    await drain_workspace_artifact_purge_jobs(
+        db_session, entity_id=entity_id, storage_bases={cleanup_base}, limit=1,
+    )
+    assert not snapshot.exists()
 
 
 @pytest.mark.asyncio
@@ -163,10 +446,19 @@ async def test_restore_document(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_deleted_workspace_blocks_trash_restore_and_permanent_delete(
+async def test_deleted_workspace_retains_knowledge_trash_lifecycle(
     client: AsyncClient,
     db_session,
 ):
+    from datetime import datetime, timezone
+
+    from packages.core.models.permission import (
+        Capability,
+        ResourceGrant,
+        ResourceType,
+        SubjectType,
+    )
+
     headers = await _auth(client, "deletedworkspacetrash")
     workspace = await client.post(
         "/api/v1/workspaces",
@@ -188,43 +480,60 @@ async def test_deleted_workspace_blocks_trash_restore_and_permanent_delete(
         headers=headers,
     )
     assert trashed.status_code == 200, trashed.text
+    member_headers = await _entity_member_headers(
+        db_session,
+        document["entity_id"],
+        "deletedworkspacetrashmember",
+    )
+    member = await db_session.scalar(select(User).where(
+        User.email == "deletedworkspacetrashmember@test.com",
+    ))
+    assert member is not None
+    db_session.add(ResourceGrant(
+        entity_id=document["entity_id"],
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=document["id"],
+        subject_type=SubjectType.USER,
+        subject_id=member.id,
+        capabilities=[Capability.DELETE],
+        granted_by=document["owner_id"],
+        granted_at=datetime.now(timezone.utc),
+        status="active",
+    ))
+    await db_session.commit()
     deleted = await client.delete(
         f"/api/v1/workspaces/{workspace_data['id']}",
         headers=headers,
     )
     assert deleted.status_code == 204, deleted.text
 
-    trash = await client.get("/api/v1/documents/trash", headers=headers)
+    retained_grant = (await db_session.execute(select(ResourceGrant).where(
+        ResourceGrant.resource_id == document["id"],
+        ResourceGrant.subject_id == member.id,
+    ))).scalar_one()
+    assert retained_grant.status == "active"
+    trash = await client.get("/api/v1/documents/trash", headers=member_headers)
     assert trash.status_code == 200, trash.text
-    assert document["id"] not in {row["id"] for row in trash.json()}
+    assert document["id"] in {row["id"] for row in trash.json()}
     restore = await client.post(
         f"/api/v1/documents/{document['id']}/restore",
+        headers=member_headers,
+    )
+    assert restore.status_code == 200, restore.text
+
+    retrash = await client.post(
+        f"/api/v1/documents/{document['id']}/trash",
         headers=headers,
     )
+    assert retrash.status_code == 200, retrash.text
     remove = await client.delete(
         f"/api/v1/documents/{document['id']}",
         headers=headers,
     )
-    assert restore.status_code == 404, restore.text
-    assert remove.status_code == 404, remove.text
-    emptied = await client.post("/api/v1/documents/trash/empty", headers=headers)
-    assert emptied.status_code == 204, emptied.text
+    assert remove.status_code == 204, remove.text
 
     db_session.expire_all()
-    preserved = await db_session.get(Document, document["id"])
-    assert preserved is not None
-    assert preserved.is_trashed is True
-
-    restored_workspace = await client.post(
-        f"/api/v1/workspaces/{workspace_data['id']}/restore",
-        headers=headers,
-    )
-    assert restored_workspace.status_code == 200, restored_workspace.text
-    restored_document = await client.post(
-        f"/api/v1/documents/{document['id']}/restore",
-        headers=headers,
-    )
-    assert restored_document.status_code == 200, restored_document.text
+    assert await db_session.get(Document, document["id"]) is None
 
 
 @pytest.mark.asyncio
@@ -284,7 +593,7 @@ async def test_trash_list_reuses_one_batched_access_context(
     ]
     context = SimpleNamespace(
         is_admin=False,
-        document_owned_by_deleted_workspace=lambda _document: False,
+        document_entity_is_unavailable=lambda _document: False,
         preload_documents=AsyncMock(),
         effective_document_capabilities=AsyncMock(
             side_effect=[{documents.Capability.DELETE}, set()],
@@ -405,6 +714,18 @@ async def test_empty_trash(client: AsyncClient, db_session, monkeypatch, tmp_pat
     headers = await _auth(client, "veruser5")
     doc1 = await _upload(client, headers, "a.txt")
     doc2 = await _upload(client, headers, "b.txt")
+    snapshot_paths = []
+    version_ids = []
+    for doc in (doc1, doc2):
+        response = await client.post(
+            f"/api/v1/documents/{doc['id']}/versions",
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        version_ids.append(response.json()["id"])
+        snapshot = tmp_path / doc["entity_id"] / response.json()["fs_path"]
+        assert snapshot.is_file()
+        snapshot_paths.append(snapshot)
     derived_cache_bases = []
     thumbnail_caches = []
     for doc in (doc1, doc2):
@@ -472,6 +793,11 @@ async def test_empty_trash(client: AsyncClient, db_session, monkeypatch, tmp_pat
     assert all(not cache_base.exists() for cache_base in derived_cache_bases)
     assert all(not cache.exists() for cache in thumbnail_caches)
     assert all(not source_file.exists() for source_file in trashed_source_files)
+    assert all(not snapshot.exists() for snapshot in snapshot_paths)
+    remaining_versions = (await db_session.execute(
+        select(DocumentVersion).where(DocumentVersion.id.in_(version_ids))
+    )).scalars().all()
+    assert remaining_versions == []
 
 
 @pytest.mark.asyncio
@@ -517,7 +843,10 @@ async def test_empty_trash_retains_source_cleanup_job_after_filesystem_failure(
 
 @pytest.mark.asyncio
 async def test_empty_trash_deletes_only_the_locked_snapshot(db_session, monkeypatch):
+    from packages.core.models.user import Entity
+
     entity_id = "empty-trash-snapshot"
+    entity = Entity(id=entity_id, name="Empty trash snapshot entity")
     snapshot_doc = Document(
         entity_id=entity_id,
         name="already-trashed.txt",
@@ -528,7 +857,7 @@ async def test_empty_trash_deletes_only_the_locked_snapshot(db_session, monkeypa
         name="trashed-after-snapshot.txt",
         is_trashed=False,
     )
-    db_session.add_all([snapshot_doc, late_doc])
+    db_session.add_all([entity, snapshot_doc, late_doc])
     await db_session.commit()
     snapshot_id = snapshot_doc.id
     late_id = late_doc.id
@@ -551,9 +880,11 @@ async def test_empty_trash_deletes_only_the_locked_snapshot(db_session, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_permanently_delete_single_document_from_trash(client: AsyncClient):
+async def test_permanently_delete_single_document_from_trash(client: AsyncClient, db_session):
     headers = await _auth(client, "veruser6")
     doc = await _upload(client, headers, "delete-from-trash.txt")
+    version = await client.post(f"/api/v1/documents/{doc['id']}/versions", headers=headers)
+    assert version.status_code == 201, version.text
 
     trashed = await client.post(
         f"/api/v1/documents/{doc['id']}/trash",
@@ -570,3 +901,4 @@ async def test_permanently_delete_single_document_from_trash(client: AsyncClient
     trash = await client.get("/api/v1/documents/trash", headers=headers)
     assert trash.status_code == 200, trash.text
     assert all(item["id"] != doc["id"] for item in trash.json())
+    assert await db_session.get(DocumentVersion, version.json()["id"]) is None

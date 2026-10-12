@@ -30,5 +30,9 @@
     "mode": "required_before_answer",
     "semantic_trigger": "the user asks to create, design, update, improve, review, test, benchmark, or troubleshoot a Manor Skill, or asks to turn a repeatable workflow into a reusable Skill, regardless of language",
     "result_authority": "primary_source"
+  },
+  "search": {
+    "terms": ["custom skill", "skill authoring", "playbook", "prompt template", "save workflow", "reusable instructions", "evals"],
+    "examples": ["turn my workflow into a skill", "build new manor skill", "improve existing skill triggering", "test whether my skill works"]
   }
 }

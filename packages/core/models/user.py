@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, UniqueConstraint, event
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -47,6 +47,9 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    # Evidence for this exact address, never inferred from active account status.
+    verified_email: Mapped[Optional[str]] = mapped_column(String(255))
+    email_verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     display_name: Mapped[Optional[str]] = mapped_column(String(255))
     first_name: Mapped[Optional[str]] = mapped_column(String(100))
     last_name: Mapped[Optional[str]] = mapped_column(String(100))
@@ -73,6 +76,36 @@ class User(Base, TimestampMixin, SoftDeleteMixin):
     totp_secret: Mapped[Optional[str]] = mapped_column(String(255))
     totp_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     backup_codes: Mapped[Optional[list]] = mapped_column(JSONB)
+
+
+@event.listens_for(User.email, "set")
+def _invalidate_changed_email_proof(user, value, old_value, initiator):
+    if value != old_value:
+        user.verified_email = None
+        user.email_verified_at = None
+
+
+@event.listens_for(User, "after_insert")
+@event.listens_for(User, "after_delete")
+def _invalidate_response_locale(mapper, connection, user):
+    from sqlalchemy.orm import object_session
+    from packages.core.ai.response_language import response_locale_cache_key
+    from packages.core.read_cache import invalidate_after_commit
+
+    session = object_session(user)
+    if session is not None:
+        invalidate_after_commit(session, response_locale_cache_key(user.id))
+
+
+@event.listens_for(User, "after_update")
+def _invalidate_updated_response_locale(mapper, connection, user):
+    from sqlalchemy import inspect
+
+    state = inspect(user)
+    if state.attrs.locale.history.has_changes() or state.attrs.deleted_at.history.has_changes():
+        _invalidate_response_locale(mapper, connection, user)
+
+
 
 
 class UserMembership(Base, TimestampMixin, SoftDeleteMixin):

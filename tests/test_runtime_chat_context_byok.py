@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
-
 
 @pytest.mark.asyncio
 async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch):
@@ -12,6 +12,11 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
 
     db_marker = object()
     seen: dict[str, dict] = {}
+    keyword_path_lookup = AsyncMock(side_effect=AssertionError("keyword path lookup must not route Chat"))
+    monkeypatch.setattr(
+        "packages.core.services.tool_path_memory.lookup_paths",
+        keyword_path_lookup,
+    )
 
     async def fake_resolve_workspace_runtime(*_args, **kwargs):
         return SimpleNamespace(
@@ -100,6 +105,7 @@ async def test_runtime_chat_context_resolves_active_tenant_llm_route(monkeypatch
         workspace_id="ws_active",
         conversation_id=None,
     )
+    keyword_path_lookup.assert_not_awaited()
 
     assert getattr(ctx, "model", None) == "openai/gpt-5.5"
     assert getattr(ctx, "llm_metadata", None) == {
@@ -152,17 +158,8 @@ async def test_workspace_ledger_tool_scope_keeps_the_tenant_byok_route(monkeypat
 
     async def fake_assemble_prompt(_db, *, request, **kwargs):
         assert kwargs["bound_tool_names"] == ledger_tools
-        assert kwargs["visible_tool_names"] == (
-            "read_content_ledger",
-            "read_finance_ledger",
-            "read_recruiting_ledger",
-            "read_relationship_ledger",
-            "query_ledger",
-            "visualize_workspace_ledgers",
-        )
-        assert request.metadata["turn_execution_plan"]["tool_catalog_mode"] == (
-            "ledger_query"
-        )
+        assert kwargs["visible_tool_names"] is None
+        assert "turn_execution_plan" not in request.metadata
         ctx = ChatContext(
             db=_db,
             entity_id=request.entity_id,

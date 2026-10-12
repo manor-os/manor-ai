@@ -28,7 +28,8 @@ async def _registration(db, monkeypatch, mode):
     monkeypatch.setattr(auth, "create_verification", AsyncMock(return_value="12345678"))
     monkeypatch.setattr(auth, "send_verification_email", AsyncMock())
     if mode == "staff_invite":
-        entity = Entity(name="Inviting entity")
+        from packages.core.governance.approval_policy_service import account_defaults
+        entity = Entity(name="Inviting entity", settings={"approval_defaults": account_defaults()})
         db.add(entity)
         await db.flush()
         req.invite_token = generate_ulid()
@@ -73,7 +74,12 @@ async def test_registration_commits_before_success_or_verification(db_session, m
         return "12345678"
 
     monkeypatch.setattr(auth, "create_verification", verification_after_commit)
-    result = await auth.register(req, Request({"type": "http"}), db_session)
+    # Deliberately inspect before get_db's dependency teardown would commit.
+    result = await auth.register(
+        req,
+        Request({"type": "http", "headers": []}),
+        db_session,
+    )
     await assert_committed()
     if mode in {"verification", "resend"}:
         assert result["requires_verification"] is True
@@ -87,7 +93,11 @@ async def test_registration_commit_failure_does_not_report_success(db_session, m
     req = await _registration(db_session, monkeypatch, mode)
     monkeypatch.setattr(db_session, "commit", AsyncMock(side_effect=RuntimeError("commit failed")))
     with pytest.raises(RuntimeError, match="commit failed"):
-        await auth.register(req, Request({"type": "http"}), db_session)
+        await auth.register(
+            req,
+            Request({"type": "http", "headers": []}),
+            db_session,
+        )
     auth.create_verification.assert_not_awaited()
     auth.send_verification_email.assert_not_awaited()
     await db_session.rollback()

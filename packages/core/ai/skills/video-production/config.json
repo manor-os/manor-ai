@@ -1,0 +1,24 @@
+{
+  "id": "video-production",
+  "name": "video-production",
+  "display_name": "Video Production",
+  "type": "runtime_guidance",
+  "description": "Request-driven video production for any style or length: visual canvas, Manor media generation, editable assembly, verified delivery, and requested publication handoff.",
+  "category": "video",
+  "output_format": "file",
+  "tags": ["video", "reference-video", "remake", "script-to-video", "storyboard", "canvas", "long-form", "runtime-guidance", "builtin"],
+  "bundle_roots": ["references"],
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the user asks in natural language to plan, generate, or substantially remake a video of any genre or length from a brief, script, uploaded reference, or product reference, optionally with a publication destination; a narrow edit to an existing approved timeline stays with video-edit, and publishing an already finished asset alone uses the relevant platform workflow",
+    "result_authority": "primary_source"
+  },
+  "tools": ["read_file", "list_files", "search_documents", "search_tools", "list_skills", "invoke_skill", "generate_file", "patch_file", "generate_image", "plan_video_segments", "generate_video", "wait_media_jobs", "probe_media", "render_frame_samples", "transcribe_video", "normalize_audio_loudness", "build_narration_timeline", "align_subtitles", "merge_videos", "compose_video_timeline", "analyze_audio", "validate_subtitles", "search_free_music", "import_free_music"],
+  "max_rounds": 30,
+  "continuation_stages": ["canvas_ready", "production_in_progress"],
+  "temperature": 0.2,
+  "search": {
+    "terms": ["ai video", "commercial", "promo", "ad video", "short film", "storyboard", "script to video", "youtube", "social video", "reels"],
+    "examples": ["make video from my script", "produce promo video with ai footage", "create storyboard first and last frames", "video ad for social media from brief"]
+  }
+}

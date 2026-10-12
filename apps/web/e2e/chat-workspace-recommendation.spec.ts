@@ -3,6 +3,7 @@ import { expect, test, type Page } from "@playwright/test";
 const CONVERSATION_ID = "conversation-recommendation-e2e";
 const WORKSPACE_ID = "workspace-recommendation-exact-id";
 const REQUEST = "Run a weekly product launch with owners, milestones, and progress tracking.";
+const RESPONSE = "I can help shape the launch plan and the first set of milestones.";
 
 type RecommendationAction = "create_new" | "open_existing" | "add_to_existing";
 
@@ -19,7 +20,7 @@ function conversationMessages(action: RecommendationAction) {
       id: `message-assistant-${action}`,
       conversation_id: CONVERSATION_ID,
       role: "assistant",
-      content: "I can help shape the launch plan and the first set of milestones.",
+      content: RESPONSE,
       meta: {
         stream_status: "completed",
         workspace_recommendation: {
@@ -225,6 +226,9 @@ test("ordinary Chat can add a recommendation to the exact existing Workspace", a
   );
   expect(state.postedWorkspaceMessages[0].body).toMatchObject({
     body: expect.stringContaining(REQUEST),
+  });
+  expect(state.postedWorkspaceMessages[0].body).toMatchObject({
+    body: expect.stringContaining(RESPONSE),
   });
   await expect(page).toHaveURL(new RegExp(`/workspaces/${WORKSPACE_ID}$`));
 });

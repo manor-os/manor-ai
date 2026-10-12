@@ -33,6 +33,7 @@ def _make_job(**kwargs):
         "delete_after_run": False,
         "consecutive_errors": 0,
         "revision": 1,
+        "user_id": None,
         "agent_id": None,
         "goal_id": None,
         "manor_task_id": None,
@@ -144,15 +145,34 @@ async def test_agent_task_runner_fences_and_closes_its_terminal_commit(monkeypat
     async def granted_claim(_task_id):
         yield claim
 
-    async def fake_run(self, *_args):
+    async def fake_run(
+        self,
+        *_args,
+        runtime_hitl_delivery_identity=None,
+    ):
         assert self._execution_claim is claim
+        assert runtime_hitl_delivery_identity is None
         self._before_terminal_commit()
         self._after_terminal_commit()
         claim.lost.set()
         self._before_terminal_commit()
         return {"status": "completed"}
 
+    async def legacy_runtime(*_args, **_kwargs):
+        from packages.core.constants.task import TaskRuntimeKind
+        from packages.core.services.task_execution import TaskExecutionDispatch
+
+        return (
+            TaskExecutionDispatch(
+                runtime_kind=TaskRuntimeKind.LEGACY_AGENT,
+                task_id="task-1",
+                target_id="agent-1",
+            ),
+            None,
+        )
+
     monkeypatch.setattr(claim_service, "agent_task_execution_claim", granted_claim)
+    monkeypatch.setattr(ai_tasks, "_prepare_agent_task_runtime", legacy_runtime)
     monkeypatch.setattr(TaskRunner, "run", fake_run)
 
     claimed, result = await ai_tasks._run_agent_task_with_execution_claim(
@@ -204,6 +224,12 @@ async def test_agent_task_claim_loss_settlement_uses_fresh_fenced_claim(monkeypa
 
         def scalar_one_or_none(self):
             return task
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return []
 
     class FakeSession:
         commits = 0
@@ -952,6 +978,11 @@ def test_run_agent_task_does_not_finalize_a_suppressed_duplicate(monkeypatch):
         "agent-1",
         scheduled_run_id="run-1",
         scheduled_job_id="job-1",
+        runtime_hitl_id="hitl-1",
+        runtime_hitl_generation=7,
+        runtime_hitl_checkpoint_digest="checkpoint-digest",
+        runtime_hitl_checkpoint_signature="checkpoint-signature",
+        runtime_hitl_resolution_signature="resolution-signature",
     )
 
     assert result == {
@@ -966,8 +997,189 @@ def test_run_agent_task_does_not_finalize_a_suppressed_duplicate(monkeypatch):
             "scheduled_run_id": "run-1",
             "scheduled_job_id": "job-1",
             "claim_recheck": True,
+            "runtime_hitl_id": "hitl-1",
+            "runtime_hitl_generation": 7,
+            "runtime_hitl_checkpoint_digest": "checkpoint-digest",
+            "runtime_hitl_checkpoint_signature": "checkpoint-signature",
+            "runtime_hitl_resolution_signature": "resolution-signature",
         },
         "countdown": AGENT_TASK_EXECUTION_RECHECK_SECONDS,
+    }]
+
+
+def test_scheduled_coordinator_handoff_stays_running_and_rechecks(monkeypatch):
+    from packages.core.constants.execution import (
+        SCHEDULED_RUN_EXECUTION_RECHECK_SECONDS,
+    )
+    from packages.core.tasks import ai_tasks
+    import packages.core.database as database
+
+    rechecks = []
+
+    def coordinated(awaitable):
+        awaitable.close()
+        return True, {
+            "task_id": "task-1",
+            "status": "in_progress",
+            "runtime_kind": "coordinated_plan",
+            "coordinator_handoff": True,
+            "coordinator_monitor": True,
+        }
+
+    monkeypatch.setattr(database, "create_worker_session", lambda: object())
+    monkeypatch.setattr(ai_tasks, "_run_async", coordinated)
+    monkeypatch.setattr(
+        ai_tasks.run_agent_task,
+        "apply_async",
+        lambda **kwargs: rechecks.append(kwargs),
+    )
+    monkeypatch.setattr(
+        ai_tasks,
+        "_update_job_run_status",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a non-terminal coordinator handoff must not settle its occurrence"
+        ),
+    )
+
+    result = ai_tasks.run_agent_task.run(
+        "task-1",
+        "agent-1",
+        scheduled_run_id="run-1",
+        scheduled_job_id="job-1",
+    )
+
+    assert result["status"] == "in_progress"
+    assert result["recheck_scheduled"] is True
+    assert rechecks == [{
+        "args": ["task-1", "agent-1"],
+        "kwargs": {
+            "scheduled_run_id": "run-1",
+            "scheduled_job_id": "job-1",
+            "claim_recheck": True,
+        },
+        "countdown": SCHEDULED_RUN_EXECUTION_RECHECK_SECONDS,
+    }]
+
+
+def test_coordinator_monitor_recheck_never_schedules_another_recheck(monkeypatch):
+    """A claim_recheck delivery is the scheduler sweep's own bounded probe.
+
+    Re-publishing from it creates one self-perpetuating chain per sweep tick
+    (the recheck storm). Only the original delivery may arm a recheck.
+    """
+    from packages.core.tasks import ai_tasks
+    import packages.core.database as database
+
+    def coordinated(awaitable):
+        awaitable.close()
+        return True, {
+            "task_id": "task-1",
+            "status": "blocked",
+            "runtime_kind": "coordinated_plan",
+            "coordinator_monitor": True,
+            "duplicate_suppressed": True,
+            "reason": "active_plan_owns_task_execution",
+        }
+
+    monkeypatch.setattr(database, "create_worker_session", lambda: object())
+    monkeypatch.setattr(ai_tasks, "_run_async", coordinated)
+    published = []
+    # Record instead of raising: the monitor branch swallows publish errors.
+    monkeypatch.setattr(
+        ai_tasks.run_agent_task,
+        "apply_async",
+        lambda **kwargs: published.append(kwargs),
+    )
+    monkeypatch.setattr(
+        ai_tasks,
+        "_update_job_run_status",
+        lambda *_args, **_kwargs: pytest.fail(
+            "a coordinator monitor result must not settle its occurrence"
+        ),
+    )
+
+    result = ai_tasks.run_agent_task.run(
+        "task-1",
+        "agent-1",
+        scheduled_run_id="run-1",
+        scheduled_job_id="job-1",
+        claim_recheck=True,
+    )
+
+    assert result["coordinator_monitor"] is True
+    assert result["recheck_scheduled"] is False
+    assert published == [], "a recovery delivery gets no recursive recheck"
+
+
+def test_autonomy_paused_recheck_never_schedules_another_recheck(monkeypatch):
+    from packages.core.tasks import ai_tasks
+    import packages.core.database as database
+
+    published = []
+
+    def paused(awaitable):
+        awaitable.close()
+        return True, {
+            "task_id": "task-1",
+            "status": "in_progress",
+            "reason": "workspace_autonomy_paused",
+        }
+
+    monkeypatch.setattr(database, "create_worker_session", lambda: object())
+    monkeypatch.setattr(ai_tasks, "_run_async", paused)
+    monkeypatch.setattr(
+        ai_tasks.run_agent_task,
+        "apply_async",
+        lambda **kwargs: published.append(kwargs),
+    )
+
+    result = ai_tasks.run_agent_task.run(
+        "task-1",
+        "agent-1",
+        scheduled_run_id="run-1",
+        scheduled_job_id="job-1",
+        claim_recheck=True,
+    )
+
+    assert result["reason"] == "workspace_autonomy_paused"
+    assert result["recheck_scheduled"] is False
+    assert published == [], "a recovery delivery gets no recursive recheck"
+
+
+def test_autonomy_paused_first_delivery_still_polls(monkeypatch):
+    from packages.core.tasks import ai_tasks
+    import packages.core.database as database
+
+    published = []
+
+    def paused(awaitable):
+        awaitable.close()
+        return True, {
+            "task_id": "task-1",
+            "status": "in_progress",
+            "reason": "workspace_autonomy_paused",
+        }
+
+    monkeypatch.setattr(database, "create_worker_session", lambda: object())
+    monkeypatch.setattr(ai_tasks, "_run_async", paused)
+    monkeypatch.setattr(
+        ai_tasks.run_agent_task,
+        "apply_async",
+        lambda **kwargs: published.append(kwargs),
+    )
+
+    result = ai_tasks.run_agent_task.run(
+        "task-1",
+        "agent-1",
+        scheduled_run_id="run-1",
+        scheduled_job_id="job-1",
+    )
+
+    assert result["recheck_scheduled"] is True
+    assert published == [{
+        "args": ["task-1", "agent-1"],
+        "kwargs": {"scheduled_run_id": "run-1", "scheduled_job_id": "job-1"},
+        "countdown": 60,
     }]
 
 
@@ -1106,6 +1318,8 @@ def test_agent_settlement_replacement_is_not_caught_as_business_failure(monkeypa
 
 @pytest.mark.asyncio
 async def test_scheduled_agent_child_rechecks_durable_occurrence(monkeypatch):
+    from contextlib import asynccontextmanager
+
     from packages.core.constants.execution import ScheduledChildAdmissionStatus
     from packages.core.tasks import ai_tasks
 
@@ -1134,8 +1348,20 @@ async def test_scheduled_agent_child_rechecks_durable_occurrence(monkeypatch):
         unexpected_agent_execution,
     )
 
+    class EmptyResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class EmptySession:
+        async def execute(self, _statement):
+            return EmptyResult()
+
+    @asynccontextmanager
+    async def session_factory():
+        yield EmptySession()
+
     claimed, result = await ai_tasks._run_scheduled_agent_task_if_open(
-        object(),
+        session_factory,
         "task-1",
         "agent-1",
         scheduled_run_id="run-deleted",
@@ -1683,9 +1909,56 @@ def test_scheduled_claim_loss_does_not_finalize_from_outer_error_handler(
     }
 
 
+def _assert_scheduled_agent_subscription_query(
+    statement,
+    *,
+    entity_id: str,
+    agent_id: str,
+    workspace_id: str,
+    subscription_id: str | None = None,
+):
+    from sqlalchemy.sql import operators, visitors
+    from sqlalchemy.sql.elements import BinaryExpression, BindParameter
+
+    from packages.core.models.workspace import AgentSubscription
+
+    descriptions = statement.column_descriptions
+    assert len(descriptions) == 1
+    assert descriptions[0]["entity"] is AgentSubscription
+    assert descriptions[0]["expr"] is AgentSubscription
+
+    equality_filters = {
+        (element.left.key, element.right.value)
+        for element in visitors.iterate(statement.whereclause)
+        if (
+            isinstance(element, BinaryExpression)
+            and element.operator is operators.eq
+            and getattr(element.left, "table", None) is AgentSubscription.__table__
+            and isinstance(element.right, BindParameter)
+        )
+    }
+    expected_filters = {
+        ("entity_id", entity_id),
+        ("agent_id", agent_id),
+        ("status", "active"),
+        ("workspace_id", workspace_id),
+    }
+    if subscription_id:
+        expected_filters.add(("id", subscription_id))
+    assert equality_filters == expected_filters
+
+    order_by = tuple(statement._order_by_clauses)
+    assert len(order_by) == 1
+    assert order_by[0].modifier is operators.asc_op
+    assert order_by[0].element.table is AgentSubscription.__table__
+    assert order_by[0].element.key == "id"
+    assert statement._limit_clause.value == 2
+
+
 @pytest.mark.asyncio
 async def test_scheduled_agent_occurrences_create_distinct_tasks(monkeypatch):
     from packages.core.constants.execution import ScheduledDispatchKind
+    from packages.core.models.scheduler import ScheduledJobRun
     from packages.core.services import task_service
     from packages.core.tasks import scheduler_tasks
 
@@ -1696,7 +1969,47 @@ async def test_scheduled_agent_occurrences_create_distinct_tasks(monkeypatch):
         created.append((task, kwargs))
         return task
 
+    class QueryResult:
+        def __init__(self, *, scalar=None, rows=None):
+            self.scalar = scalar
+            self.rows = rows or []
+
+        def scalar_one_or_none(self):
+            return self.scalar
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.rows
+
     class FakeDb:
+        async def get(self, model, run_id):
+            assert model is ScheduledJobRun
+            assert run_id in {"run-1", "run-2"}
+            return SimpleNamespace(
+                id=run_id,
+                job_id="job-1",
+                status="running",
+                trigger_type="cron",
+                idempotency_key=f"cron:{run_id}",
+                result={},
+            )
+
+        async def execute(self, statement):
+            from packages.core.models.workspace import Agent
+
+            if statement.column_descriptions[0]["entity"] is Agent:
+                return QueryResult(scalar=job.agent_id)
+            _assert_scheduled_agent_subscription_query(
+                statement,
+                entity_id=job.entity_id,
+                agent_id=job.agent_id,
+                workspace_id=job.workspace_id,
+                subscription_id="subscription-1",
+            )
+            return QueryResult(rows=[SimpleNamespace(id="subscription-1")])
+
         async def flush(self):
             return None
 
@@ -1707,7 +2020,7 @@ async def test_scheduled_agent_occurrences_create_distinct_tasks(monkeypatch):
         workspace_id="workspace-1",
         user_id="user-1",
         agent_id="agent-1",
-        execution_target={},
+        execution_target={"agent_subscription_id": "subscription-1"},
         execution_script=None,
         payload_message=None,
         default_delivery_mode="workspace_chat",
@@ -1746,6 +2059,8 @@ async def test_scheduled_agent_occurrences_create_distinct_tasks(monkeypatch):
     }
     assert created[0][1]["details"]["scheduled_run_id"] == "run-1"
     assert created[1][1]["details"]["scheduled_run_id"] == "run-2"
+    assert created[0][1]["owner_subscription_id"] == "subscription-1"
+    assert created[1][1]["owner_subscription_id"] == "subscription-1"
     assert created[0][1]["creation_logged_by_system"] is True
     assert created[0][1]["creation_log_metadata"] == {
         "entity_id": "entity-1",
@@ -1754,6 +2069,104 @@ async def test_scheduled_agent_occurrences_create_distinct_tasks(monkeypatch):
         "scheduled_run_id": "run-1",
     }
     assert job.manor_task_id == "task-2"
+
+
+@pytest.mark.parametrize(
+    "subscriptions",
+    (
+        [],
+        [
+            SimpleNamespace(id="subscription-1"),
+            SimpleNamespace(id="subscription-2"),
+        ],
+    ),
+    ids=("missing", "ambiguous"),
+)
+@pytest.mark.asyncio
+async def test_scheduled_agent_requires_one_workspace_subscription(
+    monkeypatch,
+    subscriptions,
+):
+    from packages.core.models.scheduler import ScheduledJobRun
+    from packages.core.services import task_service
+    from packages.core.tasks import scheduler_tasks
+
+    create_task_calls = []
+
+    async def create_task(*args, **kwargs):
+        create_task_calls.append((args, kwargs))
+        return SimpleNamespace(id="unexpected-task")
+
+    class QueryResult:
+        def __init__(self, *, scalar=None, rows=None):
+            self.scalar = scalar
+            self.rows = rows or []
+
+        def scalar_one_or_none(self):
+            return self.scalar
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self.rows
+
+    class FakeDb:
+        async def get(self, model, run_id):
+            assert model is ScheduledJobRun
+            return SimpleNamespace(
+                id=run_id,
+                job_id="job-1",
+                status="running",
+                trigger_type="cron",
+                idempotency_key=f"cron:{run_id}",
+                result={},
+            )
+
+        async def execute(self, statement):
+            from packages.core.models.workspace import Agent
+
+            if statement.column_descriptions[0]["entity"] is Agent:
+                return QueryResult(scalar=job.agent_id)
+            _assert_scheduled_agent_subscription_query(
+                statement,
+                entity_id=job.entity_id,
+                agent_id=job.agent_id,
+                workspace_id=job.workspace_id,
+            )
+            return QueryResult(rows=subscriptions)
+
+        async def flush(self):
+            return None
+
+    job = _make_job(
+        job_id="job-1",
+        name="Ambiguous subscription automation",
+        entity_id="entity-1",
+        workspace_id="workspace-1",
+        user_id="user-1",
+        agent_id="agent-1",
+        execution_target={},
+        execution_script=None,
+        payload_message=None,
+        default_delivery_mode="workspace_chat",
+        conversation_id=None,
+    )
+    monkeypatch.setattr(task_service, "create_task", create_task)
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires its exact active AgentSubscription",
+    ):
+        await scheduler_tasks._dispatch_agent_task(
+            FakeDb(),
+            job,
+            datetime.now(timezone.utc),
+            "scheduled occurrence",
+            run_id="run-1",
+        )
+
+    assert create_task_calls == []
 
 
 def test_agent_task_claim_recheck_publish_failure_retries_delivery(monkeypatch):
@@ -4966,10 +5379,36 @@ def test_plan_tasks_cooperatively_retry_provider_rate_limits(monkeypatch, task_n
         raise Retry()
 
     monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
+    if task_name == "run_plan":
+        monkeypatch.setattr(
+            ai_tasks,
+            "_claim_plan_cycle_delivery",
+            lambda **_kwargs: (
+                SimpleNamespace(
+                    event_id="event-1",
+                    plan_id="task-or-plan-id",
+                    wake_generation="generation-1",
+                    claim_token="claim-1",
+                ),
+                "claimed",
+            ),
+        )
+        monkeypatch.setattr(
+            ai_tasks,
+            "_release_plan_cycle_delivery",
+            lambda *_args, **_kwargs: True,
+        )
     monkeypatch.setattr(task, "retry", retry)
 
     with pytest.raises(Retry):
-        task.run("task-or-plan-id")
+        if task_name == "run_plan":
+            task.run(
+                "task-or-plan-id",
+                outbox_event_id="event-1",
+                wake_generation="generation-1",
+            )
+        else:
+            task.run("task-or-plan-id")
 
     assert retry_calls[0]["countdown"] == 45
 
@@ -4995,6 +5434,25 @@ def test_plan_rate_limit_exhaustion_closes_runtime(
         raise LLMRateLimited(45)
 
     monkeypatch.setattr(ai_tasks, "_run_async", fail_run)
+    if task_name == "run_plan":
+        monkeypatch.setattr(
+            ai_tasks,
+            "_claim_plan_cycle_delivery",
+            lambda **_kwargs: (
+                SimpleNamespace(
+                    event_id="event-1",
+                    plan_id="task-or-plan-id",
+                    wake_generation="generation-1",
+                    claim_token="claim-1",
+                ),
+                "claimed",
+            ),
+        )
+        monkeypatch.setattr(
+            ai_tasks,
+            "_release_plan_cycle_delivery",
+            lambda *_args, **_kwargs: True,
+        )
     monkeypatch.setattr(
         ai_tasks,
         failure_marker,
@@ -5003,7 +5461,14 @@ def test_plan_rate_limit_exhaustion_closes_runtime(
 
     task.push_request(retries=task.max_retries, id=f"{task_name}-rate-limit")
     try:
-        result = task.run("task-or-plan-id")
+        if task_name == "run_plan":
+            result = task.run(
+                "task-or-plan-id",
+                outbox_event_id="event-1",
+                wake_generation="generation-1",
+            )
+        else:
+            result = task.run("task-or-plan-id")
     finally:
         task.pop_request()
 
@@ -5013,40 +5478,44 @@ def test_plan_rate_limit_exhaustion_closes_runtime(
     assert marked[0][1]["error_type"] == "LLMRateLimited"
 
 
-def test_plan_dispatch_retry_reuses_the_committed_plan(monkeypatch):
-    from celery.exceptions import Retry
+def test_plan_hint_failure_keeps_the_committed_plan_runnable(monkeypatch):
     from packages.core.tasks import ai_tasks
+    from packages.core.plans import wakeup
 
     awaited = []
-    retry_calls = []
 
     def run_async(awaitable):
         awaited.append(awaitable.cr_code.co_name)
         awaitable.close()
-        return "plan-committed", "draft"
+        return (
+            "plan-committed",
+            "draft",
+            SimpleNamespace(
+                event_id="event-1",
+                plan_id="plan-committed",
+                wake_generation="generation-1",
+            ),
+        )
 
-    def fail_dispatch(_plan_id):
-        raise RuntimeError("broker unavailable")
-
-    def retry(**kwargs):
-        retry_calls.append(kwargs)
-        raise Retry()
+    hinted = []
 
     monkeypatch.setattr(ai_tasks, "_run_async", run_async)
-    monkeypatch.setattr(ai_tasks.run_plan, "delay", fail_dispatch)
-    monkeypatch.setattr(ai_tasks.plan_and_run_task, "retry", retry)
+    monkeypatch.setattr(
+        wakeup,
+        "dispatch_plan_cycle_wake_hint",
+        lambda *_args, **_kwargs: hinted.append(False) or False,
+    )
 
-    with pytest.raises(Retry):
-        ai_tasks.plan_and_run_task.run("task-1")
+    result = ai_tasks.plan_and_run_task.run("task-1")
 
     assert awaited == ["_go"]
-    assert retry_calls[0]["kwargs"] == {
-        "existing_plan_id": "plan-committed",
-    }
+    assert hinted == [False]
+    assert result == {"plan_id": "plan-committed", "status": "draft"}
 
 
-def test_plan_dispatch_retry_skips_replanning_and_recovers_terminally(monkeypatch):
+def test_existing_plan_hint_failure_does_not_project_business_failure(monkeypatch):
     from packages.core.tasks import ai_tasks
+    from packages.core.plans import wakeup
 
     awaited = []
     marked = []
@@ -5054,13 +5523,21 @@ def test_plan_dispatch_retry_skips_replanning_and_recovers_terminally(monkeypatc
     def run_async(awaitable):
         awaited.append(awaitable.cr_code.co_name)
         awaitable.close()
-        return "plan-committed", "draft"
+        return (
+            "plan-committed",
+            "draft",
+            SimpleNamespace(
+                event_id="event-1",
+                plan_id="plan-committed",
+                wake_generation="generation-1",
+            ),
+        )
 
     monkeypatch.setattr(ai_tasks, "_run_async", run_async)
     monkeypatch.setattr(
-        ai_tasks.run_plan,
-        "delay",
-        lambda _plan_id: (_ for _ in ()).throw(RuntimeError("broker unavailable")),
+        wakeup,
+        "dispatch_plan_cycle_wake_hint",
+        lambda *_args, **_kwargs: False,
     )
     monkeypatch.setattr(
         ai_tasks,
@@ -5078,9 +5555,8 @@ def test_plan_dispatch_retry_skips_replanning_and_recovers_terminally(monkeypatc
         ai_tasks.plan_and_run_task.pop_request()
 
     assert awaited == ["_load_existing_plan_for_dispatch"]
-    assert result["status"] == "needs_attention"
-    assert result["plan_id"] == "plan-committed"
-    assert marked[0][0][0:2] == ("plan-committed", "broker unavailable")
+    assert result == {"plan_id": "plan-committed", "status": "draft"}
+    assert marked == []
 
 
 @pytest.mark.asyncio

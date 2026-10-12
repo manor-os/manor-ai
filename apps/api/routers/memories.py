@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -193,11 +192,25 @@ async def extract_memories_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Extract memories from a conversation using LLM."""
-    mems = await extract_memories_from_conversation(
-        db, user.entity_id, body.conversation_id,
-        agent_id=body.agent_id,
-        user_id=body.user_id,
-    )
+    """Extract reviewable candidates; response status is proposed, not active."""
+    from packages.core.memory.compaction import MemoryScopeDenied
+
+    if body.user_id is not None and body.user_id != user.id:
+        raise HTTPException(403, "Memory extraction belongs to the authenticated user")
+    try:
+        candidates = await extract_memories_from_conversation(
+            db, user.entity_id, body.conversation_id,
+            agent_id=body.agent_id, user_id=user.id,
+        )
+    except MemoryScopeDenied as exc:
+        raise HTTPException(403, str(exc)) from exc
     await db.commit()
-    return [_to_response(m) for m in mems]
+    # Preserve the existing response fields; IDs refer explicitly to learning
+    # candidates until the normal review/application flow creates a memory.
+    return [MemoryResponse(
+        id=c.id, entity_id=c.entity_id, agent_id=c.agent_id, user_id=c.user_id,
+        memory_type=c.payload["memory_type"], content=c.summary, status=c.status,
+        source="conversation_extract",
+        metadata={"learning_candidate_id": c.id, "review_required": c.status != "applied",
+                  "source_message_id": c.payload["source_message_id"]},
+    ) for c in candidates]

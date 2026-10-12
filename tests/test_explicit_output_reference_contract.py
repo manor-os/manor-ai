@@ -155,7 +155,9 @@ def test_empty_result_rejects_named_field_references() -> None:
 
 
 def test_explicit_artifact_submission_is_bare_payload_for_direct_references() -> None:
-    """The worker and resolver must agree that ArtifactResult has no outputs wrapper."""
+    """Bare worker output must survive reference resolution and review projection."""
+    from packages.core.plans.executor import _human_step_pending_action
+
     schema = plan_output_contract_schema(get_shape("ArtifactResult").json_schema())
     files = [{"name": "outreach.md", "fs_path": "Workspaces/demo/outreach.md"}]
     result = step_result_from_submit(
@@ -168,6 +170,21 @@ def test_explicit_artifact_submission_is_bare_payload_for_direct_references() ->
         _DIRECT_ARTIFACT_REF,
         {"prepare_outreach_pack": result},
     ) == files
+
+    review_step = _outreach_plan(_DIRECT_ARTIFACT_REF).steps[1]
+    resolved_params = resolve_refs(
+        review_step.params,
+        {"prepare_outreach_pack": result},
+    )
+    action = _human_step_pending_action(resolved_params)
+
+    assert action is not None
+    assert action["kind"] == "governance_approval"
+    assert action["hitl_type"] == "review"
+    assert action["review_title"] == review_step.params["review_title"]
+    assert action["review"] == {"artifacts": files}
+    assert action["payload"]["diff"] == {"artifacts": files}
+    assert action["options"] == ["approve", "request_changes", "reject"]
 
 
 def test_output_contract_factory_is_the_single_representation_classifier() -> None:
@@ -820,19 +837,20 @@ def test_planner_prompt_distinguishes_explicit_payload_and_legacy_envelope_paths
         allowed_service_keys=[],
     )
 
-    # Explicit canonical shapes are bare payloads.  Keep these examples in the
-    # prompt so a fresh plan emits refs that the linker and worker agree on.
-    assert ".result.files" in prompt
-    assert ".result.text" in prompt
-    assert "ArtifactResult" in prompt
+    # The compact prompt declares payload fields separately from the common
+    # reference syntax; it need not repeat a full reference for every shape.
+    assert "ArtifactResult.files[].fs_path" in prompt
+    assert "TextResult.text" in prompt
+    assert "${{ steps.KEY.result.FIELD }}" in prompt
+    assert "without an outputs wrapper" in prompt
+    assert "params.review_artifacts" in prompt
+    assert "review_title" in prompt
 
     # The pre-migration sentence advertised ``outputs.*`` for every producer;
     # retaining that unqualified line would recreate the production failure.
     assert "steps.<key>.result.outputs.text / .outputs.files / .outputs.data / .status." not in prompt
 
-    # ``outputs`` remains valid for the deliberately legacy/task envelope, but
-    # the prompt must qualify it rather than present it as canonical payload
-    # syntax for explicit output_shape producers.
-    assert "StepResult" in prompt
-    assert "only for a legacy/unshaped StepResult envelope" in prompt
-    assert "${{ steps.<key>.result.outputs.data }}" in prompt
+    # Newly planned steps cannot use the generic legacy envelope. The Task's
+    # terminal output contract is the explicit exception for ``outputs.data``.
+    assert "Do not use generic StepResult" in prompt
+    assert "Task-schema terminal uses outputs.data" in prompt

@@ -6,6 +6,7 @@ system paths such as .ai/** remain writable for agent memory/workspace state.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -33,7 +34,8 @@ from packages.core.services.hitl_options import (
     normalize_approval_choice,
 )
 from packages.core.services.knowledge_visibility import is_user_visible_path, normalize_rel_path
-from packages.core.services.settings_service import update_user_preferences
+
+logger = logging.getLogger(__name__)
 
 FILE_PERMISSION_PREF_KEY = "ai_file_permission"
 DEFAULT_FILE_PERMISSION = FilePermissionMode.APPROVAL.value
@@ -128,11 +130,16 @@ def canonical_visible_user_paths(entity_id: str, paths: Iterable[str]) -> list[s
     committed. Existing symlinks, or missing children below a symlinked
     parent, otherwise let one displayed path authorize a different resource.
     """
+    visible_paths = visible_user_paths(paths)
+    _require_canonical_file_paths(entity_id, visible_paths)
+    return visible_paths
+
+
+def _require_canonical_file_paths(entity_id: str, visible_paths: list[str]) -> None:
     from packages.core.services.entity_fs import canonical_entity_root
 
-    visible_paths = visible_user_paths(paths)
     if not visible_paths:
-        return []
+        return
     root = os.path.abspath(canonical_entity_root(entity_id))
     if os.path.lexists(root) and os.path.realpath(root) != root:
         raise ValueError("Entity filesystem root may not be a filesystem alias")
@@ -153,7 +160,75 @@ def canonical_visible_user_paths(entity_id: str, paths: Iterable[str]) -> list[s
             or canonical_rel != normalize_rel_path(rel_path)
         ):
             raise ValueError(f"File path traverses a filesystem alias: {rel_path}")
-    return visible_paths
+
+
+def is_chat_upload_path(path: str) -> bool:
+    """Recognize an upload reference, not permission to read it."""
+    return bool(re.fullmatch(r"uploads/chat/[0-9a-f]{16}\.[a-zA-Z0-9]+", path))
+
+
+async def _chat_upload_readable(
+    db, *, entity_id: str, user_id: str | None, conversation_id: str | None,
+    workspace_id: str | None, path: str,
+) -> bool:
+    """Authorize an exact attachment or its readable Workspace projection."""
+    from packages.core.models.document import Document
+    from packages.core.services.document_access import (
+        DocumentAccessContext, document_workspace_ids, unreadable_document_paths,
+    )
+
+    if not user_id or not conversation_id:
+        return False
+    conversation = await db.scalar(select(Conversation).where(
+        Conversation.id == conversation_id,
+        Conversation.entity_id == entity_id,
+        Conversation.status == "active",
+    ))
+    if conversation is None or conversation.workspace_id != workspace_id:
+        return False
+    if conversation.scope not in {"channel", "workspace_main", "workspace_thread"}:
+        return False
+    if conversation.scope == "channel" and conversation.user_id != user_id:
+        return False
+    if conversation.scope != "channel" and not workspace_id:
+        return False
+    ctx = await DocumentAccessContext.load(db, entity_id=entity_id, user_id=user_id)
+    if not ctx.identity_active:
+        return False
+    if workspace_id and not await ctx.workspace_readable(db, workspace_id):
+        return False
+    attachment_message = await db.scalar(select(Message.id).where(
+        Message.conversation_id == conversation_id,
+        Message.role == "user",
+        Message.author_kind == "user",
+        Message.attachments.contains([{"kind": "chat_upload", "path": path}]),
+    ).limit(1))
+    if not attachment_message:
+        # Task threads do not repeat their Workspace's original upload message.
+        # Require a durable projection into this exact Workspace before using
+        # normal Knowledge ACLs; mere filesystem presence grants nothing.
+        projections = list((await db.scalars(select(Document).where(
+            Document.entity_id == entity_id, Document.fs_path == path,
+            Document.source == "chat_upload", Document.is_trashed == False,  # noqa: E712
+        ))).all()) if workspace_id else []
+        for document in projections:
+            if workspace_id in await document_workspace_ids(db, document):
+                break
+        else:
+            return False
+    # A persisted attachment reference cannot resurrect a deleted/restricted
+    # Knowledge projection or bypass a subsequently revoked Document grant.
+    document_states = list((await db.scalars(select(Document.is_trashed).where(
+        Document.entity_id == entity_id, Document.fs_path == path,
+    ))).all())
+    if document_states:
+        if all(document_states):
+            return False
+        return not await unreadable_document_paths(
+            db, entity_id=entity_id, rel_paths=[path], user_id=user_id,
+            workspace_id=workspace_id, actor_type="agent",
+        )
+    return True
 
 
 def _visible_path_exists(entity_id: str, path: str) -> bool | None:
@@ -217,17 +292,7 @@ def _display_path_label(path: str) -> str:
 
 
 async def load_user_file_permission_mode(db, user_id: str | None) -> str:
-    if not user_id:
-        return DEFAULT_FILE_PERMISSION
-    row = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
-    prefs = row.preferences if row else {}
-    value = (prefs or {}).get(FILE_PERMISSION_PREF_KEY)
-    # Backward/alternate shapes, useful while UI wording settles.
-    if value is None:
-        value = (prefs or {}).get("file_permission")
-    if value is None:
-        value = (prefs or {}).get("file_permissions")
-    return normalize_file_permission_mode(value)
+    raise ValueError("File approval preferences were replaced by unified approval settings")
 
 
 def _approval_prompt(*, action: str, tool_name: str, paths: list[str], mode: str) -> str:
@@ -413,6 +478,86 @@ def _deny_payload(*, action: str, tool_name: str, paths: list[str], mode: str, r
     }, ensure_ascii=False)
 
 
+AUTHORIZATION_RECEIPT_MISMATCH_ERROR = "internal_authorization_error"
+
+
+def receipt_authorizes_file_mutation(
+    receipt: Any | None,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    workspace_id: str | None,
+    conversation_id: str | None,
+    task_id: str | None,
+    action: str,
+    visible_paths: list[str],
+) -> tuple[bool, str]:
+    """Whether the public call's receipt covers this inner write, and its action key.
+
+    The one comparison ``guard_ai_file_mutation`` uses; tests evaluate the
+    same function rather than re-deriving it.
+    """
+    action_key = _precise_workspace_file_action_key(
+        entity_id=entity_id,
+        action=action,
+        paths=visible_paths,
+    )
+    authorized = bool(
+        receipt
+        and receipt.authorizes_workspace_file_mutation(
+            capability_id="file.write",
+            action_key=action_key,
+            paths=visible_paths,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            conversation_id=conversation_id,
+            task_id=task_id,
+        )
+    )
+    return authorized, action_key
+
+
+def _receipt_mismatch_payload(
+    *,
+    action: str,
+    tool_name: str,
+    paths: list[str],
+    authorized_action_key: str,
+    authorized_paths: tuple[str, ...],
+    attempted_action_key: str,
+) -> str:
+    """An internal invariant violation, never a user permission decision.
+
+    The public call was already authorized; its handler then tried to write
+    somewhere else. No grant, approval or retry can repair that, so the model
+    must report an internal error instead of asking the user to "allow" it.
+    """
+    logger.error(
+        "authorization_receipt_mismatch tool=%s attempted=%s %s authorized=%s %s",
+        tool_name, attempted_action_key, paths, authorized_action_key, list(authorized_paths),
+    )
+    message = (
+        "Internal Manor error: the file write did not match the action, file or "
+        "Workspace scope this tool call was authorized for. This is a platform bug, not a permission "
+        "decision: no user, owner or approval can allow it, and repeating the same "
+        "call fails the same way. Tell the user the file could not be saved because "
+        "of an internal error. Do not ask them to grant permission."
+    )
+    return json.dumps({
+        "error": AUTHORIZATION_RECEIPT_MISMATCH_ERROR,
+        "mode": "authorization_receipt_mismatch",
+        "message": message,
+        "reason": message,
+        "internal_error": True,
+        "requires_human": False,
+        "retryable": False,
+        "operation": {"tool": tool_name, "action": action, "paths": paths},
+        "authorized": {"action_key": authorized_action_key, "paths": list(authorized_paths)},
+        "attempted": {"action_key": attempted_action_key, "paths": paths},
+    }, ensure_ascii=False)
+
+
 async def _resource_file_acl_denial(
     db,
     *,
@@ -449,11 +594,12 @@ async def _resource_file_acl_denial(
     normalized_action = str(action or "").strip().lower()
     root = os.path.realpath(entity_root) if entity_root else None
     if not actor_user_id:
-        # Conversation-less autonomous workers historically create new
-        # Workspace artifacts without impersonating a user. This exception is
-        # deliberately prospective-only and Workspace-root-bound: the runtime
-        # approval proves which Workspace authorized the call, not permission
-        # to create arbitrary files elsewhere in the entity tree.
+        # Conversation-less autonomous workers historically mutate Workspace
+        # artifacts without impersonating a user. This exception is
+        # Workspace-root-bound: the runtime approval proves which Workspace
+        # authorized the call, not permission to mutate files elsewhere in the
+        # entity tree. Create and in-place edit are allowed; delete remains
+        # user-authenticated.
         if (
             normalized_action not in {"delete", "remove"}
             and root is not None
@@ -485,7 +631,7 @@ async def _resource_file_acl_denial(
                 and resolved_workspace_root.startswith(root + os.sep)
                 else None
             )
-            prospective_only = bool(workspace_root)
+            workspace_root_bound = bool(workspace_root)
             for path in paths:
                 rel_path = normalize_rel_path(path)
                 full_path = os.path.realpath(os.path.join(root, rel_path))
@@ -493,15 +639,14 @@ async def _resource_file_acl_denial(
                     workspace_root is None
                     or full_path == workspace_root
                     or not full_path.startswith(workspace_root + os.sep)
-                    or os.path.exists(full_path)
                 ):
-                    prospective_only = False
+                    workspace_root_bound = False
                     break
-            if prospective_only:
+            if workspace_root_bound:
                 return None
         return denied(
-            "An authenticated user is required unless every target is a new file "
-            "inside the authorized Workspace artifact root."
+            "An authenticated user is required unless every target is a create "
+            "or edit inside the authorized Workspace artifact root."
         )
 
     actor = await db.scalar(
@@ -630,15 +775,18 @@ async def guard_ai_file_read_access(
     *,
     entity_id: str,
     user_id: str | None,
+    conversation_id: str | None = None,
     workspace_id: str | None = None,
     runtime_envelope: Any | None = None,
     tool_name: str,
     paths: Iterable[str],
 ) -> str | None:
-    """Require canonical Knowledge read access for existing source files."""
+    """Require Knowledge ACLs or an exact, current-conversation attachment."""
     raw_paths = tuple(paths)
+    attachment_paths = [path for path in raw_paths if isinstance(path, str) and is_chat_upload_path(path)]
     try:
         visible_paths = canonical_visible_user_paths(entity_id, raw_paths)
+        _require_canonical_file_paths(entity_id, attachment_paths)
     except ValueError as exc:
         return _deny_payload(
             action=FileResourceAction.READ.value,
@@ -647,7 +795,7 @@ async def guard_ai_file_read_access(
             mode="entity_file_acl_denied",
             reason=str(exc),
         )
-    if len(visible_paths) != len(raw_paths) or not visible_paths:
+    if len(visible_paths) + len(attachment_paths) != len(raw_paths) or not raw_paths:
         return _deny_payload(
             action=FileResourceAction.READ.value,
             tool_name=tool_name,
@@ -671,7 +819,13 @@ async def guard_ai_file_read_access(
             user_id=actor_user_id,
             workspace_id=workspace_id,
             actor_type="agent",
-        )
+        ) if visible_paths else set()
+        for path in attachment_paths:
+            if not await _chat_upload_readable(
+                db, entity_id=entity_id, user_id=actor_user_id,
+                conversation_id=conversation_id, workspace_id=workspace_id, path=path,
+            ):
+                blocked.add(path)
     if blocked:
         return _deny_payload(
             action=FileResourceAction.READ.value,
@@ -697,6 +851,7 @@ async def guard_ai_file_mutation(
     approval_token: str | None = None,
     content_preview: Any = None,
     approval_payload: Any = None,
+    execution_id: str | None = None,
 ) -> str | None:
     """Return None when allowed, else a JSON tool result that blocks execution."""
     raw_paths = tuple(paths)
@@ -752,11 +907,6 @@ async def guard_ai_file_mutation(
             if str(action or "").strip().lower() in {"delete", "remove"}
             else "workspace.file.write"
         )
-        receipt_action_key = _precise_workspace_file_action_key(
-            entity_id=entity_id,
-            action=action,
-            paths=visible_paths,
-        )
         from packages.core.services.runtime_authorization import (
             authorize_runtime_action,
         )
@@ -767,18 +917,15 @@ async def guard_ai_file_mutation(
         )
 
         authorization_receipt = runtime_current_tool_authorization_receipt()
-        receipt_authorizes_workspace_write = bool(
-            authorization_receipt
-            and authorization_receipt.authorizes_workspace_file_mutation(
-                capability_id="file.write",
-                action_key=receipt_action_key,
-                paths=visible_paths,
-                entity_id=entity_id,
-                user_id=user_id,
-                workspace_id=effective_workspace_id,
-                conversation_id=conversation_id,
-                task_id=task_id,
-            )
+        receipt_authorizes_workspace_write, receipt_action_key = receipt_authorizes_file_mutation(
+            authorization_receipt,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=effective_workspace_id,
+            conversation_id=conversation_id,
+            task_id=task_id,
+            action=action,
+            visible_paths=visible_paths,
         )
         authorization_tool_name = (
             authorization_receipt.tool_name
@@ -838,18 +985,15 @@ async def guard_ai_file_mutation(
         if (
             not receipt_authorizes_workspace_write
             and authorization_receipt is not None
-            and authorization_receipt.workspace_id
             and authorization_receipt.capability_id == "file.write"
         ):
-            return _deny_payload(
+            return _receipt_mismatch_payload(
                 action=action,
                 tool_name=tool_name,
                 paths=visible_paths,
-                mode="authorization_receipt_mismatch",
-                reason=(
-                    "The inner file mutation did not match the exact action, "
-                    "resource, or Workspace scope authorized for the public tool call."
-                ),
+                authorized_action_key=authorization_receipt.action_key,
+                authorized_paths=authorization_receipt.resource_ids,
+                attempted_action_key=receipt_action_key,
             )
 
         acl_denial = await _resource_file_acl_denial(
@@ -871,28 +1015,24 @@ async def guard_ai_file_mutation(
             # legacy per-user approval plane is skipped here.
             return None
 
+        operation_id = execution_id or (authorization_receipt.operation_id if authorization_receipt else None)
+        if not operation_id and not approval_token:
+            return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+                mode="approval_operation_identity_missing", reason="A persisted execution identity is required for this file operation.")
         resource_id = visible_paths[0] if len(visible_paths) == 1 else None
-        mode = await load_user_file_permission_mode(db, user_id)
-        if mode != FilePermissionMode.DENY.value and effective_workspace_id:
-            from packages.core.governance.service import (
-                workspace_policy_auto_approves,
-            )
-
-            if await workspace_policy_auto_approves(
-                db,
-                workspace_id=effective_workspace_id,
-                action_key=runtime_action_key,
-                resource_id=resource_id,
-                capability_id="file.write",
-            ):
-                mode = FilePermissionMode.ALWAYS_APPROVE.value
-        if mode == FilePermissionMode.ALWAYS_APPROVE.value:
-            return None
-        if mode == FilePermissionMode.DENY.value:
-            return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths, mode=mode)
-        from packages.core.config import get_settings
-        if not get_settings().MANOR_AI_FILE_HITL_ENABLED:
-            return None
+        from packages.core.governance.approvals import _consent_requirements
+        from packages.core.governance.service import check_step_policy
+        policy = await check_step_policy(
+            db, entity_id=entity_id, user_id=user_id, workspace_id=effective_workspace_id,
+            kind="action", action_key=receipt_action_key, resource_id=resource_id,
+            resource_ids=tuple(visible_paths), resource_kind="file",
+            risk_level="high" if action in {"delete", "remove"} else "medium",
+            capability_id="file.write", operation=action, task_id=task_id,
+        )
+        mode = FilePermissionMode.APPROVAL.value
+        if not policy.allowed and not policy.pause_for_hitl:
+            return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+                mode=FilePermissionMode.DENY.value, reason=policy.reason)
 
         if conversation_id:
             # Every approval state transition (consume an explicit token,
@@ -931,11 +1071,33 @@ async def guard_ai_file_mutation(
                         "including its approved payload."
                     ),
                 )
+            if (not item.get("operation_id") or item.get("approval_action_key") != receipt_action_key
+                or not set(_consent_requirements(policy)).issubset(set(item.get("approval_requirements") or []))):
+                item["status"] = "expired"
+                conv.meta = {**(conv.meta or {}), "file_approvals": approvals}
+                flag_modified(conv, "meta")
+                await db.commit()
+                return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+                    mode="approval_requirements_changed", reason="Approval requirements changed. Start a new file action for review.")
             item["status"] = "consumed"
             item["consumed_at"] = datetime.now(timezone.utc).isoformat()
             conv.meta = {**(conv.meta or {}), "file_approvals": approvals}
             flag_modified(conv, "meta")
             await db.commit()
+            return None
+
+        existing = next((
+            (request_id, item) for request_id, item in reversed(list(((conv.meta or {}).get("file_approvals") or {}).items()))
+            if isinstance(item, dict) and item.get("operation_id") == operation_id
+        ), None) if conv else None
+        if existing is not None:
+            request_id, item = existing
+            if not operation.matches(item) or item.get("status") != "pending":
+                return _deny_payload(action=action, tool_name=tool_name, paths=visible_paths,
+                    mode="approval_operation_terminal", reason="This file operation changed or was already decided. Use its exact continuation or start a new action.")
+            return _hitl_payload(request_id, action=action, tool_name=tool_name,
+                paths=visible_paths, mode=mode, content_preview=content_preview)
+        if policy.allowed:
             return None
 
         if not conversation_id:
@@ -950,35 +1112,12 @@ async def guard_ai_file_mutation(
                 reason="Approval is required, but the conversation was not found.",
             )
 
-        from packages.core.services.runtime_authorization import (
-            authorize_hitl_action,
-        )
-
-        confirmation_authority = await authorize_hitl_action(
-            db,
-            entity_id=entity_id,
-            workspace_id=conv.workspace_id,
-            by_user_id=user_id,
-            action_key=runtime_action_key,
-            capability_id="file.write",
-            requested_by=user_id,
-            origin_conversation_id=conversation_id,
-        )
-        if confirmation_authority.allowed:
-            if await _latest_user_confirmation_allows_operation(
-                db,
-                conv=conv,
-                user_id=user_id,
-                operation=operation,
-            ):
-                await db.commit()
-                return None
-
         hitl_id = generate_ulid()
         meta = dict(conv.meta or {})
         approvals = dict(meta.get("file_approvals") or {})
         approvals[hitl_id] = {
-            "status": "pending",
+            "status": "pending", "operation_id": operation_id, "approval_action_key": receipt_action_key,
+            "approval_requirements": _consent_requirements(policy),
             **operation.to_record(),
             "content": _approval_content_preview(
                 action=action,
@@ -1013,6 +1152,8 @@ async def resolve_file_approval_message(
     action: str,
 ) -> str | None:
     """Resolve an approval card. Returns a replacement message for the LLM."""
+    if normalize_approval_choice(action) == APPROVAL_CHOICE_ALWAYS_APPROVE:
+        raise ValueError("Always approval requires a versioned approval-settings command")
     conv = (await db.execute(
         select(Conversation).where(
             Conversation.id == conversation_id,
@@ -1059,30 +1200,7 @@ async def resolve_file_approval_message(
             "Leave the approval pending and do not retry the file operation."
         )
     if raw_action == APPROVAL_CHOICE_ALWAYS_APPROVE:
-        normalized = "approved"
-        if conv.workspace_id:
-            from packages.core.governance import add_auto_approve_action
-
-            paths = item.get("paths")
-            if not isinstance(paths, list):
-                paths = []
-            resource_id = (
-                str(paths[0]).strip() if len(paths) == 1 and str(paths[0]).strip() else None
-            )
-            await add_auto_approve_action(
-                db,
-                entity_id=entity_id,
-                workspace_id=conv.workspace_id,
-                action_key=runtime_action_key,
-                resource_id=resource_id,
-                changed_by=user_id,
-            )
-        else:
-            await update_user_preferences(
-                db,
-                user_id,
-                {FILE_PERMISSION_PREF_KEY: FilePermissionMode.ALWAYS_APPROVE.value},
-            )
+        raise ValueError("Always approval requires a versioned approval-settings command")
     elif raw_action == APPROVAL_CHOICE_APPROVE:
         normalized = "approved"
     elif raw_action == APPROVAL_CHOICE_REJECT:

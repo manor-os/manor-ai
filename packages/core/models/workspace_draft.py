@@ -45,8 +45,8 @@ class WorkspaceDraft(Base, TimestampMixin):
 
     # Optional blueprint hint — the LLM may match the user's intent against
     # a published marketplace blueprint and surface it as a suggestion.
-    suggested_blueprint_id: Mapped[Optional[str]] = mapped_column(String(26))
-    applied_blueprint_id: Mapped[Optional[str]] = mapped_column(String(26))
+    suggested_blueprint_id: Mapped[Optional[str]] = mapped_column(String(160))
+    applied_blueprint_id: Mapped[Optional[str]] = mapped_column(String(160))
 
     # Set when status='finalized' — the workspace this draft became.
     finalized_workspace_id: Mapped[Optional[str]] = mapped_column(String(26))

@@ -997,25 +997,24 @@ def health_tick() -> Dict[str, Any]:
         total = 0
         failed = 0
         async with async_session() as db:
-            integrations = (await db.execute(
-                select(Integration).where(Integration.status == "active")
-            )).scalars().all()
-            for row in integrations:
+            integration_ids = list((await db.execute(
+                select(Integration.id).where(Integration.status == "active")
+            )).scalars().all())
+            oauth_ids = list((await db.execute(select(OAuthAccount.id))).scalars().all())
+
+        # A previous probe's pending health write must not pin the connection
+        # throughout the next provider request. Reload each account freshly.
+        for probe, ids in (
+            (run_and_persist_integration, integration_ids),
+            (run_and_persist_oauth, oauth_ids),
+        ):
+            for account_id in ids:
+                async with async_session() as db:
+                    result = await probe(db, account_id)
+                    await db.commit()
                 total += 1
-                result = await run_and_persist_integration(db, row.id)
                 if not result.get("ok"):
                     failed += 1
-
-            oauth_rows = (await db.execute(
-                select(OAuthAccount)
-            )).scalars().all()
-            for row in oauth_rows:
-                total += 1
-                result = await run_and_persist_oauth(db, row.id)
-                if not result.get("ok"):
-                    failed += 1
-
-            await db.commit()
         logger.info("Health tick: %d checked, %d failed", total, failed)
         return {"checked": total, "failed": failed}
 

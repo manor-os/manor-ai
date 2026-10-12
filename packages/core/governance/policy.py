@@ -1,337 +1,100 @@
-"""Validated WorkspacePolicy dataclass.
+"""Workspace hard constraints and the unified approval configuration binding.
 
-The DB stores the policy as JSONB so it can grow without migrations.
-This module is the contract between storage and runtime: everything
-that reads or writes a policy goes through ``policy_from_dict`` /
-``policy_to_dict`` so we catch shape drift in one place.
-
-Policy semantics — only what the M10 slice needs:
-
-  * ``never_allow_actions``  — hard block. The Dispatcher refuses to
-                               lease these no matter who's asking.
-
-  * ``hitl_required_actions`` — soft block. The step gets paused +
-                               a HITL prompt is posted to chat.
-                               Dispatcher returns 'paused', not 'failed'.
-
-  * ``auto_approve_actions``  — for actions that *would* otherwise need
-                               operator approval (e.g. risk_level=high),
-                               this list lets the operator pre-approve
-                               specific safe ones.
-
-  * ``*_capabilities``       — the same gates, but matched against Runtime
-                               BusinessCapability ids such as
-                               'workspace.task' or 'file.write'.
-
-  * ``max_risk_level``        — global ceiling. Steps above this are
-                               refused regardless of worker capability.
-
-  * ``budget_caps_per_kind``  — soft per-kind credit ceilings inside
-                               the workspace's monthly budget. The
-                               Dispatcher enforces by skipping steps
-                               whose kind has exhausted its slice.
-
-The matcher is glob-style: 'x.*' matches every X action; 'x.post_*'
-matches any post variant. Empty lists = no opinion.
+Consent is evaluated only by ``approval_policy.evaluate_policy``. This module
+retains the independent risk and budget boundaries for existing callers.
 """
 from __future__ import annotations
 
-import fnmatch
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from packages.core.governance.approval_scope import approval_scope_candidates
+from pydantic import ValidationError
 
-# Risk ranking — duplicated with dispatcher.service to keep the two
-# from import-coupling. Three levels is the contract.
+from packages.core.governance.approval_policy import ApprovalPolicyBinding, ApprovalPolicyOverride
+
 _RISK_RANK = {"low": 0, "medium": 1, "high": 2}
+_RETIRED_FIELDS = frozenset({
+    "never_allow_actions", "hitl_required_actions", "auto_approve_actions",
+    "never_allow_capabilities", "hitl_required_capabilities", "auto_approve_capabilities",
+    "automated_runs_always_allow",
+})
 
 
-class PolicyError(Exception):
-    """Raised on malformed policy JSONB."""
+class PolicyError(ValueError):
+    """Malformed or retired policy configuration."""
 
 
 @dataclass
 class WorkspacePolicy:
-    """Operator-supplied rules. All fields default to 'no opinion'."""
-
-    never_allow_actions: list[str] = field(default_factory=list)
-    hitl_required_actions: list[str] = field(default_factory=list)
-    auto_approve_actions: list[str] = field(default_factory=list)
-    never_allow_capabilities: list[str] = field(default_factory=list)
-    hitl_required_capabilities: list[str] = field(default_factory=list)
-    auto_approve_capabilities: list[str] = field(default_factory=list)
+    approval: ApprovalPolicyBinding | ApprovalPolicyOverride | None = None
     max_risk_level: str = "high"
-    """One of 'low' | 'medium' | 'high'. 'high' = no ceiling."""
-
-    # Per-kind credit allowance — kind → max credits per month.
-    # Missing key means "no per-kind limit". Workspace-wide budget
-    # still applies on top.
     budget_caps_per_kind: dict[str, int] = field(default_factory=dict)
 
 
-# Capabilities a fresh workspace auto-approves out of the box. Keeping this
-# off the WorkspacePolicy field defaults is deliberate: a raw
-# ``WorkspacePolicy()`` must stay "no opinion" (empty) so it can represent a
-# blueprint author's untouched policy. The grant lives in DEFAULT_POLICY (and
-# the presets) instead.
-DEFAULT_AUTO_APPROVE_CAPABILITIES = ("file.write", "manor.composite")
-
-# A fresh workspace gets this until the operator overrides.
-DEFAULT_POLICY = WorkspacePolicy(
-    auto_approve_capabilities=list(DEFAULT_AUTO_APPROVE_CAPABILITIES)
-)
-
-
-def with_default_auto_approve_capabilities(
-    policy: WorkspacePolicy,
-) -> WorkspacePolicy:
-    """Add routine default grants without weakening explicit HITL rules.
-
-    This helper is for *constructing a new policy* (Workspace setup and
-    Blueprint presets).  It deliberately does not rewrite an auto-approval
-    already present in ``policy``: an operator/author may explicitly use one
-    as an exception to a broader HITL rule.  It only decides which missing
-    system defaults are safe to add.
-    """
-    from packages.core.ai.runtime.approvals import (
-        runtime_capability_id_for_action_key,
-    )
-
-    if "*" in policy.hitl_required_actions:
-        eligible_defaults: list[str] = []
-    else:
-        hitl_action_capabilities = {
-            capability_id
-            for pattern in policy.hitl_required_actions
-            if (
-                capability_id := runtime_capability_id_for_action_key(pattern)
-            )
-        }
-        file_action_probes = (
-            "workspace.file.create",
-            "workspace.file.modify",
-            "workspace.file.delete",
-            "write_file",
-            "edit_file",
-            "delete_file",
-            "generate_file",
-        )
-        if any(
-            fnmatch.fnmatchcase(action_key, pattern)
-            for pattern in policy.hitl_required_actions
-            for action_key in file_action_probes
-        ):
-            hitl_action_capabilities.add("file.write")
-        restricted_capability_patterns = (
-            policy.never_allow_capabilities
-            + policy.hitl_required_capabilities
-        )
-        eligible_defaults = [
-            capability_id
-            for capability_id in DEFAULT_AUTO_APPROVE_CAPABILITIES
-            if capability_id not in hitl_action_capabilities
-            and not any(
-                fnmatch.fnmatchcase(capability_id, pattern)
-                for pattern in restricted_capability_patterns
-            )
-        ]
-
-    missing = [
-        capability_id
-        for capability_id in eligible_defaults
-        if capability_id not in policy.auto_approve_capabilities
-    ]
-    if not missing:
-        return policy
-    return replace(
-        policy,
-        auto_approve_capabilities=policy.auto_approve_capabilities + missing,
-    )
+DEFAULT_POLICY = WorkspacePolicy()
 
 
 @dataclass
 class PolicyDecision:
-    """What ``check_step_policy`` returns to the Dispatcher."""
-
     allowed: bool
     pause_for_hitl: bool = False
     reason: Optional[str] = None
     matched_rule: Optional[str] = None
-    """Rule pattern that drove the decision — surfaced into audit logs
-    so the operator can find which entry to edit."""
+    explanation: dict[str, Any] | None = None
 
-
-# ── Serialization ─────────────────────────────────────────────────────
 
 def policy_from_dict(raw: Optional[dict]) -> WorkspacePolicy:
-    """Inflate a JSONB blob into a validated dataclass.
-
-    Unknown keys are dropped silently — forward-compatible. Bad types
-    raise PolicyError so the operator notices instead of silently
-    falling back to permissive."""
-    if raw is None:
-        return WorkspacePolicy()
-
-    def _strs(key: str) -> list[str]:
-        v = raw.get(key, [])
-        if not isinstance(v, list) or not all(isinstance(s, str) for s in v):
-            raise PolicyError(f"{key} must be a list[str]")
-        return list(v)
-
+    raw = {} if raw is None else raw
+    if not isinstance(raw, dict):
+        raise PolicyError("Workspace policy must be an object")
+    retired = _RETIRED_FIELDS.intersection(raw)
+    if retired:
+        raise PolicyError("Retired approval fields: " + ", ".join(sorted(retired)))
+    unknown = set(raw) - {"approval", "max_risk_level", "budget_caps_per_kind"}
+    if unknown:
+        raise PolicyError("Unknown policy fields: " + ", ".join(sorted(unknown)))
     max_risk = raw.get("max_risk_level", "high")
     if max_risk not in _RISK_RANK:
-        raise PolicyError(
-            f"max_risk_level must be low|medium|high, got {max_risk!r}"
-        )
-
+        raise PolicyError(f"max_risk_level must be low|medium|high, got {max_risk!r}")
     caps = raw.get("budget_caps_per_kind", {})
     if not isinstance(caps, dict) or not all(
-        isinstance(k, str) and isinstance(v, int) and v >= 0
+        isinstance(k, str) and isinstance(v, int) and not isinstance(v, bool) and v >= 0
         for k, v in caps.items()
     ):
-        raise PolicyError(
-            "budget_caps_per_kind must be dict[str, int(>=0)]"
-        )
-
-    return WorkspacePolicy(
-        never_allow_actions=_strs("never_allow_actions"),
-        hitl_required_actions=_strs("hitl_required_actions"),
-        auto_approve_actions=_strs("auto_approve_actions"),
-        never_allow_capabilities=_strs("never_allow_capabilities"),
-        hitl_required_capabilities=_strs("hitl_required_capabilities"),
-        auto_approve_capabilities=_strs("auto_approve_capabilities"),
-        max_risk_level=max_risk,
-        budget_caps_per_kind=dict(caps),
-    )
+        raise PolicyError("budget_caps_per_kind must be dict[str, int(>=0)]")
+    try:
+        approval_raw = raw.get("approval")
+        if approval_raw is not None and not isinstance(approval_raw, dict):
+            raise PolicyError("approval must be an object")
+        approval = (ApprovalPolicyBinding if "root_entity_id" in approval_raw else ApprovalPolicyOverride).model_validate(approval_raw) if approval_raw is not None else None
+    except ValidationError as exc:
+        raise PolicyError("Invalid unified approval binding") from exc
+    return WorkspacePolicy(approval=approval, max_risk_level=max_risk, budget_caps_per_kind=dict(caps))
 
 
-def policy_to_dict(p: WorkspacePolicy) -> dict[str, Any]:
-    """Plain dict suitable for JSONB persistence."""
-    return asdict(p)
-
-
-# ── Decision logic ────────────────────────────────────────────────────
-
-def policy_auto_approves(
-    policy: WorkspacePolicy,
-    *,
-    action_key: Optional[str] = None,
-    resource_id: Optional[str] = None,
-    capability_id: Optional[str] = None,
-) -> bool:
-    """True only when the policy *explicitly* auto-approves this scope.
-
-    This is intentionally narrow: a default-allow (no rule matched anything) is
-    NOT an auto-approval. Used by the dispatcher to let a workspace's explicit
-    auto-approve override a capability's intrinsic ``required_approval`` — never
-    to clear approval just because nothing denied it. ``resource_id`` narrows an
-    action grant when the caller has one; otherwise the broader action key is
-    matched. Deny/risk/budget gates still run afterward in :func:`decide`."""
-    for candidate in approval_scope_candidates(action_key, resource_id):
-        for pattern in policy.auto_approve_actions:
-            if _matches(pattern, candidate):
-                return True
-    if capability_id:
-        for pattern in policy.auto_approve_capabilities:
-            if _matches(pattern, capability_id):
-                return True
-    return False
+def policy_to_dict(policy: WorkspacePolicy) -> dict[str, Any]:
+    result = {
+        "max_risk_level": policy.max_risk_level,
+        "budget_caps_per_kind": dict(policy.budget_caps_per_kind),
+    }
+    if policy.approval is not None:
+        result["approval"] = policy.approval.model_dump(mode="json")
+    return result
 
 
 def decide(
-    policy: WorkspacePolicy,
-    *,
-    kind: str,
-    action_key: Optional[str],
-    resource_id: Optional[str] = None,
-    risk_level: str,
+    policy: WorkspacePolicy, *, kind: str, action_key: Optional[str],
+    risk_level: str, resource_id: Optional[str] = None,
     capability_id: Optional[str] = None,
     spent_credits_per_kind: Optional[dict[str, int]] = None,
 ) -> PolicyDecision:
-    """Evaluate a step against the policy. Returns a PolicyDecision —
-    the Dispatcher branches on .allowed / .pause_for_hitl.
-
-    ``spent_credits_per_kind`` is the rolling per-kind monthly spend;
-    omit when the caller doesn't care about budget caps (e.g. preview).
-    """
-    # Risk ceiling first — cheapest check.
-    if _RISK_RANK.get(risk_level, 0) > _RISK_RANK[policy.max_risk_level]:
-        return PolicyDecision(
-            allowed=False,
-            reason=(
-                f"risk_level={risk_level!r} exceeds workspace ceiling "
-                f"{policy.max_risk_level!r}"
-            ),
-            matched_rule="max_risk_level",
-        )
-
-    # Per-kind budget caps.
+    """Check hard constraints; callers must separately evaluate consent."""
+    if risk_level not in _RISK_RANK:
+        return PolicyDecision(False, reason="Unknown action risk", matched_rule="risk_level.invalid")
+    if _RISK_RANK[risk_level] > _RISK_RANK[policy.max_risk_level]:
+        return PolicyDecision(False, reason=f"risk_level={risk_level!r} exceeds workspace ceiling {policy.max_risk_level!r}", matched_rule="max_risk_level")
     if spent_credits_per_kind is not None:
         cap = policy.budget_caps_per_kind.get(kind)
         if cap is not None and spent_credits_per_kind.get(kind, 0) >= cap:
-            return PolicyDecision(
-                allowed=False,
-                reason=f"per-kind cap reached ({cap} credits) for kind={kind!r}",
-                matched_rule=f"budget_caps_per_kind.{kind}",
-            )
-
-    # Deny gates have highest precedence across action and capability axes.
-    for candidate in approval_scope_candidates(action_key, resource_id):
-        for pattern in policy.never_allow_actions:
-            if _matches(pattern, candidate):
-                return PolicyDecision(
-                    allowed=False,
-                    reason=f"action_key={candidate!r} blocked by rule {pattern!r}",
-                    matched_rule=pattern,
-                )
-    if capability_id:
-        for pattern in policy.never_allow_capabilities:
-            if _matches(pattern, capability_id):
-                return PolicyDecision(
-                    allowed=False,
-                    reason=f"capability_id={capability_id!r} blocked by rule {pattern!r}",
-                    matched_rule=pattern,
-                )
-
-    # auto_approve has higher precedence than hitl_required so the operator can
-    # carve exceptions out of an otherwise-HITL pattern.
-    for candidate in approval_scope_candidates(action_key, resource_id):
-        for pattern in policy.auto_approve_actions:
-            if _matches(pattern, candidate):
-                return PolicyDecision(allowed=True, matched_rule=pattern)
-    if capability_id:
-        for pattern in policy.auto_approve_capabilities:
-            if _matches(pattern, capability_id):
-                return PolicyDecision(allowed=True, matched_rule=pattern)
-
-    for candidate in approval_scope_candidates(action_key, resource_id):
-        for pattern in policy.hitl_required_actions:
-            if _matches(pattern, candidate):
-                return PolicyDecision(
-                    allowed=False,
-                    pause_for_hitl=True,
-                    reason=(
-                        f"action_key={candidate!r} requires operator "
-                        f"approval (rule {pattern!r})"
-                    ),
-                    matched_rule=pattern,
-                )
-    if capability_id:
-        for pattern in policy.hitl_required_capabilities:
-            if _matches(pattern, capability_id):
-                return PolicyDecision(
-                    allowed=False,
-                    pause_for_hitl=True,
-                    reason=(
-                        f"capability_id={capability_id!r} requires operator "
-                        f"approval (rule {pattern!r})"
-                    ),
-                    matched_rule=pattern,
-                )
-
-    return PolicyDecision(allowed=True)
-
-
-def _matches(pattern: str, action_key: str) -> bool:
-    return fnmatch.fnmatchcase(action_key, pattern)
+            return PolicyDecision(False, reason=f"per-kind cap reached ({cap} credits) for kind={kind!r}", matched_rule=f"budget_caps_per_kind.{kind}")
+    return PolicyDecision(True)

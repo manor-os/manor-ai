@@ -34,5 +34,9 @@
     "mcp__gmail__remove_label",
     "mcp__gmail__download_attachment",
     "mcp__gmail__get_profile"
-  ]
+  ],
+  "search": {
+    "terms": ["google mail", "inbox", "email", "unread", "newsletter", "spam", "star", "mail"],
+    "examples": ["summarize unread gmail emails", "reply to email from my boss", "archive old promotional emails", "draft email in gmail to client"]
+  }
 }

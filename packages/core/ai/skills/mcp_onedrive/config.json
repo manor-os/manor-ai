@@ -22,5 +22,9 @@
     "mcp__onedrive__list_permissions",
     "mcp__onedrive__delete_file",
     "mcp__onedrive__restore_version"
-  ]
+  ],
+  "search": {
+    "terms": ["microsoft cloud storage", "sharepoint", "file sharing link", "cloud drive", "upload files", "microsoft 365 files", "document library"],
+    "examples": ["find file in my onedrive", "upload report to onedrive folder", "share onedrive folder with colleague", "restore previous version of file"]
+  }
 }

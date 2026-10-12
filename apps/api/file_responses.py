@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 import anyio
 from fastapi import HTTPException
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 
 from packages.core.services.entity_fs import (
     EntityFilesystemBusyError,
@@ -19,7 +19,13 @@ from packages.core.services.entity_fs import (
 
 _MAX_SNAPSHOT_FILE_BYTES = 512 * 1024 * 1024
 _MAX_SNAPSHOT_TOTAL_BYTES = 1024 * 1024 * 1024
-_MAX_SNAPSHOT_FILES = 2
+# Pages load several files at once (result previews, thumbnails, viewers).
+# Temp disk stays bounded by the byte budget above.
+_MAX_SNAPSHOT_FILES = 8
+# Wait this long for a free slot before answering 503. The entity read lock is
+# held while waiting, so keep it short.
+_SNAPSHOT_WAIT_SECONDS = 5.0
+_SNAPSHOT_WAIT_POLL_SECONDS = 0.05
 
 
 class _SnapshotBudget:
@@ -44,6 +50,17 @@ class _SnapshotBudget:
             self._bytes += size
             return True
 
+    async def reserve(self, size: int, *, timeout: float) -> bool:
+        """Reserve, briefly waiting for a slot rather than failing at once."""
+        if size < 0 or size > self._max_bytes or self._max_files <= 0:
+            return False
+        deadline = anyio.current_time() + max(0.0, timeout)
+        while not self.try_reserve(size):
+            if anyio.current_time() >= deadline:
+                return False
+            await anyio.sleep(_SNAPSHOT_WAIT_POLL_SECONDS)
+        return True
+
     def release(self, size: int) -> None:
         with self._lock:
             self._files = max(0, self._files - 1)
@@ -54,6 +71,24 @@ _snapshot_budget = _SnapshotBudget(
     max_files=_MAX_SNAPSHOT_FILES,
     max_bytes=_MAX_SNAPSHOT_TOTAL_BYTES,
 )
+
+
+class PinnedFileStreamingResponse(StreamingResponse):
+    """Own already-verified private bytes, including pre-body disconnects."""
+
+    def __init__(self, handle, **kwargs):
+        self._handle = handle
+        super().__init__(self._chunks(), **kwargs)
+
+    def _chunks(self):
+        while chunk := self._handle.read(1024 * 1024):
+            yield chunk
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._handle.close()
 
 
 def _copy_file_snapshot(path: str) -> str:
@@ -100,7 +135,10 @@ class EntitySnapshotFileResponse(FileResponse):
                         "File is too large to download safely",
                         status_code=413,
                     )
-                elif not _snapshot_budget.try_reserve(file_size):
+                elif not await _snapshot_budget.reserve(
+                    file_size,
+                    timeout=_SNAPSHOT_WAIT_SECONDS,
+                ):
                     rejection = PlainTextResponse(
                         "File download capacity is busy; retry shortly",
                         status_code=503,

@@ -6,7 +6,11 @@ import httpx
 import pytest
 from uvicorn.logging import AccessFormatter
 
-from apps.api.main import SensitiveQueryStringFilter, redact_sensitive_log_text
+from packages.core.observability.log_redaction import (
+    SensitiveQueryStringFilter,
+    install_sensitive_log_filter,
+    redact_sensitive_log_text,
+)
 
 
 def test_redacts_sensitive_query_values_from_text():
@@ -45,7 +49,7 @@ def test_redacts_sensitive_query_values_from_log_record_args():
     assert "tab=goals" in rendered
 
 
-def test_uvicorn_access_formatter_keeps_structured_arguments_after_redaction():
+def test_uvicorn_access_formatter_keeps_required_arguments_after_redaction():
     record = logging.LogRecord(
         name="uvicorn.access",
         level=logging.INFO,
@@ -55,7 +59,7 @@ def test_uvicorn_access_formatter_keeps_structured_arguments_after_redaction():
         args=(
             "127.0.0.1:1234",
             "GET",
-            "/health?token=jwt-secret&tab=goals",
+            "/ws?token=jwt-secret&workspace_id=ok",
             "1.1",
             200,
         ),
@@ -64,13 +68,18 @@ def test_uvicorn_access_formatter_keeps_structured_arguments_after_redaction():
 
     assert SensitiveQueryStringFilter().filter(record) is True
 
-    rendered = AccessFormatter("%(client_addr)s %(request_line)s %(status_code)s").format(record)
+    rendered = AccessFormatter(
+        '%(client_addr)s - "%(request_line)s" %(status_code)s'
+    ).format(record)
     assert "jwt-secret" not in rendered
     assert "token=<redacted>" in rendered
-    assert "tab=goals" in rendered
+    assert "workspace_id=ok" in rendered
+    assert "GET" in rendered
+    assert "200 OK" in rendered
 
 
 def test_filter_installed_on_uvicorn_websocket_logger():
+    install_sensitive_log_filter()
     filters = logging.getLogger("uvicorn.error").filters
 
     assert any(isinstance(item, SensitiveQueryStringFilter) for item in filters)

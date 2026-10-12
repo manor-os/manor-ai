@@ -5,12 +5,15 @@ the legacy authorize() branch denied capability-style actions for everyone —
 so ``POST /permissions/documents/{id}/visibility`` 403'd even for the entity
 owner, the "set private" save silently failed, and other entity members kept
 seeing the file. The endpoints now use the same effective-capability model
-as the rest of the document surface (owner / entity admin / explicit grant).
+as the rest of the document surface (owner / explicitly authorized curator /
+explicit grant).
 
 Covers:
   * owner can set a doc private; plain members lose browse/tree/GET/search
+  * entity owner can still see another user's private files and folders
   * private folder (cascade) hides folder + children from plain members
-  * entity admin retains visibility of private docs (admin override)
+  * no non-owner default role inherits visibility of another user's private
+    files or folders
   * plain member without grant cannot change visibility (403)
   * member with a manage_metadata folder grant can change a child doc
   * foreign entity gets 404
@@ -49,7 +52,8 @@ async def _set_visibility(
 async def test_private_doc_and_folder_hidden_from_member(client: AsyncClient):
     owner_headers = await _auth(client, "priv_owner1")
 
-    # Owner creates a folder + uploads a doc into it (defaults: entity visibility)
+    # Personal folders/files now default to private. Explicitly publish this
+    # fixture first so the test can verify the later private transition.
     folder = await client.post(
         "/api/v1/documents/folders",
         headers=owner_headers,
@@ -57,6 +61,12 @@ async def test_private_doc_and_folder_hidden_from_member(client: AsyncClient):
     )
     assert folder.status_code == 201, folder.text
     folder_id = folder.json()["id"]
+    r = await client.post(
+        f"/api/v1/folders/{folder_id}/properties",
+        headers=owner_headers,
+        json={"visibility": "entity", "cascade": False},
+    )
+    assert r.status_code == 200, r.text
 
     resp = await client.post(
         f"/api/v1/documents/upload?folder_id={folder_id}",
@@ -65,6 +75,10 @@ async def test_private_doc_and_folder_hidden_from_member(client: AsyncClient):
     )
     assert resp.status_code == 201, resp.text
     doc_in_folder = resp.json()
+    r = await _set_visibility(
+        client, owner_headers, doc_in_folder["id"], "entity"
+    )
+    assert r.status_code == 200, r.text
 
     # Root doc, explicitly entity-visible so the member can see it at first
     root_doc = await _upload(
@@ -136,25 +150,101 @@ async def test_private_doc_and_folder_hidden_from_member(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_admin_role_still_sees_private(client: AsyncClient):
-    """Entity owner/admin bypass private visibility — by design."""
-    owner_headers = await _auth(client, "priv_owner2")
+async def test_owner_sees_other_users_private_knowledge(client: AsyncClient):
+    """Entity owner is the sole default cross-user Knowledge reader."""
+    owner_headers = await _auth(client, "priv_owner_cross_user")
+    member_headers, _ = await _invite_and_accept_member(
+        client,
+        owner_headers,
+        "priv.cross.user@test.com",
+    )
+
+    folder_name = "Member Private Folder"
+    folder = await client.post(
+        "/api/v1/documents/folders",
+        headers=member_headers,
+        json={"name": folder_name},
+    )
+    assert folder.status_code == 201, folder.text
+
+    doc_name = "member-private.md"
+    document = await client.post(
+        f"/api/v1/documents/upload?folder_id={folder.json()['id']}",
+        headers=member_headers,
+        files={"file": (doc_name, b"member private", "text/markdown")},
+    )
+    assert document.status_code == 201, document.text
+
+    browse = await client.get("/api/v1/documents/browse", headers=owner_headers)
+    assert browse.status_code == 200, browse.text
+    assert folder_name in {f["name"] for f in browse.json()["folders"]}
+
+    direct = await client.get(
+        f"/api/v1/documents/{document.json()['id']}",
+        headers=owner_headers,
+    )
+    assert direct.status_code == 200, direct.text
+    assert direct.json()["name"] == doc_name
+
+
+@pytest.mark.parametrize("role", ["admin", "member", "viewer"])
+@pytest.mark.asyncio
+async def test_non_owner_roles_do_not_see_owner_private_knowledge(
+    client: AsyncClient,
+    role: str,
+):
+    """Only owner has default entity-wide visibility into private Knowledge."""
+    owner_headers = await _auth(client, f"priv_owner2_{role}")
     entity_id = await _entity_id(client, owner_headers)
 
-    doc = await _upload(client, owner_headers, name="owner-only.md")
+    folder_name = f"Owner Only {role}"
+    folder = await client.post(
+        "/api/v1/documents/folders",
+        headers=owner_headers,
+        json={"name": folder_name},
+    )
+    assert folder.status_code == 201, folder.text
+
+    doc_name = f"owner-only-{role}.md"
+    doc = await _upload(client, owner_headers, name=doc_name)
     r = await _set_visibility(client, owner_headers, doc["id"], "private")
     assert r.status_code == 200, r.text
 
-    admin = await _create_entity_user(entity_id, "priv_admin2", role="admin")
-    r = await client.get(f"/api/v1/documents/{doc['id']}", headers=admin["headers"])
-    assert r.status_code == 200, "expected admin override to read private doc"
+    other_user = await _create_entity_user(
+        entity_id,
+        f"priv_{role}2",
+        role=role,
+    )
+    r = await client.get(
+        f"/api/v1/documents/{doc['id']}",
+        headers=other_user["headers"],
+    )
+    assert r.status_code == 404, f"{role} role leaked an owner's private doc"
 
-    browse = await client.get("/api/v1/documents/browse", headers=admin["headers"])
-    assert "owner-only.md" in {d["name"] for d in browse.json()["items"]}
+    browse = await client.get(
+        "/api/v1/documents/browse",
+        headers=other_user["headers"],
+    )
+    assert browse.status_code == 200, browse.text
+    assert doc_name not in {d["name"] for d in browse.json()["items"]}
+    assert folder_name not in {f["name"] for f in browse.json()["folders"]}
 
-    # Admin can also change visibility (full owner capability set)
-    r = await _set_visibility(client, admin["headers"], doc["id"], "entity")
-    assert r.status_code == 200, r.text
+    tree = await client.get(
+        "/api/v1/documents/folder-tree",
+        headers=other_user["headers"],
+    )
+    assert tree.status_code == 200, tree.text
+    assert folder_name not in {f["name"] for f in tree.json()}
+
+    # Nor may a non-owner mutate another user's private document without an
+    # explicit grant, even when their default role is admin.
+    r = await _set_visibility(
+        client,
+        other_user["headers"],
+        doc["id"],
+        "entity",
+    )
+    assert r.status_code == 403, r.text
 
 
 @pytest.mark.asyncio
@@ -176,7 +266,7 @@ async def test_member_without_grant_cannot_change_visibility(client: AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_folder_grant_walkup_allows_member_metadata_change(
+async def test_folder_grant_allows_metadata_change_within_folder_visibility(
     client: AsyncClient,
 ):
     """A manage_metadata grant on a folder covers child documents."""
@@ -217,8 +307,12 @@ async def test_folder_grant_walkup_allows_member_metadata_change(
     )
     assert grant.status_code == 201, grant.text
 
-    # With the folder grant: allowed on the child doc
+    # The grant authorizes metadata changes, but cannot publish a child more
+    # broadly than its still-private parent folder.
     r = await _set_visibility(client, member_headers, doc["id"], "workspace")
+    assert r.status_code == 409, r.text
+
+    r = await _set_visibility(client, member_headers, doc["id"], "private")
     assert r.status_code == 200, r.text
 
 

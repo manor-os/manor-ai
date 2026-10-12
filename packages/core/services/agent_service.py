@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote, unquote
 
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.cache import cache
@@ -74,7 +74,7 @@ async def list_agents(
             Agent.deleted_at.is_(None),
         ]
     result = await db.execute(
-        select(Agent).where(*conditions).order_by(Agent.created_at.desc())
+        select(Agent).where(*conditions).order_by(Agent.created_at.desc(), Agent.id)
     )
     return list(result.scalars().all())
 
@@ -217,6 +217,21 @@ async def subscribe_agent(
         owner_user_id=owner_user_id,
         allow_local=True,
     )
+    if workspace_id is None and owner_user_id:
+        from packages.core.services.agent_subscription_service import (
+            ensure_personal_subscription,
+        )
+
+        sub = await ensure_personal_subscription(
+            db,
+            entity_id=entity_id,
+            agent_id=agent.id,
+            owner_user_id=owner_user_id,
+        )
+        if custom_prompt and sub.custom_prompt != custom_prompt:
+            sub.custom_prompt = custom_prompt
+            await db.flush()
+        return sub
     await lock_reusable_resource_reference(
         db,
         entity_id=entity_id,
@@ -228,6 +243,7 @@ async def subscribe_agent(
         entity_id=entity_id,
         agent_id=agent.id,
         workspace_id=workspace_id,
+        owner_user_id=owner_user_id,
         custom_prompt=custom_prompt or None,
     )
     db.add(sub)
@@ -613,7 +629,7 @@ def _tool_catalog_category(name: str) -> str:
         return "mcp"
     if name.startswith("workspace_"):
         return "workspace"
-    if name in {"read_file", "write_file", "edit_file", "list_files", "glob_files", "grep_files", "bash"}:
+    if name in {"read_file", "patch_file", "replace_file", "inspect_file_engine", "list_files", "glob_files", "grep_files", "bash"}:
         return "files"
     if name.startswith("generate_"):
         return "generation"
@@ -638,6 +654,20 @@ async def ensure_runtime_tool_definitions(db: AsyncSession) -> int:
     )
 
     runtime_ensure_tool_registry_initialized()
+
+    # Keep saved bindings/audit rows readable, but stop offering retired
+    # duplicate file entrypoints in the Agent tool picker.
+    await db.execute(
+        update(ToolDefinition).where(
+            ToolDefinition.name.in_({
+                "write_file", "edit_file", "generate_document_file",
+                "mcp__manor_mcp_file_engine__inspect",
+                "mcp__manor_mcp_file_engine__generate",
+                "mcp__manor_mcp_file_engine__patch",
+            }),
+            ToolDefinition.status != "inactive",
+        ).values(status="inactive")
+    )
 
     existing_result = await db.execute(select(ToolDefinition.name))
     existing = {str(row[0]) for row in existing_result.all()}

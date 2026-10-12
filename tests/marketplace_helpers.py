@@ -31,7 +31,8 @@ async def _register(client, name, *, plan_id="plan_personal"):
     entity_id = body["entity_id"]
     if plan_id:
         import asyncio
-        from sqlalchemy import update
+        from sqlalchemy import func, literal, update
+        from sqlalchemy.dialects.postgresql import JSONB
         import packages.core.database as db_module
         from packages.core.models.user import Entity
 
@@ -47,7 +48,7 @@ async def _register(client, name, *, plan_id="plan_personal"):
                 result = await conn.execute(
                     update(Entity)
                     .where(Entity.id == entity_id)
-                    .values(plan_id=plan_id, settings={"plan": plan_id})
+                    .values(plan_id=plan_id, settings=func.coalesce(Entity.settings, literal({}, type_=JSONB)).op("||")({"plan": plan_id}))
                 )
             if result.rowcount == 1:
                 updated = True

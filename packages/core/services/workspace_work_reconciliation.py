@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from sqlalchemy import select
+from sqlalchemy import inspect, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.task import Task
@@ -37,6 +37,7 @@ def build_work_batch_reconciliation(
     *,
     now: datetime | None = None,
     stale_after_hours: dict[str, float] | None = None,
+    live_plan_task_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     """Return a serializable reconciliation snapshot for one work batch."""
     now = _aware(now or datetime.now(timezone.utc))
@@ -62,6 +63,12 @@ def build_work_batch_reconciliation(
         reference_time = _task_reference_time(task)
         age_hours = _age_hours(reference_time, now)
         threshold = thresholds.get(status, DEFAULT_OPEN_TASK_STALE_AFTER_HOURS)
+        if (
+            live_plan_task_ids is not None
+            and status == "in_progress"
+            and task_id not in live_plan_task_ids
+        ):
+            threshold = 0.0
         if age_hours >= threshold:
             stale_tasks.append({
                 "task_id": task_id,
@@ -129,14 +136,66 @@ async def reconcile_active_work_batches(
                     Task.id.in_(task_ids),
                 )
             )).scalars().all())
+        redispatched_ids: set[str] = set()
+        if tasks:
+            from packages.core.services.task_execution_reconcile import (
+                recover_orphaned_in_progress_task,
+                recover_misclassified_tool_error_human_wait,
+            )
+
+            for task in tasks:
+                action = await recover_orphaned_in_progress_task(db, task)
+                if action == "redispatched":
+                    redispatched_ids.add(str(task.id))
+                await recover_misclassified_tool_error_human_wait(db, task)
+
+        live_plan_task_ids = set(redispatched_ids)
+        if task_ids:
+            from packages.core.constants.execution import PLAN_TERMINAL_STATUSES
+            from packages.core.models.execution import ExecutionPlan
+
+            plan_rows = list((await db.execute(
+                select(ExecutionPlan.task_id, ExecutionPlan.status).where(
+                    ExecutionPlan.entity_id == workspace.entity_id,
+                    ExecutionPlan.task_id.in_(task_ids),
+                )
+            )).all())
+            terminal = {status.value for status in PLAN_TERMINAL_STATUSES}
+            planned_task_ids: set[str] = set()
+            for plan_task_id, plan_status in plan_rows:
+                if not plan_task_id:
+                    continue
+                planned_task_ids.add(str(plan_task_id))
+                if str(plan_status or "") not in terminal:
+                    live_plan_task_ids.add(str(plan_task_id))
+            for task in tasks:
+                task_id = str(getattr(task, "id", "") or "")
+                if task_id and task_id not in planned_task_ids:
+                    live_plan_task_ids.add(task_id)
+
+        # Recovery can flush Task.details, expiring server-updated timestamps.
+        # Load them explicitly before the synchronous snapshot builder reads them.
+        for task in tasks:
+            expired = inspect(task).expired_attributes
+            if expired & {"updated_at", "started_at", "created_at"}:
+                await db.refresh(
+                    task,
+                    attribute_names=["updated_at", "started_at", "created_at"],
+                )
+
         snapshot = build_work_batch_reconciliation(
             batch,
             tasks,
             now=now,
             stale_after_hours=stale_after_hours,
+            live_plan_task_ids=live_plan_task_ids,
         )
         details = dict(batch.details or {})
         details["last_reconciliation"] = snapshot
+        if batch.status != "active":
+            batch.details = details
+            results.append(snapshot)
+            continue
         if snapshot["all_terminal"]:
             batch.status = "completed"
             batch.completed_at = now

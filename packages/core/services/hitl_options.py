@@ -21,7 +21,6 @@ APPROVAL_CHOICES: list[ApprovalChoice] = [
 
 DEFAULT_APPROVAL_OPTIONS: list[ApprovalChoice] = [
     APPROVAL_CHOICE_APPROVE,
-    APPROVAL_CHOICE_ALWAYS_APPROVE,
     APPROVAL_CHOICE_REJECT,
 ]
 
@@ -51,20 +50,10 @@ ONE_TIME_APPROVAL_OPTIONS: list[ApprovalChoice] = [
 
 
 def approval_options(options: list[str] | None = None) -> list[str]:
-    """Return canonical approval choices for HITL cards.
-
-    The UI always offers approve-once, always-approve, and reject for
-    approval-style requests. "Always" is the user's to give: whatever the
-    capability, if they say always, they mean always. Producers can still pass
-    a richer explicit list for non-standard cards, but plain approval fallbacks
-    should use this helper instead of hand-rolled arrays.
-    """
-
-    return (
-        list(options)
-        if isinstance(options, list) and options
-        else list(DEFAULT_APPROVAL_OPTIONS)
-    )
+    """Project current choices; stored legacy cards cannot offer blind Always."""
+    chosen = list(options) if isinstance(options, list) and options else list(DEFAULT_APPROVAL_OPTIONS)
+    filtered = [value for value in chosen if str(value).strip().lower() != APPROVAL_CHOICE_ALWAYS_APPROVE]
+    return filtered or list(DEFAULT_APPROVAL_OPTIONS)
 
 
 def one_time_approval_options(options: list[str] | None = None) -> list[str]:
@@ -72,9 +61,8 @@ def one_time_approval_options(options: list[str] | None = None) -> list[str]:
 
     A ``review`` card is a verdict on ONE specific diff. "Always apply whatever
     the next draft happens to say" is not a subject a person can consent to —
-    there is nothing stable for the grant to be about. That is a property of
-    the question, not a judgement about the user: any capability the user
-    clicks "Always" on gets a standing grant (see ``approval_options``).
+    there is nothing stable for the grant to be about. Reusable permission
+    uses the scoped policy service and is not inferred from a card choice.
 
     An explicit ``options`` list is filtered too, so a producer hand-rolling
     the vocabulary cannot put a standing button onto a card whose subject

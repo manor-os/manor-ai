@@ -14,7 +14,7 @@ from packages.core.services.workflow_chat_projection import (
     _workflow_retry_input_schema,
     workflow_result_chat_projection,
 )
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -139,6 +139,24 @@ def test_chat_entrypoint_legacy_projection_is_strictly_scoped(
     workflow = _Workflow(id=binding.workflow_id, name="Legacy boundary workflow")
 
     assert normalize_chat_entrypoint(binding, workflow) is None
+
+
+def test_app_can_project_attached_flow_without_publishing_it_to_chat() -> None:
+    from packages.core.services.workspace_workflow_router import normalize_chat_entrypoint
+
+    binding = _Binding(
+        id="app-only-binding",
+        workflow_id="workflow-app-only",
+        workspace_id="workspace-a",
+        config={"chat_entrypoint": {"enabled": False}},
+    )
+    workflow = _Workflow(id=binding.workflow_id, name="Prepare release files")
+
+    assert normalize_chat_entrypoint(binding, workflow) is None
+    app_entrypoint = normalize_chat_entrypoint(binding, workflow, include_unpublished=True)
+    assert app_entrypoint is not None
+    assert app_entrypoint.binding_id == binding.id
+    assert app_entrypoint.title == "Prepare release files"
 
 
 def test_workflow_service_key_preflight_covers_the_full_graph() -> None:
@@ -339,14 +357,15 @@ async def test_workflow_result_prefill_is_same_conversation_and_approved_branch_
         current_step_id="topic_approved",
         variables={"__result": json.dumps({"topic_id": "TB-001", "title": "Right"})},
     )
-    workflow = SimpleNamespace(name="topic-flow-v1")
+    workflow = SimpleNamespace(name="Generate approved topic")
+    installation = SimpleNamespace(component_key="topic-flow-v1")
 
     class _Rows:
         def all(self):
             return [
-                (other_conversation, workflow),
-                (revised, workflow),
-                (approved, workflow),
+                (other_conversation, workflow, installation.component_key),
+                (revised, workflow, installation.component_key),
+                (approved, workflow, installation.component_key),
             ]
 
     db = SimpleNamespace(execute=AsyncMock(return_value=_Rows()))
@@ -473,6 +492,101 @@ def test_legacy_multi_field_workflow_prefills_its_first_string_input() -> None:
         message="Prepare a launch brief.",
         attachment_refs=[],
     ) == {"topic": "Prepare a launch brief."}
+
+
+def test_chat_attachment_prefills_only_one_matching_file() -> None:
+    from packages.core.services.workspace_workflow_router import (
+        normalize_chat_entrypoint,
+        prefill_workspace_workflow_inputs,
+    )
+
+    binding = _Binding(
+        id="binding-file-prefill",
+        workflow_id="workflow-file-prefill",
+        workspace_id="workspace-a",
+        config={"chat_entrypoint": {"enabled": True}},
+    )
+    workflow = _Workflow(
+        id=binding.workflow_id,
+        name="Release package",
+        variables={},
+        steps=[{
+            "id": "start",
+            "type": "trigger",
+            "config": {"run_inputs": [{
+                "key": "song_file",
+                "type": "string",
+                "required": True,
+                "schema": {"type": "string", "x-ui": {"control": "knowledge_file", "file_kind": "audio"}},
+                "prefill": {"source": "chat_attachment", "mode": "unique"},
+            }]},
+        }],
+    )
+    entrypoint = normalize_chat_entrypoint(binding, workflow)
+    assert entrypoint is not None
+    refs = [
+        {"path": "Knowledge/song.wav", "name": "song.wav"},
+        {"fs_path": "Knowledge/cover.png", "name": "cover.png"},
+    ]
+    assert prefill_workspace_workflow_inputs(
+        entrypoint, message="Prepare this song for release.", attachment_refs=refs,
+    ) == {"song_file": "Knowledge/song.wav"}
+    assert prefill_workspace_workflow_inputs(
+        entrypoint, message="Prepare this song for release.", attachment_refs=refs + [{"fs_path": "Knowledge/alternate.mp3"}],
+    ) == {}
+    assert prefill_workspace_workflow_inputs(
+        entrypoint, message="Prepare this song for release.", attachment_refs=[],
+    ) == {}
+
+
+def test_legacy_workflow_prefill_skips_required_enum_inputs() -> None:
+    from packages.core.services.workspace_workflow_router import (
+        normalize_chat_entrypoint,
+        prefill_workspace_workflow_inputs,
+    )
+
+    binding = _Binding(
+        id="binding-legacy-enum-prefill",
+        workflow_id="workflow-legacy-enum-prefill",
+        workspace_id="workspace-a",
+        config={"chat_entrypoint": {"enabled": True}},
+    )
+    workflow = _Workflow(
+        id=binding.workflow_id,
+        name="Legacy enum intake",
+        variables={"render_mode": "video", "topic": ""},
+        steps=[{
+            "id": "start",
+            "type": "trigger",
+            "config": {
+                "run_inputs": [
+                    {
+                        "key": "render_mode",
+                        "type": "string",
+                        "required": True,
+                        "default": "video",
+                        "schema": {
+                            "type": "string",
+                            "enum": ["video", "slideshow"],
+                            "x-ui": {"control": "select"},
+                        },
+                    },
+                    {"key": "topic", "type": "string", "required": True},
+                ],
+            },
+        }],
+    )
+
+    entrypoint = normalize_chat_entrypoint(binding, workflow)
+    assert entrypoint is not None
+    assert prefill_workspace_workflow_inputs(
+        entrypoint,
+        message="Create, review, and publish a Stickman video.",
+        attachment_refs=[],
+    ) == {
+        "render_mode": "video",
+        "topic": "Create, review, and publish a Stickman video.",
+    }
 
 
 def test_chat_message_does_not_overwrite_an_optional_workflow_parameter() -> None:
@@ -807,6 +921,7 @@ async def test_workspace_chat_entrypoint_persists_attachment_refs(monkeypatch) -
         user_id="user-a",
         workspace_id="workspace-a",
         message="Use the attached reference.",
+        client_message_id="client-screenshot-turn-1",
         attachments=attachments,
         conversation_id=conversation.id,
         route_source="explicit",
@@ -815,6 +930,8 @@ async def test_workspace_chat_entrypoint_persists_attachment_refs(monkeypatch) -
     assert started.user_message.id == "saved-user-message"
     assert add_message.await_count == 1
     assert add_message.await_args.kwargs["attachments"] == attachments.attachment_refs
+    assert add_message.await_args.kwargs["meta"]["client_message_id"] == "client-screenshot-turn-1"
+    assert add_message.await_args.kwargs["meta"]["author_user_id"] == "user-a"
     assert launch.await_args.kwargs["attachments"] is attachments
     assert launch.await_args.kwargs["origin_message_id"] == "saved-user-message"
 
@@ -927,6 +1044,62 @@ async def test_workspace_flow_launcher_accepts_writable_member_in_shared_convers
         conversation=conversation,
         origin_message=origin_message,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("manual_run", "binding_status", "scope", "can_write", "allowed"),
+    [
+        (True, "active", "same", True, True),
+        (True, "paused", "same", True, True),
+        (False, "active", "same", True, False),
+        (False, "paused", "same", True, False),
+        (True, "archived", "same", True, False),
+        (True, "paused", "foreign_binding", True, False),
+        (True, "paused", "foreign_user", True, False),
+        (True, "paused", "deleted", True, False),
+        (True, "paused", "same", False, False),
+    ],
+)
+async def test_disabled_flow_launcher_manual_exception_preserves_authorization(
+    monkeypatch, manual_run, binding_status, scope, can_write, allowed,
+) -> None:
+    from packages.core.services.workspace_flow_launcher import _validate_launch_context
+
+    entrypoint = _entrypoint("binding-manual")
+    binding = SimpleNamespace(
+        id=entrypoint.binding_id, workflow_id=entrypoint.workflow_id,
+        workspace_id="other-workspace" if scope == "foreign_binding" else "workspace-a",
+        entity_id="entity-a", enabled=False, status=binding_status,
+    )
+    user = SimpleNamespace(
+        id="user-a", role="member",
+        entity_id="other-entity" if scope == "foreign_user" else "entity-a",
+    )
+    workspace = SimpleNamespace(
+        id="workspace-a", entity_id="entity-a", status="paused",
+        deleted_at="deleted" if scope == "deleted" else None,
+    )
+    db = SimpleNamespace(get=AsyncMock(side_effect=[user, workspace]))
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.user_can_write_workspace_artifacts",
+        AsyncMock(return_value=can_write),
+    )
+    arguments = dict(
+        entrypoint=entrypoint, binding=binding, entity_id="entity-a", user_id="user-a",
+        workspace_id="workspace-a", manual_run=manual_run,
+        conversation=SimpleNamespace(
+            id="conversation-a", entity_id="entity-a", workspace_id="workspace-a", user_id="user-a",
+        ),
+        origin_message=SimpleNamespace(conversation_id="conversation-a"),
+    )
+    if allowed:
+        await _validate_launch_context(db, **arguments)
+    else:
+        with pytest.raises(PermissionError):
+            await _validate_launch_context(db, **arguments)
+    assert binding.enabled is False
+    assert binding.status == binding_status
 
 
 @pytest.mark.asyncio
@@ -1477,8 +1650,8 @@ def test_workflow_progress_steps_filters_hidden_snapshot_nodes_in_every_state() 
     run.current_step_id = "publish"
     running = workflow_progress_steps(run, activity_status="running")
     assert [(step["id"], step["status"]) for step in running] == [
-        ("start", "pending"),
         ("publish", "running"),
+        ("start", "pending"),
     ]
 
     run.status = "completed"
@@ -1494,7 +1667,166 @@ def test_workflow_progress_steps_filters_hidden_snapshot_nodes_in_every_state() 
     ]
 
 
-def test_workflow_progress_steps_keeps_unreached_nodes_pending_for_actionable_outcome() -> None:
+def test_workflow_progress_steps_omits_pending_branches_ruled_out_before_current_node() -> None:
+    from packages.core.services.workflow_chat_projection import workflow_progress_steps
+
+    run = SimpleNamespace(
+        definition_snapshot={
+            "nodes": [
+                {"id": "start", "name": "Start", "type": "trigger", "targets": ["topic_ok"]},
+                {
+                    "id": "topic_ok",
+                    "name": "Topic is valid?",
+                    "type": "condition",
+                    "targets": ["reserve", "invalid_topic"],
+                },
+                {"id": "invalid_topic", "name": "Invalid topic", "type": "stop", "targets": []},
+                {"id": "reserve", "name": "Reserve Topic", "type": "tool", "targets": ["script_ok"]},
+                {
+                    "id": "script_ok",
+                    "name": "Script packet matches Topic?",
+                    "type": "condition",
+                    "targets": ["generate", "invalid_script"],
+                },
+                {"id": "invalid_script", "name": "Invalid script", "type": "stop", "targets": []},
+                {"id": "generate", "name": "Generate video", "type": "agent", "targets": ["done"]},
+                {"id": "done", "name": "Done", "type": "end", "targets": []},
+            ],
+        },
+        execution_trace=[
+            {"sequence": 1, "node_id": "start", "status": "completed"},
+            {"sequence": 2, "node_id": "topic_ok", "status": "completed"},
+            {"sequence": 3, "node_id": "reserve", "status": "completed"},
+            {"sequence": 4, "node_id": "script_ok", "status": "completed"},
+            {"sequence": 5, "node_id": "generate", "status": "running"},
+        ],
+        step_results={
+            "start": {"status": "completed"},
+            "topic_ok": {
+                "status": "completed",
+                "condition_result": True,
+                "next_override": ["reserve"],
+            },
+            "reserve": {"status": "completed"},
+            "script_ok": {
+                "status": "completed",
+                "condition_result": True,
+                "next_override": ["generate"],
+            },
+        },
+        variables={},
+        status="running",
+        current_step_id="generate",
+        retry_of_run_id=None,
+    )
+
+    projected = workflow_progress_steps(run, activity_status="running")
+
+    assert [(step["id"], step["status"]) for step in projected] == [
+        ("start", "completed"),
+        ("topic_ok", "completed"),
+        ("reserve", "completed"),
+        ("script_ok", "completed"),
+        ("generate", "running"),
+        ("done", "pending"),
+    ]
+
+
+def test_workflow_progress_steps_stops_at_an_unresolved_condition() -> None:
+    from packages.core.services.workflow_chat_projection import workflow_progress_steps
+
+    run = SimpleNamespace(
+        definition_snapshot={
+            "nodes": [
+                {"id": "start", "name": "Start", "type": "trigger", "targets": ["setup_ok"]},
+                {
+                    "id": "setup_ok",
+                    "name": "Setup ready?",
+                    "type": "condition",
+                    "targets": ["upload", "setup_blocked"],
+                },
+                {"id": "setup_blocked", "name": "Setup blocked", "type": "stop", "targets": []},
+                {
+                    "id": "upload",
+                    "name": "Upload video",
+                    "type": "agent",
+                    "targets": ["upload_ok"],
+                },
+                {
+                    "id": "upload_ok",
+                    "name": "Upload accepted?",
+                    "type": "condition",
+                    "targets": ["finish", "upload_blocked"],
+                },
+                {"id": "upload_blocked", "name": "Upload failed", "type": "stop", "targets": []},
+                {"id": "finish", "name": "Done", "type": "end", "targets": []},
+            ],
+        },
+        execution_trace=[
+            {"sequence": 1, "node_id": "start", "status": "completed"},
+            {"sequence": 2, "node_id": "setup_ok", "status": "completed"},
+            {"sequence": 3, "node_id": "upload", "status": "running"},
+        ],
+        step_results={
+            "start": {"status": "completed"},
+            "setup_ok": {
+                "status": "completed",
+                "condition_result": True,
+                "next_override": ["upload"],
+            },
+        },
+        variables={},
+        status="running",
+        current_step_id="upload",
+        retry_of_run_id=None,
+    )
+
+    projected = workflow_progress_steps(run, activity_status="running")
+
+    assert [(step["id"], step["status"]) for step in projected] == [
+        ("start", "completed"),
+        ("setup_ok", "completed"),
+        ("upload", "running"),
+        ("upload_ok", "pending"),
+    ]
+
+
+def test_workflow_progress_steps_preserves_pending_parallel_siblings() -> None:
+    from packages.core.services.workflow_chat_projection import workflow_progress_steps
+
+    run = SimpleNamespace(
+        definition_snapshot={
+            "nodes": [
+                {"id": "start", "name": "Start", "type": "trigger", "targets": ["left", "right"]},
+                {"id": "left", "name": "Left branch", "type": "tool", "targets": ["join"]},
+                {"id": "right", "name": "Right branch", "type": "tool", "targets": ["join"]},
+                {"id": "join", "name": "Join", "type": "merge", "targets": ["done"]},
+                {"id": "done", "name": "Done", "type": "end", "targets": []},
+            ],
+        },
+        execution_trace=[
+            {"sequence": 1, "node_id": "start", "status": "completed"},
+            {"sequence": 2, "node_id": "left", "status": "running"},
+        ],
+        step_results={"start": {"status": "completed"}},
+        variables={},
+        status="running",
+        current_step_id="left",
+        retry_of_run_id=None,
+    )
+
+    projected = workflow_progress_steps(run, activity_status="running")
+
+    assert [(step["id"], step["status"]) for step in projected] == [
+        ("start", "completed"),
+        ("left", "running"),
+        ("right", "pending"),
+        ("join", "pending"),
+        ("done", "pending"),
+    ]
+
+
+def test_workflow_progress_steps_keeps_only_reached_nodes_for_actionable_outcome() -> None:
     from packages.core.services.workflow_chat_projection import workflow_progress_steps
 
     run = SimpleNamespace(
@@ -1532,8 +1864,6 @@ def test_workflow_progress_steps_keeps_unreached_nodes_pending_for_actionable_ou
         ("start", "completed"),
         ("preflight", "completed"),
         ("explore", "completed"),
-        ("publish", "pending"),
-        ("alternate", "skipped"),
         ("needs_input", "completed"),
     ]
 
@@ -1656,6 +1986,63 @@ async def test_cancelled_workflow_projection_clears_retry_action(monkeypatch) ->
 
 
 @pytest.mark.asyncio
+async def test_failed_retry_attempt_projects_its_current_failure_as_next_retry(
+    monkeypatch,
+) -> None:
+    from packages.core.services import workflow_chat_projection as projection
+
+    activity = SimpleNamespace(
+        meta={"workflow_title": "Create Stickman video"},
+        content="",
+        pending_action=None,
+    )
+    run = SimpleNamespace(
+        id="retry-attempt-2",
+        binding_id="binding-1",
+        trigger_source="workspace_chat",
+        trigger_data={
+            "_workspace_chat_entrypoint": {
+                "enabled": True,
+                "conversation_id": "conversation-1",
+                "activity_message_id": "activity-1",
+            },
+        },
+        definition_snapshot={
+            "nodes": [
+                {"id": "video_segment_plan", "name": "Plan video", "type": "tool"},
+                {"id": "claim_video_project", "name": "Claim project", "type": "tool"},
+            ],
+        },
+        step_results={
+            "video_segment_plan": {"status": "completed"},
+            "claim_video_project": {"status": "failed"},
+        },
+        variables={},
+        status="failed",
+        current_step_id="claim_video_project",
+        effective_attempt_number=2,
+        effective_retry_of_run_id="attempt-1",
+        effective_retry_from_step_id="video_segment_plan",
+        error="Project schema validation failed",
+    )
+
+    async def activity_message(*_args, **_kwargs):
+        return activity
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(projection, "_activity_message", activity_message)
+    monkeypatch.setattr(projection, "_notify_update", noop)
+
+    await projection._project_workflow_run_status_chat(object(), run=run)
+
+    assert activity.meta["workflow_retry_from_step_id"] == "claim_video_project"
+    assert activity.pending_action["step_id"] == "claim_video_project"
+    assert activity.pending_action["retry_from_step_id"] == "claim_video_project"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "global_conversation",
     [False, True],
@@ -1752,6 +2139,159 @@ async def test_cancelled_retry_rebinds_reused_activity_to_latest_attempt(
     assert older_activity.pending_action is None
 
 
+@pytest.mark.asyncio
+async def test_direct_nested_retry_stays_bound_to_host_workspace_chat_activity(
+    client: AsyncClient,
+    db_session,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    _, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "nested-retry-chat-activity",
+    )
+    await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
+        headers=headers,
+        data={"message": "Run the nested workflow."},
+    )
+    original = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=headers,
+    )).json()[0]
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Message
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_chat_projection import (
+        project_workflow_run_status,
+    )
+
+    original_row = await db_session.get(WorkflowRun, original["id"])
+    original_context = dict(
+        original_row.trigger_data["_workspace_chat_entrypoint"]
+    )
+    host_run_id = generate_ulid()
+    original_context.update({
+        "nested": True,
+        "host_run_id": host_run_id,
+    })
+    original_row.trigger_data = {
+        **dict(original_row.trigger_data or {}),
+        "parent_run_id": host_run_id,
+        "parent_step_id": "nested-step",
+        "_workflow_chat_origin": original_context,
+    }
+    original_row.status = "failed"
+    original_row.current_step_id = "trigger"
+    original_row.error = "Nested retry required"
+    await project_workflow_run_status(db_session, run=original_row)
+    host_row = WorkflowRun(
+        id=host_run_id,
+        workflow_id=original_row.workflow_id,
+        entity_id=original_row.entity_id,
+        workspace_id=original_row.workspace_id,
+        binding_id=original_row.binding_id,
+        trigger_source="workspace_chat",
+        lineage_root_run_id=host_run_id,
+        lineage_is_legacy=False,
+        status="failed",
+        current_step_id="nested-step",
+        retry_from_step_id="nested-step",
+        variables={},
+        step_results={
+            "nested-step": {
+                "status": "failed",
+                "subrun_id": original_row.id,
+            },
+        },
+        trigger_data={
+            "_workspace_chat_entrypoint": {
+                **original_context,
+                "nested": False,
+                "host_run_id": host_run_id,
+            },
+        },
+        definition_snapshot={
+            "name": "Host workflow",
+            "nodes": [{"id": "nested-step", "type": "subworkflow"}],
+        },
+        execution_snapshot={},
+        execution_trace=[],
+        started_by=original_row.started_by,
+    )
+    parent_activity_id = original_context["activity_message_id"]
+    parent_activity = await db_session.get(Message, parent_activity_id)
+    parent_activity.pending_action = {
+        "kind": "workflow_retry",
+        "workflow_run_id": original_row.id,
+        "workflow_binding_id": original_row.binding_id,
+        "step_id": "trigger",
+        "retry_from_step_id": "trigger",
+        "options": ["retry", "cancel"],
+    }
+    db_session.add(host_row)
+    await db_session.commit()
+
+    host_compact = (await client.get(
+        f"/api/v1/workflows/runs/{host_run_id}?detail=false",
+        headers=headers,
+    )).json()
+    assert host_compact["intervention"]["workflow_run_id"] == host_run_id
+    assert "message_id" not in host_compact["intervention"]
+
+    retried_response = await client.post(
+        f"/api/v1/workflows/runs/{host_run_id}/retry",
+        headers=headers,
+        json={"from_step_id": "trigger", "execute": False},
+    )
+    assert retried_response.status_code == 201, retried_response.text
+    retried = retried_response.json()
+
+    retried_row = await db_session.get(WorkflowRun, retried["id"])
+    retry_context = retried_row.trigger_data["_workflow_chat_origin"]
+    retry_activity_id = retry_context["activity_message_id"]
+    assert retry_activity_id == parent_activity_id
+    assert retry_context["nested"] is True
+    assert retry_context["host_run_id"] == host_run_id
+    assert retried_row.trigger_data["parent_run_id"] == host_run_id
+    assert retried_row.trigger_data["parent_step_id"] == "nested-step"
+
+    retried_row.trigger_source = None
+    retried_row.status = "failed"
+    retried_row.current_step_id = "upload-reconciliation"
+    retried_row.error = "Latest nested upload requires reconciliation"
+    retried_row.step_results = {
+        "upload-reconciliation": {
+            "status": "failed",
+            "error": retried_row.error,
+            "retryable": False,
+            "retry_blocked": True,
+        },
+    }
+    await db_session.commit()
+
+    host_after_blocked_retry = (await client.get(
+        f"/api/v1/workflows/runs/{host_run_id}?detail=false",
+        headers=headers,
+    )).json()
+    assert host_after_blocked_retry["error"] == retried_row.error
+    assert host_after_blocked_retry["retry_from_step_id"] is None
+    assert host_after_blocked_retry["intervention"] is None
+
+    await db_session.refresh(parent_activity)
+    activities = list((await db_session.execute(
+        select(Message).where(
+            Message.conversation_id == parent_activity.conversation_id,
+            Message.message_kind == "workflow_activity",
+        )
+    )).scalars().all())
+    assert [activity.id for activity in activities] == [parent_activity_id]
+
+
 def test_intent_classifier_attachment_descriptors_exclude_locations() -> None:
     from packages.core.services.workspace_workflow_router import (
         workflow_intent_attachment_descriptors,
@@ -1789,10 +2329,94 @@ def test_pending_action_reply_detection_does_not_block_new_work() -> None:
     assert pending_action_reply_matches(
         "Use http://localhost:3010 and show onboarding.",
         [workflow_input],
+    ) is False
+    assert pending_action_reply_matches(
+        "Use http://localhost:3010 and show onboarding.",
+        [workflow_input],
+        include_workflow_free_text=True,
     ) is True
+    assert pending_action_reply_matches("respond", [workflow_input]) is True
+    assert pending_action_reply_matches("cancel", [workflow_input]) is True
+    assert pending_action_reply_matches(
+        "Go ahead and create another video about healthy habits.",
+        [workflow_input],
+    ) is False
     assert pending_action_reply_matches(
         "Create a product demo showing our onboarding flow from http://localhost:3010.",
         [proposal],
+    ) is False
+
+
+@pytest.mark.parametrize("kind", ["workflow_starter_input", "workflow_input"])
+@pytest.mark.asyncio
+async def test_cancelled_workflow_input_does_not_block_new_intent(
+    db_session,
+    kind: str,
+) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.task import Message
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workspace_workflow_router import (
+        conversation_message_is_pending_action_reply,
+    )
+
+    conversation_id = generate_ulid()
+    run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=generate_ulid(),
+        entity_id=generate_ulid(),
+        workspace_id=generate_ulid(),
+        binding_id=generate_ulid(),
+        trigger_source="workspace_chat",
+        status="paused",
+        variables={},
+        step_results={},
+        trigger_data={},
+        definition_snapshot={},
+        execution_trace=[],
+    )
+    db_session.add_all([
+        run,
+        Message(
+            id=generate_ulid(),
+            conversation_id=conversation_id,
+            role="system",
+            content="Provide the inputs required to start the video.",
+            pending_action={
+                "kind": kind,
+                "workflow_run_id": run.id,
+                "options": ["run", "cancel"],
+            },
+        ),
+    ])
+    await db_session.flush()
+    request = "生成topic是You’re Not Lazy—You’re Afraid to Fail 的视频"
+
+    assert await conversation_message_is_pending_action_reply(
+        db_session, conversation_id, request,
+    ) is False
+    assert await conversation_message_is_pending_action_reply(
+        db_session, conversation_id, "cancel",
+    ) is True
+
+    db_session.add(Message(
+        id=generate_ulid(),
+        conversation_id=conversation_id,
+        role="user",
+        content="Use http://localhost:3010 and show onboarding.",
+    ))
+    await db_session.flush()
+    from packages.core.services.workspace_runtime import _pending_hitl_extra_context
+
+    context = await _pending_hitl_extra_context(db_session, conversation_id=conversation_id)
+    assert context is not None
+    assert kind in context
+
+    run.status = "cancelled"
+    await db_session.flush()
+
+    assert await conversation_message_is_pending_action_reply(
+        db_session, conversation_id, request,
     ) is False
 
 
@@ -1823,31 +2447,79 @@ def test_select_intent_match_requires_threshold_and_margin() -> None:
 
     entrypoints = [_entrypoint("a"), _entrypoint("b")]
 
-    assert select_intent_match(
+    matched = select_intent_match(
         entrypoints,
         [
             {"binding_id": "a", "confidence": 0.94},
             {"binding_id": "b", "confidence": 0.72},
         ],
-    ).binding_id == "a"
+    )
+    assert matched.status == "matched"
+    assert matched.entrypoint is not None
+    assert matched.entrypoint.binding_id == "a"
     assert select_intent_match(
         entrypoints,
         [
             {"binding_id": "a", "confidence": 0.84},
             {"binding_id": "b", "confidence": 0.40},
         ],
-    ) is None
-    assert select_intent_match(
+    ).status == "none"
+    close = select_intent_match(
         entrypoints,
         [
             {"binding_id": "a", "confidence": 0.91},
             {"binding_id": "b", "confidence": 0.86},
         ],
-    ) is None
+    )
+    assert close.status == "ambiguous"
+    assert [item.binding_id for item in close.candidates] == ["a", "b"]
     assert select_intent_match(
         entrypoints,
         [{"binding_id": "a", "confidence": 0.94}],
-    ) is None
+    ).status == "error"
+
+
+
+def test_match_workspace_intent_choice_accepts_title_id_and_ordinal() -> None:
+    from packages.core.services.workspace_workflow_router import match_workspace_intent_choice
+
+    first = _entrypoint("a")
+    second = _entrypoint("b")
+    candidates = (first, second)
+
+    assert first is not None and second is not None
+    assert match_workspace_intent_choice("Starter a", candidates) == (first,)
+    assert match_workspace_intent_choice("a", candidates) == (first,)
+    assert match_workspace_intent_choice("1", candidates) == (first,)
+    assert match_workspace_intent_choice("1.", candidates) == (first,)
+    assert match_workspace_intent_choice("第一条", candidates) == (first,)
+    assert match_workspace_intent_choice("第1条", candidates) == (first,)
+    assert match_workspace_intent_choice("用 2", candidates) == (second,)
+    assert match_workspace_intent_choice("%flow Starter a", candidates) == (first,)
+    assert match_workspace_intent_choice("% flow 2", candidates) == (second,)
+    assert match_workspace_intent_choice("%Starter a", candidates) == (first,)
+    assert match_workspace_intent_choice("please continue in chat", candidates) == ()
+
+
+
+
+def test_workspace_intent_prompt_compares_semantic_outcome_and_effects() -> None:
+    from packages.core.services.workspace_workflow_router import _intent_prompt
+
+    prompt = _intent_prompt([_entrypoint("a")], "Create a new deliverable.", [])
+    instruction = prompt[0]["content"]
+
+    assert "semantic meaning" in instruction
+    assert "requested outcome" in instruction
+    assert "additional external effects" in instruction
+    assert "paraphrases" in instruction
+    assert "scheduled" in instruction
+    assert "contextual" in instruction
+    assert "video" not in instruction.lower()
+
+
+
+
 
 
 @pytest.mark.asyncio
@@ -1871,7 +2543,7 @@ async def test_intent_classifier_failure_returns_no_decision(monkeypatch) -> Non
         workspace_id="workspace-a",
     )
 
-    assert decision is None
+    assert decision.status == "error"
 
 
 @pytest.mark.asyncio
@@ -1886,6 +2558,7 @@ async def test_intent_classifier_uses_the_primary_chat_model_route(monkeypatch) 
         captured.update(kwargs)
         return RuntimeTextCompletionResult(
             content=json.dumps({
+                "request_mode": "now",
                 "scores": [{
                     "binding_id": "a",
                     "confidence": 0.96,
@@ -1909,9 +2582,75 @@ async def test_intent_classifier_uses_the_primary_chat_model_route(monkeypatch) 
         workspace_id="workspace-a",
     )
 
-    assert decision is not None
+    assert decision.status == "matched"
+    assert decision.entrypoint is not None
     assert decision.entrypoint.binding_id == "a"
     assert captured["source"] == RUNTIME_CHAT_SOURCE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_mode", ["scheduled", "conversation", "contextual"])
+async def test_intent_classifier_defers_non_immediate_work_even_with_high_scores(
+    monkeypatch, request_mode: str,
+) -> None:
+    from packages.core.ai.runtime.completions import RuntimeTextCompletionResult
+    from packages.core.services.workspace_workflow_router import classify_workspace_intent
+
+    async def complete(messages, **kwargs):
+        return RuntimeTextCompletionResult(
+            content=json.dumps({
+                "request_mode": request_mode,
+                "scores": [{"binding_id": "a", "confidence": 0.99}],
+            }),
+            usage={},
+        )
+
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.completions.runtime_execute_text_completion",
+        complete,
+    )
+    decision = await classify_workspace_intent(
+        entrypoints=[_entrypoint("a")],
+        message="Arrange recurring production for the previously agreed subject.",
+        attachment_refs=[],
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id="workspace-a",
+    )
+
+    assert decision.status == "none"
+    assert decision.request_mode == request_mode
+    assert decision.entrypoint is None
+
+
+@pytest.mark.asyncio
+async def test_intent_classifier_requires_explicit_request_mode(monkeypatch) -> None:
+    from packages.core.ai.runtime.completions import RuntimeTextCompletionResult
+    from packages.core.services.workspace_workflow_router import classify_workspace_intent
+
+    async def complete(messages, **kwargs):
+        return RuntimeTextCompletionResult(
+            content=json.dumps({
+                "scores": [{"binding_id": "a", "confidence": 0.99}],
+            }),
+            usage={},
+        )
+
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.completions.runtime_execute_text_completion",
+        complete,
+    )
+    decision = await classify_workspace_intent(
+        entrypoints=[_entrypoint("a")],
+        message="Create a deliverable.",
+        attachment_refs=[],
+        entity_id="entity-a",
+        user_id="user-a",
+        workspace_id="workspace-a",
+    )
+
+    assert decision.status == "error"
+    assert decision.request_mode == "unknown"
 
 
 def test_prefer_workspace_bindings_excludes_other_workspaces_and_deduplicates() -> None:
@@ -2100,6 +2839,43 @@ async def _seed_workspace_entrypoint(
     return registration, headers, workspace, binding
 
 
+
+async def _add_workspace_chat_entrypoint(
+    client: AsyncClient,
+    headers: dict,
+    workspace: dict,
+    *,
+    title: str,
+    suffix: str,
+) -> dict:
+    workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": f"Workflow {suffix}",
+        "variables": {"request": "", "attachments": []},
+        "steps": [
+            {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["end"]},
+            {"id": "end", "type": "end", "name": "Done", "config": {}, "next": []},
+        ],
+    })).json()
+    binding = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
+        "workflow_id": workflow["id"],
+        "workspace_id": workspace["id"],
+        "trigger_type": "manual",
+        "config": {
+            "chat_entrypoint": {
+                "enabled": True,
+                "title": title,
+                "description": "Run the full configured workflow.",
+                "intent": {
+                    "enabled": True,
+                    "description": "Use for a matching production request.",
+                    "minimum_confidence": 0.85,
+                },
+            }
+        },
+    })).json()
+    return binding
+
+
 @pytest.mark.asyncio
 async def test_workspace_retry_preflights_snapshot_services_before_creating_run(
     client: AsyncClient,
@@ -2185,7 +2961,115 @@ async def test_workspace_retry_preflights_snapshot_services_before_creating_run(
 
 
 @pytest.mark.asyncio
-async def test_workspace_retry_api_rejects_paused_workspace_before_creating_run(
+@pytest.mark.parametrize("workspace_manual", [False, True])
+async def test_paused_automation_binding_allows_explicit_run_without_reenabling(
+    client: AsyncClient, db_session, workspace_manual: bool,
+) -> None:
+    from packages.core.models.workflow import WorkflowBinding
+    from packages.core.services.workflow_service import start_workflow_from_binding
+
+    registration, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "paused_automation_manual_run",
+        steps=[
+            {"id": "trigger", "type": "trigger", "config": {}, "next": ["end"]},
+            {"id": "end", "type": "end", "config": {}, "next": []},
+        ],
+    )
+    stored_binding = await db_session.get(WorkflowBinding, binding["id"])
+    stored_binding.trigger_type = "event"
+    await db_session.commit()
+    pause = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/pause", headers=headers,
+    )
+    assert pause.status_code == 200, pause.text
+    await db_session.refresh(stored_binding)
+    assert stored_binding.enabled is False
+    assert stored_binding.status == "paused"
+    with pytest.raises(ValueError, match="binding is inactive"):
+        await start_workflow_from_binding(
+            db_session, stored_binding, started_by=registration["user_id"],
+        )
+    await db_session.rollback()
+
+    response = await client.post(
+        f"/api/v1/workflows/bindings/{binding['id']}/run", headers=headers,
+        json={"execute": False, "trigger_data": {"workspace_manual": workspace_manual}},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["trigger_source"] == "manual"
+    assert response.json()["trigger_data"]["_workspace_user_request"] == {
+        "user_id": registration["user_id"],
+    }
+    await db_session.refresh(stored_binding)
+    assert stored_binding.enabled is False
+    assert stored_binding.status == "paused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("user_requested", [True, False])
+@pytest.mark.parametrize("trigger_source", ["proposal", "mcp"])
+async def test_paused_workspace_proposal_flow_requires_explicit_user_dispatch(
+    client: AsyncClient, db_session, user_requested: bool, trigger_source: str,
+) -> None:
+    from sqlalchemy import func, select
+
+    from packages.core.models.workflow import WorkflowBinding, WorkflowRun
+    from packages.core.services.workflow_service import start_workflow_from_binding
+
+    registration, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "paused_proposal_flow",
+        steps=[
+            {"id": "trigger", "type": "trigger", "config": {}, "next": ["end"]},
+            {"id": "end", "type": "end", "config": {}, "next": []},
+        ],
+    )
+    pause = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/pause", headers=headers,
+    )
+    assert pause.status_code == 200, pause.text
+    stored_binding = await db_session.get(WorkflowBinding, binding["id"])
+    assert stored_binding is not None
+    if user_requested:
+        run = await start_workflow_from_binding(
+            db_session, stored_binding,
+            started_by=registration["user_id"], trigger_source=trigger_source,
+            user_requested=True,
+        )
+        assert run.trigger_source == trigger_source
+        assert run.workspace_id == workspace["id"]
+        assert run.trigger_data["_workspace_user_request"] == {
+            "user_id": registration["user_id"],
+        }
+        from packages.core.services.workflow_service import retry_workflow_run
+
+        run.status = "failed"
+        await db_session.flush()
+        retry = await retry_workflow_run(
+            db_session, run_id=run.id, entity_id=run.entity_id,
+            started_by=registration["user_id"], expected_latest_run_id=run.id,
+        )
+        assert retry.trigger_source == trigger_source
+        assert retry.trigger_data["_workspace_user_request"] == {
+            "user_id": registration["user_id"],
+        }
+    else:
+        with pytest.raises(ValueError, match="active Workspace"):
+            await start_workflow_from_binding(
+                db_session, stored_binding,
+                started_by=registration["user_id"], trigger_source=trigger_source,
+                trigger_data={"_workspace_user_request": {"user_id": registration["user_id"]}},
+            )
+        assert await db_session.scalar(
+            select(func.count()).select_from(WorkflowRun).where(
+                WorkflowRun.workspace_id == workspace["id"],
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_retry_api_allows_manual_retry_while_autonomy_paused(
     client: AsyncClient,
     db_session,
 ) -> None:
@@ -2238,13 +3122,14 @@ async def test_workspace_retry_api_rejects_paused_workspace_before_creating_run(
         json={"from_step_id": "plan", "execute": False},
     )
 
-    assert response.status_code == 409, response.text
+    assert response.status_code == 201, response.text
+    assert response.json()["retry_of_run_id"] == prior.id
     assert await db_session.scalar(
         select(func.count()).select_from(WorkflowRun).where(
             WorkflowRun.workflow_id == prior.workflow_id,
             WorkflowRun.workspace_id == workspace["id"],
         )
-    ) == family_count
+    ) == family_count + 1
 
 
 @pytest.mark.asyncio
@@ -2746,7 +3631,7 @@ async def test_workspace_viewer_chat_turn_skips_flow_intent_routing(
     async def fake_chat_stream(*args, **kwargs):
         nonlocal fallback_called
         fallback_called = True
-        yield "event: stream_end\\ndata: {}\\n\\n"
+        yield "event: stream_end\ndata: {}\n\n"
 
     monkeypatch.setattr(
         "packages.core.services.workspace_workflow_router.classify_workspace_intent",
@@ -2838,7 +3723,10 @@ async def test_explicit_workspace_entrypoint_stream_starts_projected_run(
     response = await client.post(
         f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
         headers=headers,
-        data={"message": "Create the requested deliverable from this brief."},
+        data={
+            "message": "Create the requested deliverable from this brief.",
+            "client_message_id": "explicit-flow-turn-1",
+        },
     )
 
     assert response.status_code == 200
@@ -2857,11 +3745,20 @@ async def test_explicit_workspace_entrypoint_stream_starts_projected_run(
         headers=headers,
     )).json()
     assert sorted(message["author_kind"] for message in messages) == ["system", "system", "user"]
+    user_message = next(message for message in messages if message["author_kind"] == "user")
+    assert response.headers["X-User-Message-ID"] == user_message["id"]
+    assert response.headers["X-Conversation-ID"] == user_message["conversation_id"]
+    assert user_message["meta"]["client_message_id"] == "explicit-flow-turn-1"
+    assert response.headers["X-Client-Message-ID"] == "explicit-flow-turn-1"
+    assert f'"user_message_id": "{user_message["id"]}"' in response.text
     activity = next(message for message in messages if message["message_kind"] == "workflow_activity")
     assert activity["meta"]["workflow_run_id"] == runs[0]["id"]
-    assert [step["id"] for step in activity["meta"]["workflow_steps"]] == ["trigger", "end"]
+    assert [step["id"] for step in activity["meta"]["workflow_steps"]] == [
+        "trigger",
+        "end",
+    ]
     assert [step["status"] for step in activity["meta"]["workflow_steps"]] == [
-        "pending",
+        "paused",
         "pending",
     ]
     input_request = next(message for message in messages if message["pending_action"])
@@ -3100,9 +3997,16 @@ async def test_existing_chat_stream_automatically_routes_high_confidence_intent(
     async def fake_classifier(*, entrypoints, **kwargs):
         nonlocal classifier_called
         classifier_called = True
-        from packages.core.services.workspace_workflow_router import WorkspaceIntentDecision
+        from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
 
-        return WorkspaceIntentDecision(entrypoints[0], 0.96, "Direct creation request")
+        return WorkspaceIntentClassification(
+            status="matched",
+            entrypoint=entrypoints[0],
+            candidates=(entrypoints[0],),
+            confidence=0.96,
+            reason="Direct creation request",
+            source_brief=str(kwargs.get("message") or ""),
+        )
 
     async def fake_chat_stream(*args, **kwargs):
         nonlocal fallback_called
@@ -3121,6 +4025,7 @@ async def test_existing_chat_stream_automatically_routes_high_confidence_intent(
         headers=headers,
         data={
             "message": "Create the full deliverable now.",
+            "client_message_id": "auto-flow-turn-1",
             "workspace_context": "true",
             "workspace_id": workspace["id"],
         },
@@ -3143,6 +4048,204 @@ async def test_existing_chat_stream_automatically_routes_high_confidence_intent(
     run = run_response.json()
     assert run["trigger_data"]["_workspace_chat_entrypoint"]["route_source"] == "intent"
     assert run["trigger_data"]["_workspace_chat_entrypoint"]["confidence"] == 0.96
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers,
+    )).json()
+    user_message = next(message for message in messages if message["author_kind"] == "user")
+    assert response.headers["X-User-Message-ID"] == user_message["id"]
+    assert user_message["meta"]["client_message_id"] == "auto-flow-turn-1"
+    assert response.headers["X-Client-Message-ID"] == "auto-flow-turn-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_mode", "status"),
+    [
+        ("scheduled", "none"),
+        ("contextual", "none"),
+        ("conversation", "none"),
+        ("unknown", "error"),
+        ("now", "error"),
+    ],
+)
+async def test_non_immediate_chat_turn_cannot_start_a_workflow(
+    client: AsyncClient, monkeypatch, request_mode: str, status: str,
+) -> None:
+    from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+    async def classify(*, message, **kwargs):
+        return WorkspaceIntentClassification(
+            status=status,
+            request_mode=request_mode,
+            source_brief=message,
+        )
+
+    captured: dict = {}
+
+    async def chat_stream(*args, **kwargs):
+        captured.update(kwargs)
+        yield "event: stream_end\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        classify,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", chat_stream)
+    _, headers, workspace, _binding = await _seed_workspace_entrypoint(
+        client, f"deferred{request_mode}",
+    )
+
+    response = await _chat_stream_workspace(
+        client, headers, workspace,
+        "Please arrange regular videos for the subject we discussed.",
+    )
+
+    assert response.status_code == 200
+    assert {"start_workspace_flow", "run_workflow"}.issubset(captured["blocked_tools"])
+    assert "create_scheduled_job" not in captured["blocked_tools"]
+    runs = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}", headers=headers,
+    )).json()
+    assert runs == []
+
+
+@pytest.mark.asyncio
+async def test_low_scoring_immediate_request_preserves_chat_flow_tools(
+    client: AsyncClient, monkeypatch,
+) -> None:
+    from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+    async def classify(*, message, **kwargs):
+        return WorkspaceIntentClassification(
+            status="none",
+            request_mode="now",
+            reason="below_threshold",
+            source_brief=message,
+        )
+
+    captured: dict = {}
+
+    async def chat_stream(*args, **kwargs):
+        captured.update(kwargs)
+        yield "event: stream_end\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        classify,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", chat_stream)
+    _, headers, workspace, _binding = await _seed_workspace_entrypoint(
+        client, "immediatelowconfidence",
+    )
+
+    response = await _chat_stream_workspace(
+        client, headers, workspace, "Create one deliverable now.",
+    )
+
+    assert response.status_code == 200
+    assert "start_workspace_flow" not in captured["blocked_tools"]
+    assert "run_workflow" not in captured["blocked_tools"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_previous", [False, True])
+async def test_starter_card_allows_independent_new_chat_intent_run(
+    client: AsyncClient,
+    monkeypatch,
+    cancel_previous: bool,
+) -> None:
+    from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+    steps = [
+        {
+            "id": "trigger",
+            "type": "trigger",
+            "name": "Start",
+            "config": {"run_inputs": [{"key": "request", "type": "string", "required": True}]},
+            "next": ["end"],
+        },
+        {"id": "end", "type": "end", "name": "Done", "config": {}, "next": []},
+    ]
+    _, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client, "cancelledstarter", steps=steps,
+    )
+    first = await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
+        headers=headers,
+        data={"message": "Create a video."},
+    )
+    assert first.status_code == 200, first.text
+    first_run = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}", headers=headers,
+    )).json()[0]
+    assert first_run["status"] == "paused"
+    if cancel_previous:
+        cancelled = await client.post(
+            f"/api/v1/workflows/runs/{first_run['id']}/cancel", headers=headers,
+        )
+        assert cancelled.status_code == 200, cancelled.text
+    before_messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers,
+    )).json()
+    old_card = next(
+        item for item in before_messages
+        if (item.get("pending_action") or {}).get("workflow_run_id") == first_run["id"]
+    )
+
+    classified = []
+
+    async def fake_classifier(*, entrypoints, message, **kwargs):
+        classified.append(message)
+        return WorkspaceIntentClassification(
+            status="matched", entrypoint=entrypoints[0], confidence=0.96,
+            source_brief=message,
+        )
+
+    async def no_fallback(*args, **kwargs):
+        raise AssertionError("new video request must not fall through to Chat")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        fake_classifier,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", no_fallback)
+    request = "生成topic是You’re Not Lazy—You’re Afraid to Fail 的视频"
+    response = await client.post(
+        "/api/v1/chat/stream",
+        headers=headers,
+        data={
+            "message": request,
+            "workspace_context": "true",
+            "workspace_id": workspace["id"],
+            "conversation_id": first.headers["X-Conversation-ID"],
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert classified == [request]
+    runs = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}", headers=headers,
+    )).json()
+    assert len(runs) == 2
+    assert next(run for run in runs if run["id"] == first_run["id"])["status"] == (
+        "cancelled" if cancel_previous else "paused"
+    )
+    assert next(run for run in runs if run["id"] != first_run["id"])["status"] == "paused"
+    after_messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers,
+    )).json()
+    assert next(item for item in after_messages if item["id"] == old_card["id"])[
+        "pending_action"
+    ] == old_card["pending_action"]
+    assert next(item for item in after_messages if item["id"] == old_card["id"])[
+        "resolved_at"
+    ] == old_card["resolved_at"]
+    assert len({
+        (item.get("pending_action") or {}).get("workflow_run_id")
+        for item in after_messages
+        if (item.get("pending_action") or {}).get("kind") == "workflow_starter_input"
+    }) == 2
 
 
 @pytest.mark.asyncio
@@ -3198,6 +4301,296 @@ async def test_existing_chat_stream_skips_intent_routing_for_explicit_controls(
     assert response.status_code == 200
     assert classifier_called is False
     assert fallback_called is True
+
+
+
+async def _chat_stream_workspace(
+    client: AsyncClient,
+    headers: dict,
+    workspace: dict,
+    message: str,
+    **extra: str,
+):
+    return await client.post(
+        "/api/v1/chat/stream",
+        headers=headers,
+        data={
+            "message": message,
+            "workspace_context": "true",
+            "workspace_id": workspace["id"],
+            **extra,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_existing_chat_stream_asks_user_to_choose_ambiguous_intent(
+    client: AsyncClient,
+    monkeypatch,
+) -> None:
+    queued: list[str] = []
+    fallback_called = False
+
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda run_id, *args, **kwargs: queued.append(run_id)),
+    )
+
+    async def fake_classifier(*, entrypoints, **kwargs):
+        from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+        return WorkspaceIntentClassification(
+            status="ambiguous",
+            candidates=tuple(entrypoints),
+            confidence=0.91,
+            reason="insufficient_margin",
+            source_brief=str(kwargs.get("message") or ""),
+        )
+
+    async def fake_chat_stream(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        yield "event: stream_end\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        fake_classifier,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", fake_chat_stream)
+    _, headers, workspace, _binding = await _seed_workspace_entrypoint(client, "ambiguous")
+    await _add_workspace_chat_entrypoint(
+        client,
+        headers,
+        workspace,
+        title="Publish the deliverable",
+        suffix="ambiguous-publish",
+    )
+
+    response = await _chat_stream_workspace(
+        client,
+        headers,
+        workspace,
+        "Create the full deliverable now.",
+    )
+
+    assert response.status_code == 200
+    assert fallback_called is False
+    runs = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=headers,
+    )).json()
+    assert runs == []
+    assert queued == []
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=headers,
+    )).json()
+    prompt = next(message for message in messages if message["author_kind"] == "agent")
+    assert "1. Create the deliverable" in prompt["body"]
+    assert "2. Publish the deliverable" in prompt["body"]
+    assert prompt["pending_action"] is None
+    assert prompt["meta"]["kind"] == "workspace_intent_choice"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["none", "error", None])
+async def test_existing_chat_stream_falls_through_when_intent_is_unresolved(
+    client: AsyncClient,
+    monkeypatch,
+    status: str | None,
+) -> None:
+    fallback_called = False
+
+    async def fake_classifier(*, entrypoints, **kwargs):
+        from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+        if status is None:
+            return None
+        return WorkspaceIntentClassification(
+            status=status,
+            source_brief=str(kwargs.get("message") or ""),
+        )
+
+    async def fake_chat_stream(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        yield "event: stream_end\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        fake_classifier,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", fake_chat_stream)
+    suffix = "none" if status == "none" else "error" if status == "error" else "null"
+    _, headers, workspace, _binding = await _seed_workspace_entrypoint(
+        client,
+        f"unresolved{suffix}",
+    )
+
+    response = await _chat_stream_workspace(
+        client,
+        headers,
+        workspace,
+        "Create the full deliverable now.",
+    )
+
+    assert response.status_code == 200
+    assert fallback_called is True
+    runs = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=headers,
+    )).json()
+    assert runs == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("suffix", "choice"),
+    [
+        ("choice1", "1"),
+        ("choicetitle", "Create the deliverable"),
+    ],
+)
+async def test_existing_chat_stream_starts_original_brief_after_intent_choice(
+    client: AsyncClient,
+    monkeypatch,
+    suffix: str,
+    choice: str,
+) -> None:
+    queued: list[str] = []
+    fallback_called = False
+    original_brief = "Create the full deliverable now."
+
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda run_id, *args, **kwargs: queued.append(run_id)),
+    )
+
+    async def fake_classifier(*, entrypoints, **kwargs):
+        from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+        return WorkspaceIntentClassification(
+            status="ambiguous",
+            candidates=tuple(entrypoints),
+            confidence=0.91,
+            reason="insufficient_margin",
+            source_brief=str(kwargs.get("message") or ""),
+        )
+
+    async def fake_chat_stream(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        yield "event: stream_end\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        fake_classifier,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", fake_chat_stream)
+    _, headers, workspace, create_binding = await _seed_workspace_entrypoint(
+        client,
+        suffix,
+    )
+    await _add_workspace_chat_entrypoint(
+        client,
+        headers,
+        workspace,
+        title="Publish the deliverable",
+        suffix=f"{suffix}-publish",
+    )
+
+    first = await _chat_stream_workspace(client, headers, workspace, original_brief)
+    assert first.status_code == 200
+    second = await _chat_stream_workspace(client, headers, workspace, choice)
+    assert second.status_code == 200
+    assert fallback_called is False
+    runs = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=headers,
+    )).json()
+    assert len(runs) == 1
+    assert queued == [runs[0]["id"]]
+    assert runs[0]["workflow_id"] == create_binding["workflow_id"]
+    run = (await client.get(
+        f"/api/v1/workflows/runs/{runs[0]['id']}",
+        headers=headers,
+    )).json()
+    assert run["trigger_data"]["_workspace_chat_entrypoint"]["route_source"] == "intent"
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=headers,
+    )).json()
+    user_messages = [message for message in messages if message["author_kind"] == "user"]
+    assert user_messages[-1]["body"] == original_brief
+    assert choice == original_brief or all(message["body"] != choice for message in user_messages)
+
+
+@pytest.mark.asyncio
+async def test_existing_chat_stream_reclassifies_unrelated_follow_up_after_intent_choice(
+    client: AsyncClient,
+    monkeypatch,
+) -> None:
+    fallback_called = False
+    classified: list[str] = []
+
+    async def fake_classifier(*, entrypoints, **kwargs):
+        from packages.core.services.workspace_workflow_router import WorkspaceIntentClassification
+
+        message = str(kwargs.get("message") or "")
+        classified.append(message)
+        if len(classified) == 1:
+            return WorkspaceIntentClassification(
+                status="ambiguous",
+                candidates=tuple(entrypoints),
+                confidence=0.91,
+                reason="insufficient_margin",
+                source_brief=message,
+            )
+        return WorkspaceIntentClassification(status="none", source_brief=message)
+
+    async def fake_chat_stream(*args, **kwargs):
+        nonlocal fallback_called
+        fallback_called = True
+        yield "event: stream_end\ndata: {}\n\n"
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_workflow_router.classify_workspace_intent",
+        fake_classifier,
+    )
+    monkeypatch.setattr("apps.api.routers.chat.runtime_stream_chat_turn", fake_chat_stream)
+    _, headers, workspace, _binding = await _seed_workspace_entrypoint(client, "reclassify")
+    await _add_workspace_chat_entrypoint(
+        client,
+        headers,
+        workspace,
+        title="Publish the deliverable",
+        suffix="reclassify-publish",
+    )
+
+    first = await _chat_stream_workspace(
+        client,
+        headers,
+        workspace,
+        "Create the full deliverable now.",
+    )
+    assert first.status_code == 200
+    second = await _chat_stream_workspace(
+        client,
+        headers,
+        workspace,
+        "What is the current workspace status?",
+    )
+    assert second.status_code == 200
+    assert classified == [
+        "Create the full deliverable now.",
+        "What is the current workspace status?",
+    ]
+    assert fallback_called is True
+    runs = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=headers,
+    )).json()
+    assert runs == []
 
 
 @pytest.mark.asyncio
@@ -3348,12 +4741,20 @@ async def test_legacy_workflow_step_projection_appends_when_snapshot_is_empty(
         headers=headers,
     )).json()
     activity = next(message for message in messages if message["message_kind"] == "workflow_activity")
-    assert activity["meta"]["workflow_steps"] == [{
-        "id": "legacy",
-        "name": "Legacy step",
-        "type": "tool",
-        "status": "running",
-    }]
+    assert activity["meta"]["workflow_steps"] == [
+        {
+            "id": "trigger",
+            "name": "trigger",
+            "type": "",
+            "status": "queued",
+        },
+        {
+            "id": "legacy",
+            "name": "Legacy step",
+            "type": "tool",
+            "status": "running",
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -3536,7 +4937,7 @@ async def test_workflow_update_notification_discards_inner_savepoint_descendants
 
 
 @pytest.mark.asyncio
-async def test_completed_workflow_activity_marks_unvisited_branch_skipped(
+async def test_completed_workflow_activity_omits_unvisited_branch(
     client: AsyncClient,
     monkeypatch,
 ) -> None:
@@ -3604,20 +5005,18 @@ async def test_completed_workflow_activity_marks_unvisited_branch_skipped(
         "start",
         "route",
         "left",
-        "right",
         "end",
     ]
     assert [step["status"] for step in activity["meta"]["workflow_steps"]] == [
         "completed",
         "completed",
         "completed",
-        "skipped",
         "completed",
     ]
 
 
 @pytest.mark.asyncio
-async def test_failed_workflow_activity_keeps_unvisited_nodes_pending(
+async def test_failed_workflow_activity_appends_unvisited_nodes(
     client: AsyncClient,
     monkeypatch,
 ) -> None:
@@ -3901,6 +5300,104 @@ async def test_workflow_final_output_projection_applies_binding_allowlist(
 
 
 @pytest.mark.asyncio
+async def test_workflow_final_output_projection_attaches_nested_durable_artifact(
+    client: AsyncClient,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda *args, **kwargs: None),
+    )
+    _, headers, workspace, binding = await _seed_workspace_entrypoint(
+        client,
+        "final-output-artifact",
+    )
+    await client.post(
+        f"/api/v1/workspaces/{workspace['id']}/chat/entrypoints/{binding['id']}/stream",
+        headers=headers,
+        data={"message": "Create one durable video artifact."},
+    )
+    run = (await client.get(
+        f"/api/v1/workflows/runs?workspace_id={workspace['id']}",
+        headers=headers,
+    )).json()[0]
+
+    import packages.core.database as db_module
+    from packages.core.models.task import Message
+    from packages.core.models.workflow import WorkflowRun
+    from packages.core.services.workflow_chat_projection import project_workflow_run_status
+
+    document_id = "01KYNERQ91YH35G3V7FA1M0J8F"
+    fs_path = "Workspaces/_by_id/workspace-1/runs/run-1/final/final.mp4"
+    async with db_module.async_session() as db:
+        workflow_run = await db.get(WorkflowRun, run["id"])
+        workflow_run.status = "completed"
+        workflow_run.current_step_id = "end"
+        workflow_run.step_results = {
+            "trigger": {"status": "completed"},
+            "end": {"status": "completed"},
+        }
+        workflow_run.variables = {
+            **(workflow_run.variables or {}),
+            "__result": {
+                "state": {
+                    "artifact": {
+                        "filename": "final.mp4",
+                        "fs_path": fs_path,
+                        "document_id": document_id,
+                    },
+                },
+                "receipt": {
+                    "filename": "ledger-event.json",
+                    "fs_path": "Workspaces/_by_id/workspace-1/topic-ledger/ledger-event.json",
+                    "document_id": "01KYNERQ91YH35G3V7FA1M0J90",
+                },
+            },
+        }
+        await project_workflow_run_status(db, run=workflow_run)
+        await db.flush()
+        projected_message = (await db.execute(
+            select(Message).where(
+                Message.conversation_id
+                == workflow_run.trigger_data["_workspace_chat_entrypoint"]["conversation_id"],
+                Message.meta["workflow_run_id"].as_string() == str(workflow_run.id),
+                Message.meta["workflow_final_output"].as_boolean().is_(True),
+            )
+        )).scalar_one()
+        assert projected_message.attachments
+
+        projected_message.attachments = None
+        await db.commit()
+
+        # Re-observing a completed run must also repair older Result-card
+        # projections that were persisted before Workflow attachments existed.
+        await project_workflow_run_status(db, run=workflow_run)
+        await db.commit()
+
+    messages = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages",
+        headers=headers,
+    )).json()
+    final_messages = [
+        message
+        for message in messages
+        if message.get("meta", {}).get("workflow_final_output") is True
+    ]
+    assert len(final_messages) == 1
+    assert final_messages[0]["attachments"] == [{
+        "name": "final.mp4",
+        "type": "knowledge",
+        "fileType": "mp4",
+        "previewUrl": (
+            f"/api/v1/fs/{workspace['entity_id']}/{fs_path}"
+        ),
+        "document_id": document_id,
+        "fsPath": fs_path,
+        "openUrl": f"/viewer/{document_id}",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_workflow_final_output_projection_is_idempotent_by_run(
     client: AsyncClient,
     monkeypatch,
@@ -4006,7 +5503,7 @@ async def test_workflow_final_output_projection_is_idempotent_by_run(
     assert result_ref["workflow_id"] == run["workflow_id"]
     assert result_ref["run_id"] == run["id"]
     assert result_ref["url"] == (
-        f"/flows?workflow={run['workflow_id']}&run={run['id']}"
+        f"/flows/{run['workflow_id']}/runs/{run['id']}"
     )
     assert {ref["type"] for ref in final_messages[0]["refs"]} == {
         "workflow",
@@ -4039,7 +5536,7 @@ def test_topic_brief_final_output_becomes_chat_friendly_summary_and_reference():
         "workflow_id": "workflow-topic-1",
         "workflow_name": "Generate topic from knowledge",
         "run_id": "run-topic-1",
-        "url": "/flows?workflow=workflow-topic-1&run=run-topic-1",
+        "url": "/flows/workflow-topic-1/runs/run-topic-1",
         "status": "completed",
         "kind": "topic_brief",
         "title": "Atomic Approval-First Workflows",
@@ -4773,7 +6270,8 @@ async def test_workflow_approval_can_keep_full_review_in_run_history_only(
     assert action["review_title"] == "Product video plan"
     assert action["review_location"] == "workflow_history"
     assert "review" not in action
-    hitl_request = approval["meta"]["hitl_requests"][0]
+    assert "hitl_requests" not in approval["meta"]
+    hitl_request = approval["hitl_requests"][0]
     assert hitl_request["review_location"] == "workflow_history"
     assert "review" not in hitl_request
 
@@ -5006,6 +6504,10 @@ async def test_workflow_input_card_resumes_same_run_with_response(
                 "message": "Provide a URL or ordered steps.",
                 "options": ["respond", "cancel"],
                 "response_variable": "missing_context",
+                "input_schema": {
+                    "type": "object", "properties": {"choice": {"type": "string"}},
+                    "required": ["choice"],
+                },
             },
             "next": ["end"],
         },
@@ -5077,6 +6579,10 @@ async def test_workflow_input_cancel_is_terminal_and_duplicate_is_idempotent(
                 "message": "Provide context.",
                 "options": ["respond", "cancel"],
                 "response_variable": "missing_context",
+                "input_schema": {
+                    "type": "object", "properties": {"choice": {"type": "string"}},
+                    "required": ["choice"],
+                },
             },
             "next": ["end"],
         },

@@ -3,6 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from packages.core.contracts.shapes import get_shape
+from packages.core.contracts.task_output import (
+    PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+    plan_output_contract_schema,
+)
 from packages.core.dispatcher.output_coercion import (
     _file_ref_from_dict,
     coerce_step_output_for_schema,
@@ -464,6 +469,230 @@ def test_coerce_files_as_string_paths_when_schema_requests_strings() -> None:
     ]
 
 
+def test_custom_bare_payload_coerces_mixed_file_list_to_strings() -> None:
+    schema = plan_output_contract_schema(
+        {
+            "type": "object",
+            "required": ["files"],
+            "properties": {
+                "files": {"type": "array", "items": {"type": "string"}},
+                "summary": {"type": "string"},
+            },
+        },
+        source=PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+    )
+    raw = {
+        "files": [
+            "Tonight Rights Clearance Memo.md",
+            "Tonight Royalty Registration Checklist.md",
+            {
+                "type": "path",
+                "source": "path",
+                "fs_path": "Workspaces/_by_id/ws/documents/tonight_royalty_checklist.md",
+            },
+            {
+                "type": "path",
+                "source": "path",
+                "fs_path": "Workspaces/_by_id/ws/documents/Tonight — Rights and Royalty Readiness Pack.md",
+            },
+        ],
+        "summary": "Wrote rights memo.",
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["files"] == [
+        "Tonight Rights Clearance Memo.md",
+        "Tonight Royalty Registration Checklist.md",
+        "Workspaces/_by_id/ws/documents/tonight_royalty_checklist.md",
+        "Workspaces/_by_id/ws/documents/Tonight — Rights and Royalty Readiness Pack.md",
+    ]
+
+
+def test_custom_bare_payload_drops_url_only_files_when_path_items_remain() -> None:
+    schema = plan_output_contract_schema(
+        {
+            "type": "object",
+            "required": ["files"],
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "fs_path"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "fs_path": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        },
+        source=PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+    )
+    raw = {
+        "files": [
+            {
+                "name": "Tonight_DistroKid_operator_handoff.md",
+                "fs_path": "Workspaces/_by_id/ws/documents/Tonight_DistroKid_operator_handoff.md",
+            },
+            {
+                "type": "url",
+                "source": "url",
+                "url": "https://support.distrokid.com/api/v2/help_center/en-us/articles.json",
+            },
+            {
+                "type": "path",
+                "source": "path",
+                "fs_path": "Workspaces/_by_id/ws/documents/Tonight Rights Clearance Memo.md",
+                "name": "Tonight Rights Clearance Memo.md",
+            },
+            {
+                "type": "url",
+                "source": "url",
+                "url": "https://support.distrokid.com/api/v2/help_center/en-us/articles/50784709021971.json",
+            },
+        ],
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert [file["fs_path"] for file in coerced["files"]] == [
+        "Workspaces/_by_id/ws/documents/Tonight_DistroKid_operator_handoff.md",
+        "Workspaces/_by_id/ws/documents/Tonight Rights Clearance Memo.md",
+    ]
+
+
+def _files_role_exists_schema() -> dict:
+    return plan_output_contract_schema(
+        {
+            "type": "object",
+            "required": ["files"],
+            "properties": {
+                "files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["name", "fs_path", "role", "exists"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "fs_path": {"type": "string"},
+                            "role": {"type": "string"},
+                            "exists": {"type": "boolean"},
+                        },
+                    },
+                },
+            },
+        },
+        source=PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+    )
+
+
+def test_custom_bare_payload_preserves_submitted_file_role_and_exists() -> None:
+    schema = _files_role_exists_schema()
+    raw = {
+        "files": [
+            {
+                "name": "lyrics.txt",
+                "fs_path": "Workspaces/_by_id/ws/documents/lyrics.txt",
+                "role": "lyrics",
+                "exists": True,
+            }
+        ]
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["files"][0]["role"] == "lyrics"
+    assert coerced["files"][0]["exists"] is True
+    assert coerced["files"][0]["fs_path"] == "Workspaces/_by_id/ws/documents/lyrics.txt"
+
+
+def test_custom_bare_payload_fills_exists_true_when_path_present() -> None:
+    schema = _files_role_exists_schema()
+    raw = {
+        "files": [
+            {
+                "name": "lyrics.txt",
+                "fs_path": "Workspaces/_by_id/ws/documents/lyrics.txt",
+                "role": "lyrics",
+            }
+        ]
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["files"][0]["exists"] is True
+    assert coerced["files"][0]["role"] == "lyrics"
+
+
+def test_custom_bare_payload_keeps_submitted_exists_false() -> None:
+    schema = _files_role_exists_schema()
+    raw = {
+        "files": [
+            {
+                "name": "missing.txt",
+                "fs_path": "Workspaces/_by_id/ws/documents/missing.txt",
+                "role": "lyrics",
+                "exists": False,
+            }
+        ]
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["files"][0]["exists"] is False
+    assert coerced["files"][0]["role"] == "lyrics"
+
+
+def test_custom_bare_payload_does_not_invent_file_role() -> None:
+    schema = _files_role_exists_schema()
+    raw = {
+        "files": [
+            {
+                "name": "lyrics.txt",
+                "fs_path": "Workspaces/_by_id/ws/documents/lyrics.txt",
+            }
+        ]
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    with pytest.raises(SchemaError):
+        validate_step_output(_step(schema), coerced)
+    assert "role" not in coerced["files"][0]
+    assert coerced["files"][0]["exists"] is True
+    assert coerced["files"][0]["fs_path"] == "Workspaces/_by_id/ws/documents/lyrics.txt"
+
+
+def test_custom_bare_payload_does_not_invent_files_from_summary() -> None:
+    schema = plan_output_contract_schema(
+        {
+            "type": "object",
+            "required": ["summary"],
+            "properties": {
+                "summary": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        source=PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+    )
+    raw = {
+        "summary": "Saved Workspaces/demo/documents/report.md for the operator.",
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert "files" not in coerced
+    assert coerced["summary"] == raw["summary"]
+
+
 def test_coerce_required_fs_path_from_path_alias() -> None:
     schema = {
         "type": "object",
@@ -592,6 +821,39 @@ def test_coerce_files_items_project_url_alias_to_required_file_url() -> None:
 
     validate_step_output(_step(schema), coerced)
     assert coerced["files"][0]["file_url"] == "https://cdn.example.com/generated.png"
+
+
+def test_coerce_files_items_drop_url_only_when_path_items_remain() -> None:
+    schema = {
+        "type": "object",
+        "required": ["files"],
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["name", "fs_path"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "fs_path": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+    raw = {
+        "files": [
+            {"name": "handoff.md", "path": "Workspaces/demo/documents/handoff.md"},
+            {"type": "url", "source": "url", "url": "https://support.example.com/article.json"},
+        ],
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert [file["fs_path"] for file in coerced["files"]] == [
+        "Workspaces/demo/documents/handoff.md",
+    ]
 
 
 def test_coerce_files_items_required_fs_path_does_not_use_url_alias() -> None:
@@ -924,3 +1186,43 @@ def test_coerce_linkedin_publish_requires_real_evidence() -> None:
 
     with pytest.raises(SchemaError):
         validate_step_output(_step(schema), coerced)
+
+
+
+def test_canonical_artifact_result_drops_document_id_only_when_path_item_remains() -> None:
+    schema = plan_output_contract_schema(get_shape("ArtifactResult").json_schema())
+    complete = {
+        "name": "handoff.md",
+        "fs_path": "Workspaces/_by_id/ws/documents/handoff.md",
+    }
+    raw = {
+        "files": [
+            complete,
+            {
+                "type": "document_id",
+                "source": "document_id",
+                "document_id": "01DOCIDONLY000000000000001",
+            },
+        ]
+    }
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    validate_step_output(_step(schema), coerced)
+    assert coerced["files"] == [complete]
+
+
+def test_canonical_artifact_result_keeps_document_id_only_when_nothing_satisfies() -> None:
+    schema = plan_output_contract_schema(get_shape("ArtifactResult").json_schema())
+    extra = {
+        "type": "document_id",
+        "source": "document_id",
+        "document_id": "01DOCIDONLY000000000000001",
+    }
+    raw = {"files": [extra]}
+
+    coerced = coerce_step_output_for_schema(schema, raw)
+
+    with pytest.raises(SchemaError):
+        validate_step_output(_step(schema), coerced)
+    assert coerced["files"] == [extra]

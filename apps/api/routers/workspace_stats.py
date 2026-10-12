@@ -49,6 +49,7 @@ class StatCreateRequest(BaseModel):
 
 
 class StatUpdateRequest(BaseModel):
+    collector_type: Optional[str] = None
     name: Optional[str] = None
     description: Optional[str] = None
     unit: Optional[str] = None
@@ -78,9 +79,15 @@ class StatQuickViewResponse(StatQuickViewRequest):
 def _freshness_status(stat: WorkspaceStat) -> str:
     if stat.status != "active":
         return stat.status
+    if stat.collector_type == "agent_review" and (stat.last_assessment or {}).get("collector_revision") != stat.revision:
+        return "not_assessed"
     if stat.last_collection_status == "error":
         return "collection_error"
+    if stat.last_collection_status == "insufficient_evidence":
+        return "insufficient_evidence"
     if stat.current_value_updated_at is None:
+        if stat.collector_type == "agent_review":
+            return "not_assessed"
         return "no_data"
     if stat.freshness_limit_seconds:
         updated = stat.current_value_updated_at
@@ -114,6 +121,7 @@ def _stat_payload(stat: WorkspaceStat) -> dict[str, Any]:
         "current_value_updated_at": stat.current_value_updated_at,
         "last_collection_status": stat.last_collection_status,
         "last_collection_error": stat.last_collection_error,
+        "last_assessment": stat.last_assessment,
         "freshness_status": _freshness_status(stat),
         "revision": stat.revision,
         "created_at": stat.created_at,
@@ -125,7 +133,7 @@ def _observation_payload(row: WorkspaceStatObservation) -> dict[str, Any]:
     return {
         "id": row.id,
         "stat_id": row.stat_id,
-        "value": float(row.value),
+        "value": float(row.value) if row.value is not None else None,
         "observed_at": row.observed_at,
         "window_start": row.window_start,
         "window_end": row.window_end,
@@ -299,7 +307,56 @@ async def list_workspace_stats(
 ):
     await require_workspace_readable(db, user, workspace_id)
     rows = await stat_service.list_stats(db, entity_id=user.entity_id, workspace_id=workspace_id)
-    return {"items": [_stat_payload(row) for row in rows]}
+    items = [_stat_payload(row) for row in rows]
+    await _attach_assessment_runtime(db, items, user.entity_id, workspace_id)
+    return {"items": items}
+
+
+async def _attach_assessment_runtime(db, items, entity_id, workspace_id):
+    """Derive progress from the owning Workflow, never from answer text."""
+    from packages.core.models.workflow import WorkflowBinding, WorkflowRun
+    from packages.core.models.scheduler import ScheduledJob
+
+    assessed = [item for item in items if item["collector_type"] == "agent_review"]
+    if not assessed:
+        return
+    bindings = (await db.execute(select(WorkflowBinding).where(
+        WorkflowBinding.entity_id == entity_id, WorkflowBinding.workspace_id == workspace_id,
+    ))).scalars().all()
+    jobs = (await db.execute(select(ScheduledJob).where(
+        ScheduledJob.entity_id == entity_id, ScheduledJob.workspace_id == workspace_id,
+        ScheduledJob.execution_type == "workflow",
+    ))).scalars().all()
+    runs = (await db.execute(select(WorkflowRun).where(
+        WorkflowRun.entity_id == entity_id, WorkflowRun.workspace_id == workspace_id,
+        WorkflowRun.binding_id.in_([binding.id for binding in bindings]),
+    ).distinct(WorkflowRun.binding_id).order_by(WorkflowRun.binding_id, WorkflowRun.created_at.desc()))).scalars().all()
+    for item in assessed:
+        matches = [binding for binding in bindings if (binding.config or {}).get("workspace_blueprint_workflow_slug") == item["collector_config"].get("workflow_slug")]
+        phase = "configuration_error"
+        if len(matches) == 1:
+            binding = matches[0]
+            schedules = [job for job in jobs if (job.execution_target or {}).get("binding_id") == binding.id]
+            run = next((run for run in runs if run.binding_id == binding.id), None)
+            if len(schedules) == 1:
+                phase = item["freshness_status"]
+                if not binding.enabled or binding.status != "active" or not schedules[0].enabled:
+                    phase = "paused"
+                elif run and run.status == "paused":
+                    phase = "paused"
+                elif run and run.status in {"pending", "running"}:
+                    phase = "assessing"
+                elif run and run.status in {"failed", "cancelled"}:
+                    phase = "assessment_error"
+                if phase != "paused" and schedules[0].enabled and schedules[0].last_status in {"failed", "error"} and (
+                    run is None or (schedules[0].last_run_at and schedules[0].last_run_at > run.created_at)
+                ):
+                    phase = "assessment_error"
+                item["assessment_runtime"] = {"workflow_id": binding.workflow_id,
+                    "binding_id": binding.id, "run_id": run.id if run else None,
+                    "run_status": run.status if run else None, "next_run_at": schedules[0].next_run_at}
+        if item["status"] == "active":
+            item["freshness_status"] = phase
 
 
 @router.post("/{workspace_id}/stats", status_code=201)

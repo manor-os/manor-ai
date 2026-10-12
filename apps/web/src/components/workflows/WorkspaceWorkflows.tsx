@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../../lib/api";
 import { formatDateLong, relativeTime } from "../../lib/format";
 import { t } from "../../lib/i18n";
+import { workflowPath, workflowRunPath } from "../../lib/workflowRoutes";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
 import { useToastStore } from "../../stores/toast";
+import { workflowRunInputs } from "../../lib/workflowRunInputs";
 import { IconClock, IconFlow, IconPlay, IconStop, IconTrash } from "../icons";
 import Button from "../ui/Button";
 import CompactCard from "../ui/CompactCard";
@@ -17,7 +19,7 @@ import Modal from "../ui/Modal";
 import PageHeader, { PageHeaderAddButton } from "../ui/PageHeader";
 import Select from "../ui/Select";
 import TabSwitcher from "../ui/TabSwitcher";
-import WorkflowRunDetail from "./WorkflowRunDetail";
+import WorkflowRunInputModal from "./WorkflowRunInputModal";
 import {
   canCancelWorkflowRun,
   formatWorkflowDuration,
@@ -40,6 +42,7 @@ interface WorkflowSummary {
   trigger_type?: string;
   version?: number;
   steps?: WorkflowHistoryNode[];
+  variables?: Record<string, unknown>;
 }
 
 function isOperatorBinding(binding: WorkflowBinding): boolean {
@@ -71,6 +74,7 @@ function runDuration(run?: WorkflowHistoryRun): string | null {
 
 export default function WorkspaceWorkflows({ workspaceId, canManage = false }: WorkspaceWorkflowsProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const queryClient = useQueryClient();
   const toast = useToastStore();
@@ -78,13 +82,16 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
   const [selectedWorkflowId, setSelectedWorkflowId] = useState("");
   const [detachTarget, setDetachTarget] = useState<WorkflowBinding | null>(null);
   const [cancelTarget, setCancelTarget] = useState<WorkflowHistoryRun | null>(null);
+  const [runInputBinding, setRunInputBinding] = useState<WorkflowBinding | null>(null);
   const requestedWorkflowView = searchParams.get("workflow_view");
   const requestedRunId = searchParams.get("workflow_run") || "";
   const [section, setSection] = useState<"attached" | "history">(
     requestedWorkflowView === "history" || requestedRunId ? "history" : "attached",
   );
-  const [selectedRunId, setSelectedRunId] = useState(requestedRunId);
-  const historyRowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const historyParams = new URLSearchParams(searchParams);
+  historyParams.set("workflow_view", "history");
+  historyParams.delete("workflow_run");
+  const historyReturnTo = `${location.pathname}?${historyParams}${location.hash}`;
 
   const bindingsKey = useMemo(() => ["workflow-bindings", workspaceId], [workspaceId]);
   const runsKey = useMemo(() => ["workspace-workflow-runs", workspaceId], [workspaceId]);
@@ -180,11 +187,12 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
     onError: (error) => toast.error(translateApiError(error, "Failed to detach workflow")),
   });
   const runMutation = useMutation({
-    mutationFn: (bindingId: string) => api.workflows.runBinding(bindingId, {
+    mutationFn: ({ bindingId, triggerData = {} }: { bindingId: string; triggerData?: Record<string, unknown> }) => api.workflows.runBinding(bindingId, {
       execute: false,
-      trigger_data: { workspace_manual: true },
+      trigger_data: { ...triggerData, workspace_manual: true },
     }),
     onSuccess: (run: WorkflowHistoryRun) => {
+      setRunInputBinding(null);
       queryClient.setQueryData<WorkflowHistoryRun[]>(runsKey, (current = []) => [
         run,
         ...current.filter((item) => item.id !== run.id),
@@ -197,6 +205,15 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
       translateApiError(error, "The workflow service is unavailable. Refresh and try again."),
     ),
   });
+  const requestWorkflowRun = (binding: WorkflowBinding) => {
+    const workflow = workflowById.get(binding.workflow_id);
+    if (!workflow) return;
+    if (workflowRunInputs(workflow).length) {
+      setRunInputBinding(binding);
+      return;
+    }
+    runMutation.mutate({ bindingId: binding.id });
+  };
   const cancelMutation = useMutation({
     mutationFn: (runId: string) => api.workflows.cancelRun(runId),
     onSuccess: async (_result, runId) => {
@@ -218,34 +235,35 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
   useEffect(() => {
     const hasHistoryLocation = requestedWorkflowView === "history" || Boolean(requestedRunId);
     setSection(hasHistoryLocation ? "history" : "attached");
-    setSelectedRunId(hasHistoryLocation ? requestedRunId : "");
   }, [requestedRunId, requestedWorkflowView]);
+  useEffect(() => {
+    if (requestedRunId) {
+      const remaining = new URLSearchParams(searchParams);
+      remaining.delete("tab");
+      remaining.delete("workflow_view");
+      remaining.delete("workflow_run");
+      navigate(workflowRunPath("", requestedRunId, workspaceId) + `${remaining.size ? `?${remaining}` : ""}${location.hash}`, {
+        replace: true,
+        state: { ...location.state,
+          returnTo: location.state?.returnTo || location.state?.chatReturnTo || historyReturnTo,
+          returnState: location.state?.returnState ?? location.state },
+      });
+    }
+  }, [requestedRunId, workspaceId, navigate, historyReturnTo, searchParams, location.hash, location.state]);
 
-  const updateHistoryLocation = (nextSection: "attached" | "history", runId = "") => {
+  const updateHistoryLocation = (nextSection: "attached" | "history") => {
     const next = new URLSearchParams(searchParams);
     if (nextSection === "history") next.set("workflow_view", "history");
     else next.delete("workflow_view");
-    if (nextSection === "history" && runId) next.set("workflow_run", runId);
-    else next.delete("workflow_run");
-    setSearchParams(next, { replace: true });
+    next.delete("workflow_run");
+    setSearchParams(next, { replace: true, state: location.state });
   };
-  const openHistoryRun = (runId: string) => {
-    setSection("history");
-    setSelectedRunId(runId);
-    updateHistoryLocation("history", runId);
+  const openHistoryRun = (run: WorkflowHistoryRun) => {
+    navigate(workflowRunPath(run.workflow_id || "", run.id, workspaceId), {
+      state: { returnTo: historyReturnTo, returnState: location.state },
+    });
   };
   const isLoading = workflowsLoading || bindingsLoading;
-  const selectedRun = historyRuns.find((run) => run.id === selectedRunId);
-  const selectedRunWorkflow = selectedRun?.workflow_id
-    ? workflowById.get(selectedRun.workflow_id)
-    : undefined;
-
-  const showHistoryList = () => {
-    const previousRunId = selectedRunId;
-    setSelectedRunId("");
-    updateHistoryLocation("history");
-    window.requestAnimationFrame(() => historyRowRefs.current.get(previousRunId)?.focus());
-  };
   const requestRunCancellation = (run: WorkflowHistoryRun) => {
     cancelMutation.reset();
     setCancelTarget(run);
@@ -266,7 +284,6 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
           value={section}
           onChange={(nextSection) => {
             setSection(nextSection as "attached" | "history");
-            setSelectedRunId("");
             updateHistoryLocation(nextSection as "attached" | "history");
           }}
           tabs={[
@@ -300,7 +317,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
                 <CompactCard
                   key={binding.id}
                   className="workspace-workflow-card"
-                  onClick={() => navigate(`/flows?workflow=${encodeURIComponent(binding.workflow_id)}`)}
+                  onClick={() => navigate(workflowPath(binding.workflow_id))}
                   icon={<IconTile size={36}><IconFlow size={18} /></IconTile>}
                   title={formatUserFacingText(binding.name || workflow?.name || "Workspace workflow")}
                   subtitle={String(lastRun?.error || workflow?.description || (runsUnavailable ? "Run history unavailable" : runLabel))}
@@ -314,9 +331,9 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
                         <Button
                           variant="ghost"
                           size="sm"
-                          loading={running || (runMutation.isPending && runMutation.variables === binding.id)}
-                          disabled={!canManage || !binding.enabled || binding.status !== "active"}
-                          onClick={() => runMutation.mutate(binding.id)}
+                          loading={running || (runMutation.isPending && runMutation.variables?.bindingId === binding.id)}
+                          disabled={!canManage || !workflow || !["active", "paused"].includes(binding.status)}
+                          onClick={() => requestWorkflowRun(binding)}
                           ariaLabel={`Run ${binding.name || workflow?.name || "workflow"}`}
                           title="Run in this workspace"
                           style={{ width: 30, padding: 0 }}
@@ -338,16 +355,6 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
             })}
           </div>
         )
-      ) : selectedRunId ? (
-        <WorkflowRunDetail
-          runId={selectedRunId}
-          workspaceId={workspaceId}
-          workflow={selectedRunWorkflow}
-          onBack={showHistoryList}
-          onSelectRun={openHistoryRun}
-          onRequestCancel={requestRunCancellation}
-          cancellingRunId={cancelMutation.isPending ? cancelTarget?.id : undefined}
-        />
       ) : runsLoading || workflowsLoading ? (
         <div className="workspace-workflows-loading" aria-live="polite">
           <LoadingSpinner size={24} />
@@ -396,11 +403,7 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
                 <button
                   type="button"
                   className="workflow-run-history-row-main"
-                  ref={(node) => {
-                    if (node) historyRowRefs.current.set(run.id, node);
-                    else historyRowRefs.current.delete(run.id);
-                  }}
-                  onClick={() => openHistoryRun(run.id)}
+                  onClick={() => openHistoryRun(run)}
                 >
                   <span className="workflow-run-history-row-identity">
                     <IconTile size={34}><IconFlow size={17} /></IconTile>
@@ -464,6 +467,18 @@ export default function WorkspaceWorkflows({ workspaceId, canManage = false }: W
           })}
         </div>
       )}
+
+      <WorkflowRunInputModal
+        flow={runInputBinding ? workflowById.get(runInputBinding.workflow_id) || null : null}
+        workspaceId={workspaceId}
+        busy={runMutation.isPending}
+        onClose={() => { if (!runMutation.isPending) setRunInputBinding(null); }}
+        onSubmit={async (triggerData) => {
+          if (runInputBinding && !runMutation.isPending) {
+            await runMutation.mutateAsync({ bindingId: runInputBinding.id, triggerData });
+          }
+        }}
+      />
 
       <Modal
         open={attachOpen}

@@ -1,27 +1,20 @@
 import { t } from "./i18n";
-
-export type GovernanceRuleField = "hitl_required_actions" | "never_allow_actions";
-export type GovernanceCapabilityField = "hitl_required_capabilities" | "never_allow_capabilities";
+import type { ApprovalSelector } from "./approvalTypes";
 
 export type RuntimeRuleTone = "orange" | "red";
-
 export interface RuntimeRuleInference {
-  field: GovernanceRuleField;
-  patterns: string[];
-  capabilityField: GovernanceCapabilityField;
-  capabilityPatterns: string[];
-  rule_type: "approval_required" | "deny" | "draft_only";
+  effect: "ask" | "deny";
+  selectors: ApprovalSelector[];
+  rule_type: "approval_required" | "deny" | "guidance";
   label: string;
   tone: RuntimeRuleTone;
 }
-
 export interface RuntimeRuleDraft {
   rule_key: string;
   rule_type: RuntimeRuleInference["rule_type"];
   description: string;
   severity: "medium" | "high";
-  action_patterns: string[];
-  capability_patterns: string[];
+  approval_selectors: ApprovalSelector[];
   source: string;
   enabled: boolean;
 }
@@ -38,137 +31,81 @@ const EXTERNAL_RE = /对外|external|public|公开|发送|send|publish|发布/;
 const APPROVAL_RE = /审核|审批|批准|同意|确认|给用户|用户同意|人工|human|review|approve|approval|consent|confirm|permission/;
 const DENY_RE = /禁止|不要|不得|不准|不允许|不能|never|deny|block|don't|do not/;
 const DRAFT_ONLY_RE = /只生成草稿|草稿|draft[- ]?only|draft only/;
-const BROAD_SCOPE_RE = /任何|所有|全部|每次|每一步|all|any action|everything|always/;
+const BROAD_SCOPE_RE = /任何|所有|全部|每次|每一步|\ball\b|any action|everything|always/;
+const CATEGORIES = ["read", "browser", "files", "communication", "publishing", "deletion", "purchases", "automation", "workspace", "unknown"];
 
 export function uniqueActionPatterns(values: string[]): string[] {
-  return Array.from(new Set(values.map((v) => String(v || "").trim()).filter(Boolean)));
+  return Array.from(new Set(values.map((value) => String(value || "").trim()).filter(Boolean)));
 }
 
-export function runtimeCapabilityForActionPattern(pattern: string): string | null {
-  const key = String(pattern || "").trim();
-  if (!key) return null;
-  if (key.startsWith("workspace.task.")) return "workspace.task";
-  if (key.startsWith("workspace.knowledge.")) return "workspace.knowledge";
-  if (key.startsWith("workspace.rule.") || key.startsWith("workspace.strategist.") || key.startsWith("workspace.operation.")) return "workspace.governance";
-  if (key.startsWith("workspace.file.")) return "file.write";
-  if (key.startsWith("workspace.automation.")) return "automation.manage";
-  if (key.startsWith("sandbox.")) return "sandbox.execute";
-  if (key.startsWith("social_post.")) return "external.social";
-  if (key.startsWith("email.")) return "external.email";
-  if (key.startsWith("external_message.") || key === "channel.reply") return "external.message";
-  if (key === "cli.exec") return "cli.execute";
-  if (key.startsWith("workspace.")) return "manor.composite";
-  return null;
-}
-
-export function runtimeCapabilitiesForActionPatterns(patterns: string[]): string[] {
-  return uniqueActionPatterns(
-    patterns
-      .map((pattern) => runtimeCapabilityForActionPattern(pattern))
-      .filter((pattern): pattern is string => Boolean(pattern)),
-  );
-}
-
-export function inferRuntimeActionPatterns(text: string, explicitPatterns: string[] = []): string[] {
+export function shouldReviewAllActions(text: string): boolean {
   const lower = text.toLowerCase();
-  const patterns: string[] = [...explicitPatterns];
+  return BROAD_SCOPE_RE.test(lower) && (APPROVAL_RE.test(lower) || DENY_RE.test(lower));
+}
+
+export function inferRuntimeRuleFromText(text: string, includeAllActions = shouldReviewAllActions(text)): RuntimeRuleInference {
+  const lower = text.toLowerCase();
   const fileish = FILEISH_RE.test(lower);
   const createOnly = CREATE_ONLY_RE.test(lower);
-
-  if (patterns.length === 0 && fileish) {
+  const isBlock = (DENY_RE.test(lower) || createOnly) && !APPROVAL_RE.test(lower);
+  const selectors: ApprovalSelector[] = [];
+  const action = (action_key: string) => selectors.push({ kind: "action", action_key });
+  const category = (category: string) => selectors.push({ kind: "category", category });
+  if (fileish) {
     if (createOnly) {
-      patterns.push("workspace.file.modify", "workspace.file.delete", "workspace.file.write");
+      action("workspace.file.modify");
+      action("workspace.file.delete");
     } else {
-      if (MODIFY_RE.test(lower)) patterns.push("workspace.file.modify");
-      if (DELETE_RE.test(lower)) patterns.push("workspace.file.delete");
-      if (CREATE_RE.test(lower)) patterns.push("workspace.file.create");
+      if (MODIFY_RE.test(lower)) action("workspace.file.modify");
+      if (DELETE_RE.test(lower)) action("workspace.file.delete");
+      if (CREATE_RE.test(lower)) action("workspace.file.create");
+      if (!selectors.length) { category("files"); category("deletion"); }
     }
   }
-
-  if (patterns.length === 0 || SOCIAL_RE.test(lower)) {
-    if (SOCIAL_RE.test(lower)) patterns.push("social_post.publish");
+  if (SOCIAL_RE.test(lower)) category("publishing");
+  if (EMAIL_RE.test(lower) || MESSAGE_RE.test(lower)) category("communication");
+  if (!selectors.length && (EXTERNAL_RE.test(lower) || DRAFT_ONLY_RE.test(lower))) {
+    category("publishing"); category("communication");
   }
-  if (patterns.length === 0 || EMAIL_RE.test(lower)) {
-    if (EMAIL_RE.test(lower)) patterns.push("email.send");
-  }
-  if (patterns.length === 0 || MESSAGE_RE.test(lower)) {
-    if (MESSAGE_RE.test(lower)) patterns.push("external_message.send");
-  }
-
-  if ((EXTERNAL_RE.test(lower) || DRAFT_ONLY_RE.test(lower)) && patterns.length === 0) {
-    patterns.push("social_post.publish", "email.send", "external_message.send");
-  }
-  if (DELETE_RE.test(lower) && (!fileish || SOCIAL_RE.test(lower) || EMAIL_RE.test(lower) || MESSAGE_RE.test(lower) || EXTERNAL_RE.test(lower))) {
-    patterns.push("social_post.delete", "email.delete");
-  }
-
-  return uniqueActionPatterns(patterns);
-}
-
-export function inferRuntimeRuleFromText(text: string, fallbackToWildcard = true): RuntimeRuleInference {
-  const lower = text.toLowerCase();
-  const createOnly = CREATE_ONLY_RE.test(lower);
-  const draftOnly = DRAFT_ONLY_RE.test(lower);
-  const denyish = DENY_RE.test(lower) || createOnly || draftOnly;
-  const approvalish = APPROVAL_RE.test(lower);
-  const patterns = inferRuntimeActionPatterns(text);
-  const effectivePatterns = uniqueActionPatterns(patterns.length > 0 ? patterns : (fallbackToWildcard ? ["*"] : []));
-  const isBlock = denyish && !approvalish;
-  const capabilityPatterns = runtimeCapabilitiesForActionPatterns(effectivePatterns);
-
+  if (DELETE_RE.test(lower) && !fileish) category("deletion");
+  // A broad request is represented by the policy's explicit categories. An
+  // unrecognized sentence remains guidance instead of inventing a wildcard.
+  if (!selectors.length && includeAllActions) CATEGORIES.forEach(category);
+  const unique = selectors.filter((selector, index) => selectors.findIndex(
+    (other) => JSON.stringify(other) === JSON.stringify(selector),
+  ) === index);
   return {
-    field: isBlock ? "never_allow_actions" : "hitl_required_actions",
-    patterns: effectivePatterns,
-    capabilityField: isBlock ? "never_allow_capabilities" : "hitl_required_capabilities",
-    capabilityPatterns,
-    rule_type: draftOnly ? "draft_only" : isBlock ? "deny" : "approval_required",
-    label: isBlock ? "Runtime block" : "Approval gate",
+    effect: isBlock ? "deny" : "ask", selectors: unique,
+    rule_type: unique.length ? (isBlock ? "deny" : "approval_required") : "guidance",
+    label: isBlock ? t("lib.runtime_rules.runtime_block") : t("lib.runtime_rules.approval_gate"),
     tone: isBlock ? "red" : "orange",
   };
 }
 
-export function shouldFallbackToWildcardRule(text: string): boolean {
-  const lower = text.toLowerCase();
-  return BROAD_SCOPE_RE.test(lower) && (APPROVAL_RE.test(lower) || DENY_RE.test(lower));
+export const HARD_BLOCK_RULE_TYPES = ["draft_only", "deny", "never_allow", "block"] as const;
+export function isHardBlockRuleType(ruleType: unknown): boolean {
+  return (HARD_BLOCK_RULE_TYPES as readonly string[]).includes(String(ruleType || "").trim().toLowerCase());
+}
+
+/** Only edit the source; the service recompiles derived rules atomically. */
+export function softenHardBlockRule(rule: any): any {
+  const next = { ...rule, rule_type: "approval_required", severity: rule?.severity === "high" ? "medium" : rule?.severity };
+  delete next.runtime_enforced;
+  return next;
 }
 
 export function buildRuntimeRuleFromText(text: string, source = "operator", keyPrefix = "operator"): RuntimeRuleDraft {
   const inferred = inferRuntimeRuleFromText(text);
   return {
-    rule_key: `${keyPrefix}_${Date.now()}`,
-    rule_type: inferred.rule_type,
-    description: text,
-    severity: inferred.field === "never_allow_actions" ? "high" : "medium",
-    action_patterns: inferred.patterns,
-    capability_patterns: inferred.capabilityPatterns,
-    source,
-    enabled: true,
+    rule_key: `${keyPrefix}_${Date.now()}`, rule_type: inferred.rule_type,
+    description: text, severity: inferred.effect === "deny" ? "high" : "medium",
+    approval_selectors: inferred.selectors, source, enabled: true,
   };
 }
 
-export function inferRuntimeRuleEnforcement(rule: any): {
-  label: RuntimeRuleInference["label"];
-  tone: RuntimeRuleTone;
-  patterns: string[];
-  capabilityPatterns: string[];
-} | null {
-  const text = String(`${rule?.description || ""} ${rule?.rule_key || ""} ${rule?.scope || ""}`);
-  const explicit = Array.isArray(rule?.action_patterns) ? uniqueActionPatterns(rule.action_patterns) : [];
-  const explicitCapabilities = Array.isArray(rule?.capability_patterns) ? uniqueActionPatterns(rule.capability_patterns) : [];
-  const patterns = inferRuntimeActionPatterns(text, explicit);
-  const capabilityPatterns = explicitCapabilities.length > 0 ? explicitCapabilities : runtimeCapabilitiesForActionPatterns(patterns);
-  if (patterns.length === 0 && capabilityPatterns.length === 0) return null;
-
-  const lower = text.toLowerCase();
-  const ruleType = String(rule?.rule_type || "").toLowerCase();
-  const approvalish = APPROVAL_RE.test(lower);
-  const denyish = DENY_RE.test(lower) || DRAFT_ONLY_RE.test(lower) || CREATE_ONLY_RE.test(lower);
-
-  if (["approval_required", "hitl_required", "require_approval", "review_required"].includes(ruleType) || approvalish) {
-    return { label: t("lib.runtime_rules.approval_gate"), tone: "orange", patterns, capabilityPatterns };
-  }
-  if (["deny", "never_allow", "block", "draft_only"].includes(ruleType) || denyish || rule?.severity === "block" || rule?.severity === "deny") {
-    return { label: t("lib.runtime_rules.runtime_block"), tone: "red", patterns, capabilityPatterns };
-  }
-  return null;
+export function runtimeRuleSelectorLabels(rule: any): string[] {
+  const selectors: ApprovalSelector[] = Array.isArray(rule?.approval_selectors) ? rule.approval_selectors : [];
+  return selectors.map((selector) => selector.kind === "category"
+    ? t(`approval_settings.category.${selector.category}`)
+    : selector.kind === "resource" ? `${selector.action_key}: ${selector.resource_ids.join(", ")}` : selector.action_key);
 }

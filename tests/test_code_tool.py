@@ -67,3 +67,61 @@ def test_code_child_path_cannot_escape_cwd(tmp_path):
 
     with pytest.raises(ValueError, match="inside the coding workspace"):
         CodePathFactory.resolve(str(tmp_path), "../../../etc/hosts")
+
+
+_RUNTIME_CONTEXT = {"_user_id_from_context": "user-1"}
+
+
+async def _runtime_executable(action: str) -> bool:
+    payload = json.loads(await _code_handler(
+        entity_id="test-entity",
+        action=action,
+        params={},
+        **_RUNTIME_CONTEXT,
+    ))
+    return payload.get("error") != "code_action_requires_sandbox"
+
+
+@pytest.mark.asyncio
+async def test_runtime_search_lists_only_runtime_executable_actions():
+    listing = json.loads(await _code_handler(
+        entity_id="test-entity", action="search", **_RUNTIME_CONTEXT,
+    ))
+    listed = {name for names in listing["categories"].values() for name in names}
+    assert listed, "runtime search must still list the executable actions"
+    assert listing["total_actions"] == len(listed)
+
+    matched: set[str] = set()
+    for query in ("git", "test", "branch", "dashboard", "refactor", "notebook", "plan"):
+        found = json.loads(await _code_handler(
+            entity_id="test-entity", action="search", query=query, **_RUNTIME_CONTEXT,
+        ))
+        matched.update(item["action"] for item in found["matches"])
+
+    for action in listed | matched:
+        assert await _runtime_executable(action), f"runtime search advertises {action!r}"
+
+
+@pytest.mark.asyncio
+async def test_runtime_search_guard_catches_an_unsafe_advertised_action(monkeypatch):
+    """Mutation check: widening the runtime surface must be visible to the guard."""
+    from packages.core.ai.tools import code_tool
+
+    monkeypatch.setattr(
+        code_tool,
+        "_visible_actions",
+        lambda runtime_invocation: code_tool._ALL_ACTIONS,
+    )
+    found = json.loads(await _code_handler(
+        entity_id="test-entity", action="search", query="git", **_RUNTIME_CONTEXT,
+    ))
+    advertised = [item["action"] for item in found["matches"]]
+    assert advertised
+    assert not all([await _runtime_executable(action) for action in advertised])
+
+
+def test_code_schema_description_only_promises_runtime_actions():
+    description = CODE_SCHEMA["function"]["description"]
+    assert "dashboard_module_validate" in description
+    for promised in ("refactors", "LSP", "notebooks", "monitors"):
+        assert promised not in description

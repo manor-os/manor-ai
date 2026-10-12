@@ -1,3 +1,4 @@
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useState, useEffect, useMemo, useRef, type MouseEvent as ReactMouseEvent } from "react";
 import { createPortal } from "react-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -28,20 +29,24 @@ import PriorityPill from "../components/ui/PriorityPill";
 import { STATUS_CONFIG } from "../components/ui/StatusPill";
 import { PRIORITY_CONFIG } from "../components/ui/PriorityPill";
 import { CATEGORIES } from "../lib/taskCategories";
-import { isApprovalTaskType, isInteractiveTaskType } from "../lib/taskTypes";
+import { TaskType, isApprovalTaskType, isInteractiveTaskType } from "../lib/taskTypes";
 import {
   canResumeLegacyAgentInput,
   hasPendingPlanDecision,
+  needsEffectReconciliation,
+  pendingTaskInputRequests,
   resumablePlanInputStep,
 } from "../lib/taskHitl";
 import CategoryChip from "../components/ui/CategoryChip";
 import TaskPropertiesPanel from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
+import { useTaskInputResolution } from "../components/task/useTaskInputResolution";
+import { currentTaskBlocker, taskBlockerFromLog } from "../lib/taskBlocker";
 import TaskExecutionTimeline from "../components/task/TaskExecutionTimeline";
 import ChatInputFooter, { type AttachedItem, type MentionOption } from "../components/ChatInputFooter";
 import { t } from "../lib/i18n";
-import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
+import { inferRuntimeRuleFromText, runtimeRuleSelectorLabels } from "../lib/runtimeRules";
 import { formatTaskDescriptionForDisplay, formatTaskOutputSummary, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
 import {
   dedupeGeneratedFileRecords,
@@ -245,26 +250,28 @@ function inputRequestPrompt(log: any): string {
 }
 
 function localizedRuntimeRuleDescription(rule: any): string {
-  const patterns = Array.isArray(rule.action_patterns) ? rule.action_patterns : [];
+  const selectors = Array.isArray(rule.approval_selectors) ? rule.approval_selectors : [];
+  const categories = selectors.filter((selector: any) => selector.kind === "category").map((selector: any) => selector.category);
+  const actions = selectors.filter((selector: any) => selector.kind === "action").map((selector: any) => selector.action_key);
   if (rule.source === "quick_action") {
     if (
       rule.rule_type === "approval_required"
-      && patterns.includes("social_post.publish")
-      && patterns.includes("email.send")
+      && categories.includes("publishing")
+      && categories.includes("communication")
     ) {
       return t("page.task_detail.runtime.quick_require_approval_description");
     }
     if (
       rule.rule_type === "draft_only"
-      && patterns.includes("social_post.publish")
-      && patterns.includes("email.send")
+      && categories.includes("publishing")
+      && categories.includes("communication")
     ) {
       return t("page.task_detail.runtime.quick_draft_only_description");
     }
     if (
       rule.rule_type === "deny"
-      && patterns.includes("workspace.file.modify")
-      && patterns.includes("workspace.file.delete")
+      && actions.includes("workspace.file.modify")
+      && actions.includes("workspace.file.delete")
     ) {
       return t("page.task_detail.runtime.quick_add_files_only_description");
     }
@@ -860,7 +867,7 @@ function TaskActionPanel({
 }
 
 /* ── Execution log (collapsible, compact) ── */
-function ExecutionLog({ logs }: { logs: any[] }) {
+function ExecutionLog({ logs, task }: { logs: any[]; task: Task }) {
   const [expanded, setExpanded] = useState(false);
   return (
     <div style={{ borderRadius: 16, border: "1px solid rgba(28,25,23,0.06)", background: "rgba(250,250,249,0.6)", overflow: "hidden" }}>
@@ -880,6 +887,9 @@ function ExecutionLog({ logs }: { logs: any[] }) {
       {expanded && (
         <div style={{ padding: "4px 16px 14px" }}>
           {logs.map((log: any, i: number) => {
+            if (taskBlockerFromLog(log, task)) return (
+              <TaskLogItem key={log.id || i} log={log} index={i} variant="compact" task={task} formatTime={relativeTime} />
+            );
             const lcfg = LOG_ICONS[log.log_type] || LOG_ICONS.ai_agent_turn;
             return (
               <div key={log.id || i} style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "6px 0", borderTop: i > 0 ? "1px solid rgba(231,229,228,0.25)" : "none" }}>
@@ -987,6 +997,7 @@ function TaskProvenanceBreadcrumb({
 }
 
 export default function TaskDetail() {
+  const catalogScope = useCatalogScope();
   const { taskId } = useParams<{ taskId: string }>();
   const navigate = useNavigate();
   const location = useLocation();
@@ -1027,6 +1038,7 @@ export default function TaskDetail() {
     enabled: !!taskId,
     refetchInterval: (query) => hasLiveTaskStatus(query.state.data) ? TASK_DETAIL_POLL_INTERVAL_MS : false,
   });
+  const inputResolution = useTaskInputResolution(task);
   const { data: taskConstants } = useQuery({ queryKey: ["task-constants"], queryFn: () => api.tasks.constants() });
   const {
     data: taskPlans = [],
@@ -1054,7 +1066,7 @@ export default function TaskDetail() {
     retry: false,
     staleTime: 60_000,
   });
-  const { data: agents = [] } = useQuery({ queryKey: ["agents"], queryFn: () => api.agents.list() });
+  const { data: agents = [] } = useQuery(agentListQueryOptions(catalogScope));
   const { data: workspaceAssignableAgents } = useQuery({
     queryKey: ["workspace-assignable-agents", task?.workspace_id],
     queryFn: () => api.workspaces.agents.assignable(task!.workspace_id!),
@@ -1542,18 +1554,18 @@ export default function TaskDetail() {
   const scfg = STATUS_CONFIG[task.status] || STATUS_CONFIG.pending;
   const terminalStatusLabel = t((STATUS_CONFIG[task.status] || STATUS_CONFIG.pending).labelKey);
   const isMaster = isMasterAgent(task.agent_id, task.agent_type);
-  const isAI = !!task.agent_id || isMaster;
+  const isAI = !!task.owner_agent_id || !!task.agent_id || isMaster;
   const ownerServiceLabel = humanizeServiceKey(task.owner_service_key);
   const isRuntimeOwner = Boolean(ownerServiceLabel && !task.agent_id && !task.assignee_id);
   const humanAssigneeLabel = friendlyPersonName(task.assignee_name
     || (task.assignee_id === currentUser?.id ? (currentUser?.display_name || currentUser?.email) : task.assignee_id), "");
   const humanAssigneeAvatarUrl = task.assignee_avatar
     || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null);
-  const assigneeLabel = friendlyPersonName(task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME
+  const assigneeLabel = friendlyPersonName(task.owner_agent_name || task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME
     : task.agent_id ? t("page.tasks.ai_agent")
     : task.assignee_id === currentUser?.id ? (currentUser?.display_name || currentUser?.email)
     : ownerServiceLabel || task.assignee_id), "");
-  const assigneeAvatarUrl = task.agent_avatar || task.assignee_avatar
+  const assigneeAvatarUrl = task.owner_agent_avatar || task.agent_avatar || task.assignee_avatar
     || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null);
   const sessionHostAvailable = task.session_host_available === true
     && Boolean(task.session_host_name);
@@ -1658,20 +1670,19 @@ export default function TaskDetail() {
   const addNaturalRuntimeRequirement = () => {
     const text = runtimeRulePrompt.trim();
     if (!text) return;
-    const inferred = inferRuntimeRuleFromText(text, shouldFallbackToWildcardRule(text));
+    const inferred = inferRuntimeRuleFromText(text);
     const patch: Record<string, any> = {
       instructions: appendRuntimeInstruction(runtimeContext.instructions, text),
     };
-    if (inferred.patterns.length > 0) {
+    if (inferred.selectors.length > 0) {
       patch.rules = [
         ...runtimeRules,
         {
           rule_key: `task_${Date.now()}`,
           rule_type: inferred.rule_type,
           description: text,
-          severity: inferred.field === "never_allow_actions" ? "high" : "medium",
-          action_patterns: inferred.patterns,
-          capability_patterns: inferred.capabilityPatterns,
+          severity: inferred.effect === "deny" ? "high" : "medium",
+          approval_selectors: inferred.selectors,
           source: "operator",
           enabled: true,
         },
@@ -1681,6 +1692,7 @@ export default function TaskDetail() {
     setRuntimeRulePrompt("");
   };
   const pendingPlanInputStep = resumablePlanInputStep(latestPlan, planSteps as any[]);
+  const pendingInputCards = pendingTaskInputRequests(task, latestPlan, planSteps);
   const canResumePendingInput = Boolean(pendingPlanInputStep)
     || canResumeLegacyAgentInput(task, latestPlan, plansResolved);
   const hasPendingTypedDecision = hasPendingPlanDecision(
@@ -1713,12 +1725,17 @@ export default function TaskDetail() {
   const pendingInputPrompt = String(pendingPlanInputStep?.human_input_prompt || "")
     || inputRequestPrompt(actionableInputRequest);
   const hasTaskRecoveryOrigin = Boolean(latestPlan)
+    || Boolean(currentTaskBlocker(task))
     || canResumePendingInput
     || (logs as any[]).some((log: any) => RECOVERY_EVENT_TYPES.has(log?.log_type));
   const showTaskRecoveryPanel = planDecisionStateResolved
     && hasTaskRecoveryOrigin
-    && !actionableInputRequest
-    && (!hasPendingTypedDecision || canResumePendingInput);
+    && (pendingInputCards.length > 0 || (
+      !actionableInputRequest && (!hasPendingTypedDecision || canResumePendingInput)
+    ));
+  const reviewEffectsHref = needsEffectReconciliation(task, latestPlan)
+    ? `/chat?workspace=${encodeURIComponent(task.workspace_id!)}`
+    : undefined;
   const submitActionReply = () => {
     submitHumanInputReply(hitlReply);
   };
@@ -1977,13 +1994,18 @@ export default function TaskDetail() {
           {showTaskRecoveryPanel && (
             <TaskRecoveryPanel
               key={`${task.id}:${task.status}`}
+              task={task}
               status={task.status}
               logs={logs}
               comment={newComment}
               detailReason={formatUserFacingStructuredText(taskOutputErrorMessage)}
               inputStepId={pendingPlanInputStep?.id}
               inputPrompt={String(pendingPlanInputStep?.human_input_prompt || "")}
-              isPending={retryMutation.isPending || hitlMutation.isPending || actionReplyCommentMutation.isPending}
+              inputRequests={pendingInputCards}
+              inputResetToken={inputResolution.resetToken}
+              onResolveInput={inputResolution.resolve}
+              reviewEffectsHref={reviewEffectsHref}
+              isPending={retryMutation.isPending || hitlMutation.isPending || actionReplyCommentMutation.isPending || inputResolution.isPending}
               onRetry={(note) => retryMutation.mutate(note)}
               onRespond={canResumePendingInput ? submitHumanInputReply : undefined}
             />
@@ -1992,7 +2014,7 @@ export default function TaskDetail() {
           <TaskActionPanel
             task={task}
             pendingInputPrompt={pendingInputPrompt}
-            hasPendingInput={!!actionableInputRequest}
+            hasPendingInput={pendingInputCards.length === 0 && !!actionableInputRequest}
             canResumePendingInput={canResumePendingInput}
             hitlReply={hitlReply}
             onHitlReplyChange={setHitlReply}
@@ -2214,7 +2236,7 @@ export default function TaskDetail() {
                     rule_type: "approval_required",
                     description: t("page.task_detail.runtime.quick_require_approval_description"),
                     severity: "medium",
-                    action_patterns: ["social_post.publish", "email.send", "external_message.send"],
+                    approval_selectors: [{ kind: "category", category: "publishing" }, { kind: "category", category: "communication" }],
                     source: "quick_action",
                   })}
                 >
@@ -2227,7 +2249,7 @@ export default function TaskDetail() {
                     rule_type: "draft_only",
                     description: t("page.task_detail.runtime.quick_draft_only_description"),
                     severity: "high",
-                    action_patterns: ["social_post.publish", "email.send", "external_message.send"],
+                    approval_selectors: [{ kind: "category", category: "publishing" }, { kind: "category", category: "communication" }],
                     source: "quick_action",
                   })}
                 >
@@ -2240,7 +2262,7 @@ export default function TaskDetail() {
                     rule_type: "deny",
                     description: t("page.task_detail.runtime.quick_add_files_only_description"),
                     severity: "high",
-                    action_patterns: ["workspace.file.modify", "workspace.file.delete", "workspace.file.write"],
+                    approval_selectors: [{ kind: "action", action_key: "workspace.file.modify" }, { kind: "action", action_key: "workspace.file.delete" }],
                     source: "quick_action",
                   })}
                 >
@@ -2253,11 +2275,8 @@ export default function TaskDetail() {
                     <div key={rule.rule_key || idx} style={{ display: "flex", alignItems: "flex-start", gap: 8, padding: "8px 10px", borderRadius: 10, background: "rgba(255,255,255,0.78)", border: "1px solid rgba(28,25,23,0.06)" }}>
                       <div style={{ flex: 1 }}>
                         <div style={{ fontSize: 12, fontWeight: 700, color: "#1c1917" }}>{localizedRuntimeRuleDescription(rule)}</div>
-                        {Array.isArray(rule.action_patterns) && (
-                          <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 2 }}>{rule.action_patterns.join(", ")}</div>
-                        )}
-                        {Array.isArray(rule.capability_patterns) && rule.capability_patterns.length > 0 && (
-                          <div style={{ fontSize: 11, color: "#78716c", marginTop: 2 }}>{rule.capability_patterns.join(", ")}</div>
+                        {runtimeRuleSelectorLabels(rule).length > 0 && (
+                          <div style={{ fontSize: 11, color: "#a8a29e", marginTop: 2 }}>{runtimeRuleSelectorLabels(rule).join(", ")}</div>
                         )}
                       </div>
                       <button
@@ -2290,7 +2309,7 @@ export default function TaskDetail() {
                     background: taskOutput.plan_status === "completed" ? "#e4efe8" : taskOutput.plan_status === "failed" ? "#f1dddb" : "#f5f5f4",
                     color: taskOutput.plan_status === "completed" ? "#3d7351" : taskOutput.plan_status === "failed" ? "#c14a44" : "#78716c",
                   }}>
-                    {t("page.task_detail.run_status_prefix")} {formatUserFacingLabel(taskOutput.plan_status)}
+                    {t("page.task_detail.run_status_prefix")} {taskStatusLabel(taskOutput.plan_status)}
                   </span>
                 )}
               </div>
@@ -2674,6 +2693,7 @@ export default function TaskDetail() {
                   size={32}
                 />
                 <ChatInputFooter
+                  attachments="documents"
                   value={newComment}
                   onChange={(next) => {
                     setNewComment(next);
@@ -2730,7 +2750,7 @@ export default function TaskDetail() {
 
           {/* ── Execution Log (collapsible, lower priority) ── */}
           {execLogs.length > 0 && (
-            <ExecutionLog logs={execLogs} />
+            <ExecutionLog logs={execLogs} task={task} />
           )}
             </>);
           })()}
@@ -2795,7 +2815,7 @@ export default function TaskDetail() {
                     { label: terminalStatusLabel, value: task.completed_at ? formatDateFull(task.completed_at) : null },
                     { label: t("page.task_detail.created_by"), value: creatorDisplayName },
                     { label: t("page.workspace_detail.service"), value: ownerServiceLabel },
-                    { label: t("page.custom_fields.type"), value: task.task_type ? formatUserFacingLabel(task.task_type) : null, capitalize: true },
+                    { label: t("page.custom_fields.type"), value: task.task_type === TaskType.GENERAL ? t("page.task_detail.type_general") : task.task_type ? formatUserFacingLabel(task.task_type) : null, capitalize: true },
                     { label: t("page.knowledge.workspace"), value: workspaceName },
                     { label: t("page.dashboard.estimated"), value: task.estimated_hours ? `${task.estimated_hours}h` : null },
                   ];

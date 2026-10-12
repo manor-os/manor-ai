@@ -92,6 +92,33 @@ _SIGNATURES: tuple[tuple[re.Pattern[str], ExecutionErrorHint], ...] = (
             is_transient=True,
         ),
     ),
+    # The same outage on the user's own (BYOK) route. Narrower than the entry
+    # below — its prose names the BYOK provider — so it sits ahead of it: the
+    # provider is theirs to check, and the sentence must say so. Keyed on the
+    # structured "HTTP <status> from <host>" detail the runtime emits for
+    # these failures (packages/core/ai/runtime/output_policy.py); a BYOK 401
+    # / 403 stays unmatched on purpose, exactly like the generic entry.
+    (
+        re.compile(
+            r"BYOK model provider returned an error"
+            r"[\s\S]{0,400}?"
+            r"\bHTTP (?:502|503|524) from\b",
+            re.I,
+        ),
+        ExecutionErrorHint(
+            what_happened=(
+                "Your own (BYOK) AI provider did not answer — it was "
+                "temporarily unavailable or took too long. Manor's settings "
+                "are not involved."
+            ),
+            action_to_take=(
+                "Manor already waited and tried again several times, and your "
+                "provider is still not answering. Check the provider's status "
+                "page, then run the step again later, or cancel it."
+            ),
+            is_transient=True,
+        ),
+    ),
     # The single most common real failure in production, and the one whose
     # own message is actively wrong. Every observed occurrence is an upstream
     # 503 / 524 / 502 — the provider was down or the gateway gave up waiting.

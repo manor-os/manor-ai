@@ -42,6 +42,8 @@ def runtime_document_to_dict(doc: Any, *, detail: str = "summary") -> dict[str, 
         "name": doc.name,
         "file_type": doc.file_type,
         "file_size": doc.file_size,
+        # FileRef contract: a Document's one outward address.
+        "open_url": viewer_url,
         "viewer_url": viewer_url,
         "markdown_link": runtime_document_markdown_link(
             getattr(doc, "name", None),
@@ -133,6 +135,78 @@ def _runtime_document_want_details(raw_params: dict[str, Any]) -> bool:
     }
 
 
+def _runtime_document_string_list(value: Any, *, maximum: int = 50) -> list[str]:
+    if value in (None, ""):
+        return []
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        raise ValueError("plural document filters must be arrays")
+    normalized: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+        if len(normalized) >= maximum:
+            break
+    return normalized
+
+
+def _runtime_document_optional_int(value: Any, field_name: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return parsed
+
+
+def _runtime_document_query_filters(
+    raw_params: dict[str, Any],
+    *,
+    workspace_id: str | None,
+) -> dict[str, Any]:
+    workspace_ids = _runtime_document_string_list(raw_params.get("workspace_ids"))
+    folder_ids = _runtime_document_string_list(raw_params.get("folder_ids"))
+    file_types = _runtime_document_string_list(raw_params.get("file_types"))
+    sources = _runtime_document_string_list(raw_params.get("sources"))
+    vector_statuses = _runtime_document_string_list(
+        raw_params.get("vector_statuses")
+    )
+    file_size_min = _runtime_document_optional_int(
+        raw_params.get("file_size_min"),
+        "file_size_min",
+    )
+    file_size_max = _runtime_document_optional_int(
+        raw_params.get("file_size_max"),
+        "file_size_max",
+    )
+    if (
+        file_size_min is not None
+        and file_size_max is not None
+        and file_size_min > file_size_max
+    ):
+        raise ValueError("file_size_min must be less than or equal to file_size_max")
+    return {
+        "workspace_id": workspace_id,
+        # ``None`` means no filter. In particular, ``list_documents`` reserves
+        # an explicit empty folder set to mean an intentionally empty scope.
+        "workspace_ids": workspace_ids or None,
+        "folder_ids": folder_ids or None,
+        "file_types": file_types or None,
+        "sources": sources or None,
+        "vector_statuses": vector_statuses or None,
+        "created_after": str(raw_params.get("created_after") or "") or None,
+        "created_before": str(raw_params.get("created_before") or "") or None,
+        "updated_after": str(raw_params.get("updated_after") or "") or None,
+        "updated_before": str(raw_params.get("updated_before") or "") or None,
+        "file_size_min": file_size_min,
+        "file_size_max": file_size_max,
+    }
+
+
 async def runtime_search_documents_action(
     *,
     entity_id: str,
@@ -146,6 +220,16 @@ async def runtime_search_documents_action(
 
     raw_params = dict(params or {})
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
+    try:
+        filters = _runtime_document_query_filters(
+            raw_params,
+            workspace_id=workspace_scope,
+        )
+    except ValueError as exc:
+        return json.dumps({
+            "error": "invalid_document_filters",
+            "message": str(exc),
+        })
     query = _runtime_document_search_text(raw_params)
     limit = _runtime_bounded_document_limit(
         raw_params.get("limit"),
@@ -160,7 +244,7 @@ async def runtime_search_documents_action(
         "offset": offset,
         "detail": detail,
         "user_id": user_id,
-        "workspace_id": workspace_scope,
+        **filters,
     }
     cached = await _runtime_get_cached_document_action("search_documents", entity_id, cache_params)
     if cached is not None:
@@ -171,7 +255,7 @@ async def runtime_search_documents_action(
             db,
             entity_id,
             user_id=user_id,
-            workspace_id=workspace_scope,
+            **filters,
             actor_type="agent",
             name_search=query or None,
             limit=limit,
@@ -183,7 +267,7 @@ async def runtime_search_documents_action(
                 session,
                 entity_id,
                 user_id=user_id,
-                workspace_id=workspace_scope,
+                **filters,
                 actor_type="agent",
                 name_search=query or None,
                 limit=limit,
@@ -193,6 +277,8 @@ async def runtime_search_documents_action(
     result = json.dumps({
         "total": total,
         "count": len(docs),
+        "limit": limit,
+        "offset": offset,
         "next_offset": offset + len(docs) if offset + len(docs) < total else None,
         "has_more": offset + len(docs) < total,
         "documents": [runtime_document_to_dict(doc, detail=detail) for doc in docs],
@@ -214,6 +300,16 @@ async def runtime_list_documents_action(
 
     raw_params = dict(params or {})
     workspace_scope = str(raw_params.get("workspace_id") or workspace_id or "").strip() or None
+    try:
+        filters = _runtime_document_query_filters(
+            raw_params,
+            workspace_id=workspace_scope,
+        )
+    except ValueError as exc:
+        return json.dumps({
+            "error": "invalid_document_filters",
+            "message": str(exc),
+        })
     query = _runtime_document_search_text(raw_params)
     folder_id = _runtime_document_folder_id(raw_params)
     limit = _runtime_bounded_document_limit(
@@ -230,7 +326,7 @@ async def runtime_list_documents_action(
         "offset": offset,
         "detail": detail,
         "user_id": user_id,
-        "workspace_id": workspace_scope,
+        **filters,
     }
     cached = await _runtime_get_cached_document_action("list_documents", entity_id, cache_params)
     if cached is not None:
@@ -241,7 +337,7 @@ async def runtime_list_documents_action(
             db,
             entity_id,
             user_id=user_id,
-            workspace_id=workspace_scope,
+            **filters,
             actor_type="agent",
             name_search=query or None,
             folder_id=folder_id,
@@ -254,7 +350,7 @@ async def runtime_list_documents_action(
                 session,
                 entity_id,
                 user_id=user_id,
-                workspace_id=workspace_scope,
+                **filters,
                 actor_type="agent",
                 name_search=query or None,
                 folder_id=folder_id,

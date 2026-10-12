@@ -157,6 +157,19 @@ async def _validate_change_item(
         _reject(item, "INSUFFICIENT_DATA", note)
         return note
 
+    if target_kind == "scheduled_job":
+        from packages.core.services.scheduler_service import (
+            is_agent_initiative_driver,
+        )
+
+        if is_agent_initiative_driver(row):
+            note = (
+                f"item {item.item_key}: scheduled_job {target_id} is managed by "
+                "an Agent Initiative and cannot be changed as a generic automation"
+            )
+            _reject(item, "POLICY_BLOCKED", note)
+            return note
+
     # ── expected_revision CAS precheck (fail fast; executor re-checks) ──
     expected = payload.get("expected_revision")
     if expected is None:

@@ -172,7 +172,7 @@ async def test_local_unlimited_workspace_usage_honors_custom_budget_alerts(
 
     alerts: list[str] = []
 
-    async def capture_alert(_workspace, _spent, state):
+    async def capture_alert(_db, _workspace, _spent, state):
         alerts.append(state)
 
     monkeypatch.setattr(aggregation, "_post_budget_alert", capture_alert)
@@ -187,6 +187,225 @@ async def test_local_unlimited_workspace_usage_honors_custom_budget_alerts(
     assert result["alert_emitted"] == "critical_100"
     assert alerts == ["critical_100"]
     assert workspace.budget_alert_state == "critical_100"
+
+
+@pytest.mark.asyncio
+async def test_worker_llm_step_cost_is_attributed_to_plan_without_double_counting_budget(
+    db_session,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.budget import aggregation
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.worker import Worker, WorkLease
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="LLM budget accounting",
+        # Simulate the provider-call settlement that already happened through
+        # record_llm_usage before Dispatcher completes the worker step.
+        monthly_spent_usd=Decimal("0.70"),
+    )
+    worker = Worker(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        kind="internal",
+        display_name="Internal worker",
+        capabilities={"supported_kinds": ["llm"]},
+        monthly_spent_usd=Decimal("0"),
+        status="active",
+    )
+    plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        status="running",
+        execution_mode="live",
+        approval_required=False,
+        plan_dag={"steps": []},
+        cost_tracking={},
+    )
+    step = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan.id,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        step_key="draft",
+        kind="llm",
+        params={"prompt": "draft"},
+        depends_on=[],
+        step_status="done",
+        cost={
+            "usd": 0.70,
+            "llm_usd": 0.70,
+            "budget_usd": 0,
+            "llm_tokens_input": 100,
+            "llm_tokens_output": 25,
+        },
+    )
+    lease = WorkLease(
+        id=generate_ulid(),
+        step_id=step.id,
+        plan_id=plan.id,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        worker_id=worker.id,
+        status="completed",
+        lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    db_session.add_all([workspace, worker, plan, step, lease])
+    await db_session.flush()
+
+    result = await aggregation.accumulate_step_cost(
+        db_session,
+        step,
+        lease,
+        notify=False,
+    )
+
+    assert result["usd"] == 0.70
+    assert result["budget_usd"] == 0
+    assert plan.cost_tracking["usd"] == 0.70
+    assert plan.cost_tracking["llm_tokens_input"] == 100
+    assert workspace.monthly_spent_usd == Decimal("0.70")
+    assert worker.monthly_spent_usd == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_zero_priced_worker_step_still_rolls_up_plan_token_counters(
+    db_session,
+) -> None:
+    from packages.core.budget import aggregation
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
+    entity_id = generate_ulid()
+    plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        status="running",
+        execution_mode="live",
+        approval_required=False,
+        plan_dag={"steps": []},
+        cost_tracking={},
+    )
+    step = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan.id,
+        entity_id=entity_id,
+        step_key="free-model",
+        kind="llm",
+        params={"prompt": "draft"},
+        depends_on=[],
+        step_status="done",
+        cost={
+            "usd": 0,
+            "budget_usd": 0,
+            "llm_tokens_input": 40,
+            "llm_tokens_output": 10,
+        },
+    )
+    db_session.add_all([plan, step])
+    await db_session.flush()
+
+    result = await aggregation.accumulate_step_cost(
+        db_session,
+        step,
+        notify=False,
+    )
+
+    assert result["usd"] == 0
+    assert plan.cost_tracking["usd"] == 0
+    assert plan.cost_tracking["llm_tokens_input"] == 40
+    assert plan.cost_tracking["llm_tokens_output"] == 10
+
+
+@pytest.mark.asyncio
+async def test_action_step_attributes_total_to_plan_but_only_action_to_budget(
+    db_session,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.budget import aggregation
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.worker import Worker, WorkLease
+    from packages.core.models.workspace import Workspace
+
+    entity_id = generate_ulid()
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Action accounting",
+        # The LLM portion has already entered the provider usage ledger.
+        monthly_spent_usd=Decimal("0.05"),
+    )
+    worker = Worker(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        kind="internal",
+        display_name="Internal worker",
+        capabilities={"supported_kinds": ["action"]},
+        monthly_spent_usd=Decimal("0"),
+        status="active",
+    )
+    plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        status="running",
+        execution_mode="live",
+        approval_required=False,
+        plan_dag={"steps": []},
+        cost_tracking={},
+    )
+    step = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan.id,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        step_key="publish",
+        kind="action",
+        params={},
+        depends_on=[],
+        step_status="done",
+        cost={
+            "usd": 0.30,
+            "llm_usd": 0.05,
+            "budget_usd": 0.25,
+            "llm_tokens_input": 100,
+            "llm_tokens_output": 20,
+        },
+    )
+    lease = WorkLease(
+        id=generate_ulid(),
+        step_id=step.id,
+        plan_id=plan.id,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        worker_id=worker.id,
+        status="completed",
+        lease_until=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    db_session.add_all([workspace, worker, plan, step, lease])
+    await db_session.flush()
+
+    result = await aggregation.accumulate_step_cost(
+        db_session,
+        step,
+        lease,
+        notify=False,
+    )
+
+    assert result["usd"] == pytest.approx(0.30)
+    assert result["budget_usd"] == pytest.approx(0.25)
+    assert plan.cost_tracking["usd"] == pytest.approx(0.30)
+    assert workspace.monthly_spent_usd == Decimal("0.30")
+    assert worker.monthly_spent_usd == Decimal("0.25")
 
 
 @pytest.mark.asyncio

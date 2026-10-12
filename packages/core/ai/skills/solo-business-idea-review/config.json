@@ -35,5 +35,9 @@
     "mode": "required_before_answer",
     "semantic_trigger": "the user presents or refers to one or more already-described business ideas and asks whether they are good, worth pursuing, viable, validated, risky, or suitable for a solo founder, or asks for a go/no-go review, evidence check, hard blockers, the riskiest assumption, comparison, or cheapest validation experiment, rather than open-ended generation of new ideas, regardless of language",
     "result_authority": "primary_source"
+  },
+  "search": {
+    "terms": ["startup idea", "side hustle", "indie hacker", "validate idea", "go no-go", "business viability", "market research", "lean test", "one person company"],
+    "examples": ["is my side project idea worth it", "validate saas idea before building", "riskiest assumption for my startup", "cheap experiment to test business idea"]
   }
 }

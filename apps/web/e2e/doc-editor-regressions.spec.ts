@@ -185,13 +185,15 @@ test("PPTX chart graphic frames stay visible and duplicate as native OOXML objec
     )), { timeout: 30_000 }).toBeGreaterThan(0);
 
     const shapeHosts = frame.locator(":scope > [data-presentation-shape-type]");
+    const imageHosts = frame.locator(':scope > [data-presentation-shape-type="image"]');
     const originalShapeCount = await shapeHosts.count();
+    const originalImageCount = await imageHosts.count();
     await frame.locator(':scope > [data-presentation-shape-type="graphic"]').click({ position: { x: 12, y: 12 } });
     await page.keyboard.press("Control+d");
     await expect(shapeHosts).toHaveCount(originalShapeCount + 1);
     await expect(frame.locator(':scope > [data-presentation-shape-type="graphic"]')).toHaveCount(2);
     await expect(frame.locator(':scope > [data-presentation-shape-type="graphic"] [role="img"] img')).toHaveCount(2);
-    await expect(frame.locator(':scope > [data-presentation-shape-type="image"]')).toHaveCount(0);
+    await expect(imageHosts).toHaveCount(originalImageCount);
     expect(consoleErrors.filter((message) => /module script|maximum update depth|too many re-renders/i.test(message))).toEqual([]);
   } finally {
     if (token && documentId) {
@@ -378,28 +380,50 @@ test("plain-text and AI history restore selections while the media dialog remain
     })).toEqual({ start: backwardStart, end: backwardEnd, direction: "backward" });
 
     await page.evaluate(() => {
-      type ApplyContent = (content: string, meta: { complete: boolean; source: "assistant-stream" }) => void;
-      const testWindow = window as typeof window & { __docEditorApplyContent?: ApplyContent };
+      type ApplyMeta = { complete: boolean; phase?: "preview" | "complete"; source: "assistant-stream"; turnId?: string };
+      type LiveEditAdapter = {
+        read: () => string;
+        beginTurn: (meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        preview: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        complete: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+      };
+      const testWindow = window as typeof window & { __docEditorLiveAdapter?: LiveEditAdapter };
       window.addEventListener("manor:open-editor-live-chat", (event) => {
-        testWindow.__docEditorApplyContent = (
-          event as CustomEvent<{ applyContent?: ApplyContent }>
-        ).detail.applyContent;
+        testWindow.__docEditorLiveAdapter = (
+          event as CustomEvent<{ adapter?: LiveEditAdapter }>
+        ).detail.adapter;
       }, { once: true });
     });
     await page.getByRole("button", { name: "AI edit", exact: true }).click();
     await expect.poll(() => page.evaluate(() => (
-      typeof (window as typeof window & { __docEditorApplyContent?: unknown }).__docEditorApplyContent
-    ))).toBe("function");
+      typeof (window as typeof window & { __docEditorLiveAdapter?: unknown }).__docEditorLiveAdapter
+    ))).toBe("object");
     const aiRevision = "AI replaced the plain-text document.";
-    await page.evaluate((nextContent) => {
-      type ApplyContent = (content: string, meta: { complete: boolean; source: "assistant-stream" }) => void;
-      const applyContent = (
-        window as typeof window & { __docEditorApplyContent?: ApplyContent }
-      ).__docEditorApplyContent;
-      if (!applyContent) throw new Error("AI apply callback was not captured");
-      applyContent(nextContent, { complete: true, source: "assistant-stream" });
+    await page.evaluate(async (nextContent) => {
+      type ApplyMeta = { complete: boolean; phase?: "preview" | "complete"; source: "assistant-stream"; turnId?: string };
+      type LiveEditAdapter = {
+        read: () => string;
+        beginTurn: (meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        preview: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        complete: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+      };
+      const adapter = (
+        window as typeof window & { __docEditorLiveAdapter?: LiveEditAdapter }
+      ).__docEditorLiveAdapter;
+      if (!adapter) throw new Error("AI edit adapter was not captured");
+      const turnId = "e2e-plain-text-ai-history";
+      adapter.read();
+      await adapter.beginTurn({ complete: false, phase: "preview", source: "assistant-stream", turnId });
+      await adapter.preview(nextContent, { complete: false, phase: "preview", source: "assistant-stream", turnId });
+      await adapter.complete(nextContent, { complete: true, phase: "complete", source: "assistant-stream", turnId });
     }, aiRevision);
     await expect(editor).toHaveValue(aiRevision);
+    await page.locator("#floating-chat-panel")
+      .getByRole("group", { name: "AI edit preview controls" })
+      .getByRole("button", { name: "Accept", exact: true })
+      .click();
+    await expect(page.locator(".doc-editor-live-preview-bar")).toHaveCount(0);
+    await expect(undo).toBeEnabled();
     await undo.click();
     await expect(editor).toHaveValue(originalText);
 
@@ -407,7 +431,7 @@ test("plain-text and AI history restore selections while the media dialog remain
     const markdownDownloadGate = new Promise<void>((resolve) => {
       releaseMarkdownDownload = resolve;
     });
-    const markdownDownloadPattern = `**/documents/${markdownDocument.id}/download**`;
+    const markdownDownloadPattern = `**/documents/${markdownDocument.id}/preview/content**`;
     await page.route(markdownDownloadPattern, async (route) => {
       await markdownDownloadGate;
       await route.continue();
@@ -416,7 +440,7 @@ test("plain-text and AI history restore selections while the media dialog remain
     const markdownEditor = page.getByPlaceholder("Write your markdown here...", { exact: true });
     await expect(markdownEditor).toBeHidden();
     const markdownDownloadResponse = page.waitForResponse((response) => (
-      response.url().includes(`/documents/${markdownDocument.id}/download`)
+      response.url().includes(`/documents/${markdownDocument.id}/preview/content`)
     ));
     releaseMarkdownDownload();
     await markdownDownloadResponse;
@@ -495,42 +519,59 @@ test("plain-text and AI history restore selections while the media dialog remain
     await page.goto(`/editor/${presentationDocument.id}`);
     await expect(page.locator(".presentation-editor")).toBeVisible();
     await page.evaluate(() => {
-      type ApplyContent = (content: string, meta: { complete: boolean; source: "assistant-stream" }) => void;
-      type LiveEditDetail = { applyContent?: ApplyContent; getContent?: () => string };
+      type ApplyMeta = { complete: boolean; phase?: "preview" | "complete"; source: "assistant-stream"; turnId?: string };
+      type LiveEditAdapter = {
+        read: () => string;
+        beginTurn: (meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        preview: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        complete: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+      };
+      type LiveEditDetail = { adapter?: LiveEditAdapter };
       const testWindow = window as typeof window & {
-        __docEditorApplyContent?: ApplyContent;
-        __docEditorGetContent?: () => string;
+        __docEditorPresentationAdapter?: LiveEditAdapter;
       };
       window.addEventListener("manor:open-editor-live-chat", (event) => {
         const detail = (event as CustomEvent<LiveEditDetail>).detail;
-        testWindow.__docEditorApplyContent = detail.applyContent;
-        testWindow.__docEditorGetContent = detail.getContent;
+        testWindow.__docEditorPresentationAdapter = detail.adapter;
       }, { once: true });
     });
     await page.getByRole("button", { name: "AI edit", exact: true }).click();
     await expect.poll(() => page.evaluate(() => (
-      typeof (window as typeof window & { __docEditorGetContent?: unknown }).__docEditorGetContent
-    ))).toBe("function");
+      typeof (window as typeof window & { __docEditorPresentationAdapter?: unknown }).__docEditorPresentationAdapter
+    ))).toBe("object");
     const updatedPresentationText = "Presentation edit survives navigation";
-    await page.evaluate((replacementText) => {
-      type ApplyContent = (content: string, meta: { complete: boolean; source: "assistant-stream" }) => void;
-      const testWindow = window as typeof window & {
-        __docEditorApplyContent?: ApplyContent;
-        __docEditorGetContent?: () => string;
+    await page.evaluate(async (replacementText) => {
+      type ApplyMeta = { complete: boolean; phase?: "preview" | "complete"; source: "assistant-stream"; turnId?: string };
+      type LiveEditAdapter = {
+        read: () => string;
+        beginTurn: (meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        preview: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
+        complete: (content: string, meta: ApplyMeta) => boolean | void | Promise<boolean | void>;
       };
-      if (!testWindow.__docEditorApplyContent || !testWindow.__docEditorGetContent) {
-        throw new Error("Presentation live-edit callbacks were not captured");
-      }
-      const state = JSON.parse(testWindow.__docEditorGetContent()) as {
+      const testWindow = window as typeof window & {
+        __docEditorPresentationAdapter?: LiveEditAdapter;
+      };
+      const adapter = testWindow.__docEditorPresentationAdapter;
+      if (!adapter) throw new Error("Presentation live-edit adapter was not captured");
+      const state = JSON.parse(adapter.read()) as {
         slides: Array<{ shapes: Array<{ paragraphs?: Array<{ text: string }> }> }>;
       };
       const paragraph = state.slides.flatMap((slide) => slide.shapes)
         .flatMap((shape) => shape.paragraphs || [])[0];
       if (!paragraph) throw new Error("Editable presentation paragraph was not found");
+      const originalText = paragraph.text;
       paragraph.text = replacementText;
-      testWindow.__docEditorApplyContent(JSON.stringify(state), { complete: true, source: "assistant-stream" });
+      paragraph.edits = [{ start: 0, end: originalText.length, text: replacementText }];
+      const turnId = "e2e-presentation-ai-history";
+      await adapter.beginTurn({ complete: false, phase: "preview", source: "assistant-stream", turnId });
+      await adapter.preview(JSON.stringify(state), { complete: false, phase: "preview", source: "assistant-stream", turnId });
+      await adapter.complete(JSON.stringify(state), { complete: true, phase: "complete", source: "assistant-stream", turnId });
     }, updatedPresentationText);
-    await expect(page.locator(".manor-editor-header").getByText("Unsaved changes", { exact: true })).toBeVisible();
+    await page.locator("#floating-chat-panel")
+      .getByRole("group", { name: "AI edit preview controls" })
+      .getByRole("button", { name: "Accept", exact: true })
+      .click();
+    await expect(page.locator(".doc-editor-live-preview-bar")).toHaveCount(0);
     await page.evaluate((targetDocumentId) => {
       window.history.pushState({}, "", `/editor/${targetDocumentId}`);
       window.dispatchEvent(new PopStateEvent("popstate"));
@@ -576,12 +617,18 @@ test("plain-text and AI history restore selections while the media dialog remain
     releaseFirstSave();
     await firstSaveResponse;
     await expect(page.locator(".manor-editor-header").getByText("Unsaved changes", { exact: true })).toBeVisible();
+    const secondSaveResponse = page.waitForResponse((response) => (
+      response.url().includes(`/documents/${saveStatusDocument.id}/file`)
+      && response.request().method() === "PUT"
+    ));
     await page.getByRole("button", { name: "Save", exact: true }).click();
-    await expect(page.locator(".manor-editor-header").getByText("Saved", { exact: true })).toBeVisible();
+    expect((await secondSaveResponse).ok()).toBeTruthy();
     await page.unroute(saveStatusFilePattern);
-    const savedLatestContent = await api.get(`/api/v1/documents/${saveStatusDocument.id}/content`, { headers });
-    expect(savedLatestContent.ok()).toBeTruthy();
-    expect((await savedLatestContent.json()).content).toBe(secondRevision);
+    await expect.poll(async () => {
+      const savedLatestContent = await api.get(`/api/v1/documents/${saveStatusDocument.id}/content`, { headers });
+      if (!savedLatestContent.ok()) return null;
+      return (await savedLatestContent.json()).content;
+    }).toBe(secondRevision);
 
     await page.goto(`/editor/${retryOrderDocument.id}`);
     const retryOrderEditor = page.getByPlaceholder("Start typing...", { exact: true });

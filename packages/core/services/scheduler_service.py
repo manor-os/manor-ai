@@ -1,6 +1,7 @@
 """Scheduler service — scheduled jobs, job runs, agent executions."""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -13,12 +14,12 @@ from packages.core.constants.execution import (
     DEFAULT_AGENT_MAX_TURNS,
     ScheduledRunStatus,
 )
-from packages.core.constants.agents import is_master_agent
+from packages.core.constants.agents import MANOR_AGENT_ID, is_master_agent
 from packages.core.constants.task_actors import TaskActor
 from packages.core.models.base import generate_ulid
 from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun, AgentExecution
 from packages.core.models.workflow import WorkflowBinding
-from packages.core.models.workspace import Workspace
+from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.services.reusable_resource_locks import (
     is_reusable_resource_local_id,
     lock_reusable_resource_lifecycle,
@@ -38,6 +39,190 @@ from packages.core.revisions import (
 # ── Scheduled Jobs ──
 
 SCHEDULED_JOB_AUTO_PAUSE_ERROR_THRESHOLD = 3
+MANAGED_AGENT_INITIATIVE_MUTATION_CODE = "MANAGED_AGENT_INITIATIVE"
+
+
+@dataclass(frozen=True)
+class RuntimeScheduledJobAgentRequest:
+    """Trusted caller identity plus an optional model-selected Agent id."""
+
+    requested_agent_id: str = ""
+    caller_agent_id: str = ""
+    caller_agent_subscription_id: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeScheduledJobAgentSelection:
+    """Exact Agent deployment persisted for one Runtime-created Job."""
+
+    agent_id: str
+    agent_subscription_id: str | None
+    source: str
+
+
+async def resolve_runtime_scheduled_job_agent(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None,
+    request: RuntimeScheduledJobAgentRequest,
+) -> RuntimeScheduledJobAgentSelection:
+    """Resolve and lock one executable Agent deployment.
+
+    Model input may select only an active entity Agent with one active
+    deployment in the Job scope. Invalid input falls back to the trusted
+    caller. Manor can only be selected when Manor is already the caller.
+    """
+
+    caller_agent_id = str(request.caller_agent_id or "").strip() or MANOR_AGENT_ID
+    if is_master_agent(caller_agent_id):
+        caller_agent_id = MANOR_AGENT_ID
+    requested_agent_id = str(request.requested_agent_id or "").strip()
+    caller_subscription_id = str(
+        request.caller_agent_subscription_id or ""
+    ).strip() or None
+
+    custom_agent_ids = {
+        agent_id
+        for agent_id in (caller_agent_id, requested_agent_id)
+        if agent_id and not is_master_agent(agent_id)
+    }
+    active_agent_ids: set[str] = set()
+    scoped_subscriptions: list[AgentSubscription] = []
+    if custom_agent_ids:
+        active_agent_ids = set((await db.execute(
+            select(Agent.id)
+            .where(
+                Agent.id.in_(sorted(custom_agent_ids)),
+                Agent.entity_id == entity_id,
+                Agent.status == "active",
+                Agent.deleted_at.is_(None),
+            )
+            .order_by(Agent.id.asc())
+            .with_for_update()
+        )).scalars().all())
+
+        subscription_filters = [
+            AgentSubscription.entity_id == entity_id,
+            AgentSubscription.agent_id.in_(sorted(custom_agent_ids)),
+            AgentSubscription.status == "active",
+        ]
+        if workspace_id or user_id:
+            if workspace_id:
+                subscription_filters.append(
+                    AgentSubscription.workspace_id == workspace_id
+                )
+            else:
+                subscription_filters.extend((
+                    AgentSubscription.workspace_id.is_(None),
+                    AgentSubscription.owner_user_id == user_id,
+                ))
+            scoped_subscriptions = list((await db.execute(
+                select(AgentSubscription)
+                .where(*subscription_filters)
+                .order_by(
+                    AgentSubscription.agent_id.asc(),
+                    AgentSubscription.id.asc(),
+                )
+                .with_for_update()
+            )).scalars().all())
+
+    subscriptions_by_agent: dict[str, list[AgentSubscription]] = {}
+    for subscription in scoped_subscriptions:
+        subscriptions_by_agent.setdefault(subscription.agent_id, []).append(subscription)
+
+    def custom_selection(
+        agent_id: str,
+        *,
+        exact_subscription_id: str | None = None,
+        source: str,
+    ) -> RuntimeScheduledJobAgentSelection | None:
+        if agent_id not in active_agent_ids:
+            return None
+        candidates = subscriptions_by_agent.get(agent_id, [])
+        if exact_subscription_id:
+            candidates = [
+                row for row in candidates if row.id == exact_subscription_id
+            ]
+        if len(candidates) != 1:
+            return None
+        return RuntimeScheduledJobAgentSelection(
+            agent_id=agent_id,
+            agent_subscription_id=candidates[0].id,
+            source=source,
+        )
+
+    def caller_selection(source: str) -> RuntimeScheduledJobAgentSelection | None:
+        if is_master_agent(caller_agent_id):
+            return RuntimeScheduledJobAgentSelection(
+                agent_id=MANOR_AGENT_ID,
+                agent_subscription_id=None,
+                source=source,
+            )
+        return custom_selection(
+            caller_agent_id,
+            exact_subscription_id=caller_subscription_id,
+            source=source,
+        )
+
+    if not requested_agent_id:
+        selected = caller_selection("caller")
+    elif is_master_agent(requested_agent_id):
+        selected = (
+            RuntimeScheduledJobAgentSelection(
+                agent_id=MANOR_AGENT_ID,
+                agent_subscription_id=None,
+                source="requested",
+            )
+            if is_master_agent(caller_agent_id)
+            else caller_selection("caller_fallback")
+        )
+    else:
+        requested_subscription_id = (
+            caller_subscription_id
+            if requested_agent_id == caller_agent_id
+            else None
+        )
+        selected = custom_selection(
+            requested_agent_id,
+            exact_subscription_id=requested_subscription_id,
+            source="requested",
+        ) or caller_selection("caller_fallback")
+
+    if selected is None:
+        raise ValueError("Calling Agent has no active deployment in this scope")
+    return selected
+
+
+class ManagedAgentInitiativeDriverError(ValueError):
+    """A generic Scheduler mutation targeted an Initiative-owned driver."""
+
+    code = MANAGED_AGENT_INITIATIVE_MUTATION_CODE
+
+
+def is_agent_initiative_driver(job: object) -> bool:
+    """Return whether a ScheduledJob is reserved as an Initiative driver."""
+
+    target = getattr(job, "execution_target", None)
+    target = target if isinstance(target, dict) else {}
+    return bool(
+        getattr(job, "agent_initiative_id", None)
+        or str(getattr(job, "execution_type", "") or "") == "agent_initiative"
+        or str(target.get("managed_by") or "") == "agent_initiative"
+    )
+
+
+def _assert_scheduled_job_mutation_authority(
+    job: object,
+    *,
+    allow_agent_initiative_driver: bool,
+) -> None:
+    if is_agent_initiative_driver(job) and not allow_agent_initiative_driver:
+        raise ManagedAgentInitiativeDriverError(
+            "Agent Initiative drivers can only be changed through the "
+            "Initiative lifecycle"
+        )
 
 
 def scheduled_job_workspace_scope(
@@ -156,9 +341,15 @@ async def reconcile_scheduled_job_run_projection(
     if newest_status == ScheduledRunStatus.RUNNING.value:
         return False
 
-    # A delete-after-run job remains enabled while its accepted child is
-    # executing, then closes only after the occurrence becomes terminal.
-    disable_after_terminal_run = bool(job.delete_after_run and job.enabled)
+    # A delete-after-run job remains enabled while its accepted scheduled
+    # child is executing, then closes only after that occurrence is terminal.
+    # A manual run-now is an independent occurrence and must not consume the
+    # still-pending one-shot clock.
+    disable_after_terminal_run = bool(
+        job.delete_after_run
+        and job.enabled
+        and str(newest.trigger_type or "") != "manual"
+    )
 
     previous_errors = int(job.consecutive_errors or 0)
     consecutive_errors = 0
@@ -190,6 +381,7 @@ async def reconcile_scheduled_job_run_projection(
             job,
             {"enabled": False},
             causation_id=finalized_run_id,
+            allow_agent_initiative_driver=True,
         )
     return auto_paused
 
@@ -393,6 +585,9 @@ async def create_scheduled_job(
     default_delivery_mode: str | None = None,
     user_id: str | None = None,
     require_workspace: bool = True,
+    require_actor_workspace_write: bool = False,
+    publish_realtime: bool = True,
+    runtime_agent_request: RuntimeScheduledJobAgentRequest | None = None,
 ) -> ScheduledJob:
     scheduled_job_workspace_scope(workspace_id, execution_target)
     # Workspace deletion and reusable-resource purge both acquire this fence
@@ -400,7 +595,7 @@ async def create_scheduled_job(
     # the same global order so a local resource reference cannot invert the
     # locks. Entity-only jobs acquire the fence later only when they carry a
     # reusable-resource reference, avoiding needless tenant-wide contention.
-    if workspace_id:
+    if workspace_id or runtime_agent_request is not None:
         await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
     workspace_active = await _lock_workspace_scheduling_admission(
         db,
@@ -408,6 +603,29 @@ async def create_scheduled_job(
         workspace_id=workspace_id,
         require_workspace=require_workspace,
     )
+    if workspace_id and require_actor_workspace_write:
+        from packages.core.services.workspace_access import user_can_write_workspace_id
+
+        if not user_id or not await user_can_write_workspace_id(
+            db, workspace_id=workspace_id, entity_id=entity_id, user_id=user_id,
+        ):
+            raise PermissionError("Workspace write access is required to manage automations")
+    runtime_agent_selection = None
+    if runtime_agent_request is not None:
+        runtime_agent_selection = await resolve_runtime_scheduled_job_agent(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            request=runtime_agent_request,
+        )
+        agent_id = runtime_agent_selection.agent_id
+        execution_target = dict(execution_target or {})
+        execution_target.pop("agent_subscription_id", None)
+        if runtime_agent_selection.agent_subscription_id:
+            execution_target["agent_subscription_id"] = (
+                runtime_agent_selection.agent_subscription_id
+            )
     await _lock_scheduled_job_resource_references(
         db,
         entity_id=entity_id,
@@ -436,24 +654,30 @@ async def create_scheduled_job(
         user_id=user_id,
         enabled=workspace_active,
     )
+    if runtime_agent_selection is not None:
+        # Transient receipt evidence for the Runtime caller; the durable exact
+        # deployment lives in execution_target and is revalidated at dispatch.
+        job._runtime_agent_selection = runtime_agent_selection
     if payload_message and agent_id and workspace_active:
         job.skill_generation_revision = int(job.revision or 1)
         job.skill_generation_next_attempt_at = datetime.now(timezone.utc)
     await persist_scheduled_job(db, job)
 
-    # Real-time push so Automations page refreshes without a poll.
-    # Broadcast so every admin sees agent-initiated jobs too.
-    from packages.core.services.realtime import (
-        broadcast_job_update, push_job_update,
-    )
-    summary = {
-        "id": job.id, "job_id": job.job_id, "name": job.name,
-        "schedule_kind": job.schedule_kind, "enabled": job.enabled,
-        "event": "created",
-    }
-    if user_id:
-        await push_job_update(user_id, summary, entity_id=entity_id)
-    await broadcast_job_update(entity_id, summary)
+    if publish_realtime:
+        # Real-time push so Automations page refreshes without a poll.
+        # Derived runtime drivers opt out because their product owner exposes a
+        # separate surface and generic job events would leak that abstraction.
+        from packages.core.services.realtime import (
+            broadcast_job_update, push_job_update,
+        )
+        summary = {
+            "id": job.id, "job_id": job.job_id, "name": job.name,
+            "schedule_kind": job.schedule_kind, "enabled": job.enabled,
+            "event": "created",
+        }
+        if user_id:
+            await push_job_update(user_id, summary, entity_id=entity_id)
+        await broadcast_job_update(entity_id, summary)
 
     return job
 
@@ -484,20 +708,55 @@ async def list_scheduled_jobs(
     entity_id: str,
     enabled_only: bool = False,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
     limit: int = 50,
     offset: int = 0,
     search: str | None = None,
     status: str = "all",
+    statuses: Sequence[str] | None = None,
     agent_id: str | None = None,
+    agent_ids: Sequence[str] | None = None,
+    schedule_kinds: Sequence[str] | None = None,
+    job_types: Sequence[str] | None = None,
+    execution_types: Sequence[str] | None = None,
+    last_statuses: Sequence[str] | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    last_run_after: str | datetime | None = None,
+    last_run_before: str | datetime | None = None,
+    next_run_after: str | datetime | None = None,
+    next_run_before: str | datetime | None = None,
+    consecutive_errors_min: int | None = None,
+    consecutive_errors_max: int | None = None,
     include_workflows: bool = True,
+    include_managed: bool = False,
     readable_workspace_ids: set[str] | None = None,
 ) -> tuple[list[ScheduledJob], int]:
     filters = _scheduled_job_filters(
         entity_id,
         workspace_id=workspace_id,
+        workspace_ids=workspace_ids,
         search=search,
         agent_id=agent_id,
+        agent_ids=agent_ids,
+        schedule_kinds=schedule_kinds,
+        job_types=job_types,
+        execution_types=execution_types,
+        last_statuses=last_statuses,
+        created_after=created_after,
+        created_before=created_before,
+        updated_after=updated_after,
+        updated_before=updated_before,
+        last_run_after=last_run_after,
+        last_run_before=last_run_before,
+        next_run_after=next_run_after,
+        next_run_before=next_run_before,
+        consecutive_errors_min=consecutive_errors_min,
+        consecutive_errors_max=consecutive_errors_max,
         include_workflows=include_workflows,
+        include_managed=include_managed,
         readable_workspace_ids=readable_workspace_ids,
     )
     q = select(ScheduledJob).where(*filters)
@@ -517,16 +776,37 @@ async def list_scheduled_jobs(
     if enabled_only:
         q = q.where(effective_enabled)
         count_q = count_q.where(effective_enabled)
-    elif status == "enabled":
-        q = q.where(effective_enabled)
-        count_q = count_q.where(effective_enabled)
-    elif status == "paused":
-        effective_paused = or_(ScheduledJob.enabled == False, inactive_workspace)  # noqa: E712
-        q = q.where(effective_paused)
-        count_q = count_q.where(effective_paused)
-    elif status == "attention":
-        q = q.where(ScheduledJob.consecutive_errors > 0)
-        count_q = count_q.where(ScheduledJob.consecutive_errors > 0)
+    status_values = tuple(
+        value
+        for value in _scheduled_job_filter_values(
+            status if status != "all" else None,
+            statuses,
+            lowercase=True,
+        )
+        if value != "all"
+    )
+    unknown_statuses = sorted(
+        set(status_values) - {"enabled", "paused", "attention"}
+    )
+    if unknown_statuses:
+        raise ValueError(
+            "statuses must contain only enabled, paused, attention, or all"
+        )
+    if status_values:
+        effective_paused = or_(
+            ScheduledJob.enabled.is_(False),
+            inactive_workspace,
+        )
+        status_clauses = []
+        if "enabled" in status_values:
+            status_clauses.append(effective_enabled)
+        if "paused" in status_values:
+            status_clauses.append(effective_paused)
+        if "attention" in status_values:
+            status_clauses.append(ScheduledJob.consecutive_errors > 0)
+        status_filter = or_(*status_clauses)
+        q = q.where(status_filter)
+        count_q = count_q.where(status_filter)
 
     q = q.order_by(
         ScheduledJob.created_at.desc(),
@@ -546,6 +826,7 @@ async def summarize_scheduled_jobs(
     search: str | None = None,
     agent_id: str | None = None,
     include_workflows: bool = True,
+    include_managed: bool = False,
     readable_workspace_ids: set[str] | None = None,
 ) -> dict[str, int]:
     """Return list-level totals without applying the selected status tab."""
@@ -555,6 +836,7 @@ async def summarize_scheduled_jobs(
         search=search,
         agent_id=agent_id,
         include_workflows=include_workflows,
+        include_managed=include_managed,
         readable_workspace_ids=readable_workspace_ids,
     )
     count_q = select(func.count()).select_from(ScheduledJob).where(*filters)
@@ -585,12 +867,33 @@ def _scheduled_job_filters(
     entity_id: str,
     *,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
     search: str | None = None,
     agent_id: str | None = None,
+    agent_ids: Sequence[str] | None = None,
+    schedule_kinds: Sequence[str] | None = None,
+    job_types: Sequence[str] | None = None,
+    execution_types: Sequence[str] | None = None,
+    last_statuses: Sequence[str] | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    last_run_after: str | datetime | None = None,
+    last_run_before: str | datetime | None = None,
+    next_run_after: str | datetime | None = None,
+    next_run_before: str | datetime | None = None,
+    consecutive_errors_min: int | None = None,
+    consecutive_errors_max: int | None = None,
     include_workflows: bool = True,
+    include_managed: bool = False,
     readable_workspace_ids: set[str] | None = None,
 ) -> list:
     filters = [ScheduledJob.entity_id == entity_id]
+    if not include_managed:
+        # Agent Initiative owns these driver rows. They are deliberately absent
+        # from generic Automation surfaces to preserve one mutation authority.
+        filters.append(ScheduledJob.agent_initiative_id.is_(None))
     # A soft-deleted Workspace stops new automation immediately. Keep legacy
     # opaque labels (there is no matching Workspace row) and entity-level jobs
     # visible, but hide jobs tied to a real deleted Workspace.
@@ -602,8 +905,9 @@ def _scheduled_job_filters(
         )
     )
     filters.append(~deleted_workspace)
-    if workspace_id:
-        filters.append(ScheduledJob.workspace_id == workspace_id)
+    workspace_values = _scheduled_job_filter_values(workspace_id, workspace_ids)
+    if workspace_values:
+        filters.append(ScheduledJob.workspace_id.in_(workspace_values))
     if readable_workspace_ids is not None:
         filters.append(
             or_(
@@ -611,8 +915,63 @@ def _scheduled_job_filters(
                 ScheduledJob.workspace_id.in_(readable_workspace_ids),
             )
         )
-    if agent_id:
-        filters.append(ScheduledJob.agent_id == agent_id)
+    agent_values = _scheduled_job_filter_values(agent_id, agent_ids)
+    if agent_values:
+        filters.append(ScheduledJob.agent_id.in_(agent_values))
+    schedule_kind_values = _scheduled_job_filter_values(
+        None,
+        schedule_kinds,
+        lowercase=True,
+    )
+    if schedule_kind_values:
+        filters.append(ScheduledJob.schedule_kind.in_(schedule_kind_values))
+    job_type_values = _scheduled_job_filter_values(None, job_types, lowercase=True)
+    if job_type_values:
+        filters.append(ScheduledJob.job_type.in_(job_type_values))
+    execution_type_values = _scheduled_job_filter_values(
+        None,
+        execution_types,
+        lowercase=True,
+    )
+    if execution_type_values:
+        filters.append(ScheduledJob.execution_type.in_(execution_type_values))
+    last_status_values = _scheduled_job_filter_values(
+        None,
+        last_statuses,
+        lowercase=True,
+    )
+    if last_status_values:
+        filters.append(ScheduledJob.last_status.in_(last_status_values))
+    if (
+        consecutive_errors_min is not None
+        and consecutive_errors_max is not None
+        and consecutive_errors_min > consecutive_errors_max
+    ):
+        raise ValueError(
+            "consecutive_errors_min must be less than or equal to "
+            "consecutive_errors_max"
+        )
+    if consecutive_errors_min is not None:
+        filters.append(ScheduledJob.consecutive_errors >= consecutive_errors_min)
+    if consecutive_errors_max is not None:
+        filters.append(ScheduledJob.consecutive_errors <= consecutive_errors_max)
+    for column, after, before, field_name in (
+        (ScheduledJob.created_at, created_after, created_before, "created"),
+        (ScheduledJob.updated_at, updated_after, updated_before, "updated"),
+        (ScheduledJob.last_run_at, last_run_after, last_run_before, "last_run"),
+        (ScheduledJob.next_run_at, next_run_after, next_run_before, "next_run"),
+    ):
+        after_dt, before_dt = _scheduled_job_datetime_range(
+            after,
+            before,
+            field_name,
+        )
+        if after_dt is not None:
+            filters.append(column.is_not(None))
+            filters.append(column >= after_dt)
+        if before_dt is not None:
+            filters.append(column.is_not(None))
+            filters.append(column <= before_dt)
     if not include_workflows:
         filters.append(
             or_(
@@ -633,6 +992,61 @@ def _scheduled_job_filters(
             )
         )
     return filters
+
+
+def _scheduled_job_filter_values(
+    single: Any,
+    plural: Sequence[Any] | None,
+    *,
+    lowercase: bool = False,
+) -> tuple[str, ...]:
+    if plural is not None and (
+        isinstance(plural, (str, bytes)) or not isinstance(plural, Sequence)
+    ):
+        raise TypeError("plural scheduled-job filters must be arrays")
+    values: list[str] = []
+    for value in (single, *(plural or ())):
+        normalized = str(value or "").strip()
+        if lowercase:
+            normalized = normalized.lower()
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return tuple(values)
+
+
+def _scheduled_job_datetime_bound(
+    value: str | datetime | None,
+    field_name: str,
+) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} range endpoints must be ISO-8601 datetimes"
+            ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _scheduled_job_datetime_range(
+    after: str | datetime | None,
+    before: str | datetime | None,
+    field_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    after_dt = _scheduled_job_datetime_bound(after, field_name)
+    before_dt = _scheduled_job_datetime_bound(before, field_name)
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(
+            f"{field_name}_after must be less than or equal to {field_name}_before"
+        )
+    return after_dt, before_dt
 
 
 async def get_scheduled_job(
@@ -698,7 +1112,12 @@ class ScheduledJobMutationFactory:
         changed_by_kind: str = TaskActor.SYSTEM.value,
         changed_by_id: str | None = None,
         causation_id: str | None = None,
+        allow_agent_initiative_driver: bool = False,
     ) -> ScheduledJobMutationResult | None:
+        _assert_scheduled_job_mutation_authority(
+            job,
+            allow_agent_initiative_driver=allow_agent_initiative_driver,
+        )
         current_entity_id = str(job.entity_id or "").strip()
         next_entity_id = str(updates.get("entity_id", job.entity_id) or "").strip()
         topology_change_requested = bool(
@@ -722,6 +1141,12 @@ class ScheduledJobMutationFactory:
         )).scalar_one_or_none()
         if locked is None:
             return None
+        # Re-check the authoritative locked row: the caller's ORM object may
+        # have been stale while waiting to acquire the Scheduler row lock.
+        _assert_scheduled_job_mutation_authority(
+            locked,
+            allow_agent_initiative_driver=allow_agent_initiative_driver,
+        )
 
         valid_updates = {
             key: value
@@ -772,6 +1197,7 @@ class ScheduledJobMutationFactory:
         changed_by_kind: str = TaskActor.SYSTEM.value,
         changed_by_id: str | None = None,
         causation_id: str | None = None,
+        allow_agent_initiative_driver: bool = False,
     ) -> ScheduledJobMutationResult:
         """Mutate a Job row the caller already locked parent-first.
 
@@ -781,6 +1207,10 @@ class ScheduledJobMutationFactory:
         from trying to acquire the broad lifecycle lock after a parent row.
         """
 
+        _assert_scheduled_job_mutation_authority(
+            job,
+            allow_agent_initiative_driver=allow_agent_initiative_driver,
+        )
         topology_fields = cls._RESOURCE_TOPOLOGY_FIELDS.intersection(updates)
         if topology_fields:
             fields = ", ".join(sorted(topology_fields))
@@ -1004,16 +1434,36 @@ async def delete_scheduled_job(
     db: AsyncSession,
     job_pk: str,
     entity_id: str,
+    *,
+    allow_agent_initiative_driver: bool = False,
 ) -> bool:
     job = await get_scheduled_job(db, job_pk, entity_id, for_update=True)
     if not job:
         return False
+    # Generic callers may have inspected an ordinary job before an Initiative
+    # lifecycle attached it. Authorize again only after locking the current
+    # row, so that check/use race cannot delete the newly managed driver.
+    _assert_scheduled_job_mutation_authority(
+        job,
+        allow_agent_initiative_driver=allow_agent_initiative_driver,
+    )
     # Capture identity before delete so we can push afterwards
     summary = {
         "id": job.id, "job_id": job.job_id, "name": job.name,
         "event": "deleted",
     }
     owner_id = job.user_id
+    from packages.core.services.scheduled_run_lifecycle import (
+        cancel_scheduled_runtime_hitl_tasks_for_job_deletion,
+    )
+
+    await cancel_scheduled_runtime_hitl_tasks_for_job_deletion(
+        db,
+        entity_id=entity_id,
+        job_id=job.job_id,
+        legacy_task_id=job.manor_task_id,
+        reason="scheduled_job_deleted",
+    )
     await db.execute(
         delete(ScheduledJobRun).where(ScheduledJobRun.job_id == job.job_id)
     )
@@ -1038,19 +1488,39 @@ async def toggle_scheduled_job(
     changed_by_kind: str = TaskActor.SYSTEM.value,
     changed_by_id: str | None = None,
     require_workspace: bool = False,
+    scope_workspace_id: str | None = None,
+    scope_user_id: str | None = None,
 ) -> Optional[ScheduledJob]:
     job = await get_scheduled_job(db, job_pk, entity_id)
     if not job:
         return None
-    if enabled and not await _lock_workspace_scheduling_admission(
-        db,
-        entity_id=entity_id,
-        workspace_id=job.workspace_id,
-        require_workspace=require_workspace,
-    ):
-        raise ValueError(
-            "Workspace is not active - resume it before enabling automations"
+    if scope_workspace_id and job.workspace_id != scope_workspace_id:
+        return None
+    if enabled or scope_workspace_id:
+        workspace_active = await _lock_workspace_scheduling_admission(
+            db,
+            entity_id=entity_id,
+            workspace_id=job.workspace_id,
+            require_workspace=require_workspace or bool(scope_workspace_id),
         )
+        if enabled and not workspace_active:
+            raise ValueError(
+                "Workspace is not active - resume it before enabling automations"
+            )
+    if scope_workspace_id:
+        # Workspace parent first, then Job row: keep deletion/pause lock order.
+        job = await get_scheduled_job(db, job_pk, entity_id, for_update=True)
+        if not job or job.workspace_id != scope_workspace_id:
+            return None
+        from packages.core.services.workspace_access import user_can_write_workspace_id
+
+        if not scope_user_id or not await user_can_write_workspace_id(
+            db,
+            workspace_id=scope_workspace_id,
+            entity_id=entity_id,
+            user_id=scope_user_id,
+        ):
+            raise PermissionError("Workspace write access is required to manage automations")
     result = await ScheduledJobMutationFactory.apply(
         db,
         job,
@@ -1083,7 +1553,7 @@ async def pause_workspace_automations(
 ) -> dict[str, int]:
     """Pause every automation deployed into a workspace.
 
-    Manual workflow bindings are workspace attachments, not automations, so
+    Manual and MCP workflow bindings are on-demand attachments, not automations, so
     they remain available. Scheduled jobs and inbound/event workflow bindings
     are the executable automation definitions shown in the Automations UI.
     """
@@ -1100,7 +1570,7 @@ async def pause_workspace_automations(
         select(WorkflowBinding).where(
             WorkflowBinding.entity_id == entity_id,
             WorkflowBinding.workspace_id == workspace_id,
-            WorkflowBinding.trigger_type != "manual",
+            WorkflowBinding.trigger_type.not_in(("manual", "mcp")),
         )
     )).scalars().all())
 
@@ -1112,6 +1582,7 @@ async def pause_workspace_automations(
                 db,
                 job,
                 {"enabled": False},
+                allow_agent_initiative_driver=True,
             )
             if result is not None and result.applied:
                 paused_jobs += 1
@@ -1159,6 +1630,39 @@ async def delete_workspace_automations(
         .with_for_update()
     )).scalars().all())
     job_ids = [job.job_id for job in jobs]
+    initiative_ids = [
+        job.agent_initiative_id
+        for job in jobs
+        if job.agent_initiative_id is not None
+    ]
+    if initiative_ids:
+        # Workspace teardown is the one non-user path allowed to remove these
+        # hidden clock drivers.  Move their product objects out of a runnable
+        # state first so restore cannot expose an active Initiative with no
+        # scheduler backing row.
+        from packages.core.services.agent_initiative_service import (
+            prepare_workspace_initiatives_for_driver_teardown,
+        )
+
+        await prepare_workspace_initiatives_for_driver_teardown(
+            db,
+            initiative_ids=initiative_ids,
+            workspace_id=workspace_id,
+            entity_id=entity_id,
+        )
+    if jobs:
+        from packages.core.services.scheduled_run_lifecycle import (
+            cancel_scheduled_runtime_hitl_tasks_for_job_deletion,
+        )
+
+        for job in jobs:
+            await cancel_scheduled_runtime_hitl_tasks_for_job_deletion(
+                db,
+                entity_id=entity_id,
+                job_id=job.job_id,
+                legacy_task_id=job.manor_task_id,
+                reason="workspace_automation_deleted",
+            )
     bindings = list((await db.execute(
         select(WorkflowBinding).where(
             WorkflowBinding.entity_id == entity_id,

@@ -13,6 +13,7 @@ on:
         default: false
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
@@ -25,8 +26,45 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-22.04
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve published source
+        if: github.event_name == 'push' || inputs.publish == true
+        id: source
+        run: |
+          set -euo pipefail
+          release_sha="$(git rev-parse HEAD^{commit})"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$release_sha" origin/main || {
+            echo "Published docs source is not included in main." >&2
+            exit 2
+          }
+          echo "release_sha=${release_sha}" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Verify public CI evidence
+        if: github.event_name == 'push' || inputs.publish == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repository=manor-os/manor-ai
+          branch=main
+          event_args=(--event workflow_dispatch)
+          candidate_args=(--candidate-sha "${{ steps.source.outputs.release_sha }}")
+          python3 scripts/verify_release_ci_evidence.py \
+            --source-sha "${{ steps.source.outputs.release_sha }}" \
+            --branch "${branch}" \
+            --repository "${repository}" \
+            "${event_args[@]}" \
+            "${candidate_args[@]}" \
+            --wait-seconds 3300
 
       - uses: actions/setup-node@v7
         with:

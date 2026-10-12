@@ -6,7 +6,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from packages.core.ai.runtime.integration_setup_links import runtime_integration_setup_link
+
 if TYPE_CHECKING:
+    from packages.core.ai.runtime.tool_context import RuntimeToolCallContext
     from packages.core.ai.runtime.dynamic_mcp import (
         RuntimeDynamicMCPAccountRegistrySnapshot,
     )
@@ -35,6 +38,7 @@ class RuntimeMCPCallPreflightResult:
 
     blocked_result: str = ""
     integration_account_id: str | None = None
+    chrome_connection_id: str | None = None
     integration_registry: RuntimeIntegrationRegistry | None = None
 
 
@@ -45,14 +49,15 @@ def runtime_mcp_credentials_unavailable_result(
     reason: str,
     scope: str = "none",
     suggested_tool: str | None = None,
+    offer_setup: bool = False,
 ) -> str:
     """Return the canonical unavailable-credentials tool result.
 
     Chrome is backed by a paired local CLI worker rather than a reconnectable
-    vendor token. Treat that missing worker as a terminal browser condition so
-    nested ``invoke_skill(skill_id=<Chrome Skill.id>)`` runs propagate the real stop reason to
-    the parent chat instead of converting ``credentials_unavailable`` into a
-    successful ``completed`` answer.
+    vendor token. Its raw tool result stops the unusable Chrome execution path
+    so the active loop can request one final model summary. The loop then
+    normalizes that result to a non-terminal tool error; nested Skills
+    must not propagate this raw ``stop_parent`` signal to the parent Agent.
     """
 
     payload: dict[str, object] = {
@@ -64,6 +69,8 @@ def runtime_mcp_credentials_unavailable_result(
     }
     if suggested_tool:
         payload["suggested_tool"] = suggested_tool
+    if offer_setup:
+        payload.update(runtime_integration_setup_link(provider))
     if provider == "chrome":
         payload.update({
             "status": "failed",
@@ -286,6 +293,7 @@ async def runtime_annotate_tool_availability(
                 match["account_options"] = account_options
                 match["default_account_id"] = provider_status[provider].get("account_id")
 
+
     return runtime_sort_available_matches(matches)
 
 
@@ -301,6 +309,7 @@ async def runtime_preflight_mcp_call(
     expected_account_registry_snapshot: (
         RuntimeDynamicMCPAccountRegistrySnapshot | None
     ) = None,
+    runtime_context: RuntimeToolCallContext | None = None,
 ) -> RuntimeMCPCallPreflightResult:
     """Fail closed and pin the exact account before approval/provider code."""
     parts = name.split("__", 2)
@@ -470,7 +479,7 @@ async def runtime_preflight_mcp_call(
             ):
                 return RuntimeMCPCallPreflightResult(
                     blocked_result=(
-                        RuntimeDynamicMCPFailureResultFactory.stale_binding(
+                        RuntimeDynamicMCPFailureResultFactory.stale_preflight_binding(
                             provider=provider,
                             tool_name=tool_name,
                         )
@@ -488,7 +497,7 @@ async def runtime_preflight_mcp_call(
                 ):
                     return RuntimeMCPCallPreflightResult(
                         blocked_result=(
-                            RuntimeDynamicMCPFailureResultFactory.stale_binding(
+                            RuntimeDynamicMCPFailureResultFactory.stale_preflight_binding(
                                 provider=provider,
                                 tool_name=tool_name,
                             )
@@ -596,6 +605,7 @@ async def runtime_preflight_mcp_call(
             tool_name=tool_name,
             reason=decision.reason,
             scope=decision.scope,
+            offer_setup=True,
             suggested_tool=(
                 "generate_file" if tool_name == "generate_video" else None
             ),

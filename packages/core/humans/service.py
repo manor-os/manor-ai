@@ -287,6 +287,8 @@ async def resolve_commitment(
     if status == "fulfilled":
         commitment.fulfilled_at = _utcnow()
     await db.flush()
+    from packages.core.workspace_chat.context import invalidate
+    invalidate(commitment.workspace_id)
 
     event_type = _COMMITMENT_EVENT_BY_STATUS.get(status)
     if event_type:
@@ -318,7 +320,70 @@ async def resolve_commitment(
     # it. Local import keeps humans ⟂ proposals import-light.
     if commitment.source_kind == "proposal_item":
         await _sync_proposal_item_from_commitment(db, commitment, status)
+    await _close_human_request_chat(db, commitment, status=status)
     return commitment
+
+
+async def _close_human_request_chat(
+    db: AsyncSession,
+    commitment: HumanCommitment,
+    *,
+    status: str,
+) -> None:
+    """Close the linked HITL chat card for a resolved commitment.
+
+    Queue answers and chat-card answers share one commitment. Cards already
+    resolved through `/chat/messages/{id}/resolve` are skipped by
+    `resolved_at`. Unrelated pending_action cards stay open.
+    """
+    from packages.core.models.task import Conversation, Message
+
+    rows = list((await db.execute(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.workspace_id == commitment.workspace_id,
+            Conversation.entity_id == commitment.entity_id,
+            Message.message_kind == "hitl_request",
+            Message.resolved_at.is_(None),
+        )
+    )).scalars().all())
+    if not rows:
+        return
+
+    now = _utcnow()
+    if status == "fulfilled":
+        prefix = "Answered."
+    elif status == "declined":
+        prefix = "Declined."
+    else:
+        prefix = "Closed."
+    for msg in rows:
+        refs = msg.refs or []
+        pending = msg.pending_action if isinstance(msg.pending_action, dict) else {}
+        linked = pending.get("commitment_id") == commitment.id or any(
+            isinstance(ref, dict)
+            and ref.get("type") == "human_commitment"
+            and ref.get("id") == commitment.id
+            for ref in refs
+        )
+        if not linked:
+            continue
+        msg.resolved_at = now
+        if commitment.participant_id:
+            msg.resolved_by_user_id = commitment.participant_id
+        msg.resolution = {"choice": status, "source": "human_commitment"}
+        body = (msg.content or "").strip()
+        if body:
+            cleaned = "\n".join(
+                line for line in body.splitlines()
+                if "Respond (or decline) from the workspace Human queue." not in line
+            ).strip()
+            if not cleaned.startswith(("Answered.", "Declined.", "Closed.")):
+                msg.content = f"{prefix}\n\n{cleaned}" if cleaned else prefix
+        else:
+            msg.content = prefix
+    await db.flush()
 
 
 async def _sync_proposal_item_from_commitment(
@@ -330,7 +395,8 @@ async def _sync_proposal_item_from_commitment(
     its commitment resolves (fulfilled → succeeded; declined/expired →
     cancelled). Silent no-op when the item is missing or already
     terminal."""
-    from packages.core.models.proposal import ProposalItemRecord  # local: avoid cycle
+    from packages.core.models.proposal import ProposalItemRecord, ProposalRecord  # local: avoid cycle
+    from packages.core.proposals.lifecycle import resolve_proposal_if_settled
 
     item = await db.get(ProposalItemRecord, commitment.source_id)
     if item is None or item.status not in ("approved", "executing"):
@@ -343,6 +409,10 @@ async def _sync_proposal_item_from_commitment(
         item.status = "cancelled"
     item.finished_at = _utcnow()
     await db.flush()
+
+    record = await db.get(ProposalRecord, item.proposal_id)
+    if record is not None:
+        await resolve_proposal_if_settled(db, record, resolved_at=item.finished_at)
 
 
 async def resolve_commitments_for_step(

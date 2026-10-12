@@ -40,7 +40,6 @@ from typing import Any
 from celery.exceptions import SoftTimeLimitExceeded
 from sqlalchemy import select
 
-from packages.core.constants.channels import ExternalMessageActionKey
 from packages.core.constants.notification_types import (
     NotificationCallbackDisposition,
 )
@@ -223,6 +222,8 @@ async def _resolve_message_via_chat_service(
             HumanDecisionIntent.APPROVE_STANDING,
         }
         standing = decision_intent is HumanDecisionIntent.APPROVE_STANDING
+        if standing:
+            return {"ok": False, "error": "approval_command_retired", "message": "Use the versioned approval settings command to save a rule."}
         if decision_intent not in {
             HumanDecisionIntent.APPROVE,
             HumanDecisionIntent.APPROVE_STANDING,
@@ -475,17 +476,6 @@ async def _resolve_message_via_chat_service(
             if claim_conflict is not None:
                 await db.rollback()
                 return _approval_claim_conflict_result(claim_conflict)
-        if standing:
-            from packages.core.governance import add_auto_approve_action
-
-            await add_auto_approve_action(
-                db,
-                entity_id=payload_entity_id,
-                workspace_id=workspace_id,
-                action_key=ExternalMessageActionKey.SEND.value,
-                resource_id=standing_resource_id,
-                changed_by=responder_user_id,
-            )
         await chat_service.resolve_pending_action(
             db,
             message_id=chat_message_id,

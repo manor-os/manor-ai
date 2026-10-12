@@ -33,6 +33,9 @@ _TASK_UPDATE_PUBLISH_TASKS: set[asyncio.Task[None]] = set()
 _NOTIFICATION_QUEUE_KEY = "realtime_notifications"
 _NOTIFICATION_LISTENER_KEY = "realtime_notification_listener"
 _NOTIFICATION_PUBLISH_TASKS: set[asyncio.Task[None]] = set()
+_ROOM_QUEUE_KEY = "realtime_chat_room_updates"
+_ROOM_LISTENER_KEY = "realtime_chat_room_update_listener"
+_ROOM_PUBLISH_TASKS: set[asyncio.Task[None]] = set()
 
 
 # ── Per-user push ──────────────────────────────────────────────────────────
@@ -82,6 +85,111 @@ async def push_chat_stream_snapshot(user_id: str, snapshot: dict, *, entity_id: 
     at DEBUG, which looks exactly like the feature not working.
     """
     await _send_to_user(user_id, entity_id, "chat_stream_snapshot", snapshot)
+
+
+async def push_conversation_message(
+    user_id: str,
+    message: dict,
+    *,
+    entity_id: str,
+):
+    """Tell the owner that a durable personal Conversation message changed.
+
+    Ordinary personal replies stream over the request SSE connection. Background
+    producers such as Agent Initiative have no request to stream through, so
+    they use this refetch event after committing the Message row.
+    """
+    await _send_to_user(user_id, entity_id, "conversation_message", message)
+
+
+async def broadcast_chat_room_change(
+    room_id: str, *, kind: str = "changed", message_id: str | None = None,
+) -> None:
+    """Invalidate room projections; the relay rechecks membership before delivery.
+
+    No message body or member data travels over the shared Redis channel.
+    Rooms can contain people from different Entities, so Entity broadcast is
+    not an appropriate audience for this event.
+    """
+    if not room_id:
+        return
+    try:
+        data = {"room_id": room_id, "kind": kind}
+        if kind == "message" and message_id:
+            data["message_id"] = message_id
+        await _redis_publish({
+            "target": "chat_room",
+            "room_id": room_id,
+            "event": "chat_room_changed",
+            "data": data,
+        })
+    except Exception:
+        logger.debug("Could not broadcast chat room %s change", room_id, exc_info=True)
+
+
+def _publish_chat_room_updates_after_commit(session) -> None:
+    if session.in_nested_transaction():
+        return
+    queued = session.info.pop(_ROOM_QUEUE_KEY, [])
+    # Coalesce identical room/kind signals from one transaction. Retractions
+    # stay distinct so clients can refresh older, already-rendered messages.
+    events = dict.fromkeys(
+        (loop, room_id, kind, message_id)
+        for loop, room_id, kind, _, message_id in queued
+    )
+    message_rooms = {(loop, room_id) for loop, room_id, kind, _ in events if kind == "message"}
+    for loop, room_id, kind, message_id in events:
+        if kind == "changed" and (loop, room_id) in message_rooms:
+            continue
+        if loop.is_closed():
+            continue
+
+        def schedule(
+            room_id: str = room_id,
+            kind: str = kind,
+            message_id: str | None = message_id,
+            loop: asyncio.AbstractEventLoop = loop,
+        ) -> None:
+            if message_id is None:
+                task = loop.create_task(broadcast_chat_room_change(room_id, kind=kind))
+            else:
+                task = loop.create_task(broadcast_chat_room_change(
+                    room_id, kind=kind, message_id=message_id,
+                ))
+            _ROOM_PUBLISH_TASKS.add(task)
+            task.add_done_callback(_ROOM_PUBLISH_TASKS.discard)
+
+        if loop.is_running():
+            loop.call_soon_threadsafe(schedule)
+
+
+def _clear_chat_room_updates_after_rollback(session) -> None:
+    if not session.in_nested_transaction():
+        session.info.pop(_ROOM_QUEUE_KEY, None)
+
+
+def _clear_chat_room_updates_after_soft_rollback(session, previous_transaction) -> None:
+    if previous_transaction.nested:
+        session.info[_ROOM_QUEUE_KEY] = [
+            item for item in session.info.get(_ROOM_QUEUE_KEY, [])
+            if not _task_update_transaction_descends_from(item[3], previous_transaction)
+        ]
+
+
+def queue_chat_room_change_after_commit(
+    db: AsyncSession, room_id: str, *, kind: str = "changed", message_id: str | None = None,
+) -> None:
+    """Queue a room change only after the outer transaction commits."""
+    session = db.sync_session
+    session.info.setdefault(_ROOM_QUEUE_KEY, []).append((
+        asyncio.get_running_loop(), room_id, kind, session.get_nested_transaction(), message_id,
+    ))
+    if session.info.get(_ROOM_LISTENER_KEY):
+        return
+    event.listen(session, "after_commit", _publish_chat_room_updates_after_commit)
+    event.listen(session, "after_rollback", _clear_chat_room_updates_after_rollback)
+    event.listen(session, "after_soft_rollback", _clear_chat_room_updates_after_soft_rollback)
+    session.info[_ROOM_LISTENER_KEY] = True
 
 
 # ── Entity-wide broadcast ──────────────────────────────────────────────────

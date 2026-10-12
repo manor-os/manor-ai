@@ -68,6 +68,7 @@ const SUMMARY_KEYS = [
   "result",
 ];
 const COLLECTION_KEYS = ["tasks", "items", "results", "outputs", "files", "artifacts", "attachments", "documents", "steps"];
+const FILE_COLLECTION_KEYS = new Set(["files", "artifacts", "attachments", "documents"]);
 const INTERNAL_SUMMARY_KEYS = new Set([
   "id",
   "document_id",
@@ -284,9 +285,11 @@ function structuredList(label: string, values: unknown[], fallbackItem: string):
   return rows.length ? `**${label}**\n${rows.join("\n")}` : "";
 }
 
-function jsonFallback(value: unknown): string {
+function jsonFallback(value: unknown, excludeInternal = false): string {
   try {
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(value, excludeInternal
+      ? (key, child) => INTERNAL_SUMMARY_KEYS.has(key) || key.startsWith("_") ? undefined : child
+      : undefined, 2);
   } catch {
     return "";
   }
@@ -299,12 +302,12 @@ function indentBlock(value: string): string {
     .join("\n");
 }
 
-function structuredText(value: unknown, depth = 0): string {
+function structuredText(value: unknown, depth = 0, preserveFields = false): string {
   if (value === null || value === undefined) return "";
-  if (depth > 3) return jsonFallback(value);
+  if (depth > 3) return jsonFallback(value, preserveFields);
   if (typeof value === "string") {
     const parsed = tryParseJsonish(value);
-    if (parsed !== null) return structuredText(parsed, depth + 1);
+    if (parsed !== null) return structuredText(parsed, depth + 1, preserveFields);
     return formatUserFacingText(value);
   }
   if (typeof value === "number" || typeof value === "boolean") return scalarPreview(value);
@@ -312,7 +315,15 @@ function structuredText(value: unknown, depth = 0): string {
     if (value.length === 0) return "";
     const lines = value
       .slice(0, 8)
-      .map((item, index) => `- ${itemLabel(item, index, "Item")}`)
+      .map((item, index) => {
+        if (!preserveFields) return `- ${itemLabel(item, index, "Item")}`;
+        const rendered = structuredText(item, depth + 1, true).trim();
+        if (!rendered) return "";
+        return typeof item === "object"
+          ? `- **Item ${index + 1}:**\n${indentBlock(rendered)}`
+          : `- ${rendered}`;
+      })
+      .filter(Boolean)
       .filter((line) => line.trim() !== "-");
     if (value.length > 8) lines.push(`- ${value.length - 8} more`);
     return lines.join("\n");
@@ -320,13 +331,13 @@ function structuredText(value: unknown, depth = 0): string {
   if (typeof value !== "object") return "";
 
   const obj = value as Record<string, any>;
-  for (const key of SUMMARY_KEYS) {
+  for (const key of preserveFields ? [] : SUMMARY_KEYS) {
     if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
     const candidate = structuredText(obj[key], depth + 1).trim();
     if (candidate) return candidate;
   }
 
-  if (Array.isArray(obj.files) || Array.isArray(obj.artifacts) || Array.isArray(obj.attachments) || Array.isArray(obj.documents)) {
+  if (!preserveFields && (Array.isArray(obj.files) || Array.isArray(obj.artifacts) || Array.isArray(obj.attachments) || Array.isArray(obj.documents))) {
     const files = (obj.files || obj.artifacts || obj.attachments || obj.documents) as unknown[];
     const rows = files
       .slice(0, 6)
@@ -336,7 +347,7 @@ function structuredText(value: unknown, depth = 0): string {
     if (rows.length) return `**Files**\n${rows.join("\n")}`;
   }
 
-  for (const key of COLLECTION_KEYS) {
+  for (const key of preserveFields ? [] : COLLECTION_KEYS) {
     if (!Array.isArray(obj[key]) || obj[key].length === 0) continue;
     const label = formatUserFacingLabel(key);
     const item = key === "steps" ? "Step" : key === "tasks" ? "Task" : key === "files" ? "File" : "Item";
@@ -346,17 +357,26 @@ function structuredText(value: unknown, depth = 0): string {
 
   const rows: string[] = [];
   for (const [key, rawValue] of Object.entries(obj)) {
-    if (rows.length >= 6) break;
-    if (INTERNAL_SUMMARY_KEYS.has(key) || rawValue === null || rawValue === undefined || rawValue === "") continue;
-    const rendered = Array.isArray(rawValue) || typeof rawValue === "object"
-      ? structuredText(rawValue, depth + 1).trim() || jsonFallback(rawValue)
-      : scalarPreview(rawValue);
+    if (!preserveFields && rows.length >= 6) break;
+    if (INTERNAL_SUMMARY_KEYS.has(key) || (preserveFields && key.startsWith("_")) || rawValue === null || rawValue === undefined || rawValue === "") continue;
+    let rendered: string;
+    if (preserveFields && FILE_COLLECTION_KEYS.has(key) && Array.isArray(rawValue)) {
+      const files = rawValue.slice(0, 6).map((file, index) => `- ${fileLabel(file, index)}`);
+      if (rawValue.length > 6) files.push(`- ${rawValue.length - 6} more`);
+      rendered = files.join("\n");
+    } else if (preserveFields) {
+      rendered = structuredText(rawValue, depth + 1, true).trim();
+    } else {
+      rendered = Array.isArray(rawValue) || typeof rawValue === "object"
+        ? structuredText(rawValue, depth + 1).trim() || jsonFallback(rawValue)
+        : scalarPreview(rawValue);
+    }
     if (!rendered) continue;
     rows.push(rendered.includes("\n")
       ? `- **${formatUserFacingLabel(key)}:**\n${indentBlock(rendered)}`
       : `- **${formatUserFacingLabel(key)}:** ${rendered}`);
   }
-  return rows.join("\n") || jsonFallback(value);
+  return rows.join("\n") || (preserveFields ? "" : jsonFallback(value));
 }
 
 export function formatUserFacingLabel(value?: string | null): string {
@@ -423,7 +443,7 @@ export function formatUserFacingText(value?: string | null): string {
     .replace(/\bworkspace_update_task_runtime\b/gi, "task guidance update")
     .replace(/\bWorkspace Update Task Runtime\b/gi, "Task guidance update")
     .replace(/\bworkspace update task runtime\b/gi, "task guidance update")
-    .replace(/\bworkspace\s+runtime\b/gi, "workspace work history")
+    .replace(/\bworkspace\s+runtime\b/gi, "workspace settings")
     .replace(/\bworker\s+runtime\b/gi, "agent run")
     .replace(/\bruntime\s+requirements?\b/gi, "task constraints")
     .replace(/\bruntime\s+requirement\b/gi, "task constraint")
@@ -506,8 +526,13 @@ export function formatUserFacingStructuredText(value?: unknown): string {
 
 export function formatTaskOutputSummary(output?: Record<string, unknown> | null): string {
   if (!output) return "";
-  for (const key of ["summary", "result_summary", "message", "text", "result", "results"]) {
-    const rendered = formatUserFacingStructuredText(output[key]).trim();
+  for (const key of ["result", "results", "summary", "result_summary", "message", "text"]) {
+    // A formal business payload is not a short log preview: files or one
+    // summary field must not hide its other delivered fields. The executor
+    // can save both result and a prose summary; use prose only as a fallback.
+    const rendered = (key === "result" || key === "results"
+      ? structuredText(output[key], 0, true)
+      : formatUserFacingStructuredText(output[key])).trim();
     if (rendered) return rendered;
   }
   return "";

@@ -1,0 +1,23 @@
+{
+  "id": "remotion-maps",
+  "name": "remotion-maps",
+  "display_name": "Remotion Maps",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Create animated maps in Remotion videos.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "maps",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["mapbox", "geo animation", "travel route", "map video", "location pins", "flight path", "geography"],
+    "examples": ["animated route map between cities", "map scene with markers remotion", "camera zoom on map location", "geographic overlay video animation"]
+  }
+}

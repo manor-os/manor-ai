@@ -100,10 +100,11 @@ KNOWN_FLAGS: tuple[KnownFlag, ...] = (
         default_enabled=False,
     ),
     KnownFlag(
-        key="tool_discovery_v2",
+        key="task_agent_loop",
         description=(
-            "On: agents use server-first tool search plus intent-path memory "
-            "when picking tools. Off (default): the legacy tool catalog."
+            "On: new Workspace Task runs execute as one durable agent loop. "
+            "Read once when a run is created; in-flight runs keep their engine. "
+            "Off (default): Plan/Step DAG coordinator."
         ),
         default_enabled=False,
     ),

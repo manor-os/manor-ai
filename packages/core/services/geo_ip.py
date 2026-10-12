@@ -1,14 +1,13 @@
 """Geo-IP enrichment for session records.
 
-Uses ip-api.com's free tier (45 req/min/IP, no key, no commercial-use
-restriction in this read-only diagnostic context) with a Redis cache
-keyed by IP. The cache is the workhorse: once a user's IP is seen the
-result lives for 30 days, so steady-state load is one external call
-per new visitor IP per month.
+Uses ip-api.com with a Redis cache. GEO_IP_API_KEY selects the commercial
+HTTPS endpoint. Legacy session consumers retain their existing HTTP fallback;
+new registration lookups require HTTPS and never fall back to plaintext.
+The free endpoint does not permit commercial use; configure the key before
+enabling this integration in a commercial deployment.
 
-Failure-tolerant by design — every consumer gets ``None`` on timeout,
-rate-limit, parse error, or missing Redis. Geo data is never on the
-critical path; missing it just means the admin column reads "—".
+Provider failures return ``None``; Redis failures bypass the cache. Signup
+bounds enrichment to two seconds and retains UTC if a timezone is unavailable.
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import json
 import logging
 import os
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -28,8 +28,18 @@ _TTL_SECONDS = int(os.getenv("GEO_IP_CACHE_TTL_SECONDS", str(60 * 60 * 24 * 30))
 _HTTP_TIMEOUT = float(os.getenv("GEO_IP_HTTP_TIMEOUT", "3.0"))
 _ENDPOINT = (
     "http://ip-api.com/json/{ip}"
-    "?fields=status,country,countryCode,city,lat,lon"
+    "?fields=status,country,countryCode,city,lat,lon,timezone"
 )
+
+
+def valid_timezone(value: object) -> str | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        ZoneInfo(value)
+        return value
+    except (ValueError, ZoneInfoNotFoundError):
+        return None
 
 
 def _redis():
@@ -67,13 +77,12 @@ def _is_private(ip: str) -> bool:
     )
 
 
-async def lookup_geo(ip: Optional[str]) -> Optional[dict]:
-    """Resolve ``ip`` to ``{country_code, country, city}`` (any field may be empty).
+async def lookup_geo(ip: Optional[str], *, require_https: bool = False) -> Optional[dict]:
+    """Resolve IP to coarse location, coordinates and a validated IANA timezone.
 
     Returns ``None`` for: missing input, private/loopback IPs, cache + API
-    misses, or any error. Result is cached in Redis for 30 days (positive
-    AND negative — a negative cache row avoids re-hammering the API for
-    the same junk IP).
+    misses, or provider errors. Positive results are cached for 30 days by
+    default; misses for at most five minutes, so transient failures can recover.
     """
     if not ip:
         return None
@@ -81,24 +90,38 @@ async def lookup_geo(ip: Optional[str]) -> Optional[dict]:
     if not ip or _is_private(ip):
         return None
 
-    cache_key = _REDIS_KEY_FMT.format(ip=ip)
+    from packages.core.config import get_settings
+
+    api_key = get_settings().GEO_IP_API_KEY
+    if require_https and not api_key:
+        return None
+    # Never use a plaintext-derived cache entry for registration defaults.
+    cache_key = f"geo:https:v2:{ip}" if api_key else _REDIS_KEY_FMT.format(ip=ip)
     client = _redis()
+    try:
+        return await _lookup_with_cache(ip, api_key, cache_key, client)
+    finally:
+        # Registration's total timeout can cancel during Redis or HTTP IO.
+        await _close(client)
+
+
+async def _lookup_with_cache(ip: str, api_key: str, cache_key: str, client) -> Optional[dict]:
     cached: Optional[str] = None
     if client is not None:
         try:
             cached = await client.get(cache_key)
         except Exception as exc:
-            logger.debug("geo_ip: cache get failed for %s: %s", ip, exc)
+            logger.debug("geo_ip: cache get failed (%s)", type(exc).__name__)
 
     if cached:
         try:
             parsed = json.loads(cached)
             # Negative cache row → return None without hitting API again.
-            if parsed is None or parsed.get("__miss"):
-                await _close(client)
+            if parsed is None or (isinstance(parsed, dict) and parsed.get("__miss")):
                 return None
-            await _close(client)
-            return parsed
+            if isinstance(parsed, dict):
+                parsed["timezone"] = valid_timezone(parsed.get("timezone"))
+                return parsed
         except json.JSONDecodeError:
             # Corrupted entry — fall through and refetch.
             pass
@@ -106,7 +129,13 @@ async def lookup_geo(ip: Optional[str]) -> Optional[dict]:
     payload: Optional[dict] = None
     try:
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as http:
-            resp = await http.get(_ENDPOINT.format(ip=ip))
+            if api_key:
+                resp = await http.get(
+                    f"https://pro.ip-api.com/json/{ip}",
+                    params={"key": api_key, "fields": "status,country,countryCode,city,lat,lon,timezone"},
+                )
+            else:
+                resp = await http.get(_ENDPOINT.format(ip=ip))
         if resp.status_code == 200:
             data = resp.json()
             if data.get("status") == "success":
@@ -126,17 +155,18 @@ async def lookup_geo(ip: Optional[str]) -> Optional[dict]:
                     "city": (data.get("city") or None),
                     "latitude": lat,
                     "longitude": lon,
+                    "timezone": valid_timezone(data.get("timezone")),
                 }
     except Exception as exc:
         # Don't escalate: callers expect None on any failure.
-        logger.warning("geo_ip: lookup failed for %s: %s", ip, exc)
+        # HTTP exceptions can contain the full URL, including an IP and key.
+        logger.warning("geo_ip: lookup failed (%s)", type(exc).__name__)
 
     if client is not None:
         try:
             to_store = json.dumps(payload if payload else {"__miss": True})
-            await client.setex(cache_key, _TTL_SECONDS, to_store)
+            await client.setex(cache_key, _TTL_SECONDS if payload else min(_TTL_SECONDS, 300), to_store)
         except Exception as exc:
-            logger.debug("geo_ip: cache write failed for %s: %s", ip, exc)
-        await _close(client)
+            logger.debug("geo_ip: cache write failed (%s)", type(exc).__name__)
 
     return payload

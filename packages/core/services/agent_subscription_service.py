@@ -22,11 +22,12 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.channel import ChannelContact
 from packages.core.models.document import Channel
-from packages.core.models.workspace import AgentSubscription
+from packages.core.models.workspace import Agent, AgentSubscription
 from packages.core.services.reusable_resource_locks import (
     RESOURCE_AGENT,
     lock_reusable_resource_reference,
@@ -73,7 +74,7 @@ async def resolve_exact_binding_subscription(
             AgentSubscription.entity_id == entity_id,
             AgentSubscription.status == "active",
             Workspace.entity_id == entity_id,
-            Workspace.status == "active",
+            Workspace.status.in_(("active", "paused")),
             Workspace.deleted_at.is_(None),
         )
         .with_for_update()
@@ -168,6 +169,32 @@ def _from_row(sub: AgentSubscription, *, source: str) -> ResolvedSubscription:
 
 # ── Ensure ──────────────────────────────────────────────────────────────────
 
+
+async def _ensure_master_backing_agent(db: AsyncSession) -> None:
+    """Materialise the hidden FK identity without creating a deployment."""
+    from packages.core.constants.agents import MANOR_AGENT_ID, MANOR_AGENT_NAME
+
+    if await db.get(Agent, MANOR_AGENT_ID) is not None:
+        return
+    try:
+        async with db.begin_nested():
+            db.add(Agent(
+                id=MANOR_AGENT_ID,
+                entity_id=None,
+                name=MANOR_AGENT_NAME,
+                slug="manor-master-runtime",
+                description="Internal backing identity for durable Manor AI deployments",
+                config={"virtual_master": True},
+                is_template=True,
+                is_public=False,
+                source="system",
+                status="active",
+            ))
+            await db.flush()
+    except IntegrityError:
+        pass
+
+
 async def ensure_default_subscription(
     db: AsyncSession,
     *,
@@ -191,11 +218,22 @@ async def ensure_default_subscription(
             (AgentSubscription.workspace_id == workspace_id)
             if workspace_id is not None
             else AgentSubscription.workspace_id.is_(None),
+            # Personal Initiative/DM deployments share workspace_id=NULL but
+            # are never candidates for an entity-wide legacy channel binding.
+            *(
+                (AgentSubscription.owner_user_id.is_(None),)
+                if workspace_id is None
+                else ()
+            ),
         ).limit(1)
     )).scalar_one_or_none()
     if existing:
         return existing
 
+    from packages.core.constants.agents import is_master_agent
+
+    if is_master_agent(agent_id):
+        await _ensure_master_backing_agent(db)
     await lock_reusable_resource_reference(
         db,
         entity_id=entity_id,
@@ -212,6 +250,94 @@ async def ensure_default_subscription(
     db.add(sub)
     await db.flush()
     return sub
+
+
+async def ensure_personal_subscription(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    agent_id: str,
+    owner_user_id: str,
+    name: Optional[str] = None,
+) -> AgentSubscription:
+    """Find or create one owner-scoped, Workspace-free Agent deployment.
+
+    This intentionally does not reuse ``ensure_default_subscription``: its
+    historic Workspace-NULL rows are entity-wide and have no owner identity.
+    Initiative and personal DM state must never cross that legacy boundary.
+
+    Manor's first-party master is normally virtual.  We materialise one hidden
+    platform backing row only when a user asks for durable subscription-owned
+    behaviour; runtime still recognizes it through ``is_master_agent``.
+    """
+    from packages.core.constants.agents import (
+        MANOR_AGENT_ID,
+        is_master_agent,
+    )
+
+    clean_owner = str(owner_user_id or "").strip()
+    if not clean_owner:
+        raise ValueError("owner_user_id is required for a personal subscription")
+
+    existing = (await db.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.entity_id == entity_id,
+            AgentSubscription.agent_id == agent_id,
+            AgentSubscription.workspace_id.is_(None),
+            AgentSubscription.owner_user_id == clean_owner,
+        ).limit(1)
+    )).scalar_one_or_none()
+    if existing:
+        if existing.status != "active":
+            existing.status = "active"
+            await db.flush()
+        return existing
+
+    if is_master_agent(agent_id):
+        await _ensure_master_backing_agent(db)
+    else:
+        await lock_reusable_resource_reference(
+            db,
+            entity_id=entity_id,
+            resource_type=RESOURCE_AGENT,
+            resource_id=agent_id,
+        )
+        agent = (await db.execute(
+            select(Agent.id).where(
+                Agent.id == agent_id,
+                Agent.status == "active",
+                Agent.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if agent is None:
+            raise ValueError("Agent not found")
+
+    sub = AgentSubscription(
+        entity_id=entity_id,
+        agent_id=MANOR_AGENT_ID if is_master_agent(agent_id) else agent_id,
+        owner_user_id=clean_owner,
+        workspace_id=None,
+        name=name or "Personal",
+        status="active",
+    )
+    try:
+        async with db.begin_nested():
+            db.add(sub)
+            await db.flush()
+        return sub
+    except IntegrityError:
+        # The partial unique index is the concurrency authority.
+        winner = (await db.execute(
+            select(AgentSubscription).where(
+                AgentSubscription.entity_id == entity_id,
+                AgentSubscription.agent_id == sub.agent_id,
+                AgentSubscription.workspace_id.is_(None),
+                AgentSubscription.owner_user_id == clean_owner,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if winner is None:
+            raise
+        return winner
 
 
 # ── Convenience: force a resolution to be backed by a real row ──────────────
@@ -256,5 +382,6 @@ __all__ = [
     "resolve_exact_binding_subscription",
     "resolve_subscription",
     "ensure_default_subscription",
+    "ensure_personal_subscription",
     "materialise_legacy",
 ]

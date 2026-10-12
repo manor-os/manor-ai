@@ -167,11 +167,18 @@ demo@manor.local / manor-demo
 | Agent 运行时 | 工具调用循环、技能、受限工具、人工审批、任务执行器与目标工作流。 |
 | 沙箱 | 面向产码工具与产文件流程的隔离执行服务。 |
 | 集成 | Webhook、OAuth 提供商配置、可选 Nango、API 密钥、MCP 目录与连接器界面。 |
+| 协作 | CRM、Team & Clients、资源权限与经授权的同实例客户交付。 |
+| 蓝图 | 可移植 JSON 导出/安装、模拟与来自已注册已发布来源的升级。 |
 | 文档与运维 | Docusaurus 文档、Docker Compose 指南、配置指南、安全说明、备份/恢复与升级文档。 |
 
 公开的 OSS 代码树面向自托管部署与本地评估。托管服务、私有部署自动化与
 商业云运营不在本仓库范围内。若要扩展 Manor AI,请从上述 OSS 界面入手:
 工具、技能、worker、webhook、OpenAPI 客户端与部署配置。
+
+自托管由一个部署运营主体管理，可保留多个用户和 Entity 的现有隔离。所有 AI
+入口均使用当前 Entity 的 BYOK 配置，不使用平台密钥。Chrome/CLI/Remote Coding/
+原生移动客户端、托管市场和精选商业产品包不在公开分发范围；许可证对第三方
+托管服务的现有限制不变。
 
 ## 扩展 Manor AI
 

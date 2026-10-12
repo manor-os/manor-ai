@@ -141,6 +141,7 @@ class RuntimeDynamicMCPToolBinding:
     provider: str
     action: str
     expires_at: float
+    schema: dict[str, Any] | None = None
     account_ids: tuple[str, ...] = ()
     effect: str = "write"
     requires_explicit_account: bool = False
@@ -163,6 +164,11 @@ class RuntimeDynamicMCPToolBindingFactory:
         return RuntimeDynamicMCPToolBinding(
             provider=str(getattr(tool, "provider", "") or ""),
             action=str(getattr(tool, "action", "") or ""),
+            schema=(
+                dict(getattr(tool, "schema"))
+                if isinstance(getattr(tool, "schema", None), dict)
+                else None
+            ),
             account_ids=tuple(getattr(tool, "account_ids", ()) or ()),
             effect=str(effect or "write"),
             requires_explicit_account=bool(
@@ -261,7 +267,7 @@ class RuntimeDynamicMCPFailureResultFactory:
 
     @staticmethod
     def stale_binding(*, provider: str, tool_name: str) -> str:
-        """Build the internal retry signal for a changed discovery boundary."""
+        """Describe drift without claiming whether a handler was entered."""
 
         return json.dumps({
             "server": provider,
@@ -273,6 +279,21 @@ class RuntimeDynamicMCPFailureResultFactory:
             ),
             "retryable": True,
         })
+
+    @staticmethod
+    def stale_preflight_binding(*, provider: str, tool_name: str) -> str:
+        """Host proof of binding drift before approval and effect intent.
+
+        Handler-side drift uses ``stale_binding``: an intent may already exist
+        and must not be discarded by a schema refresh or automatic retry.
+        """
+        from packages.core.ai.runtime.tool_results import RuntimePreflightValidationError
+
+        return RuntimePreflightValidationError(
+            RuntimeDynamicMCPFailureResultFactory.stale_binding(
+                provider=provider, tool_name=tool_name,
+            )
+        )
 
 
 async def runtime_discover_official_remote_mcp_tools(
@@ -451,6 +472,38 @@ def runtime_dynamic_mcp_result_is_stale(result: Any) -> bool:
         isinstance(payload, dict)
         and payload.get("error") == RuntimeDynamicMCPErrorCode.STALE_BINDING.value
     )
+
+
+def runtime_builtin_mcp_tool_handler(server_key: str, tool_name: str) -> Callable:
+    """Build a builtin MCP server's permission-aware dispatcher for one tool.
+
+    Runtime-owned bridge: services never import ``packages.core.ai.tools``
+    directly (``test_production_tool_to_tool_imports_stay_runtime_owned``).
+    """
+
+    from packages.core.ai.tools.mcp_builtin import _build_handler
+
+    return _build_handler(server_key, tool_name)
+
+
+async def runtime_resolve_mcp_bearer_token(**kwargs: Any) -> Any:
+    """Resolve a builtin MCP server's bearer token for one actor and scope.
+
+    Runtime-owned bridge over ``mcp_builtin._resolve_bearer_token`` so
+    services never import ``packages.core.ai.tools`` directly.
+    """
+
+    from packages.core.ai.tools.mcp_builtin import _resolve_bearer_token
+
+    return await _resolve_bearer_token(**kwargs)
+
+
+def runtime_mcp_runtime_only_argument_keys() -> frozenset[str]:
+    """Argument keys the runtime injects into MCP calls; never user-approved fields."""
+
+    from packages.core.ai.tools.mcp_builtin import _MCP_RUNTIME_ONLY_ARGUMENT_KEYS
+
+    return _MCP_RUNTIME_ONLY_ARGUMENT_KEYS
 
 
 def runtime_dynamic_mcp_tool_handler(

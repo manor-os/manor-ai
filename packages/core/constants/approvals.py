@@ -64,6 +64,23 @@ class ApprovalStatus(str, Enum):
         return [member.value for member in cls]
 
 
+class ApprovalConsumeOutcome(str, Enum):
+    """Result of atomically spending a one-time approval grant.
+
+    This is intentionally separate from :class:`ApprovalStatus`: status is the
+    durable row lifecycle, while this outcome identifies whether *this*
+    transaction won the ``granted -> consumed`` compare-and-swap.  Callers at
+    an external-I/O boundary may proceed only on ``CONSUMED``.
+    """
+
+    CONSUMED = "consumed"
+    ALREADY_CONSUMED = "already_consumed"
+    NOT_GRANTED = "not_granted"
+
+    __str__ = str.__str__
+    __format__ = str.__format__
+
+
 #: Statuses that still block. Membership, not equality, so a second open
 #: state (if one is ever added) reaches every read model at once.
 APPROVAL_OPEN_STATUSES: tuple[str, ...] = (ApprovalStatus.PENDING.value,)
@@ -290,4 +307,5 @@ LEASE_KIND_HITL_TYPES: dict[str, str] = {
     PendingActionKind.NEEDS_INPUT.value: HitlType.INPUT.value,
     PendingActionKind.NEEDS_LOGIN.value: HitlType.INPUT.value,
     PendingActionKind.NEEDS_CONFIRMATION.value: HitlType.AUTHORIZE.value,
+    PendingActionKind.EFFECT_RECONCILIATION.value: HitlType.ERROR.value,
 }

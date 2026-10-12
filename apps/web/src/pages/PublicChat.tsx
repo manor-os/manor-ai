@@ -7,6 +7,11 @@ import { ReadAloudButton, VoiceInputButton, VoiceInputStatus } from "../componen
 import LiveChatCallButton from "../components/chat/LiveChatCallButton";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import WebchatPageLayout from "../components/webchat/WebchatPageLayout";
+import ResidentAccountPanel from "../components/webchat/ResidentAccountPanel";
+import ResidentMaintenanceDraftPanel from "../components/webchat/ResidentMaintenanceDraftPanel";
+import { createPublicChatRequestFence } from "../lib/publicChatRequestFence";
+import { useResidentWebchat } from "../lib/useResidentWebchat";
+import { useResidentMaintenanceDrafts } from "../lib/useResidentMaintenanceDrafts";
 import { api, ApiError } from "../lib/api";
 import { tForLocale } from "../lib/i18n";
 import { useChatVoiceInput } from "../lib/useChatVoiceInput";
@@ -32,6 +37,7 @@ interface ChatInfo {
   signup_url?: string | null;
   auth_hint?: string | null;
   public_page?: unknown;
+  resident_pms?: { enabled: boolean; display_name: string | null };
 }
 
 type CustomerAuthMode = "login" | "register" | "verify";
@@ -178,6 +184,27 @@ export default function PublicChat() {
   const lastActivityAtRef = useRef(Date.now());
   const sendingRef = useRef(false);
   const resumeAttemptedForTokenRef = useRef<string | null>(null);
+  const requestFence = useRef(createPublicChatRequestFence()).current;
+  const cancelAudio = useRef<() => void>(() => {});
+  const [audioGeneration, setAudioGeneration] = useState(0);
+  const clearSensitiveView = useCallback(() => {
+    setMessages([]); setInput(""); setAttachedFiles([]);
+    lastServerMessageIdRef.current = ""; pendingServerMessageIdsRef.current.clear();
+    if (pollRef.current) clearTimeout(pollRef.current);
+    sendingRef.current = false; setSending(false);
+    cancelAudio.current(); setAudioGeneration(value => value + 1);
+  }, []);
+  const resident = useResidentWebchat({
+    token, sessionId, fence: requestFence, headers: authHeaders,
+    onInvalidate: clearSensitiveView,
+    onDisconnected: startNewPublicChat,
+  });
+  const residentDrafts = useResidentMaintenanceDrafts({
+    token, sessionId, fence: requestFence, headers: authHeaders,
+    readReady: Boolean(info?.resident_pms?.enabled) && resident.phase === "verified" && resident.historyAllowed,
+    onReadInvalid: unavailable => resident.invalidate(unavailable ? "unavailable" : "expired"),
+    refreshKey: `${messages.length}:${sending}`,
+  });
   const isEmbedded = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("embed") === "1";
   const shellStyle = isEmbedded
     ? { ...styles.embedContainer, ...embeddedThemeVariables(true) }
@@ -195,37 +222,44 @@ export default function PublicChat() {
     page: info?.public_page,
     language: info?.language,
     enabled: !isEmbedded,
-    onPrepareMessage: started && sessionId && !sending && !accessDenied ? (message: string) => {
+    onPrepareMessage: started && sessionId && resident.historyAllowed && !sending && !accessDenied ? (message: string) => {
       setInput(previous => previous.trim() ? `${previous}\n\n${message}` : message);
       requestAnimationFrame(() => {
         textareaRef.current?.focus();
         textareaRef.current?.scrollIntoView({ block: "center" });
       });
     } : undefined,
-    onRunAction: started && sessionId && token && !sending && !accessDenied ? async (moduleId: string, values: Record<string, string>, submissionId: string) => {
-      const response = await fetch(`${API_BASE}/${token}/actions/${encodeURIComponent(moduleId)}`, {
-        method: "POST",
-        headers: authHeaders(),
-        body: JSON.stringify({ session_id: sessionId, submission_id: submissionId, values }),
-      });
-      if (response.status === 401) {
-        setCurrentUser(null);
-        setStarted(false);
-      }
-      if (!response.ok) throw new Error("Public action failed");
+    onRunAction: started && sessionId && resident.historyAllowed && token && !sending && !accessDenied ? async (moduleId: string, values: Record<string, string>, submissionId: string) => {
+      const request = requestFence.begin();
+      try {
+        const response = await fetch(`${API_BASE}/${token}/actions/${encodeURIComponent(moduleId)}`, {
+          method: "POST",
+          credentials: "include", signal: request.signal,
+          headers: authHeaders(),
+          body: JSON.stringify({ session_id: sessionId, submission_id: submissionId, values }),
+        });
+        if (!request.isCurrent()) throw new Error("Session changed");
+        if (response.status === 401 || response.status === 403) {
+          resident.invalidate();
+          if (response.status === 401) { setCurrentUser(null); setStarted(false); }
+        }
+        if (!response.ok) throw new Error("Public action failed");
+      } finally { request.release(); }
     } : undefined,
   };
 
-  const voiceScope = { publicToken: token, sessionId };
+  const voiceScope = { publicToken: token, sessionId: resident.historyAllowed ? sessionId : null };
   const voice = useChatVoiceInput({
     scope: voiceScope,
-    disabled: sending || !started || !sessionId,
+    disabled: sending || !started || !sessionId || !resident.historyAllowed,
     locale: info?.language || "en",
     onTranscript: (text) => {
       setInput((previous) => previous ? `${previous.trimEnd()} ${text}` : text);
       textareaRef.current?.focus();
     },
   });
+
+  cancelAudio.current = voice.cancel;
 
   // Fetch chat info
   useEffect(() => {
@@ -273,10 +307,15 @@ export default function PublicChat() {
   }, []);
 
   // Start session
-  const startChat = useCallback(async (userOverride?: PublicChatUser | null) => {
+  const startChat = useCallback(async (userOverride?: PublicChatUser | null, fresh = false) => {
     if (!token) return;
     const effectiveUser = userOverride ?? currentUser;
-    const storedSessionId = getStoredSessionId(token);
+    const storedSessionId = fresh ? null : getStoredSessionId(token);
+    // A remembered ID alone must never reload a resident-private conversation.
+    if (storedSessionId && !await resident.check(storedSessionId)) {
+      setSessionId(storedSessionId); setStarted(true);
+      return;
+    }
     const effectiveName = info?.login_required
       ? displayNameForUser(effectiveUser)
       : visitorName || undefined;
@@ -287,10 +326,16 @@ export default function PublicChat() {
     };
     let res = await fetch(`${API_BASE}/${token}/session`, {
       method: "POST",
+      credentials: "include",
       headers: authHeaders(),
       body: JSON.stringify(sessionPayload),
     });
     if (res.status === 401) {
+      const code = await publicChatForbiddenCode(res);
+      resident.invalidate();
+      if (code === "resident_auth_required" && storedSessionId) {
+        setSessionId(storedSessionId); setStarted(true); return;
+      }
       setCurrentUser(null);
       return;
     }
@@ -306,6 +351,7 @@ export default function PublicChat() {
       setMessages([]);
       res = await fetch(`${API_BASE}/${token}/session`, {
         method: "POST",
+        credentials: "include",
         headers: authHeaders(),
         body: JSON.stringify({ ...sessionPayload, session_id: undefined }),
       });
@@ -320,7 +366,16 @@ export default function PublicChat() {
     setSessionId(data.session_id);
     saveStoredSessionId(token, data.session_id);
     setStarted(true);
-  }, [token, info?.login_required, currentUser, visitorName, customerText]);
+  }, [token, info?.login_required, currentUser, visitorName, customerText, resident.check, resident.invalidate]);
+
+  function startNewPublicChat() {
+    // Forgetting this browser's session is independent of revoking its grant.
+    // Missing proof must still deny access to the old private conversation.
+    resident.invalidate("checking");
+    forgetStoredSessionId(token);
+    setSessionId(null); setStarted(false); setError(null); setAccessDenied(false);
+    void startChat(undefined, true);
+  }
 
   useEffect(() => {
     if (!token || !info || started || sessionId) return;
@@ -346,7 +401,7 @@ export default function PublicChat() {
 
   // Poll for messages
   useEffect(() => {
-    if (!token || !sessionId || error) return;
+    if (!token || !sessionId || error || !resident.historyAllowed) return;
     let active = true;
     lastServerMessageIdRef.current = "";
     pendingServerMessageIdsRef.current.clear();
@@ -356,6 +411,7 @@ export default function PublicChat() {
       return Date.now() - lastActivityAtRef.current < 60_000 ? 2_000 : 8_000;
     };
     const poll = async () => {
+      const request = requestFence.begin();
       try {
         const lastId = lastServerMessageIdRef.current;
         const params = new URLSearchParams({ session_id: sessionId, after: lastId });
@@ -364,16 +420,20 @@ export default function PublicChat() {
         }
         const res = await fetch(
           `${API_BASE}/${token}/messages?${params}`,
-          { headers: authHeaders(), cache: "no-store" }
+          { headers: authHeaders(), credentials: "include", cache: "no-store", signal: request.signal }
         );
-        if (!active) return;
+        if (!active || !request.isCurrent()) return;
         if (res.status === 401) {
+          const code = await publicChatForbiddenCode(res);
+          resident.invalidate();
+          if (code === "resident_auth_required") return;
           setCurrentUser(null);
           setStarted(false);
           return;
         }
         if (res.status === 403) {
           const code = await publicChatForbiddenCode(res);
+          resident.invalidate();
           if (!active) return;
           if (code === "session_mismatch") {
             forgetStoredSessionId(token);
@@ -386,9 +446,12 @@ export default function PublicChat() {
           }
           return;
         }
-        if (!res.ok) return;
+        if (!res.ok) {
+          if (res.status === 503 && await publicChatForbiddenCode(res) === "resident_unavailable") resident.invalidate("unavailable");
+          return;
+        }
         const data = await res.json();
-        if (!active) return;
+        if (!active || !request.isCurrent()) return;
         const canApply = (msg: ChatMessage) => !(sendingRef.current && msg.role === "assistant");
         const serverMessages: ChatMessage[] = [];
         for (const msg of (data.messages || []) as ChatMessage[]) {
@@ -410,8 +473,11 @@ export default function PublicChat() {
           if (next !== prev) lastActivityAtRef.current = Date.now();
           return next;
         });
+      } catch {
+        // Session status rechecks separately; failed reads never populate the view.
       } finally {
-        if (active) pollRef.current = setTimeout(poll, nextDelay());
+        if (active && request.isCurrent()) pollRef.current = setTimeout(poll, nextDelay());
+        request.release();
       }
     };
     poll();
@@ -419,7 +485,7 @@ export default function PublicChat() {
       active = false;
       if (pollRef.current) clearTimeout(pollRef.current);
     };
-  }, [token, sessionId, error, customerText]);
+  }, [token, sessionId, error, customerText, resident.historyAllowed, resident.invalidate, requestFence]);
 
   // Auto-scroll
   useEffect(() => {
@@ -434,6 +500,7 @@ export default function PublicChat() {
   }, [input]);
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!resident.historyAllowed) { e.target.value = ""; return; }
     const files = Array.from(e.target.files || []);
     if (files.length) {
       setAttachedFiles((prev) => [...prev, ...files]);
@@ -447,7 +514,8 @@ export default function PublicChat() {
 
   // Send message with SSE streaming
   const send = async () => {
-    if ((!input.trim() && attachedFiles.length === 0) || !token || !sessionId || sending || voice.busy) return;
+    if ((!input.trim() && attachedFiles.length === 0) || !token || !sessionId || sending || voice.busy || !resident.historyAllowed) return;
+    const request = requestFence.begin();
     const text = input.trim();
     const filesToSend = [...attachedFiles];
     const displayContent = text || (filesToSend.length ? `[Attached: ${filesToSend.map((file) => file.name).join(", ")}]` : "");
@@ -481,6 +549,7 @@ export default function PublicChat() {
       nextId?: string,
       replace = true,
     ) => {
+      if (!request.isCurrent()) return;
       lastActivityAtRef.current = Date.now();
       setMessages((prev) =>
         prev.map((msg) =>
@@ -504,10 +573,15 @@ export default function PublicChat() {
       filesToSend.forEach((file) => form.append("files", file));
       const res = await fetch(`${API_BASE}/${token}/message/stream`, {
         method: "POST",
+        credentials: "include", signal: request.signal,
         headers: authBearerHeaders(),
         body: form,
       });
+      if (!request.isCurrent()) return;
       if (res.status === 401) {
+        const code = await publicChatForbiddenCode(res);
+        resident.invalidate();
+        if (code === "resident_auth_required") return;
         updateLocalAssistant("", "notice");
         setCurrentUser(null);
         setStarted(false);
@@ -515,6 +589,7 @@ export default function PublicChat() {
       }
       if (res.status === 403) {
         const code = await publicChatForbiddenCode(res);
+        resident.invalidate();
         if (code === "session_mismatch") {
           forgetStoredSessionId(token);
           setSessionId(null);
@@ -527,6 +602,7 @@ export default function PublicChat() {
         return;
       }
       if (!res.ok || !res.body) {
+        if (res.status === 503 && await publicChatForbiddenCode(res) === "resident_unavailable") { resident.invalidate("unavailable"); return; }
         updateLocalAssistant(customerText("page.public_chat.send_failed"), "notice");
         return;
       }
@@ -538,6 +614,7 @@ export default function PublicChat() {
       let receivedText = false;
 
       const applyAssistantId = (messageId?: string) => {
+        if (!request.isCurrent()) return;
         if (messageId) pendingServerMessageIdsRef.current.add(messageId);
         if (!messageId || messageId === assistantMessageId) return;
         setMessages((prev) =>
@@ -550,7 +627,7 @@ export default function PublicChat() {
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done || !request.isCurrent()) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
@@ -605,8 +682,8 @@ export default function PublicChat() {
     } catch {
       updateLocalAssistant(customerText("page.public_chat.send_failed"), "notice");
     } finally {
-      sendingRef.current = false;
-      setSending(false);
+      if (request.isCurrent()) { sendingRef.current = false; setSending(false); }
+      request.release();
     }
   };
 
@@ -1024,6 +1101,10 @@ export default function PublicChat() {
           </div>
         </div>
 
+        {(info.resident_pms?.enabled || !resident.historyAllowed) && <ResidentAccountPanel
+          resident={resident} enabled={Boolean(info.resident_pms?.enabled)} language={info.language}
+          onNewConversation={startNewPublicChat}
+        />}
         {/* Messages */}
         <div style={styles.messageArea}>
           {info.welcome_message && (
@@ -1092,7 +1173,7 @@ export default function PublicChat() {
                     </>
                   )}
                   {!isUser && !isSystemNotice && !isStreamingAssistant && visibleContent.trim() && (
-                    <ReadAloudButton text={visibleContent} scope={voiceScope} messageId={m.id} locale={info.language || "en"} disabled={sending} />
+                    <ReadAloudButton key={`${audioGeneration}-${m.id}`} text={visibleContent} scope={voiceScope} messageId={m.id} locale={info.language || "en"} disabled={sending || !resident.historyAllowed} />
                   )}
                   {m.attachments && m.attachments.length > 0 && (
                     <div style={styles.messageAttachmentList}>
@@ -1107,6 +1188,8 @@ export default function PublicChat() {
               </div>
             );
           })}
+          {info.resident_pms?.enabled && resident.phase === "verified" && resident.historyAllowed
+            && <ResidentMaintenanceDraftPanel controller={residentDrafts} language={info.language} />}
           <div ref={bottomRef} />
         </div>
 
@@ -1137,6 +1220,7 @@ export default function PublicChat() {
             ref={fileInputRef}
             type="file"
             multiple
+            disabled={!resident.historyAllowed}
             onChange={handleFileSelect}
             style={{ display: "none" }}
           />
@@ -1145,7 +1229,7 @@ export default function PublicChat() {
             aria-label={customerText("page.public_chat.attach_files")}
             title={customerText("page.public_chat.attach_files")}
             onClick={() => fileInputRef.current?.click()}
-            disabled={sending}
+            disabled={sending || !resident.historyAllowed}
             style={{
               ...styles.attachBtn,
               opacity: sending ? 0.45 : 1,
@@ -1155,8 +1239,8 @@ export default function PublicChat() {
               <path strokeLinecap="round" strokeLinejoin="round" d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 1 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
-          <VoiceInputButton voice={voice} disabled={sending} />
-          <LiveChatCallButton scope={voiceScope} disabled={sending || voice.busy || !sessionId} locale={info.language || "en"} />
+          <VoiceInputButton voice={voice} disabled={sending || !resident.historyAllowed} />
+          <LiveChatCallButton key={audioGeneration} scope={voiceScope} disabled={sending || voice.busy || !sessionId || !resident.historyAllowed} locale={info.language || "en"} />
           <textarea
             ref={textareaRef}
             placeholder={customerText("page.public_chat.type_a_message")}
@@ -1169,14 +1253,14 @@ export default function PublicChat() {
               }
             }}
             style={styles.chatInput}
-            disabled={sending}
+            disabled={sending || !resident.historyAllowed}
             rows={1}
           />
           <button
             aria-label={customerText("page.public_chat.send_message")}
             title={customerText("page.public_chat.send_message")}
             onClick={send}
-            disabled={(!input.trim() && attachedFiles.length === 0) || sending || voice.busy}
+            disabled={(!input.trim() && attachedFiles.length === 0) || sending || voice.busy || !resident.historyAllowed}
             style={{
               ...styles.sendBtn,
               opacity: (!input.trim() && attachedFiles.length === 0) || sending || voice.busy ? 0.4 : 1,

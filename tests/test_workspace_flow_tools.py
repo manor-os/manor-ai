@@ -10,6 +10,7 @@ import pytest
 def _runtime_envelope(*, mode: str, surface: str = "global_owner_chat"):
     return SimpleNamespace(
         surface=SimpleNamespace(value=surface),
+        profile="owner_copilot",
         metadata={"chat_mode": mode},
     )
 
@@ -54,6 +55,139 @@ class _SessionContext:
 
     async def __aexit__(self, exc_type, exc, tb):
         return False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "origin", "origin_data", "scope", "expected"),
+    [
+        ("workspace_operator", None, {}, "same", True),
+        (None, None, {}, "same", False),
+        ("background_worker", None, {}, "same", False),
+        ("workflow_step", None, {}, "same", False),
+        ("background_worker", "task", {}, "same", True),
+        ("background_worker", "task", {"scheduled_job_id": "job-a"}, "same", False),
+        ("background_worker", "task", {
+            "scheduled_job_id": "job-a",
+            "_manual_execution": {"user_id": "user-a", "action": "retry"},
+        }, "same", True),
+        ("background_worker", "task", {}, "foreign_workspace", False),
+        ("background_worker", "task", {}, "foreign_entity", False),
+        ("workflow_step", "workflow", {}, "same", False),
+        ("workflow_step", "workflow", {
+            "_workspace_user_request": {"user_id": "user-a"},
+        }, "same", True),
+        ("workflow_step", "workflow", {
+            "_workspace_user_request": {"user_id": "other-user"},
+        }, "same", False),
+        ("workflow_step", "workflow", {
+            "_workspace_user_request": {"user_id": "user-a"},
+        }, "foreign_workspace", False),
+        ("workflow_step", "workflow", {
+            "_workspace_user_request": {"user_id": "user-a"},
+        }, "foreign_entity", False),
+    ],
+)
+async def test_workflow_tool_manual_origin_requires_trusted_runtime_lineage(
+    profile, origin, origin_data, scope, expected,
+) -> None:
+    from packages.core.ai.tools.workflow_tools import _workflow_tool_user_requested
+
+    ancestor = SimpleNamespace(
+        entity_id="other-entity" if scope == "foreign_entity" else "entity-a",
+        workspace_id="other-workspace" if scope == "foreign_workspace" else "workspace-a",
+        creator_id="user-a",
+        started_by="user-a",
+        details=origin_data,
+        trigger_data=origin_data,
+    )
+    db = SimpleNamespace(get=AsyncMock(return_value=ancestor))
+    kwargs = {"_runtime_envelope_from_context": SimpleNamespace(
+        profile=profile, task_id="task-a" if origin == "task" else None,
+    )}
+    if origin == "task":
+        kwargs["task_id"] = "task-a"
+    elif origin == "workflow":
+        kwargs["_workflow_run_id_from_context"] = "run-a"
+
+    assert await _workflow_tool_user_requested(
+        db, entity_id="entity-a", workspace_id="workspace-a", kwargs=kwargs,
+    ) is expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "surface", "origin", "receipt", "scope", "expected"),
+    [
+        ("owner_copilot", "global_owner_chat", None, False, "same", True),
+        ("workspace_operator", "workspace_chat", None, False, "same", True),
+        (None, "global_owner_chat", None, False, "same", False),
+        ("unknown", "global_owner_chat", None, False, "same", False),
+        ("background_worker", "scheduled_agent_run", None, False, "same", False),
+        ("workflow_step", "workflow_agent_step", "workflow", False, "same", False),
+        ("workflow_step", "global_owner_chat", "workflow", False, "same", False),
+        ("background_worker", "scheduled_agent_run", "task", True, "same", True),
+        ("workflow_step", "workflow_agent_step", "workflow", True, "same", True),
+        ("workflow_step", "workflow_agent_step", "workflow", True, "foreign", False),
+    ],
+)
+async def test_workspace_flow_start_does_not_promote_background_origin(
+    monkeypatch, profile, surface, origin, receipt, scope, expected,
+) -> None:
+    from packages.core.ai.tools import workflow_tools
+
+    row = _flow_row(
+        binding_id="binding-a", workspace_id="workspace-a", workspace_name="Studio",
+    )
+    ancestor = SimpleNamespace(
+        entity_id="entity-a",
+        workspace_id="other-workspace" if scope == "foreign" else "workspace-a",
+        creator_id="user-a",
+        started_by="user-a",
+        details={
+            "scheduled_job_id": "job-a",
+            **({"_manual_execution": {"user_id": "user-a", "action": "retry"}} if receipt else {}),
+        },
+        trigger_data={"_workspace_user_request": {"user_id": "user-a"}} if receipt else {},
+    )
+    db = SimpleNamespace(
+        get=AsyncMock(return_value=ancestor),
+        execute=AsyncMock(side_effect=[
+            _ScalarResult(SimpleNamespace(id="conversation-a", user_id="user-a")),
+            _ScalarResult("old-user-message"),
+        ]),
+    )
+    launch = AsyncMock(return_value=SimpleNamespace(created=True, run=SimpleNamespace(
+        id="run-a", workflow_id=row[2].id, workspace_id="workspace-a", binding_id=row[1].id,
+        trigger_source="mcp", status="running", current_step_id=None, error=None,
+        started_at=None, completed_at=None, variables={}, step_results={}, trigger_data={},
+    )))
+    monkeypatch.setattr(workflow_tools, "async_session", lambda: _SessionContext(db))
+    monkeypatch.setattr(workflow_tools, "_workspace_flow_rows", AsyncMock(return_value=[row]))
+    monkeypatch.setattr("packages.core.services.workspace_flow_launcher.launch_workspace_flow", launch)
+    context = {
+        "_runtime_envelope_from_context": SimpleNamespace(
+            profile=profile, surface=surface, metadata={"chat_mode": "flows"},
+            task_id="parent-task" if origin == "task" else None,
+        ),
+    }
+    if origin == "workflow":
+        context["_workflow_run_id_from_context"] = "parent-run"
+    elif origin == "task":
+        context["task_id"] = "parent-task"
+
+    result = json.loads(await workflow_tools._start_workspace_flow(
+        entity_id="entity-a", user_id="user-a", binding_id=row[1].id,
+        conversation_id="conversation-a", source_brief="Start the next flow", **context,
+    ))
+
+    assert result["ok"] is True
+    assert launch.await_args.kwargs["user_requested"] is expected
+    assert launch.await_args.kwargs["source"] == (
+        "global_chat" if expected and surface == "global_owner_chat" else "mcp"
+    )
+    # A historical user message is projection context, never a manual receipt.
+    assert launch.await_args.kwargs["origin_message_id"] == "old-user-message"
 
 
 @pytest.mark.asyncio

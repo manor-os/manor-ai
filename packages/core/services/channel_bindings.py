@@ -13,6 +13,7 @@ from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel
 from packages.core.models.workspace import Workspace
 from packages.core.services.agent_subscription_service import resolve_subscription
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 SUPPORTED_CHANNEL_LANGUAGES = {"en", "zh", "es", "de"}
 
@@ -193,7 +194,7 @@ async def channel_workspace_is_routable(
     *,
     entity_id: str,
 ) -> bool:
-    """Fail closed for foreign, deleted, paused, or incomplete workspaces."""
+    """Keep human channel requests available when Workspace autonomy is paused."""
 
     if not workspace_id:
         return True
@@ -205,8 +206,7 @@ async def channel_workspace_is_routable(
     return bool(
         workspace
         and workspace.entity_id == entity_id
-        and workspace.deleted_at is None
-        and workspace.status == "active"
+        and workspace_allows_manual_work(workspace)
     )
 
 

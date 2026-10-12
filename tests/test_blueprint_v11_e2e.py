@@ -20,15 +20,24 @@ and uses the returned access token.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
+from datetime import datetime, timezone
 
+import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.channel import ChannelConfig
-from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+from packages.core.models.document import (
+    Document,
+    DocumentFolder,
+    DocumentGroup,
+    DocumentGroupMember,
+)
 from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
 from packages.core.models.memory import AgentMemory
 from packages.core.models.integration_session import IntegrationSession
@@ -40,9 +49,11 @@ from packages.core.models.workspace import (
     AgentToolBinding,
     ToolDefinition,
     Workspace,
+    WorkspaceStaff,
 )
 from packages.core.models.user import User
 from packages.core.blueprints.exporter import export_workspace
+from tests.test_document_permissions import _create_entity_user
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -182,6 +193,388 @@ async def test_v11_full_export_install_roundtrip(
         await client.get(f"/api/v1/blueprints/{bp['id']}", headers=headers)
     ).json()
     assert source_detail["remix_count"] == 1
+
+
+async def test_v11_export_payload_roundtrip_never_creates_marketplace_rows(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    """Portable verification exports remain payload-only across a round trip."""
+    headers, user = await _register(client, "v11payloadroundtrip")
+    source = await _create_workspace(client, headers, "Portable Source")
+    source_id = source["id"]
+
+    source_row = await db_session.get(Workspace, source_id)
+    assert source_row is not None
+    original_source_folder_id = source_row.artifact_folder_id
+    assert original_source_folder_id is not None
+    source_row.artifact_folder_id = None
+    await db_session.commit()
+    source_before = {
+        "name": source_row.name,
+        "kind": source_row.kind,
+        "operating_context": source_row.operating_context,
+        "primary_work": source_row.primary_work,
+        "operating_model": deepcopy(source_row.operating_model),
+        "settings": deepcopy(source_row.settings),
+        "artifact_folder_id": source_row.artifact_folder_id,
+    }
+
+    async def marketplace_counts() -> tuple[int, int]:
+        blueprints = list((await db_session.execute(
+            select(WorkspaceBlueprint).where(
+                WorkspaceBlueprint.entity_id == user["entity_id"],
+            )
+        )).scalars().all())
+        published_as = list((await db_session.execute(
+            select(MarketplaceResourceLink).where(
+                MarketplaceResourceLink.entity_id == user["entity_id"],
+                MarketplaceResourceLink.relationship == "published_as",
+            )
+        )).scalars().all())
+        return len(blueprints), len(published_as)
+
+    async def document_folder_count() -> int:
+        folders = list((await db_session.execute(
+            select(DocumentFolder).where(
+                DocumentFolder.entity_id == user["entity_id"],
+            )
+        )).scalars().all())
+        return len(folders)
+
+    before_counts = await marketplace_counts()
+    source_folder_count = await document_folder_count()
+    request = {
+        "title": "Portable Source Verification",
+        "summary": "A draft used only for isolated parity verification.",
+        "description": "No Marketplace listing is created.",
+        "usage_guide": "Install in simulation and compare the projection.",
+        "tags": ["verification"],
+        "author_handle": "e2e",
+        "install_variables": [{
+            "key": "review_limit",
+            "label": "Review limit",
+            "default": 3,
+            "materialize": False,
+        }, {
+            "key": "brand_name",
+            "label": "Brand name",
+            "default": "Example",
+        }],
+        "include_goals": False,
+    }
+    first_export = await client.post(
+        f"/api/v1/workspaces/{source_id}/export-blueprint-payload",
+        headers=headers,
+        json=request,
+    )
+    assert first_export.status_code == 200, first_export.text
+    payload = first_export.json()
+    assert payload["manifest"]["title"] == request["title"]
+    assert payload["manifest"]["summary"] == request["summary"]
+    assert payload["contract"]["variables"] == [{
+        "key": "review_limit",
+        "label": "Review limit",
+        "required": False,
+        "default": 3,
+        "materialize": False,
+    }, {
+        "key": "brand_name",
+        "label": "Brand name",
+        "required": False,
+        "default": "Example",
+        "materialize": True,
+    }]
+    assert payload["recipe"]["goals"] == []
+
+    second_export = await client.post(
+        f"/api/v1/workspaces/{source_id}/export-blueprint-payload",
+        headers=headers,
+        json=request,
+    )
+    assert second_export.status_code == 200, second_export.text
+    assert second_export.json() == payload
+    await db_session.refresh(source_row)
+    assert source_row.artifact_folder_id is None
+    assert await db_session.get(DocumentFolder, original_source_folder_id) is not None
+    assert await document_folder_count() == source_folder_count
+
+    rejected_export = await client.post(
+        f"/api/v1/workspaces/{source_id}/export-blueprint-payload",
+        headers=headers,
+        json={
+            "title": "Rejected portable export",
+            "knowledge_pack_mode": "inline_text",
+            "knowledge_document_ids": [generate_ulid()],
+        },
+    )
+    assert rejected_export.status_code == 400, rejected_export.text
+    assert await marketplace_counts() == before_counts
+    await db_session.refresh(source_row)
+    assert source_row.artifact_folder_id is None
+    assert await db_session.get(DocumentFolder, original_source_folder_id) is not None
+    assert await document_folder_count() == source_folder_count
+
+    installed = await client.post(
+        "/api/v1/blueprints/install-payload",
+        headers=headers,
+        json={
+            "payload": payload, "mode": "simulate", "workspace_name": "Portable Copy",
+            "workspace_source": {"workspace_id": source_id, "export_options": request},
+            "variable_values": {"brand_name": "Acme"},
+        },
+    )
+    assert installed.status_code == 201, installed.text
+    reexport = await client.post(
+        f"/api/v1/workspaces/{installed.json()['workspace_id']}/export-blueprint-payload",
+        headers=headers,
+        json=request,
+    )
+    assert reexport.status_code == 200, reexport.text
+    expected_recipe = deepcopy(payload["recipe"])
+    expected_recipe["operating_model"]["context"] = "Running for Acme."
+    assert reexport.json()["recipe"] == expected_recipe
+    assert reexport.json()["contract"]["variables"] == payload["contract"]["variables"]
+
+    assert await marketplace_counts() == before_counts
+    await db_session.refresh(source_row)
+    assert {
+        "name": source_row.name,
+        "kind": source_row.kind,
+        "operating_context": source_row.operating_context,
+        "primary_work": source_row.primary_work,
+        "operating_model": source_row.operating_model,
+        "settings": source_row.settings,
+        "artifact_folder_id": source_row.artifact_folder_id,
+    } == source_before
+
+
+async def test_v11_export_payload_uses_workspace_write_and_lifecycle_gates(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, user = await _register(client, "v11payloadauth")
+    workspace = await _create_workspace(client, headers, "Payload access boundary")
+    workspace_id = workspace["id"]
+    request = {"title": "Access boundary export"}
+
+    workspace_row = await db_session.get(Workspace, workspace_id)
+    assert workspace_row is not None
+    workspace_row.status = "paused"
+    await db_session.commit()
+    paused_owner = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint-payload",
+        headers=headers,
+        json=request,
+    )
+    assert paused_owner.status_code == 200, paused_owner.text
+
+    viewer = await _create_entity_user(
+        user["entity_id"], "v11payloadviewer", role="member",
+    )
+    db_session.add(WorkspaceStaff(
+        workspace_id=workspace_id,
+        user_id=viewer["id"],
+        role="viewer",
+        status="active",
+    ))
+    await db_session.commit()
+    viewer_response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint-payload",
+        headers=viewer["headers"],
+        json=request,
+    )
+    assert viewer_response.status_code == 403, viewer_response.text
+
+    foreign_headers, _ = await _register(client, "v11payloadforeign")
+    foreign_response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint-payload",
+        headers=foreign_headers,
+        json=request,
+    )
+    assert foreign_response.status_code == 404, foreign_response.text
+
+    workspace_row.deleted_at = datetime.now(timezone.utc)
+    await db_session.commit()
+    deleted_response = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint-payload",
+        headers=headers,
+        json=request,
+    )
+    assert deleted_response.status_code == 404, deleted_response.text
+
+
+@pytest.mark.parametrize(
+    ("operation", "mutation"),
+    [("export", "delete"), ("install", "delete"), ("install", "update")],
+)
+async def test_v11_payload_holds_source_locks_through_export_or_install(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    mutation: str,
+):
+    """Source locks protect materialization without deadlocking lifecycle writes."""
+    from apps.api.routers import blueprints as blueprint_router
+    import packages.core.database as db_module
+    from packages.core.services import reusable_resource_locks
+    from tests.test_reusable_resource_locking import _wait_until_lock_blocked
+
+    headers, user = await _register(client, "v11payloadlifecycle")
+    workspace = await _create_workspace(client, headers, "Payload lifecycle boundary")
+    workspace_id = workspace["id"]
+    exporter_entered = asyncio.Event()
+    release_exporter = asyncio.Event()
+    mutation_entered = asyncio.Event()
+    mutation_pid = None
+    request = {"title": "Lifecycle export"}
+    path = f"/api/v1/workspaces/{workspace_id}/export-blueprint-payload"
+    if operation == "install":
+        snapshot = await client.post(path, headers=headers, json=request)
+        assert snapshot.status_code == 200, snapshot.text
+        request = {
+            "payload": snapshot.json(), "mode": "simulate",
+            "workspace_source": {"workspace_id": workspace_id, "export_options": request},
+        }
+        path = "/api/v1/blueprints/install-payload"
+    target = "export_workspace" if operation == "export" else "install_blueprint"
+    original_operation = getattr(blueprint_router, target)
+    original_lock = reusable_resource_locks.lock_reusable_resource_lifecycle
+
+    async def observe_lifecycle_lock(db, **kwargs):
+        nonlocal mutation_pid
+        if exporter_entered.is_set() and not mutation_entered.is_set():
+            mutation_pid = await db.scalar(text("SELECT pg_backend_pid()"))
+            mutation_entered.set()
+        await original_lock(db, **kwargs)
+
+    async def paused_exporter(*args, **kwargs):
+        exporter_entered.set()
+        await asyncio.wait_for(release_exporter.wait(), timeout=10)
+        return await original_operation(*args, **kwargs)
+
+    monkeypatch.setattr(blueprint_router, target, paused_exporter)
+    monkeypatch.setattr(reusable_resource_locks, "lock_reusable_resource_lifecycle", observe_lifecycle_lock)
+    export_task = asyncio.create_task(client.post(
+        path, headers=headers, json=request,
+    ))
+    mutation_task = None
+    try:
+        await asyncio.wait_for(exporter_entered.wait(), timeout=10)
+        async with db_module.async_session() as contender:
+            with pytest.raises(DBAPIError) as locked:
+                await contender.execute(
+                    select(Workspace)
+                    .where(Workspace.id == workspace_id)
+                    .with_for_update(nowait=True)
+                )
+            assert locked.value.orig.sqlstate == "55P03"  # lock_not_available
+            await contender.rollback()
+            with pytest.raises(DBAPIError) as locked_actor:
+                await contender.execute(
+                    select(User).where(User.id == user["user_id"]).with_for_update(nowait=True)
+                )
+            assert locked_actor.value.orig.sqlstate == "55P03"
+            await contender.rollback()
+
+        mutation_task = asyncio.create_task(
+            client.delete(f"/api/v1/workspaces/{workspace_id}", headers=headers)
+            if mutation == "delete"
+            else client.put(
+                f"/api/v1/workspaces/{workspace_id}", headers=headers,
+                json={
+                    "operating_context": "Updated after export",
+                    "operating_model": {"context": "Updated after export"},
+                },
+            )
+        )
+        await asyncio.wait_for(mutation_entered.wait(), timeout=10)
+        assert mutation_pid is not None
+        async with db_module.async_session() as observer:
+            await _wait_until_lock_blocked(observer, backend_pid=mutation_pid)
+        release_exporter.set()
+        exported, mutated = await asyncio.wait_for(
+            asyncio.gather(export_task, mutation_task), timeout=10,
+        )
+    finally:
+        release_exporter.set()
+        tasks = [task for task in (export_task, mutation_task) if task is not None]
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert exported.status_code == (200 if operation == "export" else 201), exported.text
+    assert mutated.status_code == (204 if mutation == "delete" else 200), mutated.text
+    after_mutation = await client.post(
+        f"/api/v1/workspaces/{workspace_id}/export-blueprint-payload",
+        headers=headers,
+        json={"title": "After mutation"},
+    )
+    assert after_mutation.status_code == (404 if mutation == "delete" else 200), after_mutation.text
+    if mutation == "update":
+        assert after_mutation.json()["recipe"]["operating_model"]["context"] == "Updated after export"
+
+
+async def test_v11_export_can_omit_workspace_setup_without_changing_source(
+    client: AsyncClient,
+    db_session: AsyncSession,
+):
+    headers, _ = await _register(client, "v11omitsetup")
+    source = await _create_workspace(client, headers, "Workflow intake source")
+    workspace = await db_session.get(Workspace, source["id"])
+    setup = {
+        "version": 1,
+        "checks": [{
+            "key": "song_audio",
+            "kind": "workspace_user_materials",
+            "documents": {"mime_prefixes": ["audio/"]},
+            "blocking": True,
+        }],
+    }
+    workspace.settings = {**(workspace.settings or {}), "blocking_setup": setup}
+    await db_session.commit()
+
+    export_url = f"/api/v1/workspaces/{workspace.id}/export-blueprint"
+    default_response = await client.post(
+        export_url, headers=headers,
+        json={"slug": "workflow-intake-source", "title": "Workflow intake"},
+    )
+    assert default_response.status_code == 201, default_response.text
+    default_blueprint = default_response.json()
+    original_settings = default_blueprint["payload"]["recipe"]["operating_model"]["settings"]
+    assert original_settings["blocking_setup"] == setup
+
+    response = await client.post(
+        export_url, headers=headers,
+        json={
+            "slug": "workflow-intake-source", "title": "Workflow intake",
+            "marketplace_blueprint_id": default_blueprint["id"],
+            "replace_existing": True, "include_blocking_setup": False,
+        },
+    )
+    assert response.status_code == 201, response.text
+    blueprint = response.json()
+    expected_settings = {k: v for k, v in original_settings.items() if k != "blocking_setup"}
+    assert blueprint["payload"]["recipe"]["operating_model"]["settings"] == expected_settings
+    source_response = await client.get(f"/api/v1/workspaces/{workspace.id}", headers=headers)
+    assert source_response.json()["settings"]["blocking_setup"] == setup
+
+    for mode in ("simulate", "live"):
+        install = await client.post(
+            f"/api/v1/blueprints/{blueprint['id']}/install", headers=headers,
+            json={"mode": mode, "workspace_name": f"Workflow intake {mode}"},
+        )
+        assert install.status_code == 201, install.text
+        installed_id = install.json()["workspace_id"]
+        installed = await client.get(f"/api/v1/workspaces/{installed_id}", headers=headers)
+        assert "blocking_setup" not in installed.json()["settings"]
+        reexport = await client.post(
+            f"/api/v1/workspaces/{installed_id}/export-blueprint", headers=headers,
+            json={"slug": f"workflow-intake-{mode}", "title": "Workflow intake roundtrip"},
+        )
+        assert reexport.status_code == 201, reexport.text
+        assert reexport.json()["payload"]["recipe"]["operating_model"]["settings"] == expected_settings
 
 
 async def test_v11_business_ledger_settings_roundtrip(
@@ -1054,7 +1447,8 @@ async def test_v11_governance_rejects_embedded_blocked_tool(
         },
         "policy": {
             "governance": {
-                "never_allow_actions": ["x.delete_*"],
+                "approval": {"rules": [{"id": "author-delete-ban", "effect": "deny",
+                    "selector": {"kind": "action", "action_key": "x.delete_account"}}]},
                 "max_risk_level": "medium",
             },
             "post_install_checks": [],
@@ -1062,10 +1456,13 @@ async def test_v11_governance_rejects_embedded_blocked_tool(
         },
     }
 
+    # The author's never_allow only bites when the operator installs it as a
+    # hard block; by default it becomes an approval gate and the install goes
+    # through (tests/test_blueprint_hard_blocks_opt_in.py).
     resp = await client.post(
         "/api/v1/blueprints/install-payload",
         headers=headers,
-        json={"payload": payload, "mode": "simulate"},
+        json={"payload": payload, "mode": "simulate", "install_author_hard_blocks": True},
     )
     # Installer raises InstallError → router returns 400
     assert resp.status_code == 400, resp.text
@@ -1073,7 +1470,7 @@ async def test_v11_governance_rejects_embedded_blocked_tool(
         "Blueprint configuration or personalization is invalid."
     )
     assert "tool.x.delete_account" not in resp.text
-    assert "x.delete_*" not in resp.text
+    assert "author-delete-ban" not in resp.text
 
     # Critically: no Agent row got created (the check happens before the
     # row is added to the session).

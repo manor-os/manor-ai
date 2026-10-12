@@ -4,6 +4,10 @@ title: 沙箱
 
 # 沙箱
 
+公开 native browser 和 Code Projects 执行路径使用自托管 sandbox；不需要也不包含
+私有 Chrome 扩展/CLI runtime。缺少 sandbox 配置应只处理依赖它的工具，不应禁用
+无关工作区能力。商业额度放行不绕过 sandbox 资源限制、审批或工具范围。
+
 沙箱服务将代码执行与 API 和 worker 容器隔离。当 Agent 运行技能脚本或
 shell 命令时，沙箱服务会为本次运行启动一个专用的子 Docker 容器，施加
 资源限制并返回输出——因此不受信任的代码永远不会在应用进程内部执行。

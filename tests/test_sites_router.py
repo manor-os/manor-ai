@@ -701,9 +701,8 @@ async def test_site_bridge_records_first_party_analytics_and_strips_secrets(
     assert analytics.status_code == 200
     assert analytics.json()["page_views"] == 1
     assert analytics.json()["unique_sessions"] == 1
-    assert analytics.json()["top_pages"] == [
-        {"path": "/pricing?utm_source=test", "views": 1}
-    ]
+    # Top pages group by page; campaign parameters stay on the stored event.
+    assert analytics.json()["top_pages"] == [{"path": "/pricing", "views": 1}]
 
     stored = await db_session.scalar(
         select(SiteEvent).where(SiteEvent.site_id == site["id"])
@@ -992,16 +991,18 @@ async def test_workspace_document_editor_publishes_without_auto_connect_privileg
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_status", ["active", "paused"])
 async def test_workspace_site_publish_auto_connects_and_reuses_managed_resources(
-    client, sites_env, db_session, monkeypatch,
+    client, sites_env, db_session, monkeypatch, workspace_status,
 ):
     headers, entity_id = await _auth(client, "autositeowner")
     user = await db_session.scalar(select(User).where(User.entity_id == entity_id))
     assert user is not None
+    creator_id = user.id
     workspace = Workspace(
         entity_id=entity_id,
         name="Website Operations",
-        status="active",
+        status=workspace_status,
     )
     db_session.add(workspace)
     await db_session.flush()
@@ -1110,6 +1111,8 @@ async def test_workspace_site_publish_auto_connects_and_reuses_managed_resources
     assert len(flows) == len(bindings) == 2
     assert agents[0].config["managed_by"] == "site_bridge"
     assert channel_configs[0].config["managed_by"] == "site_bridge"
+    assert channel_configs[0].owner_user_id == creator_id
+    assert channels[0].user_id == creator_id
     assert {binding.config["site_bridge_action"] for binding in bindings} == {
         "lead",
         "subscription",
@@ -1394,3 +1397,96 @@ async def test_bind_domain_refused_when_hosting_unconfigured(
         json={"domain": "www.nowhere.com"},
     )
     assert r.status_code == 503
+
+
+def _write_multi_page_site(fs_root, entity_id: str, *, with_404: bool) -> None:
+    site = fs_root / entity_id / "mp"
+    pages = {
+        "index.html": "<title>Home</title><a href='/about'>About</a>",
+        "about.html": "<title>About</title><link rel='stylesheet' href='styles.css'>",
+        "pricing/index.html": "<title>Pricing</title>",
+        "blog/hello-world.html": "<title>Post</title>",
+        "styles.css": "h1{}",
+    }
+    if with_404:
+        pages["404.html"] = "<title>Missing</title>"
+    for rel, body in pages.items():
+        (site / rel).parent.mkdir(parents=True, exist_ok=True)
+        (site / rel).write_text(f"<!doctype html>{body}" if rel.endswith(".html") else body, encoding="utf-8")
+
+
+async def _publish_multi_page(client, sites_env, username: str, *, with_404: bool) -> dict:
+    headers, entity_id = await _auth(client, username)
+    _write_multi_page_site(sites_env, entity_id, with_404=with_404)
+    r = await client.post("/api/v1/sites/publish", headers=headers, json={"path": "mp", "name": "Multi"})
+    assert r.status_code == 200, r.text
+    return {"host": f"{r.json()['slug']}.{SITES_DOMAIN}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "status", "title", "location"), [
+    ("", 200, "Home", None),
+    ("about", 200, "About", None),
+    ("about.html", 200, "About", None),
+    ("about/", 308, None, "/about"),
+    ("pricing/", 200, "Pricing", None),
+    ("pricing", 308, None, "/pricing/"),
+    ("blog/hello-world", 200, "Post", None),
+    ("nope", 404, "Missing", None),
+    ("blog/nope", 404, "Missing", None),
+    ("gone.html", 404, "Missing", None),
+])
+async def test_multi_page_site_serves_each_page_at_its_own_address(
+    client, sites_env, path, status, title, location,
+):
+    host = await _publish_multi_page(client, sites_env, f"mp{abs(hash(path)) % 10**6}", with_404=True)
+    r = await client.get(f"/api/v1/site-host/{path}", headers=host, follow_redirects=False)
+    assert r.status_code == status, r.text
+    if title:
+        assert f"<title>{title}</title>" in r.text
+    if location:
+        assert r.headers["location"] == location
+
+
+@pytest.mark.asyncio
+async def test_single_page_apps_keep_the_entry_fallback(client, sites_env):
+    host = await _publish_multi_page(client, sites_env, "spafallback", with_404=False)
+    r = await client.get("/api/v1/site-host/some/client/route", headers=host)
+    assert r.status_code == 200
+    assert "<title>Home</title>" in r.text
+    missing_asset = await client.get("/api/v1/site-host/missing.png", headers=host)
+    assert missing_asset.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_not_found_visits_are_reported_apart_from_page_views(client, sites_env):
+    headers, entity_id = await _auth(client, "notfoundanalytics")
+    _write_multi_page_site(sites_env, entity_id, with_404=True)
+    published = await client.post(
+        "/api/v1/sites/publish", headers=headers, json={"path": "mp", "name": "Multi"},
+    )
+    site = published.json()
+    host = {"host": f"{site['slug']}.{SITES_DOMAIN}"}
+
+    missing = await client.get("/api/v1/site-host/old-page", headers=host)
+    assert missing.status_code == 404
+    assert 'data-manor-status="404"' in missing.text
+    found = await client.get("/api/v1/site-host/about", headers=host)
+    assert 'data-manor-status' not in found.text
+    runtime = await client.get("/api/v1/site-host/__manor/runtime.js", headers=host)
+    assert "status: pageStatus" in runtime.text
+
+    for path, status in (("/about", "200"), ("/old-page", "404"), ("/old-page?ref=x", "404")):
+        event = await client.post(
+            "/api/v1/site-host/__manor/events",
+            headers=host,
+            json={"event_type": "page_view", "session_id": "v1", "path": path,
+                  "properties": {"status": status}},
+        )
+        assert event.status_code == 202, event.text
+
+    analytics = (await client.get(f"/api/v1/sites/{site['id']}/analytics", headers=headers)).json()
+    assert analytics["page_views"] == 1
+    assert analytics["not_found_views"] == 2
+    assert analytics["top_pages"] == [{"path": "/about", "views": 1}]
+    assert analytics["top_missing_pages"] == [{"path": "/old-page", "views": 2}]

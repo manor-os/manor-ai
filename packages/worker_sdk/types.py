@@ -39,6 +39,7 @@ class Lease(BaseModel):
     without round-tripping back to Manor."""
 
     lease_id: str
+    attempt_token: Optional[str] = None
     step_id: str
     plan_id: str
     workspace_id: Optional[str]
@@ -90,9 +91,12 @@ class LeaseResult(BaseModel):
     cost: Optional[dict] = None
     """``{llm_tokens_input, llm_tokens_output, api_calls, usd}`` —
     fields are optional; Manor accumulates whatever's present."""
-    evidence_refs: Optional[list[str]] = None
-    """Object-store keys (S3 / MinIO) for screenshots, raw responses,
-    large blobs that don't belong inline in result."""
+    evidence_refs: Optional[list[str | dict[str, Any]]] = None
+    """Legacy object-store refs or captured artifact/tool-effect receipts.
+    A live action receipt uses kind=tool_effect, effect=action and fields
+    containing provider, action_key and the selected integration_id, if any.
+    Never derive receipts from model prose.
+    """
     task_output_value_kind: TaskOutputValueKind = TaskOutputValueKind.TASK_PAYLOAD
     """Explicit representation discriminator; raw handler values are payloads."""
 
@@ -132,16 +136,18 @@ class NeedHumanInput(Exception):
 
 class HeartbeatActiveLease(BaseModel):
     lease_id: str
+    attempt_token: Optional[str] = None
     progress: Optional[float] = None
 
 
 class HeartbeatCompletedLease(BaseModel):
     lease_id: str
+    attempt_token: Optional[str] = None
     status: Literal["done", "failed"]
     result: Any = None
     error: Optional[dict] = None
     cost: Optional[dict] = None
-    evidence_refs: Optional[list[str]] = None
+    evidence_refs: Optional[list[str | dict[str, Any]]] = None
     task_output_value_kind: TaskOutputValueKind
 
 

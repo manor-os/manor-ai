@@ -81,13 +81,14 @@ async def test_global_chat_cannot_start_draft_without_explicit_create_intent():
     }
 
 
-def test_global_chat_allows_draft_start_for_explicit_create_intent():
+@pytest.mark.asyncio
+async def test_global_chat_allows_draft_start_for_explicit_create_intent():
     from packages.core.ai.runtime.surfaces import ChatSurface
     from packages.core.ai.runtime.workspace_drafts import (
         _workspace_draft_start_allowed,
     )
 
-    assert _workspace_draft_start_allowed(SimpleNamespace(
+    assert await _workspace_draft_start_allowed(SimpleNamespace(
         surface=ChatSurface.GLOBAL_OWNER_CHAT,
         metadata={
             "workspace_creation_authorization": {
@@ -96,6 +97,38 @@ def test_global_chat_allows_draft_start_for_explicit_create_intent():
             },
         },
     ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("published", "allowed"), [
+    ({"workspace_creation_authorization": {"status": "authorized", "confidence": 0.95}}, True),
+    ({"workspace_creation_authorization": {"status": "not_authorized", "confidence": 0.9}}, False),
+    (None, False),
+], ids=["authorized", "not-authorized", "never-published"])
+async def test_deferred_authorization_is_read_when_the_draft_tool_runs(
+    monkeypatch: pytest.MonkeyPatch, published, allowed,
+):
+    """The classifier runs beside the turn; the gate waits for its verdict and
+    fails closed when none arrives."""
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.workspace_drafts import (
+        _workspace_draft_start_allowed,
+    )
+    from packages.core.services import chat_intent_routing
+
+    waited: list[tuple[str, float]] = []
+
+    async def fake_wait(key, *, timeout):
+        waited.append((key, timeout))
+        return published
+
+    monkeypatch.setattr(chat_intent_routing, "wait_for_deferred_chat_intent", fake_wait)
+
+    assert await _workspace_draft_start_allowed(SimpleNamespace(
+        surface=ChatSurface.GLOBAL_OWNER_CHAT,
+        metadata={"workspace_creation_authorization": {"status": "deferred", "key": "intent-1"}},
+    )) is allowed
+    assert waited == [("intent-1", 15.0)]
 
 
 @pytest.mark.asyncio
@@ -345,6 +378,56 @@ async def test_stream_commits_draft_shell_and_emits_exact_id_before_architect(
     second_event = await anext(stream)
     assert architect_started.is_set()
     assert "event: error" in second_event
+    await stream.aclose()
+
+
+@pytest.mark.asyncio
+async def test_workspace_draft_stream_keeps_quiet_architect_turn_connected(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.routers import workspace_drafts
+
+    architect_started = asyncio.Event()
+    keep_running = asyncio.Event()
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+    async def fake_process_message(_db, **_kwargs):
+        architect_started.set()
+        await keep_running.wait()
+        raise AssertionError("test should close the stream before completion")
+
+    monkeypatch.setattr(workspace_drafts, "async_session", FakeSession)
+    monkeypatch.setattr(
+        workspace_drafts.draft_service,
+        "process_draft_message",
+        fake_process_message,
+    )
+    monkeypatch.setattr(
+        workspace_drafts,
+        "_DRAFT_STREAM_KEEPALIVE_SECONDS",
+        0.01,
+    )
+
+    stream = workspace_drafts._stream_turn(
+        entity_id="entity",
+        user_id="creator",
+        draft_id="draft_exact",
+        user_message="Build a collaboration workspace",
+        mode="message",
+    )
+
+    assert "event: start" in await anext(stream)
+    keepalive = await asyncio.wait_for(anext(stream), timeout=0.2)
+
+    assert architect_started.is_set()
+    assert "event: keepalive" in keepalive
+    assert '"draft_id": "draft_exact"' in keepalive
     await stream.aclose()
 
 

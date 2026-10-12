@@ -44,8 +44,11 @@ class Permission(str, Enum):
 
     # Documents
     DOCS_READ = "docs.read"
+    DOCS_READ_ALL = "docs.read.all"
     DOCS_UPLOAD = "docs.upload"
     DOCS_DELETE = "docs.delete"
+    DOCS_MANAGE_ALL = "docs.manage.all"
+    DOCS_TRANSFER_DEPARTED = "docs.transfer_departed"
 
     # Agents
     AGENTS_READ = "agents.read"
@@ -66,6 +69,7 @@ class Permission(str, Enum):
 
     # Workspaces
     WORKSPACES_READ = "workspaces.read"
+    WORKSPACES_READ_ALL = "workspaces.read.all"
     WORKSPACES_CREATE = "workspaces.create"
     WORKSPACES_UPDATE = "workspaces.update"
     WORKSPACES_DELETE = "workspaces.delete"
@@ -110,6 +114,7 @@ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
         Permission.USERS_INVITE,
         Permission.TASKS_DELETE,
         Permission.DOCS_DELETE,
+        Permission.DOCS_TRANSFER_DEPARTED,
         Permission.AGENTS_UPDATE,
         Permission.AGENTS_DELETE,
         Permission.WORKSPACES_CREATE,
@@ -129,6 +134,9 @@ ROLE_PERMISSIONS: dict[str, set[Permission]] = {
         Permission.ADMIN_API_KEYS,
         Permission.ADMIN_WEBHOOKS,
         Permission.ADMIN_BILLING,
+        Permission.DOCS_READ_ALL,
+        Permission.DOCS_MANAGE_ALL,
+        Permission.WORKSPACES_READ_ALL,
     },
 }
 

@@ -15,9 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from pptx import Presentation
-from pptx.util import Emu
 
 from .drawingml_converter import convert_svg_to_slide_shapes
+from .native_charts import apply_native_charts
+from .embedded_media import apply_embedded_media
 from .pptx_dimensions import (
     CANVAS_FORMATS,
     get_slide_dimensions, get_pixel_dimensions,
@@ -309,6 +310,9 @@ def create_pptx_with_native_svg(
     workers: int | None = None,
     merge_paragraphs: bool = False,
     conversion_trace_path: Path | None = None,
+    native_chart_manifest: dict[str, Any] | None = None,
+    embedded_media_manifest: dict[str, Any] | None = None,
+    manifest_dir: Path | None = None,
 ) -> bool:
     """Create a PPTX file with native SVG.
 
@@ -337,6 +341,9 @@ def create_pptx_with_native_svg(
         use_narration_timings: Whether to set slide auto-advance from audio duration.
         narration_padding: Extra seconds added after each narration before advancing.
         conversion_trace_path: Optional JSON path for native conversion diagnostics.
+        native_chart_manifest: Declared editable charts to overlay before delivery.
+        embedded_media_manifest: Declared project-local videos to embed before delivery.
+        manifest_dir: Project directory used to resolve authorized video sources.
 
     Returns:
         Whether all slides were successfully created.
@@ -373,7 +380,7 @@ def create_pptx_with_native_svg(
     if canvas_format is None and custom_pixels is None:
         canvas_format = 'ppt169'
         if verbose:
-            print(f"  Using default format: PPT 16:9")
+            print("  Using default format: PPT 16:9")
 
     width_emu, height_emu = get_slide_dimensions(canvas_format or 'ppt169', custom_pixels)
     pixel_width, pixel_height = get_pixel_dimensions(canvas_format or 'ppt169', custom_pixels)
@@ -382,21 +389,21 @@ def create_pptx_with_native_svg(
         print(f"  Slide dimensions: {pixel_width} x {pixel_height} px")
         print(f"  SVG file count: {len(svg_files)}")
         if use_native_shapes:
-            print(f"  Mode: Native DrawingML shapes (directly editable)")
+            print("  Mode: Native DrawingML shapes (directly editable)")
         elif use_compat_mode:
-            print(f"  Compatibility mode: Enabled (PNG + SVG dual format)")
+            print("  Compatibility mode: Enabled (PNG + SVG dual format)")
             print(f"  PNG renderer: {renderer_name} {renderer_status}")
         else:
-            print(f"  Compatibility mode: Disabled (pure SVG)")
+            print("  Compatibility mode: Disabled (pure SVG)")
         if transition:
             trans_name = TRANSITIONS.get(transition, {}).get('name', transition) if TRANSITIONS else transition
             print(f"  Transition effect: {trans_name}")
         if enable_notes and notes:
             print(f"  Speaker notes: {len(notes)} page(s)")
         elif enable_notes:
-            print(f"  Speaker notes: Enabled (no notes files found)")
+            print("  Speaker notes: Enabled (no notes files found)")
         else:
-            print(f"  Speaker notes: Disabled")
+            print("  Speaker notes: Disabled")
         print()
 
     animation_cli_overrides = animation_cli_overrides or {}
@@ -410,8 +417,12 @@ def create_pptx_with_native_svg(
         prs.slide_height = height_emu
 
         blank_layout = prs.slide_layouts[6]
-        for _ in svg_files:
-            prs.slides.add_slide(blank_layout)
+        for svg_path in svg_files:
+            slide = prs.slides.add_slide(blank_layout)
+            # XML notes replacement needs the master and presentation relation
+            # that python-pptx materializes on first notes-slide access.
+            if enable_notes and notes and notes.get(svg_path.stem, '').strip():
+                slide.notes_slide
 
         base_pptx = temp_dir / 'base.pptx'
         prs.save(str(base_pptx))
@@ -806,6 +817,12 @@ def create_pptx_with_native_svg(
                 if file_path.is_file():
                     arcname = file_path.relative_to(extract_dir)
                     zf.write(file_path, arcname)
+        if native_chart_manifest is not None:
+            apply_native_charts(temp_output_path, native_chart_manifest, svg_files)
+        if embedded_media_manifest is not None:
+            if manifest_dir is None:
+                raise ValueError("Embedded media requires its project directory")
+            apply_embedded_media(temp_output_path, embedded_media_manifest, svg_files, manifest_dir=manifest_dir)
         shutil.move(str(temp_output_path), str(output_path))
 
         if conversion_trace_path and conversion_trace is not None:
@@ -827,7 +844,7 @@ def create_pptx_with_native_svg(
                 print(f"  Trace: {conversion_trace_path}")
             print(f"  Succeeded: {success_count}, Failed: {len(svg_files) - success_count}")
             if use_compat_mode and has_any_image:
-                print(f"  Mode: Office compatibility mode (supports all Office versions)")
+                print("  Mode: Office compatibility mode (supports all Office versions)")
                 if PNG_RENDERER == 'svglib' and renderer_hint:
                     print(f"  [Tip] {renderer_hint}")
 

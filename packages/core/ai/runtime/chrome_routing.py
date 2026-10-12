@@ -10,7 +10,12 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from packages.core.ai.runtime.approval_classifier import classify_chrome_confirmation
+from packages.core.ai.runtime.approval_classifier import classify_chrome_call
+from packages.core.ai.runtime.chrome_tool_catalog import CHROME_MCP_TOOLS as CHROME_MCP_TOOLS
+from packages.core.ai.runtime.chrome_tool_catalog import (
+    CHROME_COMPUTER_ACTIONS, canonical_chrome_tool_name, chrome_key_sequence, normalize_chrome_call,
+)
+from packages.core.services.file_refs import parse_file_reference
 
 
 logger = logging.getLogger(__name__)
@@ -18,82 +23,15 @@ logger = logging.getLogger(__name__)
 
 GENERIC_WEB_TOOLS = frozenset({"web_search", "web_fetch", "browse_web"})
 
-CHROME_MCP_TOOLS = frozenset({
-    "mcp__chrome__documentation",
-    "mcp__chrome__capabilities",
-    "mcp__chrome__status",
-    "mcp__chrome__reload_extension",
-    "mcp__chrome__open",
-    "mcp__chrome__open_new_tab",
-    "mcp__chrome__open_or_reuse",
-    "mcp__chrome__name_session",
-    "mcp__chrome__confirm_action",
-    "mcp__chrome__navigate",
-    "mcp__chrome__open_tabs",
-    "mcp__chrome__selected_tab",
-    "mcp__chrome__tab_info",
-    "mcp__chrome__back",
-    "mcp__chrome__forward",
-    "mcp__chrome__reload",
-    "mcp__chrome__js_dialog",
-    "mcp__chrome__handle_js_dialog",
-    "mcp__chrome__list_tabs",
-    "mcp__chrome__get_windows_and_tabs",
-    "mcp__chrome__get_group_state",
-    "mcp__chrome__start_tab_recording",
-    "mcp__chrome__switch_tab_recording_source",
-    "mcp__chrome__get_tab_recording",
-    "mcp__chrome__stop_tab_recording",
-    "mcp__chrome__cancel_tab_recording",
-    "mcp__chrome__finalize_tabs",
-    "mcp__chrome__close_group_tabs",
-    "mcp__chrome__claim_tab",
-    "mcp__chrome__activate_tab",
-    "mcp__chrome__close_tab",
-    "mcp__chrome__switch_tab",
-    "mcp__chrome__close_tabs",
-    "mcp__chrome__ping_tab",
-    "mcp__chrome__read_page",
-    "mcp__chrome__resolve_target",
-    "mcp__chrome__execute_cached_step",
-    "mcp__chrome__computer",
-    "mcp__chrome__wait",
-    "mcp__chrome__get_interactive_elements",
-    "mcp__chrome__inspect_selector",
-    "mcp__chrome__get_web_content",
-    "mcp__chrome__click_element",
-    "mcp__chrome__hover",
-    "mcp__chrome__fill_or_select",
-    "mcp__chrome__scroll",
-    "mcp__chrome__scroll_wheel",
-    "mcp__chrome__click_point",
-    "mcp__chrome__type_text",
-    "mcp__chrome__press_key",
-    "mcp__chrome__keyboard",
-    "mcp__chrome__upload",
-    "mcp__chrome__download",
-    "mcp__chrome__wait_download",
-    "mcp__chrome__screenshot",
-    "mcp__chrome__clipboard_read",
-    "mcp__chrome__clipboard_write",
-    "mcp__chrome__viewport",
-    "mcp__chrome__page_assets",
-    "mcp__chrome__history",
-    "mcp__chrome__console_logs",
-    "mcp__chrome__send_cdp",
-    "mcp__chrome__inject_script",
-    "mcp__chrome__set_cursor",
-    "mcp__chrome__hide_cursor",
-    "mcp__chrome__set_badge",
-})
-
 CHROME_KNOWLEDGE_LOCAL_MCP_TOOLS = frozenset({
     "mcp__chrome_knowledge_local__prepare_upload",
 })
 
 CHROME_LOCAL_BROWSER_DEFAULT_TOOLS = (
+    "mcp__chrome__run_sequence",
     "mcp__chrome__open_or_reuse",
     "mcp__chrome__read_page",
+    "mcp__chrome__target_state",
     "mcp__chrome__execute_cached_step",
     "mcp__chrome__click_element",
     "mcp__chrome__fill_or_select",
@@ -107,7 +45,7 @@ CHROME_LOCAL_BROWSER_DEFAULT_TOOLS = (
     "mcp__chrome__download",
     "mcp__chrome__wait_download",
     "mcp__chrome__screenshot",
-    "mcp__chrome__confirm_action",
+
 )
 
 
@@ -116,13 +54,11 @@ def _chrome_knowledge_upload_source(value: Any) -> str | None:
     if not text:
         return None
 
+    ref = parse_file_reference(text)
+    if ref is not None and (ref.entity_id or text.startswith("/workspace/")):
+        # An entity fs URL or the sandbox mount: both name a Knowledge path.
+        return ref.fs_path or None
     path = unquote(urlsplit(text).path) if "://" in text else unquote(text)
-    if path.startswith("/api/v1/fs/"):
-        remainder = path.removeprefix("/api/v1/fs/").lstrip("/")
-        _entity_id, separator, knowledge_path = remainder.partition("/")
-        return knowledge_path.lstrip("/") if separator and knowledge_path else None
-    if path.startswith("/workspace/"):
-        return path.removeprefix("/workspace/").lstrip("/") or None
     if path.startswith("Workspaces/"):
         return path
     return None
@@ -133,7 +69,7 @@ def runtime_blocked_chrome_upload_knowledge_source(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> str | None:
-    """Require Knowledge assets to be localized before paired Chrome upload."""
+    """Guide legacy path-shaped input to the direct Knowledge document contract."""
 
     if _canonical_chrome_tool_name(tool_name) != "mcp__chrome__upload":
         return None
@@ -152,14 +88,13 @@ def runtime_blocked_chrome_upload_knowledge_source(
     return json.dumps(
         {
             "status": "blocked",
-            "reason": "chrome_knowledge_prepare_upload_required",
+            "reason": "chrome_knowledge_document_required",
             "blocked_tool": "mcp__chrome__upload",
             "message": (
-                "Chrome upload accepts paired-machine local files only. Prepare each "
-                "Knowledge source first, then retry with the returned upload_files paths."
+                "Chrome upload requires Knowledge document_id or document_ids. "
+                "Find the document for this source and pass its canonical ID."
             ),
-            "next_required_tool": "mcp__chrome_knowledge_local__prepare_upload",
-            "prepare_upload_sources": sources,
+            "knowledge_sources": sources,
         },
         ensure_ascii=False,
     )
@@ -236,12 +171,15 @@ _CHROME_NODE_ACTION_TOOLS = frozenset({
     "mcp__chrome__hover",
     "mcp__chrome__fill_or_select",
 })
+_CHROME_LIVE_SEMANTIC_TARGET_TOOLS = frozenset({
+    "mcp__chrome__click_element",
+    "mcp__chrome__fill_or_select",
+})
 _CHROME_RUNTIME_CONTRACT_STATE_KEY = "chrome_runtime_contract_v1"
 _CHROME_WORKFLOW_SETUP_TOOLS = frozenset({
     "mcp__chrome__documentation",
     "mcp__chrome__capabilities",
     "mcp__chrome__status",
-    "mcp__chrome__reload_extension",
 })
 _CHROME_WORKFLOW_DOCUMENTATION_EXEMPT_TOOLS = _CHROME_WORKFLOW_SETUP_TOOLS | frozenset({
     "mcp__chrome__confirm_action",
@@ -279,6 +217,7 @@ _CHROME_PAGE_MUTATION_TOOLS = frozenset({
     "mcp__chrome__reload",
     "mcp__chrome__handle_js_dialog",
     "mcp__chrome__click_element",
+    "mcp__chrome__hover",
     "mcp__chrome__execute_cached_step",
     "mcp__chrome__fill_or_select",
     "mcp__chrome__scroll",
@@ -290,6 +229,14 @@ _CHROME_PAGE_MUTATION_TOOLS = frozenset({
     "mcp__chrome__upload",
     "mcp__chrome__inject_script",
 })
+
+
+def _chrome_tool_mutates_page(tool_name: str, arguments: dict[str, Any] | None = None) -> bool:
+    if tool_name == "mcp__chrome__computer":
+        return (arguments or {}).get("action") not in {"screenshot", "wait"}
+    return tool_name in _CHROME_PAGE_MUTATION_TOOLS
+
+
 _CHROME_TRUSTED_POST_ACTION_TOOLS = frozenset({
     "mcp__chrome__click_element",
     "mcp__chrome__execute_cached_step",
@@ -299,6 +246,7 @@ _CHROME_TRUSTED_POST_ACTION_TOOLS = frozenset({
 })
 _CHROME_NO_PROGRESS_PASSIVE_TOOLS = frozenset({
     "mcp__chrome__read_page",
+    "mcp__chrome__target_state",
     "mcp__chrome__screenshot",
     "mcp__chrome__wait",
 })
@@ -313,9 +261,9 @@ _CHROME_NAVIGATION_RESET_TOOLS = frozenset({
 })
 _CHROME_OBSERVATION_AFTER_ACTION_ALLOWED_TOOLS = _CHROME_WORKFLOW_SETUP_TOOLS | frozenset({
     "mcp__chrome__read_page",
+    "mcp__chrome__target_state",
     "mcp__chrome__wait",
     "mcp__chrome__screenshot",
-    "mcp__chrome__computer",
     "mcp__chrome__tab_info",
     "mcp__chrome__js_dialog",
     "mcp__chrome__get_group_state",
@@ -335,8 +283,6 @@ _CHROME_WORKFLOW_REQUIRES_SESSION_NAME_TOOLS = frozenset({
     "mcp__chrome__open_or_reuse",
     "mcp__chrome__navigate",
     "mcp__chrome__claim_tab",
-    "mcp__chrome__activate_tab",
-    "mcp__chrome__switch_tab",
     "mcp__chrome__close_tab",
     "mcp__chrome__close_tabs",
     "mcp__chrome__ping_tab",
@@ -347,6 +293,7 @@ _CHROME_WORKFLOW_REQUIRES_SESSION_NAME_TOOLS = frozenset({
     "mcp__chrome__js_dialog",
     "mcp__chrome__handle_js_dialog",
     "mcp__chrome__read_page",
+    "mcp__chrome__target_state",
     "mcp__chrome__execute_cached_step",
     "mcp__chrome__computer",
     "mcp__chrome__wait",
@@ -394,7 +341,7 @@ _CHROME_SUPPORTED_KEY_NAMES = frozenset({
     "ArrowRight",
     "ArrowUp",
 })
-_CHROME_REF_RE = re.compile(r"^e\d+$")
+_CHROME_REF_RE = re.compile(r"^(?:e\d+|f\d+:e\d+)$")
 
 
 @dataclass(frozen=True)
@@ -403,11 +350,12 @@ class ChromeLocalBrowserRoute:
 
     @property
     def provider_keys(self) -> tuple[str, ...]:
-        return ("chrome", "chrome_knowledge_local")
+        return ("chrome",)
 
     @property
     def allowed_tool_names(self) -> set[str]:
-        return set(CHROME_MCP_TOOLS | CHROME_KNOWLEDGE_LOCAL_MCP_TOOLS)
+        # Protocol-specific availability is resolved against the actor's accounts.
+        return set(CHROME_MCP_TOOLS)
 
     @property
     def preferred_tool_names(self) -> tuple[str, ...]:
@@ -439,33 +387,8 @@ def runtime_blocked_generic_web_for_chrome_local_browser(
     tool_name: str,
     active_user_message: str | None,
 ) -> str | None:
-    """Return a runtime block payload when explicit Chrome work uses web tools."""
-    if tool_name not in GENERIC_WEB_TOOLS:
-        return None
-    if not detect_chrome_local_browser_route(active_user_message):
-        return None
-    chrome_worker_label = "local worker"
-    return json.dumps({
-        "status": "blocked",
-        "reason": "chrome_local_browser_required",
-        "blocked_tool": tool_name,
-        "message": (
-            "This request explicitly asks to operate the user's local Chrome "
-            f"browser. Use the Chrome runtime skill backed by the paired {chrome_worker_label} "
-            "instead of web_search, web_fetch, browse_web, "
-            "or direct parent-chat Chrome MCP discovery."
-        ),
-        "next_step": (
-            "Return to the normal Chrome skill path. If the `chrome` skill is "
-            "listed in Available Skills, call invoke_skill with skill_id=<ID of chrome in Available Skills> "
-            "and the latest user request. If invoke_skill is deferred, load "
-            "invoke_skill with search_tools; do not load Chrome MCP tools "
-            "directly from the parent chat. The Chrome skill owns the "
-            "mcp-chrome-style mcp__chrome__open_or_reuse -> "
-            "mcp__chrome__read_page -> ref action -> "
-            "mcp__chrome__read_page loop through the Runtime Harness."
-        ),
-    }, ensure_ascii=False)
+    """Let the model choose web or Chrome from the authorized tool surface."""
+    return None
 
 
 def runtime_blocked_chrome_open_shortcut(
@@ -476,8 +399,6 @@ def runtime_blocked_chrome_open_shortcut(
 ) -> str | None:
     """Block legacy open for ordinary Chrome tasks; clear aliases are allowed."""
     if tool_name != "mcp__chrome__open":
-        return None
-    if not detect_chrome_local_browser_route(active_user_message):
         return None
     if _chrome_explicit_new_tab_requested(arguments or {}):
         return None
@@ -528,21 +449,23 @@ def runtime_blocked_chrome_workflow_contract(
     MCP package, while ordinary Chrome tasks are steered through
     task-scoped tab work -> finalize.
     """
-    canonical_tool = _canonical_chrome_tool_name(tool_name)
+    canonical_tool, normalized_arguments = normalize_chrome_call(tool_name, arguments)
+    if canonical_tool == "mcp__chrome__drag":
+        canonical_tool = "mcp__chrome__computer"
     if canonical_tool not in CHROME_MCP_TOOLS:
-        return None
-    raw_state = (runtime_metadata or {}).get(_CHROME_RUNTIME_CONTRACT_STATE_KEY)
-    chrome_route = detect_chrome_local_browser_route(active_user_message)
-    if active_user_message is not None and not chrome_route and not isinstance(raw_state, dict):
         return None
     if runtime_metadata is None:
         return None
     state = _chrome_runtime_contract_state(runtime_metadata)
-    _ensure_chrome_control_epoch(
+    # Keep the runtime-issued lease on the dispatched call, not only its
+    # normalized comparison view.
+    normalized_arguments["control_epoch"] = _ensure_chrome_control_epoch(
         state=state,
         arguments=arguments,
         active_user_message=active_user_message,
     )
+    normalized_arguments.pop("controlEpoch", None)
+    arguments = normalized_arguments
 
     blocked_interruption = _blocked_chrome_control_interruption(
         canonical_tool=canonical_tool,
@@ -636,6 +559,7 @@ def runtime_blocked_chrome_workflow_contract(
     blocked_observation = _blocked_chrome_action_before_observation(
         canonical_tool=canonical_tool,
         state=state,
+        arguments=arguments,
     )
     if blocked_observation is not None:
         return blocked_observation
@@ -656,8 +580,10 @@ def runtime_record_chrome_workflow_tool(
     arguments: dict[str, Any],
     runtime_metadata: dict[str, Any] | None,
 ) -> None:
-    """Record successful Chrome workflow milestones in Runtime metadata."""
-    canonical_tool = _canonical_chrome_tool_name(tool_name)
+    """Record Chrome calls; result-dependent milestones are recorded separately."""
+    canonical_tool, arguments = normalize_chrome_call(tool_name, arguments)
+    if canonical_tool == "mcp__chrome__drag":
+        canonical_tool = "mcp__chrome__computer"
     if canonical_tool not in CHROME_MCP_TOOLS or runtime_metadata is None:
         return
     state = _chrome_runtime_contract_state(runtime_metadata)
@@ -685,12 +611,6 @@ def runtime_record_chrome_workflow_tool(
         state["session_named"] = True
         if name:
             state["session_name"] = name
-    elif canonical_tool == "mcp__chrome__finalize_tabs":
-        state["finalized"] = True
-        logger.info(
-            "Chrome workflow summary %s",
-            json.dumps(runtime_chrome_workflow_summary(runtime_metadata), sort_keys=True),
-        )
 
 
 def runtime_record_chrome_tool_result(
@@ -701,11 +621,36 @@ def runtime_record_chrome_tool_result(
     runtime_metadata: dict[str, Any] | None,
 ) -> None:
     """Record Chrome result-driven recovery requirements in Runtime metadata."""
-    canonical_tool = _canonical_chrome_tool_name(tool_name)
+    canonical_tool, arguments = normalize_chrome_call(tool_name, arguments)
+    if canonical_tool == "mcp__chrome__drag":
+        canonical_tool = "mcp__chrome__computer"
     if canonical_tool not in CHROME_MCP_TOOLS or runtime_metadata is None:
         return
     state = _chrome_runtime_contract_state(runtime_metadata)
     payload = _parse_json_object(result)
+    if payload is not None:
+        from packages.core.ai.chrome_results import normalize_chrome_result
+
+        payload = normalize_chrome_result(payload)
+    if payload is not None and _chrome_tool_mutates_page(canonical_tool, arguments):
+        state["last_action_result"] = {
+            "kind": "last_browser_action",
+            "tool": canonical_tool,
+            "tabId": payload.get("tabId", arguments.get("tabId")),
+            **{key: payload[key] for key in (
+                "ok", "status", "action_executed", "retryable", "verified",
+                "website_upload_confirmed", "next_required_tool",
+                "action_receipt",
+            ) if key in payload},
+        }
+    if canonical_tool == "mcp__chrome__finalize_tabs":
+        if payload is not None and payload.get("ok") is True and not payload.get("error"):
+            state["finalized"] = True
+            logger.info(
+                "Chrome workflow summary %s",
+                json.dumps(runtime_chrome_workflow_summary(runtime_metadata), sort_keys=True),
+            )
+        return
     if payload is not None and str(payload.get("status") or "").strip() == "interrupted":
         result_epoch = str(
             payload.get("control_epoch")
@@ -751,7 +696,13 @@ def runtime_record_chrome_tool_result(
             snapshot_id = str(payload.get("snapshot_id") or payload.get("snapshotId") or "").strip()
             if snapshot_id:
                 _record_chrome_snapshot(state, snapshot_id=snapshot_id, from_read_page=True)
+            _record_chrome_page_url(state, payload)
             _record_chrome_candidate_summary(state, payload)
+        return
+
+    if canonical_tool == "mcp__chrome__resolve_target":
+        if payload is not None:
+            _record_chrome_resolved_target(state, payload)
         return
 
     if payload is None:
@@ -770,24 +721,27 @@ def runtime_record_chrome_tool_result(
 
     status = str(payload.get("status") or "").strip()
     if payload.get("approval_required") is True or status in {"approval_required", "handoff_required"}:
-        decision_arguments = dict(arguments or {})
-        for key in ("url", "target_label", "target_role", "data_summary", "label", "role"):
-            if payload.get(key) is not None:
-                decision_arguments[key] = payload[key]
-        decision = classify_chrome_confirmation(
-            canonical_tool,
-            decision_arguments,
-            initial_user_message=str(state.get("initial_user_message") or "").strip(),
-        )
+        if canonical_tool == "mcp__chrome__claim_tab":
+            return
+        decision = classify_chrome_call(canonical_tool, chrome_policy_arguments(
+            canonical_tool, arguments or {}, runtime_metadata,
+        ))
+        confirmation = decision.confirmation
+        if confirmation is None:
+            # A legacy device cannot create business approval from an ordinary
+            # action or from missing evidence. Re-observe/update the device.
+            state.pop("pending_chrome_confirmation", None)
+            state["pending_read_page_required_action"] = {"reason": "chrome_confirmation_contract_error"}
+            return
         approval_id = str(payload.get("approvalId") or payload.get("approval_id") or "").strip()
         state["pending_chrome_confirmation"] = {
             "approval_id": approval_id,
             "tool_name": canonical_tool,
-            "confirmation_mode": decision.mode,
-            "policy_category": decision.policy_category,
-            "preapproved": decision.preapproved,
-            "destination": decision.destination,
-            "data_summary": decision.data_summary,
+            "confirmation_mode": confirmation.mode,
+            "policy_category": confirmation.policy_category,
+            "preapproved": confirmation.preapproved,
+            "destination": confirmation.destination,
+            "data_summary": confirmation.data_summary,
             "action_signature": _chrome_action_signature(canonical_tool, arguments),
         }
         return
@@ -797,6 +751,20 @@ def runtime_record_chrome_tool_result(
         _record_chrome_wait(state)
 
     event_receipt = payload.get("event_receipt")
+    if (
+        _chrome_tool_mutates_page(canonical_tool, arguments)
+        and payload.get("action_executed") == "unknown"
+        and payload.get("retryable") is False
+        and payload.get("stop_reason") == "uncertain_result"
+    ):
+        state.pop("pending_read_page_required_action", None)
+        state["pending_observation_after_action"] = {
+            "tool_name": canonical_tool,
+            "reason": "uncertain_mutation_result",
+            "next_required_tool": "mcp__chrome__read_page",
+        }
+        state["post_action_read_credit"] = True
+        return
     if (
         payload.get("action_executed") is True
         and isinstance(event_receipt, dict)
@@ -825,16 +793,20 @@ def runtime_record_chrome_tool_result(
                 snapshot_id=str(post_action_state.get("snapshot_id") or "").strip(),
                 from_read_page=False,
             )
+            _record_chrome_page_url(state, post_action_state)
             _record_chrome_candidate_summary(state, post_action_state)
             state.pop("pending_observation_after_action", None)
             state.pop("post_action_read_credit", None)
             return
+        if _repeated_chrome_no_op_scroll(canonical_tool, payload, arguments, state):
+            return
         if canonical_tool in _CHROME_NAVIGATION_RESET_TOOLS and _chrome_tool_result_requires_observation(
             canonical_tool,
             payload,
+            arguments,
         ):
             _reset_chrome_exploration_budget(state, latest_snapshot_id=None)
-        if _chrome_tool_result_requires_observation(canonical_tool, payload):
+        if _chrome_tool_result_requires_observation(canonical_tool, payload, arguments):
             state["pending_observation_after_action"] = {
                 "tool_name": canonical_tool,
                 "reason": "action_may_have_changed_page",
@@ -915,13 +887,288 @@ def _record_chrome_candidate_summary(state: dict[str, Any], payload: dict[str, A
     source = payload.get("candidate_summary")
     if not isinstance(source, dict):
         source = payload
-    summary = _bounded_chrome_candidate_summary(source)
+    # The extension exposes a compact candidate_summary for model context, but
+    # approval classification needs the complete bounded observation. In
+    # particular, long forms commonly place their editable fields and submit
+    # controls after the compact first page.
+    policy_source = dict(source)
+    for key in ("semantic_refs", "submit_candidates"):
+        if isinstance(payload.get(key), list):
+            policy_source[key] = payload[key]
+    summary = _bounded_chrome_candidate_summary(policy_source)
     state["latest_candidate_summary"] = summary
+    state["latest_policy_refs"] = _bounded_chrome_policy_refs(policy_source)
+    state["latest_cached_path_hints"] = [
+        dict(hint) for hint in payload.get("cached_path_hints", [])[:8]
+        if isinstance(hint, dict)
+    ] if isinstance(payload.get("cached_path_hints"), list) else []
+    snapshot_id = str(payload.get("snapshot_id") or payload.get("snapshotId") or "").strip()
+    tab_id = payload.get("tabId")
+    if snapshot_id and isinstance(tab_id, int) and not isinstance(tab_id, bool):
+        binding = {"snapshot_id": snapshot_id, "tab_id": tab_id}
+        page_url = str(payload.get("url") or payload.get("page_url") or "").strip()
+        if page_url:
+            binding["url"] = page_url[:2_048]
+        connection = payload.get("chrome_connection")
+        if isinstance(connection, dict):
+            connection_id = str(connection.get("id") or "").strip()
+            if connection_id:
+                binding["connection_id"] = connection_id
+        state["latest_candidate_snapshot"] = binding
+
+
+def _record_chrome_resolved_target(state: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Retain an extension-attested target omitted from a parent frame projection."""
+    if payload.get("ok") is not True:
+        return
+    tab_id = payload.get("tabId")
+    snapshot_id = str(payload.get("snapshot_id") or payload.get("snapshotId") or "").strip()
+    ref = str(payload.get("ref") or payload.get("node_id") or "").strip()
+    resolution = payload.get("target_resolution")
+    if (
+        not isinstance(tab_id, int)
+        or isinstance(tab_id, bool)
+        or not snapshot_id
+        or not ref
+        or not isinstance(resolution, dict)
+        or resolution.get("matched_refs") != 1
+        or str(resolution.get("snapshot_id") or "").strip() != snapshot_id
+        or not isinstance(resolution.get("type"), str)
+        or not isinstance(resolution.get("autocomplete"), str)
+    ):
+        return
+    target = {"ref": ref[:160]}
+    for key in (
+        "label", "aria_label", "name", "text", "href", "type", "autocomplete",
+        "form_label", "dialog_label", "role", "tag", "activation",
+    ):
+        value = resolution.get(key)
+        if isinstance(value, str) and value.strip():
+            target[key] = value.strip()[:240]
+    target["type"] = resolution["type"][:240]
+    target["autocomplete"] = resolution["autocomplete"][:240]
+    for key in ("editable", "disabled", "read_only"):
+        if isinstance(resolution.get(key), bool):
+            target[key] = resolution[key]
+    if not any(target.get(key) for key in (
+        "label", "aria_label", "name", "text", "href", "type", "autocomplete",
+    )):
+        return
+    record: dict[str, Any] = {
+        "tab_id": tab_id,
+        "snapshot_id": snapshot_id,
+        "ref": ref,
+        "target": target,
+    }
+    connection_id = str(state.get("chrome_policy_connection_id") or "").strip()
+    if connection_id:
+        record["connection_id"] = connection_id
+    state["latest_resolved_target"] = record
+
+
+def _chrome_observed_policy_target(target: dict[str, Any]) -> dict[str, Any]:
+    observed = {
+        key: target[key]
+        for key in (
+            "label", "aria_label", "name", "text", "href", "type", "autocomplete",
+            "form_label", "dialog_label", "role", "tag", "activation",
+        )
+        if isinstance(target.get(key), str) and target[key].strip()
+    }
+    for key in ("editable", "disabled", "read_only"):
+        if isinstance(target.get(key), bool):
+            observed[key] = target[key]
+    return observed
+
+
+def chrome_policy_arguments(
+    tool_name: str,
+    arguments: dict[str, Any],
+    runtime_metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Add a server-recorded semantic target only to approval classification.
+
+    The returned copy never reaches the browser or approval payload hash.  A
+    model-supplied label cannot replace the fresh ref observation.
+    """
+    caller_arguments = {
+        key: value for key, value in arguments.items()
+        if not key.startswith("_runtime_trusted_browser_")
+    }
+    tool_name, normalized = normalize_chrome_call(tool_name, caller_arguments)
+    caller_arguments = normalized
+    if tool_name == "mcp__chrome__execute_cached_step":
+        state = (runtime_metadata or {}).get(_CHROME_RUNTIME_CONTRACT_STATE_KEY)
+        hint = chrome_cached_policy_hint(caller_arguments, state)
+        if hint is None:
+            return caller_arguments
+        action_input = caller_arguments.get("action_input")
+        action_input = action_input if isinstance(action_input, dict) else {}
+        leaf = {**caller_arguments, **{
+            key: value for key, value in action_input.items()
+            if key in {"value", "values", "checked", "selected", "double", "button"}
+        }, "ref": hint["next_ref"], "snapshot_id": hint["snapshot_id"]}
+        projected = chrome_policy_arguments("mcp__chrome__" + hint["action"], leaf, runtime_metadata)
+        if isinstance(projected.get("target"), dict):
+            projected["_runtime_trusted_browser_cached_action"] = hint["action"]
+        return projected
+    if tool_name not in {
+        "mcp__chrome__click_element", "mcp__chrome__fill_or_select", "mcp__chrome__click_point",
+        "mcp__chrome__type_text", "mcp__chrome__press_key", "mcp__chrome__keyboard",
+        "mcp__chrome__download",
+    }:
+        return caller_arguments
+    ref = str(caller_arguments.get("ref") or caller_arguments.get("node_id") or "").strip()
+    snapshot_id = str(caller_arguments.get("snapshot_id") or caller_arguments.get("snapshotId") or "").strip()
+    tab_id = caller_arguments.get("tabId")
+    state = (runtime_metadata or {}).get(_CHROME_RUNTIME_CONTRACT_STATE_KEY)
+    untrusted_ref_arguments = {
+        key: value for key, value in caller_arguments.items()
+        if key not in {"label", "target_label", "aria_label", "name", "text", "role", "target"}
+    }
+    if not ref:
+        return untrusted_ref_arguments
+    if not snapshot_id or not isinstance(tab_id, int) or isinstance(tab_id, bool) or not isinstance(state, dict):
+        return untrusted_ref_arguments
+    binding = state.get("latest_candidate_snapshot")
+    policy_refs = state.get("latest_policy_refs")
+    summary = state.get("latest_candidate_summary")
+    def fallback() -> dict[str, Any]:
+        return _resolved_chrome_policy_arguments(
+            state=state,
+            runtime_metadata=runtime_metadata,
+            ref=ref,
+            snapshot_id=snapshot_id,
+            tab_id=tab_id,
+            arguments=untrusted_ref_arguments,
+        )
+    if not isinstance(binding, dict) or not isinstance(policy_refs, list) or not isinstance(summary, dict):
+        return fallback()
+    if binding.get("snapshot_id") != snapshot_id or binding.get("tab_id") != tab_id:
+        return fallback()
+    current_connection_id = str(
+        state.get("chrome_policy_connection_id")
+        or (runtime_metadata or {}).get("chrome_policy_connection_id")
+        or ""
+    ).strip()
+    if current_connection_id:
+        observed_connection_id = str(binding.get("connection_id") or "").strip()
+        if not observed_connection_id or observed_connection_id != current_connection_id:
+            return fallback()
+    matches = [item for item in policy_refs if isinstance(item, dict) and str(item.get("ref") or item.get("node_id") or "").strip() == ref]
+    if len(matches) != 1:
+        return fallback()
+    target = matches[0]
+    trusted = _chrome_observed_policy_target(target)
+    is_submit = target.get("activation") not in {"navigation", "popup"} and any(
+        ref == str(item.get("ref") or item.get("node_id") or "").strip()
+        for item in summary.get("submit_candidates", []) if isinstance(item, dict)
+    )
+    if is_submit:
+        trusted["submit_candidate"] = True
+    if not trusted:
+        return fallback()
+    classified = untrusted_ref_arguments
+    classified["target"] = trusted
+    classified["url"] = str(binding.get("url") or "").strip()
+    return classified
+
+
+def chrome_cached_policy_hint(arguments: dict[str, Any], state: Any) -> dict[str, Any] | None:
+    if not isinstance(state, dict):
+        return None
+    matches = [hint for hint in state.get("latest_cached_path_hints", []) if isinstance(hint, dict) and (
+        hint.get("path_recipe_id") == arguments.get("path_recipe_id")
+        and hint.get("path_recipe_scope") == arguments.get("path_recipe_scope", "local")
+        and hint.get("step_index") == arguments.get("path_recipe_step_index")
+        and hint.get("operation_key") == arguments.get("operation_key", arguments.get("operationKey"))
+        and hint.get("operation_intent_definition_hash") == arguments.get("operation_intent_definition_hash")
+        and hint.get("action") in {"click_element", "fill_or_select"}
+        and isinstance(hint.get("next_ref"), str) and hint["next_ref"]
+        and isinstance(hint.get("snapshot_id"), str) and hint["snapshot_id"]
+        and (not arguments.get("ref") or arguments["ref"] == hint["next_ref"])
+        and (not arguments.get("snapshot_id") or arguments["snapshot_id"] == hint["snapshot_id"])
+    )]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolved_chrome_policy_arguments(
+    *,
+    state: dict[str, Any],
+    runtime_metadata: dict[str, Any] | None,
+    ref: str,
+    snapshot_id: str,
+    tab_id: int,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Use the same bound resolver receipt for every target-bearing action."""
+    resolved = state.get("latest_resolved_target")
+    if not isinstance(resolved, dict) or (
+        resolved.get("snapshot_id") != snapshot_id
+        or resolved.get("tab_id") != tab_id
+        or resolved.get("ref") != ref
+    ):
+        return arguments
+    current_connection_id = str(
+        state.get("chrome_policy_connection_id")
+        or (runtime_metadata or {}).get("chrome_policy_connection_id")
+        or ""
+    ).strip()
+    if current_connection_id and resolved.get("connection_id") != current_connection_id:
+        return arguments
+    target = resolved.get("target")
+    if not isinstance(target, dict):
+        return arguments
+    trusted = _chrome_observed_policy_target(target)
+    classified = {**arguments, "target": trusted} if trusted else dict(arguments)
+    return classified
+
+
+def _bounded_chrome_policy_refs(source: dict[str, Any]) -> list[dict[str, str]]:
+    """Keep enough server-observed ref semantics for approval classification.
+
+    This is deliberately separate from the model-facing candidate summary:
+    long forms often place editable inputs after its compact first page.
+    Ref-count and per-field limits bound this index without dropping late
+    targets from an otherwise trusted observation.
+    """
+    refs = source.get("semantic_refs")
+    if not isinstance(refs, list):
+        return []
+    compacted: list[dict[str, str]] = []
+    for raw in refs[:160]:
+        if not isinstance(raw, dict):
+            continue
+        ref = str(raw.get("ref") or raw.get("node_id") or "").strip()
+        if not ref:
+            continue
+        candidate = {"ref": ref[:160]}
+        for key in (
+            "label", "aria_label", "name", "text", "href", "type", "autocomplete", "role", "tag",
+            "form_label", "dialog_label", "activation",
+        ):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                candidate[key] = (value if key in {"type", "autocomplete"} else value.strip())[:240]
+        for key in ("editable", "disabled", "read_only"):
+            if isinstance(raw.get(key), bool):
+                candidate[key] = raw[key]
+        compacted.append(candidate)
+    return compacted
+
+
+def _record_chrome_page_url(state: dict[str, Any], payload: dict[str, Any]) -> None:
+    url = str(payload.get("url") or payload.get("page_url") or "").strip()
+    if url:
+        state["latest_page_url"] = url[:2_048]
 
 
 def _bounded_chrome_candidate_summary(value: Any) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     compacted: dict[str, Any] = {}
+    locator_keys = {"selector", "frame_selector", "shadow_host", "shadow_selector", "host_selector"}
+    remaining_chars = 16_000
+    omitted_candidate = False
     counts = source.get("counts")
     if isinstance(counts, dict):
         compacted["counts"] = {
@@ -955,9 +1202,14 @@ def _bounded_chrome_candidate_summary(value: Any) -> dict[str, Any]:
             for key in ("url", "status", "reason", "host_selector"):
                 value = raw_frame.get(key)
                 if isinstance(value, str):
-                    frame[key] = value[:240]
+                    frame[key] = value if key in locator_keys else value[:240]
             if isinstance(raw_frame.get("host_visible"), bool):
                 frame["host_visible"] = raw_frame["host_visible"]
+            size = len(json.dumps(frame, ensure_ascii=False))
+            if size > remaining_chars:
+                omitted_candidate = True
+                continue
+            remaining_chars -= size
             compacted["skipped_frames"].append(frame)
     semantic_ref_keys = (
         "ref",
@@ -1007,7 +1259,7 @@ def _bounded_chrome_candidate_summary(value: Any) -> dict[str, Any]:
         "semantic_refs": (40, semantic_ref_keys),
         "input_candidates": (8, ("ref", "node_id", "label", "role")),
         "dialog_candidates": (2, ("label", "field_refs", "submit_refs")),
-        "upload_candidates": (4, ("ref", "node_id", "selector", "label")),
+        "upload_candidates": (4, ("ref", "node_id", "selector", "frame_selector", "shadow_host", "shadow_selector", "label")),
         "submit_candidates": (4, ("ref", "node_id", "label")),
         "next_actions": (6, ("tool", "action", "ref", "node_id", "selector", "label")),
     }
@@ -1024,12 +1276,12 @@ def _bounded_chrome_candidate_summary(value: Any) -> dict[str, Any]:
                 raw_value = raw_candidate.get(candidate_key)
                 if candidate_key in {"field_refs", "submit_refs"}:
                     candidate[candidate_key] = (
-                        [str(item)[:160] for item in raw_value[:8] if isinstance(item, str) and item.strip()]
+                        [item for item in raw_value[:8] if isinstance(item, str) and item.strip()]
                         if isinstance(raw_value, list)
                         else []
                     )
                 elif isinstance(raw_value, str):
-                    candidate[candidate_key] = raw_value[:160]
+                    candidate[candidate_key] = raw_value if candidate_key in locator_keys else raw_value[:160]
                 elif isinstance(raw_value, bool):
                     candidate[candidate_key] = raw_value
                 elif isinstance(raw_value, (int, float)):
@@ -1040,8 +1292,19 @@ def _bounded_chrome_candidate_summary(value: Any) -> dict[str, Any]:
                         for coordinate in ("x", "y", "width", "height")
                         if isinstance(raw_value.get(coordinate), (int, float))
                     }
+            size = len(json.dumps(candidate, ensure_ascii=False))
+            if size > remaining_chars and (candidate.get("ref") or candidate.get("node_id")):
+                for locator_key in locator_keys:
+                    candidate.pop(locator_key, None)
+                size = len(json.dumps(candidate, ensure_ascii=False))
+            if size > remaining_chars:
+                omitted_candidate = True
+                continue
+            remaining_chars -= size
             candidates.append(candidate)
         compacted[key] = candidates
+    if omitted_candidate:
+        compacted["needs_narrower_observation"] = True
     return compacted
 
 
@@ -1084,7 +1347,6 @@ def _blocked_chrome_no_progress_exploration(
         "mcp__chrome__upload",
         "mcp__chrome__open_or_reuse",
         "mcp__chrome__navigate",
-        "mcp__chrome__confirm_action",
         "mcp__chrome__finalize_tabs",
     ]
     if read_count < 2:
@@ -1169,6 +1431,7 @@ def _record_chrome_screenshot(state: dict[str, Any]) -> None:
         screenshots.append(snapshot_id)
         state["screenshotted_snapshot_ids"] = screenshots[-20:]
         state["no_progress_recovery_count"] = int(state.get("no_progress_recovery_count") or 0) + 1
+
 
 
 def _workflow_scene_capture_context(arguments: dict[str, Any] | None) -> bool:
@@ -1262,9 +1525,10 @@ def runtime_blocked_chrome_action_shortcut(
     active_user_message: str | None,
 ) -> str | None:
     """Block Chrome actions that skip the mcp-chrome read_page/ref loop."""
-    if not detect_chrome_local_browser_route(active_user_message):
+    if not tool_name.startswith(("mcp__chrome__", "browser_", "chrome_")):
         return None
-    args = arguments or {}
+    original_name = tool_name
+    tool_name, args = normalize_chrome_call(tool_name, arguments or {})
     fallback_reason = str(args.get("fallbackReason") or args.get("fallback_reason") or "").strip()
 
     if tool_name == "mcp__chrome__type_text":
@@ -1276,7 +1540,11 @@ def runtime_blocked_chrome_action_shortcut(
 
     if tool_name in _CHROME_NODE_ACTION_TOOLS:
         ref = str(args.get("ref") or args.get("node_id") or args.get("nodeId") or "").strip()
-        if not _CHROME_REF_RE.match(ref) and not fallback_reason:
+        if (
+            not _CHROME_REF_RE.match(ref)
+            and not _has_strong_live_semantic_target(tool_name, args)
+            and not fallback_reason
+        ):
             return _blocked_invalid_chrome_ref(tool_name, "ref", ref)
 
     if tool_name == "mcp__chrome__click_point" and not fallback_reason:
@@ -1286,16 +1554,18 @@ def runtime_blocked_chrome_action_shortcut(
         )
 
     if tool_name == "mcp__chrome__computer":
-        action = str(args.get("action") or "").strip()
-        if action in {"screenshot", "wait"}:
-            return None
+        return json.dumps({
+            "status": "error", "reason": "chrome_unsupported_computer_action",
+            "blocked_tool": original_name, "action": args.get("action"),
+            "supported_actions": sorted(CHROME_COMPUTER_ACTIONS),
+            "message": "Use a supported Chrome computer action.", "action_executed": False,
+        })
+    if original_name == "mcp__chrome__computer" and tool_name not in {"mcp__chrome__screenshot", "mcp__chrome__wait"}:
         ref = str(args.get("ref") or args.get("node_id") or args.get("nodeId") or "").strip()
-        if _CHROME_REF_RE.match(ref):
-            return None
-        if not fallback_reason:
+        if not _CHROME_REF_RE.match(ref) and not fallback_reason:
             return _blocked_chrome_fallback_required(
-                tool_name,
-                f"Chrome computer action '{action or 'unknown'}' is a low-level visual/focused fallback without a read_page ref.",
+                original_name,
+                "Chrome computer requires a current ref or an explicit visual/focused fallback reason.",
             )
 
     if tool_name == "mcp__chrome__claim_tab":
@@ -1330,8 +1600,10 @@ def runtime_blocked_chrome_action_shortcut(
             }, ensure_ascii=False)
 
     if tool_name in {"mcp__chrome__press_key", "mcp__chrome__keyboard"}:
-        key = str(args.get("key") or args.get("keys") or "").strip()
-        if not _chrome_key_supported(key):
+        keys = chrome_key_sequence(args)
+        key = "+".join(keys)
+        modifiers = {"control", "shift", "alt", "meta"}
+        if not keys or not all(part in modifiers for part in keys[:-1]) or not _chrome_key_supported(keys[-1]):
             return json.dumps({
                 "status": "blocked",
                 "reason": "chrome_unsupported_key",
@@ -1340,9 +1612,8 @@ def runtime_blocked_chrome_action_shortcut(
                 "next_step": (
                     "Use a supported single key such as Enter, Tab, Escape, "
                     "Home, End, PageUp, PageDown, Backspace, Delete, Space, "
-                    "or ArrowUp/ArrowDown/ArrowLeft/ArrowRight. For navigation, "
-                    "read the page with mcp__chrome__read_page and click a "
-                    "visible ref instead of sending shortcut chords."
+                    "or ArrowUp/ArrowDown/ArrowLeft/ArrowRight, optionally preceded "
+                    "by Control, Shift, Alt or Meta. Use keys for an ordered chord."
                 ),
             }, ensure_ascii=False)
         if not fallback_reason:
@@ -1352,6 +1623,24 @@ def runtime_blocked_chrome_action_shortcut(
             )
 
     return None
+
+
+def _has_strong_live_semantic_target(tool_name: str, arguments: dict[str, Any]) -> bool:
+    if tool_name not in _CHROME_LIVE_SEMANTIC_TARGET_TOOLS:
+        return False
+    if any(arguments.get(key) is not None for key in ("ref", "node_id", "nodeId")):
+        return False
+    target = arguments.get("target")
+    if not isinstance(target, dict) or target.get("exact") is not True:
+        return False
+    role = target.get("role")
+    name = target.get("name")
+    return (
+        isinstance(role, str)
+        and bool(role.strip())
+        and isinstance(name, str)
+        and bool(name.strip())
+    )
 
 
 def _blocked_chrome_action_before_read_page(
@@ -1365,7 +1654,7 @@ def _blocked_chrome_action_before_read_page(
     pending = state.get("pending_read_page_required_action")
     if not isinstance(pending, dict):
         return None
-    if canonical_tool not in _CHROME_PAGE_MUTATION_TOOLS:
+    if not _chrome_tool_mutates_page(canonical_tool, arguments):
         return None
     return json.dumps({
         "status": "blocked",
@@ -1384,10 +1673,11 @@ def _blocked_chrome_action_before_observation(
     *,
     canonical_tool: str,
     state: dict[str, Any],
+    arguments: dict[str, Any] | None = None,
 ) -> str | None:
     if canonical_tool in _CHROME_OBSERVATION_AFTER_ACTION_ALLOWED_TOOLS:
         return None
-    if canonical_tool not in _CHROME_PAGE_MUTATION_TOOLS:
+    if not _chrome_tool_mutates_page(canonical_tool, arguments):
         return None
     pending = state.get("pending_observation_after_action")
     if not isinstance(pending, dict):
@@ -1406,10 +1696,73 @@ def _blocked_chrome_action_before_observation(
     }, ensure_ascii=False)
 
 
-def _chrome_tool_result_requires_observation(tool_name: str, payload: dict[str, Any]) -> bool:
-    if tool_name not in _CHROME_PAGE_MUTATION_TOOLS:
+def _repeated_chrome_no_op_scroll(
+    tool_name: str,
+    payload: dict[str, Any],
+    arguments: dict[str, Any] | None,
+    state: dict[str, Any],
+) -> bool:
+    scrolling = tool_name in {"mcp__chrome__scroll", "mcp__chrome__scroll_wheel"} or (
+        tool_name == "mcp__chrome__computer"
+        and (arguments or {}).get("action") in {"scroll", "scroll_to"}
+    )
+    if not scrolling or payload.get("ok") is not True:
         return False
-    if payload.get("ok") is False:
+    if payload.get("scroll_changed") is True:
+        # Returning to an earlier boundary can trigger new asynchronous work;
+        # semantic snapshots intentionally do not encode scroll position.
+        state.pop("no_op_scroll_observations", None)
+        return False
+    if payload.get("scroll_changed") is not False:
+        return False
+    observation = payload.get("action")
+    wheel = payload.get("scroll")
+    if isinstance(wheel, dict) and isinstance(wheel.get("after"), dict):
+        observation = wheel["after"]
+    if not isinstance(observation, dict) or observation.get("atBoundary") is not True:
+        return False
+    container = observation.get("scroll_container")
+    frame_id = observation.get("scroll_frame_id")
+    tab_id = payload.get("tabId")
+    snapshot_id = str(state.get("latest_snapshot_id") or "").strip()
+    snapshot_binding = state.get("latest_candidate_snapshot")
+    if (
+        not isinstance(container, str) or not container.strip()
+        or not isinstance(frame_id, int) or isinstance(frame_id, bool)
+        or not isinstance(tab_id, int) or isinstance(tab_id, bool)
+        or not snapshot_id
+        or not isinstance(snapshot_binding, dict)
+        or snapshot_binding.get("snapshot_id") != snapshot_id
+        or snapshot_binding.get("tab_id") != tab_id
+    ):
+        return False
+    binding = {
+        "snapshot_id": snapshot_id,
+        "tab_id": tab_id,
+        "frame_id": frame_id,
+        "container": container[:500],
+        "boundary": [observation.get(key) is True for key in ("atTop", "atBottom", "atLeft", "atRight")],
+        "direction": [
+            (value > 0) - (value < 0) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+            for value in (observation.get("deltaX"), observation.get("deltaY"))
+        ],
+    }
+    observed = state.get("no_op_scroll_observations")
+    observed = observed if isinstance(observed, list) else []
+    if binding in observed:
+        return True
+    # A first unchanged scroll can still start asynchronous page work. Keep
+    # one fresh read, then retain the passive budget for repeated attempts.
+    state["no_op_scroll_observations"] = [*observed[-19:], binding]
+    return False
+
+
+def _chrome_tool_result_requires_observation(
+    tool_name: str, payload: dict[str, Any], arguments: dict[str, Any] | None = None,
+) -> bool:
+    if not _chrome_tool_mutates_page(tool_name, arguments):
+        return False
+    if payload.get("ok") is False or payload.get("action_executed") is False:
         return False
     status = str(payload.get("status") or "").strip()
     if status in {
@@ -1462,14 +1815,7 @@ def _chrome_result_has_verified_post_action_state(
 
 
 def _canonical_chrome_tool_name(tool_name: str) -> str:
-    name = str(tool_name or "").strip()
-    if name.startswith("mcp__chrome__"):
-        return name
-    if name.startswith("browser_"):
-        name = name[len("browser_"):]
-    if name:
-        return f"mcp__chrome__{name}"
-    return name
+    return canonical_chrome_tool_name(tool_name) if tool_name else tool_name
 
 
 def _chrome_runtime_contract_state(runtime_metadata: dict[str, Any]) -> dict[str, Any]:
@@ -1652,8 +1998,6 @@ def _number_arg(arguments: dict[str, Any], key: str) -> float:
 def _chrome_key_supported(key: str) -> bool:
     if not key:
         return False
-    if "+" in key:
-        return False
     if re.fullmatch(r"F\d{1,2}", key, re.IGNORECASE):
         return False
-    return key in _CHROME_SUPPORTED_KEY_NAMES or len(key) == 1
+    return key.lower() in {name.lower() for name in _CHROME_SUPPORTED_KEY_NAMES} or len(key) == 1

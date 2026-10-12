@@ -13,6 +13,9 @@ export default function Login() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const safeNextPath = safeAuthRedirect(searchParams.get("next"));
+  const chatInviteToken = safeNextPath.startsWith("/chat?")
+    ? new URLSearchParams(safeNextPath.split("?", 2)[1]).get("invite") || ""
+    : "";
   const teamInviteToken = searchParams.get("team_invite") || searchParams.get("invite_token") || "";
   const inviteRedirectPath = teamInviteToken
     ? `/account?team_invite=${encodeURIComponent(teamInviteToken)}`
@@ -71,9 +74,12 @@ export default function Login() {
       sessionStorage.setItem("oauth_remember_me", rememberMe ? "1" : "0");
       if (teamInviteToken) {
         sessionStorage.setItem("oauth_team_invite", teamInviteToken);
+        sessionStorage.removeItem("oauth_chat_invite");
         sessionStorage.removeItem("oauth_invitation_code");
       } else {
         sessionStorage.removeItem("oauth_team_invite");
+        if (chatInviteToken) sessionStorage.setItem("oauth_chat_invite", chatInviteToken);
+        else sessionStorage.removeItem("oauth_chat_invite");
         const trimmedInvite = invitationCode.trim();
         if (trimmedInvite) {
           sessionStorage.setItem("oauth_invitation_code", trimmedInvite);
@@ -86,7 +92,7 @@ export default function Login() {
       setError(t("page.login.could_not_start_google_sign_in_please_check_the"));
       setGoogleLoading(false);
     }
-  }, [invitationCode, inviteRedirectPath, rememberMe, teamInviteToken]);
+  }, [chatInviteToken, invitationCode, inviteRedirectPath, rememberMe, teamInviteToken]);
 
   const { login, login2fa, register, verifyEmail, resendVerification, pendingVerificationEmail, pending2fa } = useAuthStore();
 
@@ -108,6 +114,7 @@ export default function Login() {
           entityName || undefined,
           invitationCode.trim() || undefined,
           teamInviteToken || undefined,
+          chatInviteToken || undefined,
         );
         const state = useAuthStore.getState();
         if (!state.pendingVerificationEmail && !state.pending2fa) {
@@ -460,7 +467,7 @@ export default function Login() {
               ) : (
                 <>
                   {/* Invitation code — required when the platform gate is on */}
-                  {inviteRequired && !teamInviteToken && (
+                  {inviteRequired && !teamInviteToken && !chatInviteToken && (
                     <div style={{ marginBottom: 18 }}>
                       <label className="login-label">
                         {t("page.login.invitation_code")}

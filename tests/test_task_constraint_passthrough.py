@@ -82,8 +82,9 @@ def test_planner_prompt_surfaces_constraints_as_a_binding_block():
     prompt = runtime_planner_task_prompt(task)
     assert "USER CONSTRAINTS" in prompt
     assert "只保存表格,不要写 essay" in prompt
-    # it must appear as its own block, not only buried inside the Details JSON
-    assert prompt.index("USER CONSTRAINTS") < prompt.index("Details JSON")
+    # It remains an explicit block even when operational task details are omitted.
+    assert prompt.index("Description:") < prompt.index("USER CONSTRAINTS")
+    assert '"runtime_context"' not in prompt
 
 
 # ── execution hop ──────────────────────────────────────────────────

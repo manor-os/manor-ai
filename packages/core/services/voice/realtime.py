@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -14,22 +15,116 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import websockets
 
+from packages.core.ai.runtime.token_estimate import runtime_estimate_tokens_for_text
+from packages.core.services.voice.approvals import VoicePendingAction
+from packages.core.services.voice.live_agent import (
+    LIVE_VOICE_REALTIME_MAX_OUTPUT_TOKENS,
+    LiveVoiceTool,
+    LiveVoiceTurnAction,
+    live_voice_session_factory,
+)
+from packages.core.services.voice.work_types import VoiceWorkAction
 
-DEFAULT_REALTIME_MODEL = "openai/gpt-realtime"
-DEFAULT_VERCEL_REALTIME_MODEL = "openai/gpt-realtime-mini"
+
+DEFAULT_REALTIME_MODEL = "openai/gpt-realtime-2.1"
+DEFAULT_VERCEL_REALTIME_MODEL = "openai/gpt-realtime-2.1"
+# Native OpenAI can use the lowest-latency Realtime transcription model.  The
+# Vercel Realtime adapter currently exposes OpenAI's embedded transcription
+# configuration but documents its top-level streaming transcription model as a
+# separate connection, so keep the proven embedded model on that route.  Both
+# emit revision-friendly deltas and handle multilingual input.
+OPENAI_REALTIME_TRANSCRIPTION_MODEL = "gpt-live-transcribe"
 VERCEL_REALTIME_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
 SUPPORTED_REALTIME_MODELS = frozenset(
     {
         "openai/gpt-realtime",
         "openai/gpt-realtime-2025-08-28",
+        "openai/gpt-realtime-2",
+        "openai/gpt-realtime-2.1",
     }
 )
-SUPPORTED_VERCEL_REALTIME_MODELS = frozenset({DEFAULT_VERCEL_REALTIME_MODEL})
+SUPPORTED_VERCEL_REALTIME_MODELS = frozenset(
+    {
+        "openai/gpt-realtime-mini",
+        "openai/gpt-realtime-2",
+        "openai/gpt-realtime-2.1",
+    }
+)
 OPENAI_API_BASE_URL = "https://api.openai.com/v1"
 VERCEL_GATEWAY_PROTOCOL_VERSION = "0.0.1"
 VERCEL_REALTIME_SUBPROTOCOL = "ai-gateway-realtime.v1"
-MANOR_BRIDGE_FUNCTION = "manor_agent_reply"
+# Gateway transport limit, independent of the selected model's token budget.
+# https://vercel.com/docs/ai-gateway/modalities/realtime#session-limits
+# The docs say 256 KB; use decimal bytes conservatively, not a larger KiB cap.
+VERCEL_REALTIME_MAX_MESSAGE_BYTES = 256_000
+MANOR_BRIDGE_FUNCTION = LiveVoiceTool.MANOR_AGENT.value
 MAX_UTTERANCE_CHARS = 4000
+logger = logging.getLogger(__name__)
+
+
+class RealtimeMessageTooLarge(RuntimeError):
+    """A provider message exceeds the transport limit before any send."""
+
+
+def _serialize_realtime_message(event: dict[str, Any]) -> str:
+    return json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class RealtimeModelTokenLimits:
+    context_window: int
+    max_output_tokens: int
+    # This is an instructions-plus-tools limit, separate from the context window.
+    # None means no separate cap is established, not that instructions are free.
+    max_instructions_tokens: int | None = None
+
+
+_REALTIME_MODEL_TOKEN_LIMITS = {
+    # Preserve the legacy provider's verified session instructions/tools cap.
+    "openai/gpt-realtime": RealtimeModelTokenLimits(32_000, 4_096, 16_384),
+    "openai/gpt-realtime-2025-08-28": RealtimeModelTokenLimits(32_000, 4_096, 16_384),
+    "openai/gpt-realtime-mini": RealtimeModelTokenLimits(32_000, 4_096, 16_384),
+    # Official model pages specify 128,000 context and 32,000 output tokens.
+    # They do not establish a separate 2.x instructions cap; do not inherit the
+    # legacy 16,384 cap or invent a larger instructions-only provider limit.
+    # https://developers.openai.com/api/docs/models/gpt-realtime-2
+    # https://developers.openai.com/api/docs/models/gpt-realtime-2.1
+    "openai/gpt-realtime-2": RealtimeModelTokenLimits(128_000, 32_000),
+    "openai/gpt-realtime-2.1": RealtimeModelTokenLimits(128_000, 32_000),
+}
+
+
+def realtime_model_token_limits(model: str) -> RealtimeModelTokenLimits:
+    """Return known provider limits for one explicitly supported model."""
+
+    normalized = str(model or "").strip()
+    if "/" not in normalized:
+        normalized = f"openai/{normalized}"
+    limits = _REALTIME_MODEL_TOKEN_LIMITS.get(normalized)
+    if limits is None:
+        raise RuntimeError("Realtime model token limits are not configured")
+    return limits
+
+
+def live_voice_instruction_token_budget(model: str) -> int:
+    """Budget startup instructions against the selected model and tool schema."""
+
+    limits = realtime_model_token_limits(model)
+    input_limit = limits.context_window - limits.max_output_tokens
+    if limits.max_instructions_tokens is not None:
+        input_limit = min(input_limit, limits.max_instructions_tokens)
+    tool_tokens = runtime_estimate_tokens_for_text(
+        json.dumps(
+            live_voice_session_factory.tools(),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+    # This is estimator/input-audio headroom, not another provider model limit.
+    # Session instructions are fixed while subsequent audio turns consume the
+    # remaining input context under the provider's normal truncation policy.
+    headroom = max(256, input_limit // 8)
+    return max(1, input_limit - tool_tokens - headroom)
 
 
 @dataclass(frozen=True)
@@ -53,6 +148,15 @@ class BridgeCall:
     call_id: str | None
     utterance: str
     response_id: str
+    action: VoiceWorkAction | None = None
+    transcript_sent: bool = False
+    tool: LiveVoiceTool | None = None
+    source_item_id: str | None = None
+    source_message_ids: tuple[str, ...] = ()
+    pending_action_id: str | None = None
+    # Server-owned snapshot from when this user input was captured, never a
+    # model-authored source of authority.
+    presented_actions: tuple[VoicePendingAction, ...] = ()
 
 
 VoiceOutcomeStatus = Literal[
@@ -60,6 +164,7 @@ VoiceOutcomeStatus = Literal[
     "approval_required",
     "action_handled",
     "no_reply",
+    "cancelled",
     "error",
 ]
 
@@ -70,6 +175,7 @@ class VoiceAgentOutcome:
     spoken_reply: str
     conversation_id: str | None = None
     agent_id: str | None = None
+    pending_actions: tuple[VoicePendingAction, ...] = ()
 
 
 def resolve_realtime_model() -> str:
@@ -93,8 +199,8 @@ def resolve_vercel_realtime_model() -> str:
         configured = f"openai/{configured}"
     if configured not in SUPPORTED_VERCEL_REALTIME_MODELS:
         raise RuntimeError(
-            "Twilio Voice through Vercel requires "
-            "openai/gpt-realtime-mini"
+            "Twilio Voice through Vercel requires a supported OpenAI "
+            "Realtime model"
         )
     return configured
 
@@ -157,6 +263,12 @@ async def resolve_realtime_route(
     allow_managed: bool = True,
     respect_audio_role_overrides: bool = False,
 ) -> RealtimeRoute | None:
+    from packages.core.constants.plans import is_cloud
+
+    # Self-hosted deployments may only use the entity's native BYOK route.
+    # Callers historically defaulted ``allow_managed`` to true, so enforce the
+    # deployment boundary here rather than trusting every entry surface.
+    allow_managed = allow_managed and is_cloud()
     model = resolve_realtime_model()
     if (
         respect_audio_role_overrides
@@ -225,6 +337,16 @@ async def resolve_realtime_route(
 
     if not required:
         return None
+    if not is_cloud():
+        if incompatible_byok:
+            raise RuntimeError(
+                "Twilio Voice Realtime requires native OpenAI BYOK; the configured "
+                "OpenAI-compatible custom base URL cannot carry realtime audio"
+            )
+        raise RuntimeError(
+            "Twilio Voice Realtime requires native OpenAI BYOK; configure an "
+            "OpenAI Realtime API key for this entity"
+        )
     if incompatible_byok:
         raise RuntimeError(
             "Twilio Voice Realtime requires native OpenAI BYOK; the configured "
@@ -270,6 +392,8 @@ def _vercel_session_update_event(session: dict[str, Any]) -> dict[str, Any]:
         config["instructions"] = session["instructions"]
     if session.get("output_modalities") is not None:
         config["outputModalities"] = session["output_modalities"]
+    if isinstance(session.get("max_output_tokens"), int):
+        config["maxOutputTokens"] = session["max_output_tokens"]
     audio = session.get("audio")
     if isinstance(audio, dict):
         audio_input = audio.get("input")
@@ -286,6 +410,7 @@ def _vercel_session_update_event(session: dict[str, Any]) -> dict[str, Any]:
                     ("threshold", "threshold"),
                     ("silence_duration_ms", "silenceDurationMs"),
                     ("prefix_padding_ms", "prefixPaddingMs"),
+                    ("eagerness", "eagerness"),
                 ):
                     if turn_detection.get(source) is not None:
                         normalized_turn[target] = turn_detection[source]
@@ -310,7 +435,17 @@ def _vercel_session_update_event(session: dict[str, Any]) -> dict[str, Any]:
     return {"type": "session-update", "config": config}
 
 
-def _vercel_client_events(event: dict[str, Any]) -> list[dict[str, Any]]:
+def vercel_realtime_session_fits(session: dict[str, Any]) -> bool:
+    """Measure exactly the same complete JSON message used by send()."""
+    payload = _serialize_realtime_message(_vercel_session_update_event(session))
+    return len(payload.encode("utf-8")) <= VERCEL_REALTIME_MAX_MESSAGE_BYTES
+
+
+def _vercel_client_events(
+    event: dict[str, Any],
+    *,
+    function_names: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     event_type = event.get("type")
     if event_type == "session.update":
         session = event.get("session")
@@ -327,13 +462,17 @@ def _vercel_client_events(event: dict[str, Any]) -> list[dict[str, Any]]:
         item = event.get("item")
         if not isinstance(item, dict) or item.get("type") != "function_call_output":
             raise TypeError("Vercel Realtime conversation item is not supported")
+        call_id = str(item.get("call_id") or "").strip()
         return [
             {
                 "type": "conversation-item-create",
                 "item": {
                     "type": "function-call-output",
-                    "callId": item.get("call_id"),
-                    "name": MANOR_BRIDGE_FUNCTION,
+                    "callId": call_id,
+                    "name": (function_names or {}).get(
+                        call_id,
+                        MANOR_BRIDGE_FUNCTION,
+                    ),
                     "output": item.get("output"),
                 },
             }
@@ -371,6 +510,7 @@ class _VercelRealtimeConnection:
         self._socket: Any | None = None
         self._send_lock = asyncio.Lock()
         self._session: dict[str, Any] = {}
+        self._function_names: dict[str, str] = {}
         self._verified = False
 
     async def __aenter__(self):
@@ -406,6 +546,7 @@ class _VercelRealtimeConnection:
                 f"ai-gateway-auth.{token}",
             ],
             open_timeout=15,
+            close_timeout=2,
             max_size=2 * 1024 * 1024,
         )
         self._socket = await self._socket_manager.__aenter__()
@@ -419,28 +560,58 @@ class _VercelRealtimeConnection:
     async def send(self, event: dict[str, Any]) -> None:
         if self._socket is None:
             raise RuntimeError("Vercel Realtime connection is not open")
-        event_type = event.get("type")
-        if event_type == "session.update":
-            session = event.get("session")
-            if not isinstance(session, dict):
-                raise TypeError("Vercel Realtime session update is invalid")
-            self._session = dict(session)
-        mapped: list[dict[str, Any]] = []
-        if event_type == "response.create":
-            response = event.get("response")
-            response = response if isinstance(response, dict) else {}
-            response_session = {
-                **self._session,
-                "tool_choice": response.get(
-                    "tool_choice",
-                    self._session.get("tool_choice", "none"),
-                ),
-            }
-            mapped.append(_vercel_session_update_event(response_session))
-        mapped.extend(_vercel_client_events(event))
         async with self._send_lock:
+            event_type = event.get("type")
+            session = None
+            if event_type == "session.update":
+                session = event.get("session")
+                if not isinstance(session, dict):
+                    raise TypeError("Vercel Realtime session update is invalid")
+            mapped: list[dict[str, Any]] = []
+            if event_type == "response.create":
+                response = event.get("response")
+                response = response if isinstance(response, dict) else {}
+                response_session = {
+                    **self._session,
+                    **({"tools": response["tools"]} if "tools" in response else {}),
+                    "tool_choice": response.get(
+                        "tool_choice",
+                        self._session.get("tool_choice", "none"),
+                    ),
+                }
+                mapped.append(_vercel_session_update_event(response_session))
+            mapped.extend(
+                _vercel_client_events(event, function_names=self._function_names)
+            )
+            # Validate the whole batch before sending its first config update.
+            # Never truncate structured results or poison cached session state.
+            payloads: list[str] = []
             for item in mapped:
-                await self._socket.send(json.dumps(item, separators=(",", ":")))
+                payload = _serialize_realtime_message(item)
+                size = len(payload.encode("utf-8"))
+                if size > VERCEL_REALTIME_MAX_MESSAGE_BYTES:
+                    logger.warning(
+                        "voice_realtime_message_rejected provider=vercel model=%s "
+                        "type=%s bytes=%d limit_bytes=%d",
+                        self._route.model, item["type"], size,
+                        VERCEL_REALTIME_MAX_MESSAGE_BYTES,
+                    )
+                    raise RealtimeMessageTooLarge(
+                        f"Vercel Realtime {item['type']} message has {size} bytes; "
+                        f"limit is {VERCEL_REALTIME_MAX_MESSAGE_BYTES} bytes"
+                    )
+                if item["type"] == "session-update":
+                    logger.info(
+                        "voice_realtime_message provider=vercel model=%s "
+                        "type=%s bytes=%d limit_bytes=%d",
+                        self._route.model, item["type"], size,
+                        VERCEL_REALTIME_MAX_MESSAGE_BYTES,
+                    )
+                payloads.append(payload)
+            for payload in payloads:
+                await self._socket.send(payload)
+            if session is not None:
+                self._session = dict(session)
 
     async def recv(self) -> dict[str, Any]:
         if self._socket is None:
@@ -470,6 +641,7 @@ class _VercelRealtimeConnection:
             return normalized
         raw = event.get("raw")
         if isinstance(raw, dict):
+            self._remember_function_calls(raw)
             self._verify_response_controls(raw)
             return raw
         if event_type == "error":
@@ -483,6 +655,21 @@ class _VercelRealtimeConnection:
                 "error": error,
             }
         raise RuntimeError("Vercel Realtime event is missing provider event data")
+
+    def _remember_function_calls(self, event: dict[str, Any]) -> None:
+        if event.get("type") != "response.done":
+            return
+        response = event.get("response")
+        output = response.get("output") if isinstance(response, dict) else None
+        if not isinstance(output, list):
+            return
+        for item in output:
+            if not isinstance(item, dict) or item.get("type") != "function_call":
+                continue
+            call_id = str(item.get("call_id") or "").strip()
+            name = str(item.get("name") or "").strip()
+            if call_id and name:
+                self._function_names[call_id] = name
 
     def __aiter__(self):
         return self
@@ -579,7 +766,13 @@ def parse_completed_bridge_call(
     if len(function_calls) != 1:
         return None
     item = function_calls[0]
-    if item.get("status") != "completed" or item.get("name") != MANOR_BRIDGE_FUNCTION:
+    name = str(item.get("name") or "").strip()
+    if item.get("status") != "completed" or name not in {
+        LiveVoiceTool.DELEGATE.value,
+        LiveVoiceTool.ACTIVE_WORK.value,
+        LiveVoiceTool.WAIT.value,
+        LiveVoiceTool.MANOR_AGENT.value,
+    }:
         return None
     call_id = str(item.get("call_id") or "").strip()
     if not call_id or call_id in seen_call_ids:
@@ -588,19 +781,51 @@ def parse_completed_bridge_call(
         arguments = json.loads(str(item.get("arguments") or ""))
     except (TypeError, ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(arguments, dict) or set(arguments) != {"utterance"}:
+    if not isinstance(arguments, dict):
+        return None
+    argument_keys = set(arguments)
+    valid_argument_keys = (
+        ({"action", "utterance"},)
+        if name == LiveVoiceTool.ACTIVE_WORK.value
+        else ({"utterance"}, {"utterance", "pending_action_id"})
+        if name == LiveVoiceTool.DELEGATE.value
+        else ({"utterance"}, {"action", "utterance"})
+        if name == LiveVoiceTool.MANOR_AGENT.value
+        else ({"utterance"},)
+    )
+    if argument_keys not in valid_argument_keys:
+        return None
+    pending_action_id = arguments.get("pending_action_id")
+    if "pending_action_id" in arguments and (
+        not isinstance(pending_action_id, str)
+        or not pending_action_id.strip()
+        or len(pending_action_id) > 128
+    ):
         return None
     utterance_value = arguments.get("utterance")
     if not isinstance(utterance_value, str):
         return None
     utterance = utterance_value.strip()
-    if not utterance or len(utterance) > MAX_UTTERANCE_CHARS:
+    if (
+        (not utterance and name != LiveVoiceTool.WAIT.value)
+        or len(utterance) > MAX_UTTERANCE_CHARS
+    ):
         return None
+    action: VoiceWorkAction | None = None
+    if name == LiveVoiceTool.ACTIVE_WORK.value or "action" in arguments:
+        try:
+            live_action = LiveVoiceTurnAction(str(arguments["action"]))
+        except (TypeError, ValueError):
+            return None
+        action = live_action.work_action
     seen_call_ids.add(call_id)
     return BridgeCall(
         call_id=call_id,
         utterance=utterance,
         response_id=response_id,
+        action=action,
+        tool=LiveVoiceTool(name),
+        pending_action_id=pending_action_id,
     )
 
 
@@ -707,6 +932,7 @@ def extract_input_transcription_usage(
     *,
     byok: bool,
     provider: str = "openai",
+    model: str | None = None,
 ) -> dict[str, Any] | None:
     data = event_dict(event)
     if data.get("type") != "conversation.item.input_audio_transcription.completed":
@@ -734,7 +960,7 @@ def extract_input_transcription_usage(
             input_tokens,
             _nonnegative_int(input_details.get("audio_tokens")),
         ),
-        "model": f"openai/{VERCEL_REALTIME_TRANSCRIPTION_MODEL}",
+        "model": f"openai/{model or VERCEL_REALTIME_TRANSCRIPTION_MODEL}",
         "provider": route_provider,
         "byok": byok,
         "billing_mode": billing_source,
@@ -750,6 +976,8 @@ def build_realtime_session_update(
     model: str,
     voice: str = "alloy",
     input_transcription_model: str | None = None,
+    input_transcription_language: str | None = None,
+    live_agent: bool = False,
 ) -> dict[str, Any]:
     session: dict[str, Any] = {
         "type": "realtime",
@@ -771,10 +999,29 @@ def build_realtime_session_update(
         },
     }
     if input_transcription_model:
-        session["audio"]["input"]["transcription"] = {
-            "model": input_transcription_model,
+        transcription: dict[str, Any] = {"model": input_transcription_model}
+        if input_transcription_model == "gpt-live-transcribe":
+            transcription["delay"] = "low"
+            if input_transcription_language:
+                transcription["languages"] = [input_transcription_language]
+        elif input_transcription_language:
+            transcription["language"] = input_transcription_language
+        session["audio"]["input"]["transcription"] = transcription
+    if live_agent:
+        session["audio"]["input"]["turn_detection"] = {
+            "type": "semantic_vad",
+            "eagerness": "medium",
+            "create_response": False,
+            "interrupt_response": True,
         }
-    else:
+        session["output_modalities"] = ["audio"]
+        session["max_output_tokens"] = LIVE_VOICE_REALTIME_MAX_OUTPUT_TOKENS
+        session["tools"] = live_voice_session_factory.tools()
+        session["tool_choice"] = "auto"
+        session["instructions"] = live_voice_session_factory.instructions(
+            max_tokens=live_voice_instruction_token_budget(model),
+        )
+    elif not input_transcription_model:
         session["tools"] = [
             {
                 "type": "function",
@@ -812,6 +1059,7 @@ def build_function_output_event(
     call_id: str,
     status: str,
     spoken_reply: str,
+    pending_actions: tuple[VoicePendingAction, ...] = (),
 ) -> dict[str, Any]:
     return {
         "type": "conversation.item.create",
@@ -822,9 +1070,31 @@ def build_function_output_event(
                 {
                     "status": status,
                     "spoken_reply": spoken_reply,
+                    **(
+                        {"pending_actions": [
+                            action.to_payload(item_number=index) for index, action in enumerate(pending_actions, 1)
+                        ]}
+                        if pending_actions else {}
+                    ),
                 },
-                ensure_ascii=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
             ),
+        },
+    }
+
+
+def build_function_result_event(
+    *,
+    call_id: str,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "conversation.item.create",
+        "item": {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
         },
     }
 
@@ -1047,6 +1317,21 @@ class RealtimeVoiceEngine:
                 call_id=call.call_id,
                 status=outcome.status,
                 spoken_reply=outcome.spoken_reply,
+                pending_actions=outcome.pending_actions,
+            )
+        )
+
+    async def send_function_result(
+        self,
+        call: BridgeCall,
+        result: dict[str, Any],
+    ) -> None:
+        if not call.call_id:
+            return
+        await self.send(
+            build_function_result_event(
+                call_id=call.call_id,
+                result=result,
             )
         )
 

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -47,12 +50,31 @@ async def runtime_query_entity_agents_action(
     entity_id: str,
     query: str = "",
     statuses: list[str] | None = None,
+    categories: list[str] | None = None,
+    sources: list[str] | None = None,
+    workspace_ids: list[str] | None = None,
+    owner_user_ids: list[str] | None = None,
     include_templates: bool = False,
+    created_after: str = "",
+    created_before: str = "",
+    updated_after: str = "",
+    updated_before: str = "",
+    deployment_count_min: int | None = None,
+    deployment_count_max: int | None = None,
+    require_schedulable_scope: bool = False,
+    schedulable_workspace_id: str | None = None,
+    schedulable_user_id: str | None = None,
+    viewer_user_id: str | None = None,
+    readable_workspace_ids: set[str] | None = None,
+    runtime_workspace_id: str | None = None,
+    enforce_viewer_scope: bool = False,
     limit: int = 50,
+    offset: int = 0,
+    db: Any = None,
 ) -> str:
-    """Return non-sensitive Agent metadata through the Runtime boundary."""
+    """Return one fully filtered page of non-sensitive Agent metadata."""
 
-    from sqlalchemy import and_, func, or_, select
+    from sqlalchemy import and_, false, func, or_, select
 
     from packages.core.database import async_session
     from packages.core.models.skill import AgentSkillBinding
@@ -62,13 +84,54 @@ async def runtime_query_entity_agents_action(
         AgentToolBinding,
     )
 
-    resolved_limit = max(1, min(int(limit or 50), 100))
-    normalized_query = str(query or "").strip().casefold()
-    normalized_statuses = {
-        str(status).strip().casefold()
-        for status in (statuses or [])[:10]
-        if str(status).strip()
-    }
+    try:
+        resolved_limit = max(1, min(int(limit or 50), 100))
+        resolved_offset = max(0, min(int(offset or 0), 10_000))
+        normalized_query = str(query or "").strip()
+        normalized_statuses = _agent_filter_values(statuses, lowercase=True)
+        normalized_categories = _agent_filter_values(categories, lowercase=True)
+        normalized_sources = _agent_filter_values(sources, lowercase=True)
+        normalized_workspace_ids = _agent_filter_values(workspace_ids)
+        normalized_owner_user_ids = _agent_filter_values(owner_user_ids)
+        created_range = _agent_datetime_range(
+            created_after,
+            created_before,
+            "created",
+        )
+        updated_range = _agent_datetime_range(
+            updated_after,
+            updated_before,
+            "updated",
+        )
+        deployment_min = (
+            int(deployment_count_min)
+            if deployment_count_min is not None
+            else None
+        )
+        deployment_max = (
+            int(deployment_count_max)
+            if deployment_count_max is not None
+            else None
+        )
+        if (deployment_min is not None and deployment_min < 0) or (
+            deployment_max is not None and deployment_max < 0
+        ):
+            raise ValueError("deployment count bounds must be non-negative")
+        if (
+            deployment_min is not None
+            and deployment_max is not None
+            and deployment_min > deployment_max
+        ):
+            raise ValueError(
+                "deployment_count_min must be less than or equal to "
+                "deployment_count_max"
+            )
+    except (TypeError, ValueError) as exc:
+        return json.dumps({
+            "ok": False,
+            "error": "invalid_agent_filters",
+            "message": str(exc),
+        })
     ownership = Agent.entity_id == entity_id
     if include_templates:
         ownership = or_(
@@ -76,53 +139,177 @@ async def runtime_query_entity_agents_action(
             and_(Agent.is_template.is_(True), Agent.is_public.is_(True)),
         )
 
-    async with async_session() as db:
-        rows = (
-            await db.execute(
-                select(Agent)
-                .where(Agent.deleted_at.is_(None), ownership)
-                .order_by(Agent.created_at.desc())
-                .limit(200)
-            )
-        ).scalars().all()
-        agents = [
-            agent
-            for agent in rows
-            if (
-                not normalized_statuses
-                or str(agent.status or "").casefold() in normalized_statuses
-            )
-            and (
-                not normalized_query
-                or normalized_query
-                in (
-                    f"{agent.name or ''} {agent.description or ''} "
-                    f"{agent.category or ''}"
-                ).casefold()
-            )
-        ][:resolved_limit]
-        agent_ids = [agent.id for agent in agents]
+    if enforce_viewer_scope and not viewer_user_id and not runtime_workspace_id:
+        return json.dumps({
+            "ok": False,
+            "error": "user or Workspace context is required",
+        })
 
-        async def grouped_counts(model, *conditions):
-            if not agent_ids:
-                return {}
-            result = await db.execute(
-                select(model.agent_id, func.count().label("count"))
-                .where(model.agent_id.in_(agent_ids), *conditions)
-                .group_by(model.agent_id)
-            )
-            return {str(row.agent_id): int(row.count) for row in result}
+    session_context = nullcontext(db) if db is not None else async_session()
+    async with session_context as session:
+        if enforce_viewer_scope:
+            if viewer_user_id:
+                from packages.core.services.workspace_access import (
+                    readable_workspace_ids_for_user,
+                )
 
-        tool_counts = await grouped_counts(AgentToolBinding)
-        skill_counts = await grouped_counts(
-            AgentSkillBinding,
-            AgentSkillBinding.status == "active",
-        )
-        deployment_counts = await grouped_counts(
-            AgentSubscription,
+                readable_workspace_ids = await readable_workspace_ids_for_user(
+                    session,
+                    entity_id=entity_id,
+                    user_id=viewer_user_id,
+                    role=None,
+                )
+            else:
+                readable_workspace_ids = {str(runtime_workspace_id)}
+        filters = [Agent.deleted_at.is_(None), ownership]
+        if readable_workspace_ids is not None:
+            visible_agent_clauses = [
+                and_(
+                    Agent.workspace_id.is_(None),
+                    Agent.owner_user_id.is_(None),
+                ),
+                Agent.workspace_id.in_(readable_workspace_ids),
+            ]
+            if viewer_user_id:
+                visible_agent_clauses.append(
+                    and_(
+                        Agent.workspace_id.is_(None),
+                        Agent.owner_user_id == viewer_user_id,
+                    )
+                )
+            if include_templates:
+                visible_agent_clauses.append(
+                    and_(Agent.is_template.is_(True), Agent.is_public.is_(True))
+                )
+            filters.append(or_(*visible_agent_clauses))
+        if normalized_query:
+            filters.append(or_(
+                Agent.name.icontains(normalized_query, autoescape=True),
+                Agent.description.icontains(normalized_query, autoescape=True),
+                Agent.category.icontains(normalized_query, autoescape=True),
+                Agent.slug.icontains(normalized_query, autoescape=True),
+            ))
+        if normalized_statuses:
+            filters.append(func.lower(Agent.status).in_(normalized_statuses))
+        if normalized_categories:
+            filters.append(func.lower(Agent.category).in_(normalized_categories))
+        if normalized_workspace_ids:
+            filters.append(Agent.workspace_id.in_(normalized_workspace_ids))
+        if normalized_owner_user_ids:
+            filters.append(Agent.owner_user_id.in_(normalized_owner_user_ids))
+        if normalized_sources:
+            source_clauses = []
+            if "template" in normalized_sources:
+                source_clauses.append(Agent.is_template.is_(True))
+            stored_sources = tuple(
+                value for value in normalized_sources if value != "template"
+            )
+            if stored_sources:
+                source_clauses.append(func.lower(Agent.source).in_(stored_sources))
+            filters.append(or_(*source_clauses))
+        for column, (after_dt, before_dt) in (
+            (Agent.created_at, created_range),
+            (Agent.updated_at, updated_range),
+        ):
+            if after_dt is not None:
+                filters.append(column >= after_dt)
+            if before_dt is not None:
+                filters.append(column <= before_dt)
+
+        deployment_filters = [
+            AgentSubscription.agent_id == Agent.id,
             AgentSubscription.entity_id == entity_id,
             AgentSubscription.status == "active",
+        ]
+        deployment_count = (
+            select(func.count())
+            .select_from(AgentSubscription)
+            .where(*deployment_filters)
+            .correlate(Agent)
+            .scalar_subquery()
         )
+        visible_deployment_count = deployment_count
+        if readable_workspace_ids is not None and not require_schedulable_scope:
+            visible_subscription_clauses = [
+                and_(
+                    AgentSubscription.workspace_id.is_(None),
+                    AgentSubscription.owner_user_id.is_(None),
+                ),
+                AgentSubscription.workspace_id.in_(readable_workspace_ids),
+            ]
+            if viewer_user_id:
+                visible_subscription_clauses.append(and_(
+                    AgentSubscription.workspace_id.is_(None),
+                    AgentSubscription.owner_user_id == viewer_user_id,
+                ))
+            visible_deployment_count = (
+                select(func.count())
+                .select_from(AgentSubscription)
+                .where(*deployment_filters, or_(*visible_subscription_clauses))
+                .correlate(Agent)
+                .scalar_subquery()
+            )
+        if require_schedulable_scope:
+            scoped_deployment_filters = list(deployment_filters)
+            if schedulable_workspace_id:
+                scoped_deployment_filters.append(
+                    AgentSubscription.workspace_id == schedulable_workspace_id
+                )
+            elif schedulable_user_id:
+                scoped_deployment_filters.extend((
+                    AgentSubscription.workspace_id.is_(None),
+                    AgentSubscription.owner_user_id == schedulable_user_id,
+                ))
+            else:
+                scoped_deployment_filters.append(false())
+            visible_deployment_count = (
+                select(func.count())
+                .select_from(AgentSubscription)
+                .where(*scoped_deployment_filters)
+                .correlate(Agent)
+                .scalar_subquery()
+            )
+            filters.extend((
+                Agent.status == "active",
+                visible_deployment_count == 1,
+            ))
+        tool_count = (
+            select(func.count())
+            .select_from(AgentToolBinding)
+            .where(AgentToolBinding.agent_id == Agent.id)
+            .correlate(Agent)
+            .scalar_subquery()
+        )
+        skill_count = (
+            select(func.count())
+            .select_from(AgentSkillBinding)
+            .where(
+                AgentSkillBinding.agent_id == Agent.id,
+                AgentSkillBinding.status == "active",
+            )
+            .correlate(Agent)
+            .scalar_subquery()
+        )
+        if deployment_min is not None:
+            filters.append(visible_deployment_count >= deployment_min)
+        if deployment_max is not None:
+            filters.append(visible_deployment_count <= deployment_max)
+
+        agent_rows = list((await session.execute(
+            select(
+                Agent,
+                tool_count.label("tool_count"),
+                skill_count.label("skill_count"),
+                visible_deployment_count.label("deployment_count"),
+            )
+            .where(*filters)
+            .order_by(Agent.created_at.desc(), Agent.id.desc())
+            .limit(resolved_limit)
+            .offset(resolved_offset)
+        )).all())
+        total = int((await session.execute(
+            select(func.count()).select_from(Agent).where(*filters)
+        )).scalar_one())
 
     items = [
         {
@@ -132,13 +319,76 @@ async def runtime_query_entity_agents_action(
             "category": agent.category,
             "status": agent.status,
             "source": "template" if agent.is_template else agent.source,
-            "tool_count": tool_counts.get(agent.id, 0),
-            "skill_count": skill_counts.get(agent.id, 0),
-            "deployment_count": deployment_counts.get(agent.id, 0),
+            "tool_count": int(tool_count_value or 0),
+            "skill_count": int(skill_count_value or 0),
+            "deployment_count": int(deployment_count_value or 0),
+            "workspace_id": agent.workspace_id,
+            "owner_user_id": agent.owner_user_id,
+            "created_at": agent.created_at.isoformat() if agent.created_at else None,
+            "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
         }
-        for agent in agents
+        for agent, tool_count_value, skill_count_value, deployment_count_value
+        in agent_rows
     ]
-    return json.dumps({"agents": items, "total": len(items)})
+    next_offset = resolved_offset + len(items)
+    has_more = next_offset < total
+    return json.dumps({
+        "ok": True,
+        "agents": items,
+        "total": total,
+        "count": len(items),
+        "limit": resolved_limit,
+        "offset": resolved_offset,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+    })
+
+
+def _agent_filter_values(
+    values: Sequence[Any] | None,
+    *,
+    lowercase: bool = False,
+) -> tuple[str, ...]:
+    if values is not None and (
+        isinstance(values, (str, bytes)) or not isinstance(values, Sequence)
+    ):
+        raise TypeError("plural agent filters must be arrays")
+    normalized: list[str] = []
+    for value in (values or [])[:50]:
+        item = str(value or "").strip()
+        if lowercase:
+            item = item.lower()
+        if item and item not in normalized:
+            normalized.append(item)
+    return tuple(normalized)
+
+
+def _agent_datetime_bound(value: str, field_name: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"{field_name} range endpoints must be ISO-8601 datetimes"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _agent_datetime_range(
+    after: str,
+    before: str,
+    field_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    after_dt = _agent_datetime_bound(after, field_name)
+    before_dt = _agent_datetime_bound(before, field_name)
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(
+            f"{field_name}_after must be less than or equal to {field_name}_before"
+        )
+    return after_dt, before_dt
 
 
 async def runtime_provision_agent_action(

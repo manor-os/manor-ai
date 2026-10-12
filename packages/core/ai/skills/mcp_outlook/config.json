@@ -19,5 +19,9 @@
     "mcp__outlook__list_folders",
     "mcp__outlook__download_attachment",
     "mcp__outlook__get_profile"
-  ]
+  ],
+  "search": {
+    "terms": ["microsoft mail", "office 365 email", "hotmail", "inbox", "mail folder", "categories", "exchange"],
+    "examples": ["summarize unread outlook emails", "forward email from outlook", "draft reply in outlook mailbox", "move emails to folder in outlook"]
+  }
 }

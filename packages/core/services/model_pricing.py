@@ -57,6 +57,15 @@ class FlatModelPrice:
     note: str = ""
 
 
+def _configured_positive_price(env_name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(env_name, str(default)) or default)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using %.3f", env_name, default)
+        return default
+    return value if value > 0 else default
+
+
 OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
     # OpenAI
     "openai/gpt-4": TokenModelPrice("openai", 30.00, 60.00, "official"),
@@ -64,6 +73,17 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
     "openai/gpt-4o": TokenModelPrice("openai", 2.50, 10.00, "official"),
     "openai/gpt-4.1": TokenModelPrice("openai", 2.00, 8.00, "official"),
     "openai/gpt-4.1-mini": TokenModelPrice("openai", 0.40, 1.60, "official"),
+    "openai/gpt-6-astra": TokenModelPrice(
+        "openai",
+        10.00,
+        50.00,
+        "official",
+        cache_read_multiplier=0.10,
+        cache_write_multiplier=1.25,
+        long_context_threshold=272_000,
+        long_input_per_m=20.00,
+        long_output_per_m=75.00,
+    ),
     "openai/gpt-5.6-sol": TokenModelPrice(
         "openai",
         5.00,
@@ -179,7 +199,13 @@ OFFICIAL_TOKEN_PRICES: dict[str, TokenModelPrice] = {
     "text-embedding-ada-002": TokenModelPrice("openai", 0.10, 0.0, "official"),
 
     # Anthropic
+    "anthropic/claude-fable-5.1": TokenModelPrice("anthropic", 10.00, 50.00, "official"),
     "anthropic/claude-fable-5": TokenModelPrice("anthropic", 10.00, 50.00, "official"),
+    "anthropic/claude-opus-5.5": TokenModelPrice(
+        "anthropic", 4.00, 20.00, "official",
+        cache_read_multiplier=0.05,
+        cache_write_multiplier=1.25,
+    ),
     "anthropic/claude-opus-5": TokenModelPrice(
         "anthropic", 5.00, 25.00, "official",
         cache_read_multiplier=0.10,
@@ -297,6 +323,13 @@ OFFICIAL_IMAGE_PRICES: dict[str, FlatModelPrice] = {
 
 
 OFFICIAL_AUDIO_PRICES: dict[str, FlatModelPrice] = {
+    "suno/music": FlatModelPrice(
+        "suno",
+        "audio_asset",
+        _configured_positive_price("SUNO_GENERATION_COST_USD", 0.10),
+        "configured",
+        "Override SUNO_GENERATION_COST_USD with the effective platform cost per generation.",
+    ),
     "google/gemini-3.1-flash-tts-preview": FlatModelPrice("google", "audio_asset", 0.01, "official"),
     "zyphra/zonos-v0.1-hybrid": FlatModelPrice("zyphra", "audio_asset", 0.01, "official"),
     "zyphra/zonos-v0.1-transformer": FlatModelPrice("zyphra", "audio_asset", 0.01, "official"),
@@ -309,11 +342,18 @@ OFFICIAL_AUDIO_PRICES: dict[str, FlatModelPrice] = {
 
 
 # Seedance bills per video token: tokens = W×H×fps(24)×seconds / 1024.
-# Per-second rates below derive from BytePlus list prices ($7/M for
-# 480p/720p, $7.7/M for 1080p; fast $5.6/M) at 24fps, no-video-input.
+# Per-second rates below derive from BytePlus list prices at 24fps,
+# no-video-input; Seedance 2.5 has its own $10.7/M and $11.7/M tiers.
 # Official tiers stop at 1080p (+4k); "1440p" keeps the 1080p rate so a
 # stale resolution preference can never under-bill.
 VIDEO_COST_PER_SECOND: dict[str, dict[str, float]] = {
+    # BytePlus Seedance 2.5: $10.7/M tokens at 480p/720p, $11.7/M at 1080p.
+    "bytedance/seedance-2.5": {
+        "480p": 0.103,
+        "720p": 0.231,
+        "1080p": 0.569,
+        "1440p": 0.569,
+    },
     "bytedance/seedance-2.0": {
         "480p": 0.068,
         "720p": 0.151,
@@ -325,6 +365,12 @@ VIDEO_COST_PER_SECOND: dict[str, dict[str, float]] = {
         "720p": 0.121,
         "1080p": 0.272,
         "1440p": 0.272,
+    },
+    "bytedance/seedance-v1.0-pro-fast": {
+        "480p": 0.0097,
+        "720p": 0.0206,
+        "1080p": 0.049,
+        "1440p": 0.049,
     },
     # Kling official API per-second rates (no-audio tier — Manor's Kling
     # routes generate without native audio; the with-audio tier is +50%).
@@ -533,6 +579,34 @@ def _openrouter_cached_price(model: str | None) -> tuple[float | None, float | N
     )
 
 
+def cached_context_windows(model: str | None) -> list[int]:
+    """Live context windows for ``model`` from the synced gateway caches."""
+    if not model:
+        return []
+    from packages.core.services.model_provider_handlers import openrouter_model_id
+
+    model_id = str(model).strip()
+    _load_vercel_cache_if_needed()
+    _load_openrouter_cache_if_needed()
+    entries = [
+        next((_VERCEL_CACHE_MODELS[c] for c in _vercel_cache_candidates(model_id)
+              if isinstance(_VERCEL_CACHE_MODELS.get(c), dict)), None),
+        next((_PRICING_CACHE_MODELS[c] for c in dict.fromkeys((model_id, openrouter_model_id(model_id) or model_id))
+              if isinstance(_PRICING_CACHE_MODELS.get(c), dict)), None),
+    ]
+    windows = []
+    for entry in entries:
+        value = (entry or {}).get("context_window")
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            windows.append(value)
+    return windows
+
+
+def long_context_threshold(model: str | None) -> int | None:
+    price = _lookup_token_price(model)
+    return price.long_context_threshold if price else None
+
+
 def token_unit_prices(
     model: str | None,
     *,
@@ -689,6 +763,8 @@ def model_cost_multiplier(model: str | None) -> float:
 # ($4.3/M vs $7/M standard; $3.3/M vs $5.6/M fast).
 _SEEDANCE_VIDEO_INPUT_FACTOR = 4.3 / 7.0
 _SEEDANCE_FAST_VIDEO_INPUT_FACTOR = 3.3 / 5.6
+_SEEDANCE_25_VIDEO_INPUT_FACTOR = 6.4 / 10.7
+_SEEDANCE_25_1080_VIDEO_INPUT_FACTOR = 7.0 / 11.7
 # Kling charges +50% for native audio generation.
 _KLING_AUDIO_FACTOR = 1.5
 
@@ -708,9 +784,10 @@ def estimate_video_cost_usd(
     lowered = str(model or "").lower()
     if has_video_input and "seedance" in lowered:
         rate *= (
-            _SEEDANCE_FAST_VIDEO_INPUT_FACTOR
-            if "fast" in lowered
-            else _SEEDANCE_VIDEO_INPUT_FACTOR
+            _SEEDANCE_25_1080_VIDEO_INPUT_FACTOR if "seedance-2.5" in lowered and resolution in {"1080p", "1440p"} else
+            _SEEDANCE_25_VIDEO_INPUT_FACTOR if "seedance-2.5" in lowered else
+            _SEEDANCE_FAST_VIDEO_INPUT_FACTOR if "fast" in lowered else
+            _SEEDANCE_VIDEO_INPUT_FACTOR
         )
     if with_audio and "kling" in lowered:
         rate *= _KLING_AUDIO_FACTOR

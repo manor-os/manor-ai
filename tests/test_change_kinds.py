@@ -29,12 +29,19 @@ import json
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
+from tests.strategist_helpers import proposal_with_execution_review
+
 import pytest
+
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
 from sqlalchemy import select
 
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
 from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.agent_initiative import AgentInitiative
 from packages.core.models.automation_revision import AutomationRevision
 from packages.core.models.base import generate_ulid
 from packages.core.models.feature_flag import FeatureFlag
@@ -48,10 +55,17 @@ from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.proposals import (
     apply_change_item,
     create_change_items,
+    refresh_automation_index,
     validate_items,
 )
 from packages.core.proposals.change_executor import DERIVED_INDEX_SOURCE
 from packages.core.services import feature_flags as feature_flags_service
+from packages.core.services.scheduler_service import (
+    ManagedAgentInitiativeDriverError,
+    ScheduledJobMutationFactory,
+    delete_scheduled_job,
+    delete_workspace_automations,
+)
 from packages.core.strategist import service as strategist_service
 from packages.core.strategist.proposal import (
     ProposedAutomationChange,
@@ -65,6 +79,55 @@ FLAG_KEY = "strategist_review_v2"
 AUTOMATION_UPDATE_ACTION_KEY = "workspace.proposal.automation_change.update"
 
 _seq = 0
+
+
+@pytest.mark.parametrize("approved", [True, False])
+async def test_proposal_item_operation_lookup_and_single_settlement(monkeypatch, approved):
+    from packages.core.proposals import lifecycle
+
+    record = SimpleNamespace(entity_id="entity-1", workspace_id="workspace-1")
+    item = SimpleNamespace(id="item-1", action_key=AUTOMATION_UPDATE_ACTION_KEY)
+    def request(request_id, status, **overrides):
+        return SimpleNamespace(**{
+            "id": request_id, "status": status, "workspace_id": record.workspace_id,
+            "resource_kind": "proposal_item", "resource_id": item.id,
+            "action_key": item.action_key, **overrides,
+        })
+    pending, granted = request("pending", "pending"), request("granted", "granted")
+    candidates = [pending, granted, request("consumed", "consumed"),
+        request("wrong-workspace", "pending", workspace_id="workspace-2"),
+        request("wrong-kind", "pending", resource_kind="proposal"),
+        request("wrong-item", "pending", resource_id="item-2"),
+        request("wrong-action", "pending", action_key="workspace.proposal.task")]
+    calls = []
+    async def find(_db, *, entity_id, dedup_key):
+        calls.append((entity_id, dedup_key))
+        return candidates
+    monkeypatch.setattr(lifecycle, "find_requests_by_dedup", find)
+    live = await lifecycle._live_approval_requests(None, record=record, item=item)
+    assert calls == [("entity-1", "operation:proposal_item:item-1")]
+    assert live == [pending, granted]
+
+    settled = []
+    async def grant(_db, request, **kwargs):
+        assert kwargs == {"by_user_id": "owner-1", "via": "chat_card", "authority_prechecked": False}
+        settled.append((request.id, "grant"))
+        request.status = "granted"
+    async def consume(_db, request):
+        settled.append((request.id, "consume"))
+        request.status = "consumed"
+    async def deny(_db, request, **kwargs):
+        settled.append((request.id, "deny"))
+        request.status = "denied"
+    monkeypatch.setattr(lifecycle, "grant_approval", grant)
+    monkeypatch.setattr(lifecycle, "consume_approval", consume)
+    monkeypatch.setattr(lifecycle, "deny_approval", deny)
+    await lifecycle._settle_approval_requests(None, requests=live, approved=approved,
+        actor_id="owner-1", actor_kind="user", reason="Rejected" if not approved else None)
+    if approved:
+        assert settled == [("pending", "grant"), ("pending", "consume"), ("granted", "consume")]
+    else:
+        assert settled == [("pending", "deny")]
 
 
 # ── seeding helpers ───────────────────────────────────────────────────
@@ -97,7 +160,14 @@ async def _seed_workspace(db, name: str = "Change WS") -> Workspace:
         service_key="ops",
         status="active",
     )
-    db.add_all([workspace, goal, agent, subscription])
+    db.add_all([
+        User(id=entity_id, entity_id=entity_id, email=f"{entity_id}@approval.example",
+             password_hash="test-only", role="owner", status="active"),
+        UserMembership(user_id=entity_id, entity_id=entity_id, role="owner", status="active"),
+        workspace, goal, agent, subscription,
+    ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=entity_id)
     await db.commit()
     return workspace
 
@@ -120,6 +190,43 @@ async def _seed_job(db, workspace: Workspace, **overrides) -> ScheduledJob:
     db.add(job)
     await db.commit()
     return job
+
+
+async def _mark_as_initiative_driver(
+    db,
+    workspace: Workspace,
+    job: ScheduledJob,
+) -> AgentInitiative:
+    subscription = await db.scalar(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace.id,
+    ))
+    assert subscription is not None
+    initiative = AgentInitiative(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        agent_subscription_id=subscription.id,
+        owner_user_id=workspace.entity_id,
+        name="Managed digest",
+        instruction="Check for relevant changes",
+        trigger_kind="cron",
+        trigger_config={"version": "1", "kind": "cron", "cron": "0 6 * * *"},
+        condition_config={"version": "1"},
+        decision_policy={"version": "1", "mode": "on_change"},
+        delivery_policy={"version": "1"},
+        interruption_policy={"version": "1"},
+        status="active",
+    )
+    db.add(initiative)
+    await db.flush()
+    job.agent_initiative_id = initiative.id
+    job.execution_type = "agent_initiative"
+    job.execution_target = {
+        "managed_by": "agent_initiative",
+        "initiative_id": initiative.id,
+    }
+    await db.commit()
+    return initiative
 
 
 async def _seed_binding(db, workspace: Workspace) -> WorkflowBinding:
@@ -370,6 +477,188 @@ async def test_validator_rejects_cross_workspace_and_missing_targets(db_session)
     assert items[1].status == "rejected"
     assert items[1].decision["reason_code"] == "INSUFFICIENT_DATA"
     assert "does not exist" in items[1].decision["comment"]
+
+
+async def test_managed_initiative_driver_is_hidden_and_rejected_by_validator(
+    db_session,
+):
+    workspace = await _seed_workspace(db_session)
+    job = await _seed_job(db_session, workspace)
+    await _mark_as_initiative_driver(db_session, workspace, job)
+
+    await refresh_automation_index(db_session, workspace)
+    await db_session.refresh(workspace)
+    indexed_ids = {
+        entry.get("target_id")
+        for entry in workspace.operating_model.get("automations", [])
+    }
+    assert job.id not in indexed_ids
+
+    with pytest.raises(ManagedAgentInitiativeDriverError):
+        await ScheduledJobMutationFactory.apply(
+            db_session,
+            job,
+            {"enabled": False},
+        )
+
+    record = await _proposal_record(db_session, workspace)
+    item = await _make_item(
+        db_session,
+        workspace,
+        record,
+        _automation_change(job.id, change_key="managed_driver"),
+    )
+    await validate_items(
+        db_session,
+        SimpleNamespace(id=record.review_id),
+        [],
+        [item],
+    )
+
+    assert item.status == "rejected"
+    assert item.decision["reason_code"] == "POLICY_BLOCKED"
+    assert "Agent Initiative" in item.decision["comment"]
+    await db_session.refresh(job)
+    assert job.enabled is True
+    assert job.revision == 1
+
+
+async def test_delete_rechecks_locked_driver_and_workspace_teardown_remains_legal(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.services import realtime
+
+    async def no_broadcast(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(realtime, "broadcast_job_update", no_broadcast)
+    monkeypatch.setattr(realtime, "push_job_update", no_broadcast)
+
+    workspace = await _seed_workspace(db_session)
+    managed_job = await _seed_job(db_session, workspace)
+    initiative = await _mark_as_initiative_driver(
+        db_session,
+        workspace,
+        managed_job,
+    )
+    ordinary_job = await _seed_job(db_session, workspace)
+
+    with pytest.raises(ManagedAgentInitiativeDriverError):
+        await delete_scheduled_job(
+            db_session,
+            managed_job.id,
+            workspace.entity_id,
+        )
+    assert await db_session.get(ScheduledJob, managed_job.id) is not None
+
+    assert await delete_scheduled_job(
+        db_session,
+        ordinary_job.id,
+        workspace.entity_id,
+    ) is True
+    assert await db_session.get(ScheduledJob, ordinary_job.id) is None
+
+    result = await delete_workspace_automations(
+        db_session,
+        workspace.id,
+        workspace.entity_id,
+    )
+    await db_session.commit()
+    assert result["scheduled_jobs"] == 1
+    assert await db_session.get(ScheduledJob, managed_job.id) is None
+    surviving_initiative = await db_session.get(AgentInitiative, initiative.id)
+    assert surviving_initiative is not None
+    await db_session.refresh(surviving_initiative)
+    assert surviving_initiative.status == "needs_setup"
+    assert surviving_initiative.revision == 2
+    assert surviving_initiative.updated_at is not None
+
+
+async def test_runtime_delete_closes_stale_precheck_race(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.ai.runtime.scheduling import (
+        runtime_cancel_scheduled_job_action,
+    )
+    from packages.core.services import scheduler_service
+
+    workspace = await _seed_workspace(db_session)
+    managed_job = await _seed_job(db_session, workspace)
+    await _mark_as_initiative_driver(db_session, workspace, managed_job)
+    managed_job_id = managed_job.id
+
+    real_get = scheduler_service.get_scheduled_job
+    calls = 0
+
+    async def stale_then_locked(db, job_id, entity_id, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            # The Runtime's lock-free visibility check saw the old generic row.
+            return SimpleNamespace(agent_initiative_id=None, workspace_id=workspace.id)
+        return await real_get(db, job_id, entity_id, **kwargs)
+
+    monkeypatch.setattr(
+        scheduler_service,
+        "get_scheduled_job",
+        stale_then_locked,
+    )
+    response = json.loads(await runtime_cancel_scheduled_job_action(
+        entity_id=workspace.entity_id,
+        job_id=managed_job_id,
+        workspace_id=workspace.id,
+    ))
+
+    assert calls == 2
+    assert response["ok"] is False
+    assert response["error"] == "managed_agent_initiative"
+    db_session.expire_all()
+    assert await db_session.get(ScheduledJob, managed_job_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("operation", "patch"),
+    [
+        ("update", {"cron_expr": "0 9 * * *"}),
+        ("pause", {}),
+        ("delete", {}),
+    ],
+)
+async def test_executor_rejects_managed_initiative_driver_when_validation_bypassed(
+    db_session,
+    operation,
+    patch,
+):
+    workspace = await _seed_workspace(db_session)
+    job = await _seed_job(db_session, workspace)
+    initiative = await _mark_as_initiative_driver(db_session, workspace, job)
+    record = await _proposal_record(db_session, workspace)
+    item = await _make_item(
+        db_session,
+        workspace,
+        record,
+        _automation_change(
+            job.id,
+            change_key=f"managed_driver_{operation}",
+            operation=operation,
+            patch=patch,
+        ),
+    )
+
+    result = await apply_change_item(db_session, item)
+    await db_session.commit()
+
+    assert result["ok"] is False
+    assert result["error_code"] == "MANAGED_AGENT_INITIATIVE"
+    assert item.status == "failed"
+    persisted = await db_session.get(ScheduledJob, job.id)
+    assert persisted is not None
+    assert persisted.agent_initiative_id == initiative.id
+    assert persisted.enabled is True
+    assert persisted.cron_expr == "0 6 * * *"
+    assert persisted.revision == 1
 
 
 # ── executor happy paths ──────────────────────────────────────────────
@@ -693,7 +982,7 @@ def _review_payload(job_id: str, *, revision: int = 1) -> dict:
 
 def _fake_completion(payload: dict):
     async def fake(system_prompt, user_prompt, **kwargs):
-        return SimpleNamespace(content=json.dumps(payload))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payload, user_prompt)))
     return fake
 
 
@@ -728,16 +1017,11 @@ async def _change_items(db, review_id: str) -> list[ProposalItemRecord]:
 
 
 async def test_v2_review_standing_grant_auto_applies_change(db_session, monkeypatch):
-    from packages.core.governance.policy import WorkspacePolicy
-    from packages.core.governance.service import update_policy
-
     workspace = await _seed_workspace(db_session)
     job = await _seed_job(db_session, workspace)
-    await update_policy(
-        db_session,
-        entity_id=workspace.entity_id,
-        workspace_id=workspace.id,
-        policy=WorkspacePolicy(auto_approve_actions=[AUTOMATION_UPDATE_ACTION_KEY]),
+    await set_workspace_test_approval(
+        db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        actor_id=workspace.entity_id, user_rules=[action_rule(AUTOMATION_UPDATE_ACTION_KEY, effect="allow")],
     )
     await db_session.commit()
 
@@ -802,7 +1086,7 @@ async def test_v2_review_needs_human_then_cohort_approval_applies_change(db_sess
     request = await db_session.get(HitlRequest, item.approval_request_id)
     assert request.status == "pending"
     assert request.action_key == AUTOMATION_UPDATE_ACTION_KEY
-    assert request.dedup_key == f"proposal_item:{item.id}"
+    assert request.dedup_key == f"operation:proposal_item:{item.id}"
 
     await db_session.refresh(job)
     assert job.cron_expr == "0 6 * * *"  # nothing applied yet
@@ -841,16 +1125,11 @@ async def test_v2_review_needs_human_then_cohort_approval_applies_change(db_sess
 
 
 async def test_v2_review_policy_deny_blocks_change(db_session, monkeypatch):
-    from packages.core.governance.policy import WorkspacePolicy
-    from packages.core.governance.service import update_policy
-
     workspace = await _seed_workspace(db_session)
     job = await _seed_job(db_session, workspace)
-    await update_policy(
-        db_session,
-        entity_id=workspace.entity_id,
-        workspace_id=workspace.id,
-        policy=WorkspacePolicy(never_allow_actions=[AUTOMATION_UPDATE_ACTION_KEY]),
+    await set_workspace_test_approval(
+        db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        actor_id=workspace.entity_id, user_rules=[action_rule(AUTOMATION_UPDATE_ACTION_KEY, effect="deny")],
     )
     await db_session.commit()
 

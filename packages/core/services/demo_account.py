@@ -97,7 +97,7 @@ async def ensure_demo_account(db: AsyncSession) -> dict[str, Any]:
             entity_name=entity_name,
             display_name="Demo User",
         )
-        entity.settings = _demo_entity_settings()
+        entity.settings = {**dict(entity.settings or {}), **_demo_entity_settings()}
         user.preferences = {**dict(user.preferences or {}), "demo_account": True}
         await db.flush()
         return {"enabled": True, "created": True, "email": email}
@@ -106,11 +106,12 @@ async def ensure_demo_account(db: AsyncSession) -> dict[str, Any]:
         await db.execute(select(Entity).where(Entity.id == user.entity_id))
     ).scalar_one_or_none()
     if entity is None:
+        from packages.core.governance.approval_policy_service import account_defaults
         entity = Entity(
             id=generate_ulid(),
             name=entity_name,
             plan_id=DEFAULT_PLAN_ID,
-            settings=_demo_entity_settings(),
+            settings={**_demo_entity_settings(), "approval_defaults": account_defaults()},
         )
         db.add(entity)
         await db.flush()

@@ -50,7 +50,7 @@ app = FastAPI(
         "Creates isolated Docker containers, injects skill files and dependencies, "
         "and provides exec/file APIs for LLM-directed execution."
     ),
-    version="0.1.0",
+    version="0.1.1",
     lifespan=lifespan,
 )
 
@@ -65,7 +65,12 @@ app.add_middleware(
 @app.middleware("http")
 async def require_sandbox_api_token(request: Request, call_next):
     token = config.API_TOKEN.strip()
-    if token and request.url.path.startswith("/api/v1/"):
+    if request.url.path.startswith("/api/v1/"):
+        if not token:
+            return JSONResponse(
+                {"detail": "Sandbox API token is not configured"},
+                status_code=503,
+            )
         supplied = request.headers.get("X-Manor-Sandbox-Token", "")
         if not secrets.compare_digest(supplied, token):
             return JSONResponse(
@@ -82,6 +87,10 @@ async def health():
     return {
         "status": "ok",
         "build_version": BUILD_VERSION,
+        # Skill env is handed to each docker exec and replaced by load_skill;
+        # the core only reuses a container for a credentialed skill when the
+        # runner reports this mode.
+        "env_injection": "exec",
         **runner.runtime_status(),
     }
 

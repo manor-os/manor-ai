@@ -24,6 +24,7 @@ Public API:
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -33,17 +34,24 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
+from packages.core.services.workspace_draft_sources import (
+    register_draft_sources,
+    sources_transcript_note,
+)
+
 from packages.core.constants.blueprints import BlueprintStatus
 from packages.core.constants.workspace_drafts import (
     CREATION_PREFERENCES_FIELD,
     CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
     WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
+    uses_ui_runtime_mode,
 )
 from packages.core.ai.runtime import (
     runtime_lint_workspace_draft,
     runtime_reconcile_workspace_draft_fields,
     runtime_run_workspace_architect_turn,
 )
+from packages.core.ai.runtime.control import RuntimeTurnAborted
 from packages.core.blueprints.freshness import (
     BLUEPRINT_SETTINGS_KEY,
     BLUEPRINT_VERSION_KEY,
@@ -66,7 +74,7 @@ from packages.core.services.workspace_setup_service import (
     finalize_setup,
 )
 from packages.core.services.marketplace_billing import (
-    blueprint_delivery_requires_paid_plan,
+    blueprint_delivery_is_paid,
     blueprint_delivery_source,
 )
 from packages.core.services.resource_access import (
@@ -152,6 +160,7 @@ async def start_draft(
     stream_handler: Optional[Any] = None,
     on_tool_start: Optional[Any] = None,
     on_tool_end: Optional[Any] = None,
+    document_ids: Optional[list[str]] = None,
 ) -> Tuple[str, WorkspaceDraft]:
     """Create a fresh draft and seed it with the first assistant turn.
 
@@ -164,6 +173,7 @@ async def start_draft(
         entity_id=entity_id,
         user_id=user_id,
         initial_brief=initial_brief,
+        document_ids=document_ids,
     )
 
     opening = opening_user_message(initial_brief)
@@ -177,7 +187,14 @@ async def start_draft(
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
     )
-    _record_visible_messages(draft, opening, visible)
+    note = sources_transcript_note(
+        s for s in (draft.fields or {}).get("sources", []) if s.get("turn_index") == 0
+    )
+    _record_visible_messages(
+        draft,
+        f"{opening}\n{note}" if note and opening != "begin" else opening,
+        visible,
+    )
     await _refresh_missing_from_lint(db, draft)
     await db.flush()
     await db.refresh(draft)
@@ -191,6 +208,7 @@ async def create_draft_shell(
     user_id: str,
     initial_brief: Optional[str] = None,
     draft_id: Optional[str] = None,
+    document_ids: Optional[list[str]] = None,
 ) -> WorkspaceDraft:
     """Create the durable, resumable part of a Workspace draft.
 
@@ -226,6 +244,16 @@ async def create_draft_shell(
     )
     db.add(draft)
     await db.flush()
+    if document_ids or normalized_brief:
+        await register_draft_sources(
+            db,
+            draft=draft,
+            entity_id=entity_id,
+            user_id=user_id,
+            message=normalized_brief,
+            document_ids=list(document_ids or []),
+        )
+        await db.flush()
     return draft
 
 
@@ -240,6 +268,7 @@ async def process_draft_message(
     on_tool_start: Optional[Any] = None,
     on_tool_end: Optional[Any] = None,
     dedupe_opening: bool = False,
+    document_ids: Optional[list[str]] = None,
 ) -> Tuple[str, WorkspaceDraft]:
     """Process one user turn against a persisted draft via the architect."""
     draft = await get_draft(
@@ -270,6 +299,14 @@ async def process_draft_message(
                 await stream_handler("text_delta", {"content": previous_reply})
             return previous_reply, draft
 
+    added_sources = await register_draft_sources(
+        db,
+        draft=draft,
+        entity_id=entity_id,
+        user_id=user_id,
+        message=user_message,
+        document_ids=list(document_ids or []),
+    )
     visible = await _architect_turn(
         db,
         draft=draft,
@@ -280,7 +317,12 @@ async def process_draft_message(
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
     )
-    _record_visible_messages(draft, user_message, visible)
+    note = sources_transcript_note(added_sources)
+    _record_visible_messages(
+        draft,
+        f"{user_message}\n{note}" if note else user_message,
+        visible,
+    )
     await _refresh_missing_from_lint(db, draft)
     await db.flush()
     await db.refresh(draft)
@@ -301,6 +343,7 @@ async def _architect_turn(
     stream_handler: Optional[Any] = None,
     on_tool_start: Optional[Any] = None,
     on_tool_end: Optional[Any] = None,
+    repair_service_keys: tuple[str, ...] | None = None,
 ) -> str:
     """Invoke the typed-tool architect for one turn. Mutations land on
     ``draft.fields`` via tool calls; this returns the visible reply."""
@@ -320,6 +363,7 @@ async def _architect_turn(
         stream_handler=stream_handler,
         on_tool_start=on_tool_start,
         on_tool_end=on_tool_end,
+        **({"repair_service_keys": repair_service_keys} if repair_service_keys is not None else {}),
     )
 
 
@@ -353,7 +397,7 @@ def apply_public_field_updates(
     draft: WorkspaceDraft,
     updates: dict[str, Any],
 ) -> None:
-    """Merge public field edits without preserving stale creation consent."""
+    """Merge user edits; a runtime-mode switch is itself the user's choice."""
 
     previous_fields = dict(draft.fields or {})
     fields = dict(previous_fields)
@@ -365,15 +409,17 @@ def apply_public_field_updates(
         current = fields.get(CREATION_PREFERENCES_FIELD)
         preferences = dict(current) if isinstance(current, dict) else {}
         if (
-            "goals" in updates
-            and updates["goals"] != previous_fields.get("goals")
+            any(key in updates and updates[key] != previous_fields.get(key)
+                for key in ("goals", "stats"))
         ):
             preferences["goal_confirmed"] = False
         autonomy_changed = any(
             key in updates and updates[key] != previous_fields.get(key)
             for key in ("heartbeat_enabled", "heartbeat_cadence")
         )
-        if autonomy_changed:
+        if uses_ui_runtime_mode(fields) and "heartbeat_enabled" in updates:
+            preferences["autonomy_confirmed"] = True
+        elif autonomy_changed:
             preferences["autonomy_confirmed"] = False
         fields[CREATION_PREFERENCES_FIELD] = preferences
     draft.fields = fields
@@ -383,6 +429,8 @@ def apply_public_field_updates(
 async def _refresh_missing_from_lint(
     db: AsyncSession,
     draft: WorkspaceDraft,
+    *,
+    issues_out: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Re-derive ``missing`` + ``ready`` from a fresh lint pass.
 
@@ -481,6 +529,8 @@ async def _refresh_missing_from_lint(
             draft.status = "active"
         return False
     p0_issues = [i for i in lint.get("issues", []) if i.get("severity") == "P0"]
+    if issues_out is not None:
+        issues_out.extend(p0_issues)
     missing = {
         (i.get("where") or "").split(".")[0]
         for i in p0_issues
@@ -519,6 +569,67 @@ async def _refresh_missing_from_lint(
         if draft.status == "ready":
             draft.status = "active"
     return True
+
+
+async def _repair_agent_bindings_before_finalize(
+    db: AsyncSession,
+    draft: WorkspaceDraft,
+    issues: list[dict[str, Any]],
+    *,
+    progress: Optional[Any] = None,
+) -> bool:
+    """Give generated binding failures one scoped repair before creating rows.
+
+    User choices, setup requirements and frozen Blueprint content are never
+    repaired by this path. The normal Architect Runtime owns model billing,
+    tool authorization and concurrent-edit revalidation.
+    """
+    if draft.applied_blueprint_id or draft.missing != ["agent_mappings"] or not issues:
+        return True
+    mappings = {
+        str(mapping.get("service_key")): mapping
+        for mapping in (draft.fields or {}).get("agent_mappings") or []
+        if isinstance(mapping, dict) and mapping.get("strategy") == "create_custom"
+        and mapping.get("service_key")
+    }
+    binding_fields = ("tool_bindings", "business_capabilities", "skill_bindings", "mcp_bindings")
+    affected: set[str] = set()
+    for issue in issues:
+        matched = next((
+            key for key in mappings
+            if issue.get("where") in {
+                f"agent_mappings.{key}.{field}" for field in binding_fields
+            }
+        ), None)
+        if matched is None:
+            return True
+        affected.add(matched)
+
+    from packages.core.services.plan_gate import enforce_workspace_capacity
+
+    # Reject a full plan before spending on repair; materialization rechecks it.
+    await enforce_workspace_capacity(db, draft.entity_id)
+    service_keys = tuple(sorted(affected))
+    if progress is not None:
+        progress("agent_bindings_repair_started", {"service_keys": list(service_keys)})
+    reply = await _architect_turn(
+        db,
+        draft=draft,
+        entity_id=draft.entity_id,
+        user_id=draft.user_id,
+        user_message=json.dumps({
+            "operation": "repair_agent_bindings_before_creation",
+            "validation_issues": issues,
+            "agent_mappings": [mappings[key] for key in service_keys],
+        }, ensure_ascii=False),
+        repair_service_keys=service_keys,
+    )
+    verified = await _refresh_missing_from_lint(db, draft)
+    if verified and draft.ready:
+        _record_visible_messages(draft, "", reply)
+    if progress is not None:
+        progress("agent_bindings_repair_done", {"ready": verified and draft.ready})
+    return verified
 
 
 def _blueprint_goal_to_draft(goal: dict[str, Any]) -> dict[str, Any]:
@@ -849,39 +960,18 @@ async def apply_blueprint(
     # Inlined purchase lookup — core services must not import from
     # apps.api routers.
     purchase = None
-    if bp.entity_id != entity_id:
-        from packages.core.constants.blueprints import BlueprintPurchaseStatus
-        from packages.core.models.blueprint_purchase import BlueprintPurchase
-        purchase = (await db.execute(
-            select(BlueprintPurchase).where(
-                BlueprintPurchase.blueprint_id == bp.id,
-                BlueprintPurchase.buyer_entity_id == entity_id,
-                BlueprintPurchase.status == BlueprintPurchaseStatus.COMPLETED.value,
-            )
-        )).scalar_one_or_none()
     purchased = purchase is not None
 
-    requires_paid_plan = blueprint_delivery_requires_paid_plan(bp, purchase)
-    if requires_paid_plan and bp.entity_id != entity_id:
-        from packages.core.services.marketplace_billing import (
-            require_paid_marketplace_plan,
-        )
-
-        await require_paid_marketplace_plan(
-            db,
-            entity_id=entity_id,
-            blueprint_id=bp.id,
-        )
+    paid_delivery = blueprint_delivery_is_paid(bp, purchase)
 
     # A completed purchase keeps the blueprint usable even after the
     # seller archives/unpublishes it (spec §4.3/§5.3).
     if bp.status != BlueprintStatus.PUBLISHED and not purchased:
         raise ValueError("Blueprint not available")
 
-    # Paid gate: the payload IS the paid product. Merging it into a draft
-    # would leak it to non-purchasers (the router maps PermissionError
-    # to 402).
-    if requires_paid_plan and bp.entity_id != entity_id and not purchased:
+    # Applying a paid Blueprint to a draft is an install path and requires a
+    # completed purchase (the router maps PermissionError to 402).
+    if paid_delivery and bp.entity_id != entity_id and not purchased:
         raise PermissionError("purchase required to apply this blueprint")
 
     source_payload, source_version = blueprint_delivery_source(bp, purchase)
@@ -910,14 +1000,29 @@ async def apply_blueprint(
     policy = dict(payload.get("policy") or {})
     operating_model = dict(recipe.get("operating_model") or {})
 
+    from packages.core.governance.defaults import normalize_default_workspace_governance
+    from packages.core.governance.policy import policy_to_dict
+
+    from packages.core.governance.approval_projection import import_blueprint_governance
+    imported_policy, imported_rules = import_blueprint_governance(policy.get("governance") or {}, operating_model.get("rules") or [])
+    operating_rules, default_governance, _ = normalize_default_workspace_governance(imported_rules, imported_policy)
+    if "rules" in operating_model:
+        operating_model["rules"] = operating_rules
+
     fields = copy.deepcopy(dict(draft.fields or DEFAULT_FIELDS))
+    previous_preferences = fields.get(CREATION_PREFERENCES_FIELD)
+    preserve_runtime_mode = (
+        uses_ui_runtime_mode(fields)
+        and isinstance(previous_preferences, dict)
+        and previous_preferences.get("autonomy_confirmed") is True
+    )
     if (
         WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD in fields
         or CREATION_PREFERENCES_FIELD in fields
     ):
         fields[CREATION_PREFERENCES_FIELD] = {
             "goal_confirmed": False,
-            "autonomy_confirmed": False,
+            "autonomy_confirmed": preserve_runtime_mode,
         }
     fields["_blueprint_install_metadata"] = {
         BLUEPRINT_VERSION_KEY: str(source_version or "") or None,
@@ -946,6 +1051,10 @@ async def apply_blueprint(
         value = operating_model.get(list_key)
         if isinstance(value, list) and value:
             fields[list_key] = copy.deepcopy(value)
+            if list_key == "rules":
+                # A template must not inherit a previous rule's user-confirmed
+                # hard-block receipt, even if its key and contents match.
+                fields.pop("_explicit_hard_block_rules", None)
 
     blueprint_goals = [
         _blueprint_goal_to_draft(dict(goal))
@@ -960,6 +1069,7 @@ async def apply_blueprint(
         ]
     if blueprint_goals:
         fields["goals"] = blueprint_goals
+    fields["stats"] = copy.deepcopy(recipe.get("stats") or [])
 
     scheduled_automations = [
         _blueprint_scheduled_job_to_draft(dict(job))
@@ -983,7 +1093,7 @@ async def apply_blueprint(
         if isinstance(value, dict) and value:
             fields[object_key] = copy.deepcopy(value)
 
-    if "heartbeat_enabled" in operating_model:
+    if "heartbeat_enabled" in operating_model and not preserve_runtime_mode:
         fields["heartbeat_enabled"] = bool(operating_model["heartbeat_enabled"])
     if operating_model.get("heartbeat_cadence"):
         fields["heartbeat_cadence"] = operating_model["heartbeat_cadence"]
@@ -1065,9 +1175,8 @@ async def apply_blueprint(
             if pack.get("title") or pack.get("slug")
         ]
 
-    governance = policy.get("governance")
-    if isinstance(governance, dict) and governance:
-        fields["governance_policy"] = copy.deepcopy(governance)
+    if policy.get("governance") or operating_rules:
+        fields["governance_policy"] = policy_to_dict(default_governance)
 
     # Workspace settings are portable Blueprint semantics too. Keep them in a
     # private Draft field so a user field patch cannot spoof the install
@@ -1107,6 +1216,7 @@ async def apply_blueprint(
         "settings",
         "services",
         "goals",
+        "stats",
         "rules",
         "automations",
         "evaluation",
@@ -1237,9 +1347,24 @@ async def finalize_draft(
         raise ValueError("Draft already finalized but missing workspace id")
     if draft.status == "abandoned":
         raise ValueError("Draft was abandoned and cannot be finalized")
-    lint_verified = await _refresh_missing_from_lint(db, draft)
+    issues: list[dict[str, Any]] = []
+    lint_verified = await _refresh_missing_from_lint(db, draft, issues_out=issues)
     if not lint_verified:
         raise ValueError("Draft readiness could not be verified")
+    if not draft.ready:
+        try:
+            lint_verified = await _repair_agent_bindings_before_finalize(
+                db, draft, issues, progress=progress,
+            )
+        except RuntimeTurnAborted:
+            # Capability matching releases the draft lock during provider work.
+            # A concurrent finalize may have succeeded before we reacquire it.
+            current = await get_draft(db, draft_id, entity_id, user_id, for_update=True)
+            if current is not None and current.status == "finalized" and current.finalized_workspace_id:
+                return current.finalized_workspace_id, current
+            raise
+        if not lint_verified:
+            raise ValueError("Draft readiness could not be verified after Agent binding repair")
     if not draft.ready:
         missing = ", ".join(draft.missing or [])
         raise WorkspaceDraftNotReadyError(
@@ -1422,6 +1547,7 @@ async def finalize_draft(
                 "blueprint_slug": getattr(blueprint, "slug", None),
                 "title": getattr(blueprint, "title", None),
                 "applied_via": "workspace_draft",
+                "author_hard_blocks_installed": False,
                 "installed_at": datetime.now(timezone.utc).isoformat(),
                 BLUEPRINT_VERSION_KEY: blueprint_version,
                 CONTENT_FINGERPRINT_KEY: content_fingerprint,

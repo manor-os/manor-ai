@@ -18,11 +18,11 @@ from packages.core.governance.policy import (
     policy_from_dict,
     policy_to_dict,
 )
-from packages.core.governance.policy import policy_auto_approves
 from packages.core.governance.policy_cache import GovernancePolicyCacheUnavailable
 from packages.core.governance.service import (
     add_auto_approve_action,
     add_auto_approve_capability,
+    automated_run_always_allowed,
     check_step_policy,
     get_policy,
     list_revisions,
@@ -34,9 +34,11 @@ from packages.core.governance.service import (
 
 
 from packages.core.governance.approvals import (
+    ApprovalConsumptionError,
     ApprovalDecision,
     ApprovalOrigin,
     ApprovalSubject,
+    claim_approval_consumption,
     consume_approval,
     count_open_requests,
     deny_approval,
@@ -44,11 +46,13 @@ from packages.core.governance.approvals import (
     resolve_approval,
     resolve_origin_requests,
 )
-from packages.core.constants.approvals import ApprovalOutcome
+from packages.core.constants.approvals import ApprovalConsumeOutcome, ApprovalOutcome
 
 __all__ = [
-    "ApprovalDecision", "ApprovalOrigin", "ApprovalOutcome", "ApprovalSubject",
-    "resolve_approval", "grant_approval", "deny_approval", "consume_approval",
+    "ApprovalConsumeOutcome", "ApprovalConsumptionError", "ApprovalDecision",
+    "ApprovalOrigin", "ApprovalOutcome", "ApprovalSubject",
+    "resolve_approval", "grant_approval", "deny_approval",
+    "claim_approval_consumption", "consume_approval",
     "resolve_origin_requests", "count_open_requests",
     "DEFAULT_POLICY",
     "PolicyDecision",
@@ -57,9 +61,9 @@ __all__ = [
     "GovernancePolicyCacheUnavailable",
     "policy_from_dict",
     "policy_to_dict",
-    "policy_auto_approves",
     "add_auto_approve_action",
     "add_auto_approve_capability",
+    "automated_run_always_allowed",
     "remove_auto_approve_action",
     "remove_auto_approve_capability",
     "check_step_policy",

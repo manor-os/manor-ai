@@ -102,7 +102,7 @@ async def test_public_document_visibility_batch_uses_one_preloaded_policy_snapsh
         preload_documents = AsyncMock()
 
         @staticmethod
-        def document_owned_by_deleted_workspace(document):
+        def document_entity_is_unavailable(document):
             return False
 
         @staticmethod

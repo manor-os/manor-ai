@@ -3,21 +3,32 @@ interface EmptyStateProps {
   title: string;
   description?: string;
   action?: React.ReactNode;
+  compact?: boolean;
+  className?: string;
 }
 
-export default function EmptyState({ icon, title, description, action }: EmptyStateProps) {
+export default function EmptyState({
+  icon,
+  title,
+  description,
+  action,
+  compact = false,
+  className = "",
+}: EmptyStateProps) {
   return (
-    <div className="manor-empty">
+    <div
+      className={[
+        "manor-empty",
+        compact ? "manor-empty--compact" : "",
+        className,
+      ].filter(Boolean).join(" ")}
+    >
       {icon && <div className="manor-empty-icon">{icon}</div>}
-      <div style={{ fontSize: "15px", fontWeight: 700, color: "#57534e", marginBottom: "6px" }}>
-        {title}
-      </div>
+      <div className="manor-empty-title">{title}</div>
       {description && (
-        <div style={{ fontSize: "13px", color: "#a8a29e", marginBottom: action ? "16px" : undefined }}>
-          {description}
-        </div>
+        <div className="manor-empty-description">{description}</div>
       )}
-      {action && <div>{action}</div>}
+      {action && <div className="manor-empty-action">{action}</div>}
     </div>
   );
 }

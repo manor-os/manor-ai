@@ -12,7 +12,10 @@ import {
   type WorkspaceLedgerQueryVisualization,
 } from "./api";
 import { t } from "./i18n";
+import { normalizeFileRef } from "./fileReferences";
 import type { ManualSkillReference } from "./manualSkillRefs";
+import { TYPEWRITER_TICK_MS, nextTypewriterSlice } from "./chatTypewriter";
+import { isWebsiteAccessDenied, PUBLIC_WEBSITE_ACCESS_DENIED_MESSAGE } from "./websiteAccessDenied";
 
 /* ── Types ── */
 
@@ -25,7 +28,9 @@ export interface ToolCall {
    *  `result`; this is retained after history hydration only when the draft
    *  artifact JSON would otherwise be parsed from a truncated preview. */
   rawResult?: string;
-  status?: "pending" | "success" | "error";
+  status?: "pending" | "success" | "error" | "unverified";
+  reason?: string;
+  status_code?: number;
   startedAt?: number;
   duration?: string;
   /** When a wrapper tool (invoke_skill, manor, code) is pending and a
@@ -56,11 +61,27 @@ export interface AssistantProcessStep {
   display_key?: string;
   display_params?: Record<string, string | number>;
   status?: "running" | "pending" | "success" | "completed" | "error" | string;
+  reason?: string;
+  status_code?: number;
   summary?: string;
   assistant_text?: string;
   arguments_preview?: string;
   result_preview?: string;
+  /** The model is still writing this call; it has not run yet. */
+  drafting?: boolean;
+  /** The line the model is writing now, while ``drafting``. */
+  draft_preview?: string;
+  recovered_by_step_id?: string;
+  verified_by_step_id?: string;
+  action_id?: string;
+  approval_request_id?: string;
+  presentation?: {
+    kind: "chrome_wait_observation_timeout" | "chrome_stale_snapshot_rejection";
+    tone: "neutral";
+  };
   duration_ms?: number;
+  started_at_ms?: number;
+  ended_at_ms?: number;
 }
 
 export interface AssistantProcessBlock {
@@ -71,6 +92,11 @@ export interface AssistantProcessBlock {
   status?: "running" | "pending" | "completed" | "success" | "error" | string;
   default_collapsed?: boolean;
   duration_ms?: number;
+  // Turn lifecycle is independent of individual tool-attempt outcomes.
+  lifecycle_status?: "running" | "completed" | "failed" | "cancelled" | "waiting";
+  outcome_status?: "answered" | "completed" | "partial" | "blocked" | "not_attempted";
+  started_at_ms?: number;
+  ended_at_ms?: number;
   steps: AssistantProcessStep[];
 }
 
@@ -233,6 +259,7 @@ export interface HITLRequest {
   operation?: unknown;
   review?: unknown;
   review_title?: string;
+  review_read_only?: boolean;
   workflow?: {
     id?: string;
     name?: string;
@@ -327,6 +354,8 @@ export interface ChatMessage {
   timestamp?: string;
   attachments?: {
     name: string;
+    /** Local upload bytes for preview/retry, held only in the live session. */
+    file?: File;
     document_id?: string;
     type?: string;
     fileType?: string;
@@ -370,12 +399,26 @@ export interface ChatMessage {
   updated_at?: string | null;
 }
 
-export function hasActivePersistedChatStream(messages: ChatMessage[]): boolean {
-  const latestAssistant = [...messages]
-    .reverse()
-    .find((message) => message.role === "assistant");
-  const status = latestAssistant?.meta?.stream_status;
-  return status === "running" || status === "streaming";
+export function hasActivePersistedChatStream(
+  messages: Pick<ChatMessage, "role" | "meta" | "stream_error" | "stop_reason">[],
+): boolean {
+  // Background artifact receipts may follow the running assistant row. Only
+  // a newer user turn can fence off an older turn's stale stream marker.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "user") return false;
+    if (message.role !== "assistant") continue;
+    // Terminal evidence wins over a checkpoint's stale running marker, also
+    // after history/reopen. Ordinary error prose is not lifecycle evidence.
+    if (message.stream_error || message.meta?.stream_error === true
+      || message.meta?.stream_interrupted === true
+      || ["error", "credit_exhausted"].includes(String(message.stop_reason || message.meta?.stop_reason || ""))) {
+      return false;
+    }
+    const status = message.meta?.stream_status;
+    if (status === "running" || status === "streaming") return true;
+  }
+  return false;
 }
 
 export function isChatRunActive(
@@ -457,12 +500,68 @@ export interface RuntimeQueueState {
   deadlineAt?: string;
 }
 
+export interface RuntimeHumanInputField {
+  name: string;
+  label: string;
+  type: string;
+  required: boolean;
+  options?: string[];
+}
+
+/** The `request_input` question a durable run is parked on. */
+export interface RuntimeHumanInputState {
+  requestId: string;
+  status: string;
+  question: string;
+  options?: string[];
+  fields?: RuntimeHumanInputField[];
+  context?: string;
+  deadlineAt?: string;
+  answered?: boolean;
+}
+
 export interface RuntimeStreamState {
   runId: string;
   status: string;
   queue?: RuntimeQueueState;
+  humanInput?: RuntimeHumanInputState;
   pollAfterSeconds: number;
   lastEventId?: string;
+}
+
+export function runtimeHumanInputFromPayload(raw: unknown): RuntimeHumanInputState | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const value = raw as Record<string, unknown>;
+  const requestId = String(value.request_id || "");
+  const question = String(value.question || "").trim();
+  if (!requestId || !question) return undefined;
+  const options = Array.isArray(value.options)
+    ? value.options.map((item) => String(item)).filter(Boolean)
+    : undefined;
+  const fields = Array.isArray(value.fields)
+    ? value.fields
+        .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+        .map((item) => ({
+          name: String(item.name || ""),
+          label: String(item.label || item.name || ""),
+          type: String(item.type || "text"),
+          required: item.required !== false,
+          options: Array.isArray(item.options)
+            ? item.options.map((option) => String(option)).filter(Boolean)
+            : undefined,
+        }))
+        .filter((item) => item.name)
+    : undefined;
+  return {
+    requestId,
+    status: String(value.status || "pending"),
+    question,
+    options: options && options.length > 0 ? options : undefined,
+    fields: fields && fields.length > 0 ? fields : undefined,
+    context: value.context ? String(value.context) : undefined,
+    deadlineAt: value.deadline_at ? String(value.deadline_at) : undefined,
+    answered: Boolean(value.answer) || String(value.status || "") !== "pending",
+  };
 }
 
 export function formatRuntimeQueueStatus(queue: RuntimeQueueState): string {
@@ -557,6 +656,7 @@ export interface StreamProcessResult {
   runtimeRunId?: string;
   runtimeStatus?: string;
   runtimeQueue?: RuntimeQueueState;
+  runtimeHumanInput?: RuntimeHumanInputState;
   pollAfterSeconds?: number;
   lastEventId?: string;
 }
@@ -705,8 +805,54 @@ const PUBLIC_ACTIONABLE_EXECUTOR_ERROR_RE =
   /^(?:(?:permission denied|authentication required|authorization required)\.?(?:\s+(?:reconnect|connect|sign in to|log in to) your [a-z0-9][a-z0-9 ._-]{0,79} account\.?)?|(?:rate limit|quota|usage limit) (?:exceeded|reached)\.?(?:\s+(?:try again later|upgrade your plan(?: or try again later)?)\.?)?|credits? exhausted\.?(?:\s+(?:add credits|upgrade your plan)(?: or try again later)?\.?)?)$/i;
 const PUBLIC_TOOL_FAILURE_MESSAGE =
   "This operation is temporarily unavailable. Please try again.";
+const PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE =
+  "The Chrome browser task already finished. Start a new Chrome task before doing more browser work.";
+const PUBLIC_TOOL_BLOCKED_MESSAGE = "This operation was blocked.";
+const INTERNAL_TOOL_IDENTIFIER_RE =
+  /\bmcp__[a-z0-9_.-]+(?:__[a-z0-9_.-]+)+\b/i;
 const PUBLIC_REDACTED_TOOL_NAME = "operation";
 const REDACTED_SENSITIVE_VALUE = "<redacted>";
+export const LLM_CONFIGURATION_ERROR_MESSAGE =
+  "AI is not configured for this chat. Ask your administrator to configure an AI provider, then try again.";
+// A failure on the user's own (BYOK) model route. The backend emits exactly
+// this sentence (packages/core/ai/runtime/output_policy.py) followed at most
+// by a structured "HTTP <status> from <host> (model <id>)" detail. Any other
+// text after the sentence is dropped here too, whichever layer sees it first.
+export const BYOK_PROVIDER_ERROR_MESSAGE =
+  "Your BYOK model provider returned an error. Check the model, API key, and base URL in your AI settings and the provider's status, then try again.";
+const BYOK_PROVIDER_ERROR_CODE = "byok_provider_error";
+const FILE_PERMISSION_ERROR_MESSAGES = {
+  "You don't have permission to edit this file. Ask the file owner for edit access.": "lib.chat_stream.file_edit_denied",
+  "You don't have permission to access this file. Ask the file owner for access.": "lib.chat_stream.file_access_denied",
+} as const;
+
+export function formatFilePermissionErrorMessage(message: unknown): string | null {
+  const text = String(message ?? "").trim();
+  for (const [english, key] of Object.entries(FILE_PERMISSION_ERROR_MESSAGES)) {
+    const localized = t(key);
+    if (text === english || text === localized) return localized;
+  }
+  return null;
+}
+
+const PUBLIC_BYOK_DETAIL_RE =
+  /^(?:HTTP [1-5]\d{2}|no response) from [A-Za-z0-9.-]{1,253}(?::\d{1,5})? \(model [A-Za-z0-9._:/-]{1,120}\)$/;
+
+function localizedByokProviderError(detail?: string): string {
+  const template = t("lib.chat_stream.byok_provider_error_with_detail");
+  return detail ? template.replace("{detail}", detail) : template.split("\n\n", 1)[0];
+}
+
+export function formatByokProviderErrorMessage(message: unknown): string | null {
+  const text = String(message ?? "").trim();
+  if (text === BYOK_PROVIDER_ERROR_CODE || text === BYOK_PROVIDER_ERROR_MESSAGE) {
+    return localizedByokProviderError();
+  }
+  const prefix = `${BYOK_PROVIDER_ERROR_MESSAGE}\n\nError detail: `;
+  if (!text.startsWith(prefix)) return null;
+  const detail = text.slice(prefix.length).trim();
+  return localizedByokProviderError(PUBLIC_BYOK_DETAIL_RE.test(detail) ? detail : undefined);
+}
 
 function redactSensitiveText(value: string): string {
   return value
@@ -733,17 +879,60 @@ function redactSensitiveText(value: string): string {
 }
 
 function isPublicActionableToolExecutorFailure(detail: string): boolean {
-  return PUBLIC_ACTIONABLE_EXECUTOR_ERROR_RE.test(detail.trim());
+  return PUBLIC_ACTIONABLE_EXECUTOR_ERROR_RE.test(detail.trim())
+    || detail.trim() === LLM_CONFIGURATION_ERROR_MESSAGE;
 }
 
 function localizedRequestFailure() {
   return t("lib.chat_stream.request_failed_with_detail").split("\n\n", 1)[0];
 }
 
+/** Localized text for a run the server ended outside its agent loop. */
+export function runtimeTerminalFailureText(reason: unknown): string | undefined {
+  const code = typeof reason === "string" ? reason : "";
+  if (code === "sandbox_queue_timeout") return t("component.chat_runtime_queue.timed_out");
+  if (code.startsWith("sandbox_")) return t("component.chat_runtime_queue.start_failed");
+  return undefined;
+}
+
+function publicBlockedToolResult(text: string): string | undefined {
+  const trimmed = text.trim();
+  if (
+    trimmed === PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE
+    || trimmed === PUBLIC_TOOL_BLOCKED_MESSAGE
+  ) {
+    return trimmed;
+  }
+  if (!trimmed.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    if (String(parsed.status || "").trim().toLowerCase() !== "blocked") return undefined;
+    const reason = String(parsed.reason || parsed.error || "").trim();
+    if (reason === "chrome_tabs_already_finalized") {
+      return PUBLIC_CHROME_TABS_ALREADY_FINALIZED_MESSAGE;
+    }
+    const message = String(parsed.message || "").trim();
+    if (
+      message
+      && !INTERNAL_TOOL_IDENTIFIER_RE.test(message)
+      && !INTERNAL_TOOL_CONTRACT_ERROR_RE.test(message)
+    ) {
+      return message;
+    }
+    return PUBLIC_TOOL_BLOCKED_MESSAGE;
+  } catch {
+    return undefined;
+  }
+}
+
 export function formatPublicToolResult(result: unknown): string | undefined {
   const normalized = normalizeToolResult(result);
   const text = normalized ? redactSensitiveText(normalized) : normalized;
   if (!text) return text;
+  if (text.trim() === PUBLIC_WEBSITE_ACCESS_DENIED_MESSAGE) return PUBLIC_WEBSITE_ACCESS_DENIED_MESSAGE;
+  const blockedPublic = publicBlockedToolResult(text);
+  if (blockedPublic) return blockedPublic;
   const hadExecutorPrefix = TOOL_ERROR_PREFIX_RE.test(text);
   const publicText = text.replace(TOOL_ERROR_PREFIX_RE, "").trim();
   if (hadExecutorPrefix) {
@@ -766,22 +955,20 @@ function normalizeMessageAttachments(value: unknown): ChatMessage["attachments"]
   if (!Array.isArray(value)) return undefined;
   const attachments = value
     .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
-    .map((item) => ({
-      name: String(item.name || item.filename || item.title || "").trim(),
-      document_id: item.document_id == null
-        ? undefined
-        : String(item.document_id),
-      type: item.type == null ? undefined : String(item.type),
-      fileType: item.fileType == null ? undefined : String(item.fileType),
-      mimeType: item.mimeType == null ? undefined : String(item.mimeType),
-      previewUrl: item.previewUrl == null ? undefined : String(item.previewUrl),
-      openUrl: item.openUrl == null
-        ? (item.open_url == null ? undefined : String(item.open_url))
-        : String(item.openUrl),
-      fsPath: item.fsPath == null
-        ? (item.fs_path == null ? undefined : String(item.fs_path))
-        : String(item.fsPath),
-    }))
+    .map((item) => {
+      // Persisted rows carry the snake_case FileRef; older rows camelCase.
+      const ref = normalizeFileRef(item);
+      return {
+        name: ref.name,
+        document_id: ref.document_id,
+        type: item.type == null ? undefined : String(item.type),
+        fileType: ref.file_type,
+        mimeType: ref.mime,
+        previewUrl: ref.preview_url,
+        openUrl: ref.open_url,
+        fsPath: ref.fs_path,
+      };
+    })
     .filter((item) => item.name);
   return attachments.length ? attachments : undefined;
 }
@@ -878,6 +1065,7 @@ export function markAssistantProcessBlocksStopped(blocks: AssistantBlock[] | und
   let changed = false;
   const next = blocks.map((block) => {
     if (block.type !== "process") return block;
+    if (block.lifecycle_status && !["running", "waiting"].includes(block.lifecycle_status)) return block;
     const steps = (block.steps || []).map((step) => {
       const status = step.status === "running" || step.status === "pending" ? "error" : step.status;
       if (status !== step.status) changed = true;
@@ -894,11 +1082,33 @@ export function markAssistantProcessBlocksStopped(blocks: AssistantBlock[] | und
     return {
       ...block,
       status: "error",
+      lifecycle_status: "cancelled" as const,
+      ended_at_ms: block.ended_at_ms ?? Date.now(),
       default_collapsed: true,
       steps,
     };
   });
   return changed ? next : blocks;
+}
+
+export function markAssistantProcessBlocksFailed(
+  blocks: AssistantBlock[] | undefined, content: string,
+): AssistantBlock[] | undefined {
+  const processes = blocks?.filter((block): block is AssistantProcessBlock => block.type === "process");
+  if (!processes?.length) return undefined;
+  const now = Date.now();
+  return [
+    ...processes.map((block) => ({
+      ...block,
+      lifecycle_status: "failed" as const,
+      status: "error",
+      ended_at_ms: block.ended_at_ms ?? now,
+      duration_ms: block.duration_ms ?? (block.started_at_ms == null ? undefined : Math.max(0, now - block.started_at_ms)),
+      steps: (block.steps || []).map((step) => ["running", "pending"].includes(step.status || "")
+        ? { ...step, status: "error" } : step),
+    })),
+    { id: "blk_failure_summary", type: "text", phase: "final", text: content },
+  ];
 }
 
 export function settlePendingAssistantProcess(messages: ChatMessage[]): ChatMessage[] {
@@ -934,6 +1144,10 @@ export function formatPersistedStreamErrorMessage(message: unknown): string {
   const detail = redactSensitiveText(
     normalizeToolResult(message)?.trim() || t("lib.chat_stream.unknown_error"),
   );
+  const byokMessage = formatByokProviderErrorMessage(detail);
+  if (byokMessage) return byokMessage;
+  const permissionMessage = formatFilePermissionErrorMessage(detail);
+  if (permissionMessage) return permissionMessage;
   const publicDetail = formatPublicToolResult(detail) || detail;
   if (
     /(?:sqlalchemy|asyncpg|psycopg|InFailedSQLTransactionError|current\s+transaction\s+is\s+aborted|Traceback\s+\(most\s+recent\s+call\s+last\)|\[SQL:|\[parameters?:)/i
@@ -984,36 +1198,8 @@ function formatCreditLimitMessage(detail: PlanLimitDetail): string {
   return detail.message || t("component.upgrade_prompt.default_message");
 }
 
-// Paint interval. Combined with the slice sizes below this lands around
-// 55-150 chars/sec — brisk enough that a long answer never feels stuck,
-// slow enough to read along. It used to be 18ms with slices that GREW with
-// the backlog, so a long reply painted at ~1300 chars/sec: the answers that
-// most need reading arrived fastest.
-export const TYPEWRITER_TICK_MS = 36;
+export { TYPEWRITER_TICK_MS, nextTypewriterSlice } from "./chatTypewriter";
 const TOOL_START_DISPLAY_DELAY_MS = 180;
-
-export function nextTypewriterSlice(text: string): [string, string] {
-  const chars = Array.from(text);
-  if (chars.length === 0) return ["", ""];
-
-  // The backlog still nudges the pace — a burst should not take minutes to
-  // drain — but gently, and the ceiling stays inside reading speed rather
-  // than dumping the screen.
-  const count =
-    chars.length > 1000 ? 6 :
-      chars.length > 400 ? 4 :
-        chars.length > 160 ? 3 :
-          2;
-  let end = Math.min(count, chars.length);
-
-  // Keep a trailing run of spaces/newlines with the same paint so markdown
-  // does not look like it stalls between words.
-  while (end < chars.length && end < count + 8 && /\s/.test(chars[end])) {
-    end += 1;
-  }
-
-  return [chars.slice(0, end).join(""), chars.slice(end).join("")];
-}
 
 /**
  * Parse persisted tool_calls from DB message into ToolCall[].
@@ -1083,6 +1269,8 @@ export function parseToolCalls(raw: any): ToolCall[] | undefined {
       result: formatPublicToolResult(tc.result),
       rawResult: workspaceDraftPublicResult(tc),
       status: tc.status || inferToolStatus(tc.result),
+      ...(isWebsiteAccessDenied({ ...tc, status: tc.status || inferToolStatus(tc.result) })
+        ? { reason: "website_access_denied", status_code: 403 } : {}),
       duration: persistedDuration(tc),
     }));
   }
@@ -1091,6 +1279,30 @@ export function parseToolCalls(raw: any): ToolCall[] | undefined {
     result: formatPublicToolResult(result),
     status: inferToolStatus(result),
   }));
+}
+
+export function reconcileUserMessageReceipt(
+  messages: ChatMessage[],
+  messageId: unknown,
+  conversationId?: string,
+  clientMessageId?: unknown,
+): ChatMessage[] {
+  const id = typeof messageId === "string" ? messageId.trim() : "";
+  if (!id) return messages;
+  let index = messages.length - 1;
+  while (index >= 0 && messages[index].role !== "user") index -= 1;
+  if (index < 0) return messages;
+  const message = messages[index];
+  const pendingClientMessageId = message.meta?.client_message_id;
+  if (pendingClientMessageId && pendingClientMessageId !== clientMessageId) return messages;
+  if (message.conversation_id && conversationId
+    && message.conversation_id !== conversationId) return messages;
+  // Replayed frames cannot replace a different, already durable user turn.
+  if (message.id && !message.id.startsWith("local-user-") && message.id !== id) return messages;
+  return messages.flatMap((item, itemIndex) => {
+    if (itemIndex === index) return [{ ...item, id, conversation_id: conversationId || item.conversation_id }];
+    return item.role === "user" && item.id === id ? [] : [item];
+  });
 }
 
 /**
@@ -1104,6 +1316,14 @@ export async function processSSEStream(
   currentConvId: string | undefined,
   signal?: AbortSignal,
 ): Promise<StreamProcessResult> {
+  // Response headers acknowledge the durable user row even when the stream
+  // disconnects before its first model event. They never imply model success.
+  const receiptConversationId = response.headers.get("X-Conversation-ID")?.trim() || currentConvId;
+  const receiptMessageId = response.headers.get("X-User-Message-ID");
+  const receiptClientMessageId = response.headers.get("X-Client-Message-ID");
+  if (!currentConvId || !receiptConversationId || currentConvId === receiptConversationId) {
+    setMessages((messages) => reconcileUserMessageReceipt(messages, receiptMessageId, receiptConversationId, receiptClientMessageId));
+  }
   const reader = response.body?.getReader();
   if (!reader) throw new Error("No reader available");
 
@@ -1119,12 +1339,16 @@ export async function processSSEStream(
   let currentEventId: string | undefined;
   let resetBeforeNextText = false;
   let summaryStarted = false;
+  let streamCancelled = false;
+  let streamPaused = false;
+  let runtimeStatusReason: string | undefined;
   const result: StreamProcessResult = {};
   let streamConversationId = currentConvId;
   let streamMessageId: string | undefined;
   let queuedText = "";
   let typewriterTimer: ReturnType<typeof setTimeout> | undefined;
   let typewriterIdleResolve: (() => void) | undefined;
+  let deferredFinalBlocks: AssistantBlock[] | undefined;
   type PendingToolStart = {
     tc: any;
     timer: ReturnType<typeof setTimeout>;
@@ -1158,6 +1382,11 @@ export async function processSSEStream(
   };
 
   const notifyTypewriterIdle = () => {
+    if (!queuedText && !typewriterTimer && deferredFinalBlocks) {
+      const blocks = deferredFinalBlocks;
+      deferredFinalBlocks = undefined;
+      applyAssistantBlocks(blocks);
+    }
     if (!queuedText && !typewriterTimer && typewriterIdleResolve) {
       const resolve = typewriterIdleResolve;
       typewriterIdleResolve = undefined;
@@ -1192,10 +1421,21 @@ export async function processSSEStream(
 
   const waitForTypewriterIdle = async () => {
     if (!queuedText && !typewriterTimer) return;
-    await new Promise<void>((resolve) => {
-      typewriterIdleResolve = resolve;
-      scheduleTypewriter();
-    });
+    if (signal?.aborted) {
+      flushQueuedTextNow();
+      return;
+    }
+    // The response reader has closed, but stopping presentation must still
+    // release the queue and retain all accepted text.
+    signal?.addEventListener("abort", flushQueuedTextNow, { once: true });
+    try {
+      await new Promise<void>((resolve) => {
+        typewriterIdleResolve = resolve;
+        scheduleTypewriter();
+      });
+    } finally {
+      signal?.removeEventListener("abort", flushQueuedTextNow);
+    }
   };
 
   const isRedactedToolFailure = (tc: any) =>
@@ -1257,6 +1497,8 @@ export async function processSSEStream(
     const status =
       statusOverride || tc.status || (rawResultText ? "success" : "pending");
     const resultText = formatPublicToolResult(tc.result);
+    const websiteDenial = isWebsiteAccessDenied({ ...tc, status })
+      ? { reason: "website_access_denied", status_code: 403 } : { reason: undefined, status_code: undefined };
     const incomingArguments = normalizeToolArguments(tc.arguments);
     setMessages((prev) => {
       const updated = [...prev];
@@ -1288,7 +1530,7 @@ export async function processSSEStream(
         const isChildOfWrapper =
           pendingWrapperIdx >= 0 && !WRAPPER_TOOLS.has(tc.name);
 
-        if (status === "success" || status === "error") {
+        if (status === "success" || status === "error" || status === "unverified") {
           let idx = findPendingToolIndex(
             existing,
             tc,
@@ -1326,6 +1568,7 @@ export async function processSSEStream(
               arguments: incomingArguments || existing[idx].arguments,
               result: resultText,
               status,
+              ...websiteDenial,
               duration: dur,
             };
           } else {
@@ -1334,6 +1577,7 @@ export async function processSSEStream(
               arguments: incomingArguments,
               result: resultText,
               status,
+              ...websiteDenial,
               duration: dur,
             });
           }
@@ -1375,11 +1619,20 @@ export async function processSSEStream(
     });
   };
 
-  const applyAssistantBlocks = (blocks: unknown) => {
+  const applyAssistantBlocks = (blocks: unknown, deferFinalText = false) => {
     if (!Array.isArray(blocks) || blocks.length === 0) return;
     const nextBlocks = summaryStarted
       ? markAssistantProcessBlocksSummarizing(blocks as AssistantBlock[]) || blocks
       : blocks;
+    // A terminal snapshot includes the complete reply. Keep its process
+    // lifecycle/timestamps immediately, but let text_delta paint the body
+    // before exposing the same text through the structured final block.
+    const deferFinal = (deferFinalText || Boolean(queuedText || typewriterTimer))
+      && nextBlocks.some((block: AssistantBlock) => block.type === "text" && block.phase === "final" && block.text);
+    deferredFinalBlocks = deferFinal ? nextBlocks as AssistantBlock[] : undefined;
+    const visibleBlocks = deferFinal
+      ? nextBlocks.map((block: AssistantBlock) => block.type === "text" && block.phase === "final" ? { ...block, text: "" } : block)
+      : nextBlocks;
     setMessages((prev) => {
       const updated = [...prev];
       let last = updated[updated.length - 1];
@@ -1387,7 +1640,7 @@ export async function processSSEStream(
         updated.push({
           role: "assistant",
           content: "",
-          assistant_blocks: nextBlocks as AssistantBlock[],
+          assistant_blocks: visibleBlocks as AssistantBlock[],
           timestamp: new Date().toISOString(),
         });
         return updated;
@@ -1395,7 +1648,7 @@ export async function processSSEStream(
       if (last.role === "assistant") {
         updated[updated.length - 1] = {
           ...last,
-          assistant_blocks: nextBlocks as AssistantBlock[],
+          assistant_blocks: visibleBlocks as AssistantBlock[],
         };
       }
       return updated;
@@ -1459,10 +1712,24 @@ export async function processSSEStream(
   };
 
   const clearQueuedText = () => {
+    deferredFinalBlocks = undefined;
     queuedText = "";
     if (typewriterTimer) {
       clearTimeout(typewriterTimer);
       typewriterTimer = undefined;
+    }
+    notifyTypewriterIdle();
+  };
+
+  const flushQueuedTextNow = () => {
+    if (typewriterTimer) {
+      clearTimeout(typewriterTimer);
+      typewriterTimer = undefined;
+    }
+    if (queuedText) {
+      const remaining = queuedText;
+      queuedText = "";
+      appendVisibleText(remaining);
     }
     notifyTypewriterIdle();
   };
@@ -1497,10 +1764,15 @@ export async function processSSEStream(
     return false;
   };
 
-  const applyStreamErrorMessage = (message: unknown, persisted: boolean) => {
-    const content = persisted || INTERNAL_TOOL_CONTRACT_ERROR_RE.test(String(message))
+  const applyStreamErrorMessage = (message: unknown, persisted: boolean, errorCode?: unknown) => {
+    clearQueuedText();
+    clearPendingToolStarts();
+    // This body is the host's facts-only failure projection, not a rejected
+    // model candidate or a provider diagnostic. History uses the same body.
+    const validationFailure = errorCode === "final_response_validation_failed";
+    const content = validationFailure ? redactSensitiveText(String(message)) : persisted || INTERNAL_TOOL_CONTRACT_ERROR_RE.test(String(message))
       ? formatPersistedStreamErrorMessage(message)
-      : String(message);
+      : (formatByokProviderErrorMessage(message) ?? String(message));
     setMessages((prev) => {
       const updated = [...prev];
       const last = updated[updated.length - 1];
@@ -1510,20 +1782,23 @@ export async function processSSEStream(
           content,
           stream_error: true,
           timestamp: new Date().toISOString(),
+          ...(validationFailure ? { meta: { error: "final_response_validation_failed" } } : {}),
         });
       } else {
         updated[updated.length - 1] = {
           ...last,
           content,
           stream_error: true,
-          assistant_blocks: undefined,
+          assistant_blocks: markAssistantProcessBlocksFailed(last.assistant_blocks, content),
+          ...(validationFailure ? { meta: { ...last.meta, error: "final_response_validation_failed" } } : {}),
         };
       }
       return updated;
     });
   };
 
-  while (true) {
+  try {
+    while (true) {
     if (signal?.aborted) break;
     const { done, value } = await reader.read();
     if (done) break;
@@ -1552,7 +1827,14 @@ export async function processSSEStream(
           continue;
         }
 
+        // No new text/tool events may reopen a terminal turn. Already accepted
+        // text keeps painting while terminal metadata in this chunk is read.
+        if ((result.error || result.streamEnded) && !["error", "stream_end", "runtime_status", "runtime_cancelled"].includes(currentEvent)) {
+          continue;
+        }
+
         if (currentEvent === "error") {
+          if (Array.isArray(parsed.assistant_blocks)) applyAssistantBlocks(parsed.assistant_blocks);
           const message = parsed.message || parsed.error || "Chat stream failed";
           const persisted = typeof parsed.persisted === "boolean"
             ? parsed.persisted
@@ -1562,7 +1844,11 @@ export async function processSSEStream(
             persisted,
             messageId: parsed.message_id,
           };
-          applyStreamErrorMessage(message, persisted);
+          tagLastAssistantMessage(parsed.message_id);
+          // A run ended outside its loop names why; its localized text is
+          // already public, so it skips the persisted-detail projection.
+          const runtimeFailure = runtimeTerminalFailureText(parsed.error_code);
+          applyStreamErrorMessage(runtimeFailure ?? message, runtimeFailure ? false : persisted);
           continue;
         }
 
@@ -1575,7 +1861,8 @@ export async function processSSEStream(
         }
 
         if (Array.isArray(parsed.assistant_blocks)) {
-          applyAssistantBlocks(parsed.assistant_blocks);
+          applyAssistantBlocks(parsed.assistant_blocks, currentEvent === "text_delta"
+            && Boolean(normalizeToolResult(parsed.text_delta ?? parsed.token ?? parsed.content)));
         }
 
         if (
@@ -1614,30 +1901,68 @@ export async function processSSEStream(
                   ? "cancelled"
                   : result.runtimeStatus || "queued"),
           );
+          const humanInput =
+            status === "waiting_resource"
+              ? runtimeHumanInputFromPayload(parsed.human_input)
+              : undefined;
           result.runtimeRunId = runId;
           result.runtimeStatus = status;
+          runtimeStatusReason = typeof parsed.status_reason === "string" ? parsed.status_reason : undefined;
           result.runtimeQueue = status === "waiting_resource" ? queue : undefined;
+          result.runtimeHumanInput = humanInput;
           result.pollAfterSeconds = pollAfterSeconds;
           if (currentEventId) result.lastEventId = currentEventId;
           onRuntimeState?.({
             runId,
             status,
             queue: result.runtimeQueue,
+            humanInput,
             pollAfterSeconds,
             lastEventId: currentEventId || result.lastEventId,
           });
           continue;
         }
 
+        if (
+          result.runtimeRunId
+          && ["queued", "waiting_resource"].includes(result.runtimeStatus || "")
+          && !(result.runtimeHumanInput && !result.runtimeHumanInput.answered)
+          && ["stream_start", "tool_start", "tool_end", "text_delta", "summary_start"].includes(currentEvent)
+        ) {
+          // Execution events supersede an earlier resource wait. Replays of a
+          // paused question must retain its authoritative human-input state.
+          result.runtimeStatus = "running";
+          result.runtimeQueue = undefined;
+          result.runtimeHumanInput = undefined;
+          onRuntimeState?.({
+            runId: result.runtimeRunId,
+            status: "running",
+            pollAfterSeconds: result.pollAfterSeconds || 5,
+            lastEventId: currentEventId || result.lastEventId,
+          });
+        }
+
         if (currentEvent === "stream_start") {
           streamMessageId = normalizeEventId(parsed.message_id) || streamMessageId;
+          setMessages((messages) => reconcileUserMessageReceipt(messages, parsed.user_message_id, currentConvId, parsed.client_message_id));
           tagLastAssistantMessage(parsed.message_id);
           continue;
         }
 
         if (currentEvent === "text_reset") {
-          resetBeforeNextText = true;
+          resetBeforeNextText = parsed.clear !== true;
           clearQueuedText();
+          if (parsed.clear === true) {
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== "assistant") return prev;
+              return [...prev.slice(0, -1), {
+                ...last,
+                content: "",
+                assistant_blocks: last.assistant_blocks?.filter((block) => block.type !== "text"),
+              }];
+            });
+          }
           continue;
         }
 
@@ -1696,6 +2021,8 @@ export async function processSSEStream(
             });
           }
           const stopReason = String(parsed.stop_reason || "");
+          if (stopReason === "cancelled") streamCancelled = true;
+          if (stopReason === "hitl_required" || stopReason === "needs_hitl") streamPaused = true;
           if (stopReason === "credit_exhausted") {
             const detail = normalizePlanLimitDetail(
               parsed.limit_detail || parsed.detail,
@@ -1734,7 +2061,7 @@ export async function processSSEStream(
               persisted,
               messageId: parsed.message_id ? String(parsed.message_id) : undefined,
             };
-            applyStreamErrorMessage(parsed.error, persisted);
+            applyStreamErrorMessage(parsed.error, persisted, parsed.error_code);
           } else if (stopReason === "error") {
             result.stopReason = stopReason;
           }
@@ -1835,13 +2162,52 @@ export async function processSSEStream(
         /* skip unparseable */
       }
     }
+    if (result.error?.persisted || result.streamEnded) {
+      // Execution ends now, independently of HTTP EOF. Successful replies
+      // retain their display cadence; cancellation and failures settle now.
+      if (result.error || result.stopReason || streamCancelled || streamPaused || result.persisted === false) flushQueuedTextNow();
+      cancelReader();
+      break;
+    }
+    }
+  } catch (err) {
+    flushQueuedTextNow();
+    throw err;
+  } finally {
+    signal?.removeEventListener("abort", cancelReader);
+    if (signal?.aborted) {
+      clearPendingToolStarts();
+      flushQueuedTextNow();
+    } else {
+      flushPendingToolStarts();
+    }
   }
-  signal?.removeEventListener("abort", cancelReader);
-  if (signal?.aborted) {
-    clearPendingToolStarts();
-    clearQueuedText();
-  } else {
-    flushPendingToolStarts();
+  // A run that ended outside its loop (its Sandbox never started, its ticket
+  // expired) may only report its terminal status. Never leave the bubble on
+  // its last working state with no word that the request failed.
+  if (
+    result.runtimeRunId && result.runtimeStatus === "failed"
+    && !result.error && !result.streamEnded && !signal?.aborted
+  ) {
+    const message = runtimeTerminalFailureText(runtimeStatusReason) ?? localizedRequestFailure();
+    result.error = { message, persisted: false };
+    applyStreamErrorMessage(message, false);
+  }
+  // A scoped terminal event is authoritative even if the replay's latest
+  // runtime_status still describes the earlier input suspension. Never leave
+  // a finished turn parked or route the next message back into its question.
+  if (result.runtimeRunId && (result.streamEnded || result.error?.persisted)) {
+    result.runtimeStatus = streamCancelled || result.runtimeStatus === "cancelled" ? "cancelled"
+      : result.error || result.stopReason || result.persisted === false || result.runtimeStatus === "failed"
+        ? "failed" : "completed";
+    result.runtimeQueue = undefined;
+    result.runtimeHumanInput = undefined;
+    onRuntimeState?.({
+      runId: result.runtimeRunId,
+      status: result.runtimeStatus,
+      pollAfterSeconds: result.pollAfterSeconds || 5,
+      lastEventId: result.lastEventId,
+    });
   }
   await waitForTypewriterIdle();
   return result;

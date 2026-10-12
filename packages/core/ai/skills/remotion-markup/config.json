@@ -1,0 +1,23 @@
+{
+  "id": "remotion-markup",
+  "name": "remotion-markup",
+  "display_name": "Remotion Markup",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Apply Remotion animation and effects practices.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "markup",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["react animation", "spring", "easing", "interpolate", "typography", "charts", "3d", "timing", "effects", "text animation", "animate text"],
+    "examples": ["animate text in remotion composition", "add transitions between remotion scenes", "remotion chart animation timing", "review remotion animation code"]
+  }
+}

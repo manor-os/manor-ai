@@ -16,7 +16,9 @@ app = FastAPI()
 events = []
 received = []
 inputs = 0
-reply = "你好，我能听到你的声音，现在测试中文语音回复。"
+previews = 0
+reply = "完整分析：报告已经生成，共 42 行；APR 为 6.25%，最终以核保为准。"
+presentation = "我查完了：APR 是 6.25%，最终以核保为准；完整报告已经放在聊天里。"
 messages = [{
     "id": "welcome", "conversation_id": "fixture-conversation", "body": "Workspace ready.",
     "message_kind": "text", "author_kind": "agent", "created_at": "2026-08-31T12:00:00Z",
@@ -29,16 +31,19 @@ async def noop():
 
 
 async def transcribe(audio):
-    global inputs
     assert audio.startswith(b"RIFF")
-    inputs += 1
-    return "你好" if inputs == 1 else "继续"
+    return "你好" if inputs == 0 else "继续"
 
 
 async def agent(text):
     messages.append({**messages[0], "id": "user", "author_kind": "user", "body": text})
     messages.append({**messages[0], "id": "reply", "body": reply})
     return VoiceAgentOutcome(status="ok", spoken_reply=reply, conversation_id="fixture-conversation")
+
+
+async def present_result(_text, outcome):
+    assert outcome.spoken_reply == reply
+    return presentation
 
 
 async def speak(_, _voice):
@@ -55,6 +60,11 @@ class Socket:
         return raw
 
     async def send_json(self, event):
+        global inputs, previews
+        if event["type"] == "transcript" and event.get("role") == "user":
+            inputs += 1
+        elif event["type"] == "transcript_preview":
+            previews += 1
         events.append(event["type"])
         await self.ws.send_json(event)
 
@@ -70,13 +80,19 @@ async def live(ws: WebSocket):
     assert start["conversation_id"] == "fixture-conversation"
     await GatewayVoiceSession(
         Socket(ws), conversation_id="fixture-conversation", check_access=noop,
-        prepare=noop, transcribe=transcribe, agent=agent, speak=speak,
+        prepare=noop, transcribe=transcribe,
+        agent=agent, render_result=present_result, speak=speak,
     ).run()
 
 
 @app.get("/api/v1/voice-test-observations")
 async def observations():
-    return {"events": events, "received": received, "inputs": inputs}
+    return {
+        "events": events,
+        "received": received,
+        "inputs": inputs,
+        "previews": previews,
+    }
 
 
 @app.get("/api/v1/{path:path}")

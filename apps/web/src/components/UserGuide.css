@@ -1,0 +1,76 @@
+.user-guide-choices {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 3px;
+}
+
+.user-guide-preview {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: hidden;
+  border-radius: var(--radius-control);
+}
+
+.guide-preview-canvas { fill: var(--surface-app); }
+.guide-preview-sidebar { fill: var(--surface-sunken); }
+.guide-preview-control { fill: var(--border-subtle); }
+.guide-preview-line { fill: var(--text-faint); opacity: 0.45; }
+.guide-preview-ink { fill: var(--text-muted); }
+.guide-preview-person { fill: var(--text-muted); }
+.guide-preview-person-stroke { fill: none; stroke: var(--text-muted); stroke-width: 1.5; stroke-linecap: round; }
+.guide-preview-divider { fill: none; stroke: var(--border-default); stroke-width: 0.7; }
+.guide-preview-icon { fill: none; stroke: var(--text-muted); stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+.guide-preview-heading { fill: var(--text-strong); font-size: 10px; font-weight: 600; }
+.guide-preview-label { fill: var(--text-muted); font-size: 8px; }
+.guide-preview-result-surface { fill: var(--surface-sunken); }
+
+/* Each preview plays once on entry or selection, then rests on the full UI. */
+.guide-preview-agent,
+.guide-preview-message,
+.guide-preview-reply,
+.guide-preview-result,
+.guide-preview-tabs,
+.guide-preview-trace {
+  animation: guide-preview-reveal 600ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.guide-preview-agent-0 { animation-delay: 100ms; }
+.guide-preview-agent-1 { animation-delay: 220ms; }
+.guide-preview-agent-2 { animation-delay: 340ms; }
+.guide-preview-message { animation-delay: 450ms; }
+.guide-preview-reply { animation-delay: 950ms; }
+.guide-preview-result { animation-delay: 1450ms; }
+.guide-preview-tabs { animation-delay: 200ms; }
+.guide-preview-trace-0 { animation-delay: 1350ms; }
+.guide-preview-trace-1 { animation-delay: 1550ms; }
+.guide-preview-trace-2 { animation-delay: 1750ms; }
+
+.guide-preview-process {
+  animation: guide-preview-reveal 500ms 1050ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.guide-preview-reply-professional { animation-delay: 2050ms; }
+.guide-preview-reply-professional .guide-preview-result { animation-delay: 2250ms; }
+
+@keyframes guide-preview-reveal {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 600px) {
+  .user-guide-choices { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .user-guide-preview { max-height: 140px; }
+  .user-guide-dialog .manor-dialog-body { padding-bottom: 8px; }
+  .user-guide-dialog .manor-dialog-footer { padding-top: 12px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .user-guide-choices *,
+  .user-guide-choices *::before,
+  .user-guide-choices *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+}

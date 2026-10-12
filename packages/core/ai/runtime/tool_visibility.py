@@ -4,15 +4,21 @@ from collections.abc import Callable, Iterable
 import copy
 from dataclasses import dataclass
 from enum import StrEnum
+import json
 
-from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
+from packages.core.ai.runtime.capabilities import (
+    AGENT_INITIATIVE_TOOL_NAMES,
+    CORE_CAPABILITIES,
+)
 from packages.core.ai.runtime.profiles import WORKSPACE_AGENT_TOOL_PROFILE
-from packages.core.constants.agent_capabilities import AGENT_EAGER_BOUND_TOOL_LIMIT
+from packages.core.constants.agent_capabilities import (
+    AGENT_EAGER_BOUND_TOOL_LIMIT,
+    AGENT_EAGER_BOUND_TOOL_SCHEMA_CHAR_BUDGET,
+)
 
 LOW_LEVEL_FILE_GENERATION_TOOLS = frozenset({
     "generate_image",
     "generate_video",
-    "generate_document_file",
 })
 
 # A Workspace that installs a queryable Ledger gets the generic query surface
@@ -26,6 +32,42 @@ WORKSPACE_LEDGER_READ_TOOLS = frozenset({
 })
 WORKSPACE_LEDGER_QUERY_TOOL = "query_ledger"
 WORKSPACE_LEDGER_VISUALIZATION_TOOL = "visualize_workspace_ledgers"
+
+# Execution-only compatibility names retained for persisted Tasks, Workflows,
+# and Agent bindings. Workspace masters use the composite gateways instead;
+# explicitly-bound non-master agents can still resume older definitions.
+COMPOSITE_COMPATIBILITY_TOOL_ALIASES = frozenset({
+    "sandbox_create",
+    "sandbox_exec",
+    "sandbox_status",
+    "sandbox_respond",
+    "sandbox_cancel",
+    "sandbox_read_file",
+    "sandbox_write_file",
+    "sandbox_save_result",
+    "sandbox_destroy",
+    "workspace_agent",
+    "workspace_update_task_runtime",
+    "workspace_list_knowledge",
+    "workspace_create_knowledge_folder",
+    "workspace_add_knowledge_documents",
+    "workspace_remove_knowledge_document",
+    "workspace_update_knowledge_policy",
+    "workspace_operation",
+    "workspace_resolve_hitl",
+    "answer_task_blocker",
+    "workspace_add_rule",
+    "workspace_request_strategist_review",
+    WORKSPACE_LEDGER_VISUALIZATION_TOOL,
+})
+MASTER_SHADOWED_WORKSPACE_TOOLS = frozenset({
+    "workspace_search",
+    "workspace_create_task",
+})
+
+# Temporarily hide from LLM discovery and eager load. The tools stay registered
+# and executable for Workflow steps and explicit runtime execution.
+HIDDEN_RUNTIME_TOOLS = frozenset({"rag"})
 
 
 def _is_workspace_ledger_tool(name: str) -> bool:
@@ -54,8 +96,16 @@ def runtime_expand_workspace_ledger_tools(
     return expanded
 
 _AGENT_EAGER_CAPABILITY_TOOLS = {
-    "runtime.discovery": ("search_tools",),
+    # call_tool reaches what search_tools loads without changing the tool list.
+    "runtime.discovery": ("search_tools", "call_tool"),
+    # Every surface can stop and ask the user; the durable loop resumes on the
+    # answer, other loops end the turn on the question.
+    "human.input": ("request_input",),
+}
+
+_AGENT_DEFERRED_CAPABILITY_TOOLS = {
     "response.render": ("render_response_surface",),
+    "initiative.manage": AGENT_INITIATIVE_TOOL_NAMES,
 }
 
 _MASTER_EAGER_CAPABILITY_TOOLS = {
@@ -64,24 +114,16 @@ _MASTER_EAGER_CAPABILITY_TOOLS = {
     "skill.invoke": ("invoke_skill",),
     "workspace.search": ("rag",),
     "file.read": ("read_file", "list_files", "glob_files", "grep_files"),
-    "file.write": ("write_file", "edit_file", "patch_file", "generate_file"),
-    "sandbox.execute": (
-        "sandbox_create",
-        "sandbox_exec",
-        "sandbox_read_file",
-        "sandbox_write_file",
-        "sandbox_save_result",
-        "sandbox_destroy",
-        "video_edit",
-        "coding_based_video",
-    ),
+    "file.write": ("generate_file", "patch_file", "replace_file"),
+    "sandbox.execute": ("sandbox",),
     "manor.composite": ("manor",),
     "cli.execute": ("bash",),
 }
 
 _WORKSPACE_AGENT_EAGER_CAPABILITY_TOOLS = {
     **_AGENT_EAGER_CAPABILITY_TOOLS,
-    "workspace.operate": ("workspace_agent", "workspace_operation", "workspace_resolve_hitl", "answer_task_blocker", "workspace_create_task"),
+    # delegate_to_agent names this Workspace's agents; it is dropped when there are none.
+    "workspace.operate": ("workspace_agent", "workspace_operation", "workspace_resolve_hitl", "answer_task_blocker", "workspace_create_task", "delegate_to_agent"),
     "workspace.search": ("workspace_search", "workspace_list_knowledge", "rag"),
     "workspace.task": ("workspace_create_task", "workspace_update_task_runtime", "workspace_agent"),
     "workspace.knowledge": (
@@ -98,19 +140,21 @@ _WORKSPACE_AGENT_EAGER_CAPABILITY_TOOLS = {
 }
 
 _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS = {
-    # Interactive code-lab submissions are explicit user requests to execute
-    # the submitted snippet. Keep Bash deferred (never eager) for service
-    # agents, but make it discoverable so the normal sandbox + approval policy
-    # can run the checks instead of fabricating an "execution" result.
+    "response.render": ("render_response_surface",),
+    # Contextual tools are eligible through an explicit Agent binding or
+    # Workspace Agent deployment binding. Task requirements do not grant
+    # tools, and these are not implicit for every Workspace Agent.
     "cli.execute": ("bash",),
     "manor.composite": ("manor",),
-    "file.write": ("generate_file", "patch_file"),
+    "file.write": ("generate_file", "patch_file", "replace_file"),
     "skill.invoke": ("invoke_skill",),
     "web.safe_search": ("web_search", "web_fetch", "browse_web"),
     "file.read": ("read_file", "list_files", "glob_files", "grep_files"),
     "automation.manage": (
+        "query_entity_agents",
         "create_scheduled_job",
         "list_scheduled_jobs",
+        "query_scheduled_jobs",
         "cancel_scheduled_job",
         "toggle_scheduled_job",
         "run_scheduled_job_now",
@@ -150,11 +194,18 @@ ALWAYS_LOADED = frozenset(
     for tool_name in tool_names
 )
 
+AGENT_DEFAULT_DEFERRED_TOOLS = frozenset(
+    tool_name
+    for tool_names in _AGENT_DEFERRED_CAPABILITY_TOOLS.values()
+    for tool_name in tool_names
+)
+
 def _flatten_capability_tool_subset(capability_tool_names: dict[str, tuple[str, ...]]) -> frozenset[str]:
     return frozenset(
         tool_name
         for tool_names in capability_tool_names.values()
         for tool_name in tool_names
+        if tool_name not in HIDDEN_RUNTIME_TOOLS
     )
 
 
@@ -185,6 +236,7 @@ def _validate_capability_tool_subset(capability_tool_names: dict[str, tuple[str,
 
 
 _validate_capability_tool_subset(_AGENT_EAGER_CAPABILITY_TOOLS)
+_validate_capability_tool_subset(_AGENT_DEFERRED_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_MASTER_EAGER_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_WORKSPACE_AGENT_EAGER_CAPABILITY_TOOLS)
 _validate_capability_tool_subset(_WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS)
@@ -195,6 +247,14 @@ WORKSPACE_AGENT_ALWAYS_LOADED = _flatten_capability_tool_subset(_WORKSPACE_AGENT
 WORKSPACE_AGENT_CONTEXTUAL_TOOLS = _flatten_capability_tool_subset(
     _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS
 )
+
+# Bound, already-authorized tools whose schemas are small enough to keep in the
+# first LLM round even when a wide Agent uses progressive loading. This is a
+# visibility contract, not a new grant: unbound agents still do not see them.
+_BOUND_EAGER_WHEN_AUTHORIZED_TOOLS = frozenset({
+    "invoke_skill",
+    *_WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS["file.read"],
+})
 
 
 @dataclass(frozen=True)
@@ -224,6 +284,7 @@ class RuntimeAgentBoundToolLoadingMode(StrEnum):
 class RuntimeAgentBoundToolLoadingPolicy:
     mode: RuntimeAgentBoundToolLoadingMode
     bound_first_party_count: int
+    bound_first_party_schema_chars: int | None = None
 
 
 class RuntimeAgentBoundToolLoadingPolicyFactory:
@@ -234,6 +295,7 @@ class RuntimeAgentBoundToolLoadingPolicyFactory:
         *,
         bound_tool_names: Iterable[str] | None,
         is_master: bool,
+        bound_first_party_schema_chars: int | None = None,
     ) -> RuntimeAgentBoundToolLoadingPolicy:
         bound_first_party_count = len({
             str(name).strip()
@@ -245,13 +307,21 @@ class RuntimeAgentBoundToolLoadingPolicyFactory:
             RuntimeAgentBoundToolLoadingMode.PROGRESSIVE
             if (
                 not is_master
-                and bound_first_party_count > AGENT_EAGER_BOUND_TOOL_LIMIT
+                and (
+                    bound_first_party_count > AGENT_EAGER_BOUND_TOOL_LIMIT
+                    or (
+                        bound_first_party_schema_chars is not None
+                        and bound_first_party_schema_chars
+                        > AGENT_EAGER_BOUND_TOOL_SCHEMA_CHAR_BUDGET
+                    )
+                )
             )
             else RuntimeAgentBoundToolLoadingMode.EAGER
         )
         return RuntimeAgentBoundToolLoadingPolicy(
             mode=mode,
             bound_first_party_count=bound_first_party_count,
+            bound_first_party_schema_chars=bound_first_party_schema_chars,
         )
 
 
@@ -273,15 +343,29 @@ def runtime_tool_surface_spec(
 ) -> RuntimeToolSurfaceSpec:
     if is_workspace_agent_tool_profile(tool_profile):
         if is_master:
+            # Manor AI keeps the complete ordinary owner-chat baseline inside
+            # a Workspace. Workspace capabilities are an additive overlay;
+            # they must never replace or narrow the master Agent's normal
+            # first-party, Skill, file, web, Sandbox, or integration surface.
+            ordinary_manor_chat = runtime_tool_surface_spec(is_master=True)
             return RuntimeToolSurfaceSpec(
                 name=WORKSPACE_AGENT_TOOL_PROFILE,
-                eager_tool_names=MASTER_ALWAYS_LOADED | WORKSPACE_AGENT_ALWAYS_LOADED,
-                contextual_tool_names=WORKSPACE_AGENT_CONTEXTUAL_TOOLS,
+                eager_tool_names=(
+                    ordinary_manor_chat.eager_tool_names
+                    | WORKSPACE_AGENT_ALWAYS_LOADED
+                ) - COMPOSITE_COMPATIBILITY_TOOL_ALIASES - MASTER_SHADOWED_WORKSPACE_TOOLS,
+                contextual_tool_names=(
+                    ordinary_manor_chat.contextual_tool_names
+                    | WORKSPACE_AGENT_CONTEXTUAL_TOOLS
+                ),
                 capability_ids=_ordered_unique(
-                    _MASTER_EAGER_CAPABILITY_TOOLS.keys(),
+                    ordinary_manor_chat.capability_ids,
                     _WORKSPACE_AGENT_EAGER_CAPABILITY_TOOLS.keys(),
                 ),
-                contextual_capability_ids=tuple(_WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS.keys()),
+                contextual_capability_ids=_ordered_unique(
+                    ordinary_manor_chat.contextual_capability_ids,
+                    _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS.keys(),
+                ),
             )
         return RuntimeToolSurfaceSpec(
             name=WORKSPACE_AGENT_TOOL_PROFILE,
@@ -295,11 +379,15 @@ def runtime_tool_surface_spec(
             name="master",
             eager_tool_names=MASTER_ALWAYS_LOADED,
             capability_ids=tuple(_MASTER_EAGER_CAPABILITY_TOOLS.keys()),
+            contextual_tool_names=AGENT_DEFAULT_DEFERRED_TOOLS,
+            contextual_capability_ids=tuple(_AGENT_DEFERRED_CAPABILITY_TOOLS.keys()),
         )
     return RuntimeToolSurfaceSpec(
         name="agent",
         eager_tool_names=ALWAYS_LOADED,
         capability_ids=tuple(_AGENT_EAGER_CAPABILITY_TOOLS.keys()),
+        contextual_tool_names=AGENT_DEFAULT_DEFERRED_TOOLS,
+        contextual_capability_ids=tuple(_AGENT_DEFERRED_CAPABILITY_TOOLS.keys()),
     )
 
 
@@ -354,10 +442,13 @@ def runtime_workspace_capability_tool_groups() -> dict[str, tuple[dict[str, str]
         is_master=True,
         tool_profile=WORKSPACE_AGENT_TOOL_PROFILE,
     )
+    shadowed = COMPOSITE_COMPATIBILITY_TOOL_ALIASES | MASTER_SHADOWED_WORKSPACE_TOOLS
     return {
         "always": tuple(
             _workspace_runtime_tool_descriptor(name, scope="always")
-            for name in sorted(surface.eager_tool_names - {"search_tools"})
+            for name in sorted(
+                surface.eager_tool_names - {"search_tools", "call_tool"} - shadowed
+            )
         ),
         "contextual": tuple(
             _workspace_runtime_tool_descriptor(name, scope="contextual")
@@ -404,6 +495,17 @@ def runtime_search_always_loaded_tool_names() -> frozenset[str]:
     return ALWAYS_LOADED
 
 
+def runtime_tool_is_catalog_bindable(name: str) -> bool:
+    """Whether a registered tool can be bound to an Agent as ``tool:<name>``.
+
+    MCP actions are bound per provider and ``ws_*`` tools come with a
+    Workspace; neither is a bindable catalog tool.
+    """
+
+    name = str(name or "").strip()
+    return bool(name) and not name.startswith(("mcp__", "ws_"))
+
+
 def runtime_shadowed_file_generation_tool(
     name: str,
     *,
@@ -429,7 +531,11 @@ def runtime_tool_visible_for_profile(
     eager_tool_names: set[str] | frozenset[str] | None = None,
 ) -> bool:
     bound_tool_names = runtime_expand_workspace_ledger_tools(bound_tool_names)
+    if name in HIDDEN_RUNTIME_TOOLS:
+        return False
     workspace_profile = is_workspace_agent_tool_profile(tool_profile)
+    if workspace_profile and name in AGENT_INITIATIVE_TOOL_NAMES:
+        return False
     effective_master = is_master
     eager = set(
         eager_tool_names
@@ -447,14 +553,38 @@ def runtime_tool_visible_for_profile(
             return effective_master
         return name in mcp_allowed_names
 
+    if name in COMPOSITE_COMPATIBILITY_TOOL_ALIASES:
+        if effective_master:
+            return False
+        if workspace_profile and name in eager:
+            return True
+        return bound_tool_names is not None and name in bound_tool_names
+
+    # These two narrow tools stay discoverable for external customer surfaces,
+    # but an internal master has the equivalent governed manor workspace path.
+    if effective_master and name in MASTER_SHADOWED_WORKSPACE_TOOLS:
+        return False
+
+    # Baseline presentation tools stay in every internal Agent's searchable
+    # scope, but their large schemas are loaded only after search_tools selects
+    # them for the active turn.
+    if name in AGENT_DEFAULT_DEFERRED_TOOLS:
+        return True
+
     if workspace_profile:
         if effective_master:
-            return True
+            # A Task Host carries an explicit run-local binding set. Its
+            # master identity supplies only the server-owned baseline, not
+            # every registered first-party tool (including service tools).
+            # Legacy unscoped master chats still use ``None``.
+            return (
+                bound_tool_names is None
+                or name in eager
+                or name in bound_tool_names
+            )
         if name in eager:
             return True
-        if bound_tool_names is not None and name in bound_tool_names:
-            return True
-        return name in WORKSPACE_AGENT_CONTEXTUAL_TOOLS
+        return bound_tool_names is not None and name in bound_tool_names
 
     if not effective_master and bound_tool_names is not None:
         if name not in eager and name not in bound_tool_names:
@@ -469,6 +599,7 @@ def resolve_runtime_tool_surface(
     is_master: bool,
     mcp_allowed_names: set[str] | None,
     tool_profile: str | None = None,
+    bound_first_party_schema_chars: int | None = None,
 ) -> RuntimeResolvedToolSurface:
     bound_tool_names = runtime_expand_workspace_ledger_tools(bound_tool_names)
     registered = tuple(name for name in registered_tool_names if name)
@@ -480,6 +611,7 @@ def resolve_runtime_tool_surface(
     loading_policy = RuntimeAgentBoundToolLoadingPolicyFactory.create(
         bound_tool_names=bound_tool_names,
         is_master=is_master,
+        bound_first_party_schema_chars=bound_first_party_schema_chars,
     )
     # Explicit first-party Agent bindings are an execution contract, not a
     # discovery hint. Put a narrow Agent's schemas in the first round so a
@@ -488,14 +620,16 @@ def resolve_runtime_tool_surface(
     # existing search_tools path instead of overflowing the prompt.
     # MCP bindings remain deferred because their catalogs can be large and
     # are intentionally loaded through scoped discovery.
-    if (
-        bound_tool_names is not None
-        and loading_policy.mode is RuntimeAgentBoundToolLoadingMode.EAGER
-    ):
+    if bound_tool_names is not None:
         eager.update(
             name
             for name in bound_tool_names
-            if name in registered and not name.startswith("mcp__")
+            if name in registered
+            and not name.startswith("mcp__")
+            and (
+                loading_policy.mode is RuntimeAgentBoundToolLoadingMode.EAGER
+                or name in _BOUND_EAGER_WHEN_AUTHORIZED_TOOLS
+            )
         )
     available = set(registered)
     visible: list[str] = []
@@ -567,12 +701,27 @@ def runtime_tool_registry_surface_from_schemas(
         for name, schema in tool_schemas
         if str(name or "").strip()
     }
+    bound_first_party_schema_chars = None
+    if bound_tool_names is not None:
+        bound_first_party_schema_chars = sum(
+            len(
+                json.dumps(
+                    schema,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            )
+            for name, schema in schema_map.items()
+            if name in bound_tool_names and not name.startswith("mcp__")
+        )
     resolved_surface = resolve_runtime_tool_surface(
         schema_map.keys(),
         bound_tool_names=bound_tool_names,
         is_master=is_master,
         mcp_allowed_names=mcp_allowed_names,
         tool_profile=tool_profile,
+        bound_first_party_schema_chars=bound_first_party_schema_chars,
     )
     prompt_schemas, deferred_names = runtime_tool_schemas_for_resolved_surface(
         resolved_surface,

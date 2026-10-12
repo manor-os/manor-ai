@@ -1,11 +1,10 @@
 TAG ?= prod
 PYTHON ?= $(shell if [ -x .venv/bin/python ]; then printf '%s' .venv/bin/python; else printf '%s' python3; fi)
-PYTEST_DEFAULT_MARKERS ?= not e2e and not manual and not slow and not network and not docker and not cloud
-PYTEST_SMOKE_MARKERS ?= oss_smoke
-PYTEST_REGRESSION_MARKERS ?= not manual and not network and not docker and not cloud
+UV ?= uv
+PYTHON_TEST_RUNNER ?= $(UV) run --locked --extra dev --python 3.12 python scripts/run_python_tests.py
 PYTEST_ENV = TEST_DATABASE_URL="postgresql+asyncpg://manor:manor_secret@localhost:5434/manor_test" MANOR_FS_ENABLED=false PYTHONPATH=.:tests
 
-.PHONY: dev test test-smoke test-regression test-manual test-e2e test-all test-ws test-embedding lint build clean docker-up
+.PHONY: dev test-setup test test-smoke test-regression test-manual test-e2e test-all test-ws test-embedding lint build clean docker-up
 
 # Development
 dev-api:
@@ -18,14 +17,18 @@ dev-infra:
 	docker compose up -d postgres redis minio
 
 # Testing
+test-setup:
+	$(UV) lock --check
+	$(UV) sync --locked --extra dev --python 3.12
+
 test:
-	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_DEFAULT_MARKERS)" -q --tb=short -p no:warnings
+	$(PYTEST_ENV) $(PYTHON_TEST_RUNNER) default
 
 test-smoke:
-	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_SMOKE_MARKERS)" -q --tb=short -p no:warnings
+	$(PYTEST_ENV) $(PYTHON_TEST_RUNNER) smoke
 
 test-regression:
-	$(PYTEST_ENV) $(PYTHON) -m pytest tests/ -m "$(PYTEST_REGRESSION_MARKERS)" -q --tb=short -p no:warnings
+	$(PYTEST_ENV) $(PYTHON_TEST_RUNNER) regression
 
 
 test-manual:

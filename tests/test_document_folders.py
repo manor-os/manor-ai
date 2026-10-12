@@ -64,7 +64,8 @@ async def test_concurrent_fs_path_upserts_resolve_to_one_document(client: AsyncC
 
 
 @pytest.mark.asyncio
-async def test_fs_path_upsert_does_not_transfer_existing_document_ownership(monkeypatch):
+@pytest.mark.parametrize("existing_owner", ["alice", None])
+async def test_fs_path_upsert_preserves_existing_document_policy(monkeypatch, existing_owner):
     from types import SimpleNamespace
 
     from packages.core.services import document_service
@@ -79,11 +80,11 @@ async def test_fs_path_upsert_does_not_transfer_existing_document_ownership(monk
         file_type="md",
         mime_type="text/markdown",
         source="upload",
-        created_by="alice",
-        owner_id="alice",
-        folder_id=None,
-        visibility="private",
-        classification="internal",
+        created_by=existing_owner,
+        owner_id=existing_owner,
+        folder_id="folder-alice",
+        visibility="entity",
+        classification="confidential",
         client_visible=True,
         is_trashed=False,
         trashed_at=None,
@@ -117,9 +118,18 @@ async def test_fs_path_upsert_does_not_transfer_existing_document_ownership(monk
         source="filesystem",
         created_by="bob",
         owner_id="bob",
+        folder_id="folder-bob",
+        visibility="private",
+        classification="internal",
+        client_visible=False,
     )
 
-    assert updated.owner_id == "alice"
+    assert updated.owner_id == existing_owner
+    assert updated.created_by == existing_owner
+    assert updated.folder_id == "folder-alice"
+    assert updated.visibility == "entity"
+    assert updated.classification == "confidential"
+    assert updated.client_visible is True
     assert updated.file_size == 12
 
 
@@ -249,6 +259,61 @@ async def test_storage_usage_includes_nested_subfolders(client: AsyncClient):
     ).json()
     assert leaf["total_files"] == 1
     assert leaf["total_size"] == 250
+
+
+@pytest.mark.asyncio
+async def test_browse_page_filters_before_pagination_and_keeps_private_files_private(client: AsyncClient):
+    import asyncio
+
+    import packages.core.database as db_module
+    from packages.core.services.document_service import create_document
+    from tests.test_document_permissions import _create_entity_user
+
+    headers, entity_id = await _auth(client, "folder_page_owner")
+    owner = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    created = await client.post(
+        "/api/v1/documents/folders", headers=headers, json={"name": "Paged"},
+    )
+    assert created.status_code == 201, created.text
+    folder_id = created.json()["id"]
+
+    names = ("alpha.md", "bravo.md", "charlie.pdf", "delta.md", "echo.pdf")
+    async with db_module.async_session() as db:
+        for name in names:
+            await create_document(
+                db, entity_id,
+                name=name,
+                file_type=name.rsplit(".", 1)[-1],
+                source="upload",
+                folder_id=folder_id,
+                owner_id=owner["id"],
+                visibility="private",
+            )
+        await db.commit()
+
+    url = f"/api/v1/documents/browse-page?folder_id={folder_id}&file_type_filter=md&sort_by=name&limit=2"
+    first = await client.get(url, headers=headers)
+    assert first.status_code == 200, first.text
+    assert [doc["name"] for doc in first.json()["items"]] == ["alpha.md", "bravo.md"]
+    assert first.json()["next_cursor"] is not None
+    second = await client.get(f"{url}&cursor={first.json()['next_cursor']}", headers=headers)
+    assert second.status_code == 200, second.text
+    assert [doc["name"] for doc in second.json()["items"]] == ["delta.md"]
+    assert second.json()["next_cursor"] is None
+
+    tree = await client.get("/api/v1/documents/folder-tree?include_counts=false", headers=headers)
+    assert tree.status_code == 200, tree.text
+    assert next(folder for folder in tree.json() if folder["id"] == folder_id)["document_count"] is None
+
+    member = await _create_entity_user(entity_id, "folder_page_member")
+    owner_page, member_page = await asyncio.gather(
+        client.get("/api/v1/documents/browse-page?scope=all", headers=headers),
+        client.get("/api/v1/documents/browse-page?scope=all", headers=member["headers"]),
+    )
+    assert owner_page.status_code == 200, owner_page.text
+    assert member_page.status_code == 200, member_page.text
+    assert set(names).issubset({doc["name"] for doc in owner_page.json()["items"]})
+    assert not set(names).intersection({doc["name"] for doc in member_page.json()["items"]})
 
 
 @pytest.mark.asyncio

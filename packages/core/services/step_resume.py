@@ -40,7 +40,7 @@ async def _workspace_allows_step_transition(
             Workspace.deleted_at.is_(None),
         )
     )
-    return status == "active"
+    return status in {"active", "paused"}
 
 
 async def lock_waiting_step_for_decision(
@@ -178,16 +178,45 @@ def apply_step_resume(
 ) -> None:
     """Mutate a step row to flip from waiting_human back to pending.
     Pure — caller handles DB load, plan reset, and re-enqueue."""
-    if params_update:
+    from packages.core.contracts.step_execution import STEP_EXECUTION_CONTRACT_PARAM
+
+    if isinstance(params_update, dict) and STEP_EXECUTION_CONTRACT_PARAM in params_update:
+        raise ValueError("Step execution contract is server-owned and cannot change during input resume")
+    structured_answer = (
+        isinstance(params_update, dict) and "answers" in params_update
+    )
+    if structured_answer and human_input_response is not None:
+        raise ValueError(
+            "a step resume must use exactly one human-input answer channel"
+        )
+
+    if params_update or structured_answer or human_input_response is not None:
         # Tool wrapper expects values inside step.params; preserve any
         # unrelated existing keys (cookies path, original args, etc.).
         merged = dict(step.params or {})
-        merged.update(params_update)
+        if params_update:
+            merged.update(params_update)
+
+        # ``answers`` (structured cards) and ``human_input_response`` (legacy
+        # free-form cards) are alternative wire formats for one current human
+        # response.  Replace the other channel in the same row mutation so a
+        # later coordinator resume can never combine a prior response with the
+        # newly submitted one.  The response column is projected into params
+        # only when the worker snapshots the step; a stale params copy must not
+        # survive either direction.
+        if structured_answer:
+            merged.pop("human_input_response", None)
+            step.human_input_response = None
+        elif human_input_response is not None:
+            merged.pop("answers", None)
+            merged.pop("human_input_response", None)
         step.params = merged
 
     if human_input_response is not None:
         step.human_input_response = human_input_response
 
+    # ``runtime_checkpoint`` is deliberately kept: it is what lets the next
+    # attempt resume the parked subagent at the answered call.
     step.step_status = ExecutionStepStatus.PENDING.value
     step.human_input_prompt = None
     step.current_lease_id = None
@@ -212,6 +241,8 @@ def apply_step_cancel(
     step.human_input_prompt = None
     step.current_lease_id = None
     step.finished_at = datetime.now(timezone.utc)
+    if hasattr(step, "runtime_checkpoint"):
+        step.runtime_checkpoint = None
 
 
 async def resume_step_for_retry(
@@ -256,6 +287,16 @@ async def resume_step_for_retry(
     if origin is None:
         return None
     step, plan = origin
+    if not await _workspace_allows_step_transition(
+        db, entity_id=entity_id, workspace_id=plan.workspace_id,
+    ):
+        return None
+    from packages.core.services.task_execution_origin import (
+        record_manual_plan_execution,
+        record_manual_task_execution,
+    )
+
+    record_manual_plan_execution(plan, user_id=user_id, action="step_resume")
 
     apply_step_resume(
         step,
@@ -288,17 +329,23 @@ async def resume_step_for_retry(
                 Task.entity_id == entity_id,
             )
         )).scalar_one_or_none()
+        if task is not None:
+            record_manual_task_execution(task, user_id=user_id, action="step_resume")
         if task and task.status == TaskStatus.WAITING_ON_CUSTOMER:
             await apply_task_status_transition(
                 task, "in_progress", db=db, actor_kind="user", actor_id=user_id,
             )
 
-    if enqueue:
-        try:
-            from packages.core.tasks.ai_tasks import run_plan
-            run_plan.delay(target_plan_id)
-        except Exception:
-            pass  # best-effort — next heartbeat will pick it up
+    # ``enqueue=False`` historically meant "the caller will send the
+    # post-commit broker hint". It must not suppress the transactional
+    # recovery surface: the caller can crash after commit and before that hint.
+    from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+    await stage_plan_cycle_wake(
+        db,
+        target_plan_id,
+        reason="human_step_resumed",
+    )
     return target_plan_id
 
 
@@ -340,6 +387,19 @@ async def cancel_step(
     if origin is None:
         return None
     step, _plan = origin
+    if not await _workspace_allows_step_transition(
+        db, entity_id=entity_id, workspace_id=_plan.workspace_id,
+    ):
+        return None
+
+    # The paused lease (needs_human) or a still-active one must not outlive
+    # the step: revoke first so a worker that resumes cannot report through
+    # it onto the cancelled step.
+    from packages.core.dispatcher.service import Dispatcher
+
+    await Dispatcher().revoke_active_leases(
+        db, step_ids=[step.id], reason=reason,
+    )
 
     apply_step_cancel(
         step,
@@ -352,10 +412,11 @@ async def cancel_step(
 
     # Re-enqueue the executor so it sees the failed step and decides
     # whether to replan or terminate the plan.
-    if enqueue:
-        try:
-            from packages.core.tasks.ai_tasks import run_plan
-            run_plan.delay(target_plan_id)
-        except Exception:
-            pass
+    from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+    await stage_plan_cycle_wake(
+        db,
+        target_plan_id,
+        reason="human_step_cancelled",
+    )
     return target_plan_id

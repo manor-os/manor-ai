@@ -7,4 +7,5 @@ export interface ChatMessageActionTextSource {
 export function chatMessageActionText(
   message: ChatMessageActionTextSource,
   visibleContent?: unknown,
+  streaming?: boolean,
 ): string;

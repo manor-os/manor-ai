@@ -6,11 +6,12 @@ from typing import Any, Literal
 
 
 REQUIRED_BEFORE_ANSWER = "required_before_answer"
+REQUIRED_BEFORE_TOOLS = "required_before_tools"
 PRIMARY_SOURCE = "primary_source"
 _MAX_SEMANTIC_TRIGGER_CHARS = 600
 _POLICY_FIELDS = frozenset({"mode", "semantic_trigger", "result_authority"})
 
-InvocationMode = Literal["required_before_answer"]
+InvocationMode = Literal["required_before_answer", "required_before_tools"]
 ResultAuthority = Literal["primary_source"]
 
 
@@ -33,9 +34,10 @@ class SkillInvocationPolicy:
             raise ValueError(f"invocation_policy has unknown fields: {names}")
 
         mode = raw.get("mode")
-        if mode != REQUIRED_BEFORE_ANSWER:
+        if mode not in (REQUIRED_BEFORE_ANSWER, REQUIRED_BEFORE_TOOLS):
             raise ValueError(
-                f"invocation_policy.mode must be {REQUIRED_BEFORE_ANSWER!r}"
+                f"invocation_policy.mode must be {REQUIRED_BEFORE_ANSWER!r} "
+                f"or {REQUIRED_BEFORE_TOOLS!r}"
             )
 
         semantic_trigger_raw = raw.get("semantic_trigger")
@@ -137,10 +139,21 @@ def render_skill_invocation_policy(
     """Render a validated policy without embedding product-specific logic."""
 
     trigger = policy.semantic_trigger.rstrip(". ")
+    timing = (
+        "as your first tool call, before any other tool discovery or execution"
+        if policy.mode == REQUIRED_BEFORE_TOOLS
+        else "before answering"
+    )
     return (
         f'- When {trigger}, you must call `invoke_skill(skill_id="{skill_id}", '
-        "input=<current user request>)` before answering. Determine whether the "
-        "policy applies from semantic meaning, not literal keyword matching. "
+        f"input=<current user request>)` {timing}. Pass the user's original "
+        "wording and language to the Skill, and answer in that language unless the "
+        "user requests another. Determine whether the policy applies from semantic "
+        "meaning, not literal keyword matching. "
         "Treat the Skill result and its references as the primary source of "
-        "truth; do not answer from memory when the Skill is available."
+        "truth; do not answer from memory when the Skill is available. If the "
+        "Skill returns an artifact link, copy its complete Markdown link exactly "
+        "instead of reconstructing or shortening its identifier. One completed "
+        "invocation satisfies this rule for the turn; invoke it again only when "
+        "its result calls for continuation of the user's requested work."
     )

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import set_committed_value
 
 from packages.core.database import get_db
+from packages.core.database_runtime import release_read_transaction
 from packages.core.models.user import User
 from packages.core.permissions import (
     Permission,
@@ -157,6 +158,10 @@ async def get_current_user(
                 f"Your organization has been suspended. {reason}".strip(),
             )
 
+    # Authentication is a read snapshot, not a transaction for the subsequent
+    # upload, external lookup or Agent run. Support-session bookkeeping and
+    # other writes deliberately remain on their original commit/rollback path.
+    await release_read_transaction(db)
     return user
 
 
@@ -168,6 +173,7 @@ def require_role(*roles: str):
     ) -> User:
         if await effective_user_role_name(db, user) not in roles:
             raise HTTPException(status.HTTP_403_FORBIDDEN, f"Requires role: {', '.join(roles)}")
+        await release_read_transaction(db)
         return user
     return check
 
@@ -292,6 +298,7 @@ def require_permission(permission: Permission):
             user.role,
             permission,
         )
+        await release_read_transaction(db)
         return user
     return _check
 
@@ -321,7 +328,9 @@ async def get_current_worker(
         pause instruction)
       * Optional IP allowlist (``worker.allowed_ips``) honoured
     """
-    from packages.core.workers import get_worker, verify_worker_secret
+    from packages.core.workers.authentication import (
+        WorkerAuthenticationBusy, authenticate_worker_secret,
+    )
 
     if not credentials:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Worker bearer secret required")
@@ -333,11 +342,15 @@ async def get_current_worker(
             "Manor-Worker-Id header required",
         )
 
-    worker = await get_worker(db, worker_id)
+    try:
+        worker = await authenticate_worker_secret(db, worker_id, credentials.credentials)
+    except WorkerAuthenticationBusy as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            {"code": "worker_auth_busy", "message": "Worker authentication is busy; retry shortly"},
+            headers={"Retry-After": "2"},
+        ) from exc
     if worker is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Worker not found")
-
-    if not verify_worker_secret(worker, credentials.credentials):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid worker secret")
 
     protocol_version = request.headers.get(WORKER_PROTOCOL_HEADER)
@@ -367,6 +380,7 @@ async def get_current_worker(
                 f"Source IP {client_ip!r} not in worker allowlist",
             )
 
+    await release_read_transaction(db)
     return worker
 
 

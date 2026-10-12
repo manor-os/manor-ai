@@ -105,6 +105,11 @@ class WorkspaceBlueprint(Base):
     )
     # Revocable link-sharing token (None = sharing off).
     share_token: Mapped[Optional[str]] = mapped_column(String(64))
+    # Empty keeps existing link-sharing behavior; a non-empty list limits
+    # private link access to accounts with these verified email addresses.
+    share_allowed_emails: Mapped[list] = mapped_column(
+        JSONB, nullable=False, server_default="[]",
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
@@ -113,6 +118,7 @@ class WorkspaceBlueprint(Base):
         DateTime(timezone=True), onupdate=func.now(),
     )
     published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
 
 
 class BlueprintFavorite(Base):

@@ -38,10 +38,14 @@ from packages.core.ai.runtime import (
 )
 from packages.core.constants.document_groups import WorkspaceDocumentGroupKind
 from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
-from packages.core.models.workspace import Workspace
+from packages.core.services.file_refs import parse_file_reference
+from packages.core.services.generated_file_refs import entity_fs_open_url
+from packages.core.models.permission import Capability, ResourceGrant, ResourceType, Share, Visibility
+from packages.core.models.workspace import Workspace, WorkspaceStaff
 from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.text_extraction import extract_text
 from packages.core.services.tool_cache_version import bump_tool_cache_version
+from packages.core.services.image_formats import heif_mime_from_header, register_heif_decoder
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,9 @@ def _detect_image_mime(data: bytes, declared: str) -> str:
 
     Falls back to ``declared`` if the format cannot be determined.
     """
+    heif_mime = heif_mime_from_header(data[:256])
+    if heif_mime:
+        return heif_mime
     for sig, mime in _IMAGE_SIGNATURES:
         if data[:len(sig)] == sig:
             # RIFF container could be non-webp; verify WEBP marker.
@@ -89,7 +96,7 @@ def _prepare_inline_image(data: bytes, declared_mime: str) -> tuple[bytes, str] 
     keeping the original saved URL in text context.
     """
     actual_mime = _detect_image_mime(data, declared_mime)
-    if len(data) <= _MAX_INLINE_IMAGE_BYTES:
+    if len(data) <= _MAX_INLINE_IMAGE_BYTES and actual_mime in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
         return data, actual_mime
     try:
         from PIL import Image, ImageOps  # type: ignore
@@ -97,6 +104,8 @@ def _prepare_inline_image(data: bytes, declared_mime: str) -> tuple[bytes, str] 
         return None
 
     try:
+        if actual_mime in {"image/heic", "image/heif"}:
+            register_heif_decoder()
         with Image.open(io.BytesIO(data)) as img:
             img = ImageOps.exif_transpose(img)
             if img.mode not in {"RGB", "L"}:
@@ -127,7 +136,7 @@ _AUDIO_MIME_PREFIXES = ("audio/",)
 _VIDEO_MIME_PREFIX = "video/"
 _VIDEO_EXTENSIONS = {"mp4", "mov", "m4v", "webm", "avi", "mkv"}
 _AUDIO_EXTENSIONS = {"mp3", "wav", "m4a", "aac", "ogg", "opus", "flac", "webm"}
-_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif"}
+_IMAGE_EXTENSIONS = {"png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "avif", "heic", "heif"}
 _WORKSPACE_DEFAULT_COLLECTION_NAME = "Workspace Knowledge"
 _WORKSPACE_GROUP_DEFAULT_KIND = WorkspaceDocumentGroupKind.DEFAULT_COLLECTION.value
 _ATTACHMENT_TEXT_READY_NOTE = (
@@ -138,6 +147,8 @@ _ATTACHMENT_TEXT_READY_NOTE = (
 
 
 def _safe_upload_ext(filename: str, mime: str) -> str:
+    if mime in {"image/heic", "image/heif"}:
+        return ".heic" if mime == "image/heic" else ".heif"
     ext = os.path.splitext(filename or "")[1].lower()
     if not ext and mime:
         ext = "." + mime.split(";", 1)[0].split("/")[-1].lower()
@@ -145,7 +156,10 @@ def _safe_upload_ext(filename: str, mime: str) -> str:
     return ext if ext.startswith(".") else f".{ext}"
 
 
-def _save_chat_upload(content: bytes, filename: str, entity_id: str, mime: str) -> tuple[str, str]:
+def _save_chat_upload(
+    content: bytes, filename: str, entity_id: str, mime: str,
+    *, storage_scope: str | None = None,
+) -> tuple[str, str]:
     """Persist an attached file to the entity filesystem.
 
     Returns ``(relative_path, local_url)``. The filename is content-hash based
@@ -159,7 +173,8 @@ def _save_chat_upload(content: bytes, filename: str, entity_id: str, mime: str) 
     short_hash = hashlib.sha256(content).hexdigest()[:16]
     safe_name = f"{short_hash}{ext}"
 
-    rel_path = f"uploads/chat/{safe_name}"
+    scope_dir = hashlib.sha256(storage_scope.encode()).hexdigest()[:16] if storage_scope else None
+    rel_path = "/".join(part for part in ("uploads/chat", scope_dir, safe_name) if part)
     filepath = os.path.join(get_entity_root(entity_id), rel_path)
     if not os.path.isfile(filepath) or os.path.getsize(filepath) != len(content):
         write_entity_file_atomic(
@@ -169,20 +184,28 @@ def _save_chat_upload(content: bytes, filename: str, entity_id: str, mime: str) 
             expected_size=len(content),
             allow_empty=True,
         )
-    return rel_path, f"/api/v1/fs/{entity_id}/{rel_path}"
+    return rel_path, entity_fs_open_url(entity_id, rel_path)
 
 
-def _save_chat_image(content: bytes, filename: str, entity_id: str, mime: str) -> str:
+def _save_chat_image(
+    content: bytes, filename: str, entity_id: str, mime: str,
+    *, storage_scope: str | None = None,
+) -> str:
     """Persist an attached image and return a stable local URL."""
-    _, local_url = _save_chat_upload(content, filename, entity_id, mime)
+    if storage_scope:
+        _, local_url = _save_chat_upload(
+            content, filename, entity_id, mime, storage_scope=storage_scope,
+        )
+    else:
+        _, local_url = _save_chat_upload(content, filename, entity_id, mime)
     return local_url
 
 
 def _fs_path_from_local_url(entity_id: str, local_url: str) -> str | None:
-    prefix = f"/api/v1/fs/{entity_id}/"
-    if not local_url.startswith(prefix):
+    parsed = parse_file_reference(local_url, entity_id=entity_id)
+    if parsed is None or parsed.entity_id != entity_id:
         return None
-    return local_url[len(prefix):].strip("/") or None
+    return parsed.fs_path or None
 
 
 def _document_media_extensions(doc: Document) -> set[str]:
@@ -266,12 +289,283 @@ async def _ensure_workspace_upload_group(
     return group
 
 
+def _attachment_document_id(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    for key in ("id", "document_id"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+async def bind_workspace_knowledge_documents(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    user_id: str | None = None,
+    attachments: Any = None,
+    tool_name: str = "hitl_upload",
+) -> list[dict[str, Any]]:
+    """Project HITL attachment Documents into this Workspace's Knowledge.
+
+    Need Input uploads that go through ``/documents/upload`` without a folder
+    become private entity-root files. Fulfilling the workspace card makes the
+    same Document visible from the Workspace root without moving its bytes or
+    changing its durable identity. Missing or foreign ids stay unchanged so
+    the human answer still fulfills.
+    """
+    if not isinstance(attachments, list):
+        return []
+
+    from packages.core.services.document_file_move import move_document_file_to_folder
+    from packages.core.services.document_access import (
+        effective_document_capabilities_for_user,
+        user_can_read_document,
+    )
+    from packages.core.services.document_service import _get_document_for_policy_mutation
+    from packages.core.services.knowledge_visibility import normalize_rel_path
+    from packages.core.services.workspace_artifacts import (
+        ensure_workspace_artifact_folder,
+    )
+
+    bound: list[dict[str, Any]] = []
+    group = None
+    workspace = None
+    artifact_folder = None
+    mutated = False
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        original = dict(item)
+        document_id = _attachment_document_id(item)
+        if not document_id:
+            bound.append(original)
+            continue
+        async def authorize_attachment(auth_db: AsyncSession, document: Document) -> None:
+            capabilities = await effective_document_capabilities_for_user(
+                auth_db,
+                document=document,
+                user_id=user_id,
+            )
+            can_publish = bool(capabilities.intersection({
+                Capability.SHARE_INTERNAL,
+                Capability.GRANT_ACCESS,
+            }))
+            can_read = await user_can_read_document(
+                auth_db,
+                document,
+                entity_id=entity_id,
+                user_id=user_id,
+                allow_redacted=False,
+            )
+            if not can_publish or not can_read:
+                raise HTTPException(404, "Document not found")
+
+        doc = await _get_document_for_policy_mutation(
+            db,
+            document_id,
+            entity_id,
+            is_trashed=False,
+            require_visible_path=False,
+            mutation_authorizer=authorize_attachment,
+        )
+        if doc is None:
+            bound.append(original)
+            continue
+        workspace_memberships = set((await db.scalars(
+            select(DocumentGroup.workspace_id)
+            .join(DocumentGroupMember, DocumentGroupMember.group_id == DocumentGroup.id)
+            .where(
+                DocumentGroupMember.document_id == doc.id,
+                DocumentGroup.workspace_id.is_not(None),
+            )
+        )).all())
+        has_document_acl = (await db.scalar(
+            select(ResourceGrant.id).where(
+                ResourceGrant.entity_id == entity_id,
+                ResourceGrant.resource_type == ResourceType.DOCUMENT,
+                ResourceGrant.resource_id == doc.id,
+            ).limit(1)
+        )) is not None or (await db.scalar(
+            select(Share.id).where(
+                Share.entity_id == entity_id,
+                Share.resource_type == ResourceType.DOCUMENT,
+                Share.resource_id == doc.id,
+            ).limit(1)
+        )) is not None
+        origin = doc.metadata_.get("origin") if isinstance(doc.metadata_, dict) else None
+        origin_workspace_id = str((origin or {}).get("workspace_id") or "").strip()
+        has_external_workspace_origin = bool(
+            origin_workspace_id and origin_workspace_id != workspace_id
+        )
+        can_auto_home = (
+            doc.folder_id is None
+            and not has_external_workspace_origin
+            and not (workspace_memberships - {workspace_id})
+            and not has_document_acl
+        )
+        if can_auto_home:
+            if doc.visibility == Visibility.PRIVATE:
+                doc.visibility = Visibility.WORKSPACE
+            doc.metadata_ = merge_document_metadata(
+                doc.metadata_,
+                origin={
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                    "tool_name": tool_name,
+                },
+            )
+            mutated = True
+        if group is None:
+            group = await _ensure_workspace_upload_group(
+                db, entity_id=entity_id, workspace_id=workspace_id,
+            )
+        if group is not None:
+            member = (await db.execute(
+                select(DocumentGroupMember).where(
+                    DocumentGroupMember.document_id == doc.id,
+                    DocumentGroupMember.group_id == group.id,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if not member:
+                db.add(DocumentGroupMember(document_id=doc.id, group_id=group.id))
+        if workspace is None:
+            workspace = (await db.execute(
+                select(Workspace).where(
+                    Workspace.id == workspace_id,
+                    Workspace.entity_id == entity_id,
+                    Workspace.deleted_at.is_(None),
+                ).limit(1)
+            )).scalar_one_or_none()
+            if workspace is not None:
+                artifact_folder = await ensure_workspace_artifact_folder(db, workspace)
+        if can_auto_home and artifact_folder is not None:
+            if doc.folder_id != artifact_folder.id:
+                doc.folder_id = artifact_folder.id
+                mutated = True
+        enriched = dict(original)
+        enriched["id"] = doc.id
+        enriched["document_id"] = doc.id
+        enriched["name"] = doc.name or original.get("name") or doc.id
+        enriched["type"] = original.get("type") or "knowledge"
+        if doc.fs_path:
+            enriched["fs_path"] = doc.fs_path
+        bound.append(enriched)
+
+    if mutated:
+        await db.flush()
+        await bump_tool_cache_version(entity_id, "documents")
+    return bound
+
+
+async def resolve_workspace_input_attachments(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    user_id: str,
+    attachments: Any,
+) -> list[dict[str, Any]]:
+    """Resolve user-selected documents before a Workspace input is consumed.
+
+    Existing Knowledge remains in its original location and access boundary.
+    Only an explicitly local input upload that is actor-owned, unfiled and has
+    no prior sharing or Workspace association follows upload projection.
+    """
+    from packages.core.services.document_access import (
+        document_workspace_ids,
+        get_visible_document,
+    )
+    from packages.core.services.workspace_access import user_can_write_workspace_artifacts
+
+    if not isinstance(attachments, list) or len(attachments) > 50:
+        raise HTTPException(422, "Attachments must be a list of at most 50 documents")
+    documents: list[Document] = []
+    seen: set[str] = set()
+    upload_intent_ids: set[str] = set()
+    for item in attachments:
+        document_id = _attachment_document_id(item)
+        if not document_id:
+            raise HTTPException(422, "Each attachment must identify a Knowledge document")
+        if item.get("origin") == "input_upload":
+            upload_intent_ids.add(document_id)
+        if document_id in seen:
+            continue
+        document = await get_visible_document(
+            db, document_id, entity_id, user_id=user_id,
+        )
+        if document is None:
+            raise HTTPException(404, "An attached document is no longer available")
+        seen.add(document_id)
+        documents.append(document)
+
+    upload_ids = sorted(
+        document.id for document in documents
+        if document.id in upload_intent_ids
+        and document.source == "upload" and document.owner_id == user_id
+        and document.folder_id is None
+    )
+    if upload_ids:
+        # Two independently answered cards may carry the same upload. Lock in
+        # a stable order and reload before deciding its first Workspace home.
+        (await db.scalars(select(Document).where(
+            Document.entity_id == entity_id, Document.id.in_(upload_ids),
+        ).order_by(Document.id).with_for_update().execution_options(populate_existing=True))).all()
+        for document_id in upload_ids:
+            if await get_visible_document(db, document_id, entity_id, user_id=user_id) is None:
+                raise HTTPException(404, "An attached document is no longer available")
+
+    resolved: list[dict[str, Any]] = []
+    for document in documents:
+        reference = {
+            "id": document.id,
+            "document_id": document.id,
+            "name": document.name,
+            "type": "knowledge",
+            "viewer_url": f"/viewer/{document.id}",
+        }
+        if document.fs_path:
+            reference["fs_path"] = document.fs_path
+        # A selected existing document must not be moved or implicitly shared.
+        unfiled_upload = (
+            document.id in upload_intent_ids
+            and document.source == "upload"
+            and document.owner_id == user_id
+            and document.folder_id is None
+            and not await document_workspace_ids(db, document)
+        )
+        has_acl = False
+        if unfiled_upload:
+            has_acl = (await db.scalar(select(ResourceGrant.id).where(
+                ResourceGrant.entity_id == entity_id,
+                ResourceGrant.resource_type == ResourceType.DOCUMENT,
+                ResourceGrant.resource_id == document.id,
+            ).limit(1))) is not None or (await db.scalar(select(Share.id).where(
+                Share.entity_id == entity_id,
+                Share.resource_type == ResourceType.DOCUMENT,
+                Share.resource_id == document.id,
+            ).limit(1))) is not None
+        if unfiled_upload and not has_acl and await user_can_write_workspace_artifacts(
+            db, workspace_id=workspace_id, user_id=user_id,
+        ):
+            bound = await bind_workspace_knowledge_documents(
+                db, entity_id=entity_id, workspace_id=workspace_id,
+                user_id=user_id, attachments=[reference],
+            )
+            reference = bound[0]
+        resolved.append(reference)
+    return resolved
+
+
 async def _register_workspace_chat_upload(
     db: AsyncSession,
     *,
     entity_id: str,
     workspace_id: str | None,
     user_id: str | None,
+    surface: ChatSurface | None = None,
     filename: str,
     saved_rel_path: str,
     saved_url: str,
@@ -285,15 +579,51 @@ async def _register_workspace_chat_upload(
     uploaded document to appear in that workspace, so we attach the Document row
     to the workspace's default collection explicitly.
     """
-    if not workspace_id:
+    if surface != ChatSurface.WORKSPACE_CHAT or not workspace_id or not user_id:
         return None
 
-    group = await _ensure_workspace_upload_group(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
+    from packages.core.models.permission import Capability
+    from packages.core.services.actor_authorization import (
+        AuthenticatedUserCredential, resolve_current_user_actor,
     )
-    if not group:
+    from packages.core.services.document_access import effective_document_capabilities_for_user
+    from packages.core.services.document_service import create_document, _enforce_storage_limit
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+        lock_workspace_recipient_authorization,
+        user_can_write_workspace_artifacts,
+    )
+
+    # Match the existing lifecycle/authorization lock order: Workspace, its
+    # permission inputs, then Document. Re-read authority after any lock wait.
+    workspace = await lock_workspace_access_boundary(
+        db, workspace_id=workspace_id, entity_id=entity_id,
+    )
+    if workspace is None or workspace.deleted_at is not None:
+        return None
+    await lock_workspace_recipient_authorization(
+        db, workspace_id=workspace_id, entity_id=entity_id, user_id=user_id,
+    )
+
+    # The authenticated entity can differ from the User's primary entity.
+    # Resolve current membership instead of trusting an id or cached role.
+    actor = await resolve_current_user_actor(
+        db,
+        AuthenticatedUserCredential(user_id=user_id, entity_id=entity_id, token_version=None),
+    )
+    if actor is None:
+        return None
+    # Prior request authorization may have cached an older WorkspaceStaff
+    # object. Refresh it under the authorization locks before the role helper.
+    (await db.execute(
+        select(WorkspaceStaff).where(
+            WorkspaceStaff.workspace_id == workspace_id,
+            WorkspaceStaff.user_id == user_id,
+        ).execution_options(populate_existing=True)
+    )).scalars().all()
+    if not await user_can_write_workspace_artifacts(
+        db, workspace_id=workspace_id, user_id=user_id, entity_role=actor.role,
+    ):
         return None
 
     name = os.path.basename(filename or saved_rel_path) or "attachment"
@@ -313,70 +643,93 @@ async def _register_workspace_chat_upload(
             Document.id.desc(),
         )
         .limit(1)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )).scalar_one_or_none()
 
-    origin = {
-        "workspace_id": workspace_id,
-        "user_id": user_id,
-        "tool_name": "chat_upload",
-    }
-    chat_upload = {
-        "url": saved_url,
-        "path": saved_rel_path,
-    }
-    if existing:
-        existing.name = name
-        existing.file_url = saved_url
-        existing.file_size = file_size
-        existing.file_type = ext
-        existing.mime_type = mime or existing.mime_type
-        existing.source = existing.source or "chat_upload"
-        existing.created_by = existing.created_by or user_id
-        existing.is_trashed = False
-        existing.trashed_at = None
-        existing.trashed_by = None
-        existing.metadata_ = merge_document_metadata(
-            existing.metadata_,
-            origin=origin,
-            extra={
-                "chat_upload": chat_upload,
-            },
-        )
-        doc = existing
-    else:
-        doc = Document(
-            entity_id=entity_id,
-            name=name,
-            fs_path=saved_rel_path,
-            file_url=saved_url,
-            file_size=file_size,
-            file_type=ext,
-            mime_type=mime or "application/octet-stream",
-            source="chat_upload",
-            created_by=user_id,
-            metadata_=merge_document_metadata(
-                None,
+    # Keep Document and collection membership atomic even if collection
+    # resolution fails after the document has been flushed.
+    async with db.begin_nested():
+        origin = {
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "tool_name": "chat_upload",
+        }
+        chat_upload = {
+            "url": saved_url,
+            "path": saved_rel_path,
+        }
+        if existing:
+            capabilities = await effective_document_capabilities_for_user(
+                db, document=existing, user_id=user_id, _actor=actor,
+            )
+            if Capability.EDIT not in capabilities:
+                return None
+            if existing.is_trashed:
+                await _enforce_storage_limit(db, entity_id)
+            existing.name = name
+            existing.file_url = saved_url
+            existing.file_size = file_size
+            existing.file_type = ext
+            existing.mime_type = mime or existing.mime_type
+            existing.source = "chat_upload"
+            existing.created_by = existing.created_by or user_id
+            existing.owner_id = existing.owner_id or user_id
+            existing.visibility = Visibility.WORKSPACE
+            existing.is_trashed = False
+            existing.trashed_at = None
+            existing.trashed_by = None
+            existing.metadata_ = merge_document_metadata(
+                existing.metadata_,
                 origin=origin,
                 extra={
                     "chat_upload": chat_upload,
                 },
-            ),
+            )
+            doc = existing
+        else:
+            doc = await create_document(
+                db, entity_id,
+                name=name,
+                fs_path=saved_rel_path,
+                file_url=saved_url,
+                file_size=file_size,
+                file_type=ext,
+                mime_type=mime or "application/octet-stream",
+                source="chat_upload",
+                created_by=user_id,
+                owner_id=user_id,
+                visibility=Visibility.WORKSPACE,
+                metadata=merge_document_metadata(
+                    None,
+                    origin=origin,
+                    extra={
+                        "chat_upload": chat_upload,
+                    },
+                ),
+                emit_created_event=False,
+            )
+
+        # No group or membership is created until authorization and storage
+        # admission succeed. Existing live documents remain idempotent at quota.
+        group = await _ensure_workspace_upload_group(
+            db, entity_id=entity_id, workspace_id=workspace_id,
         )
-        db.add(doc)
-        await db.flush()
+        if group is None:
+            raise HTTPException(409, "Workspace upload collection is unavailable; retry")
 
-    member = (await db.execute(
-        select(DocumentGroupMember).where(
-            DocumentGroupMember.document_id == doc.id,
-            DocumentGroupMember.group_id == group.id,
-        ).limit(1)
-    )).scalar_one_or_none()
-    if not member:
-        db.add(DocumentGroupMember(document_id=doc.id, group_id=group.id))
-        await db.flush()
+        member = (await db.execute(
+            select(DocumentGroupMember).where(
+                DocumentGroupMember.document_id == doc.id,
+                DocumentGroupMember.group_id == group.id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        if not member:
+            db.add(DocumentGroupMember(document_id=doc.id, group_id=group.id))
+            await db.flush()
 
-    await bump_tool_cache_version(entity_id, "documents")
-    return doc.id
+        await bump_tool_cache_version(entity_id, "documents")
+        return doc.id
 
 
 def _context_heading(kind: str, name: str, reference: str = "") -> str:
@@ -485,6 +838,18 @@ async def build_file_context(
     text_parts: list[str] = []
     inline_image_bytes = 0
     inline_text_chars = 0
+    storage_scope = (
+        f"{workspace_id}:{user_id}"
+        if surface == ChatSurface.WORKSPACE_CHAT and workspace_id and user_id
+        else None
+    )
+
+    def save_upload(content: bytes, filename: str, mime: str) -> tuple[str, str]:
+        if storage_scope:
+            return _save_chat_upload(
+                content, filename, entity_id, mime, storage_scope=storage_scope,
+            )
+        return _save_chat_upload(content, filename, entity_id, mime)
 
     def append_text(kind: str, name: str, text: str, reference: str = "") -> None:
         """Append extracted text without letting attachments dominate prompt."""
@@ -533,8 +898,27 @@ async def build_file_context(
             # Detect actual format from magic bytes — browsers sometimes
             # send the wrong content_type (e.g. jpeg for a PNG file).
             mime = _detect_image_mime(content, mime)
-            local_url = _save_chat_image(content, f.filename or "image.png", entity_id, mime)
+            if storage_scope:
+                local_url = _save_chat_image(
+                    content, f.filename or "image.png", entity_id, mime,
+                    storage_scope=storage_scope,
+                )
+            else:
+                local_url = _save_chat_image(content, f.filename or "image.png", entity_id, mime)
             saved_rel_path = _fs_path_from_local_url(entity_id, local_url)
+            if workspace_id and saved_rel_path:
+                await _register_workspace_chat_upload(
+                    db,
+                    entity_id=entity_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    filename=f.filename or "image.png",
+                    surface=surface,
+                    saved_rel_path=saved_rel_path,
+                    saved_url=local_url,
+                    file_size=len(content),
+                    mime=mime,
+                )
             out.image_urls.append(local_url)
             out.add_attachment_ref(
                 kind="chat_upload",
@@ -575,10 +959,9 @@ async def build_file_context(
         # not transcribe arbitrary uploaded videos here; video mode may need
         # the actual clip bytes as reference media.
         if mime.startswith(_VIDEO_MIME_PREFIX):
-            saved_rel_path, saved_url = _save_chat_upload(
+            saved_rel_path, saved_url = save_upload(
                 content,
                 f.filename or "video",
-                entity_id,
                 mime or "video/mp4",
             )
             out.video_urls.append(saved_url)
@@ -599,6 +982,7 @@ async def build_file_context(
                     workspace_id=workspace_id,
                     user_id=user_id,
                     filename=f.filename or "video",
+                    surface=surface,
                     saved_rel_path=saved_rel_path,
                     saved_url=saved_url,
                     file_size=len(content),
@@ -609,10 +993,9 @@ async def build_file_context(
         # Audio branch — save as a structured reference, then transcribe via
         # Whisper so ordinary chat still sees the speech content.
         if any(mime.startswith(p) for p in _AUDIO_MIME_PREFIXES):
-            saved_rel_path, saved_url = _save_chat_upload(
+            saved_rel_path, saved_url = save_upload(
                 content,
                 f.filename or "audio",
-                entity_id,
                 mime or "audio/webm",
             )
             out.audio_urls.append(saved_url)
@@ -633,6 +1016,7 @@ async def build_file_context(
                     workspace_id=workspace_id,
                     user_id=user_id,
                     filename=f.filename or "audio",
+                    surface=surface,
                     saved_rel_path=saved_rel_path,
                     saved_url=saved_url,
                     file_size=len(content),
@@ -713,10 +1097,9 @@ async def build_file_context(
 
         # Text-extractable branch — persist for later chunked reads, then extract
         # a bounded preview for the immediate prompt.
-        saved_rel_path, saved_url = _save_chat_upload(
+        saved_rel_path, saved_url = save_upload(
             content,
             f.filename or "attachment",
-            entity_id,
             mime or "application/octet-stream",
         )
         workspace_doc_id = await _register_workspace_chat_upload(
@@ -725,6 +1108,7 @@ async def build_file_context(
             workspace_id=workspace_id,
             user_id=user_id,
             filename=f.filename or "attachment",
+            surface=surface,
             saved_rel_path=saved_rel_path,
             saved_url=saved_url,
             file_size=len(content),
@@ -818,7 +1202,7 @@ async def build_file_context(
         doc_mime = (doc.mime_type or "").lower()
         if _document_is_video(doc, doc_mime):
             if doc.fs_path:
-                kb_url = f"/api/v1/fs/{entity_id}/{doc.fs_path}"
+                kb_url = entity_fs_open_url(entity_id, doc.fs_path)
                 out.video_urls.append(kb_url)
                 out.add_attachment_ref(
                     kind="knowledge_document",
@@ -846,7 +1230,7 @@ async def build_file_context(
 
         if _document_is_audio(doc, doc_mime):
             if doc.fs_path:
-                kb_url = f"/api/v1/fs/{entity_id}/{doc.fs_path}"
+                kb_url = entity_fs_open_url(entity_id, doc.fs_path)
                 out.audio_urls.append(kb_url)
                 out.add_attachment_ref(
                     kind="knowledge_document",
@@ -874,7 +1258,7 @@ async def build_file_context(
 
         if _document_is_image(doc, doc_mime):
             if doc.fs_path:
-                kb_url = f"/api/v1/fs/{entity_id}/{doc.fs_path}"
+                kb_url = entity_fs_open_url(entity_id, doc.fs_path)
                 out.image_urls.append(kb_url)
                 out.add_attachment_ref(
                     kind="knowledge_document",
@@ -930,7 +1314,7 @@ async def build_file_context(
                 text_parts.append(image_reference_line)
                 continue
 
-        kb_url = f"/api/v1/fs/{entity_id}/{doc.fs_path}" if doc.fs_path else doc.file_url
+        kb_url = entity_fs_open_url(entity_id, doc.fs_path) if doc.fs_path else doc.file_url
         reference_parts = [f"document_id={doc.id}"]
         if doc.fs_path:
             reference_parts.append(f"path={doc.fs_path}")

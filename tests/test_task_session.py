@@ -226,6 +226,9 @@ async def test_workspace_action_keeps_source_chat_out_of_task_session(
             "title": "Mock product interview",
             "task_type": "interactive",
             "agent_id": "source-session-agent",
+            # The closed runtime factory, not a duplicate TaskType switch,
+            # keeps this on its foreground session adapter.
+            "start": True,
         },
     ))
 
@@ -234,6 +237,7 @@ async def test_workspace_action_keeps_source_chat_out_of_task_session(
     task = (await db_session.execute(
         select(Task).where(Task.id == result["task"]["id"])
     )).scalar_one()
+    assert task.status == "pending"
     assert task.conversation_id is None
     assert task.details["runtime_context"]["captured_from"]["conversation_id"] == (
         "source-workspace-chat"
@@ -253,9 +257,29 @@ async def test_generic_runtime_rejects_interactive_task_creation():
 
 
 @pytest.mark.asyncio
-async def test_owner_subscription_disambiguates_reused_host_agent(db_session):
+async def test_generic_runtime_rejects_overlong_assignee_before_database_access(monkeypatch):
+    from packages.core.ai.runtime.task_actions import runtime_create_task_action
+
+    class UnexpectedSession:
+        def __call__(self):
+            raise AssertionError("invalid assignee reached the database")
+
+    monkeypatch.setattr("packages.core.database.async_session", UnexpectedSession())
+    result = json.loads(await runtime_create_task_action(
+        entity_id="benchmark-entity",
+        params={"title": "Check price", "assignee_id": "benchmark-entity-with-a-long-slug"},
+    ))
+
+    assert result["error"] == "invalid_assignee_id"
+    assert "omit it" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_owner_subscription_keeps_reused_host_in_task_workspace(db_session):
+    from packages.core.models.task import Task
     from packages.core.models.workspace import Agent, AgentSubscription
     from packages.core.services import task_service
+    from packages.core.services.task_session import TaskSessionHostError, resolve_task_session_host
 
     db_session.add(Agent(
         id="reused-session-agent",
@@ -275,7 +299,9 @@ async def test_owner_subscription_disambiguates_reused_host_agent(db_session):
         AgentSubscription(
             id="reused-teacher-sub",
             entity_id="session-entity",
-            workspace_id="session-workspace",
+            # One Agent may be deployed once per Workspace. Reuse across
+            # Workspaces must not let the Host borrow a foreign subscription.
+            workspace_id="session-reuse-workspace",
             agent_id="reused-session-agent",
             service_key="teacher",
             status="active",
@@ -294,6 +320,14 @@ async def test_owner_subscription_disambiguates_reused_host_agent(db_session):
     )
 
     assert task.owner_subscription_id == "reused-interview-sub"
+    assert task.agent_id == "reused-session-agent"
+    foreign_owner_task = Task(
+        entity_id="session-entity", workspace_id="session-workspace",
+        title="Foreign owner must be rejected", task_type="interactive",
+        agent_id="reused-session-agent", owner_subscription_id="reused-teacher-sub",
+    )
+    with pytest.raises(TaskSessionHostError, match="subscription is not active"):
+        await resolve_task_session_host(db_session, foreign_owner_task)
 
 
 @pytest.mark.asyncio
@@ -362,7 +396,7 @@ async def test_task_response_returns_exact_session_host_for_reused_agent(
         AgentSubscription(
             id=teacher_sub_id,
             entity_id=entity_id,
-            workspace_id=workspace_id,
+            workspace_id="api-teacher-workspace",
             agent_id=agent_id,
             name="SQL Teacher",
             service_key="teacher",
@@ -957,6 +991,7 @@ async def test_runtime_context_ignores_requested_agent_for_interactive_task(
             ),
             tool_schemas=[],
             prompt="session prompt",
+            envelope=SimpleNamespace(metadata={}, principal=SimpleNamespace(actor_user_id=None)),
         )
 
     monkeypatch.setattr(
@@ -1002,6 +1037,7 @@ async def test_task_session_subscription_limits_workspace_role_tools(db_session)
     entity_id = "role-scope-entity"
     workspace_id = "role-scope-workspace"
     agent_id = "multi-role-session-agent"
+    teacher_agent_id = "role-scope-teacher-agent"
     interview_sub_id = "interview-role-sub"
     teacher_sub_id = "teacher-role-sub"
     db_session.add(Workspace(
@@ -1039,6 +1075,12 @@ async def test_task_session_subscription_limits_workspace_role_tools(db_session)
         status="active",
     ))
     db_session.add_all([
+        Agent(
+            id=teacher_agent_id,
+            entity_id=entity_id,
+            name="SQL Teacher",
+            status="active",
+        ),
         AgentSubscription(
             id=interview_sub_id,
             entity_id=entity_id,
@@ -1051,7 +1093,7 @@ async def test_task_session_subscription_limits_workspace_role_tools(db_session)
             id=teacher_sub_id,
             entity_id=entity_id,
             workspace_id=workspace_id,
-            agent_id=agent_id,
+            agent_id=teacher_agent_id,
             service_key="teacher",
             status="active",
         ),
@@ -1101,6 +1143,7 @@ async def test_task_session_subscription_limits_workspace_role_skills(db_session
     entity_id = "role-skill-entity"
     workspace_id = "role-skill-workspace"
     agent_id = "role-skill-agent"
+    teacher_agent_id = "role-skill-teacher-agent"
     interview_sub_id = "role-skill-interview-sub"
     teacher_sub_id = "role-skill-teacher-sub"
     interview_skill_id = "interview-score-skill"
@@ -1132,6 +1175,12 @@ async def test_task_session_subscription_limits_workspace_role_skills(db_session
         status="active",
     ))
     db_session.add_all([
+        Agent(
+            id=teacher_agent_id,
+            entity_id=entity_id,
+            name="SQL Teacher",
+            status="active",
+        ),
         AgentSubscription(
             id=interview_sub_id,
             entity_id=entity_id,
@@ -1144,7 +1193,7 @@ async def test_task_session_subscription_limits_workspace_role_skills(db_session
             id=teacher_sub_id,
             entity_id=entity_id,
             workspace_id=workspace_id,
-            agent_id=agent_id,
+            agent_id=teacher_agent_id,
             service_key="teacher",
             status="active",
         ),
@@ -1191,6 +1240,7 @@ async def test_reassigning_task_session_host_rebinds_its_conversation(db_session
     entity_id = "rebind-session-entity"
     workspace_id = "rebind-session-workspace"
     agent_id = "rebind-multi-role-agent"
+    new_agent_id = "rebind-teacher-agent"
     old_sub_id = "rebind-interview-sub"
     new_sub_id = "rebind-teacher-sub"
     db_session.add(Agent(
@@ -1200,6 +1250,12 @@ async def test_reassigning_task_session_host_rebinds_its_conversation(db_session
         status="active",
     ))
     db_session.add_all([
+        Agent(
+            id=new_agent_id,
+            entity_id=entity_id,
+            name="SQL Teacher",
+            status="active",
+        ),
         AgentSubscription(
             id=old_sub_id,
             entity_id=entity_id,
@@ -1212,7 +1268,7 @@ async def test_reassigning_task_session_host_rebinds_its_conversation(db_session
             id=new_sub_id,
             entity_id=entity_id,
             workspace_id=workspace_id,
-            agent_id=agent_id,
+            agent_id=new_agent_id,
             service_key="teacher",
             status="active",
         ),
@@ -1245,15 +1301,16 @@ async def test_reassigning_task_session_host_rebinds_its_conversation(db_session
         db_session,
         task.id,
         entity_id,
-        agent_id=agent_id,
+        agent_id=new_agent_id,
         agent_type="agent",
         owner_subscription_id=new_sub_id,
         owner_service_key=None,
     )
 
     assert updated is not None
+    assert updated.agent_id == new_agent_id
     assert updated.owner_subscription_id == new_sub_id
-    assert conversation.agent_id == agent_id
+    assert conversation.agent_id == new_agent_id
     assert conversation.agent_subscription_id == new_sub_id
 
 

@@ -126,8 +126,8 @@ async def test_writes_and_reads_the_stable_workspace_receipt(
 ) -> None:
     module = _module()
     directory = SimpleNamespace(
-        storage_path="Workspaces/_by_id/folder-1/technical",
-        display_path="Workspaces/Demo/technical",
+        storage_path="Workspaces/_by_id/folder-1",
+        display_path="Workspaces/Demo",
     )
     synced: list[dict] = []
 
@@ -135,7 +135,7 @@ async def test_writes_and_reads_the_stable_workspace_receipt(
         assert kwargs == {
             "entity_id": "entity-1",
             "workspace_id": "workspace-1",
-            "directory_path": "technical",
+            "directory_path": "",
         }
         return directory
 
@@ -160,6 +160,9 @@ async def test_writes_and_reads_the_stable_workspace_receipt(
     monkeypatch.setattr(module, "runtime_entity_file_root", lambda entity_id: str(tmp_path))
     monkeypatch.setattr(module, "runtime_write_entity_file_atomic", write_atomic)
     monkeypatch.setattr(module, "runtime_sync_entity_file_to_knowledge", sync_to_knowledge)
+    async def existing_base(**kwargs):
+        return directory.storage_path
+    monkeypatch.setattr(module, "_existing_receipt_base", existing_base)
 
     receipt = _build_receipt()
     result = await module.write_publication_receipt(
@@ -177,12 +180,12 @@ async def test_writes_and_reads_the_stable_workspace_receipt(
     )
 
     expected_rel_path = (
-        "Workspaces/_by_id/folder-1/technical/"
+        "Workspaces/_by_id/folder-1/"
         "latest-youtube-publication.json"
     )
     assert result["path"] == expected_rel_path
     assert result["display_path"] == (
-        "Workspaces/Demo/technical/latest-youtube-publication.json"
+        "Workspaces/Demo/latest-youtube-publication.json"
     )
     assert result["document_id"] == "document-1"
     assert loaded == receipt
@@ -191,3 +194,8 @@ async def test_writes_and_reads_the_stable_workspace_receipt(
     assert synced[0]["task_id"] is None
     assert synced[0]["source"] == "youtube_publication"
     assert len(synced[0]["source"]) <= Document.__table__.c.source.type.length
+    # Legacy state remains readable; new workspace state takes precedence.
+    legacy = tmp_path / directory.storage_path / "technical" / module.RECEIPT_FILENAME
+    legacy.parent.mkdir()
+    (tmp_path / expected_rel_path).rename(legacy)
+    assert await module.read_publication_receipt(entity_id="entity-1", workspace_id="workspace-1") == receipt

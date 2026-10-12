@@ -202,6 +202,18 @@ async def map_agent_to_service(
     If an active subscription already exists for the same workspace + service_key,
     it is updated rather than duplicated.
     """
+    from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+    from packages.core.services.workspace_access import lock_workspace_access_boundary
+
+    # Preserve the resource-purge order, then serialize new subscription rows
+    # with Workspace lifecycle and V3 factory admission. Locking only existing
+    # subscriptions cannot stop a new service from changing that selection.
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    locked_workspace = await lock_workspace_access_boundary(
+        db, workspace_id=workspace_id, entity_id=entity_id,
+    )
+    if locked_workspace is None or locked_workspace.deleted_at is not None:
+        raise ValueError("Workspace not found")
     ws = await get_workspace(db, workspace_id, entity_id)
     if not ws:
         raise ValueError("Workspace not found")
@@ -234,6 +246,28 @@ async def map_agent_to_service(
         )
     )
     sub = result.scalar_one_or_none()
+
+    # Agent deployments have a unique (entity, agent, workspace) identity even
+    # after unmapping. Reactivate that same row when adding it back, instead of
+    # inserting a duplicate or colliding while replacing another service Agent.
+    agent_sub = (await db.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.entity_id == entity_id,
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.agent_id == agent_id,
+        )
+    )).scalar_one_or_none()
+    if agent_sub is not None and agent_sub is not sub:
+        if agent_sub.status == "active":
+            raise ValueError(
+                f"Agent is already mapped to service {agent_sub.service_key!r}; "
+                "create a distinct Agent to add another service"
+            )
+        if sub is not None:
+            sub.status = "inactive"
+        sub = agent_sub
+        sub.service_key = service_key
+        sub.status = "active"
 
     if sub:
         sub.agent_id = agent_id
@@ -287,12 +321,15 @@ async def get_workspace_agent_mappings(
     Display identity is an API projection and stays opt-in so operation drafts
     persist only the canonical portable mapping contract.
     """
+    # Stable order: operation snapshots taken at draft creation and at apply
+    # must list the same rows in the same positions, or a validation error
+    # (e.g. the second of two duplicates) moves to another row between them.
     result = await db.execute(
         select(AgentSubscription).where(
             AgentSubscription.entity_id == entity_id,
             AgentSubscription.workspace_id == workspace_id,
             AgentSubscription.status == "active",
-        )
+        ).order_by(AgentSubscription.created_at, AgentSubscription.id)
     )
     subs = result.scalars().all()
     mappings = [

@@ -10,6 +10,37 @@ from packages.core.tasks._runtime import run_in_worker as _run_async
 logger = logging.getLogger(__name__)
 
 
+@celery_app.task(name="maintenance.recover_runtime_file_commits")
+def recover_runtime_file_commits_task() -> dict:
+    """Recover committed cleanup/uncommitted writes; never rerun producers."""
+    async def run() -> dict:
+        from sqlalchemy import func, select
+        from packages.core.database import async_session
+        from packages.core.models.runtime_file_commit import RuntimeFileCommit
+        from packages.core.services.entity_fs import (
+            EntityFilesystemBusyError, canonical_entity_root, entity_filesystem_mutation_lock,
+        )
+        from packages.core.services.runtime_file_journal import recover_runtime_file_commits
+
+        async with async_session() as db:
+            entities = list((await db.execute(select(RuntimeFileCommit.entity_id).where(
+                RuntimeFileCommit.cleanup_pending.is_(True),
+            ).group_by(RuntimeFileCommit.entity_id).order_by(func.min(RuntimeFileCommit.created_at)).limit(32))).scalars())
+        report = {"recovered": 0, "unresolved": 0, "busy": 0}
+        for entity_id in entities:
+            try:
+                # A live writer owns this lock. Never infer its death from age.
+                async with entity_filesystem_mutation_lock(canonical_entity_root(entity_id), timeout_seconds=0):
+                    result = await recover_runtime_file_commits(entity_id)
+                report["recovered"] += result["recovered"]
+                report["unresolved"] += result["unresolved"]
+            except EntityFilesystemBusyError:
+                report["busy"] += 1
+        return report
+
+    return _run_async(run())
+
+
 @celery_app.task(
     bind=True,
     name="calendar.reconcile_booking_metadata",
@@ -48,6 +79,27 @@ def cleanup_chat_uploads() -> dict:
         return _run_async(_run())
     except Exception as exc:  # noqa: BLE001
         logger.exception("maintenance.cleanup_chat_uploads failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+@celery_app.task(name="maintenance.cleanup_document_upload_recovery")
+def cleanup_document_upload_recovery() -> dict:
+    """Remove expired browser-upload intents and unreferenced source bytes."""
+
+    async def _run() -> dict:
+        from apps.api.routers.documents import (
+            cleanup_expired_document_upload_recovery_intents,
+        )
+
+        report = await cleanup_expired_document_upload_recovery_intents(
+            limit=_env_int("DOCUMENT_UPLOAD_RECOVERY_CLEANUP_LIMIT", 200),
+        )
+        return {"ok": True, **report}
+
+    try:
+        return _run_async(_run())
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("maintenance.cleanup_document_upload_recovery failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 

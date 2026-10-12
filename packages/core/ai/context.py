@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Iterable, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +50,8 @@ class AgentExecutionContext:
     temperature: float | None = None
     max_tokens: int | None = None
     initial_messages: list[dict] = field(default_factory=list)
+    context_sources: list[dict] = field(default_factory=list)
+    prompt_context: object | None = None
     entity_id: str = ""
     user_id: Optional[str] = None
     agent_id: Optional[str] = None
@@ -70,6 +72,7 @@ async def build_agent_context(
     entity_id: str,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
+    agent_subscription_id: Optional[str] = None,
     workspace_id: Optional[str] = None,
     conversation_id: Optional[str] = None,
     task_id: Optional[str] = None,
@@ -79,6 +82,8 @@ async def build_agent_context(
     extra_system_prompt: Optional[str] = None,
     runtime_surface: ChatSurface | str = ChatSurface.SCHEDULED_AGENT_RUN,
     runtime_metadata: Optional[dict] = None,
+    skill_refs: Iterable[dict] | None = None,
+    load_history: bool = True,
 ) -> AgentExecutionContext:
     """Build a complete execution context for any LLM call.
 
@@ -86,6 +91,7 @@ async def build_agent_context(
         entity_id: The entity (tenant) this execution belongs to.
         user_id: Optional user who triggered it (for model prefs).
         agent_id: Which agent to use. None = master agent.
+        agent_subscription_id: Exact deployment selected for a worker step.
         workspace_id: Optional workspace scope (loads workspace context).
         conversation_id: Optional conversation (loads history).
         task_id: Task this run belongs to. Callers that execute a plan step
@@ -99,6 +105,9 @@ async def build_agent_context(
             inherit through the RuntimeEnvelope.
     """
     from packages.core.constants.agents import is_master_agent, MANOR_AGENT_ID
+
+    if agent_subscription_id:
+        runtime_metadata = {**(runtime_metadata or {}), "agent_subscription_id": agent_subscription_id}
 
     ctx = AgentExecutionContext(
         entity_id=entity_id,
@@ -141,6 +150,7 @@ async def build_agent_context(
         entity_id=entity_id,
         user_id=user_id,
         agent_id=agent_id,
+        agent_subscription_id=agent_subscription_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
         task_id=task_id,
@@ -188,16 +198,21 @@ async def build_agent_context(
             ),
             mode=mode if mode != "task" else "full",
             active_user_message=active_user_message,
+            manual_skill_selected=bool(skill_refs),
+            skill_refs=skill_refs,
             legacy_extra_context=runtime.extra_context,
             initial_extra_context=runtime.extra_context,
         )
         chat_ctx = assembled.context
+        ctx.prompt_context = chat_ctx
         ctx.tools = assembled.tool_schemas
         ctx.tool_names = list(assembled.tool_names)
         ctx.allowed_tool_names = set(assembled.allowed_tool_names)
         ctx.runtime_envelope = assembled.envelope
         ctx.runtime_profile = assembled.envelope.profile.value
         ctx.system_prompt = assembled.prompt
+        from packages.core.ai.runtime.context_window import context_source_manifest
+        ctx.context_sources = context_source_manifest(chat_ctx.runtime_context_sections)
         if is_master:
             ctx.agent_name = "Manor AI"
         else:
@@ -262,9 +277,13 @@ async def build_agent_context(
     # ── Append caller-provided prompt override ──
     if extra_system_prompt:
         ctx.system_prompt = runtime_merge_prompt_appendix(ctx.system_prompt, extra_system_prompt)
+        from packages.core.ai.runtime.context_window import context_section, context_source_manifest
+        ctx.context_sources.extend(context_source_manifest([
+            context_section("delegation_instructions", extra_system_prompt, category="agent_instructions"),
+        ]))
 
     # ── Load conversation history (if available) ──
-    if conversation_id:
+    if conversation_id and load_history:
         try:
             from packages.core.services.conversation_history import load_conversation_history
             ctx.initial_messages = await load_conversation_history(
@@ -272,6 +291,7 @@ async def build_agent_context(
                 conversation_id,
                 token_budget=80_000,
                 latest_user_message=active_user_message,
+                runtime_metadata=(ctx.runtime_envelope.metadata if ctx.runtime_envelope else None),
             )
         except Exception:
             logger.debug("build_agent_context: history loading failed for conv %s", conversation_id)

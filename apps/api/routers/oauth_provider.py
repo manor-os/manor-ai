@@ -8,23 +8,24 @@ GET  /api/v1/oauth/clients/{client_id}
 
 POST /api/v1/oauth/authorize
     Authenticated (user JWT in Authorization header).
-    Body: { client_id, redirect_uri, scope, state }
+    Body: { client_id, redirect_uri, scope, state, code_challenge?, code_challenge_method? }
     Returns: { redirect_to: "<redirect_uri>?code=<code>&state=<state>" }
     Frontend then sets `window.location = redirect_to`.
 
 POST /api/v1/oauth/token
     No auth header. Standard OAuth 2.0 form-encoded or JSON body.
-    Body: { grant_type=authorization_code, code, client_id, client_secret, redirect_uri }
+    Body: { grant_type=authorization_code, code, client_id, client_secret, redirect_uri, code_verifier? }
     Returns: { access_token, token_type, expires_in, scope, user }
 """
 from __future__ import annotations
 
+import json
 import logging
 from typing import List, Optional
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import get_db
@@ -45,13 +46,18 @@ class ClientInfo(BaseModel):
     description: Optional[str] = None
     redirect_uris: List[str]
     allowed_scopes: List[str]
+    require_pkce: bool = False
+    require_verified_email: bool = False
 
 
 class AuthorizeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     client_id: str
     redirect_uri: str
     scope: Optional[str] = ""  # space-separated OAuth scopes
     state: Optional[str] = None
+    code_challenge: Optional[StrictStr] = None
+    code_challenge_method: Optional[StrictStr] = None
 
 
 class AuthorizeResponse(BaseModel):
@@ -61,16 +67,19 @@ class AuthorizeResponse(BaseModel):
 
 
 class TokenRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     grant_type: str = Field(..., description="must be 'authorization_code'")
     code: str
     client_id: str
     client_secret: str
     redirect_uri: str
+    code_verifier: Optional[StrictStr] = None
 
 
 class TokenUserInfo(BaseModel):
     id: str
     email: str
+    email_verified: bool = False
     name: Optional[str] = None
     entity_id: str
     role: Optional[str] = None
@@ -82,6 +91,38 @@ class TokenResponse(BaseModel):
     expires_in: int
     scope: str = ""
     user: TokenUserInfo
+
+
+def _unique_parameters(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_parameter")
+        result[key] = value
+    return result
+
+
+async def _protocol_body(request: Request, model):
+    """Never silently choose the first/last duplicate OAuth parameter."""
+    try:
+        _unique_parameters(request.query_params.multi_items())
+        content_type = (request.headers.get("content-type") or "").lower()
+        if "application/x-www-form-urlencoded" in content_type:
+            data = _unique_parameters((await request.form()).multi_items())
+        else:
+            data = json.loads(await request.body(), object_pairs_hook=_unique_parameters)
+        if not isinstance(data, dict):
+            raise ValueError("invalid_body")
+        return model.model_validate(data)
+    except (ValueError, TypeError):
+        # ValidationError includes input values, which can contain client secrets
+        # and verifiers. Return only the stable OAuth error, never that detail.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid_request",
+                            headers={"Cache-Control": "no-store"}) from None
+
+
+async def _authorize_body(request: Request) -> AuthorizeRequest:
+    return await _protocol_body(request, AuthorizeRequest)
 
 
 # ── Public client info ──
@@ -100,6 +141,8 @@ async def get_client_info(
         description=client.description,
         redirect_uris=client.redirect_uris or [],
         allowed_scopes=client.allowed_scopes or [],
+        require_pkce=bool(client.require_pkce),
+        require_verified_email=bool(client.require_verified_email),
     )
 
 
@@ -107,7 +150,7 @@ async def get_client_info(
 
 @router.post("/authorize", response_model=AuthorizeResponse)
 async def authorize(
-    body: AuthorizeRequest,
+    body: AuthorizeRequest = Depends(_authorize_body),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -137,9 +180,13 @@ async def authorize(
             redirect_uri=body.redirect_uri,
             scope=requested_scopes,
             state=body.state,
+            code_challenge=body.code_challenge,
+            code_challenge_method=body.code_challenge_method,
         )
     except PermissionError as e:
         raise HTTPException(status.HTTP_403_FORBIDDEN, str(e))
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
 
     await db.commit()
 
@@ -160,24 +207,7 @@ async def token(
     db: AsyncSession = Depends(get_db),
 ):
     """OAuth 2.0 token endpoint. Accepts JSON body OR application/x-www-form-urlencoded."""
-    content_type = (request.headers.get("content-type") or "").lower()
-    if "application/x-www-form-urlencoded" in content_type:
-        form = await request.form()
-        data = dict(form)
-    elif "application/json" in content_type:
-        data = await request.json()
-    else:
-        # Try both
-        try:
-            data = await request.json()
-        except Exception:
-            form = await request.form()
-            data = dict(form)
-
-    try:
-        body = TokenRequest(**data)
-    except Exception as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"invalid_request:{e}")
+    body = await _protocol_body(request, TokenRequest)
 
     if body.grant_type != "authorization_code":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "unsupported_grant_type")
@@ -189,6 +219,7 @@ async def token(
             client_id=body.client_id,
             client_secret=body.client_secret,
             redirect_uri=body.redirect_uri,
+            code_verifier=body.code_verifier,
         )
         await db.commit()
     except ValueError as e:

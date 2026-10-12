@@ -1,0 +1,9 @@
+:root { color-scheme: light dark; --surface-app: #fbfbfa; --text-strong: #1c1917; --text-muted: #78716c; --accent: #436b65; --accent-ring: rgba(67,107,101,.22); }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; box-sizing: border-box; background: var(--surface-app); color: var(--text-strong); font-family: system-ui, sans-serif; }
+main { width: 100%; max-width: 420px; text-align: center; }
+h1 { font-size: 24px; }
+p { color: var(--text-muted); line-height: 1.6; }
+a { display: inline-block; padding: 12px 20px; margin-top: 8px; border-radius: 10px; background: var(--accent); color: white; text-decoration: none; }
+a:hover { filter: brightness(.9); }
+a:focus-visible { outline: 3px solid var(--accent-ring); outline-offset: 3px; }
+@media (prefers-color-scheme: dark) { :root { --surface-app: #1c1917; --text-strong: #f5f5f4; --text-muted: #a8a29e; } }

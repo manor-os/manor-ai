@@ -83,13 +83,6 @@ def test_artifact_roles_distinguish_deliverable_from_working_material():
     assert len(ArtifactRole.values()) == 3
 
 
-def test_deliverable_role_keeps_its_stored_value():
-    """The stored word stays 'final' so existing rows and any consumer that
-    already filters on it keep working — renaming it would have been a data
-    migration for zero benefit."""
-    assert ArtifactRole.DELIVERABLE.value == "final"
-
-
 @pytest.mark.parametrize("member", list(WorkspaceArtifactDir))
 def test_bucket_names_are_safe_path_segments(member):
     assert member.value.isalnum() or member.value.isalpha()

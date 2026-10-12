@@ -9,6 +9,37 @@
   min-width: 0;
 }
 
+html[data-theme="dark"] .embedded-chat-header
+  .workspace-intro-launcher.ai-edit-button {
+  border: 0;
+  background: var(--surface-muted);
+  color: var(--text-default);
+  box-shadow: var(--glass-highlight), var(--shadow-sm);
+}
+
+html[data-theme="dark"] .embedded-chat-header
+  .workspace-intro-launcher .ai-edit-button__label {
+  color: inherit !important;
+}
+
+html[data-theme="dark"] .embedded-chat-header
+  .workspace-intro-launcher svg {
+  color: var(--accent);
+}
+
+html[data-theme="dark"] .embedded-chat-header
+  .workspace-intro-launcher.ai-edit-button:hover:not(:disabled) {
+  background: var(--glass-card-hover);
+  color: var(--text-strong);
+  box-shadow: var(--glass-highlight), var(--shadow-md);
+}
+
+html[data-theme="dark"] .embedded-chat-header
+  .workspace-intro-launcher.ai-edit-button:focus-visible {
+  background: var(--surface-muted);
+  box-shadow: 0 0 0 3px var(--accent-ring), var(--shadow-sm);
+}
+
 .workspace-intro-dialog .manor-dialog-header {
   margin-bottom: 14px;
   padding: 20px 22px 0;

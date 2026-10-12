@@ -249,7 +249,10 @@ async def _record_youtube_publication(
         )
 
     try:
-        metrics = await fetch_youtube_public_metrics(public_url)
+        metrics = await fetch_youtube_public_metrics(
+            public_url,
+            include_comments=False,
+        )
         source_task_id = (
             context.task_id if source_kind == "workspace_publication" else None
         )

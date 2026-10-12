@@ -2,13 +2,18 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Optional
 
 from sqlalchemy import select, func, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.task import TaskLogType, TaskType
+from packages.core.ai.response_language import normalize_response_locale
+from packages.core.i18n import get_locale, t
+
+from packages.core.constants.task import TaskLogType, TaskRuntimeKind, TaskType
 from packages.core.constants.agents import (
     MANOR_AGENT_NAME,
     is_legacy_agent_author_placeholder,
@@ -35,6 +40,17 @@ from packages.core.services.reusable_resource_locks import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _task_log_locale(db: AsyncSession, user_id: str | None) -> str:
+    """Snapshot the event actor's saved language using this transaction."""
+    if user_id:
+        from packages.core.models.user import User
+
+        locale = await db.scalar(select(User.locale).where(User.id == user_id))
+        if resolved := normalize_response_locale(locale):
+            return resolved
+    return get_locale()
 
 _TASK_ATTENTION_STATUSES = frozenset({
     "waiting_on_customer",
@@ -63,12 +79,29 @@ def _exclude_trashed_workspace_tasks(query):
 
 async def list_tasks(
     db: AsyncSession, entity_id: str, *,
+    query: str | None = None,
     status: str | None = None,
+    statuses: Sequence[str] | None = None,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
     category_id: str | None = None,
+    category_ids: Sequence[str] | None = None,
     assignee_id: str | None = None,
+    assignee_ids: Sequence[str] | None = None,
+    task_type: str | None = None,
+    task_types: Sequence[str] | None = None,
+    priority: int | None = None,
+    priorities: Sequence[int] | None = None,
+    priority_min: int | None = None,
+    priority_max: int | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
     completed_after: str | datetime | None = None,
     completed_before: str | datetime | None = None,
+    deadline_after: str | datetime | None = None,
+    deadline_before: str | datetime | None = None,
     parent_task_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
@@ -94,29 +127,70 @@ async def list_tasks(
     q = _exclude_trashed_workspace_tasks(q)
     count_q = _exclude_trashed_workspace_tasks(count_q)
 
-    if status:
-        q = q.where(Task.status == status)
-        count_q = count_q.where(Task.status == status)
+    text_query = str(query or "").strip()
+    if text_query:
+        text_filter = or_(
+            Task.title.icontains(text_query, autoescape=True),
+            Task.description.icontains(text_query, autoescape=True),
+        )
+        q = q.where(text_filter)
+        count_q = count_q.where(text_filter)
+
+    status_values = _merge_task_filter_values(status, statuses)
+    if status_values:
+        q = q.where(Task.status.in_(status_values))
+        count_q = count_q.where(Task.status.in_(status_values))
     if attention_only:
         q = q.where(Task.status.in_(_TASK_ATTENTION_STATUSES))
         count_q = count_q.where(Task.status.in_(_TASK_ATTENTION_STATUSES))
-    if workspace_id:
-        q = q.where(Task.workspace_id == workspace_id)
-        count_q = count_q.where(Task.workspace_id == workspace_id)
-    if category_id:
-        q = q.where(Task.category_id == category_id)
-        count_q = count_q.where(Task.category_id == category_id)
-    if assignee_id:
-        q = q.where(Task.assignee_id == assignee_id)
-        count_q = count_q.where(Task.assignee_id == assignee_id)
-    if completed_after:
-        after_dt = _coerce_datetime(completed_after)
-        q = q.where(Task.completed_at.isnot(None), Task.completed_at >= after_dt)
-        count_q = count_q.where(Task.completed_at.isnot(None), Task.completed_at >= after_dt)
-    if completed_before:
-        before_dt = _coerce_datetime(completed_before)
-        q = q.where(Task.completed_at.isnot(None), Task.completed_at <= before_dt)
-        count_q = count_q.where(Task.completed_at.isnot(None), Task.completed_at <= before_dt)
+
+    workspace_values = _merge_task_filter_values(workspace_id, workspace_ids)
+    if workspace_values:
+        q = q.where(Task.workspace_id.in_(workspace_values))
+        count_q = count_q.where(Task.workspace_id.in_(workspace_values))
+
+    category_values = _merge_task_filter_values(category_id, category_ids)
+    if category_values:
+        q = q.where(Task.category_id.in_(category_values))
+        count_q = count_q.where(Task.category_id.in_(category_values))
+
+    assignee_values = _merge_task_filter_values(assignee_id, assignee_ids)
+    if assignee_values:
+        q = q.where(Task.assignee_id.in_(assignee_values))
+        count_q = count_q.where(Task.assignee_id.in_(assignee_values))
+
+    task_type_values = _merge_task_filter_values(task_type, task_types)
+    if task_type_values:
+        q = q.where(Task.task_type.in_(task_type_values))
+        count_q = count_q.where(Task.task_type.in_(task_type_values))
+
+    priority_values = _merge_task_filter_values(priority, priorities)
+    if priority_values:
+        q = q.where(Task.priority.in_(priority_values))
+        count_q = count_q.where(Task.priority.in_(priority_values))
+    if priority_min is not None and priority_max is not None and priority_min > priority_max:
+        raise ValueError("priority_min must be less than or equal to priority_max")
+    if priority_min is not None:
+        q = q.where(Task.priority >= priority_min)
+        count_q = count_q.where(Task.priority >= priority_min)
+    if priority_max is not None:
+        q = q.where(Task.priority <= priority_max)
+        count_q = count_q.where(Task.priority <= priority_max)
+
+    for column, after, before, field_name in (
+        (Task.created_at, created_after, created_before, "created"),
+        (Task.updated_at, updated_after, updated_before, "updated"),
+        (Task.completed_at, completed_after, completed_before, "completed"),
+        (Task.deadline, deadline_after, deadline_before, "deadline"),
+    ):
+        after_dt, before_dt = _coerce_datetime_range(after, before, field_name)
+        if after_dt is not None:
+            q = q.where(column.isnot(None), column >= after_dt)
+            count_q = count_q.where(column.isnot(None), column >= after_dt)
+        if before_dt is not None:
+            q = q.where(column.isnot(None), column <= before_dt)
+            count_q = count_q.where(column.isnot(None), column <= before_dt)
+
     if parent_task_id:
         q = q.where(Task.parent_task_id == parent_task_id)
         count_q = count_q.where(Task.parent_task_id == parent_task_id)
@@ -141,12 +215,46 @@ async def list_tasks(
             Task.id.desc(),
         )
     else:
-        q = q.order_by(Task.created_at.desc())
+        q = q.order_by(Task.created_at.desc(), Task.id.desc())
     q = q.limit(limit).offset(offset)
 
     result = await db.execute(q)
     count_result = await db.execute(count_q)
     return list(result.scalars().all()), count_result.scalar_one()
+
+
+def _merge_task_filter_values(
+    single: object | None,
+    multiple: Sequence[object] | None,
+) -> tuple[object, ...]:
+    """Merge legacy singular and new multi-value filters without duplicates."""
+
+    values: list[object] = []
+    candidates: list[object] = []
+    if single not in (None, ""):
+        candidates.append(single)
+    if multiple:
+        if isinstance(multiple, (str, bytes)):
+            candidates.append(multiple)
+        else:
+            candidates.extend(multiple)
+    for value in candidates:
+        if value in (None, "") or value in values:
+            continue
+        values.append(value)
+    return tuple(values)
+
+
+def _coerce_datetime_range(
+    after: str | datetime | None,
+    before: str | datetime | None,
+    field_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    after_dt = _coerce_datetime(after) if after is not None else None
+    before_dt = _coerce_datetime(before) if before is not None else None
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(f"{field_name}_after must be before or equal to {field_name}_before")
+    return after_dt, before_dt
 
 
 def _coerce_datetime(value: str | datetime) -> datetime:
@@ -179,6 +287,60 @@ async def _enforce_dependency_gate_for_start(
             "in_progress",
             "Task dependencies are not completed yet; waiting for predecessor outputs.",
         )
+
+
+async def _require_task_start_runtime(
+    db: AsyncSession,
+    task: Task,
+    fields: dict | None = None,
+):
+    """Resolve the exact runtime before an ``in_progress`` write.
+
+    ``update_task`` may change execution identity in the same request that
+    starts the Task. Resolve against a detached projection of those fields so
+    the factory sees the requested identity without dirtying or autoflushing
+    the persisted Task first. Subscription locks keep the selected binding
+    stable through the caller's status/outbox transaction.
+
+    A Workspace Task with no unambiguous active service scope has no runner.
+    It must remain in its prior state instead of becoming a stranded
+    ``in_progress`` row. Foreground Task adapters and standalone Tasks retain
+    their existing lifecycle semantics.
+    """
+    from packages.core.services.task_execution import resolve_task_execution
+
+    requested = fields or {}
+
+    def requested_value(name: str):
+        return requested[name] if name in requested else getattr(task, name, None)
+
+    projected_task = SimpleNamespace(
+        id=task.id,
+        entity_id=requested_value("entity_id"),
+        workspace_id=requested_value("workspace_id"),
+        task_type=requested_value("task_type"),
+        agent_id=requested_value("agent_id"),
+        agent_type=requested_value("agent_type"),
+        owner_service_key=requested_value("owner_service_key"),
+        owner_subscription_id=requested_value("owner_subscription_id"),
+        delegate_service_keys=requested_value("delegate_service_keys"),
+    )
+    execution = await resolve_task_execution(
+        db,
+        projected_task,
+        lock_subscriptions=True,
+    )
+    if (
+        projected_task.workspace_id
+        and execution.runtime_kind is TaskRuntimeKind.MANUAL
+    ):
+        raise TaskStatusTransitionError(
+            task.status,
+            "in_progress",
+            "Workspace Task cannot enter in_progress without one unambiguous "
+            "active service scope",
+        )
+    return execution
 
 
 async def get_task(db: AsyncSession, task_id: str, entity_id: str) -> Optional[Task]:
@@ -240,7 +402,17 @@ async def create_task(
     deadline: str | None = None,
     scheduled_at: str | None = None,
     duration_minutes: int | None = None,
+    origin_task_id: str | None = None,
 ) -> Task:
+    """Create a Task.
+
+    ``origin_task_id`` is host provenance only (the Runtime envelope's Task
+    when a Task run creates this one): it is recorded in
+    ``details.origin_task_id`` and defaults ``parent_task_id``. Caller
+    ``details`` can never supply it.
+    """
+    from packages.core.services.task_execution_origin import ORIGIN_TASK_KEY, record_task_origin
+
     if agent_id and not is_master_agent(agent_id):
         await lock_reusable_resource_references(
             db,
@@ -248,6 +420,7 @@ async def create_task(
             agent_ids=(agent_id,),
         )
     merged_details = dict(details or {})
+    merged_details.pop(ORIGIN_TASK_KEY, None)
     if scheduled_at:
         merged_details["scheduled_at"] = scheduled_at
     if duration_minutes:
@@ -273,6 +446,15 @@ async def create_task(
         details=merged_details,
         deadline=_coerce_datetime(deadline) if deadline else None,
     )
+    record_task_origin(task, origin_task_id)
+    if workspace_id:
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is not None and workspace.entity_id == entity_id:
+            from packages.core.ai.runtime.task_requirements import (
+                apply_workspace_service_task_requirements,
+            )
+
+            apply_workspace_service_task_requirements(task, workspace)
     from packages.core.services.task_session import validate_new_task_session
 
     validate_new_task_session(task)
@@ -302,7 +484,8 @@ async def create_task(
     else:
         creator_display, creator_meta, creator_actor = "system", None, TaskActor.SYSTEM
     await add_task_log(
-        db, task.id, TaskLogType.CREATE, f"Task created: {title}",
+        db, task.id, TaskLogType.CREATE,
+        t("task.log.created", locale=await _task_log_locale(db, creator_id), title=title),
         actor=creator_actor,
         created_by=creator_display,
         metadata={**(creation_log_metadata or {}), **(creator_meta or {})},
@@ -353,13 +536,84 @@ async def update_task(
     entity_id: str,
     *,
     user_id: str | None = None,
+    manual_execution: bool = False,
     dispatch_plan: bool = True,
+    require_nonterminal: bool = False,
+    log_locale: str | None = None,
     **fields,
 ) -> Optional[Task]:
     task = await get_task(db, task_id, entity_id)
     if not task:
         return None
-    if task.task_type == TaskType.INTERACTIVE.value:
+    requested_status = fields.get("status")
+    entering_terminal = requested_status in TERMINAL_STATUSES
+    if entering_terminal:
+        # Canonical approval-boundary lock order is HitlRequest → Task.  Close
+        # every unspent Task-origin request first, including an orphan created
+        # in the guard-commit/checkpoint-write crash window, then lock and
+        # refresh the Task before applying its terminal transition.
+        from packages.core.services.task_runtime_approvals import (
+            expire_task_runtime_approval_for_terminal,
+        )
+
+        await expire_task_runtime_approval_for_terminal(
+            db,
+            task=task,
+            reason=f"task_{requested_status}",
+        )
+        task = (await db.execute(
+            select(Task).where(
+                Task.id == task_id,
+                Task.entity_id == entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one()
+        if require_nonterminal and task.status in TERMINAL_STATUSES:
+            # Worker finalization is a compare-and-set, not a normal edit.  A
+            # terminal row written by cancellation/recovery (including the
+            # same target status with different evidence) is authoritative.
+            # Raise while the row lock is still held so the caller can return
+            # that committed row without overwriting its output/details.
+            raise TaskStatusTransitionError(
+                task.status,
+                str(requested_status),
+                "Task was already terminal before worker finalization",
+            )
+    elif require_nonterminal:
+        # A worker may also finish in a non-terminal attention state such as
+        # waiting_on_customer/blocked.  Serialize that compare-and-set through
+        # the same per-Task boundary so it cannot revive a Task cancelled just
+        # after the initial unlocked read.
+        from packages.core.services.task_runtime_approvals import (
+            lock_task_runtime_approval_boundary,
+        )
+
+        await lock_task_runtime_approval_boundary(db, task_id=task_id)
+        task = (await db.execute(
+            select(Task).where(
+                Task.id == task_id,
+                Task.entity_id == entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one()
+        if task.status in TERMINAL_STATUSES:
+            raise TaskStatusTransitionError(
+                task.status,
+                str(requested_status),
+                "Task was already terminal before worker finalization",
+            )
+    elif task.task_type == TaskType.INTERACTIVE.value:
+        task = (await db.execute(
+            select(Task).where(
+                Task.id == task_id,
+                Task.entity_id == entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one()
+    elif requested_status is not None:
+        # Every lifecycle transition must decide old -> new from a locked,
+        # current row. Without this refresh, two concurrent starts can both
+        # observe ``pending`` and mint different status_changed_at/outbox
+        # generations; the stale-intent fence eventually converges, but only
+        # after potentially wasting a Planner turn. Terminal transitions keep
+        # their stricter HitlRequest -> Task lock order above.
         task = (await db.execute(
             select(Task).where(
                 Task.id == task_id,
@@ -400,9 +654,24 @@ async def update_task(
 
     old_status = task.status
     old_assignee_id = task.assignee_id
+    terminal_runtime_marker = None
+    if entering_terminal and isinstance(task.details, dict):
+        from packages.core.services.task_runtime_approvals import (
+            TASK_RUNTIME_HITL_DETAIL_KEY,
+        )
+
+        current_marker = task.details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
+        if isinstance(current_marker, dict):
+            terminal_runtime_marker = dict(current_marker)
     new_status = fields.get("status")
+    start_execution = None
     if new_status is not None and new_status != old_status:
         await _enforce_dependency_gate_for_start(db, task, fields)
+        if new_status == "in_progress":
+            # Factory admission happens before the status mutation. A
+            # Workspace MANUAL result therefore cannot be committed as a
+            # runner-less in-progress Task by update, Kanban, or bulk callers.
+            start_execution = await _require_task_start_runtime(db, task, fields)
         await apply_task_status_transition(
             task, new_status, db=db,
             actor_kind="user" if user_id else "system", actor_id=user_id,
@@ -442,6 +711,28 @@ async def update_task(
         if k == "deadline" and isinstance(v, str):
             v = _coerce_datetime(v)
         setattr(task, k, v)
+
+    if manual_execution and user_id and (
+        new_status in {"pending", "in_progress"} or fields.get("agent_id")
+    ):
+        from packages.core.services.task_execution_origin import record_manual_task_execution
+
+        record_manual_task_execution(task, user_id=user_id, action="task_start")
+
+    if entering_terminal:
+        details = dict(task.details or {})
+        from packages.core.services.task_runtime_approvals import (
+            TASK_RUNTIME_HITL_DETAIL_KEY,
+        )
+
+        marker = terminal_runtime_marker or details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
+        if isinstance(marker, dict):
+            details[TASK_RUNTIME_HITL_DETAIL_KEY] = {
+                **marker,
+                "state": "finished",
+                "result_status": requested_status,
+            }
+            task.details = details
 
     if task.task_type == TaskType.INTERACTIVE.value:
         from packages.core.services.task_session import resolve_task_session_host
@@ -494,8 +785,16 @@ async def update_task(
 
     # Track status transitions
     if new_status is not None and new_status != old_status:
+        event_locale = log_locale or await _task_log_locale(
+            db, user_id or task.creator_id or task.owner_id,
+        )
         await add_task_log(
-            db, task_id, TaskLogType.STATUS_CHANGE, f"Status: {old_status} → {fields['status']}",
+            db, task_id, TaskLogType.STATUS_CHANGE,
+            t(
+                "task.log.status_changed", locale=event_locale,
+                old_status=t(f"task.status.{old_status}", locale=event_locale),
+                new_status=t(f"task.status.{new_status}", locale=event_locale),
+            ),
             actor=TaskActor.SYSTEM,
         )
 
@@ -509,26 +808,26 @@ async def update_task(
             "workspace_id": task.workspace_id,
         })
 
-        # Plan-driven dispatch: when a task with an owner_subscription
-        # transitions to in_progress, hand it to the Planner asynchronously.
-        # The legacy ``run_agent_task`` Celery path stays available for
-        # plain TaskRunner-driven tasks (no owner_subscription), so this
-        # hook is purely additive — old call sites unaffected.
+        # First execution uses the same route as manual recovery. A Workspace
+        # team can plan without a pinned owner. Assigned TaskRunner tasks are
+        # still dispatched by their existing API/scheduler entrypoints.
         if (
             new_status == "in_progress"
             and old_status != "in_progress"
             and dispatch_plan
-            and task.task_type != TaskType.INTERACTIVE.value
-            and (task.owner_subscription_id or task.owner_service_key)
         ):
-            try:
-                from packages.core.tasks.ai_tasks import plan_and_run_task
-                plan_and_run_task.delay(task_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "task %s: failed to dispatch plan_and_run_task: %s",
-                    task_id, exc,
-                )
+            from packages.core.services.task_execution import (
+                stage_task_execution_intent,
+            )
+
+            if (
+                start_execution is not None
+                and start_execution.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
+            ):
+                # The Task transition and its initial execution intent commit
+                # atomically. A broker outage can delay delivery, but cannot
+                # strand an in-progress Workspace Task without a durable start.
+                await stage_task_execution_intent(db, task, start_execution)
         if new_status in TERMINAL_STATUSES:
             try:
                 from packages.core.services.workspace_operation_service import check_work_batch_completion
@@ -750,6 +1049,7 @@ async def get_tasks_by_status(
     include_automations: bool = False,
     limit_per_status: int = 50,
     readable_workspace_ids: set[str] | None = None,
+    offset_per_status: int = 0,
 ) -> dict[str, list]:
     """Get tasks grouped by status for Kanban board.
 
@@ -758,8 +1058,8 @@ async def get_tasks_by_status(
     page via ``scheduled_job_runs``, so they don't belong on the
     user's Kanban. Pass ``include_automations=True`` to opt in.
 
-    ``limit_per_status`` caps how many tasks load per status group.
-    The total count badge still shows the real count; the UI paginates.
+    ``limit_per_status`` and ``offset_per_status`` page each status group
+    independently. Counts always cover the full readable, filtered scope.
 
     Returns: ``{"pending": [...], "in_progress": [...], ...}``
     """
@@ -774,17 +1074,37 @@ async def get_tasks_by_status(
             Task.workspace_id.is_(None),
             Task.workspace_id.in_(readable_workspace_ids),
         ))
-    q = q.order_by(Task.priority.desc(), Task.created_at.desc())
-    result = await db.execute(q)
-    tasks = list(result.scalars().all())
-
-    board: dict[str, list] = {}
-    status_counts: dict[str, int] = {}
-    for task in tasks:
-        status_counts[task.status] = status_counts.get(task.status, 0) + 1
-        bucket = board.setdefault(task.status, [])
-        if len(bucket) < limit_per_status:
-            bucket.append(task)
+    scoped_tasks = q.with_only_columns(
+        Task.id, Task.status, Task.priority, Task.created_at,
+    ).subquery()
+    counts = await db.execute(
+        select(scoped_tasks.c.status, func.count())
+        .group_by(scoped_tasks.c.status)
+    )
+    status_counts = dict(counts.all())
+    ranked_tasks = select(
+        scoped_tasks.c.id,
+        func.row_number().over(
+            partition_by=scoped_tasks.c.status,
+            order_by=(
+                scoped_tasks.c.priority.desc(),
+                scoped_tasks.c.created_at.desc(),
+                scoped_tasks.c.id.desc(),
+            ),
+        ).label("status_position"),
+    ).subquery()
+    result = await db.execute(
+        select(Task)
+        .join(ranked_tasks, ranked_tasks.c.id == Task.id)
+        .where(
+            ranked_tasks.c.status_position > offset_per_status,
+            ranked_tasks.c.status_position <= offset_per_status + limit_per_status,
+        )
+        .order_by(Task.priority.desc(), Task.created_at.desc(), Task.id.desc())
+    )
+    board: dict[str, list] = {status: [] for status in status_counts}
+    for task in result.scalars().all():
+        board.setdefault(task.status, []).append(task)
     # Attach total counts so the UI can show "20 of 150" without loading all
     board["_counts"] = status_counts  # type: ignore[assignment]
     return board
@@ -798,13 +1118,66 @@ async def move_task(db: AsyncSession, task_id: str, entity_id: str, new_status: 
     if not task:
         return None
 
+    if new_status in TERMINAL_STATUSES:
+        from packages.core.services.task_runtime_approvals import (
+            expire_task_runtime_approval_for_terminal,
+        )
+
+        await expire_task_runtime_approval_for_terminal(
+            db,
+            task=task,
+            reason=f"task_{new_status}",
+        )
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == task_id, Task.entity_id == entity_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one()
+
     old_status = task.status
+    start_execution = None
     if new_status != old_status:
         fields: dict = {"status": new_status}
         await _enforce_dependency_gate_for_start(db, task, fields)
+        if new_status == "in_progress":
+            start_execution = await _require_task_start_runtime(db, task, fields)
         if "details" in fields:
             task.details = fields["details"]
     await apply_task_status_transition(task, new_status, db=db)
+
+    if (
+        new_status == "in_progress"
+        and new_status != old_status
+    ):
+        # Kanban moves are a real Task-start surface, not a display-only status
+        # edit. Keep them on the same closed runtime factory and transactional
+        # start-intent boundary as update_task(). Foreground interactive and
+        # approval adapters are classified here but deliberately not queued.
+        from packages.core.services.task_execution import (
+            stage_task_execution_intent,
+        )
+
+        if (
+            start_execution is not None
+            and start_execution.runtime_kind is TaskRuntimeKind.COORDINATED_PLAN
+        ):
+            await stage_task_execution_intent(db, task, start_execution)
+
+    if new_status in TERMINAL_STATUSES:
+        from packages.core.services.task_runtime_approvals import (
+            TASK_RUNTIME_HITL_DETAIL_KEY,
+        )
+
+        details = dict(task.details or {})
+        marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
+        if isinstance(marker, dict):
+            details[TASK_RUNTIME_HITL_DETAIL_KEY] = {
+                **marker,
+                "state": "finished",
+                "result_status": new_status,
+            }
+            task.details = details
 
     await db.flush()
     if new_status in TERMINAL_STATUSES:

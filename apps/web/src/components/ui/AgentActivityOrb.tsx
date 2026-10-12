@@ -7,7 +7,6 @@ import type {
   AssistantBlock,
   AssistantProcessStep,
   ChatMessage,
-  SubAgentEvent,
   ToolCall,
 } from "../../lib/chatStream";
 import { getLocale } from "../../lib/i18n";
@@ -74,6 +73,7 @@ function isPendingStatus(status: unknown): boolean {
 
 function activityForOperation(name: string): AgentActivity {
   const normalized = name.trim().toLowerCase();
+  if (normalized === "ai_edit_read_current_file" || normalized === "ai_edit_verify_patch") return "working";
   if (SEARCH_PATTERN.test(normalized)) return "searching";
   if (SHAPE_PATTERN.test(normalized)) return "shaping";
   if (CONNECT_PATTERN.test(normalized) || normalized.startsWith("mcp__")) return "connecting";
@@ -82,35 +82,39 @@ function activityForOperation(name: string): AgentActivity {
   return "working";
 }
 
-function runningSubAgents(events: SubAgentEvent[] | undefined): SubAgentEvent[] {
-  return (events || []).filter((event) => isPendingStatus(event.status));
-}
-
 function activeToolName(tools: ToolCall[] | undefined): string {
-  const active = [...(tools || [])]
-    .reverse()
-    .find((tool) => isPendingStatus(tool.status || (tool.result ? "success" : "pending")));
-  return active?.activeChild || active?.name || "";
+  for (let index = (tools?.length || 0) - 1; index >= 0; index -= 1) {
+    const tool = tools![index];
+    if (isPendingStatus(tool.status || (tool.result ? "success" : "pending"))) {
+      return tool.activeChild || tool.name || "";
+    }
+  }
+  return "";
 }
 
 function activeProcessStep(blocks: AssistantBlock[] | undefined): AssistantProcessStep | undefined {
-  const steps = (blocks || [])
-    .filter((block) => block.type === "process")
-    .flatMap((block) => block.steps || []);
-  return [...steps].reverse().find((step) => isPendingStatus(step.status));
+  for (let index = (blocks?.length || 0) - 1; index >= 0; index -= 1) {
+    const block = blocks![index];
+    if (block.type !== "process") continue;
+    for (let stepIndex = (block.steps?.length || 0) - 1; stepIndex >= 0; stepIndex -= 1) {
+      const step = block.steps![stepIndex];
+      if (isPendingStatus(step.status)) return step;
+    }
+  }
+  return undefined;
 }
 
 /** Map the real streaming envelope to one of thinking-orbs' visual states. */
 export function inferAgentActivity(message?: Pick<ChatMessage, "content" | "tool_calls" | "assistant_blocks" | "sub_agent_events"> | null): AgentActivity {
   if (!message) return "breathing";
-  if (runningSubAgents(message.sub_agent_events).length > 0) return "weaving";
+  if (message.sub_agent_events?.some((event) => isPendingStatus(event.status))) return "weaving";
 
   const toolName = activeToolName(message.tool_calls);
   if (toolName) return activityForOperation(toolName);
-  if (message.content?.trim()) return "composing";
 
   const processStep = activeProcessStep(message.assistant_blocks);
   if (processStep?.name) return activityForOperation(processStep.name);
+  if (message.content?.trim()) return "composing";
   return "solving";
 }
 

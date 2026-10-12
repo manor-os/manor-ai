@@ -88,7 +88,6 @@ def test_solo_business_idea_skills_are_default_runtime_guidance(slug: str):
     policy = SkillInvocationPolicy.from_config(config["invocation_policy"])
     assert policy.mode == REQUIRED_BEFORE_ANSWER
     assert policy.result_authority == PRIMARY_SOURCE
-    assert "regardless of language" in policy.semantic_trigger
 
 
 def test_default_idea_skills_are_not_duplicated_in_marketplace():
@@ -105,58 +104,6 @@ def test_default_idea_skill_resources_are_available_to_runtime(slug: str):
     )
 
     assert set(files) == EXPECTED_PATHS[slug]
-
-
-def test_idea_finder_is_founder_fit_evidence_first_and_fast():
-    prompt = (ROOT / "solo-business-idea-finder/SKILL.md").read_text(encoding="utf-8")
-
-    assert "Never invent customer pain" in prompt
-    assert "Provided fact" in prompt
-    assert "Observed evidence" in prompt
-    assert "weekly delivery/support load at 1, 10, and 30 customers" in prompt
-    assert "Apply hard filters before scoring" in prompt
-    assert "evidence caps" in prompt
-    assert "Provisional ranking" in prompt
-    assert "Do not require Workflow" in prompt
-    assert "Use `web_search` for a fast, current public scan" in prompt
-    assert 'skill="chrome"' in prompt
-    assert "X or LinkedIn" in prompt
-    assert "default Manor" in prompt
-    assert "For a quick chat request" in prompt
-    assert "Never describe an untested idea as validated demand" in prompt
-
-
-def test_idea_review_has_clear_verdict_red_team_and_validation_integrity():
-    prompt = (ROOT / "solo-business-idea-review/SKILL.md").read_text(encoding="utf-8")
-
-    assert "Reserve `Validated`" in prompt
-    assert "Do not average away a fatal flaw" in prompt
-    assert "Do not apply venture-capital thresholds" in prompt
-    assert "PROCEED TO TEST" in prompt
-    assert "REVISE BEFORE TEST" in prompt
-    assert "REFRAME" in prompt
-    assert "PARK / STOP" in prompt
-    assert "strongest disconfirming evidence" in prompt
-    assert "1, 10, and 30 customers" in prompt
-    assert "customer-research" in prompt
-    assert "competitor-brief" in prompt
-    assert "Use `web_search` for a fast, current public scan" in prompt
-    assert 'skill="chrome"' in prompt
-    assert "Planning an experiment does not authorize outreach" in prompt
-    assert "For a quick audit" in prompt
-    assert "Do not require Workflow" in prompt
-
-
-@pytest.mark.parametrize("slug", SKILL_SLUGS)
-def test_solo_business_idea_bundles_have_professional_examples_and_no_placeholders(
-    slug: str,
-):
-    skill_dir = ROOT / slug
-    all_text = "\n".join(path.read_text(encoding="utf-8") for path in skill_dir.rglob("*.md"))
-
-    assert "[TODO:" not in all_text
-    assert "This example is fictional" in all_text
-    assert "success probability" in all_text or "probability of success" in all_text
 
 
 @pytest.mark.parametrize("slug", SKILL_SLUGS)

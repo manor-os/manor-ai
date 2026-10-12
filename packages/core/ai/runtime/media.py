@@ -25,6 +25,7 @@ async def runtime_generate_image_media(
     task_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
+    workspace_shared: bool = False,
 ) -> str:
     """Run image generation through the Runtime media boundary."""
 
@@ -39,6 +40,7 @@ async def runtime_generate_image_media(
         task_id=task_id,
         agent_id=agent_id,
         conversation_id=conversation_id,
+        _workspace_shared_from_context=workspace_shared,
         **dict(params or {}),
     )
 
@@ -104,6 +106,38 @@ async def runtime_generate_video_media(
         _runtime_artifact_urls_from_context=list(runtime_artifact_urls or []),
         _dependency_artifact_urls_from_context=list(dependency_artifact_urls or []),
         **dict(params or {}),
+    )
+
+
+async def runtime_resolve_suno_audio_credentials(
+    *,
+    user_id: str,
+    entity_id: str,
+    byok: bool,
+) -> RuntimeMediaCredentials:
+    """Resolve the role-scoped BYOK key or Manor's managed Suno key."""
+
+    from packages.core.ai.tools.extended_tools import (
+        _platform_native_media_credential_async,
+        _resolve_user_media_credentials,
+    )
+
+    if byok:
+        api_key, base_url_override, is_byok = await _resolve_user_media_credentials(
+            user_id,
+            entity_id,
+            role="audio",
+        )
+    else:
+        api_key, native_base_url = await _platform_native_media_credential_async("suno")
+        base_url_override = native_base_url
+        is_byok = False
+    return RuntimeMediaCredentials(
+        api_key=api_key,
+        provider="suno",
+        catalog_provider="suno",
+        base_url_override=base_url_override,
+        is_byok=is_byok,
     )
 
 
@@ -250,3 +284,29 @@ async def runtime_resolve_video_generation_credentials(
         base_url_override=base_url_override,
         is_byok=is_byok,
     )
+
+
+# ── recording tool helpers for sibling tool modules ─────────────────────────
+# Tool modules never import each other (``test_production_tool_to_tool_imports_
+# stay_runtime_owned``); the creative studio tools reach recording_tools' schema
+# and path helpers through these runtime-owned bridges.
+
+
+def runtime_recording_tool_schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
+    from packages.core.ai.tools.recording_tools import _schema
+
+    return _schema(name, description, properties, required)
+
+
+async def runtime_recording_output_scope(
+    entity_id: str, workspace_id: str | None, task_id: str | None, output_directory: str,
+) -> tuple[str, str]:
+    from packages.core.ai.tools.recording_tools import _scope
+
+    return await _scope(entity_id, workspace_id, task_id, output_directory)
+
+
+async def runtime_recording_source_path(reference: str, ctx: dict) -> tuple[str, str]:
+    from packages.core.ai.tools.recording_tools import _source_path
+
+    return await _source_path(reference, ctx)

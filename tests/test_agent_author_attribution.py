@@ -91,16 +91,6 @@ def test_nothing_writes_a_placeholder_any_more():
     assert not offenders, f"placeholder still written at {offenders}"
 
 
-def test_an_agent_less_call_resolves_to_the_master_agent():
-    """No agent id does not mean no agent: the master agent ran it."""
-    import inspect
-
-    from packages.core.services.task_service import agent_log_authorship
-
-    body = inspect.getsource(agent_log_authorship)
-    assert "return MANOR_AGENT_NAME, None, TaskActor.MANOR" in body
-
-
 # ── The wire ──────────────────────────────────────────────────────────
 
 

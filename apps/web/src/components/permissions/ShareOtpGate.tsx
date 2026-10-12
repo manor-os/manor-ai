@@ -6,9 +6,10 @@ import { t } from "../../lib/i18n";
 interface ShareOtpGateProps {
   endpoint: string;
   onVerified: () => void;
+  minimal?: boolean;
 }
 
-export default function ShareOtpGate({ endpoint, onVerified }: ShareOtpGateProps) {
+export default function ShareOtpGate({ endpoint, onVerified, minimal = false }: ShareOtpGateProps) {
   const [email, setEmail] = useState("");
   const [code, setCode] = useState("");
   const [step, setStep] = useState<"email" | "code">("email");
@@ -52,7 +53,8 @@ export default function ShareOtpGate({ endpoint, onVerified }: ShareOtpGateProps
   return (
     <form
       onSubmit={submit}
-      style={{
+      className={minimal ? "signature-otp mt-6" : undefined}
+      style={minimal ? undefined : {
         maxWidth: 420,
         margin: "28px auto 12px",
         padding: 20,
@@ -61,14 +63,16 @@ export default function ShareOtpGate({ endpoint, onVerified }: ShareOtpGateProps
         boxShadow: "var(--shadow-sm)",
       }}
     >
-      <h2 style={{ margin: "0 0 6px", color: "var(--text-strong)", fontSize: 18 }}>
+      <h2 className={minimal ? "sr-only" : undefined} style={minimal ? undefined : { margin: "0 0 6px", color: "var(--text-strong)", fontSize: 18 }}>
         {t("page.shared.verify_title")}
       </h2>
-      <p style={{ margin: "0 0 18px", color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
-        {step === "email"
-          ? t("page.shared.verify_email_hint")
-          : t("page.shared.verify_code_hint", { email })}
-      </p>
+      {(!minimal || step === "code") && (
+        <p style={{ margin: "0 0 18px", color: "var(--text-muted)", fontSize: 13, lineHeight: 1.5 }}>
+          {step === "email"
+            ? t("page.shared.verify_email_hint")
+            : t("page.shared.verify_code_hint", { email })}
+        </p>
+      )}
       <Input
         label={step === "email" ? t("page.shared.email") : t("page.shared.code")}
         value={step === "email" ? email : code}

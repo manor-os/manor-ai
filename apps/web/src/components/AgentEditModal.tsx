@@ -1,5 +1,7 @@
+import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import React, { useState, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
@@ -248,6 +250,7 @@ export function TestPromptPanel({
 }
 
 export default function AgentEditModal() {
+  const catalogScope = useCatalogScope();
   const agentId = useAgentEditModalStore((s) => s.agentId);
   const showModal = agentId !== undefined;
   const isEditing = typeof agentId === "string";
@@ -275,6 +278,9 @@ export default function AgentEditModal() {
   const [formTestMsg, setFormTestMsg] = useState("");
   const [formTestResp, setFormTestResp] = useState("");
   const [formTestLoading, setFormTestLoading] = useState(false);
+  // True while the agent's current skill/tool bindings are being fetched, so
+  // the tabs can show "loading" instead of an empty (misleading) selection.
+  const [bindingsLoading, setBindingsLoading] = useState(false);
   const [improvingFormPrompt, setImprovingFormPrompt] = useState(false);
   const [formAvatarUploading, setFormAvatarUploading] = useState(false);
   const [formRuntimeProfile, setFormRuntimeProfile] =
@@ -299,9 +305,8 @@ export default function AgentEditModal() {
   const promptTextareaRef = useRef<HTMLTextAreaElement>(null);
 
   const { data: entitySkills } = useQuery({
-    queryKey: ["skills", "list"],
-    queryFn: () => api.skills.list({ include_platform: true }),
-    enabled: privateApiEnabled && showModal,
+    ...skillListQueryOptions(catalogScope, { include_platform: true }),
+    enabled: privateApiEnabled && !!catalogScope && showModal,
   });
 
   const { data: toolCatalog } = useQuery({
@@ -480,6 +485,7 @@ export default function AgentEditModal() {
         setFormTags(formatUserFacingText(tags));
         setFormTestMsg("");
         setFormTestResp("");
+        setBindingsLoading(true);
         const [boundSkills, availableSkills, boundTools] = await Promise.all([
           api.skills.listAgentBindings(agent.id),
           api.skills.listAgentAvailable(agent.id),
@@ -492,8 +498,10 @@ export default function AgentEditModal() {
         const boundToolIds = (boundTools || []).map((t: any) => t.id);
         setOrigToolIds(boundToolIds);
         setEditToolIds([...boundToolIds]);
+        setBindingsLoading(false);
       } catch {
         if (cancelled) return;
+        setBindingsLoading(false);
         setOrigSkillIds([]);
         setEditSkillIds([]);
         setOrigToolIds([]);
@@ -526,7 +534,9 @@ export default function AgentEditModal() {
           hasBindingFailures = results.some((r) => r.status === "rejected");
         }
       }
-      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       closeModal();
         if (hasBindingFailures) {
           toast.error(t("page.agents.agent_created_but_some_tool_skill_bindings_faile"));
@@ -541,6 +551,7 @@ export default function AgentEditModal() {
       api.agents.update(id, data),
     onSuccess: async () => {
       const agentId2 = editingAgent?.id as string;
+      let hasBindingFailures = false;
       if (agentId2) {
         const toAttachSkills = editSkillIds.filter(
           (id: string) => !origSkillIds.includes(id),
@@ -558,33 +569,57 @@ export default function AgentEditModal() {
         for (const skillId of toAttachSkills) {
           try {
             await api.skills.bindSkill(agentId2, skillId);
+            setOrigSkillIds((ids) => Array.from(new Set([...ids, skillId])));
           } catch {
-            /* non-fatal */
+            hasBindingFailures = true;
           }
         }
         for (const skillId of toDetachSkills) {
           try {
             await api.skills.unbindSkill(agentId2, skillId);
+            setOrigSkillIds((ids) => ids.filter((id) => id !== skillId));
           } catch {
-            /* non-fatal */
+            hasBindingFailures = true;
           }
         }
         if (toAttachTools.length > 0) {
           try {
             await api.agents.bindTools(agentId2, toAttachTools);
+            setOrigToolIds((ids) => Array.from(new Set([...ids, ...toAttachTools])));
           } catch {
-            /* non-fatal */
+            hasBindingFailures = true;
           }
         }
         if (toDetachTools.length > 0) {
           try {
             await api.agents.unbindTools(agentId2, toDetachTools);
+            setOrigToolIds((ids) => ids.filter((id) => !toDetachTools.includes(id)));
           } catch {
-            /* non-fatal */
+            hasBindingFailures = true;
           }
         }
       }
-      queryClient.invalidateQueries({ queryKey: ["agents"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-agents"] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-capabilities"] });
+      if (hasBindingFailures) {
+        // Keep the user's requested selections, but base a retry on the
+        // bindings that actually committed so successful changes are retained.
+        try {
+          const [boundSkills, boundTools] = await Promise.all([
+            api.skills.listAgentBindings(agentId2),
+            api.agents.getTools(agentId2),
+          ]);
+          setOrigSkillIds((boundSkills || []).map((skill: any) => skill.id));
+          setOrigToolIds((boundTools || []).map((tool: any) => tool.id));
+        } catch {
+          // Preserve the confirmed binding updates above if readback fails.
+        }
+        toast.error(t("page.agents.agent_bindings_update_failed"));
+        return;
+      }
       closeModal();
       toast.success(t("page.agents.agent_updated"));
     },
@@ -734,7 +769,9 @@ export default function AgentEditModal() {
                   toast.error(e?.message || t("page.agent_form.ai_failed"));
                   throw e;
                 }
-                queryClient.invalidateQueries({ queryKey: ["agents"] });
+                invalidateCatalogQueries(queryClient, "agents");
+                invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+                queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
                 toast.success(t("page.agent_form.ai_updated"));
                 closeModal();
               }}
@@ -1133,6 +1170,9 @@ export default function AgentEditModal() {
                   <span>{selectedSkillCount} selected</span>
                 </div>
                 <div className="mt-2 max-h-64 overflow-y-auto rounded-xl border border-stone-200 bg-white">
+                  {bindingsLoading && (
+                    <div className="p-3 text-xs text-stone-400">{t("page.agents.loading_bindings")}</div>
+                  )}
                   {filteredSkills.length === 0 ? (
                     <div className="p-3 text-xs text-stone-400">{t("page.agents.no_skills_available")}</div>
                   ) : (
@@ -1225,6 +1265,9 @@ export default function AgentEditModal() {
                 </div>
               </div>
               <div className="mt-2 max-h-64 overflow-y-auto rounded-xl border border-stone-200 bg-white divide-y divide-stone-100">
+                {bindingsLoading && (
+                  <div className="p-3 text-xs text-stone-400">{t("page.agents.loading_bindings")}</div>
+                )}
                 {filteredTools.length === 0 ? (
                   <div className="p-3 text-xs text-stone-400">{t("page.agents.no_tools_available")}</div>
                 ) : (

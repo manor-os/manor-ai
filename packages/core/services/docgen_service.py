@@ -326,18 +326,27 @@ def _generate_pdf_reportlab(title: str, content: str, options: dict | None = Non
         ListFlowable, ListItem,
     )
     from reportlab.lib import colors  # type: ignore[import-untyped]
+    from reportlab.pdfbase import pdfmetrics  # type: ignore[import-untyped]
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont  # type: ignore[import-untyped]
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.75 * inch, bottomMargin=0.75 * inch)
     styles = getSampleStyleSheet()
+    cjk_font = "STSong-Light" if re.search(r"[\u3400-\u9fff]", title + content) else None
+    if cjk_font:
+        pdfmetrics.registerFont(UnicodeCIDFont(cjk_font))
 
     # Custom styles
     title_style = ParagraphStyle(
         "DocTitle", parent=styles["Title"], fontSize=20, spaceAfter=20,
+        fontName=cjk_font or styles["Title"].fontName,
     )
-    h2_style = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=16, spaceAfter=10)
-    h3_style = ParagraphStyle("H3", parent=styles["Heading3"], fontSize=13, spaceAfter=8)
-    body_style = styles["BodyText"]
+    h2_style = ParagraphStyle("H2", parent=styles["Heading2"], fontSize=16, spaceAfter=10,
+                              fontName=cjk_font or styles["Heading2"].fontName)
+    h3_style = ParagraphStyle("H3", parent=styles["Heading3"], fontSize=13, spaceAfter=8,
+                              fontName=cjk_font or styles["Heading3"].fontName)
+    body_style = (ParagraphStyle("BodyCJK", parent=styles["BodyText"], fontName=cjk_font)
+                  if cjk_font else styles["BodyText"])
     bullet_style = styles["BodyText"]
 
     heading_styles = {1: title_style, 2: h2_style, 3: h3_style}
@@ -387,7 +396,7 @@ def _generate_pdf_reportlab(title: str, content: str, options: dict | None = Non
             t.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#4472C4")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 0), (-1, -1), cjk_font or "Helvetica-Bold"),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#D9E2F3")]),
             ]))

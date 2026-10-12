@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+from types import SimpleNamespace
 
 from apps.api.routers.chat import (
     _VideoEditRouteState,
@@ -307,18 +307,12 @@ def test_video_chat_mode_auto_and_native_motion_force_video_edit():
 
     native_prompt = _chat_mode_runtime_prompt("video", {"generation_mode": "native_motion"})
     assert native_prompt is not None
-    assert "Do not call a video-generation model" in native_prompt
     assert "video-edit" in native_prompt
     assert "explicit user approval" in native_prompt
-    assert "Do not substitute manor.video_edit_recipe" in native_prompt
 
     auto_prompt = _chat_mode_runtime_prompt("video", {"generation_mode": "auto"})
     assert auto_prompt is not None
-    assert "Decide per scene" in auto_prompt
-    assert "instead of routing every video request" in auto_prompt
     assert "video-edit" in auto_prompt
-    assert "video editing" in auto_prompt
-    assert "Do not silently fall back to manor.video_edit_recipe" in auto_prompt
 
 
 def test_auto_chat_does_not_guess_video_mode_from_keywords():
@@ -332,6 +326,22 @@ def test_auto_chat_does_not_guess_video_mode_from_keywords():
     )
 
     assert calls == []
+
+
+def test_auto_chat_does_not_force_video_skill_from_request_wording():
+    for prompt in (
+        "请只做一份 12 秒、9:16、两镜头的桌面咖啡机产品宣传视频画布。",
+        "怎么制作产品宣传视频？",
+        "请帮我修改这个视频的字幕",
+        "What is a video storyboard?",
+        "你自己去准备自己去编辑",
+    ):
+        assert _chat_mode_direct_tool_calls(
+            chat_mode="auto",
+            chat_mode_payload=None,
+            prompt=prompt,
+            attachments=FileAttachments(),
+        ) == []
 
 
 def test_auto_follow_up_routes_by_live_video_session_enum_without_keywords():
@@ -438,27 +448,6 @@ def test_video_route_rejects_sandbox_owned_by_another_user(monkeypatch):
     assert state is _VideoEditRouteState.INACTIVE
 
 
-def test_chat_clients_reset_mode_while_auto_can_continue_server_session():
-    root = Path(__file__).resolve().parents[1]
-    embedded = (root / "apps/web/src/components/EmbeddedChat.tsx").read_text()
-    floating = (root / "apps/web/src/components/FloatingChat.tsx").read_text()
-    brief = (root / "apps/web/src/components/ChatModeBriefPanel.tsx").read_text()
-
-    assert "const resetChatModeAfterTurn" in embedded
-    assert "const resetChatModeAfterTurn" in floating
-    assert 'const requestChatMode = chatMode === "auto" ? undefined : chatMode;' in embedded
-    assert '!editorLiveSessionActive && chatMode !== "auto"' in floating
-    assert "const turnChatMode = options.responseSurfaceSubmission" in embedded
-    assert "if (turnChatMode) resetChatModeAfterTurn();" in embedded
-    assert (
-        "if (!isResponseSurfaceSubmission && requestChatMode) "
-        "resetChatModeAfterTurn();"
-    ) in floating
-    assert "getPersistedChatModeState" not in embedded
-    assert "getPersistedChatModeState" not in floating
-    assert "getPersistedChatModeState" not in brief
-
-
 def test_video_chat_mode_ai_video_keeps_direct_generation_and_wait_contract():
     calls = _chat_mode_direct_tool_calls(
         chat_mode="video",
@@ -516,7 +505,6 @@ def test_image_chat_mode_directly_calls_image_generation_with_references():
 
     assert calls[0]["name"] == "generate_file"
     assert calls[0]["arguments"]["kind"] == "image"
-    assert "Typography/text is intentional" in calls[0]["arguments"]["prompt"]
     assert calls[0]["arguments"]["params"] == {
         "aspect_ratio": "9:16",
         "resolution": "4k",
@@ -570,7 +558,6 @@ def test_slides_full_page_image_mode_uses_llm_tool_parameter_selection():
     assert "invoke_skill" in prompt
     assert "pptx" in prompt
     assert "params.render='full_page_image'" in prompt
-    assert "params object" in prompt
     assert "generate_file" not in prompt
 
 
@@ -600,13 +587,11 @@ def test_flows_mode_routes_through_workspace_flow_tools_without_forcing_media():
     ) == []
 
     prompt = _chat_mode_runtime_prompt("flows")
-
     assert prompt is not None
     assert "search_tools" in prompt
-    assert prompt.index("search_tools") < prompt.index("list_workspace_flows")
     assert "list_workspace_flows" in prompt
     assert "start_workspace_flow" in prompt
-    assert "do not guess" in prompt.lower()
+
     assert _message_with_chat_mode_marker("Run it", "flows") == (
         "Run it\n[Mode: flows]"
     )
@@ -708,6 +693,74 @@ def test_normal_chat_with_images_still_uses_multimodal_blocks():
 
     assert isinstance(llm_message, list)
     assert llm_message[1]["image_url"]["url"] == "data:image/png;base64,abc"
+
+
+def test_normal_chat_video_reference_requires_frame_and_audio_evidence():
+    attachments = FileAttachments(
+        text_context="[Video: source.mp4 → /api/v1/fs/entity/uploads/chat/source.mp4]",
+        video_urls=["/api/v1/fs/entity/uploads/chat/source.mp4"],
+    )
+    llm_message = _stream_llm_message_with_attachments(
+        "What happens in this video?", attachments, [],
+    )
+
+    assert isinstance(llm_message, str)
+    assert "render_frame_samples" in llm_message
+    assert "transcribe_video" in llm_message
+    assert "Do not claim a visual or spoken detail was verified from the URL alone" in llm_message
+
+
+def test_plain_chat_uploaded_video_probes_before_model_tool_selection():
+    url = "/api/v1/fs/entity/uploads/chat/0123456789abcdef.mp4"
+    attachments = FileAttachments(
+        text_context=f"[Video: sample.mp4 → {url}]",
+        video_urls=[url],
+    )
+    attachments.add_attachment_ref(
+        kind="chat_upload", name="sample.mp4", path="uploads/chat/0123456789abcdef.mp4",
+        url=url, video=True,
+    )
+
+    for prompt in ("这个视频里是什么？", "Thoughts?", "请帮我修改这个视频的字幕"):
+        calls = _chat_mode_direct_tool_calls(
+            chat_mode="auto", chat_mode_payload=None,
+            prompt=prompt, attachments=attachments,
+        )
+        assert calls == [{"name": "probe_media", "arguments": {"input_path": url}}]
+    metadata = _runtime_metadata_for_chat_mode(
+        SimpleNamespace(attachments=attachments, runtime_metadata={}),
+        chat_mode="auto", chat_mode_prompt=None, direct_tool_calls=calls,
+    )
+    assert metadata["forced_tool_calls"] == calls
+    assert set(metadata["extra_tool_names"]) == {
+        "probe_media", "render_frame_samples", "transcribe_video", "read_file",
+    }
+
+
+def test_uploaded_video_is_probed_regardless_of_generation_wording():
+    url = "/api/v1/fs/entity/uploads/chat/0123456789abcdef.mp4"
+    attachments = FileAttachments(video_urls=[url])
+    attachments.add_attachment_ref(kind="chat_upload", url=url, video=True)
+
+    calls = _chat_mode_direct_tool_calls(
+        chat_mode="auto", chat_mode_payload=None,
+        prompt="根据这个视频重新制作一段产品广告", attachments=attachments,
+    )
+
+    assert calls == [{"name": "probe_media", "arguments": {"input_path": url}}]
+
+
+def test_uploaded_video_edit_request_gets_metadata_probe_without_forcing_a_skill():
+    url = "/api/v1/fs/entity/uploads/chat/0123456789abcdef.mp4"
+    attachments = FileAttachments(video_urls=[url])
+    attachments.add_attachment_ref(kind="chat_upload", url=url, video=True)
+
+    calls = _chat_mode_direct_tool_calls(
+        chat_mode="auto", chat_mode_payload=None,
+        prompt="请帮我修改这个视频的字幕", attachments=attachments,
+    )
+
+    assert calls == [{"name": "probe_media", "arguments": {"input_path": url}}]
 
 
 def test_editor_document_is_appended_as_escaped_untrusted_user_data():

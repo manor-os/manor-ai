@@ -15,6 +15,9 @@ import {
   WorkerState,
 } from "./types.js";
 
+const LEASE_ATTEMPT_TOKEN_CAPABILITY = "lease_attempt_token_version";
+const LEASE_ATTEMPT_TOKEN_VERSION = 1;
+
 export interface LeaseContext {
   readonly lease: Lease;
   /**
@@ -56,6 +59,9 @@ export class ManorWorker {
   private capabilities: Record<string, unknown> | null;
   private readonly handlers = new Map<string, LeaseHandler>();
   private readonly active = new Map<string, Promise<void>>();
+  private readonly attemptTokens = new Map<string, string>();
+  // Immutable terminal reports. A batch remains here until the heartbeat
+  // carrying that exact snapshot receives an acknowledgement.
   private completions: HeartbeatCompletedLease[] = [];
   private readonly stop = new AbortController();
   private readonly log: NonNullable<ManorWorkerOptions["logger"]>;
@@ -101,6 +107,92 @@ export class ManorWorker {
     this.capabilities = capabilities ? { ...capabilities } : null;
   }
 
+  private reportedCapabilities(): Record<string, unknown> {
+    return {
+      ...(this.capabilities ?? {}),
+      [LEASE_ATTEMPT_TOKEN_CAPABILITY]: LEASE_ATTEMPT_TOKEN_VERSION,
+    };
+  }
+
+  private queueCompletion(completion: HeartbeatCompletedLease): boolean {
+    const existing = this.completions.find(
+      (pending) => pending.lease_id === completion.lease_id,
+    );
+    if (existing) {
+      this.log.error(
+        `conflicting or duplicate terminal report ignored for lease ${completion.lease_id}`,
+      );
+      return false;
+    }
+    this.completions.push(structuredClone(completion));
+    return true;
+  }
+
+  private hasQueuedCompletion(leaseId: string): boolean {
+    return this.completions.some((completion) => completion.lease_id === leaseId);
+  }
+
+  private acknowledgeCompletions(completedBatch: HeartbeatCompletedLease[]): void {
+    const acknowledged = new Set(completedBatch);
+    this.completions = this.completions.filter(
+      (completion) => !acknowledged.has(completion),
+    );
+  }
+
+  private successCompletion(
+    lease: Lease,
+    result: LeaseResult,
+  ): HeartbeatCompletedLease {
+    const completion: HeartbeatCompletedLease = {
+      lease_id: lease.lease_id,
+      attempt_token: lease.attempt_token,
+      status: "done",
+      task_output_value_kind: result.task_output_value_kind ?? "task_payload",
+    };
+    if (Object.prototype.hasOwnProperty.call(result, "result")) {
+      completion.result = result.result;
+    }
+    if (Object.prototype.hasOwnProperty.call(result, "cost")) {
+      completion.cost = result.cost;
+    }
+    if (Object.prototype.hasOwnProperty.call(result, "evidence_refs")) {
+      completion.evidence_refs = result.evidence_refs;
+    }
+    return completion;
+  }
+
+  private async reportSuccess(lease: Lease, result: LeaseResult): Promise<void> {
+    try {
+      await this.client.completeLease(lease.lease_id, result, {
+        attemptToken: lease.attempt_token,
+      });
+    } catch (exc) {
+      // The handler already succeeded. Never turn an ambiguous completion
+      // transport into a contradictory failure; heartbeat retries the exact
+      // immutable terminal report.
+      this.log.warn(
+        `completeLease report failed for lease ${lease.lease_id}; queued for heartbeat retry: ${errMsg(exc)}`,
+      );
+    }
+  }
+
+  private async reportFailure(
+    lease: Lease,
+    error: Record<string, unknown>,
+    opts?: { willRetry?: boolean },
+  ): Promise<void> {
+    try {
+      await this.client.failLease(lease.lease_id, error, {
+        willRetry: opts?.willRetry,
+        attemptToken: lease.attempt_token,
+      });
+    } catch (exc) {
+      this.log.warn(
+        `failLease report failed for lease ${lease.lease_id}; queued for heartbeat retry: ${errMsg(exc)}`,
+      );
+    }
+  }
+
   // ── Run loop ─────────────────────────────────────────────────────────
 
   async runForever(): Promise<void> {
@@ -119,10 +211,13 @@ export class ManorWorker {
 
   private async loop(): Promise<void> {
     let nextHeartbeatIn = 2;
+    let lastHeartbeatIn = nextHeartbeatIn;
     while (!this.stop.signal.aborted) {
       try {
         nextHeartbeatIn = await this.tick();
+        lastHeartbeatIn = nextHeartbeatIn;
       } catch (exc) {
+        if (this.stop.signal.aborted) break;
         if (
           exc instanceof WorkerClientError &&
           exc.requiresOperatorAction
@@ -137,10 +232,10 @@ export class ManorWorker {
         }
         if (exc instanceof WorkerClientError) {
           this.log.warn(`heartbeat failed (${exc.message}) — backing off`);
-          nextHeartbeatIn = Math.max(nextHeartbeatIn, 10);
+          nextHeartbeatIn = Math.max(lastHeartbeatIn, 10, exc.retryAfterMs / 1000) + Math.random() * 2;
         } else {
           this.log.error("unexpected loop failure — backing off", exc);
-          nextHeartbeatIn = Math.max(nextHeartbeatIn, 30);
+          nextHeartbeatIn = Math.max(lastHeartbeatIn, 30) + Math.random() * 5;
         }
       }
       await sleepOrAbort(nextHeartbeatIn * 1000, this.stop.signal);
@@ -148,11 +243,18 @@ export class ManorWorker {
   }
 
   private async tick(): Promise<number> {
-    const active: HeartbeatActiveLease[] = [...this.active.keys()].map((lease_id) => ({
-      lease_id,
-    }));
-    const completedBatch = this.completions;
-    this.completions = [];
+    // Snapshot without removing. Handlers may append while heartbeat I/O is
+    // in flight; only this exact batch is removed after the response.
+    const completedBatch = [...this.completions];
+    const pendingCompletionIds = new Set(
+      this.completions.map((completion) => completion.lease_id),
+    );
+    const active: HeartbeatActiveLease[] = [...this.active.keys()]
+      .filter((lease_id) => !pendingCompletionIds.has(lease_id))
+      .map((lease_id) => ({
+        lease_id,
+        attempt_token: this.attemptTokens.get(lease_id),
+      }));
 
     const capacityN = Math.max(0, this.maxConcurrent - active.length);
     const state: WorkerState = this.stop.signal.aborted
@@ -167,9 +269,9 @@ export class ManorWorker {
       active_leases: active,
       completed_since_last: completedBatch,
       capacity: { can_accept_leases: capacityN },
-      capabilities: this.capabilities,
+      capabilities: this.reportedCapabilities(),
     };
-    const resp = await this.client.heartbeat(req);
+    const resp = await this.client.heartbeat(req, this.stop.signal);
 
     for (const lease of resp.new_leases ?? []) {
       this.spawnHandler(lease);
@@ -185,6 +287,8 @@ export class ManorWorker {
       }
     }
 
+    this.acknowledgeCompletions(completedBatch);
+
     return Math.max(1, Math.floor(resp.next_heartbeat_in_seconds || 5));
   }
 
@@ -195,10 +299,16 @@ export class ManorWorker {
       this.log.warn(`lease ${lease.lease_id} already active — server replayed`);
       return;
     }
+    if (this.hasQueuedCompletion(lease.lease_id)) {
+      this.log.warn(`lease ${lease.lease_id} replayed while terminal report is pending`);
+      return;
+    }
     const p = this.runHandler(lease).finally(() => {
       this.active.delete(lease.lease_id);
+      this.attemptTokens.delete(lease.lease_id);
     });
     this.active.set(lease.lease_id, p);
+    if (lease.attempt_token) this.attemptTokens.set(lease.lease_id, lease.attempt_token);
   }
 
   private async runHandler(lease: Lease): Promise<void> {
@@ -209,6 +319,7 @@ export class ManorWorker {
           await this.client.extendLease(lease.lease_id, {
             extraSeconds: 300,
             progress: fraction,
+            attemptToken: lease.attempt_token,
           });
         } catch (exc) {
           this.log.warn(`progress update failed: ${errMsg(exc)}`);
@@ -224,27 +335,17 @@ export class ManorWorker {
         );
       }
       const raw = await handler(lease, ctx);
-      const result = LeaseResultFactory.fromHandlerOutput(raw);
-      await this.client.completeLease(lease.lease_id, result);
-      const completion: HeartbeatCompletedLease = {
-        lease_id: lease.lease_id,
-        status: "done",
-        task_output_value_kind: result.task_output_value_kind ?? "task_payload",
-      };
-      if (Object.prototype.hasOwnProperty.call(result, "result")) {
-        completion.result = result.result;
+      const result = structuredClone(LeaseResultFactory.fromHandlerOutput(raw));
+      const completion = this.successCompletion(lease, result);
+      if (this.queueCompletion(completion)) {
+        await this.reportSuccess(lease, result);
       }
-      if (Object.prototype.hasOwnProperty.call(result, "cost")) {
-        completion.cost = result.cost;
-      }
-      if (Object.prototype.hasOwnProperty.call(result, "evidence_refs")) {
-        completion.evidence_refs = result.evidence_refs;
-      }
-      this.completions.push(completion);
     } catch (exc) {
       if (exc instanceof NeedHumanInput) {
         try {
-          await this.client.needHuman(lease.lease_id, exc.prompt);
+          await this.client.needHuman(lease.lease_id, exc.prompt, {
+            attemptToken: lease.attempt_token,
+          });
         } catch (rep) {
           this.log.warn(`need_human report failed: ${errMsg(rep)}`);
         }
@@ -257,28 +358,30 @@ export class ManorWorker {
           kind: lease.kind,
           provider: lease.provider,
         };
-        await this.client.failLease(lease.lease_id, err, { willRetry: false });
-        this.completions.push({
+        const completion: HeartbeatCompletedLease = {
           lease_id: lease.lease_id,
+          attempt_token: lease.attempt_token,
           status: "failed",
           error: err,
           task_output_value_kind: "task_payload",
-        });
+        };
+        if (this.queueCompletion(completion)) {
+          await this.reportFailure(lease, err, { willRetry: false });
+        }
         return;
       }
       this.log.error(`handler for lease ${lease.lease_id} raised`, exc);
       const err = { type: errType(exc), message: errMsg(exc) };
-      try {
-        await this.client.failLease(lease.lease_id, err);
-      } catch (rep) {
-        this.log.warn(`fail_lease report failed: ${errMsg(rep)}`);
-      }
-      this.completions.push({
+      const completion: HeartbeatCompletedLease = {
         lease_id: lease.lease_id,
+        attempt_token: lease.attempt_token,
         status: "failed",
         error: err,
         task_output_value_kind: "task_payload",
-      });
+      };
+      if (this.queueCompletion(completion)) {
+        await this.reportFailure(lease, err);
+      }
     }
   }
 
@@ -302,17 +405,18 @@ export class ManorWorker {
       await Promise.allSettled(this.active.values());
     }
     if (this.completions.length > 0) {
+      const completedBatch = [...this.completions];
       try {
         const req: HeartbeatRequest = {
           state: "shutting_down",
           timestamp: new Date().toISOString(),
           active_leases: [],
-          completed_since_last: this.completions,
+          completed_since_last: completedBatch,
           capacity: { can_accept_leases: 0 },
-          capabilities: this.capabilities,
+          capabilities: this.reportedCapabilities(),
         };
         await this.client.heartbeat(req);
-        this.completions = [];
+        this.acknowledgeCompletions(completedBatch);
       } catch (exc) {
         this.log.warn(`final flush failed: ${errMsg(exc)}`);
       }

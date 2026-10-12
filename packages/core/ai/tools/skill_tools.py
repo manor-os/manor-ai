@@ -21,15 +21,26 @@ async def _invoke_skill_handler(
     params=None,
     conversation_id: str = "",
     user_id: str = "",
+    bundle_file: str | None = None,
+    char_offset: int | None = None,
     **kwargs,
 ):
     """Invoke a runtime-visible skill by ID.
 
     ``skill`` remains accepted through ``kwargs`` for callers using the
     pre-runtime tool shape; new schema-generated calls use ``skill_id``.
+    ``bundle_file`` loads one bundled file of an instructions-only skill.
     """
     resolved_skill_id = skill_id or str(kwargs.get("skill") or "")
     runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    # An empty bundle_file is an omitted one: models often send "" for unused
+    # optional strings, and that must not turn a normal invocation into a read.
+    bundle_file = str(bundle_file or "").strip() or None
+    bundle_kwargs = (
+        {"bundle_file": bundle_file, "bundle_char_offset": char_offset}
+        if bundle_file
+        else {}
+    )
     return await runtime_invoke_skill_action(
         entity_id=entity_id,
         skill_id=resolved_skill_id,
@@ -38,6 +49,7 @@ async def _invoke_skill_handler(
         runtime_context=runtime_context,
         user_id=user_id or None,
         conversation_id=conversation_id or runtime_context.conversation_id,
+        **bundle_kwargs,
     )
 
 
@@ -49,6 +61,7 @@ async def _draft_skill_handler(
         entity_id=entity_id,
         name=name,
         description=description,
+        user_id=kwargs.get("user_id") or None,
     )
 
 
@@ -62,6 +75,7 @@ async def _create_skill_handler(
         description=description,
         category=kwargs.get("category"),
         tags=kwargs.get("tags", []),
+        user_id=kwargs.get("user_id") or None,
     )
 
 
@@ -82,6 +96,7 @@ async def _update_skill_handler(
         entity_id=entity_id,
         skill_id=skill_id,
         change_description=change_description,
+        user_id=kwargs.get("user_id") or None,
     )
 
 
@@ -103,32 +118,44 @@ def get_tools():
                 "function": {
                     "name": "invoke_skill",
                     "description": (
-                        "Invoke a reusable skill by ID. Skills are pre-built prompt+tool "
-                        "chains or sandboxed script workflows for specialized tasks like "
-                        "'write_email', 'research_topic', document generation, or complex "
-                        "file editing. Use this when a matching entry appears in Available "
-                        "Skills; use generate_document_file only for direct conversion of "
-                        "already-supplied text/Markdown into a simple document. For external "
-                        "social platform operations, invoke a subscribed social operations "
-                        "skill when one is available; otherwise use search_tools to load the "
-                        "relevant Integration/MCP tool. Content-writing skills are for "
-                        "drafts, blogs, articles, or an explicitly requested style."
+                        "Run a skill by ID when search_tools surfaces a "
+                        "matching Skill or one was explicitly selected. Supplied "
+                        "text/Markdown to a simple document: generate_file(kind='document'). "
+                        "Social platform actions: a subscribed social operations skill, "
+                        "else the Integration/MCP tool. Content-writing skills are for "
+                        "drafts, blogs, articles, or a requested style."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "skill_id": {"type": "string", "description": "Runtime skill ID to invoke"},
-                            "input": {"type": "string", "description": "Input text/instructions for the skill"},
+                            "skill_id": {
+                                "type": "string",
+                                "description": "Skill ID (or legacy `skill`).",
+                            },
+                            "skill": {
+                                "type": "string",
+                                "description": "Legacy alias.",
+                            },
+                            "input": {"type": "string", "description": "Input text or instructions"},
                             "params": {
                                 "type": "object",
-                                "description": (
-                                    "Structured options for the selected skill. Use this for fixed composer/runtime "
-                                    "settings instead of encoding them in natural language."
-                                ),
+                                "description": "Fixed composer/runtime settings, not prose.",
                                 "additionalProperties": True,
                             },
+                            "bundle_file": {
+                                "type": "string",
+                                "description": "Instructions-only skill's file, e.g. references/x.md.",
+                            },
+                            "char_offset": {
+                                "type": "integer",
+                                "description": "Resume offset.",
+                            },
                         },
-                        "required": ["skill_id", "input"],
+                        # No top-level anyOf/oneOf/allOf: Anthropic rejects such
+                        # input_schema with HTTP 400 ("input_schema does not support
+                        # oneOf, allOf, or anyOf at the top level"). The skill_id /
+                        # skill alternative is enforced by the handler instead.
+                        "required": ["input"],
                     },
                 },
             },

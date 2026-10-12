@@ -59,9 +59,20 @@ def _utcnow() -> datetime:
 
 
 async def _workspace(db) -> Workspace:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import User, UserMembership
+    from tests.approval_settings_test_utils import initialize_test_approval_owners
+
+    actor_id = generate_ulid()
     workspace = Workspace(entity_id=ENTITY_ID, name="Consolidator WS")
-    db.add(workspace)
+    db.add_all([
+        workspace,
+        User(id=actor_id, entity_id=ENTITY_ID, email=f"{actor_id}@example.test",
+            password_hash="test-only", role="owner", status="active"),
+        UserMembership(user_id=actor_id, entity_id=ENTITY_ID, role="owner", status="active"),
+    ])
     await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=actor_id)
     return workspace
 
 
@@ -225,11 +236,12 @@ async def test_run_all_produces_eight_complete_reports(db_session):
         assert row.coverage["reused"] is False
         # human_participation: v2 with M9 (real commitment counts), v3 with
         # the opt-in L1 edit-pattern layer, v4 with the governance /
-        # information HITL split; execution: v2 with the opt-in L1
+        # information HITL split, v5 with fulfilled operator answers;
+        # execution: v2 with the opt-in L1
         # failure-cluster layer; risk_governance: v2 with the same HITL
         # split. Everything else is still pure L0 v1.
         expected_version = {
-            "human_participation": "-consolidator-v4",
+            "human_participation": "-consolidator-v5",
             "execution": "-consolidator-v2",
             "risk_governance": "-consolidator-v2",
         }.get(row.domain, "-consolidator-v1")

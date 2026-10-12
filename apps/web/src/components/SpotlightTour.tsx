@@ -19,6 +19,8 @@ export interface TourStep {
   mode?: "chat" | "workspace";
   /** Target lives inside the collapsible Configure menu; ask the sidebar to open it. */
   openConfigure?: boolean;
+  /** Temporarily reveal the sidebar for its steps, or hide it for the composer. */
+  openSidebar?: boolean;
 }
 
 type TourPlacement = NonNullable<TourStep["position"]>;
@@ -76,37 +78,53 @@ export default function SpotlightTour({
   const [targetRect, setTargetRect] = useState<DOMRect | null>(null);
   const [viewport, setViewport] = useState(() => viewportSize());
   const directionRef = useRef<"forward" | "backward">("forward");
+  const autoStartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearAutoStart = useCallback(() => {
+    if (autoStartTimerRef.current !== null) {
+      clearTimeout(autoStartTimerRef.current);
+      autoStartTimerRef.current = null;
+    }
+  }, []);
 
   // Auto-show once per storageKey
   useEffect(() => {
+    clearAutoStart();
     if (!enabled) {
       setVisible(false);
       return;
     }
     const completed = localStorage.getItem(storageKey);
     if (!completed) {
-      const timer = setTimeout(() => setVisible(true), autoStartDelay);
-      return () => clearTimeout(timer);
+      autoStartTimerRef.current = setTimeout(() => {
+        autoStartTimerRef.current = null;
+        setVisible(true);
+      }, autoStartDelay);
     }
-  }, [enabled, storageKey, autoStartDelay]);
+    return clearAutoStart;
+  }, [enabled, storageKey, autoStartDelay, clearAutoStart]);
 
   // Allow manual re-trigger via custom event. An explicit start bypasses the
   // `enabled` gate — that gate only governs auto-showing.
   useEffect(() => {
     if (!startEvent) return;
     const handleStart = () => {
+      clearAutoStart();
       directionRef.current = "forward";
       setCurrentStep(0);
       setVisible(true);
     };
     window.addEventListener(startEvent, handleStart);
     return () => window.removeEventListener(startEvent, handleStart);
-  }, [startEvent]);
+  }, [startEvent, clearAutoStart]);
 
   const finish = useCallback(() => {
+    clearAutoStart();
     localStorage.setItem(storageKey, "true");
     setVisible(false);
-  }, [storageKey]);
+    if (steps.some((step) => step.openSidebar !== undefined)) {
+      window.dispatchEvent(new Event("manor:tour-finish"));
+    }
+  }, [storageKey, clearAutoStart, steps]);
 
   const next = useCallback(() => {
     directionRef.current = "forward";
@@ -148,7 +166,7 @@ export default function SpotlightTour({
     // Targets like the workspace nav only exist in one sidebar mode; ask the
     // app shell to switch there before measuring (AppLayout listens for this).
     if (step.mode) {
-      window.dispatchEvent(new CustomEvent("manor:tour-mode", { detail: { mode: step.mode } }));
+      window.dispatchEvent(new CustomEvent("manor:tour-mode", { detail: { mode: step.mode, openSidebar: step.openSidebar } }));
     }
     if (step.openConfigure) {
       window.dispatchEvent(new Event("manor:tour-configure"));
@@ -273,7 +291,12 @@ export default function SpotlightTour({
   if (compactTooltip) {
     tooltipStyle.left = VIEWPORT_MARGIN;
     tooltipStyle.right = VIEWPORT_MARGIN;
-    tooltipStyle.bottom = VIEWPORT_MARGIN;
+    // Keep the highlighted composer or footer visible above the tooltip.
+    if (targetRect && targetRect.bottom > viewport.height - TOOLTIP_ESTIMATED_HEIGHT - VIEWPORT_MARGIN) {
+      tooltipStyle.top = VIEWPORT_MARGIN;
+    } else {
+      tooltipStyle.bottom = VIEWPORT_MARGIN;
+    }
   } else if (targetRect) {
     const preferred: TourPlacement = step.position || "right";
     const available = {

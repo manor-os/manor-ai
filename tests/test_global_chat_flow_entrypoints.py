@@ -4,6 +4,101 @@ import pytest
 from httpx import AsyncClient
 
 
+async def _create_workspace_flow(
+    client: AsyncClient,
+    *,
+    headers: dict[str, str],
+    workspace_name: str,
+    flow_name: str,
+) -> tuple[dict, dict, dict]:
+    workspace = (await client.post("/api/v1/workspaces", headers=headers, json={
+        "name": workspace_name,
+    })).json()
+    workflow = (await client.post("/api/v1/workflows", headers=headers, json={
+        "name": flow_name,
+        "steps": [
+            {"id": "trigger", "type": "trigger", "name": "Start", "config": {}, "next": ["end"]},
+            {"id": "end", "type": "end", "name": "Done", "config": {}, "next": []},
+        ],
+    })).json()
+    binding = (await client.post("/api/v1/workflows/bindings", headers=headers, json={
+        "workflow_id": workflow["id"],
+        "workspace_id": workspace["id"],
+        "trigger_type": "manual",
+        "config": {
+            "chat_entrypoint": {
+                "enabled": True,
+                "title": flow_name,
+            },
+        },
+    })).json()
+    return workspace, workflow, binding
+
+
+@pytest.mark.asyncio
+async def test_global_chat_flow_entrypoints_honor_explicit_workspace_scope(
+    client: AsyncClient,
+) -> None:
+    registration = (await client.post("/api/v1/auth/register", json={
+        "username": "scoped_personal_percent_flow",
+        "email": "scoped_personal_percent_flow@test.com",
+        "password": "pass123",
+        "entity_name": "Scoped Personal Percent Flow",
+    })).json()
+    headers = {"Authorization": f"Bearer {registration['access_token']}"}
+    workspace, workflow, binding = await _create_workspace_flow(
+        client,
+        headers=headers,
+        workspace_name="Selected Workspace",
+        flow_name="Selected Flow",
+    )
+    other_workspace, _, other_binding = await _create_workspace_flow(
+        client,
+        headers=headers,
+        workspace_name="Other Workspace",
+        flow_name="Other Flow",
+    )
+
+    listed = await client.get(
+        "/api/v1/chat/flow-entrypoints",
+        headers=headers,
+        params={"workspace_id": workspace["id"]},
+    )
+    missing = await client.get(
+        "/api/v1/chat/flow-entrypoints",
+        headers=headers,
+        params={"workspace_id": "01MISSINGWORKSPACE0000000000"},
+    )
+    foreign_start = await client.post(
+        f"/api/v1/chat/flow-entrypoints/{other_binding['id']}/stream",
+        headers=headers,
+        data={
+            "message": "Do not start a Flow from another Workspace.",
+            "workspace_id": workspace["id"],
+        },
+    )
+
+    assert listed.status_code == 200, listed.text
+    assert listed.json() == [{
+        "binding_id": binding["id"],
+        "workflow_id": workflow["id"],
+        "workspace_id": workspace["id"],
+        "workspace_name": "Selected Workspace",
+        "title": "Selected Flow",
+        "description": "",
+        "placeholder": "",
+        "order": 100,
+        "inputs": [],
+    }]
+    assert all(
+        row["workspace_id"] != other_workspace["id"]
+        for row in listed.json()
+    )
+    assert missing.status_code == 200
+    assert missing.json() == []
+    assert foreign_start.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_personal_chat_lists_and_directly_starts_percent_flow(
     client: AsyncClient,

@@ -26,13 +26,15 @@ def test_video_tool_schema_exposes_duration_choices():
 
     props = GENERATE_VIDEO_SCHEMA["function"]["parameters"]["properties"]
     duration = GENERATE_VIDEO_SCHEMA["function"]["parameters"]["properties"]["duration"]
-    assert duration["enum"] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert duration["minimum"] == 4
+    assert duration["maximum"] == 30
     assert duration["default"] == 5
     assert "audio_reference_url" in props
     assert "audio_reference_urls" in props
     assert "reference_video_urls" in props
     assert "audio_url" in props
     assert "requires_reference_media" in props
+    assert props["expected_model"]["type"] == "string"
     assert props["generate_audio"]["default"] is True
     assert props["requires_reference_media"]["default"] is False
 
@@ -41,7 +43,7 @@ def test_generate_file_schema_exposes_video_parameter_choices():
     from packages.core.ai.tools.generate_file_tool import GENERATE_FILE_SCHEMA
 
     props = GENERATE_FILE_SCHEMA["function"]["parameters"]["properties"]
-    assert props["duration"]["enum"] == [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    assert props["duration"]["enum"] == list(range(4, 31))
     assert props["params"]["properties"]["duration"]["enum"] == props["duration"]["enum"]
     assert "Single clip seconds" in props["duration"]["description"]
     assert "videos/mp4" in GENERATE_FILE_SCHEMA["function"]["description"]
@@ -56,6 +58,46 @@ def test_generate_file_schema_exposes_video_parameter_choices():
     assert props["params"]["properties"]["generate_audio"]["default"] is True
     assert props["params"]["properties"]["requires_reference_media"]["default"] is False
     assert "Set false for a silent clean picture" in props["params"]["properties"]["generate_audio"]["description"]
+
+
+def test_seedance_25_catalog_limits_and_duration_normalization():
+    from packages.core.constants.models import CATALOG, video_model_capabilities
+    from packages.core.tasks.media_tasks import normalize_video_duration
+
+    assert any(item["id"] == "bytedance/seedance-2.5" for item in CATALOG["video"])
+    caps = video_model_capabilities("bytedance/seedance-2.5")
+    assert (caps["max_reference_images"], caps["max_reference_videos"], caps["max_audio_references"]) == (30, 10, 10)
+    assert caps["audio_requires_visual_reference"] is False
+    assert caps["generation_schema"]["duration"]["text_to_video"]["maximum"] == 30
+    assert normalize_video_duration(30, "bytedance/seedance-2.5") == 30
+    assert normalize_video_duration(30, "bytedance/seedance-2.0") == 15
+
+
+def test_seedance_25_snapshot_keeps_all_allowed_references():
+    from packages.core.tasks.media_tasks import snapshot_video_reference_urls
+
+    result = snapshot_video_reference_urls(
+        entity_id="entity", job_id="job", model="bytedance/seedance-2.5",
+        reference_urls=[f"https://example.test/image-{i}.png" for i in range(30)],
+        reference_video_urls=[f"https://example.test/video-{i}.mp4" for i in range(10)],
+        audio_reference_urls=[f"https://example.test/audio-{i}.wav" for i in range(10)],
+    )
+
+    assert len(result["reference_urls"]) == 30
+    assert len(result["reference_video_urls"]) == 10
+    assert len(result["audio_reference_urls"]) == 10
+
+
+def test_seedance_25_capability_validation_enforces_limits():
+    from packages.core.ai.tools.extended_tools import _video_capability_error
+
+    model = "bytedance/seedance-2.5"
+    assert _video_capability_error(model=model, prompt="sound-driven scene", audio_reference_urls=["audio.wav"], duration=30) is None
+    assert "at most 30" in _video_capability_error(model=model, prompt="scene", reference_urls=["ref.png"] * 31)
+    assert "at most 10" in _video_capability_error(model=model, prompt="scene", reference_video_urls=["ref.mp4"] * 11)
+    assert "at most 10" in _video_capability_error(model=model, prompt="scene", audio_reference_urls=["ref.wav"] * 11)
+    assert "duration schema" in _video_capability_error(model=model, prompt="scene", duration=31)
+    assert "cannot be mixed" in _video_capability_error(model=model, prompt="scene", first_frame_url="frame.png", reference_urls=["ref.png"])
 
 
 @pytest.mark.asyncio
@@ -117,7 +159,7 @@ async def test_video_download_reuses_existing_knowledge_document_for_same_fs_pat
         db_session.add(workspace)
         await db_session.flush()
         artifact_folder = await ensure_workspace_artifact_folder(db_session, workspace)
-        expected_path = f"{workspace_artifact_storage_base(artifact_folder.id)}/videos/launch.mp4"
+        expected_path = f"{workspace_artifact_storage_base(artifact_folder.id)}/launch.mp4"
         db_session.add(
             Document(
                 id=document_id,
@@ -662,6 +704,7 @@ def test_video_model_capabilities_are_cataloged():
     from packages.core.constants.models import CATALOG, video_model_capabilities
 
     seedance = video_model_capabilities("bytedance/seedance-2.0")
+    seedance_v1_fast = video_model_capabilities("bytedance/seedance-v1.0-pro-fast")
     kling = video_model_capabilities("kwaivgi/kling-v3.0-pro")
 
     assert seedance["first_frame"] is True
@@ -672,12 +715,339 @@ def test_video_model_capabilities_are_cataloged():
     assert seedance["max_reference_videos"] == 3
     assert seedance["audio_reference"] is True
     assert seedance["max_audio_references"] == 3
+    assert seedance_v1_fast["first_frame"] is True
+    assert seedance_v1_fast["last_frame"] is False
+    assert seedance_v1_fast["reference_images"] is False
+    assert seedance_v1_fast["native_audio"] is False
     assert kling["first_frame"] is True
     assert kling["last_frame"] is False
     assert kling["reference_images"] is False
     assert kling["reference_videos"] is False
     assert kling["audio_reference"] is False
     assert all("capabilities" in item for item in CATALOG["video"])
+
+
+def test_video_model_capabilities_publish_only_known_duration_schemas():
+    from packages.core.constants.models import video_model_capabilities
+
+    seedance_2 = video_model_capabilities("bytedance/seedance-2.0")
+    seedance_v1 = video_model_capabilities("bytedance/seedance-v1.0-pro-fast")
+    unknown = video_model_capabilities("custom/video-model")
+
+    assert "generation_schema" not in seedance_2
+    assert "generation_schema" not in unknown
+    assert seedance_v1["generation_schema"]["duration"]["image_to_video"] == {
+        "type": "integer",
+        "enum": [4, 5, 6, 7, 8, 9, 10, 11, 12],
+        "default": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_video_segment_planner_uses_selected_model_schema(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def selected_model(*_args, **_kwargs):
+        return "bytedance/seedance-v1.0-pro-fast"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+
+    result = json.loads(
+        await extended_tools._plan_video_segments_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            target_duration_seconds=120,
+            generation_mode="image_to_video",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["model"] == "bytedance/seedance-v1.0-pro-fast"
+    assert result["duration_schema_source"] == "model_schema"
+    assert result["duration_schema"]["enum"] == [4, 5, 6, 7, 8, 9, 10, 11, 12]
+    assert result["generation_durations_seconds"] == [12] * 10
+    assert result["segment_durations_seconds"] == [12] * 10
+    assert result["generated_duration_seconds"] == 120
+    assert result["trim_seconds"] == 0
+    assert result["total_duration_seconds"] == 120
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_duration", [None, "not-a-duration", 4.5])
+async def test_video_segment_planner_blocks_invalid_target_duration(target_duration):
+    from packages.core.ai.tools import extended_tools
+
+    result = json.loads(
+        await extended_tools._plan_video_segments_handler(
+            target_duration_seconds=target_duration,
+        )
+    )
+
+    assert result["status"] == "blocked"
+    assert "whole number" in result["error"]
+
+
+def test_video_capability_validation_rejects_duration_outside_selected_model_schema():
+    from packages.core.ai.tools.extended_tools import _video_capability_error
+
+    error = _video_capability_error(
+        model="bytedance/seedance-v1.0-pro-fast",
+        prompt="Animate this accepted scene.",
+        first_frame_url="/api/v1/fs/entity/scene.png",
+        duration=15,
+    )
+
+    assert error is not None
+    assert "image_to_video duration schema" in error
+    assert "4, 5, 6, 7, 8, 9, 10, 11, 12" in error
+
+
+@pytest.mark.parametrize("duration", [3, 4.5, "4.5s"])
+def test_video_capability_validation_does_not_silently_coerce_schema_duration(duration):
+    from packages.core.ai.tools.extended_tools import _video_capability_error
+
+    error = _video_capability_error(
+        model="bytedance/seedance-v1.0-pro-fast",
+        prompt="Animate this accepted scene.",
+        first_frame_url="/api/v1/fs/entity/scene.png",
+        duration=duration,
+    )
+
+    assert error is not None
+    assert f"received {duration}" in error
+
+
+@pytest.mark.asyncio
+async def test_video_segment_planner_uses_common_durations_without_model_schema(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def selected_model(*_args, **_kwargs):
+        return "custom/video-model"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+
+    result = json.loads(
+        await extended_tools._plan_video_segments_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            target_duration_seconds=121,
+            generation_mode="image_to_video",
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["model"] == "custom/video-model"
+    assert result["duration_schema_source"] == "compatibility_fallback"
+    assert result["duration_schema"]["enum"] == [5, 10]
+    assert result["generation_durations_seconds"] == [10] * 12 + [5]
+    assert result["segment_durations_seconds"] == [10] * 11 + [6, 5]
+    assert result["generated_duration_seconds"] == 125
+    assert result["trim_seconds"] == 4
+    assert sum(result["segment_durations_seconds"]) == 121
+
+
+@pytest.mark.asyncio
+async def test_video_segment_planner_supports_integer_duration_range(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def selected_model(*_args, **_kwargs):
+        return "range/video-model"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+    monkeypatch.setattr(
+        extended_tools,
+        "_video_duration_schema",
+        lambda *_args: {"type": "integer", "minimum": 4, "maximum": 6},
+    )
+
+    result = json.loads(
+        await extended_tools._plan_video_segments_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            target_duration_seconds=12,
+            generation_mode="image_to_video",
+        )
+    )
+
+    assert result["duration_schema_source"] == "model_schema"
+    assert result["generation_durations_seconds"] == [6, 6]
+    assert result["segment_durations_seconds"] == [6, 6]
+
+
+def test_video_capability_validation_enforces_integer_duration_range(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    monkeypatch.setattr(
+        extended_tools,
+        "_video_duration_schema",
+        lambda *_args: {"type": "integer", "minimum": 4, "maximum": 6},
+    )
+
+    assert extended_tools._video_capability_error(
+        model="range/video-model",
+        prompt="Animate this accepted scene.",
+        first_frame_url="/api/v1/fs/entity/scene.png",
+        duration=6,
+    ) is None
+    error = extended_tools._video_capability_error(
+        model="range/video-model",
+        prompt="Animate this accepted scene.",
+        first_frame_url="/api/v1/fs/entity/scene.png",
+        duration=7,
+    )
+    assert error is not None
+    assert "4, 5, 6" in error
+
+
+@pytest.mark.asyncio
+async def test_video_segment_planner_does_not_truncate_decimal_enum_values(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def selected_model(*_args, **_kwargs):
+        return "decimal/video-model"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+    monkeypatch.setattr(
+        extended_tools,
+        "_video_duration_schema",
+        lambda *_args: {"type": "integer", "enum": [4.5, 10.5]},
+    )
+
+    result = json.loads(
+        await extended_tools._plan_video_segments_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            target_duration_seconds=11,
+            generation_mode="image_to_video",
+        )
+    )
+
+    assert result["duration_schema_source"] == "compatibility_fallback"
+    assert result["duration_schema"]["enum"] == [5, 10]
+    assert result["generation_durations_seconds"] == [10, 5]
+    assert result["segment_durations_seconds"] == [6, 5]
+
+
+@pytest.mark.asyncio
+async def test_unrecognized_duration_schema_uses_nonbinding_fallback(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def selected_model(*_args, **_kwargs):
+        return "unrecognized/video-model"
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+    monkeypatch.setattr(
+        extended_tools,
+        "_video_duration_schema",
+        lambda *_args: {"type": "number", "minimum": 4, "maximum": 12},
+    )
+
+    result = json.loads(
+        await extended_tools._plan_video_segments_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            target_duration_seconds=11,
+            generation_mode="image_to_video",
+        )
+    )
+    capability_error = extended_tools._video_capability_error(
+        model="unrecognized/video-model",
+        prompt="Animate this accepted scene.",
+        first_frame_url="/api/v1/fs/entity/scene.png",
+        duration=7,
+    )
+
+    assert result["duration_schema_source"] == "compatibility_fallback"
+    assert result["duration_schema"]["enum"] == [5, 10]
+    assert capability_error is None
+
+
+def test_video_capability_validation_does_not_invent_unknown_model_limits():
+    from packages.core.ai.tools.extended_tools import _video_capability_error
+
+    assert _video_capability_error(
+        model="custom/video-model",
+        prompt="Animate this accepted scene.",
+        first_frame_url="/api/v1/fs/entity/scene.png",
+        duration=7,
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_generate_video_rejects_changed_planned_model_before_credentials(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    calls: list[str] = []
+
+    async def selected_model(*_args, **_kwargs):
+        return "bytedance/seedance-2.0"
+
+    async def unexpected_credentials(*_args, **_kwargs):
+        calls.append("credentials")
+        raise AssertionError("model fence must run before credential lookup")
+
+    async def unexpected_credit(*_args, **_kwargs):
+        calls.append("credit")
+        raise AssertionError("model fence must run before credit admission")
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_user_media_credentials",
+        unexpected_credentials,
+    )
+    monkeypatch.setattr(
+        extended_tools,
+        "runtime_assert_credit_available",
+        unexpected_credit,
+    )
+
+    result = json.loads(
+        await extended_tools._generate_video_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            prompt="Animate this accepted scene.",
+            expected_model="kwaivgi/kling-v3.0-std",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "video_model_changed_replan_required"
+    assert result["expected_model"] == "kwaivgi/kling-v3.0-std"
+    assert result["model"] == "bytedance/seedance-2.0"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_generate_video_accepts_matching_planned_model(monkeypatch):
+    from packages.core.ai.tools import extended_tools
+
+    async def selected_model(*_args, **_kwargs):
+        return "current/video-model"
+
+    async def resolve_credentials(*_args, **_kwargs):
+        return "", "", False
+
+    monkeypatch.setattr(extended_tools, "_resolve_user_video_model", selected_model)
+    monkeypatch.setattr(
+        extended_tools,
+        "_resolve_user_media_credentials",
+        resolve_credentials,
+    )
+
+    result = json.loads(
+        await extended_tools._generate_video_handler(
+            entity_id="entity-1",
+            user_id="user-1",
+            prompt="Animate this accepted scene.",
+            expected_model="current/video-model",
+        )
+    )
+
+    assert result["status"] == "failed"
+    assert result["error"] == "No video generation API key configured"
+    assert result["model"] == "current/video-model"
+    assert "error_code" not in result
 
 
 def test_seedance_prefers_native_official_key_over_platform_openrouter(monkeypatch):

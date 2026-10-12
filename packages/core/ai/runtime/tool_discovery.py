@@ -3,8 +3,14 @@ from __future__ import annotations
 import copy
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+
+from packages.core.ai.runtime.integration_setup_links import runtime_integration_setup_link
+from packages.core.ai.runtime.tool_visibility import runtime_tool_is_catalog_bindable
+from packages.core.constants.integrations import (
+    INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +18,11 @@ logger = logging.getLogger(__name__)
 GENERIC_WEB_TOOLS = frozenset({"web_search", "web_fetch", "browse_web"})
 LOCAL_CODING_BLOCKED_FIRST_PARTY_TOOLS = GENERIC_WEB_TOOLS | frozenset({
     "bash",
+    "sandbox",
     "sandbox_exec",
+    "sandbox_status",
+    "sandbox_respond",
+    "sandbox_cancel",
     "sandbox_create",
     "sandbox_read_file",
     "sandbox_write_file",
@@ -21,6 +31,11 @@ LOCAL_CODING_BLOCKED_FIRST_PARTY_TOOLS = GENERIC_WEB_TOOLS | frozenset({
 
 SENSITIVE_FIRST_PARTY_PREFIXES = ("delete_", "cancel_", "remove_", "send_", "publish_")
 DEFAULT_DEFERRED_TOOL_HINT_LIMIT = 12
+SEARCH_TOOLS_HARD_CAP = 8
+# A multi-capability request searches each step: at most this many queries,
+# a few results each by default (still within the hard cap).
+SEARCH_TOOLS_MAX_QUERIES = 4
+SEARCH_TOOLS_RESULTS_PER_QUERY = 3
 SOCIAL_MCP_PROVIDERS = frozenset({
     "chrome",
     "facebook",
@@ -57,17 +72,6 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
         "知识库保存本地",
         "知识库本地文件",
     ),
-    "chrome_knowledge_local": (
-        "chrome knowledge upload",
-        "prepare upload",
-        "prepare chrome upload",
-        "knowledge upload",
-        "upload knowledge",
-        "local upload files",
-        "知识库上传",
-        "准备上传",
-        "Chrome上传",
-    ),
     "linkedin": ("linkedin", "linked in", "领英"),
     "twitter_x": ("twitter", "tweet", "x.com", "推特"),
     "facebook": ("facebook", "fb", "脸书"),
@@ -91,42 +95,11 @@ MCP_PROVIDER_ALIASES: dict[str, tuple[str, ...]] = {
         "预约链接",
         "日历设置",
     ),
-    "manor_mcp_file_engine": (
-        "manor file engine",
-        "file engine",
-        "office engine",
-        "document engine",
-        "knowledge editor",
-        "generate file",
-        "patch file",
-        "edit file",
-        "document patch",
-        "office patch",
-        "docx",
-        "word",
-        "pptx",
-        "powerpoint",
-        "slides",
-        "xlsx",
-        "excel",
-        "spreadsheet",
-        "文档引擎",
-        "文件引擎",
-        "office 引擎",
-        "知识库编辑",
-        "生成文件",
-        "编辑文件",
-        "补丁",
-        "word 文档",
-        "ppt",
-        "excel",
-        "表格",
-        "幻灯片",
-    ),
     "google_drive": ("google drive", "drive", "云盘"),
     "github": ("github", "git hub"),
     "notion": ("notion",),
     "replicate": ("replicate",),
+    "suno": ("suno", "suno music", "music generation", "AI music", "音乐生成"),
     "tavily": ("tavily",),
     "jimeng": ("jimeng", "即梦"),
     "claude_code": (
@@ -268,6 +241,13 @@ def runtime_mcp_provider_text_score(provider: str, text: str | None) -> int:
     """Score whether text explicitly points at an MCP provider."""
     if not text:
         return 0
+    from packages.core.ai.runtime.skill_routing import (
+        is_local_coding_provider_key,
+        local_coding_cli_intent,
+    )
+
+    if is_local_coding_provider_key(provider) and not local_coding_cli_intent(text):
+        return 0
     haystack = text.lower()
     score = 0
     for alias in runtime_mcp_provider_aliases(provider):
@@ -377,6 +357,14 @@ def runtime_apply_integration_account_options_to_schema(
     properties = parameters.setdefault("properties", {})
     if not isinstance(properties, dict):
         return schema
+    properties.pop(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT, None)
+    required = parameters.get("required")
+    if isinstance(required, list):
+        parameters["required"] = [
+            item
+            for item in required
+            if item != INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT
+        ]
 
     labels = "; ".join(
         f"{option['id']} = {option.get('display_name') or 'Connected account'}"
@@ -495,10 +483,15 @@ def runtime_sort_available_matches(matches: list[dict]) -> list[dict]:
 
 @dataclass(frozen=True)
 class RuntimeSearchToolsRequest:
+    mode: str
     query: str
+    provider_key: str | None
+    exact_names: tuple[str, ...]
     max_results: int
     search_pool_size: int
     error: str | None = None
+    # One query per step of a multi-capability request; ``query`` joins them.
+    queries: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -507,37 +500,90 @@ class RuntimeSearchToolsRequest:
 
 def runtime_prepare_search_tools_request(
     *,
-    query: object,
+    query: object = None,
+    mode: object = None,
+    provider_key: object = None,
+    exact_names: object = None,
     max_results: object = None,
+    queries: object = None,
     default_max_results: int = 5,
-    hard_cap: int = 8,
+    hard_cap: int = SEARCH_TOOLS_HARD_CAP,
     min_results: int = 1,
     oversample_multiplier: int = 4,
     min_search_pool_size: int = 16,
 ) -> RuntimeSearchToolsRequest:
+    normalized_mode = str(mode or "semantic").strip().casefold()
+    query_list = tuple(dict.fromkeys(
+        str(item or "").strip() for item in queries if str(item or "").strip()
+    )) if isinstance(queries, (list, tuple)) else ()
     query_text = str(query or "").strip()
+    too_many_queries = len(query_list) > SEARCH_TOOLS_MAX_QUERIES
+    if query_list and query_text:
+        # Models often send both: per-step queries and one summarizing the
+        # request. The summary is ranked as one more query.
+        query_list = tuple(dict.fromkeys((*query_list, query_text)))
+    query_text = " ; ".join(query_list) if len(query_list) > 1 else query_text or "".join(query_list)
+    normalized_provider_key = str(provider_key or "").strip().casefold() or None
+    normalized_exact_names = (
+        tuple(
+            dict.fromkeys(
+                str(name or "").strip()
+                for name in exact_names
+                if str(name or "").strip()
+            )
+        )
+        if isinstance(exact_names, (list, tuple))
+        else ()
+    )
+    default_limit = (
+        max(default_max_results, len(normalized_exact_names))
+        if normalized_mode == "exact"
+        # A few results for each step of a multi-query search.
+        else max(default_max_results, SEARCH_TOOLS_RESULTS_PER_QUERY * len(query_list))
+    )
     try:
-        requested_max = int(max_results or default_max_results)
+        requested_max = int(max_results or default_limit)
     except (TypeError, ValueError):
         requested_max = default_max_results
     normalized_max = max(min_results, min(requested_max, hard_cap))
     search_pool_size = max(normalized_max * oversample_multiplier, min_search_pool_size)
+    error: str | None = None
+    if normalized_mode not in {"semantic", "provider", "exact"}:
+        error = "mode must be semantic, provider, or exact"
+    elif normalized_mode == "semantic" and not query_text:
+        error = "query is required for semantic search"
+    elif query_list and normalized_mode != "semantic":
+        error = "queries is for semantic search only"
+    elif too_many_queries:
+        error = f"queries cannot contain more than {SEARCH_TOOLS_MAX_QUERIES} entries"
+    elif normalized_mode == "provider":
+        if not normalized_provider_key:
+            error = "provider_key is required for provider search"
+        elif not runtime_integration_setup_link(normalized_provider_key):
+            error = "provider_key has an invalid format"
+    elif normalized_mode == "exact":
+        if not normalized_exact_names:
+            error = "exact_names is required for exact search"
+        elif len(normalized_exact_names) > hard_cap:
+            error = f"exact_names cannot contain more than {hard_cap} names"
     return RuntimeSearchToolsRequest(
+        mode=normalized_mode,
         query=query_text,
+        provider_key=normalized_provider_key,
+        exact_names=normalized_exact_names,
         max_results=normalized_max,
         search_pool_size=search_pool_size,
-        error=None if query_text else "query is required",
+        error=error,
+        queries=query_list if len(query_list) > 1 else (),
     )
 
 
 def _runtime_empty_matches_suppression_hint(suppressed_mcp: list[dict]) -> str:
     """Reason-aware hint for the zero-matches path.
 
-    browse_server: (B1) produces two distinct suppressed shapes —
-    'not_usable' and 'unknown_server' — that need different guidance than
-    the generic intent-suppression case ('outside_active_user_intent',
-    from ordinary keyword search). Blaming intent suppression for a
-    not_usable/unknown_server browse result was misleading (Important #4).
+    Structured provider discovery produces distinct ``not_usable`` and
+    ``unknown_server`` shapes that need different guidance than the generic
+    scope-suppression case.
     """
     unknown = next(
         (item for item in suppressed_mcp if item.get("reason") == "unknown_server"),
@@ -559,26 +605,177 @@ def _runtime_empty_matches_suppression_hint(suppressed_mcp: list[dict]) -> str:
     )
 
 
+NOT_IN_SCOPE_REASON = "exists_not_bound_to_this_agent"
+BLOCKED_BY_POLICY_REASON = "blocked_by_policy"
+AVAILABLE_VIA_MANOR_REASON = "available_via_manor"
+
+
+def runtime_not_in_scope_entries(
+    *,
+    requested_names: Iterable[str],
+    registered_tool_names: Iterable[str],
+    scoped_tool_names: Iterable[str],
+    blocked_tool_names: Iterable[str] = (),
+    can_acquire: bool = False,
+    policy_blocks: Callable[[str], bool | None] | None = None,
+    platform_routes: Mapping[str, dict] | None = None,
+) -> list[dict]:
+    """Describe exact-requested native tools that exist but are outside this run's scope.
+
+    Information only: nothing here is loaded, granted or made callable. A
+    policy-blocked tool is never offered for acquisition.
+    """
+
+    registered = {str(name) for name in registered_tool_names}
+    scoped = {str(name) for name in scoped_tool_names}
+    blocked = {str(name) for name in blocked_tool_names}
+    entries: list[dict] = []
+    seen: set[str] = set()
+    for raw in requested_names:
+        name = str(raw or "").strip().lower()
+        if (
+            not name
+            or name in seen
+            or name in scoped
+            or name not in registered
+            or name.startswith("mcp__")
+        ):
+            continue
+        seen.add(name)
+        # True: policy denies it. None: policy could not be evaluated, so
+        # acquisition is not offered and no block is claimed.
+        policy_verdict = policy_blocks(name) if policy_blocks is not None else False
+        if name in blocked or policy_verdict is True:
+            entries.append({
+                "name": name,
+                "reason": BLOCKED_BY_POLICY_REASON,
+                "otherwise": (
+                    "The current policy blocks this tool for this agent. Tell the user; "
+                    "only they can change that policy."
+                ),
+            })
+            continue
+        route = (platform_routes or {}).get(name)
+        if route is not None:
+            # Already callable here through the in-scope manor tool.
+            entries.append({"name": name, "reason": AVAILABLE_VIA_MANOR_REASON, "call_with": route})
+            continue
+        entry: dict = {"name": name, "reason": NOT_IN_SCOPE_REASON}
+        if can_acquire and policy_verdict is False and runtime_tool_is_catalog_bindable(name):
+            entry["acquire_with"] = {
+                "tool": "acquire_capabilities",
+                "arguments": {"action": "prepare", "catalog_ids": [f"tool:{name}"]},
+            }
+        entry["otherwise"] = "Ask the user to add it to this agent's configuration."
+        entries.append(entry)
+    return entries
+
+
+def runtime_not_in_scope_hint(entries: Iterable[dict]) -> str:
+    """One actionable sentence per out-of-scope tool."""
+
+    sentences: list[str] = []
+    for entry in entries:
+        name = str(entry.get("name") or "")
+        if entry.get("reason") == AVAILABLE_VIA_MANOR_REASON:
+            route = entry.get("call_with") or {}
+            arguments = ", ".join(
+                f"{key}={value!r}" for key, value in (route.get("arguments") or {}).items()
+            )
+            sentences.append(
+                f"{name} is not bound as its own tool, but it is available here as "
+                f"{route.get('tool')}({arguments})."
+            )
+        elif entry.get("reason") == BLOCKED_BY_POLICY_REASON:
+            sentences.append(
+                f"{name} exists but the current policy blocks it for this agent; "
+                "tell the user it is unavailable here."
+            )
+        elif entry.get("acquire_with"):
+            sentences.append(
+                f"{name} exists but is not bound to this agent; acquire it with "
+                f"acquire_capabilities(prepare, ['tool:{name}'])."
+            )
+        else:
+            sentences.append(
+                f"{name} exists but is not bound to this agent. "
+                "Ask the user to add it to this agent's configuration."
+            )
+    return " ".join(sentences)
+
+
 def runtime_search_tools_payload(
     *,
     matches: list[dict],
     query: str,
+    mode: str = "semantic",
+    provider_keys: Iterable[str] = (),
     suppressed_mcp: list[dict] | None = None,
     total_tool_count: int | None = None,
     servers: list[dict] | None = None,
+    total_skill_count: int | None = None,
+    not_in_scope: list[dict] | None = None,
 ) -> dict:
     suppressed_mcp = list(suppressed_mcp or [])
+    not_in_scope = list(not_in_scope or [])
+    normalized_provider_keys = tuple(
+        dict.fromkeys(
+            str(provider or "").strip().casefold()
+            for provider in provider_keys
+            if str(provider or "").strip()
+        )
+    )
     if not matches:
+        tool_count = total_tool_count or 0
+        hint = (
+            f"No tools matched. {tool_count} tools available."
+            if total_skill_count is None
+            else (
+                "No capabilities matched. "
+                f"{tool_count} {'tool' if tool_count == 1 else 'tools'} and "
+                f"{total_skill_count} "
+                f"{'skill' if total_skill_count == 1 else 'skills'} available."
+            )
+        )
         payload: dict = {
+            "ok": True,
             "matches": [],
+            "mode": mode,
             "query": query,
             "loaded_tools": [],
-            "hint": f"No tools matched. {total_tool_count or 0} tools available.",
+            "hint": hint,
         }
+        if normalized_provider_keys:
+            payload["provider_keys"] = list(normalized_provider_keys)
+        if mode == "exact":
+            payload["hint"] = (
+                f"{hint} Exact names do not use semantic matching; use semantic "
+                "mode to search by capability description."
+            )
         if suppressed_mcp:
             payload["suppressed_mcp"] = suppressed_mcp
             payload["hint"] = _runtime_empty_matches_suppression_hint(suppressed_mcp)
-        return payload
+            setup_links = [
+                runtime_integration_setup_link(provider)
+                for provider in dict.fromkeys(
+                    str(item.get("server_key") or "")
+                    for item in suppressed_mcp if item.get("reason") == "not_usable"
+                )
+            ]
+            if any(setup_links):
+                payload["integration_setup"] = [link for link in setup_links if link]
+        if not_in_scope:
+            # The requested tool exists; "nothing matched" alone would be false.
+            payload["not_in_scope"] = not_in_scope
+            payload["hint"] = (
+                f"{payload['hint']} {runtime_not_in_scope_hint(not_in_scope)}"
+                if suppressed_mcp
+                else runtime_not_in_scope_hint(not_in_scope)
+            )
+        return _runtime_structured_provider_failure(
+            payload,
+            provider_keys=normalized_provider_keys,
+        )
 
     unavailable = [
         {
@@ -593,14 +790,21 @@ def runtime_search_tools_payload(
         and match.get("available") is False
     ]
     payload = {
+        "ok": True,
         "matches": matches,
+        "mode": mode,
         "query": query,
-        "loaded_tools": [
+        # Several composite operations share one tool (manor): load it once.
+        "loaded_tools": list(dict.fromkeys(
             match.get("name")
             for match in matches
-            if match.get("name") and match.get("available") is not False
-        ],
+            if match.get("name")
+            and match.get("kind") != "skill"
+            and match.get("available") is not False
+        )),
     }
+    if normalized_provider_keys:
+        payload["provider_keys"] = list(normalized_provider_keys)
     if suppressed_mcp:
         payload["suppressed_mcp"] = suppressed_mcp
     if servers:
@@ -610,19 +814,172 @@ def runtime_search_tools_payload(
         payload["mcp_options"] = mcp_options
     hints: list[str] = []
     if suppressed_mcp:
-        hints.append(
-            "Some MCP providers matched the search query but were not loaded "
-            "because they do not match the user's current request."
-        )
+        hints.append(_runtime_empty_matches_suppression_hint(suppressed_mcp))
     if unavailable:
         payload["unavailable_mcp"] = unavailable
+        setup_links = [
+            runtime_integration_setup_link(provider)
+            for provider in dict.fromkeys(
+                str(item.get("server_key") or runtime_mcp_provider_from_tool_name(item.get("name") or "") or "")
+                for item in unavailable
+            )
+        ]
+        if any(setup_links):
+            payload["integration_setup"] = [link for link in setup_links if link]
         hints.append(
             "MCP candidates without connected credentials are listed for transparency "
             "but are not loaded or callable. Connect the integration under Settings \u2192 "
             "Integrations, or choose a ready alternate path."
         )
+    if not_in_scope:
+        payload["not_in_scope"] = not_in_scope
+        hints.append(runtime_not_in_scope_hint(not_in_scope))
     if hints:
         payload["hint"] = " ".join(hints)
+    return _runtime_structured_provider_failure(
+        payload,
+        provider_keys=normalized_provider_keys,
+    )
+
+
+def _runtime_usable_match_names(
+    matches: Iterable[dict],
+    unavailable_providers: set[str],
+) -> list[str]:
+    """Names of matches the model can still call although some providers are unusable.
+
+    Tools: callable unless flagged unavailable/not ready or served by an unusable
+    MCP provider. Skills: usable only when every provider implied by their tools
+    (or ``required_integrations``) is usable; a skill with no provider signal at
+    all is treated as not usable so we never claim a false alternative.
+    """
+    usable: list[str] = []
+    for match in matches:
+        if not isinstance(match, dict):
+            continue
+        name = str(match.get("name") or "").strip()
+        if not name:
+            continue
+        if match.get("kind") == "skill":
+            providers = {
+                provider.casefold()
+                for provider in (
+                    runtime_mcp_provider_from_tool_name(str(tool or ""))
+                    for tool in (match.get("tools") or ())
+                )
+                if provider
+            }
+            providers |= {
+                str(item.get("provider") or "").strip().casefold()
+                for item in (match.get("required_integrations") or ())
+                if isinstance(item, dict) and str(item.get("provider") or "").strip()
+            }
+            if providers:
+                if providers & unavailable_providers:
+                    continue
+                usable.append(name)
+                continue
+            if match.get("available") is True or match.get("ready") is True:
+                usable.append(name)
+            continue
+        if match.get("available") is False or match.get("ready") is False:
+            continue
+        provider = runtime_mcp_provider_from_tool_name(name)
+        if provider and provider.casefold() in unavailable_providers:
+            continue
+        usable.append(name)
+    return usable
+
+
+def _runtime_structured_provider_failure(
+    payload: dict,
+    *,
+    provider_keys: Iterable[str],
+) -> dict:
+    """Report provider-scoped discovery evidence, never end the parent run.
+
+    Failure to discover one provider does not establish whether the user's
+    capability is unavailable. The model chooses further discovery or setup;
+    the ordinary execution boundary still owns permissions and effects.
+    """
+
+    requested = tuple(
+        dict.fromkeys(
+            str(provider or "").strip().casefold()
+            for provider in provider_keys
+            if str(provider or "").strip()
+        )
+    )
+    if not requested:
+        return payload
+    unavailable = [
+        provider
+        for provider in requested
+        if any(
+            str(item.get("server_key") or "") == provider
+            and item.get("reason") == "not_usable"
+            for item in payload.get("suppressed_mcp") or ()
+            if isinstance(item, dict)
+        )
+        or any(
+            str(
+                item.get("server_key")
+                or runtime_mcp_provider_from_tool_name(str(item.get("name") or ""))
+                or ""
+            )
+            == provider
+            for item in payload.get("unavailable_mcp") or ()
+            if isinstance(item, dict)
+        )
+    ]
+    if not unavailable:
+        return payload
+    provider = unavailable[0]
+    setup = runtime_integration_setup_link(provider)
+    usable_names = _runtime_usable_match_names(
+        payload.get("matches") or (),
+        {str(item).casefold() for item in unavailable},
+    )
+    details = {
+        "failure_scope": "provider_discovery",
+        "provider_selection": "inferred" if payload.get("mode") == "semantic" else "explicit",
+        "mode": payload.get("mode"),
+        "query": payload.get("query"),
+        "provider_keys": list(requested),
+        "unavailable_provider_keys": unavailable,
+        "callable_candidates": usable_names,
+        "capability_availability": "not_established",
+        "suppressed_mcp": payload.get("suppressed_mcp", []),
+        "unavailable_mcp": payload.get("unavailable_mcp", []),
+        **setup,
+    }
+    payload["details"] = details
+    payload["unavailable_provider_keys"] = unavailable
+    payload.update(setup)
+    if usable_names:
+        # Mark, do not abort: the model still has a callable path.
+        existing_hint = str(payload.get("hint") or "").strip()
+        alternatives = ", ".join(usable_names)
+        payload["hint"] = " ".join(
+            part for part in (
+                existing_hint,
+                f"{provider} is unavailable. Other invocable candidates: {alternatives}. "
+                "Their suitability and dependencies must be assessed; they are not verified substitutes.",
+            ) if part
+        )
+        return payload
+    reason = str(payload.get("hint") or "").strip() or (
+        f"No usable {provider} integration account is connected."
+    )
+    reason += (
+        " This is a provider-discovery result, not proof that the requested capability "
+        "is unavailable. No provider action was executed. Further discovery remains "
+        "within the current tool scope. Discovery does not authorize replacing a "
+        "provider explicitly required by the user."
+    )
+    # The catalog lookup succeeded. A candidate's missing connection is data,
+    # not an execution failure or a reason to stop the parent loop.
+    payload.update(ok=True, hint=reason)
     return payload
 
 
@@ -637,7 +994,9 @@ def runtime_finalize_search_tools_payload(
     visible_matches = list(matches)[:request.max_results]
     return runtime_search_tools_payload(
         matches=visible_matches,
+        mode=request.mode,
         query=request.query,
+        provider_keys=(request.provider_key,) if request.provider_key else (),
         suppressed_mcp=suppressed_mcp,
         total_tool_count=total_tool_count,
         servers=servers,
@@ -809,82 +1168,5 @@ def runtime_tool_search_scope(
     query: str | None,
     active_user_message: str | None,
 ) -> RuntimeToolSearchScope:
-    from packages.core.ai.runtime.chrome_routing import (
-        detect_chrome_local_browser_route,
-    )
-    from packages.core.ai.runtime.skill_routing import (
-        local_coding_provider_route,
-        social_platform_action_intent,
-    )
-
-    available_tool_names = tuple(str(name) for name in tool_names)
-
-    active_scores = runtime_mcp_active_provider_scores(
-        tool_names=available_tool_names,
-        active_user_message=active_user_message,
-    )
-    chrome_local_route = next(
-        (
-            route
-            for text in (active_user_message, query)
-            if (route := detect_chrome_local_browser_route(text))
-        ),
-        None,
-    )
-    local_coding_providers = local_coding_provider_route(active_user_message)
-    if local_coding_providers:
-        active_scores = {
-            **active_scores,
-            **{
-                provider: max(active_scores.get(provider, 0), 100)
-                for provider in local_coding_providers
-            },
-        }
-
-    preferred_local_providers: set[str] = set()
-    preferred_chrome_tool_names: tuple[str, ...] = ()
-    if chrome_local_route:
-        preferred_local_providers.update(chrome_local_route.provider_keys)
-        preferred_chrome_tool_names = chrome_local_route.preferred_tool_names
-    if preferred_local_providers:
-        active_scores = {
-            **active_scores,
-            **{
-                provider: max(active_scores.get(provider, 0), 100)
-                for provider in preferred_local_providers
-            },
-        }
-
-    social_intent = social_platform_action_intent(active_user_message) or (
-        social_platform_action_intent(query)
-        and any(
-            runtime_mcp_provider_from_tool_name(name) == "chrome"
-            for name in available_tool_names
-        )
-    )
-    if social_intent and not active_scores:
-        # Browser-only networks such as Xiaohongshu use the local Chrome
-        # provider. Do not let an unrelated social connector win merely
-        # because it happens to be installed.
-        if any(
-            runtime_mcp_provider_from_tool_name(name) == "chrome"
-            for name in available_tool_names
-        ):
-            active_scores = {"chrome": 100}
-    allowed_social_tool_names = frozenset(
-        name
-        for name in available_tool_names
-        if (
-            provider := runtime_mcp_provider_from_tool_name(name)
-        ) is not None
-        and active_scores.get(provider, 0) > 0
-    )
-
-    return RuntimeToolSearchScope(
-        active_provider_scores=active_scores,
-        local_coding_providers=tuple(local_coding_providers),
-        restrict_social_tools=social_intent,
-        allowed_social_tool_names=allowed_social_tool_names,
-        chrome_local_browser=bool(chrome_local_route),
-        preferred_chrome_tool_names=preferred_chrome_tool_names,
-    )
+    """Search every authorized tool; query text may rank but never gate it."""
+    return RuntimeToolSearchScope(active_provider_scores={})

@@ -21,13 +21,9 @@ Two halves, both pinned here:
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-
-FILE_REFERENCES = Path("apps/web/src/lib/fileReferences.ts")
 CHAT_MARKDOWN = Path("apps/web/src/components/ChatMarkdown.tsx")
 
 
@@ -36,45 +32,8 @@ def _source(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-# ── The UI half ───────────────────────────────────────────────────────
-
-
-def test_a_strict_openable_predicate_exists():
-    source = _source(FILE_REFERENCES)
-    assert "export function isOpenableFileReference(" in source
-
-
-@pytest.mark.parametrize(
-    "marker,why",
-    [
-        ("decodeFileReferenceHref", "an already-encoded manor-file: reference"),
-        ("/viewer/", "a document route"),
-        ("/api/v1/fs/", "an entity filesystem path"),
-        ("https?", "an absolute URL"),
-    ],
-)
-def test_the_predicate_accepts_addresses_not_names(marker, why):
-    """Each accepted form is an address that resolves without guessing."""
-    body = _source(FILE_REFERENCES).split("export function isOpenableFileReference(")[1]
-    body = body.split("\nexport function ")[0]
-    # Regex literals escape their slashes (/^\\/viewer\\/…/), so compare
-    # against the unescaped form rather than the source text verbatim.
-    assert marker in body.replace("\\", ""), f"the predicate should accept {why}"
-
-
-def test_prose_scanning_requires_an_openable_reference():
-    """Both linkify paths — inline code and plain prose — were turning bare
-    filenames into links; that is what produced the card."""
-    source = _source(FILE_REFERENCES)
-
-    for fn_name in ("standaloneInlineFileReference", "linkifyPlainFileReferencesSegment"):
-        body = source.split(f"function {fn_name}(")[1].split("\nfunction ")[0]
-        assert "isOpenableFileReference" in body, (
-            f"{fn_name} must gate on the strict predicate"
-        )
-        assert not re.search(r"!looksLikeFileReference\(", body), (
-            f"{fn_name} still accepts a filename-shaped token"
-        )
+# Parser behavior is exercised in the frontend parser suite.
+# Keep the component's card gate and backend reference contracts here.
 
 
 def test_the_card_component_is_gated_on_an_address():
@@ -110,8 +69,8 @@ def test_agents_are_told_to_cite_the_returned_address():
     assert "Never print it separately" in guidance
     assert "never add a `Document ID`" in guidance
     assert "task, generation, or search" in guidance
-    assert "treat its destination as opaque" in guidance
-    assert "open_url" in guidance
+    assert "treat the destination as opaque" in guidance
+    assert "`sandbox:`" in guidance
     # The specific failure: inventing a path instead of quoting the tool's.
     assert "reconstruct" in guidance
 

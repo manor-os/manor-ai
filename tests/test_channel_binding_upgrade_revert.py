@@ -173,9 +173,14 @@ async def test_revert_existing_channel_restores_route_and_keeps_repaired_owner(d
     binding.config = {**binding.config, "language": "zh"}
     binding.user_id = None
     binding.updated_at = old
+    agent = Agent(
+        entity_id=workspace.entity_id, name="Sales", status="active", config={},
+    )
+    db_session.add(agent)
+    await db_session.flush()
     sales = AgentSubscription(
         entity_id=workspace.entity_id, workspace_id=workspace.id,
-        agent_id=subscription.agent_id, service_key="sales", status="active",
+        agent_id=agent.id, service_key="sales", status="active",
     )
     db_session.add(sales)
     await db_session.flush()

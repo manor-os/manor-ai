@@ -12,12 +12,13 @@ Both share the same ``messages`` table — the router walks
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from sqlalchemy import and_, desc, func, or_, select
+from sqlalchemy import and_, desc, event, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.pending_actions import PendingActionKind
@@ -26,25 +27,31 @@ from packages.core.models.task import Conversation, Message, Task
 
 logger = logging.getLogger(__name__)
 
+_CHAT_EVENT_QUEUE_KEY = "workspace_chat_events_after_commit"
+_CHAT_EVENT_LISTENER_KEY = "workspace_chat_event_listener"
+_CHAT_EVENT_PUBLISH_TASKS: set[asyncio.Task[None]] = set()
+
 
 async def _publish_workspace_chat_event(entity_id: str, data: dict) -> None:
-    """Best-effort realtime fanout for workspace chat events.
-
-    Keep this awaited inside the caller's current event loop. Detached tasks in
-    Celery workers can outlive the loop that created them and produce
-    "Future attached to a different loop" errors while the DB transaction has
-    already succeeded.
-    """
+    """Best-effort realtime fanout; the durable Message remains authoritative."""
     try:
         from packages.core.cache import _get_redis
 
+        workspace_id = str(data.get("workspace_id") or "").strip()
+        if not workspace_id:
+            logger.warning("workspace chat realtime publish missing workspace_id")
+            return
         r = await _get_redis()
         if not r:
             return
         await r.publish(
             "manor:ws_broadcast",
             json.dumps({
+                # The relay authorizes top-level targets. Keeping the workspace
+                # only inside ``data`` would fall back to an entity-wide push.
+                "target": "workspace",
                 "entity_id": entity_id,
+                "workspace_id": workspace_id,
                 "event": "workspace_chat_message",
                 "data": data,
             }, ensure_ascii=False, default=str),
@@ -65,6 +72,20 @@ async def publish_workspace_chat_message_event(
     immediate best-effort fanout, commit, and then call this helper. This
     prevents a realtime refetch from racing the message transaction.
     """
+    await _publish_workspace_chat_event(
+        entity_id,
+        _workspace_chat_message_event_data(
+            workspace_id=workspace_id,
+            message=message,
+        ),
+    )
+
+
+def _workspace_chat_message_event_data(
+    *,
+    workspace_id: str,
+    message: Message,
+) -> dict:
     action = (
         message.pending_action
         if isinstance(message.pending_action, dict) and message.pending_action.get("kind")
@@ -79,6 +100,9 @@ async def publish_workspace_chat_message_event(
         "has_pending_action": action is not None,
         "action_kind": (action or {}).get("kind"),
     }
+    conversation_id = str(getattr(message, "conversation_id", None) or "").strip()
+    if conversation_id:
+        event_data["conversation_id"] = conversation_id
     if meta.get("agent_greeting") is True:
         event_data.update({
             "agent_greeting": True,
@@ -92,7 +116,125 @@ async def publish_workspace_chat_message_event(
             "state": strategist_activity.get("state"),
             "review_id": strategist_activity.get("review_id"),
         }
-    await _publish_workspace_chat_event(entity_id, event_data)
+    return event_data
+
+
+def _schedule_workspace_chat_event(
+    loop: asyncio.AbstractEventLoop,
+    *,
+    entity_id: str,
+    event_data: dict,
+) -> None:
+    if loop.is_closed():
+        return
+
+    def schedule() -> None:
+        publish = loop.create_task(
+            _publish_workspace_chat_event(entity_id, dict(event_data))
+        )
+        _CHAT_EVENT_PUBLISH_TASKS.add(publish)
+
+        def finished(done: asyncio.Task[None]) -> None:
+            _CHAT_EVENT_PUBLISH_TASKS.discard(done)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.debug(
+                    "workspace chat post-commit realtime publish skipped",
+                    exc_info=True,
+                )
+
+        publish.add_done_callback(finished)
+
+    try:
+        if asyncio.get_running_loop() is loop:
+            schedule()
+            return
+    except RuntimeError:
+        pass
+    if loop.is_running():
+        loop.call_soon_threadsafe(schedule)
+
+
+def _chat_event_transaction_descends_from(transaction, ancestor) -> bool:
+    while transaction is not None:
+        if transaction is ancestor:
+            return True
+        transaction = transaction.parent
+    return False
+
+
+def _publish_workspace_chat_events_after_commit(session) -> None:
+    if session.in_nested_transaction():
+        return
+    queued = session.info.pop(_CHAT_EVENT_QUEUE_KEY, [])
+    for loop, entity_id, event_data, _owner in queued:
+        _schedule_workspace_chat_event(
+            loop,
+            entity_id=entity_id,
+            event_data=event_data,
+        )
+
+
+def _clear_workspace_chat_events_after_rollback(session) -> None:
+    if not session.in_nested_transaction():
+        session.info.pop(_CHAT_EVENT_QUEUE_KEY, None)
+
+
+def _clear_workspace_chat_events_after_soft_rollback(
+    session,
+    previous_transaction,
+) -> None:
+    if not previous_transaction.nested:
+        return
+    queued = session.info.get(_CHAT_EVENT_QUEUE_KEY, [])
+    session.info[_CHAT_EVENT_QUEUE_KEY] = [
+        item
+        for item in queued
+        if not _chat_event_transaction_descends_from(item[3], previous_transaction)
+    ]
+
+
+def queue_workspace_chat_message_event_after_commit(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    message: Message,
+) -> None:
+    """Fan out a durable Message only after its transaction commits."""
+
+    sync_session = db.sync_session
+    owner = sync_session.get_nested_transaction()
+    sync_session.info.setdefault(_CHAT_EVENT_QUEUE_KEY, []).append((
+        asyncio.get_running_loop(),
+        entity_id,
+        _workspace_chat_message_event_data(
+            workspace_id=workspace_id,
+            message=message,
+        ),
+        owner,
+    ))
+    if sync_session.info.get(_CHAT_EVENT_LISTENER_KEY):
+        return
+    event.listen(
+        sync_session,
+        "after_commit",
+        _publish_workspace_chat_events_after_commit,
+    )
+    event.listen(
+        sync_session,
+        "after_rollback",
+        _clear_workspace_chat_events_after_rollback,
+    )
+    event.listen(
+        sync_session,
+        "after_soft_rollback",
+        _clear_workspace_chat_events_after_soft_rollback,
+    )
+    sync_session.info[_CHAT_EVENT_LISTENER_KEY] = True
 
 
 # ── Conversation lifecycle ────────────────────────────────────────────
@@ -299,11 +441,7 @@ async def post_workspace_lifecycle_activity(
 # ── Reads ─────────────────────────────────────────────────────────────
 
 def open_pending_action_filters(entity_id: str, workspace_id: str) -> tuple:
-    """The single definition of "an action card still waiting on a human".
-
-    Every surface that shows the user a number must count through this, or the
-    numbers drift apart and the user has to guess which one is lying.
-    """
+    """Unresolved message cards for the existing chat loading behavior."""
     return (
         Conversation.entity_id == entity_id,
         Conversation.workspace_id == workspace_id,
@@ -352,12 +490,12 @@ async def count_open_pending_actions(
     "still waiting" copy sits there until a reload. Meanwhile the sidebar
     badge re-counted from the DB and dropped — one answer, two numbers.
     """
-    return int((await db.execute(
-        select(func.count())
-        .select_from(Message)
-        .join(Conversation, Message.conversation_id == Conversation.id)
-        .where(*open_pending_action_filters(entity_id, workspace_id))
-    )).scalar() or 0)
+    from .pending_actions import count_pending_actions_by_workspace
+
+    counts = await count_pending_actions_by_workspace(
+        db, entity_id=entity_id, workspace_ids=[workspace_id],
+    )
+    return sum(counts[workspace_id].values())
 
 
 async def list_messages(
@@ -466,6 +604,77 @@ async def resolve_pending_action(
     msg.resolved_at = datetime.now(timezone.utc)
     msg.resolved_by_user_id = user_id
 
+    if emit_followup:
+        await _emit_pending_action_resolution_followup(
+            db,
+            message=msg,
+            resolution=resolution,
+        )
+
+    return msg
+
+
+async def resolve_effect_reconciliation_pending_action(
+    db: AsyncSession,
+    *,
+    message_id: str,
+    approval_request_id: str,
+    pending_action_kind: str,
+    user_id: str,
+    resolution: dict,
+) -> tuple[Optional[Message], bool]:
+    """Resolve a reconciliation card through one database CAS.
+
+    The caller has already acquired the reconciliation service's canonical
+    execution/request locks. Identical replays may validate successfully, but
+    only the transaction that changes ``resolved_at`` from NULL may project
+    Chat receipts or trigger post-commit work.
+    """
+
+    winner_id = (await db.execute(
+        update(Message)
+        .where(
+            Message.id == message_id,
+            Message.resolved_at.is_(None),
+            Message.pending_action["approval_request_id"].as_string()
+            == approval_request_id,
+            Message.pending_action["kind"].as_string()
+            == pending_action_kind,
+        )
+        .values(
+            resolution=resolution,
+            resolved_at=datetime.now(timezone.utc),
+            resolved_by_user_id=user_id,
+        )
+        .returning(Message.id)
+        .execution_options(synchronize_session=False)
+    )).scalar_one_or_none()
+    msg = (await db.execute(
+        select(Message)
+        .where(Message.id == message_id)
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if msg is None:
+        return None, False
+    won = winner_id is not None
+    if won:
+        await _emit_pending_action_resolution_followup(
+            db,
+            message=msg,
+            resolution=resolution,
+        )
+    return msg, won
+
+
+async def _emit_pending_action_resolution_followup(
+    db: AsyncSession,
+    *,
+    message: Message,
+    resolution: dict,
+) -> None:
+    """Project the standalone Chat receipt for one resolved action."""
+
+    msg = message
     # Workspace Chat keeps a standalone resolution receipt for continuity.
     # Personal Chat approval handlers already persist the user's choice and an
     # assistant continuation message, while the original card also gains its
@@ -485,34 +694,32 @@ async def resolve_pending_action(
         "approve" in choice
         or choice in ("yes", "accept", "confirm", "continue_after_login")
     )
-    follow: Message | None = None
-    if emit_followup:
-        if is_retry:
-            content = "Retry requested"
-        elif is_feedback:
-            content = "✓ Feedback sent"
-        elif is_response:
-            content = "✓ Response submitted"
-        elif is_workflow_start:
-            content = "✓ Workflow started"
-        elif is_cancelled:
-            content = "✗ Cancelled"
-        else:
-            label = "Approved" if is_approve else "Rejected" if choice else "Resolved"
-            content = f"✓ {label}" if is_approve else f"✗ {label}"
-        if note:
-            content += f" — {note}"
-        follow = Message(
-            id=generate_ulid(),
-            conversation_id=msg.conversation_id,
-            role="system",
-            content=content,
-            author_kind="system",
-            message_kind="system",
-            refs=[{"type": "message", "id": msg.id}],
-        )
-        db.add(follow)
-        await db.flush()
+    if is_retry:
+        content = "Retry requested"
+    elif is_feedback:
+        content = "✓ Feedback sent"
+    elif is_response:
+        content = "✓ Response submitted"
+    elif is_workflow_start:
+        content = "✓ Workflow started"
+    elif is_cancelled:
+        content = "✗ Cancelled"
+    else:
+        label = "Approved" if is_approve else "Rejected" if choice else "Resolved"
+        content = f"✓ {label}" if is_approve else f"✗ {label}"
+    if note:
+        content += f" — {note}"
+    follow = Message(
+        id=generate_ulid(),
+        conversation_id=msg.conversation_id,
+        role="system",
+        content=content,
+        author_kind="system",
+        message_kind="system",
+        refs=[{"type": "message", "id": msg.id}],
+    )
+    db.add(follow)
+    await db.flush()
 
     # Let other open clients refresh their sidebar counts. The API caller also
     # updates optimistically, but shared workspaces need a cross-tab signal.
@@ -520,11 +727,12 @@ async def resolve_pending_action(
         conv = (await db.execute(
             select(Conversation).where(Conversation.id == msg.conversation_id)
         )).scalar_one_or_none()
-        if conv and conv.workspace_id and follow is not None:
+        if conv and conv.workspace_id:
             entity_id = conv.entity_id
             workspace_id = conv.workspace_id
             await _publish_workspace_chat_event(entity_id, {
                 "workspace_id": workspace_id,
+                "conversation_id": msg.conversation_id,
                 "message_id": follow.id,
                 "resolved_message_id": msg.id,
                 "message_kind": "system",
@@ -534,5 +742,3 @@ async def resolve_pending_action(
             })
     except Exception:
         pass  # WS push is best-effort
-
-    return msg

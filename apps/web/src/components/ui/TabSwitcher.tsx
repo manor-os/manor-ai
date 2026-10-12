@@ -19,7 +19,7 @@ interface Tab {
   compactLabel?: string;
   icon?: ReactNode;
   count?: number;
-  badge?: string;
+  badge?: ReactNode;
   status?: "warning" | "danger";
   statusLabel?: string;
 }
@@ -164,7 +164,7 @@ export default function TabSwitcher({
                 aria-hidden="true"
               />
             )}
-            {tab.badge && (
+            {typeof tab.badge === "string" ? (
               <span style={{
                 fontSize: 9, fontWeight: 700, letterSpacing: "0.03em",
                 padding: "1px 5px", borderRadius: 4, lineHeight: 1.4,
@@ -173,7 +173,7 @@ export default function TabSwitcher({
               }}>
                 {tab.badge}
               </span>
-            )}
+            ) : tab.badge}
             {tab.count !== undefined && (
               <span style={{
                 fontSize: size === "sm" ? 10 : 11, fontWeight: 600,

@@ -30,6 +30,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -45,6 +46,13 @@ class ExecutionPlan(Base, TimestampMixin):
         Index("ix_plans_task", "task_id"),
         Index("ix_plans_workspace_status", "workspace_id", "status"),
         Index("ix_plans_entity_status", "entity_id", "status"),
+        Index("ix_plans_wake_scan", "status", "updated_at", "id"),
+        Index(
+            "ix_plans_wake_runnable",
+            text("COALESCE(updated_at, created_at)"),
+            "id",
+            postgresql_where=text("status IN ('draft', 'pending', 'running')"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -177,6 +185,8 @@ class ExecutionStep(Base, TimestampMixin):
     # Step uses this 7-state execution machine. They are aggregated for
     # display but never confused at the data layer.
 
+    # Advanced only by an explicit user retry, never by automatic attempts.
+    approval_operation_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     risk_level: Mapped[str] = mapped_column(
@@ -196,6 +206,14 @@ class ExecutionStep(Base, TimestampMixin):
     # Lease-level HITL: when an action throws NeedsHumanAuth, prompt
     # is written here, then user reply lands in human_input_response,
     # and the next attempt picks it up via params.
+    # none_as_null: clearing the checkpoint must leave SQL NULL, not a JSON
+    # ``null`` value, so ``runtime_checkpoint IS NULL`` stays truthful.
+    runtime_checkpoint: Mapped[Optional[dict]] = mapped_column(JSONB(none_as_null=True))
+    """The subagent's parked transcript when ``request_input`` paused the step.
+
+    Written with ``human_input_prompt``; kept across the resume so the next
+    attempt continues the loop at the pending tool call with the answer as its
+    result. Cleared when the step reaches a terminal status."""
 
     cost: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     # {llm_tokens_input, llm_tokens_output, api_calls, usd}

@@ -21,7 +21,10 @@ Use this skill to make a Manor branch reviewable without losing work or overstat
 
 ## Verification matrix
 
-Run only relevant checks, but make the selection explicit.
+Read the repository [testing policy](../../testing.md). Run relevant checks and
+required gates, making the selection explicit. Explain the behavior or risk
+covered, why tests were added, reused, or unnecessary, and any duplicate or
+obsolete coverage retired. Test count is not a completion criterion.
 
 | Touched area | Minimum check |
 | --- | --- |
@@ -50,6 +53,8 @@ Use the template:
 
 ## Handoff checklist
 
+- Tests created in this task have passed the testing policy's retention review;
+  useful coverage is retained or consolidated, and disposable probes are cleaned up.
 - Dirty worktree contains only expected files or is clearly explained.
 - New public assets are tracked.
 - No ignored build artifacts are staged.

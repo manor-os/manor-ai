@@ -20,6 +20,7 @@ from packages.core.ai.runtime.file_actions import (
     runtime_sync_entity_file_to_knowledge,
 )
 from packages.core.models.base import generate_ulid
+from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.workspace_artifacts import (
     ensure_workspace_artifact_directory,
     resolve_workspace_artifact_directory,
@@ -294,7 +295,8 @@ def _markdown_cell(value: Any) -> str:
 
 def _safe_ledger_link(value: Any) -> str:
     raw = str(value or "").strip()
-    if raw.startswith("/api/v1/fs/"):
+    file_ref = parse_file_reference(raw)
+    if file_ref is not None and file_ref.entity_id and not urlparse(raw).scheme:
         return quote(raw, safe="/:?=&%#-._~")
     parsed = urlparse(raw)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
@@ -771,6 +773,27 @@ async def record_topic_event(
 
     relative_name = f"{EVENT_DIRECTORY}/{clean_reservation_id}-{event}.json"
     abs_path = os.path.join(ledger_root, relative_name)
+    if event == "youtube_saved" and os.path.isfile(abs_path):
+        requested_details = details if isinstance(details, dict) else {}
+        requested_identity = str(
+            requested_details.get("video_id")
+            or requested_details.get("watch_url")
+            or ""
+        ).strip()
+        existing_details = _read_json_file(abs_path).get("details")
+        existing_identity = str(
+            existing_details.get("video_id")
+            or existing_details.get("watch_url")
+            or ""
+        ).strip() if isinstance(existing_details, dict) else ""
+        if requested_identity and requested_identity != existing_identity:
+            identity_hash = hashlib.sha256(
+                requested_identity.encode("utf-8")
+            ).hexdigest()[:16]
+            relative_name = (
+                f"{EVENT_DIRECTORY}/{clean_reservation_id}-{event}-{identity_hash}.json"
+            )
+            abs_path = os.path.join(ledger_root, relative_name)
     record = {
         "schema_version": LEDGER_SCHEMA_VERSION,
         "entry_type": "topic_status",

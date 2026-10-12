@@ -10,6 +10,7 @@ from httpx import AsyncClient
 
 import packages.core.database as db_module
 from packages.core.ai.runtime.document_actions import runtime_list_documents_action
+from packages.core.ai.runtime.manor_actions import runtime_manor_get_document
 from packages.core.ai.runtime.rag import runtime_rag_action
 from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.permission import (
@@ -191,7 +192,8 @@ async def test_workspace_members_only_role_matrix(client: AsyncClient):
     workspace_id = workspace["id"]
     assert workspace["settings"]["access_mode"] == "members_only"
 
-    assert (await client.get(f"/api/v1/workspaces/{workspace_id}", headers=admin["headers"])).status_code == 200
+    # Entity admin does not have the owner-only workspaces.read.all grant.
+    assert (await client.get(f"/api/v1/workspaces/{workspace_id}", headers=admin["headers"])).status_code == 404
     assert (await client.get(f"/api/v1/workspaces/{workspace_id}", headers=member["headers"])).status_code == 404
     assert (await client.get("/api/v1/workspaces", headers=member["headers"])).json() == []
 
@@ -552,8 +554,17 @@ async def test_private_folder_hides_folder_and_child_documents_until_granted(cli
     assert folder_resp.status_code == 201, folder_resp.text
     folder_id = folder_resp.json()["id"]
 
+    # New folders and uploads default to private. Start with an explicitly
+    # entity-visible child so changing only the folder tests ancestor hiding.
+    entity_props = await client.post(
+        f"/api/v1/folders/{folder_id}/properties",
+        headers=owner["headers"],
+        json={"visibility": Visibility.ENTITY, "cascade": False},
+    )
+    assert entity_props.status_code == 200, entity_props.text
+
     upload_resp = await client.post(
-        f"/api/v1/documents/upload?folder_id={folder_id}",
+        f"/api/v1/documents/upload?folder_id={folder_id}&visibility=entity",
         headers=owner["headers"],
         files={"file": ("private-folder-child.md", b"private folder content", "text/markdown")},
     )
@@ -767,6 +778,148 @@ async def test_runtime_document_tools_filter_by_user_and_workspace(client: Async
         )
     )
     assert rag_member["source_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_workspace_chat_upload_document_resolves_only_from_its_knowledge_workspace(
+    client: AsyncClient,
+):
+    owner = await _register_owner(client, "runtime_chat_upload_owner")
+    entity_id = owner["entity_id"]
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner["headers"],
+        json={"name": "Chat Upload Workspace"},
+    )
+    other_workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner["headers"],
+        json={"name": "Other Workspace"},
+    )
+    workspace_id = workspace.json()["id"]
+
+    async with db_module.async_session() as session:
+        document = Document(
+            entity_id=entity_id,
+            name="release-intake.json",
+            fs_path="uploads/chat/release-intake.json",
+            file_type="json",
+            mime_type="application/json",
+            source="chat_upload",
+            created_by=owner["user_id"],
+            owner_id=owner["user_id"],
+            visibility=Visibility.WORKSPACE,
+            classification="internal",
+        )
+        group = DocumentGroup(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            name="Workspace Knowledge",
+            settings={"kind": "default_collection", "default_collection": True},
+        )
+        session.add_all([document, group])
+        await session.flush()
+        session.add(DocumentGroupMember(document_id=document.id, group_id=group.id))
+        await session.commit()
+        document_id = document.id
+
+    async with db_module.async_session() as session:
+        listed = json.loads(
+            await runtime_list_documents_action(
+                entity_id=entity_id,
+                user_id=owner["user_id"],
+                workspace_id=workspace_id,
+                params={"detail": "details"},
+                db=session,
+            )
+        )
+        resolved = json.loads(
+            await runtime_manor_get_document(
+                session,
+                entity_id=entity_id,
+                user_id=owner["user_id"],
+                workspace_id=workspace_id,
+                params={"document_id": document_id},
+            )
+        )
+        wrong_workspace = json.loads(
+            await runtime_manor_get_document(
+                session,
+                entity_id=entity_id,
+                user_id=owner["user_id"],
+                workspace_id=other_workspace.json()["id"],
+                params={"document_id": document_id},
+            )
+        )
+
+    assert [item["document_id"] for item in listed["documents"]] == [document_id]
+    assert resolved["document"]["document_id"] == document_id
+    assert resolved["document"]["fs_path"] == "uploads/chat/release-intake.json"
+    assert wrong_workspace == {"error": "Document not found"}
+    viewer = await client.get(
+        f"/api/v1/documents/{document_id}",
+        headers=owner["headers"],
+    )
+    assert viewer.status_code == 200
+    knowledge = await client.get(
+        "/api/v1/documents",
+        params={"workspace_id": workspace_id},
+        headers=owner["headers"],
+    )
+    assert knowledge.status_code == 200
+    assert [item["id"] for item in knowledge.json()["items"]] == [document_id]
+
+
+@pytest.mark.asyncio
+async def test_workspace_knowledge_does_not_expose_unrelated_hidden_document(
+    client: AsyncClient,
+):
+    owner = await _register_owner(client, "runtime_hidden_doc_owner")
+    entity_id = owner["entity_id"]
+    workspace = await client.post(
+        "/api/v1/workspaces",
+        headers=owner["headers"],
+        json={"name": "Hidden Document Workspace"},
+    )
+    workspace_id = workspace.json()["id"]
+
+    async with db_module.async_session() as session:
+        document = Document(
+            entity_id=entity_id,
+            name="internal.txt",
+            fs_path="tmp/internal.txt",
+            file_type="txt",
+            mime_type="text/plain",
+            source="upload",
+            created_by=owner["user_id"],
+            owner_id=owner["user_id"],
+            visibility=Visibility.WORKSPACE,
+            classification="internal",
+        )
+        group = DocumentGroup(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            name="Workspace Knowledge",
+            settings={"kind": "default_collection", "default_collection": True},
+        )
+        session.add_all([document, group])
+        await session.flush()
+        session.add(DocumentGroupMember(document_id=document.id, group_id=group.id))
+        await session.commit()
+        document_id = document.id
+
+    async with db_module.async_session() as session:
+        result = json.loads(
+            await runtime_manor_get_document(
+                session,
+                entity_id=entity_id,
+                user_id=owner["user_id"],
+                workspace_id=workspace_id,
+                params={"document_id": document_id},
+            )
+        )
+
+    assert result == {"error": "Document not found"}
 
 
 @pytest.mark.asyncio

@@ -62,6 +62,7 @@ async def authorize_runtime_action(
     conversation_id: str | None = None,
     task_id: str | None = None,
     runtime_surface: Any = None,
+    agent_subscription_id: str | None = None,
 ) -> PermissionDecision:
     request = RuntimeAuthorizationRequest.create(
         entity_id=entity_id,
@@ -78,6 +79,7 @@ async def authorize_runtime_action(
         conversation_id=conversation_id,
         task_id=task_id,
         runtime_surface=runtime_surface,
+        agent_subscription_id=agent_subscription_id,
     )
     return await _DEFAULT_SERVICE.authorize_runtime(db, request)
 

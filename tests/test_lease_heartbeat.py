@@ -34,6 +34,7 @@ import pytest
 from sqlalchemy import select
 
 from packages.core.database import async_session
+from packages.core.dispatcher.service import Dispatcher
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.worker import WorkLease, Worker
@@ -126,8 +127,17 @@ def _spy_on_extends(monkeypatch) -> list[str]:
     extends: list[str] = []
     real_extend = internal.extend_active_lease_sync
 
-    def _spy(lease_id: str, *, extra_seconds: float) -> bool:
-        ok = real_extend(lease_id, extra_seconds=extra_seconds)
+    def _spy(
+        lease_id: str,
+        *,
+        extra_seconds: float,
+        execution_claim_id: str | None = None,
+    ) -> bool:
+        ok = real_extend(
+            lease_id,
+            extra_seconds=extra_seconds,
+            execution_claim_id=execution_claim_id,
+        )
         extends.append(lease_id)
         return ok
 
@@ -140,8 +150,10 @@ def _capture_heartbeats(monkeypatch) -> list:
     started: list = []
     real_start = internal._start_lease_heartbeat
 
-    def _spy(lease_id: str):
-        heartbeat = real_start(lease_id)
+    def _spy(lease_id: str, **kwargs):
+        # The worker now passes ``on_inactive=`` (lease revocation cancels
+        # the step body); forward it so the spied heartbeat behaves the same.
+        heartbeat = real_start(lease_id, **kwargs)
         started.append(heartbeat)
         return heartbeat
 
@@ -150,6 +162,57 @@ def _capture_heartbeats(monkeypatch) -> list:
 
 
 # ── the regression that matters ───────────────────────────────────────
+
+@pytest.mark.parametrize("evidence_owner", ["step", "lease"])
+@pytest.mark.asyncio
+async def test_expired_lease_with_captured_effect_waits_for_reconciliation(
+    db_session, evidence_owner,
+):
+    """Expiry cannot prove an evidenced external action is safe to replay."""
+    seeded = await _seed_lease(db_session, lease_seconds=-1)
+    step, lease = await _reload(db_session, seeded)
+    receipt = {
+        "kind": "tool_effect",
+        "effect": "publish",
+        "fields": {
+            "provider_id": "post-123",
+            "delivery_confirmed": True,
+        },
+    }
+    if evidence_owner == "step":
+        step.evidence_refs = [receipt]
+    else:
+        lease.evidence_refs = [receipt]
+    checkpoint = {
+        "version": 1,
+        "messages": [{"role": "tool", "content": "published post-123"}],
+    }
+    step.runtime_checkpoint = checkpoint
+    await db_session.commit()
+
+    assert await Dispatcher().expire_leases(db_session) == 1
+    await db_session.commit()
+
+    step, lease = await _reload(db_session, seeded)
+    assert lease.status == "expired"
+    assert lease.error == step.error
+    assert step.step_status == "waiting_human"
+    assert step.attempt_count < step.max_attempts, (
+        "captured effects must suppress automatic retry even with attempts remaining"
+    )
+    assert step.current_lease_id is None
+    assert step.finished_at is None
+    assert step.runtime_checkpoint == checkpoint
+    assert step.evidence_refs == [receipt]
+    if evidence_owner == "lease":
+        assert lease.evidence_refs == [receipt]
+    assert step.error["type"] == "lease_expired"
+    assert step.error["failure"]["retryable"] is False
+    assert step.error["failure"]["requires_human"] is True
+    assert "next_retry_at" not in step.error
+    assert "reconcile" in step.error["failure"]["reason"].lower()
+    assert "reconcile" in step.human_input_prompt.lower()
+
 
 @pytest.mark.asyncio
 async def test_a_body_that_blocks_the_event_loop_still_keeps_its_lease(
@@ -369,3 +432,109 @@ async def test_zero_interval_disables_the_heartbeat(db_session, monkeypatch):
 
     _step, lease = await _reload(db_session, seeded)
     assert (lease.heartbeat_count or 0) == 0
+
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_extends_immediately_when_execute_starts(
+    db_session, monkeypatch
+):
+    """Queue grace is replaced by the 300s clock as soon as execute starts.
+
+    Waiting a full heartbeat interval before the first extend would still
+    let a lease that queued almost until grace expire during startup.
+    """
+    seeded = await _seed_lease(
+        db_session, params={"max_runtime_seconds": 30}, lease_seconds=0.2,
+    )
+    _compress_heartbeat(monkeypatch, interval=5.0, extend=5.0)
+
+    started = asyncio.Event()
+
+    async def _body(snapshot):
+        started.set()
+        await asyncio.sleep(0.25)
+        return {"result": {"text": "ok"}}
+
+    monkeypatch.setattr(internal, "_execute_by_kind", _body)
+
+    task = asyncio.create_task(internal.execute_lease_inproc(seeded["lease_id"]))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    _step, lease = await _reload(db_session, seeded)
+    assert (lease.heartbeat_count or 0) >= 1
+    outcome = await task
+    assert outcome["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_checkout_gives_queued_leases_strategist_queue_grace(db_session):
+    """A never-heartbeated lease must survive heavy-queue wait behind Strategist.
+
+    The old grant clock was 300s from checkout. execute_lease shares
+    CeleryQueue.HEAVY with run_strategist_review (hard limit 1800s), so a
+    queued lease with heartbeat_count=0 was expired as dead before the
+    worker started. TTL is liveness after execute starts.
+    """
+    from packages.core.dispatcher.service import (
+        Dispatcher,
+        _DEFAULT_LEASE_TTL,
+        _QUEUED_LEASE_GRACE,
+    )
+
+    entity_id = generate_ulid()
+    from tests.approval_settings_test_utils import action_rule, initialize_test_account_approval
+
+    await initialize_test_account_approval(db_session, entity_id=entity_id,
+        user_rules=[action_rule("unclassified.action")])
+    plan_id = generate_ulid()
+    step_id = generate_ulid()
+    worker_id = generate_ulid()
+    granted_after = datetime.now(timezone.utc)
+
+    db_session.add_all([
+        Worker(
+            id=worker_id, entity_id=entity_id, kind="internal",
+            display_name="Internal worker",
+            capabilities={"supported_kinds": ["llm"], "max_risk_level": "high"},
+            monthly_spent_usd=Decimal("0"), auto_pause_on_budget=True,
+            status="active",
+        ),
+        ExecutionPlan(
+            id=plan_id, entity_id=entity_id, status="running",
+            execution_mode="live", approval_required=False, plan_dag={"steps": []},
+        ),
+        ExecutionStep(
+            id=step_id, plan_id=plan_id, entity_id=entity_id,
+            step_key="draft", kind="llm",
+            params={}, depends_on=[], step_status="pending",
+            risk_level="low", attempt_count=0, max_attempts=3,
+        ),
+    ])
+    await db_session.commit()
+
+    dispatcher = Dispatcher()
+    worker = await db_session.get(Worker, worker_id)
+    leased = await dispatcher.checkout_steps_for_worker(
+        db_session, worker, max_n=1, plan_id=plan_id,
+    )
+    await db_session.commit()
+    assert len(leased) == 1
+    lease, _step = leased[0]
+    assert (lease.heartbeat_count or 0) == 0
+    assert lease.last_heartbeat_at is None
+    assert lease.lease_until >= granted_after + _QUEUED_LEASE_GRACE
+    assert lease.lease_until <= (
+        datetime.now(timezone.utc) + _QUEUED_LEASE_GRACE + _DEFAULT_LEASE_TTL
+        + timedelta(seconds=2)
+    )
+
+    assert await dispatcher.expire_leases(
+        db_session, now=datetime.now(timezone.utc) + timedelta(seconds=400),
+    ) == 0
+    await db_session.refresh(lease)
+    assert lease.status == "active"
+
+    assert await dispatcher.expire_leases(
+        db_session, now=lease.lease_until + timedelta(seconds=1),
+    ) == 1

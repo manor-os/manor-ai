@@ -64,6 +64,13 @@ class UpdateOAuthClientRequest(BaseModel):
     scopes: Optional[str] = None
 
 
+def _require_local_lark_config_write(server_key: str) -> None:
+    from packages.core.constants.plans import is_cloud
+
+    if server_key == "lark" and is_cloud():
+        raise HTTPException(403, "Configure Lark through Platform Admin integrations.")
+
+
 @router.get("", response_model=list[OAuthClientStatus])
 async def list_oauth_clients(
     db: AsyncSession = Depends(get_db),
@@ -119,6 +126,7 @@ async def update_oauth_client(
     user: User = Depends(get_current_user),
 ) -> dict:
     await _require_admin(db, user)
+    _require_local_lark_config_write(server_key)
     if server_key not in _PROVIDER_OAUTH_META:
         raise HTTPException(404, f"Unknown OAuth provider: {server_key}")
     if not body.client_id.strip() or (
@@ -178,7 +186,7 @@ async def check_oauth_client_health(
         "scope": cfg.scopes.split()[0] if cfg.scopes else "",
         "state": "healthcheck",
     }
-    if server_key == "robinhood":
+    if server_key in {"robinhood", "lark"}:
         import base64
         import hashlib
         import secrets
@@ -190,6 +198,8 @@ async def check_oauth_client_health(
             hashlib.sha256(secrets.token_urlsafe(64).encode()).digest()
         ).rstrip(b"=").decode()
         params["code_challenge_method"] = "S256"
+        if server_key == "lark":
+            params["scope"] = cfg.scopes
         params = apply_authorize_param_conventions(cfg, params)
     try:
         async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as cx:
@@ -202,7 +212,7 @@ async def check_oauth_client_health(
         # an allow-list — still proves the client_id is recognized.
         # 401/403 = bad client_id; 404 = provider misconfigured.
         ok = resp.status_code in (200, 302, 303, 307, 400)
-        if server_key == "robinhood":
+        if server_key in {"robinhood", "lark"}:
             ok = resp.status_code in (200, 302, 303, 307)
         return OAuthClientHealth(
             server_key=server_key,
@@ -210,7 +220,7 @@ async def check_oauth_client_health(
             status_code=resp.status_code,
             detail=(
                 "OAuth entry reachable; client registration and user consent are not verified by this probe."
-                if ok and server_key == "robinhood"
+                if ok and server_key in {"robinhood", "lark"}
                 else ("OK" if ok else f"Provider returned HTTP {resp.status_code}")
             ),
         )
@@ -230,6 +240,7 @@ async def reset_oauth_client(
     """Clear the UI override on this provider so env bootstrap
     re-seeds it on next restart."""
     await _require_admin(db, user)
+    _require_local_lark_config_write(server_key)
     if server_key not in _PROVIDER_OAUTH_META:
         raise HTTPException(404, f"Unknown OAuth provider: {server_key}")
 

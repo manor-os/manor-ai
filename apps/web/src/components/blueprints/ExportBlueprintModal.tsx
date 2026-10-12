@@ -38,6 +38,7 @@ interface SectionToggle {
     | "include_stats"
     | "include_scheduled_jobs"
     | "include_workflows"
+    | "include_blocking_setup"
     | "include_custom_fields"
     | "include_governance"
     | "include_channel_requirements"
@@ -128,6 +129,7 @@ const SECTIONS: SectionToggle[] = [
   { key: "include_stats",                 label: t("page.workspace_stats.title"), defaultOn: true,  hint: "Collection definitions only. Observation history is never exported." },
   { key: "include_scheduled_jobs",        label: t("page.blueprint_detail.scheduled_jobs"),       defaultOn: true,  hint: "Cron triggers (last_run_at dropped)." },
   { key: "include_workflows",             label: "Workflows",                  defaultOn: true,  hint: "Workspace workflow graphs, variables, and active bindings." },
+  { key: "include_blocking_setup",        label: "Workspace setup checks",     defaultOn: true,  hint: "Carry workspace prerequisites into new installs. Turn off when the exported workflow collects these inputs at launch; the source workspace is unchanged." },
   { key: "include_custom_fields",         label: t("component.export_blueprint_modal.custom_field_defs"),    defaultOn: true,  hint: "Per-workspace field schemas for tasks/clients." },
   { key: "include_governance",            label: t("page.blueprint_detail.governance_policy"),    defaultOn: true,  hint: "Current policy snapshot — operator picks a preset overlay on install." },
   { key: "include_channel_requirements",  label: t("component.export_blueprint_modal.channel_requirements"), defaultOn: true,  hint: "Channel types and service routing; account identities and credentials are never copied." },
@@ -136,7 +138,7 @@ const SECTIONS: SectionToggle[] = [
   { key: "include_embedded_skills",       label: "Private Skills",             defaultOn: true,  hint: "Embed private Skills bound to exported Agents." },
   { key: "include_starter_memory",        label: "Agent starter memory",       defaultOn: false, hint: "Include eligible agent-level memory; private and confidential entries stay excluded." },
   { key: "include_knowledge_packs",       label: "Knowledge structure",        defaultOn: true,  hint: "Export Workspace Knowledge groups and safe document paths." },
-  { key: "include_memory_files",          label: t("component.export_blueprint_modal.memory_md_files"),      defaultOn: false, hint: "Include bodies only for public, clean, non-PII Markdown stored as Knowledge text." },
+  { key: "include_memory_files",          label: t("component.export_blueprint_modal.memory_md_files"),      defaultOn: false, hint: "Include bodies only for public, clean, non-PII Markdown and CSV stored as Knowledge text." },
 ];
 
 function defaultSlug(name: string): string {
@@ -156,11 +158,23 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  let handleExportedBlueprint = (bp: BlueprintDetail) => {
+    const blob = new Blob([JSON.stringify(bp.payload, null, 2)], {
+      type: "application/json",
+    });
+    const href = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = href;
+    link.download = `${slug || "workspace-blueprint"}.json`;
+    link.click();
+    URL.revokeObjectURL(href);
+  };
 
   const [title, setTitle] = useState("");
   const [slug, setSlug] = useState("");
   const [summary, setSummary] = useState("");
   const [description, setDescription] = useState("");
+  const [usageGuide, setUsageGuide] = useState("");
   const [tagsInput, setTagsInput] = useState("");
   const [authorHandle, setAuthorHandle] = useState("");
   const [personalizationFields, setPersonalizationFields] = useState<PersonalizationField[]>([]);
@@ -205,6 +219,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
       setSlug(defaultSlug(workspaceName));
       setSummary("");
       setDescription("");
+      setUsageGuide("");
       setTagsInput("");
       setAuthorHandle("");
       setPersonalizationFields([]);
@@ -225,6 +240,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
       setSlug(existing.slug);
       setSummary(existing.summary ?? "");
       setDescription(existing.description ?? "");
+      setUsageGuide(String((existing.payload.manifest as Record<string, unknown> | undefined)?.usage_guide ?? ""));
       setTagsInput(existing.tags.join(", "));
       setAuthorHandle(existing.author_handle ?? "");
       setPersonalizationFields(personalizationFieldsFromBlueprint(existing));
@@ -260,6 +276,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
         title,
         summary: summary || undefined,
         description: description || undefined,
+        usage_guide: usageGuide.trim(),
         tags: tagsInput.split(",").map((t) => t.trim()).filter(Boolean),
         author_handle: authorHandle || undefined,
         marketplace_blueprint_id: existingBlueprintQuery.data?.id,
@@ -276,7 +293,7 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
       queryClient.invalidateQueries({ queryKey: ["blueprints"] });
       toast.success(t("component.export_blueprint_modal.blueprint_draft_created"));
       onClose();
-      navigate(`/blueprints/${bp.id}`);
+      handleExportedBlueprint(bp);
     },
     onError: (e: Error) => {
       toast.error(`Export failed: ${e.message}`);
@@ -373,6 +390,13 @@ export default function ExportBlueprintModal({ open, onClose, workspaceId, works
 
         <Textarea label={t("component.export_blueprint_modal.summary_one_line")} value={summary} onChange={(e) => setSummary(e.target.value)} rows={2} />
         <Textarea label={t("page.task_collections.description")} value={description} onChange={(e) => setDescription(e.target.value)} rows={4} />
+        <Textarea
+          label={t("page.blueprint_detail.usage_guide")}
+          value={usageGuide}
+          onChange={(e) => setUsageGuide(e.target.value.slice(0, 10000))}
+          placeholder={t("page.blueprint_detail.usage_guide_placeholder")}
+          rows={6}
+        />
         <Input
           label={t("page.blueprint_detail.tags_csv")}
           value={tagsInput}

@@ -37,6 +37,19 @@ The public edition is source-available under the Manor Sustainable Use License. 
 
 ## Capability map
 
+### Interface modes
+
+A saved choice is kept. Without one, existing users default to Professional
+without a first-use prompt; new users see User Guide with Simple preselected.
+Select Start to save and begin the tour; reopen it from More → User Guide.
+You can also change mode in Settings → Appearance → Interface mode. Your choice
+is saved in this browser.
+Simple focuses on Chat and installing Workspaces. Workspace Chat
+still shows the multi-Agent team, results, approvals, and necessary run and
+setup status. Professional adds the existing management pages, configuration,
+and detailed chat controls. The choice does not change data, permissions, or
+ongoing work. The capability map below includes Professional-mode surfaces.
+
 ### Chat and collaboration
 
 - Use Manor AI for research, planning, drafting, and starting work.
@@ -128,6 +141,9 @@ The public edition is source-available under the Manor Sustainable Use License. 
 - Use security controls presented to the current user.
 
 ## First workflow
+
+Use Professional mode for the configuration steps below, or choose Simple mode
+and Install Workspace for a chat-first start.
 
 1. Open Manor AI and send a short request.
 2. Create a Workspace with a clear outcome.

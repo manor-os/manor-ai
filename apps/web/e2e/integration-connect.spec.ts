@@ -4,6 +4,8 @@ const draft = "Read my email and summarize the attached notes";
 const attachment = "connection-notes.txt";
 
 async function prepare(page: Page, outcome = "success", delay?: "start" | "sync") {
+  // The Connectors menu belongs to professional mode; the product defaults to simple.
+  await page.addInitScript(() => localStorage.setItem("manor-interface-mode", "professional"));
   await page.route("**/api/v1/**", route => route.fulfill({ json: [] }));
   await page.goto(`/e2e/fixtures/integration-connect.html${delay ? `?delay=${delay}` : ""}`);
   await page.getByRole("combobox", { name: "Authorization outcome" }).selectOption(outcome);
@@ -35,6 +37,30 @@ async function reopenSetup(page: Page) {
   await page.getByRole("button", { name: "Connectors", exact: true }).click();
   await page.getByRole("button", { name: "Gmail Read and send email Connect", exact: true }).click();
   return page.getByRole("dialog", { name: "Gmail", exact: true });
+}
+
+for (const setup of ["checking", "unavailable"]) {
+  for (const ready of [false, true]) {
+    test(`Chat respects setup=${setup} while retaining ready=${ready} usage`, async ({ page }) => {
+      await page.addInitScript(() => localStorage.setItem("manor-interface-mode", "professional"));
+      await page.route("**/api/v1/**", route => route.fulfill({ json: [] }));
+      await page.goto(`/e2e/fixtures/integration-connect.html?setup=${setup}${ready ? "&ready=1" : ""}`);
+      await page.getByRole("textbox").fill(draft);
+      await page.getByRole("button", { name: "Connectors", exact: true }).click();
+      const connector = page.getByRole("button", { name: /^Gmail Read and send email/ });
+      if (ready) {
+        await expect(connector).toBeEnabled();
+        await connector.click();
+        await expect(page.getByLabel("Chat draft")).toContainText("Use Gmail to");
+      } else {
+        await expect(connector).toBeDisabled();
+        await expect(connector).toContainText(setup === "checking" ? "Checking setup…" : "Status unavailable");
+        await expect(page.getByLabel("Chat draft")).toHaveText(draft);
+      }
+      await expect(page.getByLabel("Current route")).toHaveText("/chat");
+      await expect(page.getByLabel("Request counts")).toContainText("Authorization requests: 0");
+    });
+  }
 }
 
 test("closing connection setup preserves the route-owned draft and real file", async ({ page }) => {

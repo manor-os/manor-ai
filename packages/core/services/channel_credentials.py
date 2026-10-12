@@ -1,6 +1,9 @@
 """Resolve ChannelConfig credentials through their owned source connection."""
 from __future__ import annotations
 
+import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 
 import httpx
@@ -8,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.credentials import Requester, get_credential_service
 from packages.core.database import async_session
+from packages.core.database_runtime import release_read_transaction
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Integration
 from packages.core.models.user import OAuthAccount
@@ -15,6 +19,22 @@ from packages.core.services.integration_access import resolve_integration_access
 from packages.core.services.whatsapp_business_config import (
     load_whatsapp_business_config,
 )
+
+
+# A locked outbound coordinator can lend its session to sequential adapter
+# credential reads. It alone owns commit/rollback; child tasks do not borrow it.
+_borrowed_session: ContextVar[tuple[AsyncSession, object] | None] = ContextVar(
+    "channel_credential_session", default=None,
+)
+
+
+@contextmanager
+def use_channel_credential_session(db: AsyncSession):
+    token = _borrowed_session.set((db, asyncio.current_task()))
+    try:
+        yield
+    finally:
+        _borrowed_session.reset(token)
 
 
 _SOURCE_UNAVAILABLE = "Channel credential source is unavailable"
@@ -63,6 +83,7 @@ async def resolve_nango_integration_credentials(
         secret = await get_nango_secret(db, integration.entity_id)
         if not secret:
             return leased_credentials
+        await release_read_transaction(db)
         async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(
                 f"{_NANGO_BASE}/connection/{connection_id}",
@@ -174,6 +195,7 @@ async def lease_channel_credentials(
     if bool(source_kind) != bool(source_id):
         raise ValueError(_SOURCE_UNAVAILABLE)
     if not source_kind:
+        await release_read_transaction(db)
         return get_credential_service().lease_channel_config(
             channel_config,
             requester=Requester(kind="channel", id=channel_config.id),
@@ -187,6 +209,7 @@ async def lease_channel_credentials(
         account = await db.get(OAuthAccount, source_id)
         if not account or account.user_id != channel_config.owner_user_id:
             raise ValueError(_SOURCE_UNAVAILABLE)
+        await release_read_transaction(db)
         credentials = get_credential_service().lease_oauth_account(
             account,
             requester=requester,
@@ -196,6 +219,7 @@ async def lease_channel_credentials(
         integration = await db.get(Integration, source_id)
         if not integration or integration.owner_user_id != channel_config.owner_user_id:
             raise ValueError(_SOURCE_UNAVAILABLE)
+        await release_read_transaction(db)
         credentials = get_credential_service().lease_integration(
             integration,
             requester=requester,
@@ -216,14 +240,33 @@ async def lease_channel_config_credentials(
     reason: str,
     resolve_nango: bool = False,
 ) -> dict:
-    """Convenience entry point for adapters, which run outside request DB scope."""
-    async with async_session() as db:
-        stored_config = await db.get(ChannelConfig, channel_config.id)
-        if not stored_config:
-            raise ValueError(_SOURCE_UNAVAILABLE)
-        return await lease_channel_credentials(
-            db,
-            stored_config,
-            reason=reason,
-            resolve_nango=resolve_nango,
+    """Lease through the coordinator's session, or own a short read session."""
+    borrowed = _borrowed_session.get()
+    if borrowed is not None and borrowed[1] is asyncio.current_task():
+        return await _lease_stored_channel_credentials(
+            borrowed[0], channel_config, reason=reason, resolve_nango=resolve_nango,
         )
+    async with async_session() as db:
+        return await _lease_stored_channel_credentials(
+            db, channel_config, reason=reason, resolve_nango=resolve_nango,
+        )
+
+
+async def _lease_stored_channel_credentials(
+    db: AsyncSession, channel_config: ChannelConfig, *, reason: str, resolve_nango: bool,
+) -> dict:
+    stored_config = await db.get(ChannelConfig, channel_config.id, populate_existing=True)
+    if not stored_config:
+        raise ValueError(_SOURCE_UNAVAILABLE)
+    # Reused sessions may have loaded the source for a previous target. Refresh
+    # it before ownership/status checks so revocation and rotation remain fresh.
+    source_model = {"integration": Integration, "oauth_account": OAuthAccount}.get(
+        stored_config.credential_source_kind,
+    )
+    if source_model is not None and stored_config.credential_source_id:
+        source = await db.get(source_model, stored_config.credential_source_id, populate_existing=True)
+        if source is None:
+            raise ValueError(_SOURCE_UNAVAILABLE)
+    return await lease_channel_credentials(
+        db, stored_config, reason=reason, resolve_nango=resolve_nango,
+    )

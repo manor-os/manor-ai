@@ -25,6 +25,7 @@ from packages.core.models.document import Integration
 from packages.core.models.goal import Goal
 from packages.core.services.workspace_autonomy import (
     WorkspaceAutonomyState,
+    workspace_allows_manual_work,
     workspace_autonomy_skip_reason,
     workspace_autonomy_state,
 )
@@ -48,8 +49,8 @@ def _workspace_measurement_skip_reason(
     if autonomy_state is WorkspaceAutonomyState.RUNNING:
         return None
     if (
-        autonomy_state is WorkspaceAutonomyState.DISABLED
-        and not require_autonomous_runtime
+        not require_autonomous_runtime
+        and workspace_allows_manual_work(workspace)
     ):
         return None
     return workspace_autonomy_skip_reason(workspace)
@@ -179,6 +180,19 @@ async def _measure(
                 params = internal["meta"]
                 measurement_source_label = "workspace_internal"
             else:
+                if goal.workspace_id:
+                    from packages.core.services.provider_keys import canonical_provider_key
+                    from packages.core.services.workspace_integration_scope import (
+                        load_disabled_workspace_providers,
+                    )
+
+                    disabled = await load_disabled_workspace_providers(
+                        db, workspace_id=goal.workspace_id, entity_id=goal.entity_id,
+                    )
+                    if canonical_provider_key(provider) in disabled:
+                        raise MeasurementError(
+                            f"integration {provider!r} is disabled in this workspace"
+                        )
                 measurer = measurer_registry.get(provider)
                 if measurer is None:
                     raise MeasurementError(

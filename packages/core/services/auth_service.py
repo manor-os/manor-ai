@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.config import get_settings
 from packages.core.constants.plans import DEFAULT_PLAN_ID
+from packages.core.i18n import SUPPORTED_LOCALES, get_locale
 from packages.core.models.base import generate_ulid
 from packages.core.models.user import Entity, User, UserMembership
 
@@ -78,7 +79,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 # ── JWT ──
 
-_DEFAULT_EXPIRE = min(int(os.getenv("JWT_EXPIRE_MINUTES", "60")), 60)
+_DEFAULT_EXPIRE = min(max(1, int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))), 1440)
 _JWT_ISSUER = os.getenv("JWT_ISSUER", "manor-api")
 _JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "manor-api")
 
@@ -93,14 +94,14 @@ def create_access_token(
     expires_minutes: int | None = None,
     mfa_authenticated: bool = False,
 ) -> str:
-    """Create a short-lived, server-revocable API access token.
+    """Create a server-revocable API access token, valid for at most 24 hours.
 
     ``remember`` is retained for client compatibility, but no longer creates a
-    seven-day bearer token. Persistence belongs to a future rotating refresh
-    session; access tokens are capped at 60 minutes.
+    seven-day bearer token. Persistent browser login uses a separate rotating refresh
+    session; access tokens are capped at 24 hours.
     """
     del remember
-    minutes = min(max(1, expires_minutes or _DEFAULT_EXPIRE), 60)
+    minutes = min(max(1, expires_minutes or _DEFAULT_EXPIRE), 1440)
     now = datetime.now(timezone.utc)
     expire = now + timedelta(minutes=minutes)
     payload = {
@@ -161,8 +162,9 @@ def _generate_avatar_url(name: str) -> str:
 
 # ── Registration ──
 
-def _default_entity_settings() -> dict[str, str]:
-    return {"plan": DEFAULT_PLAN_ID}
+def _default_entity_settings() -> dict:
+    from packages.core.governance.approval_policy_service import account_defaults
+    return {"plan": DEFAULT_PLAN_ID, "approval_defaults": account_defaults()}
 
 
 _MEMBERSHIP_ROLES = {"owner", "admin", "member", "viewer", "external", "client"}
@@ -223,7 +225,8 @@ async def ensure_user_membership(
             )
         )
     ).scalar_one_or_none()
-    if membership is None:
+    membership_created = membership is None
+    if membership_created:
         membership = UserMembership(
             id=generate_ulid(),
             user_id=user.id,
@@ -241,6 +244,9 @@ async def ensure_user_membership(
             membership.staff_id = staff_id
         membership.is_primary = bool(membership.is_primary or is_primary)
     await db.flush()
+    if membership_created:
+        from packages.core.governance.approval_policy_service import initialize_personal_approval
+        await initialize_personal_approval(db, user_id=user.id, entity_id=entity_id)
     return membership
 
 
@@ -604,13 +610,17 @@ async def get_or_create_oauth_user(
     first_name: str = None, last_name: str = None,
     avatar_url: str = None,
     access_token: str = None, refresh_token: str = None,
+    locale: str | None = None,
+    email_verified: bool = False,
 ) -> tuple[User, bool]:
     """Find or create a user from OAuth provider login.
 
-    OAuth users are always 'active' (Google already verified their email).
+    Provider sign-in admission and exact-address verification are separate.
+    The request language initializes new users only; existing preferences persist.
     """
     from packages.core.models.user import OAuthAccount
     from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
+    from packages.core.services.user_email_proof import mark_email_verified
 
     # Check existing OAuth link
     result = await db.execute(
@@ -630,6 +640,8 @@ async def get_or_create_oauth_user(
         await db.flush()
         user_result = await db.execute(select(User).where(User.id == oauth.user_id))
         user = user_result.scalar_one()
+        if email_verified is True:
+            mark_email_verified(user, email)
         # Update avatar/name if changed on Google side
         if avatar_url and user.avatar_url != avatar_url:
             user.avatar_url = avatar_url
@@ -646,6 +658,13 @@ async def get_or_create_oauth_user(
         await db.flush()
         return user, False
 
+    # An unverified Google/Apple email cannot claim an existing identity (including
+    # its stored proof), or reserve a new identity for another person's address.
+    # Existing provider+subject links above do not depend on a new email claim.
+    # Enterprise SAML uses its existing, separately configured IdP trust contract.
+    if provider in {"google", "apple"} and email_verified is not True:
+        raise ValueError("provider_email_verification_required")
+
     # Check if user with this email exists — link OAuth to existing account
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
@@ -654,6 +673,8 @@ async def get_or_create_oauth_user(
         # Ensure existing user is active (e.g. was pending email verification)
         if user.status == "pending":
             user.status = "active"
+        if email_verified is True:
+            mark_email_verified(user, email)
         if avatar_url and not user.avatar_url:
             user.avatar_url = avatar_url
         if first_name and not user.first_name:
@@ -684,6 +705,7 @@ async def get_or_create_oauth_user(
         return user, False
 
     # Create new entity + user + oauth
+    initial_locale = (locale or get_locale()).strip().lower().replace("_", "-").split("-", 1)[0]
     name_hint = display_name or email.split("@")[0]
     entity = Entity(
         id=generate_ulid(),
@@ -699,11 +721,14 @@ async def get_or_create_oauth_user(
         email=email, display_name=display_name or email.split("@")[0],
         first_name=first_name, last_name=last_name,
         password_hash="oauth_no_password",
+        locale=initial_locale if initial_locale in SUPPORTED_LOCALES else "en",
         avatar_url=avatar_url or _generate_avatar_url(display_name or email.split("@")[0]),
         role="owner",
-        status="active",  # Google already verified the email
+        status="active",
     )
     db.add(user)
+    if email_verified is True:
+        mark_email_verified(user, email)
     await db.flush()
     await ensure_user_membership(
         db,

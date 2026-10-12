@@ -170,15 +170,12 @@ async def verify_evidence_refs(
     if not verified:
         return normalized
 
+    from packages.core.database_runtime import release_read_transaction
     from packages.core.ai.runtime.file_actions import runtime_entity_file_root
     from packages.core.database import async_session
     from packages.core.models.document import Document
     from packages.core.models.document_version import DocumentVersion
     from packages.core.models.workspace import Workspace
-    from packages.core.services.workspace_artifacts import (
-        artifact_folder_id_from_entity_storage_path,
-        resolve_workspace_folder_binding,
-    )
     from sqlalchemy import select
 
     root = runtime_entity_file_root(entity_id)
@@ -215,27 +212,6 @@ async def verify_evidence_refs(
             )).scalar_one_or_none()
             if document is None:
                 raise EvidenceReferenceError("evidence_not_found", "Knowledge evidence document was not found")
-            origin = document.metadata_ if isinstance(document.metadata_, dict) else {}
-            origin = origin.get("origin") if isinstance(origin.get("origin"), dict) else {}
-            in_workspace = origin.get("workspace_id") == workspace_id
-            if not in_workspace and document.folder_id:
-                binding = await resolve_workspace_folder_binding(
-                    db,
-                    entity_id=entity_id,
-                    folder_id=document.folder_id,
-                )
-                in_workspace = bool(binding and binding.workspace_id == workspace_id)
-            if not in_workspace and document.fs_path:
-                in_workspace = (
-                    artifact_folder_id_from_entity_storage_path(document.fs_path)
-                    == workspace.artifact_folder_id
-                )
-            if not in_workspace:
-                raise EvidenceReferenceError(
-                    "evidence_scope_invalid",
-                    "Knowledge evidence document is not bound to this Workspace",
-                )
-
             version_id = str(ref.get("version_id") or "").strip()
             version_number = ref.get("version_number")
             version = None
@@ -257,6 +233,11 @@ async def verify_evidence_refs(
                 raise EvidenceReferenceError("evidence_version_not_found", "Knowledge evidence version was not found")
             if version_number is not None and version.version_number != version_number:
                 raise EvidenceReferenceError("evidence_version_mismatch", "Knowledge evidence version number does not match version_id")
+            if version.workspace_id != workspace_id:
+                raise EvidenceReferenceError(
+                    "evidence_scope_invalid",
+                    "Knowledge evidence version is not bound to this Workspace",
+                )
             rel_path = str(version.fs_path or "").strip()
             if not rel_path:
                 raise EvidenceReferenceError(
@@ -272,6 +253,7 @@ async def verify_evidence_refs(
             full_path = os.path.realpath(os.path.join(root, rel_path))
             if os.path.commonpath([root, full_path]) != root or not os.path.isfile(full_path):
                 raise EvidenceReferenceError("evidence_unverifiable", "Knowledge evidence version file is unavailable")
+            await release_read_transaction(db)
             actual_sha256 = await asyncio.to_thread(_sha256_file, full_path)
             if actual_sha256.lower() != str(ref.get("sha256") or "").lower():
                 raise EvidenceReferenceError("evidence_hash_mismatch", "Knowledge evidence hash does not match the requested version")

@@ -11,6 +11,7 @@ external config module dependency).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import contextlib
 import contextvars
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ import re
 import threading
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+from uuid import uuid4
 
 import httpx
 
@@ -50,6 +53,7 @@ DEFAULT_LLM_MODEL = "openai/gpt-5.6-luna"
 DEFAULT_LLM_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_LLM_TIMEOUT = 300.0  # user-facing chat should fail loudly instead of hanging for 30 minutes
 DEFAULT_LLM_STREAM_IDLE_TIMEOUT = 45.0
+DEFAULT_WORKER_LLM_STREAM_IDLE_TIMEOUT = 180.0
 
 LLM_MODEL_ALIASES: Dict[str, str] = {
     # Aliases only point at first-party-served models (Anthropic /
@@ -57,6 +61,12 @@ LLM_MODEL_ALIASES: Dict[str, str] = {
     # etc.) are intentionally excluded — see CATALOG inclusion rule
     # in packages/core/constants/models.py for the reasoning.
     "gpt5": "openai/gpt-5",
+    "gpt6": "openai/gpt-6-astra",
+    "gpt-6": "openai/gpt-6-astra",
+    "chatgpt6": "openai/gpt-6-astra",
+    "chatgpt-6": "openai/gpt-6-astra",
+    "gpt6-astra": "openai/gpt-6-astra",
+    "gpt-6-astra": "openai/gpt-6-astra",
     "gpt56": "openai/gpt-5.6-sol",
     "gpt5.6": "openai/gpt-5.6-sol",
     "gpt-5.6": "openai/gpt-5.6-sol",
@@ -88,15 +98,23 @@ LLM_MODEL_ALIASES: Dict[str, str] = {
     "claude": "anthropic/claude-sonnet-4",
     "claude-sonnet": "anthropic/claude-sonnet-4",
     # Bare "opus" tracks the newest Opus; pinned aliases stay on their version.
-    "claude-opus": "anthropic/claude-opus-5",
-    "opus": "anthropic/claude-opus-5",
+    "claude-opus": "anthropic/claude-opus-5.5",
+    "opus": "anthropic/claude-opus-5.5",
+    "opus-5.5": "anthropic/claude-opus-5.5",
+    "opus-5-5": "anthropic/claude-opus-5.5",
+    "claude-opus-5.5": "anthropic/claude-opus-5.5",
+    "claude-opus-5-5": "anthropic/claude-opus-5.5",
     "opus-5": "anthropic/claude-opus-5",
     "claude-opus-5": "anthropic/claude-opus-5",
     "opus-4.7": "anthropic/claude-opus-4.7",
     "claude-opus-4.7": "anthropic/claude-opus-4.7",
-    "fable": "anthropic/claude-fable-5",
+    "fable": "anthropic/claude-fable-5.1",
+    "claude-fable": "anthropic/claude-fable-5.1",
+    "fable-5.1": "anthropic/claude-fable-5.1",
+    "fable-5-1": "anthropic/claude-fable-5.1",
+    "claude-fable-5.1": "anthropic/claude-fable-5.1",
+    "claude-fable-5-1": "anthropic/claude-fable-5.1",
     "fable-5": "anthropic/claude-fable-5",
-    "claude-fable": "anthropic/claude-fable-5",
     "claude-fable-5": "anthropic/claude-fable-5",
     "gemini": "google/gemini-2.5-pro-preview-06-05",
     "gemini-flash": "google/gemini-2.0-flash-001",
@@ -113,6 +131,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+_SLOW_LLM_CALL_WARN_MS = _env_int("LLM_SLOW_CALL_WARN_MS", 20000)
+
+
 def _resolve_llm_model(raw: str) -> str:
     """Resolve model alias to full OpenRouter model ID."""
     key = (raw or "").strip().lower()
@@ -121,25 +142,40 @@ def _resolve_llm_model(raw: str) -> str:
     return raw.strip() if raw else DEFAULT_LLM_MODEL
 
 
-def _apply_chat_completion_tool_compatibility(
+def _apply_chat_completion_compatibility(
     payload: Dict[str, Any],
     *,
     model: str,
     tools: List[Dict[str, Any]],
 ) -> None:
-    """Apply model-specific defaults required by Chat Completions tools.
+    """Apply model-specific Chat Completions compatibility defaults.
 
     GPT-5.6 defaults to medium reasoning, while function tools on the Chat
     Completions endpoint require effective reasoning ``none``. Manor's agent
     runtime still uses Chat Completions, so make that endpoint constraint
     explicit without changing reasoning for ordinary text-only calls.
+
+    GPT-6 Astra does not accept ``temperature`` on OpenAI, Vercel AI Gateway,
+    or OpenRouter. Omit Manor's generic sampling default for both plain and
+    tool-using calls, and map unsupported ``none`` reasoning to its lowest
+    supported effort.
     """
 
     bare_model = str(model or "").strip().lower().split("/", 1)[-1]
+    if bare_model == "gpt-6-astra":
+        payload.pop("temperature", None)
+        if payload.get("reasoning_effort") == "none":
+            payload["reasoning_effort"] = "low"
     if tools and (bare_model == "gpt-5.6" or bare_model.startswith("gpt-5.6-")):
         payload.setdefault("reasoning_effort", "none")
 
 
+# Wall-clock time of the first real model-output SSE frame of the call in
+# flight (heartbeats excluded). Set by the stream iterator, consumed and reset
+# by _record_llm_call, which every call path ends in.
+_stream_first_output_at: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "_stream_first_output_at", default=None
+)
 _is_byok_call: contextvars.ContextVar[bool] = contextvars.ContextVar("_is_byok_call", default=False)
 _llm_route_provider: contextvars.ContextVar[str] = contextvars.ContextVar("_llm_route_provider", default="")
 _llm_pricing_source: contextvars.ContextVar[str] = contextvars.ContextVar("_llm_pricing_source", default="")
@@ -778,15 +814,118 @@ def get_llm_timeout() -> float:
 
 
 def get_llm_stream_idle_timeout() -> float:
-    """Return max seconds to wait for the next streaming chunk before fallback."""
+    """Return max seconds to wait for the next streaming chunk before fallback.
+
+    User-facing chat stays snappy. Worker/planner roles allow longer grok
+    thinking gaps; env still wins when set.
+    """
     try:
-        return float(
-            os.getenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS")
-            or os.getenv("LLM_STREAM_IDLE_TIMEOUT")
-            or DEFAULT_LLM_STREAM_IDLE_TIMEOUT
+        raw = os.getenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS") or os.getenv(
+            "LLM_STREAM_IDLE_TIMEOUT"
         )
+        if raw:
+            return float(raw)
+        role = (os.getenv("MANOR_SERVICE_ROLE") or "").strip().lower()
+        if role.startswith("worker"):
+            return float(DEFAULT_WORKER_LLM_STREAM_IDLE_TIMEOUT)
+        return float(DEFAULT_LLM_STREAM_IDLE_TIMEOUT)
     except Exception:
         return float(DEFAULT_LLM_STREAM_IDLE_TIMEOUT)
+
+
+DEFAULT_LLM_STREAM_RESPONSE_TIMEOUT = 60.0
+
+
+def get_llm_stream_response_timeout() -> float:
+    """Return max seconds to wait for a streaming response to *start*.
+
+    Distinct from the idle timeout, which only runs once chunks flow. A
+    gateway that rejects a streaming request upstream can hold the request
+    open without sending headers at all (seen with OpenRouter: a 400 that the
+    buffered path reports in 4 s took the full 300 s read timeout to surface
+    on the stream). Providers send SSE headers immediately, so a bounded wait
+    here costs nothing on the happy path and turns that stall into a quick
+    fallback to the buffered request.
+    """
+    try:
+        return float(
+            os.getenv("LLM_STREAM_RESPONSE_TIMEOUT_SECONDS")
+            or DEFAULT_LLM_STREAM_RESPONSE_TIMEOUT
+        )
+    except Exception:
+        return float(DEFAULT_LLM_STREAM_RESPONSE_TIMEOUT)
+
+
+class LLMStreamProviderError(RuntimeError):
+    """The provider answered the stream with an error frame instead of chunks."""
+
+
+def _raise_on_stream_error_chunk(chunk: Any) -> None:
+    """Surface an SSE error frame at once instead of waiting for the stream to end.
+
+    OpenAI-compatible gateways send ``{"error": {...}}``; the Anthropic
+    Messages API sends ``{"type": "error", "error": {...}}``. Either way the
+    stream carries no usable content, and the buffered fallback would
+    otherwise only run after the idle timeout or an empty-response check.
+    """
+    if not isinstance(chunk, dict):
+        return
+    error = chunk.get("error")
+    # Some gateways emit an empty error field on healthy chunks; only a
+    # populated error (or an explicit error event) is a failure.
+    if not error and chunk.get("type") != "error":
+        return
+    if isinstance(error, dict):
+        message = str(error.get("message") or error.get("type") or "provider error")
+        metadata = error.get("metadata")
+        raw = metadata.get("raw") if isinstance(metadata, dict) else None
+        if raw:
+            message = f"{message}: {_compact_provider_error_text(str(raw), limit=600)}"
+    else:
+        message = str(error or "provider error")
+    raise LLMStreamProviderError(message)
+
+
+def _should_skip_buffered_stream_fallback(stream_error: BaseException) -> bool:
+    """Return true when retrying the same call as a buffered POST would only hang.
+
+    An SSE error frame already told us the provider cannot complete this
+    generation. An idle stall means the stream stayed open without model
+    progress. Falling back to a buffered request then waits for Cloudflare's
+    origin timeout and can honour a 524 Retry-After of minutes, which is how
+    a failed turn stays open with keepalives instead of ending.
+    """
+    if isinstance(stream_error, LLMStreamProviderError):
+        return True
+    return isinstance(stream_error, TimeoutError) and "stalled" in str(stream_error)
+
+
+@asynccontextmanager
+async def _open_llm_stream(client: httpx.AsyncClient, url: str, *, headers: Dict[str, str], json: Dict[str, Any]):
+    """Open a streaming POST with a bound on how long the response may take to start."""
+    manager = client.stream("POST", url, headers=headers, json=json)
+    timeout = get_llm_stream_response_timeout()
+    try:
+        if timeout > 0:
+            response = await asyncio.wait_for(manager.__aenter__(), timeout=timeout)
+        else:
+            response = await manager.__aenter__()
+    except asyncio.TimeoutError as exc:
+        # The request was cancelled mid-flight; make sure httpx releases it.
+        try:
+            await manager.__aexit__(None, None, None)
+        except Exception:  # noqa: BLE001 - best-effort release after a cancel
+            pass
+        raise TimeoutError(
+            f"LLM streaming response did not start within {timeout:.0f}s"
+        ) from exc
+    try:
+        yield response
+    except BaseException as exc:
+        if not await manager.__aexit__(type(exc), exc, exc.__traceback__):
+            raise
+    else:
+        await manager.__aexit__(None, None, None)
 
 
 def _llm_stream_transport_enabled() -> bool:
@@ -957,6 +1096,82 @@ _billing_ctx_var: contextvars.ContextVar[Optional[LLMBillingContext]] = contextv
 _entity_in_flight_credits: dict[str, int] = {}
 _entity_in_flight_lock = threading.Lock()
 
+# What the agent loop sent in the current provider call, so automatic billing
+# records the same prompt-source breakdown the chat path settles explicitly.
+_context_attribution_var: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "llm_context_attribution", default=None,
+)
+
+
+@contextlib.contextmanager
+def llm_context_attribution_scope(attribution: Optional[dict]):
+    """Attach a prompt-source breakdown to usage recorded inside this scope only."""
+    token = _context_attribution_var.set(dict(attribution) if attribution else None)
+    try:
+        yield
+    finally:
+        _context_attribution_var.reset(token)
+
+
+_prompt_cache_key_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "llm_prompt_cache_key", default=None,
+)
+# Routes that rejected ``prompt_cache_key``; they get requests without it.
+_PROMPT_CACHE_KEY_REJECTED_BASE_URLS: set[str] = set()
+
+
+@contextlib.contextmanager
+def llm_prompt_cache_key_scope(key: Optional[str]):
+    """Route OpenAI-family calls in this scope to the same prompt cache.
+
+    OpenAI caches prompt prefixes per machine and picks the machine from the
+    first tokens plus ``prompt_cache_key``; one key per conversation stream keeps
+    its turns on a warm cache.
+    """
+    token = _prompt_cache_key_var.set(key or None)
+    try:
+        yield
+    finally:
+        _prompt_cache_key_var.reset(token)
+
+
+def _apply_prompt_cache_key(payload: Dict[str, Any], *, model: str, base_url: str) -> None:
+    key = _prompt_cache_key_var.get()
+    if (
+        key
+        and provider_for_model(model) == "openai"
+        and base_url.rstrip("/") not in _PROMPT_CACHE_KEY_REJECTED_BASE_URLS
+    ):
+        payload["prompt_cache_key"] = key
+
+
+# (base_url, model) routes that rejected ``reasoning_effort`` and accepted the
+# same request without it. grok-4.5 behind a BYOK gateway answers
+# reasoning_effort="none" with a bare "Upstream error: 400", which failed every
+# capability-matcher call; later requests on the route leave it out.
+_REASONING_EFFORT_REJECTED_ROUTES: set[tuple[str, str]] = set()
+
+
+def _reasoning_effort_route(base_url: str, payload: Dict[str, Any]) -> tuple[str, str]:
+    return base_url.rsplit("/chat/completions", 1)[0].rstrip("/"), str(payload.get("model") or "")
+
+
+def _apply_reasoning_effort_route(payload: Dict[str, Any], *, base_url: str) -> None:
+    if "reasoning_effort" in payload and _reasoning_effort_route(base_url, payload) in _REASONING_EFFORT_REJECTED_ROUTES:
+        payload.pop("reasoning_effort")
+
+
+def _is_prompt_cache_key_rejection(exc: httpx.HTTPStatusError) -> bool:
+    response = exc.response
+    if response is None or response.status_code not in {400, 422}:
+        return False
+    try:
+        body = response.text
+    except Exception:
+        return False
+    return "prompt_cache_key" in (body or "")
+
+
 @contextlib.asynccontextmanager
 async def llm_billing_context(
     entity_id: str,
@@ -1019,6 +1234,7 @@ _BASE64_SIGNATURE_PREFIXES = (
     "UEsDB",           # ZIP-based Office docs
 )
 _MAX_LLM_TOOLS = 128
+_MAX_LLM_TOOL_SCHEMA_CHARS = 64_000
 _StreamHandler = Optional[Callable[[str, Dict[str, Any]], Any]]
 
 
@@ -1251,6 +1467,36 @@ def _sanitize_llm_value(value: Any, *, path: Tuple[str, ...] = ()) -> Tuple[Any,
             changes += count
         return sanitized_list, changes
     return value, 0
+
+
+def _system_reminder_text(content: Any) -> str:
+    return f"<system-reminder>\n{_content_to_plain_text(content)}\n</system-reminder>"
+
+
+def _portable_late_system_messages(messages: List[Dict[str, Any]], *, model: str) -> List[Dict[str, Any]]:
+    """Keep system messages after the history where the provider would move them.
+
+    The runtime sends per-turn context (and the response-language note) as a
+    system message just before the current request, after the cacheable
+    history. OpenAI models read a late system message in place. Other providers
+    (Claude, Gemini, ... directly or through a gateway) fold every system
+    message into the leading system prompt, which would put per-turn text back
+    in front of the history and defeat prompt caching. For them it travels as a
+    user-role ``<system-reminder>`` at the same position, as Claude Code does.
+    """
+    if provider_for_model(model) == "openai":
+        return messages
+    seen_conversation = False
+    result: List[Dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "system" and seen_conversation:
+            result.append({"role": "user", "content": _system_reminder_text(message.get("content"))})
+            continue
+        if role and role != "system":
+            seen_conversation = True
+        result.append(message)
+    return result
 
 
 def _sanitize_messages_for_llm(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1636,7 +1882,43 @@ def _normalize_tools_for_llm(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]
         )
         normalized = normalized[:_MAX_LLM_TOOLS]
 
+    trimmed = _trim_llm_tools_to_schema_budget(normalized)
+    if len(trimmed) < len(normalized):
+        dropped_names = [_tool_name(tool) for tool in normalized[len(trimmed):]]
+        logger.warning(
+            "LLM tool normalization trimmed tool schemas from %d to %d chars; dropped=%s",
+            _llm_tool_schema_chars(normalized),
+            _MAX_LLM_TOOL_SCHEMA_CHARS,
+            dropped_names[:30],
+        )
+        normalized = trimmed
+
     return normalized
+
+
+def _llm_tool_schema_chars(tools: List[Dict[str, Any]]) -> int:
+    return len(json.dumps(tools, ensure_ascii=False, default=str))
+
+
+def _trim_llm_tools_to_schema_budget(
+    tools: List[Dict[str, Any]],
+    *,
+    max_chars: int = _MAX_LLM_TOOL_SCHEMA_CHARS,
+) -> List[Dict[str, Any]]:
+    """Keep a prefix of tool schemas within a serialized size budget."""
+    if not tools:
+        return []
+    if _llm_tool_schema_chars(tools) <= max_chars:
+        return list(tools)
+    kept: List[Dict[str, Any]] = []
+    for tool in tools:
+        candidate = kept + [tool]
+        if kept and _llm_tool_schema_chars(candidate) > max_chars:
+            break
+        kept = candidate
+        if _llm_tool_schema_chars(kept) > max_chars:
+            break
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -1918,6 +2200,95 @@ def _drop_unreplayable_reasoning_turns(messages: list[dict]) -> tuple[list[dict]
     return out, dropped
 
 
+def _unsupported_response_format_retry(
+    exc: BaseException, payload: Dict[str, Any],
+) -> tuple[Dict[str, Any], Dict[str, str]] | None:
+    """Drop a schema only when the provider explicitly rejects that capability."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code not in {400, 422}:
+        return None
+    response_format = payload.get("response_format") or (payload.get("output_config") or {}).get("format")
+    if not isinstance(response_format, dict) or response_format.get("type") != "json_schema":
+        return None
+    try:
+        body = exc.response.json()
+    except ValueError:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    message = str(error.get("message") or "") if isinstance(error, dict) else exc.response.text
+    parameter = str(error.get("param") or "") if isinstance(error, dict) else ""
+    code = str(error.get("code") or "") if isinstance(error, dict) else ""
+    error_type = str(error.get("type") or "") if isinstance(error, dict) else ""
+    if any(term in f"{error_type} {code}".lower() for term in (
+        "authentication", "authorization", "permission", "unauthorized", "access_denied", "forbidden",
+        "api_key", "billing", "credit", "balance", "insufficient", "quota", "rate_limit",
+        "invalid_schema", "invalid_json_schema", "schema_validation",
+    )):
+        return None
+    parameter = parameter.lower()
+    if parameter and (
+        not parameter.startswith(("response_format", "json_schema", "output_config"))
+        or ".schema" in parameter or "/schema" in parameter
+        or (parameter.startswith("output_config.") and not parameter.startswith("output_config.format"))
+    ):
+        return None
+    detail = f"{parameter} {message}".lower()
+    if not any(name in detail for name in ("response_format", "json_schema", "output_config")):
+        return None
+    # Schema construction defects and account failures must remain visible.
+    if any(term in detail for term in (
+        "invalid schema", "invalid json schema", "malformed schema", "schema is invalid",
+        "schema is too complex", "schema validation", "schema keyword", "schema constraint", "schema option",
+        "schema feature", "oneof", "anyof", "allof", "$ref",
+        "unsupported keyword", "unsupported property", "unsupported constraint",
+        "additionalproperties", "minlength", "maxlength", "minimum", "maximum", "minitems", "maxitems",
+        "authentication", "unauthorized", "api key", "insufficient", "quota", "credit", "balance",
+    )):
+        return None
+    if not any(term in detail for term in (
+        "not supported", "unsupported", "does not support", "unknown parameter", "unrecognized parameter",
+    )) and code not in {"unsupported_parameter", "unknown_parameter", "unsupported_value"}:
+        return None
+    retry_payload = dict(payload)
+    retry_payload.pop("response_format", None)
+    if "output_config" in retry_payload:
+        output_config = {key: value for key, value in retry_payload["output_config"].items() if key != "format"}
+        if output_config:
+            retry_payload["output_config"] = output_config
+        else:
+            retry_payload.pop("output_config")
+    diagnostic = {"type": "json_schema", "reason": "unsupported_format"}
+    logger.warning("Provider explicitly rejected json_schema; retrying once with prompt and host validation")
+    return retry_payload, diagnostic
+
+
+async def _post_with_response_format_retry(
+    url: str, headers: Dict[str, str], payload: Dict[str, Any],
+) -> httpx.Response:
+    try:
+        return await _post_with_retry(url, headers=headers, payload=payload)
+    except httpx.HTTPStatusError as exc:
+        fallback = _unsupported_response_format_retry(exc, payload)
+        if fallback is None:
+            raise
+        retry_payload, diagnostic = fallback
+        try:
+            response = await _post_with_retry(url, headers=headers, payload=retry_payload)
+        except Exception as retry_error:
+            retry_error.response_format_fallback = diagnostic
+            raise
+        response.extensions["response_format_fallback"] = diagnostic
+        return response
+
+
+def _attach_response_format_fallback(
+    usage: Dict[str, Any], response: httpx.Response,
+    stream_fallback: Dict[str, str] | None = None,
+) -> None:
+    diagnostic = stream_fallback or getattr(response, "extensions", {}).get("response_format_fallback")
+    if diagnostic:
+        usage["response_format_fallback"] = diagnostic
+
+
 async def _post_chat_with_reasoning_retry(
     url: str,
     headers: Dict[str, str],
@@ -1928,6 +2299,24 @@ async def _post_chat_with_reasoning_retry(
     try:
         return await _post_with_retry(url, headers, payload)
     except httpx.HTTPStatusError as exc:
+        format_retry = _unsupported_response_format_retry(exc, payload)
+        if format_retry is not None:
+            retry_payload, diagnostic = format_retry
+            try:
+                response = await _post_chat_with_reasoning_retry(
+                    url, headers, retry_payload, call_type=call_type,
+                )
+            except Exception as retry_error:
+                retry_error.response_format_fallback = diagnostic
+                raise
+            response.extensions["response_format_fallback"] = diagnostic
+            return response
+        if "prompt_cache_key" in payload and _is_prompt_cache_key_rejection(exc):
+            base_url = url.rsplit("/chat/completions", 1)[0].rstrip("/")
+            _PROMPT_CACHE_KEY_REJECTED_BASE_URLS.add(base_url)
+            logger.warning("%s: route rejected prompt_cache_key; retrying without it (%s)", call_type, base_url)
+            retry_payload = {key: value for key, value in payload.items() if key != "prompt_cache_key"}
+            return await _post_chat_with_reasoning_retry(url, headers, retry_payload, call_type=call_type)
         if _is_reasoning_replay_error(exc) and isinstance(payload.get("messages"), list):
             retry_messages, dropped = _drop_unreplayable_reasoning_turns(payload["messages"])
             if dropped:
@@ -1938,7 +2327,28 @@ async def _post_chat_with_reasoning_retry(
                     call_type,
                     dropped,
                 )
-                return await _post_with_retry(url, headers, retry_payload)
+                return await _post_with_response_format_retry(url, headers, retry_payload)
+        if (
+            "reasoning_effort" in payload
+            and exc.response is not None
+            and exc.response.status_code in {400, 422}
+        ):
+            # Remembered only when the same request succeeds without it: a
+            # model that requires the parameter (gpt-5.6 tool calls) failing
+            # for another reason must not lose it on later calls.
+            retry_payload = {key: value for key, value in payload.items() if key != "reasoning_effort"}
+            try:
+                response = await _post_chat_with_reasoning_retry(url, headers, retry_payload, call_type=call_type)
+            except httpx.HTTPStatusError as retry_error:
+                diagnostic = getattr(retry_error, "response_format_fallback", None)
+                if (isinstance(diagnostic, dict) and diagnostic.get("type") == "json_schema"
+                        and diagnostic.get("reason") == "unsupported_format"):
+                    exc.response_format_fallback = {"type": "json_schema", "reason": "unsupported_format"}
+                raise exc
+            route = _reasoning_effort_route(url, payload)
+            _REASONING_EFFORT_REJECTED_ROUTES.add(route)
+            logger.warning("%s: %s rejected reasoning_effort; retried without it (%s)", call_type, route[1], route[0])
+            return response
         raise
 
 
@@ -1963,14 +2373,64 @@ def _failure_message(detail: str, *, model: Optional[str] = None) -> str:
     )
 
 
-def _failure_usage(model: Optional[str], error: str) -> Dict[str, Any]:
+def _failure_usage(
+    model: Optional[str],
+    error: str,
+    *,
+    error_code: str | None = None,
+    public_detail: str | None = None,
+) -> Dict[str, Any]:
     """EMPTY_USAGE clone with the error preserved so callers / dashboards
     that inspect ``usage`` (rather than the response text) can also see
     why the call failed."""
     out = EMPTY_USAGE.copy()
     out["model"] = model
     out["error"] = (error or "")[:1000]
+    if error_code:
+        out["error_code"] = error_code
+    if public_detail:
+        out["error_public_detail"] = public_detail
     return _annotate_usage_with_billing_source(out, model=model)
+
+
+def _byok_public_failure_detail(
+    routing: Any, exc: BaseException, *, model: Optional[str],
+) -> str:
+    """Structured, secret-free description of a failure on the user's own route.
+
+    Empty for every non-BYOK route. The shape is a contract with
+    ``output_policy._PUBLIC_BYOK_DETAIL_RE``: status (or "no response"), the
+    provider host the owner configured, and the model id — never the provider
+    body, never request diagnostics.
+    """
+    if getattr(routing, "source", None) != "byok":
+        return ""
+    host = urlparse(str(getattr(routing, "base_url", "") or "")).hostname or "provider"
+    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+        what = f"HTTP {exc.response.status_code}"
+    else:
+        what = "no response"
+    return f"{what} from {host} (model {model})"
+
+
+def _byok_failure_usage(
+    routing: Any, exc: BaseException, *, model: Optional[str], detail: str,
+) -> Dict[str, Any]:
+    """``_failure_usage`` that types the failure when the route is the user's own."""
+    public_detail = _byok_public_failure_detail(routing, exc, model=model)
+    if not public_detail:
+        usage = _failure_usage(model, detail)
+    else:
+        # Lazy: the runtime package pulls this module in at import time.
+        from packages.core.ai.runtime.output_policy import BYOK_PROVIDER_ERROR_CODE
+
+        usage = _failure_usage(
+            model, detail, error_code=BYOK_PROVIDER_ERROR_CODE, public_detail=public_detail,
+        )
+    diagnostic = getattr(exc, "response_format_fallback", None)
+    if diagnostic:
+        usage["response_format_fallback"] = diagnostic
+    return usage
 
 
 def _usage_total(usage: Optional[Dict[str, Any]]) -> int:
@@ -2065,11 +2525,18 @@ def _openai_content_to_anthropic_blocks(content: Any) -> List[Dict[str, Any]]:
     return blocks
 
 
-def _tool_result_content_for_anthropic(content: Any) -> str:
+def _tool_result_content_for_anthropic(content: Any) -> Any:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
+    if isinstance(content, list) and content and all(
+        isinstance(block, dict) and block.get("type") == "text" for block in content
+    ):
+        # Text parts (a prompt-cache breakpoint wraps a tool result this way)
+        # stay content blocks, keeping their cache_control.
+        blocks = _openai_content_to_anthropic_blocks(content)
+        return blocks or ""
     try:
         return json.dumps(content, ensure_ascii=False, default=str)
     except Exception:
@@ -2121,15 +2588,23 @@ def _anthropic_messages_from_openai(messages: List[Dict[str, Any]]) -> Tuple[str
             out.append({"role": "user", "content": list(pending_tool_results)})
             pending_tool_results.clear()
 
+    seen_conversation = False
     for message in messages:
         if not isinstance(message, dict):
             continue
         role = message.get("role")
+        if role == "system" and seen_conversation:
+            # Late system context stays where it is (see
+            # _portable_late_system_messages) instead of joining ``system``.
+            flush_tool_results()
+            out.append({"role": "user", "content": [{"type": "text", "text": _system_reminder_text(message.get("content"))}]})
+            continue
         if role == "system":
             text = _content_to_plain_text(message.get("content"))
             if text:
                 system_parts.append(text)
             continue
+        seen_conversation = True
 
         if role == "tool":
             tool_call_id = message.get("tool_call_id")
@@ -2208,7 +2683,7 @@ def _anthropic_tool_choice(tool_choice: Optional[Any]) -> Optional[Dict[str, Any
 
 
 # Anthropic removed sampling parameters (temperature/top_p/top_k) from
-# Opus 4.7 onward and the Fable/Mythos tier — sending them to the native
+# Opus 4.7 onward (incl. the Opus 5 line) and the Fable/Mythos tier — sending them to the native
 # /v1/messages API is a hard 400. Wire-model prefixes, so this covers
 # future point releases (e.g. claude-fable-5.1) without a code change.
 # OpenRouter calls are unaffected — the gateway drops unsupported params.
@@ -2217,6 +2692,7 @@ _ANTHROPIC_NO_SAMPLING_PREFIXES = (
     "claude-mythos",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    "claude-opus-5",
 )
 
 
@@ -2272,7 +2748,9 @@ def _parse_anthropic_content_blocks(data: Dict[str, Any]) -> Tuple[str, Optional
             if not name:
                 continue
             tool_calls.append({
-                "id": block.get("id") or f"call_{len(tool_calls)}",
+                # Missing provider IDs need a new transport identity, never
+                # a per-response index that could borrow an earlier receipt.
+                "id": block.get("id") or f"call_{uuid4().hex}",
                 "name": name,
                 "arguments": block.get("input") if isinstance(block.get("input"), dict) else {},
             })
@@ -2320,6 +2798,7 @@ async def _anthropic_messages_completion(
     max_tokens: Optional[int],
     tools: Optional[List[Dict[str, Any]]] = None,
     tool_choice: Optional[Any] = None,
+    response_format: Optional[Dict[str, Any]] = None,
     stream_handler: _StreamHandler = None,
     call_type: str = "chat_completion",
     started_at: Optional[float] = None,
@@ -2333,6 +2812,13 @@ async def _anthropic_messages_completion(
         "messages": anthropic_messages,
         "max_tokens": _anthropic_max_tokens(wire_model, max_tokens),
     }
+    if response_format is not None and response_format.get("type") == "json_schema":
+        # Native Messages uses output_config.format, without the OpenAI
+        # schema name/strict wrapper. JSON object mode has no native equivalent.
+        payload["output_config"] = {"format": {
+            "type": "json_schema",
+            "schema": response_format["json_schema"]["schema"],
+        }}
     if _anthropic_accepts_sampling_params(wire_model):
         payload["temperature"] = temperature
     if system:
@@ -2351,17 +2837,19 @@ async def _anthropic_messages_completion(
             payload["tool_choice"] = choice
 
     headers = _anthropic_request_headers(api_key)
+    response_format_fallback = None
     if stream_handler is not None:
         streamed_any_text = False
         try:
             client = await get_llm_client()
             content_parts: List[str] = []
             tool_call_parts: Dict[int, Dict[str, Any]] = {}
+            tool_drafts = _ToolCallDraftEmitter(stream_handler)
             raw_usage: Dict[str, Any] = {}
             finish_reason = ""
             response_model = wire_model
-            async with client.stream(
-                "POST",
+            async with _open_llm_stream(
+                client,
                 f"{base_url}/messages",
                 headers=dict(headers),
                 json={**payload, "stream": True},
@@ -2375,11 +2863,8 @@ async def _anthropic_messages_completion(
                     if not data_line or data_line == "[DONE]":
                         continue
                     chunk = json.loads(data_line)
+                    _raise_on_stream_error_chunk(chunk)
                     event_type = chunk.get("type")
-                    if event_type == "error":
-                        error = chunk.get("error") or {}
-                        message = error.get("message") if isinstance(error, dict) else error
-                        raise RuntimeError(f"Anthropic stream error: {message or 'unknown error'}")
                     if event_type == "message_start":
                         message = chunk.get("message") or {}
                         if isinstance(message, dict):
@@ -2404,11 +2889,12 @@ async def _anthropic_messages_completion(
                                 )
                         elif block.get("type") == "tool_use":
                             tool_call_parts[index] = {
-                                "id": block.get("id") or f"call_{index}",
+                                "id": block.get("id") or f"call_{uuid4().hex}",
                                 "name": str(block.get("name") or ""),
                                 "input": block.get("input") if isinstance(block.get("input"), dict) else {},
                                 "arguments_text": "",
                             }
+                            await tool_drafts.update(index, tool_call_parts[index])
                         continue
                     if event_type == "content_block_delta":
                         index = int(chunk.get("index", 0) or 0)
@@ -2429,13 +2915,14 @@ async def _anthropic_messages_completion(
                             entry = tool_call_parts.setdefault(
                                 index,
                                 {
-                                    "id": f"call_{index}",
+                                    "id": f"call_{uuid4().hex}",
                                     "name": "",
                                     "input": {},
                                     "arguments_text": "",
                                 },
                             )
                             entry["arguments_text"] += str(delta.get("partial_json") or "")
+                            await tool_drafts.update(index, entry)
                         continue
                     if event_type == "message_delta":
                         delta = chunk.get("delta") or {}
@@ -2462,7 +2949,7 @@ async def _anthropic_messages_completion(
                     else:
                         arguments = entry.get("input") or {}
                     parsed_tool_calls.append({
-                        "id": entry.get("id") or f"call_{index}",
+                        "id": entry.get("id") or f"call_{uuid4().hex}",
                         "name": name,
                         "arguments": arguments,
                     })
@@ -2503,20 +2990,36 @@ async def _anthropic_messages_completion(
         except Exception as stream_error:
             if streamed_any_text:
                 await _emit_stream_event(stream_handler, "text_reset", {})
+            format_retry = _unsupported_response_format_retry(stream_error, payload)
+            if format_retry is not None:
+                payload, response_format_fallback = format_retry
+            if _should_skip_buffered_stream_fallback(stream_error):
+                logger.warning(
+                    "%s Anthropic stream path failed, skipping buffered fallback: %s",
+                    call_type,
+                    stream_error,
+                )
+                raise
             logger.warning(
                 "%s Anthropic stream path failed, falling back to buffered response: %s",
                 call_type,
                 stream_error,
             )
 
-    response = await _post_with_retry(
-        f"{base_url}/messages",
-        headers=headers,
-        payload=payload,
-    )
+    try:
+        response = await _post_with_response_format_retry(
+            f"{base_url}/messages",
+            headers=headers,
+            payload=payload,
+        )
+    except Exception as buffered_error:
+        if response_format_fallback:
+            buffered_error.response_format_fallback = response_format_fallback
+        raise
     data = _parse_llm_response_json(response, call_type="anthropic_messages_completion")
     content, parsed_tool_calls = _parse_anthropic_content_blocks(data)
     usage = _usage_from_anthropic_response(data, model)
+    _attach_response_format_fallback(usage, response, response_format_fallback)
     finish_reason = data.get("stop_reason") or ""
     usage["finish_reason"] = finish_reason
 
@@ -2555,6 +3058,44 @@ async def _emit_stream_event(
         await maybe_result
 
 
+# A tool call the model is still writing, shown live: the first event as soon
+# as its name streams in, then at most every 160 characters or half second.
+_TOOL_DRAFT_MIN_CHARS = 160
+_TOOL_DRAFT_MIN_SECONDS = 0.5
+_TOOL_DRAFT_MAX_CHARS = 65536
+
+
+class _ToolCallDraftEmitter:
+    """Publish ``tool_call_draft`` for tool calls still streaming in.
+
+    A draft is display only: the call has not run, and the host still
+    validates, authorizes and executes the finished call as before.
+    """
+
+    def __init__(self, handler: _StreamHandler) -> None:
+        self._handler = handler
+        self._sent: Dict[int, Tuple[int, float]] = {}
+
+    async def update(self, index: int, entry: Dict[str, Any]) -> None:
+        if self._handler is None or not entry.get("name"):
+            return
+        text = str(entry.get("arguments_text") or "")
+        now = time.monotonic()
+        last = self._sent.get(index)
+        if last is not None and (
+            len(text) - last[0] < _TOOL_DRAFT_MIN_CHARS and now - last[1] < _TOOL_DRAFT_MIN_SECONDS
+        ):
+            return
+        self._sent[index] = (len(text), now)
+        try:
+            await _emit_stream_event(self._handler, "tool_call_draft", {
+                "index": index, "id": str(entry.get("id") or ""), "name": str(entry["name"]),
+                "arguments_text": text[:_TOOL_DRAFT_MAX_CHARS],
+            })
+        except Exception:
+            logger.debug("tool_call_draft emit failed", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # LLM call history tracking (contextvars-based)
 # ---------------------------------------------------------------------------
@@ -2573,6 +3114,37 @@ def _record_llm_call(
 ) -> None:
     usage = _annotate_usage_with_billing_source(usage, model=model)
 
+    # One line per finished call so a slow turn can be attributed to a specific
+    # call (classifier vs. main loop) from logs alone. Streamed calls also carry
+    # time-to-first-token (request start -> first model output frame) and the
+    # streaming phase (first output -> completion).
+    first_output_at = _stream_first_output_at.get()
+    _stream_first_output_at.set(None)
+    total_ms = float(duration_ms or 0)
+    first_token_ms: Optional[int] = None
+    stream_ms: Optional[int] = None
+    if first_output_at is not None:
+        started_wall = time.time() - total_ms / 1000
+        first_token_ms = max(0, int((first_output_at - started_wall) * 1000))
+        stream_ms = max(0, int(total_ms) - first_token_ms)
+    logger.log(
+        logging.WARNING if total_ms >= _SLOW_LLM_CALL_WARN_MS else logging.INFO,
+        "LLM call done [%s]: model=%s duration_ms=%d first_token_ms=%s stream_ms=%s "
+        "success=%s finish=%s prompt_tokens=%d completion_tokens=%d messages=%d tools=%d%s",
+        call_type,
+        model,
+        int(total_ms),
+        "-" if first_token_ms is None else first_token_ms,
+        "-" if stream_ms is None else stream_ms,
+        bool(success),
+        finish_reason,
+        int(usage.get("prompt", usage.get("prompt_tokens", 0)) or 0),
+        int(usage.get("completion", usage.get("completion_tokens", 0)) or 0),
+        int(message_count or 0),
+        int(tool_count or 0),
+        f" error={_compact_provider_error_text(error, limit=120)}" if error else "",
+    )
+
     # ── Telemetry history (in-memory) ──
     history = _llm_call_history_var.get()
     if history is not None:
@@ -2590,6 +3162,7 @@ def _record_llm_call(
                     )
                 ),
                 "duration_ms": float(duration_ms or 0),
+                "first_token_ms": first_token_ms,
                 "message_count": int(message_count or 0),
                 "tool_count": int(tool_count or 0),
                 "finish_reason": finish_reason,
@@ -2977,6 +3550,8 @@ _CACHE_MIN_TOKENS_DEFAULT = 1024
 _CACHE_MIN_TOKENS = {
     # Keep dotted OpenRouter IDs and hyphenated Anthropic-native IDs in sync.
     "claude-fable-5": 2048,
+    "claude-opus-5.5": 4096,
+    "claude-opus-5-5": 4096,
     "claude-opus-5": 4096,
     "claude-opus-4.7": 4096,
     "claude-opus-4-7": 4096,
@@ -3082,6 +3657,26 @@ _OPENROUTER_PROVIDER_NAMES = {
 }
 
 
+def _history_breakpoint_index(messages: list[dict]) -> int | None:
+    """The message whose end is the reusable history prefix, if any.
+
+    Skips the system message (marked separately) and messages without text,
+    which cannot carry a cache marker.
+    """
+    if not messages:
+        return None
+    end = len(messages) - 1
+    if messages[-1].get("role") == "user":
+        end -= 1
+    for index in range(end, -1, -1):
+        message = messages[index]
+        if message.get("role") == "system":
+            return None
+        if _estimate_content_tokens(message.get("content")) > 0:
+            return index
+    return None
+
+
 def _apply_prompt_cache(payload: Dict[str, Any]) -> bool:
     """Mutate ``payload`` in place to add ``cache_control`` breakpoints
     on the stable prefix (system prompt, last tool definition, last
@@ -3102,8 +3697,8 @@ def _apply_prompt_cache(payload: Dict[str, Any]) -> bool:
       [2] last tool definition (cache_control inside ``function`` per
           Anthropic's tool-shape — top-level key is ignored on tool
           objects when OpenRouter translates OpenAI-format → Anthropic)
-      [3] history through turn N-1 (the assistant turn just before the
-          fresh user message)
+      [3] history: through the turn before a fresh user message, or
+          through the latest tool results inside an agent loop
       [4] new user message — left UN-cached so it busts only its own slot
     """
     model = payload.get("model") or ""
@@ -3138,7 +3733,24 @@ def _apply_prompt_cache(payload: Dict[str, Any]) -> bool:
     if sys_idx is not None:
         sys_msg = messages[sys_idx]
         sys_text = sys_msg.get("content")
-        sys_msg["content"] = _wrap_with_cache_control(sys_text)
+        from packages.core.ai.runtime.workspace_operation_skills import (
+            WORKSPACE_OPERATION_GUIDANCE_END, WORKSPACE_OPERATION_GUIDANCE_START,
+        )
+
+        # Workspace guides precede actor state. Pin that public prefix rather
+        # than a changing Workspace/user snapshot so requests can reuse it.
+        if (
+            isinstance(sys_text, str)
+            and sys_text.startswith(WORKSPACE_OPERATION_GUIDANCE_START)
+            and WORKSPACE_OPERATION_GUIDANCE_END in sys_text
+        ):
+            prefix, suffix = sys_text.split(WORKSPACE_OPERATION_GUIDANCE_END, 1)
+            blocks = _wrap_with_cache_control(prefix + WORKSPACE_OPERATION_GUIDANCE_END)
+            if suffix:
+                blocks.append({"type": "text", "text": suffix})
+            sys_msg["content"] = blocks
+        else:
+            sys_msg["content"] = _wrap_with_cache_control(sys_text)
 
     # ── Mark the last tool definition ──
     # Anthropic reads cache_control on the inner ``function`` block when
@@ -3151,15 +3763,15 @@ def _apply_prompt_cache(payload: Dict[str, Any]) -> bool:
             if isinstance(target, dict):
                 target["cache_control"] = {"type": "ephemeral"}
 
-    # ── Mark the last assistant turn (history through turn N-1) ──
-    # Find the last assistant message that isn't the very last message.
-    # If the last message is itself an assistant (e.g. resume), skip
-    # this slot — we've already covered enough with system+tools.
-    if messages and messages[-1].get("role") == "user":
-        for i in range(len(messages) - 2, -1, -1):
-            if messages[i].get("role") == "assistant":
-                messages[i]["content"] = _wrap_with_cache_control(messages[i].get("content"))
-                break
+    # ── Moving breakpoint over the conversation history ──
+    # A fresh user message is the only volatile tail: cache through the
+    # turn before it. Inside an agent loop the request ends with the latest
+    # tool results, which every later round of the run repeats verbatim, so
+    # the breakpoint goes on that last message and the next round reads the
+    # whole history from cache instead of recomputing it.
+    history_idx = _history_breakpoint_index(messages)
+    if history_idx is not None:
+        messages[history_idx]["content"] = _wrap_with_cache_control(messages[history_idx].get("content"))
 
     # ── Pin OpenRouter route to the model's first-party provider ──
     # Without ``order``, OpenRouter will sometimes route to Bedrock or
@@ -3233,6 +3845,12 @@ def _schedule_billing_record(
                 int(getattr(billing, "in_flight_credits", 0) or 0) - int(reserved_credits),
             )
             _release_entity_in_flight_credits(billing.entity_id, reserved_credits)
+
+    attribution = _context_attribution_var.get()
+    if attribution and not any(
+        key in usage for key in ("context_attribution", "context_attribution_total", "context_breakdown")
+    ):
+        usage = {**usage, "context_attribution": attribution}
 
     async def _write():
         try:
@@ -3315,15 +3933,90 @@ def bind_llm_call_history(history: Optional[List[Dict[str, Any]]]):
 # HTTP retry logic
 # ---------------------------------------------------------------------------
 
+_SSE_HEARTBEAT_EVENT_TYPES = frozenset(
+    {"heartbeat", "keep_alive", "keep-alive", "keepalive", "ping"}
+)
+
+
+def _sse_payload_has_model_progress(decoded: Dict[str, Any]) -> bool:
+    """Return true when an SSE JSON payload contains model output or a terminal signal."""
+
+    if decoded.get("error") or str(decoded.get("type") or "").strip().lower() == "error":
+        return True
+    usage = decoded.get("usage")
+    if isinstance(usage, dict) and usage:
+        return True
+    event_type = str(decoded.get("type") or decoded.get("event") or "").strip().lower()
+    if event_type and event_type not in _SSE_HEARTBEAT_EVENT_TYPES:
+        return True
+    choices = decoded.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        if choice.get("finish_reason"):
+            return True
+        delta = choice.get("delta")
+        if not isinstance(delta, dict) or not delta:
+            message = choice.get("message")
+            delta = message if isinstance(message, dict) else {}
+        if not delta:
+            continue
+        content = delta.get("content")
+        if content:
+            return True
+        if delta.get("tool_calls") or delta.get("function_call"):
+            return True
+        if _extract_reasoning_content(delta):
+            return True
+    return False
+
+
+def _sse_data_line_is_heartbeat(line: str) -> bool:
+    """Return true for keep-alives and empty OpenAI chunks that are not model progress.
+
+    Gateways often drip ``data: {"choices":[{"delta":{}}]}`` while the origin is
+    stuck. Those frames reset a naive idle timer even though no token arrived.
+    """
+
+    stripped = str(line or "").strip()
+    if not stripped.startswith("data:"):
+        return False
+    payload = stripped[5:].strip()
+    if payload.lower() in _SSE_HEARTBEAT_EVENT_TYPES:
+        return True
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    if not isinstance(decoded, dict):
+        return False
+    event_type = str(decoded.get("type") or decoded.get("event") or "").strip().lower()
+    if event_type in _SSE_HEARTBEAT_EVENT_TYPES:
+        return True
+    return not _sse_payload_has_model_progress(decoded)
+
+
 async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
-    """Yield streaming lines, aborting when the provider accepts stream mode but stalls."""
+    """Yield meaningful SSE data lines and time out when only heartbeats arrive.
+
+    Providers and gateways commonly keep an otherwise stalled stream alive with
+    blank lines or ``: keep-alive`` comments.  Those transport heartbeats are
+    not model progress and must not reset the user-facing idle timeout.
+    """
 
     timeout = get_llm_stream_idle_timeout()
     iterator = response.aiter_lines().__aiter__()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout if timeout > 0 else None
     while True:
         try:
-            if timeout > 0:
-                line = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+            if deadline is not None:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                line = await asyncio.wait_for(iterator.__anext__(), timeout=remaining)
             else:
                 line = await iterator.__anext__()
         except StopAsyncIteration:
@@ -3332,15 +4025,27 @@ async def _iter_stream_lines_with_idle_timeout(response: httpx.Response):
             raise TimeoutError(
                 f"LLM streaming response stalled for {timeout:.0f}s without a chunk"
             ) from exc
+        stripped = (line or "").strip()
+        if (
+            not stripped.startswith("data:")
+            or not stripped[5:].strip()
+            or _sse_data_line_is_heartbeat(stripped)
+        ):
+            continue
+        if _stream_first_output_at.get() is None:
+            _stream_first_output_at.set(time.time())
         yield line
+        if timeout > 0:
+            deadline = loop.time() + timeout
 
 async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> httpx.Response:
     """
     POST to `url` with automatic retry on transient provider/proxy failures,
     connect failures, and ReadTimeout.
-    Waits for Retry-After seconds if the header is present, otherwise
-    uses exponential back-off: 1 s, 2 s, 4 s ... capped at _MAX_DELAY.
-    Retries once on ReadTimeout (common with large tool payloads).
+    Honours Retry-After only on HTTP 429; other retryable statuses use
+    exponential back-off: 1 s, 2 s, 4 s ... capped at _MAX_DELAY.
+    Cloudflare 524 is retried once. Retrying a timed-out origin for minutes
+    (or honouring its Retry-After) just multiplies the hang.
     Raises the last exception if all retries are exhausted.
     """
     if not (headers.get("Authorization") or headers.get("x-api-key") or headers.get("X-API-Key")):
@@ -3393,7 +4098,13 @@ async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str,
 
         # --- 429 / transient gateway handling ---
         retry_after = response.headers.get("Retry-After")
-        wait = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else delay
+        wait = delay
+        if (
+            response.status_code == 429
+            and retry_after
+            and retry_after.replace(".", "", 1).isdigit()
+        ):
+            wait = float(retry_after)
 
         # Cooperative backoff: if the provider is telling us to wait longer
         # than a worker should idle, raise LLMRateLimited so the goal runner
@@ -3408,10 +4119,11 @@ async def _post_with_retry(url: str, headers: Dict[str, str], payload: Dict[str,
             await response.aclose()
             raise LLMRateLimited(wait)
 
-        if attempt < _MAX_RETRIES:
+        retry_limit = 1 if response.status_code == 524 else _MAX_RETRIES
+        if attempt < retry_limit:
             logger.warning(
                 "HTTP %s from provider (attempt %d/%d); retrying in %.1fs",
-                response.status_code, attempt + 1, _MAX_RETRIES + 1, wait,
+                response.status_code, attempt + 1, retry_limit + 1, wait,
             )
             await asyncio.sleep(wait)
             delay = min(delay * 2, _MAX_DELAY)
@@ -3454,7 +4166,9 @@ async def chat_completion(
     if not api_key:
         detail = _missing_llm_key_detail()
         logger.warning(detail)
-        return "", _failure_usage(resolved_model, detail)
+        return "", _failure_usage(
+            resolved_model, detail, error_code="llm_configuration_missing",
+        )
 
     # Pre-flight after key resolution so native-provider BYOK can bypass
     # Manor credit gates while platform OpenRouter calls remain gated.
@@ -3472,7 +4186,7 @@ async def chat_completion(
     # Strip provider prefix when calling the provider directly (not OpenRouter)
     wire_model = normalize_model_for_provider(resolved_model, base_url)
 
-    sanitized_messages = _sanitize_messages_for_llm(messages)
+    sanitized_messages = _portable_late_system_messages(_sanitize_messages_for_llm(messages), model=resolved_model)
     payload: Dict[str, Any] = {
         "model": wire_model,
         "messages": sanitized_messages,
@@ -3484,6 +4198,11 @@ async def chat_completion(
         payload["max_tokens"] = max_tokens
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
+    _apply_chat_completion_compatibility(
+        payload,
+        model=resolved_model,
+        tools=[],
+    )
     adapt_native_chat_completion_payload(
         payload,
         model_id=resolved_model,
@@ -3493,6 +4212,8 @@ async def chat_completion(
     if provider_block:
         payload["provider"] = provider_block
     prompt_cache_applied = _apply_prompt_cache(payload)
+    _apply_prompt_cache_key(payload, model=resolved_model, base_url=base_url)
+    _apply_reasoning_effort_route(payload, base_url=base_url)
 
     _call_source = routing.source or (
         "BYOK-custom"
@@ -3507,6 +4228,7 @@ async def chat_completion(
     route_provider_token = _llm_route_provider.set(route_provider)
     pricing_source_token = _llm_pricing_source.set(pricing_source)
     started_at = time.time()
+    response_format_fallback = None
     try:
         if _is_anthropic_messages_api(base_url):
             content, _tool_calls, usage = await _anthropic_messages_completion(
@@ -3516,6 +4238,7 @@ async def chat_completion(
                 messages=sanitized_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                response_format=response_format,
                 stream_handler=stream_handler,
                 call_type="chat_completion",
                 started_at=started_at,
@@ -3538,8 +4261,8 @@ async def chat_completion(
                 usage = EMPTY_USAGE.copy()
                 usage["model"] = resolved_model
                 finish_reason = ""
-                async with client.stream(
-                    "POST",
+                async with _open_llm_stream(
+                    client,
                     f"{base_url}/chat/completions",
                     headers=dict(request_headers),
                     json=stream_payload,
@@ -3553,6 +4276,7 @@ async def chat_completion(
                         if not data_line or data_line == "[DONE]":
                             continue
                         chunk = json.loads(data_line)
+                        _raise_on_stream_error_chunk(chunk)
                         if isinstance(chunk.get("usage"), dict):
                             usage = _usage_from_response(chunk, resolved_model)
                         choice = (chunk.get("choices") or [{}])[0]
@@ -3597,22 +4321,37 @@ async def chat_completion(
             except Exception as stream_error:
                 if streamed_any_text:
                     await _emit_stream_event(stream_handler, "text_reset", {})
+                format_retry = _unsupported_response_format_retry(stream_error, payload)
+                if format_retry is not None:
+                    payload, response_format_fallback = format_retry
+                if _should_skip_buffered_stream_fallback(stream_error):
+                    logger.warning(
+                        "chat_completion stream path failed, skipping buffered fallback: %s",
+                        stream_error,
+                    )
+                    raise
                 logger.warning(
                     "chat_completion stream path failed, falling back to buffered response: %s",
                     stream_error,
                 )
 
-        response = await _post_chat_with_reasoning_retry(
-            f"{base_url}/chat/completions",
-            headers=dict(request_headers),
-            payload=payload,
-            call_type="chat_completion",
-        )
+        try:
+            response = await _post_chat_with_reasoning_retry(
+                f"{base_url}/chat/completions",
+                headers=dict(request_headers),
+                payload=payload,
+                call_type="chat_completion",
+            )
+        except Exception as buffered_error:
+            if response_format_fallback:
+                buffered_error.response_format_fallback = response_format_fallback
+            raise
         data = _parse_llm_response_json(response, call_type="chat_completion")
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message", {}) or {}
         content = msg.get("content", "") or ""
         usage = _usage_from_response(data, resolved_model)
+        _attach_response_format_fallback(usage, response, response_format_fallback)
         finish_reason = choice.get("finish_reason") or ""
         usage["finish_reason"] = finish_reason
         _attach_reasoning_to_usage(usage, _extract_reasoning_content(msg))
@@ -3677,7 +4416,7 @@ async def chat_completion(
         # Return empty content (callers like supervisor prefer empty over
         # canned text) but propagate the error in the usage dict so it
         # can surface in run-detail / debug surfaces.
-        return "", _failure_usage(resolved_model, detail)
+        return "", _byok_failure_usage(routing, e, model=resolved_model, detail=detail)
     finally:
         _llm_route_provider.reset(route_provider_token)
         _llm_pricing_source.reset(pricing_source_token)
@@ -3704,6 +4443,7 @@ async def chat_completion_with_tools(
     *,
     temperature: float = 0.7,
     tool_choice: Optional[Any] = None,
+    response_format: Optional[Dict[str, Any]] = None,
     model: Optional[str] = None,
     stream_handler: _StreamHandler = None,
     metadata: Optional[Dict[str, Any]] = None,
@@ -3732,7 +4472,9 @@ async def chat_completion_with_tools(
     if not api_key:
         detail = _missing_llm_key_detail()
         logger.warning("%s Tool calling unavailable.", detail)
-        return "", None, _failure_usage(model, detail)
+        return "", None, _failure_usage(
+            model, detail, error_code="llm_configuration_missing",
+        )
 
     # Pre-flight after key resolution so native-provider BYOK can bypass
     # Manor credit gates while platform OpenRouter calls remain gated.
@@ -3747,7 +4489,7 @@ async def chat_completion_with_tools(
 
     wire_model = normalize_model_for_provider(model, base_url)
 
-    sanitized_messages = _sanitize_messages_for_llm(messages)
+    sanitized_messages = _portable_late_system_messages(_sanitize_messages_for_llm(messages), model=model)
     normalized_tools = _normalize_tools_for_llm(tools)
     effective_max_tokens = max_tokens if max_tokens is not None else _DEFAULT_TOOL_CALL_MAX_TOKENS
     payload: Dict[str, Any] = {
@@ -3758,7 +4500,9 @@ async def chat_completion_with_tools(
         "tool_choice": tool_choice if tool_choice is not None else "auto",
         "max_tokens": effective_max_tokens,
     }
-    _apply_chat_completion_tool_compatibility(
+    if response_format is not None:
+        payload["response_format"] = response_format
+    _apply_chat_completion_compatibility(
         payload,
         model=model,
         tools=normalized_tools,
@@ -3772,6 +4516,8 @@ async def chat_completion_with_tools(
     if provider_block:
         payload["provider"] = provider_block
     prompt_cache_applied = _apply_prompt_cache(payload)
+    _apply_prompt_cache_key(payload, model=model, base_url=base_url)
+    _apply_reasoning_effort_route(payload, base_url=base_url)
 
     _call_source = routing.source or (
         "BYOK-custom"
@@ -3788,6 +4534,7 @@ async def chat_completion_with_tools(
     route_provider_token = _llm_route_provider.set(route_provider)
     pricing_source_token = _llm_pricing_source.set(pricing_source)
     started_at = time.time()
+    response_format_fallback = None
     try:
         if _is_anthropic_messages_api(base_url):
             return await _anthropic_messages_completion(
@@ -3799,6 +4546,7 @@ async def chat_completion_with_tools(
                 max_tokens=effective_max_tokens,
                 tools=normalized_tools,
                 tool_choice=tool_choice,
+                response_format=response_format,
                 stream_handler=stream_handler,
                 call_type="chat_completion_with_tools",
                 started_at=started_at,
@@ -3819,10 +4567,11 @@ async def chat_completion_with_tools(
                 usage["model"] = model
                 content_parts: List[str] = []
                 tool_call_parts: Dict[int, Dict[str, Any]] = {}
+                tool_drafts = _ToolCallDraftEmitter(stream_handler)
                 reasoning_parts: List[str] = []
                 finish_reason = ""
-                async with client.stream(
-                    "POST",
+                async with _open_llm_stream(
+                    client,
                     f"{base_url}/chat/completions",
                     headers=dict(request_headers),
                     json=stream_payload,
@@ -3836,6 +4585,7 @@ async def chat_completion_with_tools(
                         if not data_line or data_line == "[DONE]":
                             continue
                         chunk = json.loads(data_line)
+                        _raise_on_stream_error_chunk(chunk)
                         if isinstance(chunk.get("usage"), dict):
                             usage = _usage_from_response(chunk, model)
                         choice = (chunk.get("choices") or [{}])[0]
@@ -3852,7 +4602,7 @@ async def chat_completion_with_tools(
                                 entry = tool_call_parts.setdefault(
                                     index,
                                     {
-                                        "id": tc.get("id") or f"call_{index}",
+                                        "id": tc.get("id") or f"call_{uuid4().hex}",
                                         "name": "",
                                         "arguments_text": "",
                                     },
@@ -3864,6 +4614,8 @@ async def chat_completion_with_tools(
                                     entry["name"] = fn["name"]
                                 if fn.get("arguments"):
                                     entry["arguments_text"] += str(fn.get("arguments") or "")
+                                    entry["argument_fragments"] = entry.get("argument_fragments", 0) + 1
+                                await tool_drafts.update(index, entry)
 
                         delta_content = delta.get("content") or ""
                         if isinstance(delta_content, list):
@@ -3896,22 +4648,46 @@ async def chat_completion_with_tools(
                 parsed_tool_calls: Optional[List[Dict[str, Any]]] = None
                 if tool_call_parts:
                     parsed_tool_calls = []
+                    argument_diagnostics = []
                     for index in sorted(tool_call_parts.keys()):
                         entry = tool_call_parts[index]
                         raw_args = entry.get("arguments_text") or "{}"
+                        argument_state = "parsed"
                         try:
                             arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                         except json.JSONDecodeError:
                             arguments = {"_raw": raw_args}
+                            argument_state = "invalid_json"
+                        else:
+                            if not entry.get("arguments_text"):
+                                argument_state = "absent"
+                            elif not isinstance(arguments, dict):
+                                argument_state = "non_object"
+                            elif not arguments:
+                                argument_state = "empty_object"
                         name = str(entry.get("name") or "").strip()
                         if not name:
                             continue
+                        # Shape only: never copy argument values, prompt text,
+                        # credentials, or raw provider frames into diagnostics.
+                        argument_diagnostics.append({
+                            "tool_index": index,
+                            "argument_chars": len(entry.get("arguments_text") or ""),
+                            "argument_fragments": entry.get("argument_fragments", 0),
+                            "state": argument_state,
+                        })
                         parsed_tool_calls.append(
                             {
-                                "id": entry.get("id") or f"call_{index}",
+                                "id": entry.get("id") or f"call_{uuid4().hex}",
                                 "name": name,
                                 "arguments": arguments,
                             }
+                        )
+                    usage["tool_argument_diagnostics"] = argument_diagnostics
+                    if argument_diagnostics:
+                        logger.info(
+                            "[tool-arguments] model=%s diagnostics=%s",
+                            model, argument_diagnostics,
                         )
 
                 if parsed_tool_calls:
@@ -3954,19 +4730,34 @@ async def chat_completion_with_tools(
             except Exception as stream_error:
                 if streamed_any_text:
                     await _emit_stream_event(stream_handler, "text_reset", {})
+                format_retry = _unsupported_response_format_retry(stream_error, payload)
+                if format_retry is not None:
+                    payload, response_format_fallback = format_retry
+                if _should_skip_buffered_stream_fallback(stream_error):
+                    logger.warning(
+                        "chat_completion_with_tools stream path failed, skipping buffered fallback: %s",
+                        stream_error,
+                    )
+                    raise
                 logger.warning(
                     "chat_completion_with_tools stream path failed, falling back to buffered response: %s",
                     stream_error,
                 )
 
-        response = await _post_chat_with_reasoning_retry(
-            f"{base_url}/chat/completions",
-            headers=dict(request_headers),
-            payload=payload,
-            call_type="chat_completion_with_tools",
-        )
+        try:
+            response = await _post_chat_with_reasoning_retry(
+                f"{base_url}/chat/completions",
+                headers=dict(request_headers),
+                payload=payload,
+                call_type="chat_completion_with_tools",
+            )
+        except Exception as buffered_error:
+            if response_format_fallback:
+                buffered_error.response_format_fallback = response_format_fallback
+            raise
         data = _parse_llm_response_json(response, call_type="chat_completion_with_tools")
         usage = _usage_from_response(data, model)
+        _attach_response_format_fallback(usage, response, response_format_fallback)
         choice = (data.get("choices") or [{}])[0]
         msg = choice.get("message") or {}
         finish_reason = choice.get("finish_reason") or ""
@@ -3988,7 +4779,7 @@ async def chat_completion_with_tools(
                 if not name:
                     continue  # skip malformed entries
                 parsed.append({
-                    "id": tc.get("id") or f"call_{len(parsed)}",
+                    "id": tc.get("id") or f"call_{uuid4().hex}",
                     "name": name,
                     "arguments": arguments,
                 })
@@ -4065,6 +4856,7 @@ async def chat_completion_with_tools(
                 tools,
                 temperature=temperature,
                 tool_choice=tool_choice,
+                response_format=response_format,
                 model=model,
                 stream_handler=stream_handler,
                 metadata=metadata_for_call,
@@ -4081,7 +4873,7 @@ async def chat_completion_with_tools(
             try:
                 fallback_payload = {**payload, "model": fallback}
                 fallback_payload.pop("reasoning_effort", None)
-                _apply_chat_completion_tool_compatibility(
+                _apply_chat_completion_compatibility(
                     fallback_payload,
                     model=fallback,
                     tools=normalized_tools,
@@ -4091,13 +4883,14 @@ async def chat_completion_with_tools(
                     model_id=fallback,
                     base_url=base_url,
                 )
-                fb_response = await _post_with_retry(
+                fb_response = await _post_with_response_format_retry(
                     f"{base_url}/chat/completions",
                     headers=dict(request_headers),
                     payload=fallback_payload,
                 )
                 fb_data = _parse_llm_response_json(fb_response, call_type="chat_completion_with_tools(fallback)")
                 fb_usage = _usage_from_response(fb_data, fallback)
+                _attach_response_format_fallback(fb_usage, fb_response)
                 fb_usage = _annotate_usage_with_billing_source(fb_usage, model=fallback)
                 fb_choice = (fb_data.get("choices") or [{}])[0]
                 fb_msg = fb_choice.get("message") or {}
@@ -4114,7 +4907,7 @@ async def chat_completion_with_tools(
                         name = fn.get("name") or ""
                         if name:
                             fb_parsed.append({
-                                "id": tc.get("id") or f"call_{len(fb_parsed)}",
+                                "id": tc.get("id") or f"call_{uuid4().hex}",
                                 "name": name,
                                 "arguments": args,
                             })
@@ -4134,7 +4927,7 @@ async def chat_completion_with_tools(
         return (
             _failure_message(full_detail, model=model),
             None,
-            _failure_usage(model, full_detail),
+            _byok_failure_usage(routing, e, model=model, detail=full_detail),
         )
 
     except httpx.ReadTimeout as e:
@@ -4157,6 +4950,7 @@ async def chat_completion_with_tools(
                 tools,
                 temperature=temperature,
                 tool_choice=tool_choice,
+                response_format=response_format,
                 model=model,
                 stream_handler=stream_handler,
                 metadata=metadata_for_call,
@@ -4169,7 +4963,7 @@ async def chat_completion_with_tools(
         return (
             "The request timed out. Please try again -- large tool sets can take longer to process.",
             None,
-            _failure_usage(model, f"ReadTimeout: {e}"),
+            _byok_failure_usage(routing, e, model=model, detail=f"ReadTimeout: {e}"),
         )
     except Exception as e:
         _record_llm_call(
@@ -4191,6 +4985,7 @@ async def chat_completion_with_tools(
                 tools,
                 temperature=temperature,
                 tool_choice=tool_choice,
+                response_format=response_format,
                 model=model,
                 stream_handler=stream_handler,
                 metadata=metadata_for_call,
@@ -4203,7 +4998,7 @@ async def chat_completion_with_tools(
         return (
             _failure_message(f"{type(e).__name__}: {e}", model=model),
             None,
-            _failure_usage(model, f"{type(e).__name__}: {e}"),
+            _byok_failure_usage(routing, e, model=model, detail=f"{type(e).__name__}: {e}"),
         )
     finally:
         _llm_route_provider.reset(route_provider_token)

@@ -13,7 +13,7 @@ Covered:
     exemption list
   * MCP allowlist + starter_memory + knowledge_pack rules
   * strategist enum + weights-sum-to-1 rule
-  * governance never_allow ∩ auto_approve rule
+  * typed governance selectors and deterministic deny precedence
 """
 
 from __future__ import annotations
@@ -151,9 +151,11 @@ def _v11_payload() -> dict:
         },
         "policy": {
             "governance": {
-                "never_allow_actions": ["billing.*"],
-                "hitl_required_actions": ["x.delete_*"],
-                "auto_approve_actions": ["x.like"],
+                "approval": {"rules": [
+                    {"id": "purchases", "effect": "deny", "selector": {"kind": "category", "category": "purchases"}},
+                    {"id": "delete", "effect": "ask", "selector": {"kind": "category", "category": "deletion"}},
+                    {"id": "like", "effect": "allow", "selector": {"kind": "action", "action_key": "x.like"}},
+                ]},
                 "max_risk_level": "medium",
             },
             "post_install_checks": [],
@@ -641,6 +643,20 @@ def test_validate_accepts_v11():
     validate_payload(_v11_payload())  # should not raise
 
 
+def test_usage_guide_is_bounded_portable_text():
+    payload = _v11_payload()
+    payload["manifest"]["usage_guide"] = "1. Open Workspace Chat.\n2. Review results."
+    validate_payload(payload)
+
+    payload["manifest"]["usage_guide"] = ["not text"]
+    with pytest.raises(PayloadError, match="manifest.usage_guide"):
+        validate_payload(payload)
+
+    payload["manifest"]["usage_guide"] = "x" * 10001
+    with pytest.raises(PayloadError, match="manifest.usage_guide"):
+        validate_payload(payload)
+
+
 def test_v11_task_policy_sections_are_not_portable():
     p = _v11_payload()
     p["recipe"]["task_categories"] = [{"key": "production", "label": "Production"}]
@@ -996,14 +1012,33 @@ def test_v11_strategist_weights_within_tolerance_passes():
     validate_payload(p)
 
 
-# ── Rule 11: governance never_allow ∩ auto_approve = ∅ ────────────────
+# ── Rule 11: typed approval configuration ────────────────────────────
 
 
-def test_v11_governance_overlap_raises():
+def test_v11_governance_overlap_is_valid_and_deny_wins():
+    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_policy import ApprovalScope, evaluate_policy
+    from packages.core.governance.approval_policy_service import build_policy_chain
+
     p = _v11_payload()
-    p["policy"]["governance"]["auto_approve_actions"] = ["x.like", "billing.*"]
-    # billing.* is in never_allow already
-    with pytest.raises(PayloadError, match="overlap"):
+    p["policy"]["governance"]["approval"]["rules"].append({
+        "id": "allow-purchases", "effect": "allow",
+        "selector": {"kind": "category", "category": "purchases"},
+    })
+    validate_payload(p)
+    chain = build_policy_chain(scope=ApprovalScope(kind="account", id="e", entity_id="e"),
+        root={"revision": 1, "policy": {"mode": "automatic", **p["policy"]["governance"]["approval"]}})
+    assert evaluate_policy(chain, action_facts(action_key="purchase.buy")).outcome == "deny"
+
+
+@pytest.mark.parametrize("selector", [
+    {"kind": "action", "action_key": "x.delete_*"},
+    {"kind": "category", "category": "unsupported"},
+])
+def test_v11_governance_rejects_invalid_typed_selector(selector):
+    p = _v11_payload()
+    p["policy"]["governance"]["approval"]["rules"][0]["selector"] = selector
+    with pytest.raises(PayloadError, match="Invalid policy.governance"):
         validate_payload(p)
 
 

@@ -10,7 +10,7 @@ configuration, predictable upgrades, and user-controlled credentials.
 
 ```bash
 cp .env.example .env
-pip install ".[dev]"
+uv sync --locked --extra dev --python 3.12
 cd apps/web && npm ci && cd ../..
 ./scripts/dev.sh infra
 ./scripts/dev.sh init
@@ -25,13 +25,18 @@ Start the app:
 
 ## Checks
 
-Run focused checks before opening a PR:
+Follow the [testing policy](.agents/testing.md). Start with the behavior being
+changed and its existing coverage. Run the relevant files while iterating:
 
 ```bash
-make lint
-make test
-npm --prefix apps/web run build
+uv run --locked --extra dev --python 3.12 python scripts/run_python_tests.py smoke tests/test_ci_first_phase.py
 ```
+
+Choose the appropriate lane and test paths for your change; this example checks
+the CI contract only. Use `make test-smoke` for the complete smoke gate and
+`make test-regression` for general regression. Run the applicable build or lint
+checks for frontend changes. These broader checks are not required after every
+edit.
 
 Docs changes should also build locally:
 
@@ -44,7 +49,10 @@ npm run build
 ## Pull Requests
 
 - Keep changes scoped to one feature, fix, or release-boundary update.
-- Add or update tests when behavior changes.
+- Reuse existing coverage and fill meaningful behavior gaps. Before delivery,
+  review new tests once: keep distinct regressions, consolidate duplicates,
+  and remove disposable probes. Copy, styling, and mechanical changes normally
+  need the relevant build, diff, or UI check without a new permanent test.
 - Update README, docs, or `.env.example` when setup, configuration, routes, or
   deployment behavior changes.
 - Link the issue or discussion that motivated the change when there is one.

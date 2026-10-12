@@ -19,6 +19,7 @@ export const PendingActionKind = {
   GOVERNANCE_APPROVAL: "governance_approval",
   TASK_APPROVAL: "task_approval",
   TASK_RECOVERY: "task_recovery",
+  EFFECT_RECONCILIATION: "effect_reconciliation",
   APPROVE_PROPOSALS: "approve_proposals",
   RETRY_STRATEGIST_REVIEW: "retry_strategist_review",
   WORKSPACE_OPERATION_REVIEW: "workspace_operation_review",

@@ -317,11 +317,13 @@ async def test_moving_folder_reapplies_parent_policy_to_subtree(client: AsyncCli
     )
     assert moved.status_code == 200, moved.text
     assert moved.json()["classification"] == "confidential"
-    assert moved.json()["visibility"] == "workspace"
+    # This is an ordinary personal folder whose visibility label was changed,
+    # not a folder bound to an actual Workspace. Moving into it is not sharing.
+    assert moved.json()["visibility"] == "private"
     refreshed = await client.get(f"/api/v1/documents/{doc['id']}", headers=headers)
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["classification"] == "confidential"
-    assert refreshed.json()["visibility"] == "workspace"
+    assert refreshed.json()["visibility"] == "private"
 
 
 @pytest.mark.asyncio
@@ -545,7 +547,7 @@ async def test_folder_share_can_never_expire(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_deleted_workspace_blocks_folder_acl_and_public_share_until_restore(
+async def test_deleted_workspace_retains_folder_acl_and_public_share(
     client: AsyncClient,
 ):
     headers = await _auth(client, "deletedworkspacefoldershare")
@@ -573,13 +575,13 @@ async def test_deleted_workspace_blocks_folder_acl_and_public_share_until_restor
         headers=headers,
     )
     assert deleted.status_code == 204, deleted.text
-    assert (await client.get(f"/api/v1/shared-folder/{token}")).status_code == 410
+    assert (await client.get(f"/api/v1/shared-folder/{token}")).status_code == 200
     assert (
         await client.get(
             f"/api/v1/folders/{folder_id}/grants",
             headers=headers,
         )
-    ).status_code == 404
+    ).status_code == 200
 
     restored = await client.post(
         f"/api/v1/workspaces/{workspace_data['id']}/restore",
@@ -590,7 +592,7 @@ async def test_deleted_workspace_blocks_folder_acl_and_public_share_until_restor
 
 
 @pytest.mark.asyncio
-async def test_deleted_workspace_blocks_knowledge_folder_crud_until_restore(
+async def test_deleted_workspace_retains_knowledge_folder_crud(
     client: AsyncClient,
 ):
     headers = await _auth(client, "deletedworkspacefoldercrud")
@@ -616,23 +618,26 @@ async def test_deleted_workspace_blocks_knowledge_folder_crud_until_restore(
     create = await client.post(
         "/api/v1/documents/folders",
         headers=headers,
-        json={"name": "Must not be created", "parent_id": child["id"]},
+        json={"name": "New Knowledge child", "parent_id": child["id"]},
     )
+    assert create.status_code == 201, create.text
     rename = await client.put(
         f"/api/v1/documents/folders/{child['id']}",
         headers=headers,
-        json={"name": "Must not be renamed"},
+        json={"name": "Retained Knowledge folder"},
     )
+    assert rename.status_code == 200, rename.text
     move = await client.post(
         f"/api/v1/documents/folders/{child['id']}/move",
         headers=headers,
         json={"parent_id": None},
     )
+    assert move.status_code == 200, move.text
     remove = await client.delete(
-        f"/api/v1/documents/folders/{child['id']}",
+        f"/api/v1/documents/folders/{create.json()['id']}",
         headers=headers,
     )
-    assert {create.status_code, rename.status_code, move.status_code, remove.status_code} == {404}
+    assert remove.status_code == 204, remove.text
 
     restored = await client.post(
         f"/api/v1/workspaces/{workspace_data['id']}/restore",
@@ -641,7 +646,10 @@ async def test_deleted_workspace_blocks_knowledge_folder_crud_until_restore(
     assert restored.status_code == 200, restored.text
     tree = await client.get("/api/v1/documents/folder-tree", headers=headers)
     assert tree.status_code == 200, tree.text
-    assert child["id"] in {folder["id"] for folder in tree.json()}
+    retained = next(folder for folder in tree.json() if folder["id"] == child["id"])
+    assert retained["name"] == "Retained Knowledge folder"
+    assert retained["parent_id"] is None
+    assert create.json()["id"] not in {folder["id"] for folder in tree.json()}
 
 
 @pytest.mark.asyncio
@@ -674,14 +682,14 @@ async def test_folder_rename_serializes_with_workspace_delete(
         rename_task = asyncio.create_task(client.put(
             f"/api/v1/documents/folders/{child['id']}",
             headers=headers,
-            json={"name": "Must not win"},
+            json={"name": "Retained Knowledge folder"},
         ))
         await asyncio.sleep(0.1)
         assert rename_task.done() is False
         await deleting_db.commit()
 
     response = await asyncio.wait_for(rename_task, timeout=5)
-    assert response.status_code == 404, response.text
+    assert response.status_code == 200, response.text
     restored = await client.post(
         f"/api/v1/workspaces/{workspace_data['id']}/restore",
         headers=headers,
@@ -692,7 +700,7 @@ async def test_folder_rename_serializes_with_workspace_delete(
     child_after_restore = next(
         folder for folder in tree.json() if folder["id"] == child["id"]
     )
-    assert child_after_restore["name"] == "Stable child name"
+    assert child_after_restore["name"] == "Retained Knowledge folder"
 
 
 @pytest.mark.asyncio
@@ -732,7 +740,7 @@ async def test_public_folder_share_serializes_with_workspace_delete(
         await deleting_db.commit()
 
     response = await asyncio.wait_for(request_task, timeout=5)
-    assert response.status_code == 410, response.text
+    assert response.status_code == 200, response.text
 
 
 @pytest.mark.asyncio
@@ -777,6 +785,9 @@ async def test_public_folder_share_serializes_with_direct_child_workspace_delete
     await db_session.flush()
     hidden_document = await db_session.get(Document, hidden["id"])
     assert hidden_document is not None
+    hidden_document.owner_id = None
+    hidden_document.visibility = "workspace"
+    hidden_document.source = "agent"
     hidden_document.metadata_ = {
         "origin": {"workspace_id": child_workspace.id}
     }
@@ -805,8 +816,10 @@ async def test_public_folder_share_serializes_with_direct_child_workspace_delete
 
     response = await asyncio.wait_for(request_task, timeout=5)
     assert response.status_code == 200, response.text
-    assert [doc["id"] for doc in response.json()["documents"]] == [visible["id"]]
-    assert response.json()["subfolders"] == []
+    assert {doc["id"] for doc in response.json()["documents"]} == {
+        visible["id"], hidden["id"],
+    }
+    assert [folder["id"] for folder in response.json()["subfolders"]] == [hidden_folder["id"]]
 
 
 # ── Cross-entity isolation ───────────────────────────────────────────────
@@ -1013,7 +1026,7 @@ async def test_folder_share_filters_confidential_children(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_folder_share_filters_children_owned_by_deleted_workspace(
+async def test_explicit_folder_share_retains_children_after_source_workspace_deletion(
     client: AsyncClient,
     db_session,
 ):
@@ -1056,6 +1069,9 @@ async def test_folder_share_filters_children_owned_by_deleted_workspace(
     await db_session.flush()
     hidden_document = await db_session.get(Document, hidden["id"])
     assert hidden_document is not None
+    hidden_document.owner_id = None
+    hidden_document.visibility = "workspace"
+    hidden_document.source = "agent"
     hidden_document.metadata_ = {"origin": {"workspace_id": workspace.id}}
     await db_session.commit()
 
@@ -1069,10 +1085,10 @@ async def test_folder_share_filters_children_owned_by_deleted_workspace(
 
     public = await client.get(f"/api/v1/shared-folder/{token}")
     assert public.status_code == 200, public.text
-    assert [document["id"] for document in public.json()["documents"]] == [
-        visible["id"]
-    ]
-    assert public.json()["subfolders"] == []
+    assert {document["id"] for document in public.json()["documents"]} == {
+        visible["id"], hidden["id"],
+    }
+    assert [child["id"] for child in public.json()["subfolders"]] == [hidden_folder["id"]]
 
     workspace.deleted_at = None
     await db_session.commit()

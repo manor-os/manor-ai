@@ -49,6 +49,8 @@ from packages.core.blueprints.freshness import (
     BLUEPRINT_SETTINGS_KEY,
     BLUEPRINT_VERSION_KEY,
     CONTENT_FINGERPRINT_KEY,
+    LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY,
+    LAST_PARTIAL_UPGRADE_VERSION_KEY,
     MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY,
     SECTION_FINGERPRINTS_KEY,
     UPGRADE_UNSUPPORTED_FINGERPRINT_KEY,
@@ -367,8 +369,9 @@ def _desired_content(
 ) -> dict[str, Any]:
     """The blueprint's values for the fields an upgrade may touch.
 
-    Only behaviour-affecting fields. A blueprint retitling its skill is not
-    something to overwrite a workspace for.
+    Behaviour-affecting fields plus the component's release metadata. A
+    blueprint retitling its skill is not something to overwrite a workspace
+    for, while a published version must remain consistent after upgrade.
     """
     source = spec
     if kind == "workflow":
@@ -383,11 +386,73 @@ def _desired_content(
         )
 
         source = _blueprint_workflow_definition_values(source)
+    desired_fields = {*_fields_for(kind), "version"}
     return {
         field: source.get(field)
-        for field in _fields_for(kind)
+        for field in desired_fields
         if source.get(field) is not None
     }
+
+
+def _component_upgrade_patch(
+    kind: str,
+    row: Any,
+    desired: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the supported changes while preserving Flow version monotonicity."""
+    patch = content_patch_for(row, desired, _fields_for(kind))
+    if kind != "workflow":
+        if (
+            desired.get("version") is not None
+            and getattr(row, "version", None) != desired["version"]
+        ):
+            patch["version"] = desired["version"]
+        return patch
+
+    current_version = int(getattr(row, "version", 1) or 1)
+    source_version = int(desired.get("version") or current_version)
+    next_version = (
+        max(current_version + 1, source_version)
+        if patch
+        else max(current_version, source_version)
+    )
+    if next_version != current_version:
+        patch["version"] = next_version
+    return patch
+
+
+def _with_installed_component_versions(
+    payload: dict[str, Any] | None,
+    *,
+    installed_components: dict[tuple[str, str], Any],
+    installed_workflows: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Rebuild a legacy fingerprint candidate from exact installed rows."""
+    if not isinstance(payload, dict):
+        return payload
+
+    comparison = copy.deepcopy(payload)
+    embedded = comparison.get("embedded") or {}
+    for kind, specs in (
+        ("skill", embedded.get("skills") or []),
+        ("agent", embedded.get("agents") or []),
+    ):
+        for spec in specs:
+            if not isinstance(spec, dict) or "version" not in spec:
+                continue
+            slug = str(spec.get("slug") or "").strip()
+            row = installed_components.get((kind, slug))
+            if row is not None:
+                spec["version"] = getattr(row, "version", spec["version"])
+
+    for spec in (comparison.get("recipe") or {}).get("workflows") or []:
+        if not isinstance(spec, dict) or "version" not in spec:
+            continue
+        slug = str(spec.get("slug") or "").strip()
+        row = installed_workflows.get(slug)
+        if row is not None:
+            spec["version"] = int(getattr(row, "version", spec["version"]) or 1)
+    return comparison
 
 
 def _planned_workflow_content(
@@ -872,6 +937,80 @@ async def plan(
     if not isinstance(payload, dict) or not has_blueprint_identity:
         return result
 
+    embedded = payload.get("embedded") or {}
+    entity_id = workspace.entity_id
+    source_blueprint_ids = _workflow_source_template_ids(
+        record,
+        payload,
+        source_blueprint_id,
+    )
+    from packages.core.blueprints.installer import (
+        blueprint_workflow_installation_source_id,
+    )
+
+    source_template_ids = [
+        blueprint_workflow_installation_source_id(source_id, workspace.id)
+        for source_id in source_blueprint_ids
+    ] + source_blueprint_ids
+    installed_components: dict[tuple[str, str], Any] = {}
+    for kind, specs in (
+        ("skill", embedded.get("skills") or []),
+        ("agent", embedded.get("agents") or []),
+    ):
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            slug = str(spec.get("slug") or "").strip()
+            if not slug:
+                continue
+            row = await _installed_blueprint_component(
+                db,
+                workspace=workspace,
+                source_blueprint_ids=source_blueprint_ids,
+                kind=kind,
+                spec=spec,
+            )
+            if row is not None:
+                installed_components[(kind, slug)] = row
+
+    from packages.core.blueprints.installer import _materialize_workflow_skill_refs
+
+    workflow_specs = copy.deepcopy((payload.get("recipe") or {}).get("workflows") or [])
+    for spec in workflow_specs:
+        spec["steps"] = await _materialize_workflow_skill_refs(
+            db, entity_id=workspace.entity_id, workspace_id=workspace.id,
+            user_id=None, node=spec.get("steps") or [],
+            allow_install_external=False,
+        )
+    workflow_component_keys = {
+        str(spec.get("slug") or "").strip(): str(
+            spec.get("component_id")
+            or spec.get("id")
+            or spec.get("slug")
+            or ""
+        ).strip()
+        for spec in workflow_specs
+        if isinstance(spec, dict)
+    }
+    internal_slugs = {
+        str(spec.get("slug") or "").strip()
+        for spec in workflow_specs
+        if isinstance(spec, dict) and spec.get("internal")
+    }
+    (
+        installed_workflows,
+        missing_workflow_bindings,
+        obsolete_workflow_bindings,
+    ) = await _installed_blueprint_workflows(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        source_blueprint_ids=source_blueprint_ids,
+        source_template_ids=source_template_ids,
+        workflow_component_keys=workflow_component_keys,
+        internal_slugs=internal_slugs,
+    )
+
     result["blueprint_fingerprint"] = blueprint_content_fingerprint(
         fingerprint_payload
     )
@@ -883,6 +1022,14 @@ async def plan(
     ).strip()
     installed_unsupported_fingerprint = normalize_blueprint_upgrade_unsupported_fingerprint(
         installed_unsupported_fingerprint, fingerprint_payload,
+    )
+    installed_unsupported_fingerprint = normalize_blueprint_upgrade_unsupported_fingerprint(
+        installed_unsupported_fingerprint,
+        _with_installed_component_versions(
+            fingerprint_payload,
+            installed_components=installed_components,
+            installed_workflows=installed_workflows,
+        ),
     )
     installed_materialized_unsupported_fingerprint = str(
         record.get(MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY) or ""
@@ -929,6 +1076,14 @@ async def plan(
         previous_contract_payload["contract"] = previous_contract
         installed_unsupported_fingerprint = normalize_blueprint_upgrade_unsupported_fingerprint(
             installed_unsupported_fingerprint, previous_contract_payload,
+        )
+        installed_unsupported_fingerprint = normalize_blueprint_upgrade_unsupported_fingerprint(
+            installed_unsupported_fingerprint,
+            _with_installed_component_versions(
+                previous_contract_payload,
+                installed_components=installed_components,
+                installed_workflows=installed_workflows,
+            ),
         )
         current_materialized_comparison_payload = copy.deepcopy(payload)
         current_materialized_contract = dict(
@@ -1019,6 +1174,14 @@ async def plan(
     materialized_unsupported_baseline = normalize_blueprint_upgrade_unsupported_fingerprint(
         materialized_unsupported_baseline, current_materialized_comparison_payload,
     )
+    materialized_unsupported_baseline = normalize_blueprint_upgrade_unsupported_fingerprint(
+        materialized_unsupported_baseline,
+        _with_installed_component_versions(
+            current_materialized_comparison_payload,
+            installed_components=installed_components,
+            installed_workflows=installed_workflows,
+        ),
+    )
     materialized_unsupported_baseline_unknown = bool(
         (
             installed_unsupported_fingerprint
@@ -1068,22 +1231,6 @@ async def plan(
             ),
             "changes": [unsupported_change],
         })
-    embedded = payload.get("embedded") or {}
-    entity_id = workspace.entity_id
-    source_blueprint_ids = _workflow_source_template_ids(
-        record,
-        payload,
-        source_blueprint_id,
-    )
-    from packages.core.blueprints.installer import (
-        blueprint_workflow_installation_source_id,
-    )
-
-    source_template_ids = [
-        blueprint_workflow_installation_source_id(source_id, workspace.id)
-        for source_id in source_blueprint_ids
-    ] + source_blueprint_ids
-
     for kind, specs in (("skill", embedded.get("skills") or []),
                         ("agent", embedded.get("agents") or [])):
         for spec in specs:
@@ -1094,13 +1241,7 @@ async def plan(
                 spec.get("component_id") or spec.get("id") or slug
             ).strip()
 
-            row = await _installed_blueprint_component(
-                db,
-                workspace=workspace,
-                source_blueprint_ids=source_blueprint_ids,
-                kind=kind,
-                spec=spec,
-            )
+            row = installed_components.get((kind, slug))
 
             label = spec.get("display_name") or spec.get("name") or slug
             if row is None:
@@ -1111,7 +1252,11 @@ async def plan(
                 })
                 continue
 
-            patch = content_patch_for(row, _desired_content(kind, spec), _fields_for(kind))
+            patch = _component_upgrade_patch(
+                kind,
+                row,
+                _desired_content(kind, spec),
+            )
             if not patch:
                 action = UpgradeAction.UNCHANGED
             elif _is_workspace_edited(row, applied):
@@ -1131,35 +1276,6 @@ async def plan(
                 "new_content": _preview(patch) if patch else {},
             })
 
-    workflow_specs = ((payload.get("recipe") or {}).get("workflows") or [])
-    workflow_component_keys = {
-        str(spec.get("slug") or "").strip(): str(
-            spec.get("component_id")
-            or spec.get("id")
-            or spec.get("slug")
-            or ""
-        ).strip()
-        for spec in workflow_specs
-        if isinstance(spec, dict)
-    }
-    internal_slugs = {
-        str(spec.get("slug") or "").strip()
-        for spec in workflow_specs
-        if isinstance(spec, dict) and spec.get("internal")
-    }
-    (
-        installed_workflows,
-        missing_workflow_bindings,
-        obsolete_workflow_bindings,
-    ) = await _installed_blueprint_workflows(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace.id,
-        source_blueprint_ids=source_blueprint_ids,
-        source_template_ids=source_template_ids,
-        workflow_component_keys=workflow_component_keys,
-        internal_slugs=internal_slugs,
-    )
     workflow_id_by_key = {
         slug: row.id for slug, row in installed_workflows.items()
     }
@@ -1185,13 +1301,13 @@ async def plan(
             })
             continue
 
-        patch = content_patch_for(
+        patch = _component_upgrade_patch(
+            "workflow",
             row,
             _planned_workflow_content(
                 spec,
                 workflow_id_by_key=workflow_id_by_key,
             ),
-            _fields_for("workflow"),
         )
         binding_missing = slug in missing_workflow_bindings
         binding_remove = slug in obsolete_workflow_bindings
@@ -1889,6 +2005,14 @@ async def apply(
                     )
                 except WorkflowDependencyError as exc:
                     raise BlueprintUpgradeIncompleteError(str(exc)) from exc
+            from packages.core.blueprints.installer import _materialize_workflow_skill_refs
+
+            resolved_spec = copy.deepcopy(resolved_spec)
+            resolved_spec["steps"] = await _materialize_workflow_skill_refs(
+                db, entity_id=workspace.entity_id, workspace_id=workspace.id,
+                user_id=by_user_id, node=resolved_spec.get("steps") or [],
+                allow_install_external=False,
+            )
             desired_workflow = _blueprint_workflow_definition_values(resolved_spec)
 
             async def authorize_existing_workflow(row: WorkflowDefinition) -> None:
@@ -2148,6 +2272,15 @@ async def apply(
             )
             item["id"] = row.id
 
+        if kind == "workflow":
+            from packages.core.blueprints.installer import _materialize_workflow_skill_refs
+
+            spec = copy.deepcopy(spec)
+            spec["steps"] = await _materialize_workflow_skill_refs(
+                db, entity_id=workspace.entity_id, workspace_id=workspace.id,
+                user_id=by_user_id, node=spec.get("steps") or [],
+                allow_install_external=False,
+            )
         try:
             desired_content = _desired_content(
                 kind,
@@ -2156,10 +2289,10 @@ async def apply(
             )
         except WorkflowDependencyError as exc:
             raise BlueprintUpgradeIncompleteError(str(exc)) from exc
-        patch = content_patch_for(
+        patch = _component_upgrade_patch(
+            kind,
             row,
             desired_content,
-            _fields_for(kind),
         )
         binding_missing = bool(
             kind == "workflow" and item.get("binding_missing")
@@ -2225,9 +2358,14 @@ async def apply(
                 }
         for field, value in patch.items():
             setattr(row, field, value)
-        if patch:
+        revision_patch = {
+            field: value
+            for field, value in patch.items()
+            if field in _fields_for(kind)
+        }
+        if revision_patch:
             new_revision = await bump_revision(
-                db, row, patch=patch,
+                db, row, patch=revision_patch,
                 changed_by_kind="user" if by_user_id else "system",
                 changed_by_id=by_user_id,
             )
@@ -2471,6 +2609,18 @@ async def apply(
             "from_materialized_unsupported_fingerprint": record.get(
                 MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY
             ),
+            "from_partial_upgrade_fingerprint_present": (
+                LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY in record
+            ),
+            "from_partial_upgrade_fingerprint": record.get(
+                LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY
+            ),
+            "from_partial_upgrade_version_present": (
+                LAST_PARTIAL_UPGRADE_VERSION_KEY in record
+            ),
+            "from_partial_upgrade_version": record.get(
+                LAST_PARTIAL_UPGRADE_VERSION_KEY
+            ),
             "items": restored,
         }
         if personalization_changed:
@@ -2510,6 +2660,13 @@ async def apply(
         record[MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY] = (
             blueprint_upgrade_unsupported_fingerprint(payload)
         )
+        record.pop(LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY, None)
+        record.pop(LAST_PARTIAL_UPGRADE_VERSION_KEY, None)
+    else:
+        if current_fingerprint:
+            record[LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY] = current_fingerprint
+        if current_version:
+            record[LAST_PARTIAL_UPGRADE_VERSION_KEY] = current_version
     if personalization is not None:
         if personalization:
             settings[PERSONALIZATION_SETTINGS_KEY] = dict(personalization)
@@ -2958,16 +3115,43 @@ async def revert(
         entry = prepared_entry["entry"]
         row = prepared_entry["row"]
         if prepared_entry["type"] == "channel":
+            before = entry.get("before")
+            if row.type == "twilio_voice" and (
+                before is None
+                or any(
+                    getattr(row, field) != before.get(field)
+                    for field in (
+                        "agent_id",
+                        "agent_subscription_id",
+                        "workspace_id",
+                        "type",
+                        "status",
+                    )
+                )
+            ):
+                from packages.core.services.voice.call_sessions import (
+                    cancel_unconnected_call_sessions_for_binding,
+                )
+
+                await cancel_unconnected_call_sessions_for_binding(
+                    db,
+                    channel_config_id=prepared_entry["account"].id,
+                    channel_binding_id=row.id,
+                    reason=(
+                        "Twilio Voice Blueprint binding was reverted before the "
+                        "call connected."
+                    ),
+                )
             if entry.get("before") is None:
                 # Same unbind operation as the channel API: retain the account
                 # and its conversations/logs; remove only this routing row.
                 await db.delete(row)
             else:
                 for field in CHANNEL_BINDING_SNAPSHOT_FIELDS:
-                    setattr(row, field, copy.deepcopy(entry["before"][field]))
+                    setattr(row, field, copy.deepcopy(before[field]))
                 # Undo routing, never undo the repair of a legacy missing owner.
                 row.user_id = prepared_entry["account"].owner_user_id
-                preserve_channel_binding_route_order(row, entry["before"]["updated_at"])
+                preserve_channel_binding_route_order(row, before["updated_at"])
             reverted.append({"kind": "channel", "name": entry.get("name")})
             continue
         if prepared_entry["type"] == "installed_workflow":
@@ -3120,6 +3304,18 @@ async def revert(
         )
     elif "from_materialized_unsupported_fingerprint_present" in point:
         record.pop(MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY, None)
+    if point.get("from_partial_upgrade_fingerprint_present"):
+        record[LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY] = point.get(
+            "from_partial_upgrade_fingerprint"
+        )
+    elif "from_partial_upgrade_fingerprint_present" in point:
+        record.pop(LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY, None)
+    if point.get("from_partial_upgrade_version_present"):
+        record[LAST_PARTIAL_UPGRADE_VERSION_KEY] = point.get(
+            "from_partial_upgrade_version"
+        )
+    elif "from_partial_upgrade_version_present" in point:
+        record.pop(LAST_PARTIAL_UPGRADE_VERSION_KEY, None)
     if "personalization_present" in point:
         if point.get("personalization_present"):
             settings[PERSONALIZATION_SETTINGS_KEY] = copy.deepcopy(

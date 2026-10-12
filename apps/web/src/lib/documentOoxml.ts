@@ -1,12 +1,18 @@
+import { removeZipFolderEntries } from "./ooxmlPackage";
+import { stripInvalidXmlCharacters } from "./xmlText";
+
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const SOURCE_ATTRIBUTE = "data-docx-paragraph-index";
 const SOURCE_EDITABLE_ATTRIBUTE = "data-docx-source-editable";
+const TEXT_BOX_ATTRIBUTE = "data-docx-text-box-index";
+const TEXT_BOX_PARAGRAPH_ATTRIBUTE = "data-docx-text-box-paragraph-index";
 const INSERT_AFTER_ATTRIBUTE = "data-docx-insert-after";
 const PLACEHOLDER_ATTRIBUTE = "data-docx-placeholder";
 const ALT_CHUNK_ATTRIBUTE = "data-docx-alt-chunk-id";
 const BLOCK_SELECTOR = "p,h1,h2,h3,h4,h5,h6,li,div,blockquote,pre,figure,td,th,hr";
 const DIRECT_INLINE_BLOCK_SELECTOR = "a[href],img[src]";
 const WORD_PARAGRAPH_PATTERN = /<w:p(?:\s[^>]*)?\/>|<w:p(?:\s[^>]*)?>[\s\S]*?<\/w:p>/g;
+const WORD_TEXT_BOX_CONTENT_PATTERN = /<w:txbxContent(?:\s[^>]*)?>[\s\S]*?<\/w:txbxContent>/g;
 
 export interface DocumentParagraphSource {
   index: number;
@@ -22,6 +28,8 @@ export interface DocumentParagraphEdits {
   formattedContentReplacements?: Map<number, string>;
   formattedInsertions?: Map<number, string[]>;
   deletions?: Set<number>;
+  textBoxReplacements?: Map<string, string>;
+  textBoxFormattedContentReplacements?: Map<string, string>;
 }
 
 export class DocumentPreservationError extends Error {
@@ -43,7 +51,7 @@ function decodeXmlText(value: string): string {
 }
 
 function escapeXmlText(value: string): string {
-  return value
+  return stripInvalidXmlCharacters(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -73,18 +81,39 @@ function paragraphIsEditable(paragraphXml: string): boolean {
   return !/<w:(?:fldChar|instrText|drawing|object|pict|altChunk|ins|del|moveFrom|moveTo)\b/i.test(paragraphXml);
 }
 
+interface IsolatedWordTextBoxes {
+  contents: string[];
+  masked: string;
+}
+
+function isolateWordTextBoxes(xml: string): IsolatedWordTextBoxes {
+  const contents: string[] = [];
+  const masked = xml.replace(WORD_TEXT_BOX_CONTENT_PATTERN, (content) => {
+    const index = contents.push(content) - 1;
+    return `<w:txbxContent data-manor-text-box-token="${index}"/>`;
+  });
+  return { contents, masked };
+}
+
+function restoreWordTextBoxes(xml: string, contents: string[]): string {
+  return xml.replace(/<w:txbxContent data-manor-text-box-token="(\d+)"\/>/g, (_token, rawIndex: string) => (
+    contents[Number(rawIndex)] || "<w:txbxContent/>"
+  ));
+}
+
 export async function extractDocumentParagraphSources(buffer: ArrayBuffer): Promise<DocumentParagraphSource[]> {
   const JSZip = (await import("jszip")).default;
   const zip = await JSZip.loadAsync(buffer);
   const documentEntry = zip.file("word/document.xml");
   if (!documentEntry) throw new DocumentPreservationError("The DOCX package has no word/document.xml part.");
   const documentXml = await documentEntry.async("text");
+  const isolated = isolateWordTextBoxes(documentXml);
   let revisionBlockDepth = 0;
   let cursor = 0;
-  return Array.from(documentXml.matchAll(WORD_PARAGRAPH_PATTERN)).map((match, index) => {
+  return Array.from(isolated.masked.matchAll(WORD_PARAGRAPH_PATTERN)).map((match, index) => {
     const paragraphXml = match[0];
     const paragraphStart = match.index || 0;
-    for (const revision of documentXml.slice(cursor, paragraphStart).matchAll(/<w:(?:ins|del|moveFrom|moveTo)\b[^>]*>|<\/w:(?:ins|del|moveFrom|moveTo)>/g)) {
+    for (const revision of isolated.masked.slice(cursor, paragraphStart).matchAll(/<w:(?:ins|del|moveFrom|moveTo)\b[^>]*>|<\/w:(?:ins|del|moveFrom|moveTo)>/g)) {
       if (revision[0].startsWith("</")) revisionBlockDepth = Math.max(0, revisionBlockDepth - 1);
       else if (!/\/\s*>$/.test(revision[0])) revisionBlockDepth += 1;
     }
@@ -100,9 +129,17 @@ export async function extractDocumentParagraphSources(buffer: ArrayBuffer): Prom
 
 function leafBlocks(root: ParentNode): HTMLElement[] {
   return Array.from(root.querySelectorAll<HTMLElement>(`${BLOCK_SELECTOR},${DIRECT_INLINE_BLOCK_SELECTOR}`)).filter((element) => {
+    if (element.closest(".manor-docx-text-box")) return false;
+    if (element.hasAttribute(SOURCE_ATTRIBUTE)) return true;
     if (element.parentElement === root && element.matches(DIRECT_INLINE_BLOCK_SELECTOR)) return true;
     return element.matches(BLOCK_SELECTOR) && !element.querySelector(BLOCK_SELECTOR);
   });
+}
+
+function textBoxParagraphBlocks(root: ParentNode): HTMLElement[] {
+  return Array.from(root.querySelectorAll<HTMLElement>(
+    `[${TEXT_BOX_ATTRIBUTE}][${TEXT_BOX_PARAGRAPH_ATTRIBUTE}]`,
+  ));
 }
 
 export function matchDocumentParagraphSourceIndexes(
@@ -212,6 +249,26 @@ export function recoverDocumentParagraphSourceIndexes(
   return recovered;
 }
 
+export function repeatedDocumentSourceInsertionIndexes(
+  editedSourceIndexes: Array<number | null>,
+  baselineSourceIndexes: Iterable<number>,
+): number[] {
+  const validSources = new Set(baselineSourceIndexes);
+  const seenSources = new Set<number>();
+  const insertionIndexes: number[] = [];
+  let previousSource: number | null = null;
+  editedSourceIndexes.forEach((source, index) => {
+    if (source == null || !validSources.has(source)) {
+      previousSource = null;
+      return;
+    }
+    if (seenSources.has(source) && previousSource === source) insertionIndexes.push(index);
+    else seenSources.add(source);
+    previousSource = source;
+  });
+  return insertionIndexes;
+}
+
 function carryDocumentSourceAnnotations(baselineHtml: string, editedHtml: string): string {
   const baseline = parseAnnotatedHtml(baselineHtml);
   const edited = parseAnnotatedHtml(editedHtml);
@@ -225,6 +282,17 @@ function carryDocumentSourceAnnotations(baselineHtml: string, editedHtml: string
     const source = sourceIndex(block);
     return source == null ? [] : [[source, block] as const];
   }));
+  for (const index of repeatedDocumentSourceInsertionIndexes(
+    edited.blocks.map(sourceIndex),
+    baselineBySource.keys(),
+  )) {
+    const editedBlock = edited.blocks[index];
+    const source = sourceIndex(editedBlock);
+    if (source == null) continue;
+    editedBlock.removeAttribute(SOURCE_ATTRIBUTE);
+    editedBlock.removeAttribute(SOURCE_EDITABLE_ATTRIBUTE);
+    editedBlock.setAttribute(INSERT_AFTER_ATTRIBUTE, String(source));
+  }
   const recovered = recoverDocumentParagraphSourceIndexes(
     baseline.blocks.map((block) => ({ sourceIndex: sourceIndex(block), tagName: block.tagName })),
     edited.blocks.map((block) => ({ sourceIndex: sourceIndex(block), tagName: block.tagName })),
@@ -273,6 +341,7 @@ function blockShellSignature(element: HTMLElement): string {
 function editableBlockText(element: HTMLElement): string {
   if (element.matches(".doc-editor-page-break,[data-docx-page-break='true']")) return "\n";
   const clone = element.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll(".manor-docx-text-box").forEach((textBox) => textBox.remove());
   clone.querySelectorAll("br").forEach((lineBreak) => {
     lineBreak.replaceWith(lineBreak.hasAttribute(PLACEHOLDER_ATTRIBUTE) ? "" : "\n");
   });
@@ -281,6 +350,7 @@ function editableBlockText(element: HTMLElement): string {
 
 function documentStructureSignature(root: HTMLElement): string {
   const clone = root.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll(".manor-docx-text-box").forEach((textBox) => textBox.replaceChildren());
   leafBlocks(clone).forEach((block) => {
     if (block.hasAttribute(SOURCE_ATTRIBUTE) || block.hasAttribute(INSERT_AFTER_ATTRIBUTE)) block.remove();
   });
@@ -291,6 +361,80 @@ function documentStructureSignature(root: HTMLElement): string {
     node = walker.nextNode();
   }
   return clone.innerHTML;
+}
+
+function bodyBlockHtml(element: HTMLElement): string {
+  const clone = element.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll(".manor-docx-text-box").forEach((textBox) => textBox.replaceChildren());
+  return clone.innerHTML;
+}
+
+function documentBodyMergeSignature(element: HTMLElement): string {
+  const clone = element.cloneNode(true) as HTMLElement;
+  clone.querySelectorAll(".manor-docx-text-box").forEach((textBox) => textBox.replaceChildren());
+  return clone.outerHTML;
+}
+
+function documentBodyMergeEquivalent(baseline: HTMLElement, edited: HTMLElement): boolean {
+  if (documentBodyMergeSignature(baseline) === documentBodyMergeSignature(edited)) return true;
+  return Boolean(
+    baseline.querySelector(".manor-docx-text-box")
+    && edited.querySelector(".manor-docx-text-box"),
+  );
+}
+
+function textBoxParagraphKey(element: HTMLElement): string | null {
+  const textBoxIndex = Number(element.getAttribute(TEXT_BOX_ATTRIBUTE));
+  const paragraphIndex = Number(element.getAttribute(TEXT_BOX_PARAGRAPH_ATTRIBUTE));
+  return Number.isInteger(textBoxIndex) && textBoxIndex >= 0
+    && Number.isInteger(paragraphIndex) && paragraphIndex >= 0
+    ? `${textBoxIndex}:${paragraphIndex}`
+    : null;
+}
+
+function collectDocumentTextBoxEdits(
+  baselineRoot: HTMLElement,
+  editedRoot: HTMLElement,
+  context: DocumentSerializationContext = EMPTY_DOCUMENT_CONTEXT,
+): Pick<DocumentParagraphEdits, "textBoxReplacements" | "textBoxFormattedContentReplacements"> {
+  const baselineTextBoxBlocks = textBoxParagraphBlocks(baselineRoot);
+  const editedTextBoxBlocks = textBoxParagraphBlocks(editedRoot);
+  const baselineTextBoxKeys = baselineTextBoxBlocks.map(textBoxParagraphKey);
+  const editedTextBoxKeys = editedTextBoxBlocks.map(textBoxParagraphKey);
+  if (
+    baselineTextBoxKeys.some((key) => key == null)
+    || editedTextBoxKeys.some((key) => key == null)
+    || new Set(baselineTextBoxKeys).size !== baselineTextBoxKeys.length
+    || baselineTextBoxKeys.length !== editedTextBoxKeys.length
+    || baselineTextBoxKeys.some((key, index) => key !== editedTextBoxKeys[index])
+  ) {
+    throw new DocumentPreservationError("Changing Word text-box paragraph structure is not supported in the browser yet.");
+  }
+  const textBoxReplacements = new Map<string, string>();
+  const textBoxFormattedContentReplacements = new Map<string, string>();
+  baselineTextBoxBlocks.forEach((baselineBlock, index) => {
+    const editedBlock = editedTextBoxBlocks[index];
+    const key = baselineTextBoxKeys[index];
+    if (!key || baselineBlock.innerHTML === editedBlock.innerHTML) return;
+    if (baselineBlock.getAttribute(SOURCE_EDITABLE_ATTRIBUTE) === "false") {
+      throw new DocumentPreservationError("This Word text-box paragraph cannot be edited safely.");
+    }
+    const baselineText = editableBlockText(baselineBlock);
+    const editedText = editableBlockText(editedBlock);
+    if (
+      baselineText !== editedText
+      && baselineBlock.tagName === editedBlock.tagName
+      && markupSignature(baselineBlock) === markupSignature(editedBlock)
+    ) {
+      textBoxReplacements.set(key, editedText);
+      return;
+    }
+    if (baselineBlock.tagName !== editedBlock.tagName) {
+      throw new DocumentPreservationError("Changing this Word text-box paragraph structure is not supported yet.");
+    }
+    textBoxFormattedContentReplacements.set(key, documentParagraphXml(editedBlock, "", context));
+  });
+  return { textBoxReplacements, textBoxFormattedContentReplacements };
 }
 
 export function collectDocumentParagraphEdits(baselineHtml: string, editedHtml: string): DocumentParagraphEdits {
@@ -344,9 +488,14 @@ export function collectDocumentParagraphEdits(baselineHtml: string, editedHtml: 
       deletions.add(index);
       continue;
     }
-    if (baselineBlock.innerHTML !== editedBlock.innerHTML) {
+    if (bodyBlockHtml(baselineBlock) !== bodyBlockHtml(editedBlock)) {
       const baselineText = editableBlockText(baselineBlock);
       const editedText = editableBlockText(editedBlock);
+      if (
+        baselineText === editedText
+        && baselineBlock.querySelector(".manor-docx-text-box")
+        && editedBlock.querySelector(".manor-docx-text-box")
+      ) continue;
       if (
         baselineText !== editedText
         && baselineBlock.getAttribute(SOURCE_EDITABLE_ATTRIBUTE) !== "false"
@@ -375,6 +524,8 @@ export function collectDocumentParagraphEdits(baselineHtml: string, editedHtml: 
       throw new DocumentPreservationError("This Word object cannot be edited safely yet.");
     }
   }
+
+  const textBoxEdits = collectDocumentTextBoxEdits(baseline.root, edited.root);
 
   const insertions = new Map<number, string[]>();
   const formattedInsertions = new Map<number, string[]>();
@@ -407,6 +558,7 @@ export function collectDocumentParagraphEdits(baselineHtml: string, editedHtml: 
     formattedContentReplacements,
     formattedInsertions,
     deletions,
+    ...textBoxEdits,
   };
 }
 
@@ -559,8 +711,86 @@ function patchParagraphFormatting(sourceParagraphXml: string, replacementParagra
 
 function normalizedDocumentEdits(edits: Map<number, string> | DocumentParagraphEdits): DocumentParagraphEdits {
   return edits instanceof Map
-    ? { replacements: edits, insertions: new Map(), formattedReplacements: new Map(), formattedContentReplacements: new Map(), formattedInsertions: new Map(), deletions: new Set() }
+    ? {
+      replacements: edits,
+      insertions: new Map(),
+      formattedReplacements: new Map(),
+      formattedContentReplacements: new Map(),
+      formattedInsertions: new Map(),
+      deletions: new Set(),
+      textBoxReplacements: new Map(),
+      textBoxFormattedContentReplacements: new Map(),
+    }
     : edits;
+}
+
+interface XmlRange {
+  end: number;
+  start: number;
+}
+
+function directWordParagraphRanges(containerXml: string): XmlRange[] {
+  const openingEnd = containerXml.indexOf(">");
+  const closingStart = containerXml.lastIndexOf("</w:txbxContent>");
+  if (openingEnd < 0 || closingStart < openingEnd) return [];
+  const ranges: XmlRange[] = [];
+  const tokenPattern = /<(\/?)(([A-Za-z_][\w.-]*):)?([\w.-]+)(?:\s[^<>]*?)?(\/?)>/g;
+  tokenPattern.lastIndex = openingEnd + 1;
+  let depth = 0;
+  let paragraphStart: number | null = null;
+  let match = tokenPattern.exec(containerXml);
+  while (match && match.index < closingStart) {
+    const closing = match[1] === "/";
+    const qualifiedName = `${match[3] ? `${match[3]}:` : ""}${match[4]}`;
+    const selfClosing = match[5] === "/";
+    if (closing) {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0 && paragraphStart != null && qualifiedName === "w:p") {
+        ranges.push({ start: paragraphStart, end: tokenPattern.lastIndex });
+        paragraphStart = null;
+      }
+    } else if (selfClosing) {
+      if (depth === 0 && qualifiedName === "w:p") {
+        ranges.push({ start: match.index, end: tokenPattern.lastIndex });
+      }
+    } else {
+      if (depth === 0 && qualifiedName === "w:p") paragraphStart = match.index;
+      depth += 1;
+    }
+    match = tokenPattern.exec(containerXml);
+  }
+  return ranges;
+}
+
+function patchWordTextBoxContents(
+  contents: string[],
+  edits: Pick<DocumentParagraphEdits, "textBoxReplacements" | "textBoxFormattedContentReplacements">,
+): string[] {
+  const textReplacements = edits.textBoxReplacements || new Map<string, string>();
+  const formattedReplacements = edits.textBoxFormattedContentReplacements || new Map<string, string>();
+  const found = new Set<string>();
+  const patched = contents.map((content, textBoxIndex) => {
+    let result = content;
+    const ranges = directWordParagraphRanges(content);
+    for (let paragraphIndex = ranges.length - 1; paragraphIndex >= 0; paragraphIndex -= 1) {
+      const key = `${textBoxIndex}:${paragraphIndex}`;
+      const replacement = textReplacements.get(key);
+      const formattedReplacement = formattedReplacements.get(key);
+      if (replacement == null && formattedReplacement == null) continue;
+      found.add(key);
+      const range = ranges[paragraphIndex];
+      const paragraph = result.slice(range.start, range.end);
+      const next = formattedReplacement == null
+        ? patchParagraphText(paragraph, replacement || "")
+        : patchParagraphFormatting(paragraph, formattedReplacement);
+      result = `${result.slice(0, range.start)}${next}${result.slice(range.end)}`;
+    }
+    return result;
+  });
+  for (const key of [...textReplacements.keys(), ...formattedReplacements.keys()]) {
+    if (!found.has(key)) throw new DocumentPreservationError(`Unable to find source text-box paragraph ${key}.`);
+  }
+  return patched;
 }
 
 export async function preserveDocumentFile(
@@ -574,8 +804,10 @@ export async function preserveDocumentFile(
   if (!documentEntry) throw new DocumentPreservationError("The DOCX package has no word/document.xml part.");
   const documentXml = await documentEntry.async("text");
   const normalizedEdits = normalizedDocumentEdits(edits);
+  const isolated = isolateWordTextBoxes(documentXml);
+  const textBoxContents = patchWordTextBoxContents(isolated.contents, normalizedEdits);
   let paragraphIndex = 0;
-  const patchedXml = documentXml.replace(WORD_PARAGRAPH_PATTERN, (paragraph) => {
+  const patchedBodyXml = isolated.masked.replace(WORD_PARAGRAPH_PATTERN, (paragraph) => {
     const sourceIndex = paragraphIndex++;
     if (normalizedEdits.deletions?.has(sourceIndex)) {
       const insertedParagraphs = normalizedEdits.insertions.get(sourceIndex) || [];
@@ -604,11 +836,12 @@ export async function preserveDocumentFile(
   ]) {
     if (index < 0 || index >= paragraphIndex) throw new DocumentPreservationError(`Unable to find source paragraph ${index}.`);
   }
+  const patchedXml = restoreWordTextBoxes(patchedBodyXml, textBoxContents);
   const validPatchedXml = patchedXml.replace(/<w:tc(\s[^>]*)?>([\s\S]*?)<\/w:tc>/g, (cell, attributes = "", content = "") => (
     /<w:p(?:\s|\/|>)/.test(content) ? cell : `<w:tc${attributes}>${content}<w:p/></w:tc>`
   ));
   zip.file("word/document.xml", validPatchedXml);
-  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", mimeType: DOCX_MIME });
+  const blob = await removeZipFolderEntries(zip).generateAsync({ type: "blob", compression: "DEFLATE", mimeType: DOCX_MIME });
   const safeName = fileName.toLowerCase().endsWith(".docx") ? fileName : `${fileName.replace(/\.doc$/i, "")}.docx`;
   return new File([blob], safeName, { type: DOCX_MIME, lastModified: Date.now() });
 }
@@ -1590,7 +1823,13 @@ function patchMappedParagraphsBeforeStructuralMerge(
     const sourceIndex = paragraphIndex++;
     const baselineBlock = baselineBySource.get(sourceIndex);
     const editedBlock = editedBySource.get(sourceIndex);
-    if (!baselineBlock || !editedBlock || baselineBlock.outerHTML === editedBlock.outerHTML) return paragraphXml;
+    if (!baselineBlock || !editedBlock
+      || documentBodyMergeSignature(baselineBlock) === documentBodyMergeSignature(editedBlock)
+      || (
+        baselineBlock.querySelector(".manor-docx-text-box")
+        && editedBlock.querySelector(".manor-docx-text-box")
+        && editableBlockText(baselineBlock) === editableBlockText(editedBlock)
+      )) return paragraphXml;
     const baselineText = editableBlockText(baselineBlock);
     const editedText = editableBlockText(editedBlock);
     if (
@@ -1696,7 +1935,8 @@ function mergeDocumentBodyXml(
     const orderedEditedXml = edited.flatMap((item) => {
       if (item.unitIndexes.length > 0) {
         const baselineItem = baselineByUnits.get(keyFor(item.unitIndexes));
-        return [baselineItem?.element.outerHTML === item.element.outerHTML
+        return [baselineItem
+          && documentBodyMergeEquivalent(baselineItem.element, item.element)
           ? item.unitIndexes.map((unitIndex) => body.units[unitIndex].xml).join("")
           : serializeItem(item, baselineItem)];
       }
@@ -1721,7 +1961,7 @@ function mergeDocumentBodyXml(
   for (const item of edited) {
     if (item.unitIndexes.length === 0) continue;
     const baselineItem = baselineByUnits.get(keyFor(item.unitIndexes));
-    if (baselineItem?.element.outerHTML === item.element.outerHTML) continue;
+    if (baselineItem && documentBodyMergeEquivalent(baselineItem.element, item.element)) continue;
     const firstUnit = item.unitIndexes[0];
     replacements.set(firstUnit, serializeItem(item, baselineItem));
     item.unitIndexes.forEach((unitIndex) => consumed.add(unitIndex));
@@ -1829,13 +2069,21 @@ async function rebuildDocumentBodyInPackage(
   const relationshipsXml = await zip.file("word/_rels/document.xml.rels")?.async("text") || EMPTY_DOCUMENT_RELATIONSHIPS;
   const contentTypesXml = await zip.file("[Content_Types].xml")?.async("text") || BASIC_DOCUMENT_CONTENT_TYPES;
   const resources = await prepareDocumentResources(zip, html, relationshipsXml, contentTypesXml);
-  const patchedDocumentXml = patchMappedParagraphsBeforeStructuralMerge(
-    documentXml,
+  const baseline = parseAnnotatedHtml(baselineHtml);
+  const edited = parseAnnotatedHtml(html);
+  const textBoxEdits = collectDocumentTextBoxEdits(baseline.root, edited.root, resources.context);
+  const isolated = isolateWordTextBoxes(documentXml);
+  const patchedTextBoxContents = patchWordTextBoxContents(isolated.contents, textBoxEdits);
+  const patchedMaskedDocumentXml = patchMappedParagraphsBeforeStructuralMerge(
+    isolated.masked,
     baselineHtml,
     html,
     resources.context,
   );
-  const nextDocumentXml = mergeDocumentBodyXml(patchedDocumentXml, baselineHtml, html, resources.context);
+  const mergedMaskedDocumentXml = mergeDocumentBodyXml(
+    patchedMaskedDocumentXml, baselineHtml, html, resources.context,
+  );
+  const nextDocumentXml = restoreWordTextBoxes(mergedMaskedDocumentXml, patchedTextBoxContents);
   const nextRelationshipsXml = pruneUnusedGeneratedDocumentResources(
     zip,
     nextDocumentXml,
@@ -1844,7 +2092,7 @@ async function rebuildDocumentBodyInPackage(
   zip.file("word/document.xml", nextDocumentXml);
   zip.file("word/_rels/document.xml.rels", nextRelationshipsXml);
   zip.file("[Content_Types].xml", resources.contentTypesXml);
-  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", mimeType: DOCX_MIME });
+  const blob = await removeZipFolderEntries(zip).generateAsync({ type: "blob", compression: "DEFLATE", mimeType: DOCX_MIME });
   const safeName = fileName.toLowerCase().endsWith(".docx") ? fileName : `${fileName.replace(/\.(?:doc|wps)$/i, "")}.docx`;
   return new File([blob], safeName, { type: DOCX_MIME, lastModified: Date.now() });
 }
@@ -1869,15 +2117,25 @@ export async function editDocumentFile(
   try {
     const baseline = parseAnnotatedHtml(currentBaselineHtml);
     const edited = parseAnnotatedHtml(currentEditedHtml);
-    const resourceSignature = (root: HTMLElement) => Array.from(root.querySelectorAll<HTMLElement>("a[href],img[src]"))
-      .map((element) => `${element.tagName}:${element.getAttribute(element.tagName.toLowerCase() === "a" ? "href" : "src") || ""}`)
-      .join("\n");
+    const bodyResources = (root: HTMLElement) => Array.from(
+      root.querySelectorAll<HTMLElement>("a[href],img[src]"),
+    ).filter((element) => !element.closest(".manor-docx-text-box"));
+    const resourceKey = (element: HTMLElement) => (
+      `${element.tagName}:${element.getAttribute(element.tagName.toLowerCase() === "a" ? "href" : "src") || ""}`
+    );
+    const resourceSignature = (root: HTMLElement) => bodyResources(root).map(resourceKey).join("\n");
+    const baselineTextBoxResources = new Set(Array.from(
+      baseline.root.querySelectorAll<HTMLElement>(".manor-docx-text-box a[href],.manor-docx-text-box img[src]"),
+    ).map(resourceKey));
+    const addedTextBoxResource = Array.from(
+      edited.root.querySelectorAll<HTMLElement>(".manor-docx-text-box a[href],.manor-docx-text-box img[src]"),
+    ).some((element) => !baselineTextBoxResources.has(resourceKey(element)));
     const baselineBlocks = new Map(baseline.blocks.flatMap((block) => {
       const index = block.getAttribute(SOURCE_ATTRIBUTE);
       return index == null ? [] : [[Number(index), block] as const];
     }));
     const changedResourceBlock = edited.blocks.some((block) => {
-      if (!block.matches(DIRECT_INLINE_BLOCK_SELECTOR) && !block.querySelector(DIRECT_INLINE_BLOCK_SELECTOR)) return false;
+      if (!block.matches(DIRECT_INLINE_BLOCK_SELECTOR) && bodyResources(block).length === 0) return false;
       const index = block.getAttribute(SOURCE_ATTRIBUTE);
       if (index == null) return true;
       const baselineBlock = baselineBlocks.get(Number(index));
@@ -1886,13 +2144,19 @@ export async function editDocumentFile(
         ? baselineBlock.outerHTML !== block.outerHTML
         : baselineBlock.innerHTML !== block.innerHTML;
     });
-    if (resourceSignature(baseline.root) !== resourceSignature(edited.root) || changedResourceBlock) {
+    if (resourceSignature(baseline.root) !== resourceSignature(edited.root)
+      || changedResourceBlock || addedTextBoxResource) {
       return rebuildDocumentBodyInPackage(original, currentBaselineHtml, currentEditedHtml, fileName);
     }
     const edits = collectDocumentParagraphEdits(currentBaselineHtml, currentEditedHtml);
     return await preserveDocumentFile(original, edits, fileName);
   } catch (error) {
     if (!(error instanceof DocumentPreservationError)) throw error;
+    if (currentBaselineHtml.includes("manor-docx-text-box")) {
+      throw new DocumentPreservationError(
+        `Unable to preserve the native Word text box: ${error.message}`,
+      );
+    }
     return rebuildDocumentBodyInPackage(original, currentBaselineHtml, currentEditedHtml, fileName);
   }
 }
@@ -1922,7 +2186,7 @@ export async function buildDocumentFile(html: string, fileName: string): Promise
   zip.file("_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`);
   zip.file("word/document.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>${body}<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr></w:body></w:document>`);
   zip.file("word/_rels/document.xml.rels", resources.relationshipsXml);
-  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", mimeType: DOCX_MIME });
+  const blob = await removeZipFolderEntries(zip).generateAsync({ type: "blob", compression: "DEFLATE", mimeType: DOCX_MIME });
   const safeName = fileName.replace(/\.(?:doc|wps)$/i, ".docx");
   return new File([blob], safeName.toLowerCase().endsWith(".docx") ? safeName : `${safeName}.docx`, {
     type: DOCX_MIME,

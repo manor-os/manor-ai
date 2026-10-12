@@ -9,10 +9,14 @@ from typing import Any
 
 from sqlalchemy import select
 
+from packages.core.i18n import t
 from packages.core.constants.goals import GoalStatus
 from packages.core.constants.review import ReviewSkipReason
-from packages.core.constants.task import TaskLogType, TaskType
+from packages.core.constants.task import TaskLogType, TaskRuntimeKind, TaskType
 from packages.core.ai.runtime.task_actions import runtime_normalize_task_priority
+from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
+from packages.core.ai.runtime.tool_context import runtime_active_user_message_from_context
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 logger = logging.getLogger(__name__)
 
@@ -400,6 +404,9 @@ async def runtime_workspace_create_task_action(
     params: dict[str, Any] | None = None,
 ) -> str:
     raw_params = dict(params or {})
+    # Composite callers also use "instructions" for the Task's output contract.
+    if "instructions" in raw_params and not str(raw_params.get("runtime_instructions") or "").strip():
+        raw_params["runtime_instructions"] = raw_params["instructions"]
     customer_context = _customer_context_from_runtime_tool_kwargs(raw_params)
     creator_user_id = _internal_task_creator_id_from_runtime_tool_kwargs(
         raw_params,
@@ -412,18 +419,17 @@ async def runtime_workspace_create_task_action(
         return _dumps({"error": "workspace_id is required; use this tool only inside workspace chat"})
 
     try:
+        from packages.core.ai.runtime.execution_origin import runtime_origin_task_id
         from packages.core.database import async_session
         from packages.core.services import task_service
         from packages.core.services.workspace_service import record_activity
 
-        dispatch_requested = _truthy(
+        start_requested = _truthy(
             raw_params.get("start")
             if raw_params.get("start") is not None
             else raw_params.get("run_now") or raw_params.get("execute")
         )
         task_type = str(raw_params.get("task_type") or TaskType.GENERAL.value)
-        if task_type == TaskType.INTERACTIVE.value:
-            dispatch_requested = False
         requested_owner = str(
             raw_params.get("owner_service_key") or raw_params.get("service_key") or raw_params.get("agent_type") or ""
         ).strip() or None
@@ -558,19 +564,91 @@ async def runtime_workspace_create_task_action(
                 delegate_service_keys=delegate_service_keys,
                 details=details,
                 deadline=raw_params.get("deadline") or None,
+                # Created from inside a Task run (manual or automatic): link
+                # it to that Task, so it is never an orphan nobody can trace.
+                origin_task_id=runtime_origin_task_id(raw_params, entity_id=entity_id),
             )
+            from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+            from packages.core.services.task_execution_origin import (
+                record_manual_task_execution,
+            )
+
+            call_context = runtime_tool_call_context_from_kwargs(raw_params)
+            envelope = call_context.runtime_envelope
+            envelope_meta = getattr(envelope, "metadata", None) or {}
+            origin_message_id = envelope_meta.get("origin_user_message_id")
+            if (
+                origin_message_id and creator_user_id and conversation_id
+                and getattr(envelope, "entity_id", None) == entity_id
+                and getattr(envelope, "workspace_id", None) == workspace_id
+                and getattr(envelope, "conversation_id", None) == conversation_id
+                and getattr(envelope, "user_id", None) == creator_user_id
+                and getattr(envelope, "surface", None) == "workspace_chat"
+            ):
+                # Never copy a model-supplied details/origin object. This is
+                # provenance, not authorization, and survives a Chat resume.
+                task.details = {**task.details, "execution_origin": {
+                    "kind": "workspace_chat_create", "entity_id": entity_id,
+                    "workspace_id": workspace_id, "user_id": creator_user_id,
+                    "conversation_id": conversation_id,
+                    "origin_user_message_id": str(origin_message_id),
+                }}
+                from packages.core.ledger.event_types import EXECUTION_REQUESTED
+                from packages.core.ledger.service import record_event
+
+                await record_event(
+                    db, entity_id=entity_id, workspace_id=workspace_id,
+                    event_type=EXECUTION_REQUESTED, source_kind="task", source_id=task.id,
+                    idempotency_key=f"chat-task-created:{task.id}",
+                    causation_id=str(origin_message_id), root_execution_id=task.id,
+                    actor_kind="user", actor_id=creator_user_id,
+                    payload=task.details["execution_origin"],
+                )
+            manual_request = await runtime_tool_is_user_requested(
+                db, entity_id=entity_id, workspace_id=workspace_id, kwargs=raw_params,
+            )
+            if creator_user_id and manual_request:
+                record_manual_task_execution(task, user_id=creator_user_id, action="workspace_chat_task")
+            elif not manual_request:
+                task.details = {
+                    **task.details,
+                    "automation_origin": {
+                        "task_id": call_context.task_id,
+                        "workflow_run_id": call_context.workflow_run_id,
+                    },
+                }
             if goal_link_ids:
                 await _link_task_to_goals(db, task_id=task.id, goal_ids=goal_link_ids)
             if dependency_task_ids:
                 from packages.core.services.task_dependencies import details_with_dependency_state
 
                 task.details = await details_with_dependency_state(db, task, dict(task.details or {}))
+            from packages.core.services.task_execution import (
+                resolve_task_execution,
+                stage_task_execution_intent,
+            )
+
+            execution = await resolve_task_execution(db, task) if start_requested else None
+            if (
+                execution is not None
+                and execution.runtime_kind is TaskRuntimeKind.MANUAL
+            ):
+                return _dumps({
+                    "error": "task_executor_unavailable",
+                    "message": "Assign an active workspace Agent before starting this task.",
+                })
+            # Foreground interactive and human-decision adapters share the
+            # factory/lifecycle boundary but are not background dispatches.
+            dispatch_requested = bool(
+                execution is not None and execution.is_dispatchable
+            )
+            log_locale = await task_service._task_log_locale(db, creator_user_id)
             if runtime_context:
                 await task_service.add_task_log(
                     db,
                     task.id,
                     TaskLogType.RUNTIME_CONTEXT,
-                    "Workspace Agent captured task runtime requirements.",
+                    t("task.log.runtime_requirements", locale=log_locale),
                     actor=author_actor,
                     created_by=author_created_by,
                     metadata={"runtime_context": runtime_context, **(author_meta or {})},
@@ -582,7 +660,7 @@ async def runtime_workspace_create_task_action(
                         db,
                         task.id,
                         TaskLogType.DEPENDENCY_WAIT,
-                        "Workspace Agent queued task; predecessor task outputs are not ready yet.",
+                        t("task.log.dependency_wait", locale=log_locale),
                         actor=author_actor,
                         created_by=author_created_by,
                         metadata={
@@ -598,6 +676,7 @@ async def runtime_workspace_create_task_action(
                         task.id,
                         entity_id,
                         user_id=creator_user_id,
+                        manual_execution=manual_request,
                         dispatch_plan=False,
                         status="in_progress",
                         details=dict(task.details or {}),
@@ -605,10 +684,6 @@ async def runtime_workspace_create_task_action(
                     if updated:
                         task = updated
                     dispatch_after_commit = True
-            if task.task_type == TaskType.INTERACTIVE.value:
-                # The conversation is the execution surface. Interactive Tasks
-                # are not dispatched to the background Planner/Runner.
-                dispatch_after_commit = False
             await record_activity(
                 db,
                 workspace_id,
@@ -629,18 +704,16 @@ async def runtime_workspace_create_task_action(
                 user_id=creator_user_id,
                 agent_id=actor_agent_id,
             )
+            if dispatch_after_commit:
+                assert execution is not None
+                await stage_task_execution_intent(db, task, execution)
             await db.commit()
             await db.refresh(task)
 
-        dispatched = False
-        if dispatch_after_commit:
-            try:
-                from packages.core.tasks.ai_tasks import plan_and_run_task
-
-                plan_and_run_task.delay(task.id)
-                dispatched = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("workspace_create_task dispatch failed: task=%s error=%s", task.id, exc)
+        # ``dispatched`` retains the public response vocabulary. It now means
+        # the start was committed to the durable publisher, not that a
+        # process-local broker call happened to return successfully.
+        dispatched = bool(dispatch_after_commit)
 
         return _dumps({
             "created": True,
@@ -784,11 +857,6 @@ async def runtime_workspace_request_strategist_review_action(
     except (TypeError, ValueError):
         countdown = 1
     countdown = max(0, min(countdown, 300))
-    trigger = ReviewTrigger(
-        kind=ReviewTriggerKind.HUMAN_REQUESTED,
-        detail=reason or "requested in chat",
-    )
-
     try:
         from packages.core.database import async_session
         from packages.core.services.workspace_service import record_activity
@@ -803,7 +871,20 @@ async def runtime_workspace_request_strategist_review_action(
             workspace = await _load_workspace(db, entity_id=entity_id, workspace_id=workspace_id)
             if not workspace:
                 return _dumps({"error": "workspace not found"})
-            if workspace.status != "active":
+            human_requested = bool(user_id) and await runtime_tool_is_user_requested(
+                db, entity_id=entity_id, workspace_id=workspace_id, kwargs=raw_params,
+            )
+            if human_requested:
+                active_request = (runtime_active_user_message_from_context(raw_params) or "").strip()
+                if active_request:
+                    reason = active_request[:500]
+            trigger = ReviewTrigger(
+                kind=ReviewTriggerKind.HUMAN_REQUESTED if human_requested else ReviewTriggerKind.EVENT,
+                detail=reason or ("requested in chat" if human_requested else "requested by runtime"),
+            )
+            if not workspace_allows_manual_work(workspace) or (
+                workspace.status == "paused" and not human_requested
+            ):
                 return _dumps({
                     "requested": False,
                     "blocked": True,
@@ -813,14 +894,14 @@ async def runtime_workspace_request_strategist_review_action(
                     "next_step": (
                         "Tell the user the Strategist review did not start because "
                         f"the workspace is {workspace.status}. Do not claim that the "
-                        "review was requested or is running. Ask them to start the "
-                        "workspace first, then request the review again."
+                        "review was requested or is running. Paused workspaces require "
+                        "an explicit user request; unavailable workspaces must be restored first."
                     ),
                 })
 
             open_tasks = await list_open_proposals(db, workspace_id)
             superseded: dict | None = None
-            if open_tasks and not supersede:
+            if open_tasks and (not supersede or not human_requested):
                 # Do NOT enqueue: the review would be blocked on arrival and
                 # the person would never hear back. Hand the conflict to the
                 # model so it can ask, then call again with supersede=true.
@@ -847,7 +928,7 @@ async def runtime_workspace_request_strategist_review_action(
 
             async_result = run_strategist_review.apply_async(
                 args=[workspace_id],
-                kwargs=trigger.celery_kwargs(),
+                kwargs={**trigger.celery_kwargs(), "user_id": user_id},
                 countdown=countdown,
             )
             await record_activity(

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from packages.core.blueprints.report import (
     GoalPace,
     _build_activity,
     _build_cost,
     _dedupe_goal_paces,
+)
+from packages.core.constants.execution import (
+    COORDINATOR_CHILD_PARAM_KEY,
+    COORDINATOR_PARAM_KEY,
+    COORDINATOR_PARENT_STEP_PARAM_KEY,
 )
 from packages.core.models.runtime_learning import RuntimeEvidence
 
@@ -33,6 +39,50 @@ def test_simulation_report_counts_runtime_evidence_when_no_steps_ran() -> None:
     cost = _build_cost([], [evidence], now, now)
     assert cost.total_credits == 120
     assert cost.by_kind_credits == {"strategist_review": 120}
+
+
+def test_simulation_report_cost_excludes_coordinator_child_rollup() -> None:
+    child_usd = 0.10
+    parent_own_usd = 0.15
+    rolled_up_usd = child_usd + parent_own_usd
+    now = datetime.now(timezone.utc)
+    parent = SimpleNamespace(
+        plan_id="plan",
+        step_key="coordinate",
+        finished_at=None,
+        params={COORDINATOR_PARAM_KEY: True},
+        cost={},
+        kind="subagent",
+    )
+    child = SimpleNamespace(
+        plan_id="plan",
+        step_key="coordinate__child",
+        finished_at=now,
+        params={
+            COORDINATOR_CHILD_PARAM_KEY: True,
+            COORDINATOR_PARENT_STEP_PARAM_KEY: parent.step_key,
+        },
+        cost={"usd": child_usd},
+        kind="subagent",
+    )
+    steps = [
+        parent,
+        child,
+    ]
+
+    while_parent_running = _build_cost(steps, [], now, now)
+
+    assert while_parent_running.total_usd == child_usd
+
+    parent.finished_at = now
+    parent.cost = {"usd": rolled_up_usd}
+    after_parent_rollup = _build_cost(steps, [], now, now)
+
+    assert after_parent_rollup.total_usd == rolled_up_usd
+    assert (
+        sum(after_parent_rollup.by_kind_credits.values())
+        == after_parent_rollup.total_credits
+    )
 
 
 def test_simulation_report_dedupes_duplicate_goal_rows_by_title() -> None:

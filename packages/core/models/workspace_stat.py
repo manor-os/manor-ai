@@ -39,7 +39,7 @@ class WorkspaceStat(Base, TimestampMixin):
     unit: Mapped[Optional[str]] = mapped_column(String(40))
     window: Mapped[str] = mapped_column(String(40), nullable=False, default="rolling_7d")
 
-    # manual | workspace_internal | integration
+    # manual | workspace_internal | integration | agent_review
     collector_type: Mapped[str] = mapped_column(String(32), nullable=False)
     collector_config: Mapped[dict] = mapped_column(JSONB, nullable=False, server_default="{}")
     collection_cadence: Mapped[Optional[str]] = mapped_column(String(64))
@@ -55,6 +55,7 @@ class WorkspaceStat(Base, TimestampMixin):
     current_value_updated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     last_collection_status: Mapped[Optional[str]] = mapped_column(String(24))
     last_collection_error: Mapped[Optional[str]] = mapped_column(Text)
+    last_assessment: Mapped[Optional[dict]] = mapped_column(JSONB)
 
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
@@ -78,7 +79,9 @@ class WorkspaceStatObservation(Base):
     stat_id: Mapped[str] = mapped_column(String(26), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     workspace_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    value: Mapped[Decimal] = mapped_column(Numeric(24, 6), nullable=False)
+    # NULL is an assessed unknown, never numeric zero. Its evidence explains
+    # what could not be verified; it must not overwrite the last known value.
+    value: Mapped[Optional[Decimal]] = mapped_column(Numeric(24, 6), nullable=True)
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     window_start: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     window_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))

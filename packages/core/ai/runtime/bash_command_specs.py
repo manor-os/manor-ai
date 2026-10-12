@@ -8,6 +8,13 @@ import re
 class BashCommandSpecFactory:
     """Create deterministic permission facts for supported shell syntax."""
 
+    LOCAL_ONLY_COMMANDS = frozenset({
+        "mkdir", "cp", "mv", "touch", "chmod", "rm",
+        "ls", "cat", "head", "tail", "find", "tree", "file", "wc",
+        "grep", "rg", "sort", "uniq", "cut", "tr", "diff",
+        "echo", "date", "pwd", "which", "whoami",
+    })
+
     WRITE_REDIRECTION_PATTERN = re.compile(r"(?<![<>=])(?:\d*>>|\d*>\|?)\s*([^\s;&|]+)")
 
     @classmethod

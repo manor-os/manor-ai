@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 from packages.core.ai.runtime.tool_context import runtime_injected_tool_context_args
+from packages.core.database_runtime import release_read_transaction
 
 
 _TASK_PRIORITY_LABELS = {
@@ -115,26 +116,25 @@ _TASK_CREATE_ALLOWED_FIELDS = frozenset({
 _WORKSPACE_UPDATE_ALLOWED_FIELDS = frozenset({
     "address",
     "attribute_tags",
-    "auto_pause_on_budget",
     "category",
     "cover_image_url",
     "description",
-    "heartbeat_cadence",
-    "heartbeat_enabled",
     "identity_label",
     "kind",
     "latitude",
     "longitude",
-    "monthly_budget_usd",
     "name",
     "occupancy_status",
     "operating_context",
-    "operating_model",
     "pms_property_id",
     "pms_unit_id",
     "primary_work",
     "property_type",
     "status",
+})
+_WORKSPACE_REVIEWED_UPDATE_FIELDS = frozenset({
+    "operating_model", "monthly_budget_usd",
+    "auto_pause_on_budget", "heartbeat_enabled", "heartbeat_cadence",
 })
 _CLIENT_FIELDS = frozenset({
     "address",
@@ -240,6 +240,15 @@ def _looks_like_local_id(value: str) -> bool:
 
 def _runtime_truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_string_list(value: Any) -> list[str]:
+    if value in (None, ""):
+        return []
+    values = [value] if isinstance(value, str) else value
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        return []
+    return [str(item).strip() for item in values if str(item).strip()]
 
 
 def _runtime_bounded_int(value: Any, default: int, maximum: int, minimum: int = 0) -> int:
@@ -443,6 +452,7 @@ async def _runtime_validate_document_folder_position(
     *,
     name: str,
     parent_id: str | None = None,
+    owner_id: str | None = None,
     folder_id: str | None = None,
 ) -> tuple[str, list[Any], dict[str, Any]]:
     from packages.core.services.knowledge_visibility import is_user_visible_folder_path
@@ -479,6 +489,7 @@ async def _runtime_validate_document_folder_position(
             folder for folder in folders
             if folder.parent_id == parent_id
             and folder.name == clean_name
+            and folder.owner_id == owner_id
             and folder.id != folder_id
         ),
         None,
@@ -496,12 +507,68 @@ def _runtime_split_document_folder_path(name: str) -> list[str]:
     ]
 
 
+async def _runtime_user_can_manage_folder(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    folder: Any,
+    capabilities: set[str],
+) -> bool:
+    """Authorize a user-scoped Runtime Manor folder mutation."""
+    if not user_id:
+        return True
+    from packages.core.services.document_access import DocumentAccessContext
+
+    access = await DocumentAccessContext.load(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        folder_ids={str(folder.id)},
+    )
+    if not await access.folder_path_readable(db, str(folder.id)):
+        return False
+    if access.can_manage_all_documents or folder.owner_id == user_id:
+        return True
+    return bool(access.folder_capabilities(str(folder.id)).intersection(capabilities))
+
+
+async def _runtime_user_can_read_workspace(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    workspace_id: str,
+    runtime_workspace_id: str | None = None,
+) -> bool:
+    if not user_id:
+        return bool(
+            runtime_workspace_id
+            and str(workspace_id) == str(runtime_workspace_id)
+        )
+    from packages.core.permissions import resolve_effective_user_role_name
+    from packages.core.services.workspace_access import user_can_read_workspace_id
+
+    role = await resolve_effective_user_role_name(
+        db, user_id=user_id, entity_id=entity_id,
+    )
+
+    return await user_can_read_workspace_id(
+        db,
+        workspace_id=workspace_id,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=role,
+    )
+
+
 async def _runtime_create_document_folder_path(
     db: Any,
     entity_id: str,
     *,
     name: str,
     parent_id: str | None = None,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import DocumentFolder
@@ -519,14 +586,36 @@ async def _runtime_create_document_folder_path(
 
     for part in parts:
         folders, folder_by_id = await _runtime_load_document_folders(db, entity_id)
+        parent = folder_by_id.get(current_parent_id) if current_parent_id else None
+        if parent is not None and not await _runtime_user_can_manage_folder(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            folder=parent,
+            capabilities={"upload_to", "edit"},
+        ):
+            raise LookupError("Parent folder not found or is not writable")
         existing = next(
             (
                 folder for folder in folders
-                if folder.parent_id == current_parent_id and folder.name == part
+                if folder.parent_id == current_parent_id
+                and folder.name == part
+                and folder.owner_id == user_id
             ),
             None,
         )
         if existing:
+            if user_id:
+                from packages.core.services.document_access import user_can_read_folder_path
+
+                if not await user_can_read_folder_path(
+                    db,
+                    entity_id=entity_id,
+                    folder_id=existing.id,
+                    user_id=user_id,
+                    role=None,
+                ):
+                    raise LookupError("Folder already exists but is not available")
             leaf = existing
             current_parent_id = existing.id
             continue
@@ -536,12 +625,15 @@ async def _runtime_create_document_folder_path(
             entity_id,
             name=part,
             parent_id=current_parent_id,
+            owner_id=user_id,
         )
         folder = DocumentFolder(
             id=generate_ulid(),
             entity_id=entity_id,
             name=clean_name,
             parent_id=current_parent_id,
+            owner_id=user_id,
+            visibility="private",
         )
         db.add(folder)
         await db.flush()
@@ -772,7 +864,7 @@ async def _resolve_task_assignment(
     return {}, {}, {
         "error": "assignee_not_found",
         "message": (
-            "Could not resolve the assignee. Use list_staff/list_users/list_agents, "
+            "Could not resolve the assignee. Use list_staff/list_agents, "
             "then pass assignee_id, staff_id, user_id, agent_id, assignee_email, or assignee_name."
         ),
         "lookup": lookup.search_text,
@@ -789,12 +881,14 @@ def _is_task_update_clear_value(value: Any) -> bool:
 
 
 def _merge_task_details_for_update(existing_details: Any, detail_patch: Any) -> dict[str, Any]:
+    from packages.core.services.task_execution_origin import TASK_EXECUTION_ORIGIN_KEYS
+
     merged = dict(existing_details or {})
     if detail_patch is None:
         return merged
     if not isinstance(detail_patch, dict):
         raise ValueError("details must be an object")
-    merged.update(detail_patch)
+    merged.update({key: value for key, value in detail_patch.items() if key not in TASK_EXECUTION_ORIGIN_KEYS})
     return merged
 
 
@@ -963,11 +1057,17 @@ async def runtime_manor_list_tasks(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """List tasks via the Runtime Manor task boundary."""
 
     from packages.core.services.task_service import list_tasks
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
+
+    if not user_id and not workspace_id:
+        return json.dumps({"error": "user or Workspace context is required"})
 
     raw_params = dict(params or {})
     assignee_email = (
@@ -1000,14 +1100,30 @@ async def runtime_manor_list_tasks(
         ).isoformat()
 
     allowed_filters = {
+        "query",
         "status",
+        "statuses",
         "workspace_id",
+        "workspace_ids",
+        "category_id",
+        "category_ids",
         "assignee_id",
+        "assignee_ids",
+        "task_type",
+        "task_types",
+        "priority",
+        "priorities",
+        "priority_min",
+        "priority_max",
+        "created_after",
+        "created_before",
+        "updated_after",
+        "updated_before",
         "completed_after",
         "completed_before",
+        "deadline_after",
+        "deadline_before",
         "parent_task_id",
-        "limit",
-        "offset",
         "include_automations",
     }
     service_params = {
@@ -1015,10 +1131,42 @@ async def runtime_manor_list_tasks(
         for key, value in raw_params.items()
         if key in allowed_filters and value not in (None, "", [], ())
     }
+    try:
+        limit = max(1, min(int(raw_params.get("limit") or 50), 100))
+        offset = max(0, int(raw_params.get("offset") or 0))
+    except (TypeError, ValueError):
+        return json.dumps({
+            "error": "invalid_task_filters",
+            "message": "limit and offset must be integers",
+        })
+    service_params.update({"limit": limit, "offset": offset})
+    service_params["readable_workspace_ids"] = (
+        await readable_workspace_ids_for_user(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=None,
+        )
+        if user_id
+        else {str(workspace_id)}
+    )
 
-    tasks, total = await list_tasks(db, entity_id, **service_params)
+    try:
+        tasks, total = await list_tasks(db, entity_id, **service_params)
+    except (TypeError, ValueError) as exc:
+        return json.dumps({
+            "error": "invalid_task_filters",
+            "message": str(exc),
+        })
+    next_offset = offset + len(tasks)
+    has_more = next_offset < total
     return json.dumps({
         "total": total,
+        "count": len(tasks),
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
         "tasks": [
             {
                 "id": t.id,
@@ -1041,6 +1189,8 @@ async def runtime_manor_get_task_details(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Get task details via the Runtime Manor task boundary."""
@@ -1049,6 +1199,24 @@ async def runtime_manor_get_task_details(
 
     task = await get_task(db, (params or {}).get("task_id", ""), entity_id)
     if not task:
+        return json.dumps({"error": "Task not found"})
+    task_workspace_id = str(getattr(task, "workspace_id", "") or "")
+    if task_workspace_id:
+        if user_id:
+            from packages.core.services.workspace_access import user_can_read_workspace_id
+
+            can_read = await user_can_read_workspace_id(
+                db,
+                workspace_id=task_workspace_id,
+                entity_id=entity_id,
+                user_id=user_id,
+                role=None,
+            )
+        else:
+            can_read = task_workspace_id == str(workspace_id or "")
+        if not can_read:
+            return json.dumps({"error": "Task not found"})
+    elif not user_id:
         return json.dumps({"error": "Task not found"})
     return json.dumps({
         "id": task.id,
@@ -1095,6 +1263,7 @@ async def runtime_manor_create_task(
     workspace_id: str = "",
     user_id: str | None = None,
     actor_agent_id: str | None = None,
+    runtime_tool_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Create a task via the Runtime Manor task boundary."""
 
@@ -1130,17 +1299,40 @@ async def runtime_manor_create_task(
         create_params.update(assignment_fields)
     _remove_task_assignment_aliases(create_params)
     create_params = _runtime_filter_params(create_params, _TASK_CREATE_ALLOWED_FIELDS)
+    from packages.core.services.task_execution_origin import (
+        TASK_EXECUTION_ORIGIN_KEYS,
+        record_manual_task_execution,
+    )
+
+    if isinstance(create_params.get("details"), dict):
+        create_params["details"] = {
+            key: value for key, value in create_params["details"].items()
+            if key not in TASK_EXECUTION_ORIGIN_KEYS
+        }
     if create_params.get("task_type") == "interactive":
         # The injected conversation is the request's source chat, not the
         # Task-owned session Conversation created on the first Task turn.
         create_params["conversation_id"] = None
+    from packages.core.ai.runtime.execution_origin import (
+        runtime_origin_task_id,
+        runtime_tool_is_user_requested,
+    )
+
     task = await create_task(
         db,
         entity_id,
         **create_params,
         creator_id=user_id,
         creator_agent_id=actor_agent_id,
+        # Created from inside a Task run: link it to that Task (provenance).
+        origin_task_id=runtime_origin_task_id(runtime_tool_kwargs, entity_id=entity_id),
     )
+    if user_id and await runtime_tool_is_user_requested(
+        db, entity_id=entity_id, workspace_id=task.workspace_id, kwargs=runtime_tool_kwargs or {},
+    ):
+        record_manual_task_execution(task, user_id=user_id, action="runtime_task_create")
+    else:
+        task.details = {**(task.details or {}), "automation_origin": {"source": "runtime_task_tool"}}
     await db.commit()
     result = {
         "id": task.id,
@@ -1165,6 +1357,7 @@ async def runtime_manor_update_task(
     user_id: str | None = None,
     workspace_id: str = "",
     task_id: str | None = None,
+    runtime_tool_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Update a task via the Runtime Manor task boundary."""
 
@@ -1191,12 +1384,18 @@ async def runtime_manor_update_task(
     )
     if update_error:
         return json.dumps(update_error, default=str)
+    from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
+
+    manual_execution = await runtime_tool_is_user_requested(
+        db, entity_id=entity_id, workspace_id=existing_task.workspace_id, kwargs=runtime_tool_kwargs or {},
+    )
     try:
         task = await update_task(
             db,
             target_task_id,
             entity_id,
             user_id=user_id,
+            manual_execution=manual_execution,
             **update_fields,
         )
     except TaskStatusTransitionError as exc:
@@ -1227,6 +1426,8 @@ async def runtime_manor_assign_task(
     params: Mapping[str, Any] | None = None,
     workspace_id: str = "",
     task_id: str | None = None,
+    user_id: str | None = None,
+    runtime_tool_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Assign a task via the Runtime Manor task boundary."""
 
@@ -1255,15 +1456,21 @@ async def runtime_manor_assign_task(
         return json.dumps({
             "error": "assignee_required",
             "message": (
-                "assign_task requires an assignee. Use list_staff/list_users/list_agents, "
+                "assign_task requires an assignee. Use list_staff/list_agents, "
                 "then pass assignee_id/staff_id/user_id/agent_id, or pass assignee_name/email."
             ),
             "required_params": _TASK_ASSIGNEE_REQUIRED_PARAMS,
         })
+    from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
+
     task = await update_task(
         db,
         target_task_id,
         entity_id,
+        user_id=user_id,
+        manual_execution=await runtime_tool_is_user_requested(
+            db, entity_id=entity_id, workspace_id=existing_task.workspace_id, kwargs=runtime_tool_kwargs or {},
+        ),
         **assignment_fields,
     )
     await db.commit()
@@ -1404,6 +1611,27 @@ async def runtime_manor_list_workspace_artifacts(
                 .limit(6)
             )
         ).scalars().all()
+        if user_id:
+            from packages.core.permissions import resolve_effective_user_role_name
+            from packages.core.services.workspace_access import (
+                user_readable_workspace_ids,
+            )
+
+            role = await resolve_effective_user_role_name(
+                db, user_id=user_id, entity_id=entity_id,
+            )
+            readable_workspace_ids = await user_readable_workspace_ids(
+                db,
+                entity_id=entity_id,
+                user_id=user_id,
+                role=role,
+                workspace_ids={str(workspace.id) for workspace in workspaces},
+            )
+            workspaces = [
+                workspace
+                for workspace in workspaces
+                if str(workspace.id) in readable_workspace_ids
+            ]
         active_workspaces = [
             ws for ws in workspaces
             if getattr(ws, "status", None) == "active"
@@ -1427,6 +1655,15 @@ async def runtime_manor_list_workspace_artifacts(
                     for ws in candidates[:5]
                 ],
             }, ensure_ascii=False)
+
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id_value,
+        runtime_workspace_id=workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
 
     cache_params = {
         "workspace_id": workspace_id_value,
@@ -1531,9 +1768,15 @@ async def runtime_manor_list_document_folders(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """List Knowledge folders via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({
+            "error": "User context is required to list personal Knowledge folders"
+        })
 
     from sqlalchemy import func as sqfunc, select
 
@@ -1544,7 +1787,7 @@ async def runtime_manor_list_document_folders(
     parent_id = raw_params.get("parent_id")
     if parent_id in ("", "root"):
         parent_id = None
-    cache_params = {"parent_id": parent_id}
+    cache_params = {"parent_id": parent_id, "user_id": user_id}
     cached = await _runtime_manor_get_cached_read(
         entity_id,
         "list_document_folders",
@@ -1554,30 +1797,70 @@ async def runtime_manor_list_document_folders(
         return cached
 
     folders, folder_by_id = await _runtime_load_document_folders(db, entity_id)
-    all_visible_folders = [
+    path_visible_folders = [
         folder for folder in folders
         if is_user_visible_folder_path(_runtime_folder_rel_path(folder, folder_by_id))
     ]
+    documents = []
+    if user_id and path_visible_folders:
+        documents = list((await db.execute(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.folder_id.in_({folder.id for folder in path_visible_folders}),
+                Document.is_trashed == False,  # noqa: E712
+            )
+        )).scalars().all())
+    if user_id:
+        from packages.core.services.document_access import DocumentAccessContext
+
+        access = await DocumentAccessContext.load(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            folder_ids={folder.id for folder in path_visible_folders},
+            document_ids={document.id for document in documents},
+        )
+        all_visible_folders = [
+            folder
+            for folder in path_visible_folders
+            if await access.folder_path_readable(db, folder.id)
+        ]
+        visible_folder_ids = {folder.id for folder in all_visible_folders}
+        documents = [
+            document
+            for document in documents
+            if document.folder_id in visible_folder_ids
+            and await access.can_read_document(db, document, actor_type="agent")
+        ]
+    else:
+        all_visible_folders = path_visible_folders
     visible_folders = all_visible_folders
     if "parent_id" in raw_params:
         visible_folders = [
             folder for folder in visible_folders
             if folder.parent_id == parent_id
         ]
-    visible_folder_ids = {folder.id for folder in all_visible_folders}
-    if visible_folder_ids:
-        count_rows = (await db.execute(
-            select(Document.folder_id, sqfunc.count())
-            .where(
-                Document.entity_id == entity_id,
-                Document.folder_id.in_(visible_folder_ids),
-                Document.is_trashed == False,  # noqa: E712
-            )
-            .group_by(Document.folder_id)
-        )).all()
+    if user_id:
+        direct_counts: dict[str, int] = {}
+        for document in documents:
+            if document.folder_id:
+                direct_counts[str(document.folder_id)] = (
+                    direct_counts.get(str(document.folder_id), 0) + 1
+                )
     else:
-        count_rows = []
-    direct_counts = {row[0]: int(row[1] or 0) for row in count_rows}
+        visible_folder_ids = {folder.id for folder in all_visible_folders}
+        count_rows = (
+            await db.execute(
+                select(Document.folder_id, sqfunc.count())
+                .where(
+                    Document.entity_id == entity_id,
+                    Document.folder_id.in_(visible_folder_ids),
+                    Document.is_trashed == False,  # noqa: E712
+                )
+                .group_by(Document.folder_id)
+            )
+        ).all() if visible_folder_ids else []
+        direct_counts = {row[0]: int(row[1] or 0) for row in count_rows}
     child_ids_by_parent: dict[str | None, list[str]] = {}
     for folder in all_visible_folders:
         child_ids_by_parent.setdefault(folder.parent_id, []).append(folder.id)
@@ -1618,12 +1901,50 @@ async def runtime_manor_list_document_folders(
     return result
 
 
-async def runtime_manor_list_document_groups(db: Any, *, entity_id: str) -> str:
+async def runtime_manor_list_document_groups(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+) -> str:
     """List document groups via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({
+            "error": "User context is required to list Knowledge groups"
+        })
 
     from packages.core.services.document_service import list_groups
 
     groups = await list_groups(db, entity_id)
+    if user_id:
+        from packages.core.permissions import resolve_effective_user_role_name
+        from packages.core.services.document_access import DocumentAccessContext
+        from packages.core.services.workspace_access import user_readable_workspace_ids
+
+        access = await DocumentAccessContext.load(
+            db, entity_id=entity_id, user_id=user_id,
+        )
+        role = await resolve_effective_user_role_name(
+            db, user_id=user_id, entity_id=entity_id,
+        )
+
+        scoped_workspace_ids = {
+            str(group.workspace_id) for group in groups if group.workspace_id
+        }
+        readable_workspace_ids = await user_readable_workspace_ids(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=role,
+            workspace_ids=scoped_workspace_ids,
+        )
+        groups = [
+            group
+            for group in groups
+            if (not group.workspace_id and access.can_manage_all_documents)
+            or str(group.workspace_id) in readable_workspace_ids
+        ]
     return json.dumps({
         "count": len(groups),
         "groups": [
@@ -1758,7 +2079,7 @@ async def runtime_manor_upload_document(
                 async with RuntimeFileProjectionTransactionFactory.create(
                     entity_id,
                 ) as transaction:
-                    target = transaction.copy_file(
+                    target = await transaction.copy_file(
                         target_rel,
                         staged_path,
                         expected_content_sha256=content_sha256,
@@ -1835,16 +2156,45 @@ async def runtime_manor_delete_document(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Delete a Knowledge document via the Runtime Manor document boundary."""
 
+    if not user_id:
+        return json.dumps({"deleted": False, "error": "User context is required"})
+
+    from packages.core.models.permission import Capability
+    from packages.core.services.document_access import (
+        effective_document_capabilities_for_user,
+        get_visible_document,
+    )
     from packages.core.services.document_service import delete_document
 
     raw_params = params or {}
+    document_id = raw_params.get("document_id") or ""
+    if user_id:
+        document = await get_visible_document(
+            db,
+            document_id,
+            entity_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            actor_type="agent",
+        )
+        if document is None:
+            return json.dumps({"deleted": False, "error": "Document not found"})
+        capabilities = await effective_document_capabilities_for_user(
+            db,
+            document=document,
+            user_id=user_id,
+        )
+        if Capability.DELETE not in capabilities:
+            return json.dumps({"deleted": False, "error": "Delete permission is required"})
     ok = await delete_document(
         db,
-        raw_params.get("document_id") or "",
+        document_id,
         entity_id,
     )
     await db.commit()
@@ -1862,9 +2212,13 @@ async def runtime_manor_create_document_folder(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Create a Knowledge folder via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({"error": "User context is required"})
 
     raw_params = params or {}
     name = raw_params.get("name") or raw_params.get("folder_name") or ""
@@ -1877,6 +2231,7 @@ async def runtime_manor_create_document_folder(
             entity_id,
             name=name,
             parent_id=parent_id,
+            user_id=user_id,
         )
     except (FileExistsError, LookupError, ValueError) as exc:
         return json.dumps({"error": str(exc)})
@@ -1893,9 +2248,13 @@ async def runtime_manor_rename_document_folder(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Rename a Knowledge folder via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({"error": "User context is required"})
 
     from sqlalchemy import select
 
@@ -1912,12 +2271,21 @@ async def runtime_manor_rename_document_folder(
     )).scalar_one_or_none()
     if not folder:
         return json.dumps({"error": "Folder not found"})
+    if not await _runtime_user_can_manage_folder(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        folder=folder,
+        capabilities={"manage_metadata", "edit"},
+    ):
+        return json.dumps({"error": "Folder not found or metadata permission is required"})
     try:
         clean_name, folders, folder_by_id = await _runtime_validate_document_folder_position(
             db,
             entity_id,
             name=new_name,
             parent_id=folder.parent_id,
+            owner_id=folder.owner_id,
             folder_id=folder.id,
         )
     except (FileExistsError, LookupError, ValueError) as exc:
@@ -1938,6 +2306,18 @@ async def runtime_manor_rename_document_folder(
     )
     if is_workspace_root:
         from packages.core.services.entity_service import update_workspace
+        from packages.core.services.workspace_access import (
+            lock_workspace_access_boundary,
+            user_can_manage_workspace,
+        )
+
+        await lock_workspace_access_boundary(
+            db, workspace_id=workspace_binding.workspace_id, entity_id=entity_id,
+        )
+        if not await user_can_manage_workspace(
+            db, workspace_id=workspace_binding.workspace_id, user_id=user_id,
+        ):
+            return json.dumps({"error": "Only Workspace owners/admins can rename this Workspace folder"})
 
         workspace = await update_workspace(
             db,
@@ -1975,9 +2355,13 @@ async def runtime_manor_move_document_folder(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Move a Knowledge folder via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({"error": "User context is required"})
 
     from sqlalchemy import select
 
@@ -1996,16 +2380,35 @@ async def runtime_manor_move_document_folder(
     )).scalar_one_or_none()
     if not folder:
         return json.dumps({"error": "Folder not found"})
+    if not await _runtime_user_can_manage_folder(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        folder=folder,
+        capabilities={"manage_metadata", "edit"},
+    ):
+        return json.dumps({"error": "Folder not found or metadata permission is required"})
     try:
         _clean_name, folders, folder_by_id = await _runtime_validate_document_folder_position(
             db,
             entity_id,
             name=folder.name,
             parent_id=parent_id,
+            owner_id=folder.owner_id,
             folder_id=folder.id,
         )
     except (FileExistsError, LookupError, ValueError) as exc:
         return json.dumps({"error": str(exc)})
+    if parent_id:
+        destination = folder_by_id.get(parent_id)
+        if destination is None or not await _runtime_user_can_manage_folder(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            folder=destination,
+            capabilities={"upload_to", "edit"},
+        ):
+            return json.dumps({"error": "Destination folder not found or is not writable"})
     from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
     if await contains_workspace_artifact_root(
         db,
@@ -2033,9 +2436,13 @@ async def runtime_manor_delete_document_folder(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Delete a Knowledge folder tree via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({"error": "User context is required"})
 
     from sqlalchemy import select
 
@@ -2050,19 +2457,46 @@ async def runtime_manor_delete_document_folder(
     folder = folder_by_id.get(folder_id)
     if not folder:
         return json.dumps({"error": "Folder not found"})
+    if not await _runtime_user_can_manage_folder(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        folder=folder,
+        capabilities={"delete"},
+    ):
+        return json.dumps({"error": "Folder not found or delete permission is required"})
     folder_ids = _runtime_folder_subtree_ids(folders, folder_id)
+    for child in folders:
+        if child.id in folder_ids and not await _runtime_user_can_manage_folder(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            folder=child,
+            capabilities={"delete"},
+        ):
+            return json.dumps({"error": "A child folder is not deletable"})
     from packages.core.services.workspace_artifacts import contains_workspace_artifact_root
     if await contains_workspace_artifact_root(
         db, entity_id=entity_id, folder_ids=folder_ids,
     ):
         return json.dumps({"error": "Workspace folders cannot be deleted from Knowledge"})
     folder_id_list = list(folder_ids)
-    doc_ids = list((await db.execute(
-        select(Document.id).where(
+    documents = list((await db.execute(
+        select(Document).where(
             Document.entity_id == entity_id,
             Document.folder_id.in_(folder_id_list),
         ).order_by(Document.id).with_for_update()
     )).scalars().all())
+    from packages.core.models.permission import Capability
+    from packages.core.services.document_access import effective_document_capabilities_for_user
+
+    for document in documents:
+        capabilities = await effective_document_capabilities_for_user(
+            db, document=document, user_id=user_id,
+        )
+        if Capability.DELETE not in capabilities:
+            return json.dumps({"error": "A document in this folder is not deletable"})
+    doc_ids = [document.id for document in documents]
     if doc_ids:
         from packages.core.services.comment_service import delete_resource_comments
 
@@ -2103,6 +2537,9 @@ async def runtime_manor_move_documents_to_folder(
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Move one or more Knowledge documents via the Runtime Manor document boundary."""
+
+    if not user_id:
+        return json.dumps({"error": "User context is required"})
 
     from packages.core.services.document_access import get_visible_document, list_visible_documents
 
@@ -2169,6 +2606,19 @@ async def runtime_manor_move_documents_to_folder(
                 or candidate.name == normalized
             ]
             if matches:
+                from packages.core.services.document_access import DocumentAccessContext
+
+                access = await DocumentAccessContext.load(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    folder_ids={candidate.id for candidate in matches},
+                )
+                matches = [
+                    candidate for candidate in matches
+                    if await access.folder_path_readable(db, candidate.id)
+                ]
+            if matches:
                 return json.dumps({
                     "error": (
                         f"'{target_text}' is not a folder id. Pass the id "
@@ -2187,6 +2637,14 @@ async def runtime_manor_move_documents_to_folder(
         target_folder_path = _runtime_folder_rel_path(folder, folder_by_id)
         if not is_user_visible_folder_path(target_folder_path):
             return json.dumps({"error": "Folder not found"})
+        if not await _runtime_user_can_manage_folder(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            folder=folder,
+            capabilities={"upload_to", "edit"},
+        ):
+            return json.dumps({"error": "Folder not found or is not writable"})
         from packages.core.services.workspace_artifacts import resolve_workspace_folder_binding
         workspace_binding = await resolve_workspace_folder_binding(
             db,
@@ -2238,6 +2696,10 @@ async def runtime_manor_move_documents_to_folder(
     if not document_ids:
         return json.dumps({"error": "document_ids required unless all_visible=true"})
 
+    from packages.core.models.permission import Capability
+    from packages.core.services.document_access import (
+        effective_document_capabilities_for_user,
+    )
     from packages.core.services.document_file_move import move_document_file_to_folder
     from packages.core.services.document_file_state import mark_document_file_missing
 
@@ -2257,6 +2719,15 @@ async def runtime_manor_move_documents_to_folder(
         if not doc:
             missing.append(document_id)
             continue
+        if user_id:
+            capabilities = await effective_document_capabilities_for_user(
+                db,
+                document=doc,
+                user_id=user_id,
+            )
+            if Capability.EDIT not in capabilities:
+                missing.append(document_id)
+                continue
         fs_move = move_document_file_to_folder(
             doc,
             entity_id=entity_id,
@@ -2347,81 +2818,192 @@ async def runtime_manor_apply_workspace_operation_patch(
     source_action: str,
     patch: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Apply a single workspace operation patch via the Runtime Manor boundary."""
+    """Stage a single workspace operation patch as a reviewable draft.
 
-    from packages.core.services.workspace_operation_service import (
-        OperationConflictError,
-        OperationValidationError,
-        apply_operation_draft,
-        create_operation_draft,
+    The legacy ``manor`` workspace actions (update_workspace_rules,
+    update_operating_model, add/remove_workspace_service, map/unmap agent,
+    update_workspace_goals) used to apply their patch immediately. That was
+    a second, unguarded door into workspace configuration: an agent that had
+    just been handed a review card by the ``operation`` draft flow could
+    reach the same change through here with no card at all (seen in the
+    2026-09-07 E2E, where it also dropped an unrelated rule). Every path an
+    agent can take to change workspace configuration now raises the same
+    review card; the change applies only when a person approves it.
+    """
+
+    import packages.core.services.workspace_operation_service as operation_service
+    from packages.core.ai.runtime.workspace_operation_actions import (
+        _operation_review_payload,
     )
 
     target_workspace_id = str((params or {}).get("workspace_id") or workspace_id or "").strip()
     if not target_workspace_id:
         return {"error": "workspace_id is required"}
-    draft = await create_operation_draft(
-        db,
-        target_workspace_id,
-        entity_id,
-        user_id=user_id,
-        source_event_id=f"manor_tool.{source_action}",
-        initial_patches=[dict(patch)],
-    )
+    try:
+        draft = await operation_service.create_operation_draft(
+            db,
+            target_workspace_id,
+            entity_id,
+            user_id=user_id,
+            source_event_id=f"manor_tool.{source_action}",
+            initial_patches=[dict(patch)],
+        )
+    except ValueError as exc:
+        await db.rollback()
+        return {"error": f"failed to stage workspace operation: {exc}"}
     if draft is None:
         return {"error": "Workspace not found"}
-    try:
-        return await apply_operation_draft(
-            db,
-            draft.id,
-            entity_id,
-            target_workspace_id,
-            user_id=user_id,
-            user_confirmation=True,
-        )
-    except OperationConflictError as exc:
-        await db.rollback()
-        return {"error": str(exc), "type": "operation_conflict"}
-    except OperationValidationError as exc:
-        await db.rollback()
-        return {
-            "error": "workspace operation validation failed",
-            "validation": exc.validation,
-        }
+    draft_data = operation_service.draft_to_dict(draft)
+    payload = _operation_review_payload(
+        draft_data,
+        prompt="Apply these workspace runtime changes?",
+        content={
+            "patches": draft_data.get("patches") or [],
+            "effect": (
+                "These workspace-wide changes will affect future goals, "
+                "services, rules, tools, skills, channels, or strategist "
+                "behavior after approval."
+            ),
+        },
+    )
+    payload["draft"] = draft_data
+    return payload
 
 
-async def runtime_manor_list_agents(db: Any, *, entity_id: str) -> str:
+async def runtime_manor_list_agents(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    require_schedulable_scope: bool = False,
+    params: Mapping[str, Any] | None = None,
+) -> str:
     """List agents via the Runtime Manor action boundary."""
 
-    from packages.core.services.agent_service import list_agents
+    from packages.core.ai.runtime.agent_provisioning import (
+        runtime_query_entity_agents_action,
+    )
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
 
-    agents = await list_agents(db, entity_id)
-    return json.dumps([
-        {
-            "id": a.id,
-            "name": a.name,
-            "category": a.category,
-            "source": a.source,
-            "status": a.status,
-        }
-        for a in agents
-    ], default=str)
+    if not user_id and not workspace_id:
+        return json.dumps({"ok": False, "error": "user or Workspace context is required"})
+    readable_workspace_ids = (
+        await readable_workspace_ids_for_user(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=None,
+        )
+        if user_id
+        else {str(workspace_id)}
+    )
+
+    raw_params = dict(params or {})
+    return await runtime_query_entity_agents_action(
+        entity_id=entity_id,
+        query=str(raw_params.get("query") or raw_params.get("search") or ""),
+        statuses=_runtime_string_list(raw_params.get("statuses")),
+        categories=_runtime_string_list(raw_params.get("categories")),
+        sources=_runtime_string_list(raw_params.get("sources")),
+        workspace_ids=_runtime_string_list(raw_params.get("workspace_ids")),
+        owner_user_ids=_runtime_string_list(raw_params.get("owner_user_ids")),
+        include_templates=_runtime_truthy(raw_params.get("include_templates")),
+        created_after=str(raw_params.get("created_after") or ""),
+        created_before=str(raw_params.get("created_before") or ""),
+        updated_after=str(raw_params.get("updated_after") or ""),
+        updated_before=str(raw_params.get("updated_before") or ""),
+        deployment_count_min=raw_params.get("deployment_count_min"),
+        deployment_count_max=raw_params.get("deployment_count_max"),
+        require_schedulable_scope=require_schedulable_scope,
+        schedulable_workspace_id=workspace_id,
+        schedulable_user_id=user_id,
+        viewer_user_id=user_id,
+        readable_workspace_ids=readable_workspace_ids,
+        limit=_runtime_bounded_int(raw_params.get("limit"), 50, 100, 1),
+        offset=_runtime_bounded_int(raw_params.get("offset"), 0, 10_000, 0),
+        db=db,
+    )
 
 
-async def runtime_manor_get_dashboard_summary(db: Any, *, entity_id: str) -> str:
+async def runtime_manor_get_dashboard_summary(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+) -> str:
     """Return the entity dashboard summary via the Runtime Manor boundary."""
 
     from packages.core.services.analytics_service import get_dashboard_stats
+    from packages.core.services.workspace_access import (
+        readable_workspace_ids_for_user,
+        user_can_read_workspace_id,
+    )
 
-    summary = await get_dashboard_stats(db, entity_id)
+    if not user_id:
+        return json.dumps({"error": "user context is required"})
+    readable_workspace_ids = await readable_workspace_ids_for_user(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=None,
+    )
+    if workspace_id:
+        if not await user_can_read_workspace_id(
+            db,
+            workspace_id=workspace_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=None,
+        ):
+            return json.dumps({"error": "Workspace not found"})
+    elif readable_workspace_ids is not None:
+        return json.dumps({
+            "error": "workspace_id is required for a workspace-scoped dashboard",
+        })
+
+    summary = await get_dashboard_stats(db, entity_id, workspace_id=workspace_id)
+    if readable_workspace_ids is not None:
+        # These aggregates are entity-wide in analytics_service today. Do not
+        # expose them from a restricted Workspace dashboard.
+        for key in ("documents", "agents", "clients", "staff", "usage"):
+            summary.pop(key, None)
     return json.dumps(summary, default=str)
 
 
-async def runtime_manor_list_workspaces(db: Any, *, entity_id: str) -> str:
+async def runtime_manor_list_workspaces(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+) -> str:
     """List workspaces via the Runtime Manor action boundary."""
 
     from packages.core.services.entity_service import list_workspaces
 
+    if not user_id and not workspace_id:
+        return json.dumps({"error": "user or Workspace context is required"})
     workspaces = await list_workspaces(db, entity_id)
+    if user_id:
+        from packages.core.services.workspace_access import user_readable_workspace_ids
+
+        readable_ids = await user_readable_workspace_ids(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_ids={str(workspace.id) for workspace in workspaces},
+        )
+        workspaces = [
+            workspace for workspace in workspaces if str(workspace.id) in readable_ids
+        ]
+    elif workspace_id:
+        workspaces = [
+            workspace
+            for workspace in workspaces
+            if str(workspace.id) == str(workspace_id)
+        ]
     return json.dumps([
         {"id": w.id, "name": w.name, "category": w.category, "status": w.status}
         for w in workspaces
@@ -2432,13 +3014,24 @@ async def runtime_manor_get_workspace(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Get workspace details via the Runtime Manor action boundary."""
 
     from packages.core.services.workspace_service import get_workspace_full
 
-    ws = await get_workspace_full(db, (params or {}).get("workspace_id", ""), entity_id)
+    workspace_id = str((params or {}).get("workspace_id", "") or "")
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_workspace_id=runtime_workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
+    ws = await get_workspace_full(db, workspace_id, entity_id)
     if not ws:
         return json.dumps({"error": "Workspace not found"})
     return json.dumps(ws, default=str)
@@ -2448,6 +3041,8 @@ async def runtime_manor_update_workspace(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Update workspace fields via the Runtime Manor workspace boundary."""
@@ -2455,7 +3050,26 @@ async def runtime_manor_update_workspace(
     from packages.core.services.entity_service import update_workspace
 
     update_params = dict(params or {})
+    reviewed = sorted(set(update_params) & _WORKSPACE_REVIEWED_UPDATE_FIELDS)
+    if reviewed:
+        return json.dumps({
+            "error": "Workspace runtime configuration requires an operation draft; nothing was updated.",
+            "fields": reviewed,
+            "hint": "Use manor(action='workspace', params={action:'operation', params:{action:'create_draft', patches:[{op,payload}]}}). "
+                    "Use operating_model.update, budget_policy.update or heartbeat_policy.update as appropriate.",
+        })
     workspace_id = update_params.pop("workspace_id", "")
+    if user_id:
+        from packages.core.services.workspace_access import user_can_manage_workspace
+
+        if not await user_can_manage_workspace(
+            db,
+            workspace_id=workspace_id,
+            user_id=user_id,
+        ):
+            return json.dumps({"error": "Workspace not found or manage permission is required"})
+    elif not runtime_workspace_id or str(workspace_id) != str(runtime_workspace_id):
+        return json.dumps({"error": "Workspace not found or manage permission is required"})
     update_params = _runtime_filter_params(update_params, _WORKSPACE_UPDATE_ALLOWED_FIELDS)
     ws = await update_workspace(
         db,
@@ -2473,6 +3087,7 @@ async def runtime_manor_get_workspace_daily_summary(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
     workspace_id: str = "",
     params: Mapping[str, Any] | None = None,
 ) -> str:
@@ -2486,6 +3101,14 @@ async def runtime_manor_get_workspace_daily_summary(
     target_workspace_id = raw_params.get("workspace_id") or workspace_id or ""
     if not target_workspace_id:
         return json.dumps({"error": "workspace_id is required"})
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=target_workspace_id,
+        runtime_workspace_id=workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
     summary = await get_workspace_daily_summary(
         db,
         entity_id,
@@ -2503,13 +3126,24 @@ async def runtime_manor_get_operating_model(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Get a workspace operating model via the Runtime Manor boundary."""
 
     from packages.core.services.entity_service import get_workspace
 
-    ws = await get_workspace(db, (params or {}).get("workspace_id", ""), entity_id)
+    workspace_id = str((params or {}).get("workspace_id", "") or "")
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_workspace_id=runtime_workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
+    ws = await get_workspace(db, workspace_id, entity_id)
     if not ws:
         return json.dumps({"error": "Workspace not found"})
     return json.dumps({
@@ -2522,15 +3156,24 @@ async def runtime_manor_get_workspace_agents(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Get workspace agent-service mappings via the Runtime Manor boundary."""
 
     from packages.core.services.workspace_service import get_workspace_agent_mappings
 
-    mappings = await get_workspace_agent_mappings(
-        db, (params or {}).get("workspace_id", ""), entity_id,
-    )
+    workspace_id = str((params or {}).get("workspace_id", "") or "")
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_workspace_id=runtime_workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
+    mappings = await get_workspace_agent_mappings(db, workspace_id, entity_id)
     return json.dumps(mappings, default=str)
 
 
@@ -2538,6 +3181,8 @@ async def runtime_manor_get_workspace_activity(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Get workspace activity via the Runtime Manor action boundary."""
@@ -2545,9 +3190,18 @@ async def runtime_manor_get_workspace_activity(
     from packages.core.services.workspace_service import list_activity
 
     raw_params = params or {}
+    workspace_id = str(raw_params.get("workspace_id", "") or "")
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_workspace_id=runtime_workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
     activities = await list_activity(
         db,
-        raw_params.get("workspace_id", ""),
+        workspace_id,
         entity_id,
         limit=raw_params.get("limit", 20),
         event_type=raw_params.get("event_type"),
@@ -2559,13 +3213,24 @@ async def runtime_manor_get_workspace_dashboard(
     db: Any,
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
 ) -> str:
     """Get workspace dashboard stats via the Runtime Manor boundary."""
 
     from packages.core.services.workspace_dashboard_service import get_workspace_stats
 
-    stats = await get_workspace_stats(db, entity_id, (params or {}).get("workspace_id", ""))
+    workspace_id = str((params or {}).get("workspace_id", "") or "")
+    if not await _runtime_user_can_read_workspace(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_workspace_id=runtime_workspace_id,
+    ):
+        return json.dumps({"error": "Workspace not found"})
+    stats = await get_workspace_stats(db, entity_id, workspace_id)
     return json.dumps(stats, default=str)
 
 
@@ -2861,6 +3526,8 @@ async def runtime_manor_create_scheduled_job(
     *,
     entity_id: str,
     params: Mapping[str, Any] | None = None,
+    caller_agent_id: str = "",
+    caller_agent_subscription_id: str | None = None,
     user_id: str = "",
     workspace_id: str = "",
     conversation_id: str = "",
@@ -2880,10 +3547,16 @@ async def runtime_manor_create_scheduled_job(
         every_seconds=raw_params.get("every_seconds") or 0,
         run_at=str(raw_params.get("run_at") or ""),
         agent_id=str(raw_params.get("agent_id") or ""),
+        caller_agent_id=caller_agent_id,
+        caller_agent_subscription_id=caller_agent_subscription_id,
         timezone_str=str(raw_params.get("timezone") or "UTC"),
-        workspace_id=workspace_id or str(raw_params.get("workspace_id") or "") or None,
+        workspace_id=(
+            workspace_id
+            or (str(raw_params.get("workspace_id") or "") if user_id else "")
+            or None
+        ),
         conversation_id=conversation_id or str(raw_params.get("conversation_id") or "") or None,
-        user_id=user_id or str(raw_params.get("user_id") or "") or None,
+        user_id=user_id or None,
         default_delivery_mode=raw_params.get("default_delivery_mode"),
         execution_target=raw_params.get("execution_target"),
         output_kind=str(raw_params.get("output_kind") or ""),
@@ -2895,18 +3568,61 @@ async def runtime_manor_create_scheduled_job(
     )
 
 
-async def runtime_manor_list_scheduled_jobs(*, entity_id: str) -> str:
+async def runtime_manor_list_scheduled_jobs(
+    db: Any = None,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    params: Mapping[str, Any] | None = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
+) -> str:
     """List scheduled jobs via the Runtime Manor action boundary."""
 
-    from packages.core.ai.runtime.scheduling import runtime_list_scheduled_jobs_action
+    from packages.core.ai.runtime.scheduling import (
+        runtime_query_scheduled_jobs_action,
+    )
 
-    return await runtime_list_scheduled_jobs_action(entity_id=entity_id)
+    raw_params = dict(params or {})
+    return await runtime_query_scheduled_jobs_action(
+        entity_id=entity_id,
+        user_id=user_id,
+        runtime_workspace_id=workspace_id,
+        query=str(raw_params.get("query") or raw_params.get("search") or ""),
+        workspace_id=str(raw_params.get("workspace_id") or ""),
+        workspace_ids=_runtime_string_list(raw_params.get("workspace_ids")),
+        enabled_only=_runtime_truthy(raw_params.get("enabled_only")),
+        statuses=_runtime_string_list(raw_params.get("statuses")),
+        agent_id=str(raw_params.get("agent_id") or ""),
+        agent_ids=_runtime_string_list(raw_params.get("agent_ids")),
+        schedule_kinds=_runtime_string_list(raw_params.get("schedule_kinds")),
+        job_types=_runtime_string_list(raw_params.get("job_types")),
+        execution_types=_runtime_string_list(raw_params.get("execution_types")),
+        last_statuses=_runtime_string_list(raw_params.get("last_statuses")),
+        created_after=str(raw_params.get("created_after") or ""),
+        created_before=str(raw_params.get("created_before") or ""),
+        updated_after=str(raw_params.get("updated_after") or ""),
+        updated_before=str(raw_params.get("updated_before") or ""),
+        last_run_after=str(raw_params.get("last_run_after") or ""),
+        last_run_before=str(raw_params.get("last_run_before") or ""),
+        next_run_after=str(raw_params.get("next_run_after") or ""),
+        next_run_before=str(raw_params.get("next_run_before") or ""),
+        consecutive_errors_min=raw_params.get("consecutive_errors_min"),
+        consecutive_errors_max=raw_params.get("consecutive_errors_max"),
+        limit=_runtime_bounded_int(raw_params.get("limit"), 50, 200, 1),
+        offset=_runtime_bounded_int(raw_params.get("offset"), 0, 10_000, 0),
+        db=db,
+        runtime_kwargs=runtime_kwargs,
+    )
 
 
 async def runtime_manor_cancel_scheduled_job(
     *,
     entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
 ) -> str:
     """Cancel a scheduled job via the Runtime Manor action boundary."""
 
@@ -2915,13 +3631,19 @@ async def runtime_manor_cancel_scheduled_job(
     return await runtime_cancel_scheduled_job_action(
         entity_id=entity_id,
         job_id=str(dict(params or {}).get("job_id") or ""),
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_kwargs=runtime_kwargs,
     )
 
 
 async def runtime_manor_toggle_scheduled_job(
     *,
     entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
 ) -> str:
     """Toggle a scheduled job via the Runtime Manor action boundary."""
 
@@ -2933,13 +3655,19 @@ async def runtime_manor_toggle_scheduled_job(
         entity_id=entity_id,
         job_id=str(raw_params.get("job_id") or ""),
         enabled=enabled_value if isinstance(enabled_value, bool) else _runtime_truthy(enabled_value),
+        user_id=user_id,
+        workspace_id=workspace_id,
+        runtime_kwargs=runtime_kwargs,
     )
 
 
 async def runtime_manor_run_scheduled_job_now(
     *,
     entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
     params: Mapping[str, Any] | None = None,
+    runtime_kwargs: dict[str, Any] | None = None,
 ) -> str:
     """Run a scheduled job immediately via the Runtime Manor action boundary."""
 
@@ -2948,6 +3676,9 @@ async def runtime_manor_run_scheduled_job_now(
     return await runtime_run_scheduled_job_now_action(
         entity_id=entity_id,
         job_id=str(dict(params or {}).get("job_id") or ""),
+        runtime_kwargs=runtime_kwargs,
+        user_id=user_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -2993,12 +3724,19 @@ async def runtime_manor_list_notifications(
     }, default=str)
 
 
-async def runtime_manor_list_conversations(db: Any, *, entity_id: str) -> str:
+async def runtime_manor_list_conversations(
+    db: Any,
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+) -> str:
     """List conversation records via the Runtime Manor communication boundary."""
 
     from packages.core.services.conversation_records import list_conversations
 
-    convos = await list_conversations(db, entity_id)
+    if not user_id:
+        return json.dumps({"error": "user context is required"})
+    convos = await list_conversations(db, entity_id, user_id=user_id)
     return json.dumps([
         {"id": c.id, "title": c.title}
         for c in convos
@@ -3127,12 +3865,13 @@ async def runtime_manor_send_email(
                 html_content=str(html_content or ""),
                 conversation_id=conversation_id,
             )
+            # Each accepted external send has its own durable receipt.
+            await db.commit()
             message_log_ids.append(log.id)
             if log.status == "sent":
                 delivered.append(addr)
             else:
                 failed.append({"to": addr, "error": log.error_message or "unknown error"})
-        await db.commit()
         return json.dumps({
             "sent": len(delivered) > 0,
             "status": (
@@ -3155,6 +3894,7 @@ async def runtime_manor_send_email(
 
     # Platform-SMTP fallback — same per-recipient fan-out. Wrap the body in
     # the branded template exactly like ``send_common_email`` did.
+    await release_read_transaction(db)
     wrapped_html = _render("common", content=str(html_content or content))
     result = await send_bulk_email(recipients, str(subject), wrapped_html)
     return json.dumps({

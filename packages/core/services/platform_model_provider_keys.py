@@ -247,6 +247,11 @@ async def resolve_official_provider_credential(
     so deployments keep working before the admin page is configured.
     """
 
+    from packages.core.constants.plans import is_cloud
+
+    if not is_cloud():
+        return None
+
     provider = str(provider or "").strip().lower()
     handler = handler_for_provider(provider)
     if not handler:

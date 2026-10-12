@@ -4,8 +4,8 @@
 moment a worker reports a lease done. It:
 
   1. Adds ``step.cost.usd`` to ``plan.cost_tracking.usd``.
-  2. Adds the same to ``workspace.monthly_spent_usd``.
-  3. Adds the same to ``worker.monthly_spent_usd``.
+  2. Adds ``step.cost.budget_usd`` to ``workspace.monthly_spent_usd``.
+  3. Adds ``step.cost.budget_usd`` to ``worker.monthly_spent_usd``.
   4. Fires chat alerts on 80% / 100% threshold crossings — deduped via
      ``workspace.budget_alert_state``.
 
@@ -38,6 +38,16 @@ _WARNING_THRESHOLD = Decimal("0.80")
 _CRITICAL_THRESHOLD = Decimal("1.00")
 
 
+def _nonnegative_finite_decimal(value: object) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value or 0))
+    except Exception:
+        return None
+    if not parsed.is_finite():
+        return None
+    return max(parsed, Decimal(0))
+
+
 async def accumulate_step_cost(
     db: AsyncSession,
     step: ExecutionStep,
@@ -53,32 +63,46 @@ async def accumulate_step_cost(
        workspace_pct: <0..1>, alert_emitted: <state-change>}
     """
     cost = step.cost or {}
-    raw = cost.get("usd")
-    if raw is None:
+    plan_raw = cost.get("usd")
+    # Legacy/non-LLM workers only reported ``usd``. New Runtime-backed LLM
+    # steps also report ``budget_usd=0`` because their provider calls already
+    # enter the Workspace budget through record_llm_usage. Keeping the fallback
+    # preserves the old contract for API, code, and external workers.
+    budget_raw = cost.get("budget_usd", plan_raw)
+    counter_keys = ("llm_tokens_input", "llm_tokens_output", "api_calls")
+    has_counters = any(cost.get(key) is not None for key in counter_keys)
+    if plan_raw is None and budget_raw is None and not has_counters:
         return {"usd": 0, "alert_emitted": None}
 
-    try:
-        delta = Decimal(str(raw))
-    except Exception:
+    plan_delta = _nonnegative_finite_decimal(plan_raw)
+    if plan_delta is None:
         logger.warning("step %s/%s: non-numeric cost.usd=%r — skipping accumulation",
-                       step.plan_id, step.step_key, raw)
+                       step.plan_id, step.step_key, plan_raw)
         return {"usd": 0, "alert_emitted": None}
-    if delta <= 0:
+    budget_delta = _nonnegative_finite_decimal(budget_raw)
+    if budget_delta is None:
+        logger.warning(
+            "step %s/%s: non-numeric cost.budget_usd=%r — skipping accumulation",
+            step.plan_id,
+            step.step_key,
+            budget_raw,
+        )
         return {"usd": 0, "alert_emitted": None}
-
     # ── Plan rollup ──
     plan = (await db.execute(
-        select(ExecutionPlan).where(ExecutionPlan.id == step.plan_id)
+        select(ExecutionPlan)
+        .where(ExecutionPlan.id == step.plan_id)
+        .with_for_update()
     )).scalar_one_or_none()
     plan_total = Decimal("0")
     if plan is not None:
         ct = dict(plan.cost_tracking or {})
-        prior = Decimal(str(ct.get("usd") or 0))
-        plan_total = prior + delta
+        prior = _nonnegative_finite_decimal(ct.get("usd")) or Decimal(0)
+        plan_total = prior + plan_delta
         ct["usd"] = float(plan_total)
         # Also accumulate llm token counters if present — operator might
         # want a per-plan token total without summing N step rows.
-        for k in ("llm_tokens_input", "llm_tokens_output", "api_calls"):
+        for k in counter_keys:
             v = cost.get(k)
             if v is not None:
                 try:
@@ -87,19 +111,39 @@ async def accumulate_step_cost(
                     pass
         plan.cost_tracking = ct
 
+    if plan_delta <= 0 and budget_delta <= 0:
+        # Token/call telemetry remains useful even when the model provider did
+        # not expose pricing. Persist the plan counters without touching
+        # workspace/worker spend or emitting budget alerts.
+        await db.flush()
+        return {
+            "usd": 0,
+            "budget_usd": 0,
+            "plan_total": float(plan_total),
+            "workspace_total": None,
+            "workspace_pct": None,
+            "alert_emitted": None,
+        }
+
     # ── Worker rollup ──
     if lease is not None:
         worker = (await db.execute(
-            select(Worker).where(Worker.id == lease.worker_id)
+            select(Worker).where(
+                Worker.id == lease.worker_id,
+                Worker.entity_id == step.entity_id,
+            ).with_for_update()
         )).scalar_one_or_none()
         if worker is not None:
-            worker.monthly_spent_usd = (worker.monthly_spent_usd or Decimal(0)) + delta
+            worker.monthly_spent_usd = (
+                worker.monthly_spent_usd or Decimal(0)
+            ) + budget_delta
 
     # ── Workspace rollup ──
     if not step.workspace_id:
         await db.flush()
         return {
-            "usd": float(delta),
+            "usd": float(plan_delta),
+            "budget_usd": float(budget_delta),
             "plan_total": float(plan_total),
             "workspace_total": None,
             "workspace_pct": None,
@@ -107,12 +151,13 @@ async def accumulate_step_cost(
         }
 
     workspace = (await db.execute(
-        select(Workspace).where(Workspace.id == step.workspace_id)
+        select(Workspace).where(Workspace.id == step.workspace_id).with_for_update()
     )).scalar_one_or_none()
     if workspace is None:
         await db.flush()
         return {
-            "usd": float(delta),
+            "usd": float(plan_delta),
+            "budget_usd": float(budget_delta),
             "plan_total": float(plan_total),
             "workspace_total": None,
             "workspace_pct": None,
@@ -120,7 +165,7 @@ async def accumulate_step_cost(
         }
 
     prev_spent = workspace.monthly_spent_usd or Decimal(0)
-    new_spent = prev_spent + delta
+    new_spent = prev_spent + budget_delta
     workspace.monthly_spent_usd = new_spent
 
     # ── Threshold detection ──
@@ -147,10 +192,11 @@ async def accumulate_step_cost(
     await db.flush()
 
     if alert:
-        await _post_budget_alert(workspace, new_spent, alert)
+        await _post_budget_alert(db, workspace, new_spent, alert)
 
     return {
-        "usd": float(delta),
+        "usd": float(plan_delta),
+        "budget_usd": float(budget_delta),
         "plan_total": float(plan_total),
         "workspace_total": float(new_spent),
         "workspace_pct": (
@@ -178,9 +224,8 @@ async def accumulate_workspace_ai_cost(
     if not workspace_id or cost_usd is None:
         return {"usd": 0, "workspace_total": None, "workspace_pct": None, "alert_emitted": None}
 
-    try:
-        delta = Decimal(str(cost_usd))
-    except Exception:
+    delta = _nonnegative_finite_decimal(cost_usd)
+    if delta is None:
         logger.warning(
             "workspace %s: non-numeric cost_usd=%r — skipping budget accumulation",
             workspace_id, cost_usd,
@@ -190,7 +235,7 @@ async def accumulate_workspace_ai_cost(
         return {"usd": 0, "workspace_total": None, "workspace_pct": None, "alert_emitted": None}
 
     workspace = (await db.execute(
-        select(Workspace).where(Workspace.id == workspace_id)
+        select(Workspace).where(Workspace.id == workspace_id).with_for_update()
     )).scalar_one_or_none()
     if workspace is None:
         await db.flush()
@@ -220,7 +265,7 @@ async def accumulate_workspace_ai_cost(
 
     await db.flush()
     if alert:
-        await _post_budget_alert(workspace, new_spent, alert)
+        await _post_budget_alert(db, workspace, new_spent, alert)
 
     return {
         "usd": float(delta),
@@ -242,45 +287,49 @@ def _bucket(pct: Decimal) -> str:
 
 
 async def _post_budget_alert(
-    workspace: Workspace, spent: Decimal, state: str,
+    db: AsyncSession,
+    workspace: Workspace,
+    spent: Decimal,
+    state: str,
 ) -> None:
-    """Best-effort chat alert on threshold crossing."""
-    try:
-        from packages.core.database import async_session
-        from packages.core.services.credit_service import usd_to_credits
-        from packages.core.workspace_chat import service as chat_service
+    """Stage a threshold alert with the spend/state update that triggered it."""
+    from packages.core.services.credit_service import usd_to_credits
+    from packages.core.workspace_chat import service as chat_service
 
-        budget = workspace.monthly_budget_usd or Decimal(0)
-        pct = float(spent / budget * 100) if budget > 0 else 0.0
-        # User-facing surface is credits, not USD.
-        spent_credits = usd_to_credits(float(spent))
-        budget_credits = usd_to_credits(float(budget))
-        if state == "critical_100":
-            body = (
-                f"🛑 **Budget hit** — workspace has spent {spent_credits} "
-                f"of {budget_credits} credits ({pct:.0f}%). "
-                f"{'New plans paused.' if workspace.auto_pause_on_budget else 'Logging only — auto-pause off.'} "
-                f"Raise the cap or wait for the monthly reset."
-            )
-        else:
-            body = (
-                f"⚠ **Budget warning** — workspace has spent {spent_credits} "
-                f"of {budget_credits} credits ({pct:.0f}%). "
-                f"At 100% Manor will {'pause new plans' if workspace.auto_pause_on_budget else 'continue but log'}."
-            )
+    budget = workspace.monthly_budget_usd or Decimal(0)
+    pct = float(spent / budget * 100) if budget > 0 else 0.0
+    # User-facing surface is credits, not USD.
+    spent_credits = usd_to_credits(float(spent))
+    budget_credits = usd_to_credits(float(budget))
+    if state == "critical_100":
+        body = (
+            f"🛑 **Budget hit** — workspace has spent {spent_credits} "
+            f"of {budget_credits} credits ({pct:.0f}%). "
+            f"{'New plans paused.' if workspace.auto_pause_on_budget else 'Logging only — auto-pause off.'} "
+            f"Raise the cap or wait for the monthly reset."
+        )
+    else:
+        body = (
+            f"⚠ **Budget warning** — workspace has spent {spent_credits} "
+            f"of {budget_credits} credits ({pct:.0f}%). "
+            f"At 100% Manor will {'pause new plans' if workspace.auto_pause_on_budget else 'continue but log'}."
+        )
 
-        async with async_session() as db:
-            await chat_service.post_message(
-                db,
-                entity_id=workspace.entity_id,
-                workspace_id=workspace.id,
-                body=body,
-                message_kind="goal_alert",   # reuse existing chat kind
-                author_kind="system",
-            )
-            await db.commit()
-    except Exception:
-        logger.warning("budget alert chat post failed", exc_info=True)
+    message = await chat_service.post_message(
+        db,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        body=body,
+        message_kind="goal_alert",   # reuse existing chat kind
+        author_kind="system",
+        publish_event=False,
+    )
+    chat_service.queue_workspace_chat_message_event_after_commit(
+        db,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        message=message,
+    )
 
 
 # ── Monthly reset ─────────────────────────────────────────────────────
@@ -309,7 +358,9 @@ async def monthly_reset_scan(db: AsyncSession) -> dict:
     wk_reset = 0
 
     workspaces = list((await db.execute(
-        select(Workspace).where(Workspace.monthly_budget_usd.is_not(None))
+        select(Workspace)
+        .where(Workspace.monthly_budget_usd.is_not(None))
+        .with_for_update(skip_locked=True)
     )).scalars().all())
     for ws in workspaces:
         if monthly_reset_due(ws.budget_reset_at, now):
@@ -319,7 +370,9 @@ async def monthly_reset_scan(db: AsyncSession) -> dict:
             ws_reset += 1
 
     workers = list((await db.execute(
-        select(Worker).where(Worker.monthly_budget_usd.is_not(None))
+        select(Worker)
+        .where(Worker.monthly_budget_usd.is_not(None))
+        .with_for_update(skip_locked=True)
     )).scalars().all())
     for w in workers:
         if monthly_reset_due(w.budget_reset_at, now):

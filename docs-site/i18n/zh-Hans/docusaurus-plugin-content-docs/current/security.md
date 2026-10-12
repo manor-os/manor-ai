@@ -41,8 +41,10 @@ title: 安全
 
 ## 会话与账号安全 {#session-and-account-security}
 
-- 会话是用 `JWT_SECRET_KEY` 签名的 JWT；过期时间默认 24 小时
-  （`JWT_EXPIRE_MINUTES`）。
+- 访问 JWT 使用 `JWT_SECRET_KEY` 签名，默认有效期为 24 小时
+  （`JWT_EXPIRE_MINUTES`，最长 24 小时）。Remember me 创建可撤销的
+  HttpOnly 浏览器会话，凭据轮换，但有效期固定为登录后的 30 天。
+  退出登录或修改密码会使已有登录凭据失效。
 - 用户可以在**设置 → 安全**中启用双因素认证（TOTP）并查看活跃会话。
 - 用于程序化访问的 API 密钥在**设置 → API 密钥**中管理；将其作用域
   收窄，并在人员变动时轮换。

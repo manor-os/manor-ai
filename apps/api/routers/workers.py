@@ -36,7 +36,8 @@ Endpoint groups:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import random
 from typing import Any, Literal, Optional
 from urllib.parse import urlparse
 
@@ -47,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user, get_current_worker
 from packages.core.constants.execution import (
+    ACTION_EFFECT_GENERATION_PARAM_KEY,
     ExecutionPlanStatus,
     ExecutionStepStatus,
     PLAN_TERMINAL_STATUSES,
@@ -64,6 +66,7 @@ from packages.core.dispatcher import (
     LeaseNotActive,
     MISSING_RESULT,
 )
+from packages.core.dispatcher.action_params import executable_action_params
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.user import User
 from packages.core.models.worker import (
@@ -74,11 +77,14 @@ from packages.core.models.worker import (
 from packages.core.workers import (
     CURRENT_WORKER_PROTOCOL_VERSION,
     INTERNAL_WORKER_KIND,
+    LEASE_ATTEMPT_TOKEN_CAPABILITY,
     WORKER_PROTOCOL_HEADER,
+    WorkerLeaseFencingVersion,
     WorkerProtocolVersion,
     require_current_worker_protocol,
     register_external_worker,
     rotate_worker_secret,
+    supports_lease_attempt_token,
     update_worker_status,
     worker_protocol_header_value,
 )
@@ -106,6 +112,7 @@ class WorkerCapabilities(BaseModel):
     uses_manor_credentials: bool = True
     deployment: Literal["local", "remote", "cloud"] = "local"
     protocol_version: WorkerProtocolVersion
+    lease_attempt_token_version: Optional[WorkerLeaseFencingVersion] = None
 
 
 class RegisterRequest(BaseModel):
@@ -166,12 +173,14 @@ class WorkerRenameRequest(BaseModel):
 
 class HeartbeatActiveLease(BaseModel):
     lease_id: str
+    attempt_token: Optional[str] = None
     progress: Optional[float] = None
     events: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class HeartbeatCompletedLease(BaseModel):
     lease_id: str
+    attempt_token: Optional[str] = None
     status: Literal["done", "failed"]
     # Worker outputs are JSON values, not necessarily objects. Presence is
     # retained through ``model_fields_set`` so explicit null is not confused
@@ -179,7 +188,8 @@ class HeartbeatCompletedLease(BaseModel):
     result: Any = None
     error: Optional[dict] = None
     cost: Optional[dict] = None
-    evidence_refs: Optional[list[str]] = None
+    evidence_refs: Optional[list[str | dict[str, Any]]] = None
+    runtime_checkpoint: Optional[dict] = None
     task_output_value_kind: TaskOutputValueKind
 
 
@@ -201,6 +211,7 @@ class HeartbeatRequest(BaseModel):
 
 class LeaseDTO(BaseModel):
     lease_id: str
+    attempt_token: Optional[str] = None
     step_id: str
     plan_id: str
     workspace_id: Optional[str]
@@ -237,22 +248,30 @@ class HeartbeatResponse(BaseModel):
 # ── Lease lifecycle schemas ──────────────────────────────────────────
 
 class CompleteLeaseRequest(BaseModel):
+    attempt_token: Optional[str] = None
     result: Any = None
     cost: Optional[dict] = None
-    evidence_refs: Optional[list[str]] = None
+    evidence_refs: Optional[list[str | dict[str, Any]]] = None
     task_output_value_kind: TaskOutputValueKind
 
 
 class FailLeaseRequest(BaseModel):
+    attempt_token: Optional[str] = None
     error: dict
     will_retry: Optional[bool] = None
+    evidence_refs: Optional[list[str | dict[str, Any]]] = None
+    runtime_checkpoint: Optional[dict] = None
 
 
 class NeedHumanRequest(BaseModel):
+    attempt_token: Optional[str] = None
     prompt: str = Field(..., min_length=1, max_length=2000)
+    evidence_refs: Optional[list[str | dict[str, Any]]] = None
+    runtime_checkpoint: Optional[dict] = None
 
 
 class ExtendLeaseRequest(BaseModel):
+    attempt_token: Optional[str] = None
     extra_seconds: float = Field(default=300, gt=0, le=3600)
     progress: Optional[float] = Field(default=None, ge=0, le=1)
 
@@ -273,20 +292,22 @@ def _merge_worker_capabilities(
     *,
     worker_id: str | None = None,
 ) -> dict:
-    """Merge heartbeat capabilities without erasing just-connected sessions.
-
-    Older local worker builds probe browser sessions only once at startup.
-    After a
-    user connects a local browser session from Integrations, the API writes the
-    connected platform into worker.capabilities immediately; the next heartbeat
-    from an older daemon can otherwise shallow-merge an empty browser session
-    list over that fresh state.
-    """
+    """Merge heartbeat capabilities and normalize Chrome-only browser state."""
     merged = dict(stored or {})
+    merged.pop("local_browser", None)
     incoming = dict(reported or {})
     for key, value in incoming.items():
-        if key != "browser":
+        # Heartbeat capability discovery describes runtime availability.  The
+        # registered lease ceiling is server-owned admission policy and must
+        # not be raised by the same client that requests new work.
+        if key not in {"browser", "max_concurrent_leases"}:
             merged[key] = value
+    # A worker may add this fencing contract during a rolling SDK upgrade,
+    # but it cannot later downgrade itself and receive unfenced attempts.
+    if supports_lease_attempt_token(stored):
+        merged[LEASE_ATTEMPT_TOKEN_CAPABILITY] = int(
+            WorkerLeaseFencingVersion.ATTEMPT_TOKEN_V1
+        )
 
     if "browser" not in incoming:
         return merged
@@ -304,80 +325,29 @@ def _merge_worker_capabilities(
     browser = dict(current_browser)
     browser.update(reported_browser)
 
-    current_statuses = (
-        dict(current_browser.get("session_statuses") or {})
-        if isinstance(current_browser.get("session_statuses"), dict)
-        else {}
-    )
-    reported_statuses = (
-        dict(reported_browser.get("session_statuses") or {})
-        if isinstance(reported_browser.get("session_statuses"), dict)
-        else {}
-    )
-    session_statuses = {**current_statuses, **reported_statuses}
-    if session_statuses:
-        browser["session_statuses"] = session_statuses
+    if reported_browser.get("extension_install_mode") == "store":
+        for development_key in (
+            "extension_source_path",
+            "extension_load_path",
+            "extension_visible_load_path",
+            "extension_download_url",
+            "extension_download_path",
+            "extension_download_error",
+            "extension_build_error",
+        ):
+            browser.pop(development_key, None)
 
-    saved_sessions_authoritative = reported_browser.get("saved_sessions_authoritative") is True
-    for key in ("saved_sessions", "active_sessions"):
-        reported_sessions = _string_list(reported_browser.get(key))
-        if reported_sessions:
-            if key == "saved_sessions" and saved_sessions_authoritative:
-                # Modern local workers report saved_sessions from the local cookie
-                # files on every heartbeat. Treat that as the source of truth
-                # so reconnecting after a prior explicit disconnect works.
-                browser[key] = reported_sessions
-                for platform in reported_sessions:
-                    session_statuses[platform] = "connected"
-                last_action = (
-                    dict(browser.get("last_session_action") or {})
-                    if isinstance(browser.get("last_session_action"), dict)
-                    else {}
-                )
-                if (
-                    last_action.get("platform") in reported_sessions
-                    and last_action.get("status") == "disconnected"
-                ):
-                    browser["last_session_action"] = {
-                        **last_action,
-                        "status": "connected",
-                    }
-            else:
-                # For non-authoritative or active-session lists, do not let a
-                # stale heartbeat resurrect a platform that a stop_session
-                # action has already marked disconnected.
-                browser[key] = [
-                    platform
-                    for platform in reported_sessions
-                    if session_statuses.get(platform) != "disconnected"
-                ]
-            continue
-        if key == "saved_sessions" and saved_sessions_authoritative:
-            browser[key] = []
-            continue
-        if key in reported_browser:
-            preserved = [
-                platform
-                for platform in _string_list(current_browser.get(key))
-                if session_statuses.get(platform) == "connected"
-            ]
-            browser[key] = preserved
-
-    disconnected = {
-        platform
-        for platform, status in session_statuses.items()
-        if status == "disconnected"
-    }
-    if disconnected:
-        for key in ("saved_sessions", "active_sessions"):
-            if key in browser:
-                browser[key] = [
-                    platform
-                    for platform in _string_list(browser.get(key))
-                    if platform not in disconnected
-                ]
-    if session_statuses:
-        browser["session_statuses"] = session_statuses
+    for legacy_key in (
+        "playwright_available",
+        "browser_use_available",
+        "legacy_backend",
+        "active_sessions",
+        "saved_sessions",
+        "saved_sessions_authoritative",
+        "session_statuses",
+        "last_session_action",
+    ):
+        browser.pop(legacy_key, None)
 
     gateway = browser.get("gateway")
     if isinstance(gateway, dict):
@@ -402,6 +372,38 @@ def _sync_worker_runtime_version(
     if isinstance(runtime, dict):
         synced["runtime"] = {**runtime, "version": normalized_version}
     return synced
+
+
+HEARTBEAT_DB_WRITE_INTERVAL = timedelta(seconds=15)
+
+
+def _heartbeat_requires_worker_write(
+    req: HeartbeatRequest,
+    worker: Worker,
+    *,
+    now: datetime,
+) -> bool:
+    """Whether this beat would change the stored Worker row (or it is stale)."""
+    if worker.status in {WorkerStatus.PAIRING, WorkerStatus.OFFLINE}:
+        return True
+    if req.version and req.version != worker.version:
+        return True
+    last = worker.last_heartbeat_at
+    if last is None:
+        return True
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    if now - last >= HEARTBEAT_DB_WRITE_INTERVAL:
+        return True
+    projected = worker.capabilities
+    if _should_merge_heartbeat_capabilities(req, worker_status=worker.status):
+        projected = _merge_worker_capabilities(
+            projected, req.capabilities, worker_id=worker.id,
+        )
+    projected = _sync_worker_runtime_version(
+        projected, req.version, stored_version=worker.version,
+    )
+    return projected != (worker.capabilities or {})
 
 
 def _should_merge_heartbeat_capabilities(
@@ -536,10 +538,23 @@ def _build_lease_dto_for_worker(
     Kept separate from DB loading so the AI tool -> local action -> worker
     lease protocol can be regression-tested without a database.
     """
-    params = dict(getattr(step, "params", None) or {})
     human_input_response = getattr(step, "human_input_response", None)
-    if human_input_response is not None:
+    raw_params = getattr(step, "params", None)
+    params = (
+        executable_action_params(
+            raw_params,
+            human_input_response=human_input_response,
+        )
+        if getattr(step, "kind", None) == "action"
+        else dict(raw_params or {})
+    )
+    if getattr(step, "kind", None) != "action" and human_input_response is not None:
         params["human_input_response"] = human_input_response
+    if getattr(step, "kind", None) != "action":
+        # Preserve the pre-existing fence for non-action DTOs. Action DTOs
+        # already drop every Runtime control field through the shared provider
+        # projection above.
+        params.pop(ACTION_EFFECT_GENERATION_PARAM_KEY, None)
     resolved_subscription_id = (
         subscription_id
         or getattr(lease, "subscription_id", None)
@@ -549,6 +564,7 @@ def _build_lease_dto_for_worker(
     resolved_bindings = bindings if bindings is not None else {"tools": [], "skills": []}
     return LeaseDTO(
         lease_id=lease.id,
+        attempt_token=getattr(lease, "execution_claim_id", None),
         step_id=step.id,
         plan_id=step.plan_id,
         workspace_id=step.workspace_id,
@@ -886,11 +902,12 @@ async def _heartbeat_inner(
     dispatcher = Dispatcher()
     now = datetime.now(timezone.utc)
     instructions: list[HeartbeatInstruction] = []
-    wake_plan_ids: set[str] = set()
-
-    # Phase 1 — drain completions. Each one is independent; tolerate
-    # already-terminated leases (worker may have retried over a flaky
-    # network and we already processed it).
+    # Phase 1 — drain completions. Each one is an independent transaction:
+    # completion locks Workspace -> Task -> Plan -> Lease -> Step for its
+    # atomic cost roll-up, and retaining those locks while processing another
+    # workspace would let two heartbeat batches deadlock in opposite scope
+    # order. Tolerate already-terminated leases (the worker may have retried
+    # over a flaky network and we already processed it).
     for c in req.completed_since_last:
         try:
             if c.status == "done":
@@ -904,95 +921,131 @@ async def _heartbeat_inner(
                     cost=c.cost,
                     evidence_refs=c.evidence_refs,
                     task_output_value_kind=c.task_output_value_kind,
+                    expected_worker_id=worker.id,
+                    expected_execution_claim_id=c.attempt_token,
+                    require_execution_claim_id_if_present=True,
                 )
-                if completed_lease.plan_id:
-                    wake_plan_ids.add(completed_lease.plan_id)
             else:
                 failed_lease = await dispatcher.fail_lease(
                     db, c.lease_id,
                     error=c.error or {"type": "WorkerReportedFailure", "message": "no detail"},
+                    evidence_refs=c.evidence_refs,
+                    runtime_checkpoint=c.runtime_checkpoint,
+                    expected_worker_id=worker.id,
+                    expected_execution_claim_id=c.attempt_token,
+                    require_execution_claim_id_if_present=True,
                 )
-                if failed_lease.plan_id:
-                    wake_plan_ids.add(failed_lease.plan_id)
+            await db.commit()
         except LeaseNotActive:
             # Already terminal — ignore.
-            pass
+            await db.rollback()
+            await db.refresh(worker)
         except DispatchError:
-            pass
+            await db.rollback()
+            await db.refresh(worker)
 
     # Phase 2 — extend in-flight leases.
     for al in req.active_leases:
-        active_row = (await db.execute(
-            select(WorkLease, ExecutionStep)
-            .join(ExecutionStep, ExecutionStep.id == WorkLease.step_id)
-            .where(
-                WorkLease.id == al.lease_id,
-                WorkLease.worker_id == worker.id,
+        try:
+            lease_row = await dispatcher.extend_lease(
+                db,
+                al.lease_id,
+                progress=al.progress,
+                expected_worker_id=worker.id,
+                expected_execution_claim_id=al.attempt_token,
+                require_execution_claim_id_if_present=True,
             )
-        )).first()
-        if active_row is not None:
-            lease_row, step_row = active_row
+        except (LeaseNotActive, DispatchError):
+            # Each active report is its own transaction. A stale token cannot
+            # leave pending progress/cancel writes that later heartbeat
+            # bookkeeping would accidentally commit.
+            await db.rollback()
+            await db.refresh(worker)
+            instructions.append(HeartbeatInstruction(
+                type="cancel_lease",
+                payload={"lease_id": al.lease_id, "reason": "stale_attempt"},
+            ))
+            continue
+        step_row = (await db.execute(
+            select(ExecutionStep).where(ExecutionStep.id == lease_row.step_id)
+        )).scalar_one_or_none()
+        if step_row is not None:
             if coerce_step_status(step_row.step_status) == ExecutionStepStatus.CANCELLED:
-                if lease_row.status == WorkLeaseStatus.ACTIVE:
-                    lease_row.status = WorkLeaseStatus.CANCELLED.value
-                    lease_row.error = {
-                        "type": "LeaseCancelled",
-                        "message": "The plan or step was cancelled while the local CLI task was running.",
-                    }
-                    step_row.current_lease_id = None
-                    db.add(WorkerActivityLog(
-                        worker_id=worker.id,
-                        event="lease_cancel_requested",
-                        lease_id=al.lease_id,
-                        payload_summary={"step_id": step_row.id, "step_key": step_row.step_key},
-                    ))
+                # ``extend_lease`` already fenced this report and atomically
+                # superseded an attempt that no longer owns its Step.
                 instructions.append(HeartbeatInstruction(
                     type="cancel_lease",
                     payload={"lease_id": al.lease_id, "reason": "step_cancelled"},
                 ))
+                await db.commit()
+                await db.refresh(worker)
                 continue
-        try:
-            await dispatcher.extend_lease(
-                db, al.lease_id, progress=al.progress,
-            )
-        except (LeaseNotActive, DispatchError):
-            pass
+        await db.commit()
+        await db.refresh(worker)
 
-    # Phase 3 — worker bookkeeping.
-    worker.last_heartbeat_at = now
-    if req.version:
-        worker.version = req.version
-    if worker.status in {WorkerStatus.PAIRING, WorkerStatus.OFFLINE}:
-        was_offline = worker.status == WorkerStatus.OFFLINE
-        worker.status = WorkerStatus.ACTIVE.value
-        db.add(WorkerActivityLog(
-            worker_id=worker.id,
-            event="reconnected" if was_offline else "paired",
-            payload_summary={"source": "heartbeat"},
-            ip=None,
-        ))
-    if hasattr(worker, "consecutive_failures") and worker.status == WorkerStatus.ACTIVE:
-        # Workers that successfully heartbeat have not failed catastrophically.
-        # Don't reset counter here — leave that to explicit operator action.
-        pass
-    # Merge capabilities reported by the daemon into the stored worker record.
-    # This keeps DB capabilities in sync with what's actually installed on the
-    # machine (Browser Use, coding CLIs, etc.) without requiring a re-pair.
-    if _should_merge_heartbeat_capabilities(req, worker_status=worker.status):
-        worker.capabilities = _merge_worker_capabilities(
+    # Phase 3 — worker bookkeeping. Authentication loaded ``worker`` before
+    # this request began processing lease reports. Another heartbeat can have
+    # upgraded its fencing capability in the meantime, so lock and refresh the
+    # authoritative row before merging. This makes capability negotiation
+    # monotonic even when two requests entered with stale ORM snapshots.
+    #
+    # Most beats change nothing but the timestamp. Those skip the row lock and
+    # UPDATE entirely while the stored timestamp is fresh: freshness readers
+    # use 60s+ windows, and a beat that would not change the row cannot
+    # downgrade anything a concurrent beat wrote.
+    if _heartbeat_requires_worker_write(req, worker, now=now):
+        locked_worker = (await db.execute(
+            select(Worker)
+            .where(Worker.id == worker.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if locked_worker is None:
+            raise HTTPException(401, "worker is no longer registered")
+        worker = locked_worker
+        worker.last_heartbeat_at = now
+        if req.version:
+            worker.version = req.version
+        if worker.status in {WorkerStatus.PAIRING, WorkerStatus.OFFLINE}:
+            was_offline = worker.status == WorkerStatus.OFFLINE
+            worker.status = WorkerStatus.ACTIVE.value
+            db.add(WorkerActivityLog(
+                worker_id=worker.id,
+                event="reconnected" if was_offline else "paired",
+                payload_summary={"source": "heartbeat"},
+                ip=None,
+            ))
+        if hasattr(worker, "consecutive_failures") and worker.status == WorkerStatus.ACTIVE:
+            # Workers that successfully heartbeat have not failed catastrophically.
+            # Don't reset counter here — leave that to explicit operator action.
+            pass
+        # Merge capabilities reported by the daemon into the stored worker record.
+        # This keeps DB capabilities in sync with what's actually installed on the
+        # machine (Browser Use, coding CLIs, etc.) without requiring a re-pair.
+        if _should_merge_heartbeat_capabilities(req, worker_status=worker.status):
+            worker.capabilities = _merge_worker_capabilities(
+                worker.capabilities,
+                req.capabilities,
+                worker_id=worker.id,
+            )
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(worker, "capabilities")
+        worker.capabilities = _sync_worker_runtime_version(
             worker.capabilities,
-            req.capabilities,
-            worker_id=worker.id,
+            req.version,
+            stored_version=worker.version,
         )
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(worker, "capabilities")
-    worker.capabilities = _sync_worker_runtime_version(
-        worker.capabilities,
-        req.version,
-        stored_version=worker.version,
-    )
-    from sqlalchemy.orm.attributes import flag_modified
-    flag_modified(worker, "capabilities")
+
+        # End the Worker-owned transaction before checkout starts acquiring
+        # Workspace/Step locks.  A SELECT in checkout triggers autoflush; without
+        # this boundary the dirty heartbeat row is locked first (Worker ->
+        # Workspace), while lease completion takes Workspace first and rolls cost
+        # into the same Worker last.  Concurrent heartbeat/complete requests for
+        # one worker can therefore deadlock in opposite order.
+        await db.commit()
+        await db.refresh(worker)
 
     # Phase 4 — checkout new leases.
     new_leases: list[LeaseDTO] = []
@@ -1020,17 +1073,25 @@ async def _heartbeat_inner(
         ))
 
     await db.commit()
-    from packages.core.plans.wakeup import wake_plan_cycle
-    for plan_id in wake_plan_ids:
-        wake_plan_cycle(plan_id)
 
-    next_in = int((worker.preferences or {}).get("heartbeat_interval_seconds", 2))
+    next_in = _next_heartbeat_interval(worker, has_active_leases=bool(req.active_leases or new_leases))
     return HeartbeatResponse(
         server_time=now,
         next_heartbeat_in_seconds=next_in,
         new_leases=new_leases,
         instructions=instructions,
     )
+
+
+def _next_heartbeat_interval(worker: Worker, *, has_active_leases: bool) -> int:
+    """V2-compatible polling cadence; durable lease renewal remains unchanged."""
+    default = 5 if has_active_leases else 10
+    try:
+        interval = int((worker.preferences or {}).get("heartbeat_interval_seconds", default))
+    except (ValueError, TypeError, OverflowError):
+        interval = default
+    interval = max(1, min(60, interval))
+    return max(1, min(60, round(interval * random.uniform(0.8, 1.2))))
 
 
 # ── Lease lifecycle (worker auth) ────────────────────────────────────
@@ -1054,12 +1115,13 @@ async def lease_complete(
             cost=req.cost,
             evidence_refs=req.evidence_refs,
             task_output_value_kind=req.task_output_value_kind,
+            expected_worker_id=worker.id,
+            expected_execution_claim_id=req.attempt_token,
+            require_execution_claim_id_if_present=True,
         )
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))
     await db.commit()
-    from packages.core.plans.wakeup import wake_plan_cycle
-    wake_plan_cycle(completed_lease.plan_id)
 
 
 @router.post("/leases/{lease_id}/fail", status_code=204)
@@ -1073,12 +1135,15 @@ async def lease_fail(
     try:
         failed_lease = await Dispatcher().fail_lease(
             db, lease_id, error=req.error, will_retry=req.will_retry,
+            evidence_refs=req.evidence_refs,
+            runtime_checkpoint=req.runtime_checkpoint,
+            expected_worker_id=worker.id,
+            expected_execution_claim_id=req.attempt_token,
+            require_execution_claim_id_if_present=True,
         )
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))
     await db.commit()
-    from packages.core.plans.wakeup import wake_plan_cycle
-    wake_plan_cycle(failed_lease.plan_id)
 
 
 @router.post("/leases/{lease_id}/need-human", status_code=204)
@@ -1090,7 +1155,16 @@ async def lease_need_human(
 ):
     await _ensure_lease_belongs_to_worker(db, lease_id, worker)
     try:
-        await Dispatcher().lease_needs_human(db, lease_id, prompt=req.prompt)
+        await Dispatcher().lease_needs_human(
+            db,
+            lease_id,
+            prompt=req.prompt,
+            evidence_refs=req.evidence_refs,
+            runtime_checkpoint=req.runtime_checkpoint,
+            expected_worker_id=worker.id,
+            expected_execution_claim_id=req.attempt_token,
+            require_execution_claim_id_if_present=True,
+        )
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))
     await db.commit()
@@ -1109,6 +1183,9 @@ async def lease_extend(
             db, lease_id,
             extra_seconds=req.extra_seconds,
             progress=req.progress,
+            expected_worker_id=worker.id,
+            expected_execution_claim_id=req.attempt_token,
+            require_execution_claim_id_if_present=True,
         )
     except LeaseNotActive as exc:
         raise HTTPException(409, str(exc))

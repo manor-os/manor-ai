@@ -102,3 +102,29 @@ def test_stale_reconciliation_results_filters_only_stale() -> None:
     fresh = {"batch_id": "batch_2", "stale": False}
 
     assert stale_reconciliation_results([stale, fresh]) == [stale]
+
+def test_in_progress_without_live_plan_is_immediately_stale() -> None:
+    result = build_work_batch_reconciliation(
+        _batch("task_1"),
+        [_task("task_1", "in_progress", age_hours=0.1)],
+        now=NOW,
+        live_plan_task_ids=set(),
+    )
+
+    assert result["status"] == "stalled"
+    assert result["stale"] is True
+    assert result["stale_task_ids"] == ["task_1"]
+    assert result["stale_tasks"][0]["stale_after_hours"] == 0.0
+
+
+def test_in_progress_with_live_plan_is_not_immediately_stale() -> None:
+    result = build_work_batch_reconciliation(
+        _batch("task_1"),
+        [_task("task_1", "in_progress", age_hours=0.1)],
+        now=NOW,
+        live_plan_task_ids={"task_1"},
+    )
+
+    assert result["status"] == "active"
+    assert result["stale"] is False
+    assert result["stale_task_ids"] == []

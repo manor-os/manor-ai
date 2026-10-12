@@ -198,7 +198,8 @@ def test_user_prompt_separates_builtin_channels_from_external_integrations() -> 
                 "purpose": "Available unit facts.",
             }
         ],
-        governance_policy={"hitl_required_actions": ["external_message.send"]},
+        governance_policy={"approval": {"mode": None, "rules": [{"id": "review-send", "effect": "ask",
+            "selector": {"kind": "action", "action_key": "external_message.send"}}]}},
         goals=[],
         recent_tasks=[],
         recent_plans=[],
@@ -217,8 +218,9 @@ def test_user_prompt_separates_builtin_channels_from_external_integrations() -> 
     assert "primary_external: webchat" in text
     assert "No integrations/channels are configured" not in text
     assert "Connect email integration" not in text
-    assert "HITL required actions: external_message.send" in text
-    assert "Auto-approve actions: _(none configured)_" in text
+    assert "ask: external_message.send" in text
+    assert "Approval mode: follow account default" in text
+    assert "\nallow:" not in text
 
 
 def test_user_prompt_marks_setup_owned_starter_knowledge() -> None:
@@ -294,7 +296,7 @@ def test_strategist_sanitizes_unsupported_auto_approval_claims() -> None:
             )
         ],
     )
-    ctx = SimpleNamespace(governance_policy={"auto_approve_actions": []})
+    ctx = SimpleNamespace(governance_policy={"approval": {"mode": None, "rules": []}})
 
     service._sanitize_governance_language(proposal, ctx)
     combined = "\n".join(
@@ -621,7 +623,8 @@ async def test_outcome_evaluation_records_runtime_evidence(db_session) -> None:
 
 
 @pytest.mark.asyncio
-async def test_scheduled_strategist_skips_active_work_batch(db_session, monkeypatch) -> None:
+@pytest.mark.parametrize("trigger", ["scheduled", "work_batch_completed"])
+async def test_autonomous_strategist_skips_active_work_batch(db_session, monkeypatch, trigger) -> None:
     workspace = Workspace(
         id=generate_ulid(),
         entity_id="ent_strategy_batch_skip",
@@ -657,7 +660,7 @@ async def test_scheduled_strategist_skips_active_work_batch(db_session, monkeypa
 
     monkeypatch.setattr(service, "generate_proposal", _should_not_generate)
 
-    result = await service.run_review(db_session, workspace.id, trigger="scheduled")
+    result = await service.run_review(db_session, workspace.id, trigger=trigger)
 
     assert result["skipped"] is True
     assert result["reason"] == "active_work_batch"
@@ -665,7 +668,55 @@ async def test_scheduled_strategist_skips_active_work_batch(db_session, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
+async def test_event_review_rechecks_new_work_batch_before_persisting(db_session, monkeypatch) -> None:
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id="ent_strategy_late_batch",
+        name="Late batch review",
+        status="active",
+    )
+    db_session.add(workspace)
+    await db_session.commit()
+    existing_task_id = generate_ulid()
+
+    async def _generate_after_batch_started(ctx, *, review_id: str, db=None):
+        db.add(Task(
+            id=existing_task_id,
+            entity_id=workspace.entity_id,
+            workspace_id=workspace.id,
+            title="Already running",
+            status="in_progress",
+        ))
+        db.add(WorkspaceWorkBatch(
+            id=generate_ulid(),
+            entity_id=workspace.entity_id,
+            workspace_id=workspace.id,
+            source_kind="strategist_proposal",
+            status="active",
+            task_ids=[existing_task_id],
+            details={},
+        ))
+        await db.flush()
+        return Proposal(
+            review_id=review_id,
+            summary="Propose another cohort",
+            tasks=[],
+            notes="An unnecessary follow-up proposal",
+        )
+
+    monkeypatch.setattr(service, "generate_proposal", _generate_after_batch_started)
+
+    result = await service.run_review(
+        db_session, workspace.id, trigger="work_batch_completed",
+    )
+
+    assert result["skipped"] is True
+    assert result["reason"] == "active_work_batch"
+    assert result["open_task_ids"] == [existing_task_id]
+
+
+@pytest.mark.asyncio
+async def test_strategist_auto_approves_proposals_with_exact_approval_setting(
     db_session,
     monkeypatch,
 ) -> None:
@@ -674,7 +725,7 @@ async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
         entity_id="ent_strategy_auto_approve",
         name="Strategy Auto Approve",
         status="active",
-        settings={"strategist": {"auto_approve_proposals": True}},
+        settings={},
     )
     agent_id = generate_ulid()
     db_session.add(workspace)
@@ -696,6 +747,24 @@ async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
             status="active",
         )
     )
+    await db_session.commit()
+
+    from packages.core.models.user import User, UserMembership
+    from packages.core.proposals.constants import TASK_ACTION_KEY
+    from tests.approval_settings_test_utils import (
+        action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+    )
+
+    actor_id = generate_ulid()
+    db_session.add_all([
+        User(id=actor_id, entity_id=workspace.entity_id, email=f"{actor_id}@example.test",
+            password_hash="test-only", role="owner", status="active"),
+        UserMembership(user_id=actor_id, entity_id=workspace.entity_id, role="owner", status="active"),
+    ])
+    await db_session.flush()
+    await initialize_test_approval_owners(db_session, workspace, user_id=actor_id)
+    await set_workspace_test_approval(db_session, entity_id=workspace.entity_id,
+        workspace_id=workspace.id, actor_id=actor_id, user_rules=[action_rule(TASK_ACTION_KEY)])
     await db_session.commit()
 
     async def _fake_generate_proposal(ctx, *, review_id: str, db=None):
@@ -734,7 +803,6 @@ async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
                 "workspace_id": workspace_arg.id,
                 "task_ids": list(task_ids),
                 "auto_approved": auto_approved,
-                # Legacy workspace boolean → no standing-grant key to name.
                 "auto_approved_action_key": auto_approved_action_key,
             }
         )
@@ -751,13 +819,32 @@ async def test_strategist_auto_approves_proposals_when_workspace_pref_enabled(
             "workspace_id": workspace.id,
             "task_ids": result["task_ids"],
             "auto_approved": True,
-            "auto_approved_action_key": None,
+            "auto_approved_action_key": TASK_ACTION_KEY,
         }
     ]
     tasks = list((await db_session.execute(select(Task).where(Task.workspace_id == workspace.id))).scalars().all())
     assert len(tasks) == 1
     assert tasks[0].status == "in_progress"
     assert tasks[0].owner_service_key == "ops"
+
+
+def _add_active_content_subscription(db_session, workspace: Workspace) -> AgentSubscription:
+    agent = Agent(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        name="Content Agent",
+        status="active",
+    )
+    subscription = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        agent_id=agent.id,
+        service_key="content",
+        status="active",
+    )
+    db_session.add_all([agent, subscription])
+    return subscription
 
 
 @pytest.mark.asyncio
@@ -771,6 +858,7 @@ async def test_approve_proposal_creates_work_batch(db_session) -> None:
     review_id = "rv_batch_approve"
     task_ids = [generate_ulid(), generate_ulid()]
     db_session.add(workspace)
+    subscription = _add_active_content_subscription(db_session, workspace)
     for task_id in task_ids:
         db_session.add(
             Task(
@@ -779,15 +867,21 @@ async def test_approve_proposal_creates_work_batch(db_session) -> None:
                 workspace_id=workspace.id,
                 title=f"Proposal task {task_id[-4:]}",
                 status="proposed",
+                owner_service_key=subscription.service_key,
+                owner_subscription_id=subscription.id,
                 details={"strategist_review_id": review_id},
             )
         )
     await db_session.commit()
 
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    actor_id = await initialize_test_task_proposal(db_session, workspace, review_id=review_id)
     moved = await service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
         review_id=review_id,
+        actor_id=actor_id,
     )
     await db_session.commit()
 
@@ -962,6 +1056,8 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     db_session,
     monkeypatch,
 ) -> None:
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
     from packages.core.services.task_service import update_task
     from packages.core.tasks import ai_tasks
 
@@ -979,6 +1075,7 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: dispatched.append(task_id))
 
     db_session.add(workspace)
+    subscription = _add_active_content_subscription(db_session, workspace)
     db_session.add_all(
         [
             Task(
@@ -987,6 +1084,8 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
                 workspace_id=workspace.id,
                 title="Draft strategy document",
                 status="proposed",
+                owner_service_key=subscription.service_key,
+                owner_subscription_id=subscription.id,
                 details={"strategist_review_id": review_id, "strategist_task_key": "draft_strategy"},
             ),
             Task(
@@ -995,7 +1094,8 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
                 workspace_id=workspace.id,
                 title="Use strategy document for calendar",
                 status="proposed",
-                owner_service_key="content",
+                owner_service_key=subscription.service_key,
+                owner_subscription_id=subscription.id,
                 details={
                     "strategist_review_id": review_id,
                     "strategist_task_key": "calendar",
@@ -1007,10 +1107,14 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     )
     await db_session.commit()
 
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    actor_id = await initialize_test_task_proposal(db_session, workspace, review_id=review_id)
     moved = await service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
         review_id=review_id,
+        actor_id=actor_id,
     )
     await db_session.commit()
     assert set(moved) == {task_a_id, task_b_id}
@@ -1021,6 +1125,12 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     assert task_b.status == "pending"
     assert task_b.details["dependency_status"] == "waiting"
     assert dispatched == []
+    start_intents = select(RuntimeOutboxEvent.aggregate_id).where(
+        RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+        RuntimeOutboxEvent.aggregate_id.in_([task_a_id, task_b_id]),
+        RuntimeOutboxEvent.delivered_at.is_(None),
+    ).order_by(RuntimeOutboxEvent.aggregate_id)
+    assert list((await db_session.execute(start_intents)).scalars()) == [task_a_id]
 
     await update_task(
         db_session,
@@ -1039,7 +1149,8 @@ async def test_approve_proposal_gates_dependent_tasks_until_outputs_exist(
     assert task_b.details["dependency_status"] == "completed"
     assert task_b.details["dep_outputs"][0]["task_id"] == task_a_id
     assert task_b.details["dep_outputs"][0]["files"][0]["name"] == "strategy.md"
-    assert dispatched == [task_b_id]
+    assert dispatched == []
+    assert list((await db_session.execute(start_intents)).scalars()) == sorted([task_a_id, task_b_id])
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1167,7 @@ async def test_approve_selected_includes_required_predecessors(db_session) -> No
     task_c_id = generate_ulid()
 
     db_session.add(workspace)
+    subscription = _add_active_content_subscription(db_session, workspace)
     db_session.add_all(
         [
             Task(
@@ -1064,6 +1176,8 @@ async def test_approve_selected_includes_required_predecessors(db_session) -> No
                 workspace_id=workspace.id,
                 title="Prepare source artifact",
                 status="proposed",
+                owner_service_key=subscription.service_key,
+                owner_subscription_id=subscription.id,
                 details={"strategist_review_id": review_id, "strategist_task_key": "source"},
             ),
             Task(
@@ -1072,6 +1186,8 @@ async def test_approve_selected_includes_required_predecessors(db_session) -> No
                 workspace_id=workspace.id,
                 title="Use source artifact",
                 status="proposed",
+                owner_service_key=subscription.service_key,
+                owner_subscription_id=subscription.id,
                 details={
                     "strategist_review_id": review_id,
                     "strategist_task_key": "downstream",
@@ -1084,16 +1200,22 @@ async def test_approve_selected_includes_required_predecessors(db_session) -> No
                 workspace_id=workspace.id,
                 title="Optional unrelated task",
                 status="proposed",
+                owner_service_key=subscription.service_key,
+                owner_subscription_id=subscription.id,
                 details={"strategist_review_id": review_id, "strategist_task_key": "optional"},
             ),
         ]
     )
     await db_session.commit()
 
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    actor_id = await initialize_test_task_proposal(db_session, workspace, review_id=review_id)
     moved = await service.approve_proposal(
         db_session,
         entity_id=workspace.entity_id,
         review_id=review_id,
+        actor_id=actor_id,
         only_task_ids=[task_b_id],
     )
     await db_session.commit()

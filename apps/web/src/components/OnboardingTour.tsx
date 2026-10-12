@@ -1,11 +1,71 @@
 import { useLocation } from "react-router-dom";
 import SpotlightTour, { type TourStep } from "./SpotlightTour";
 import { t } from "../lib/i18n";
+import { useDisplayPreferences } from "../stores/displayPreferences";
 
 /**
  * Sidebar onboarding tour for new users.
- * Walks through the app shell: mode switcher, chat, and the workspace nav.
+ * Simple mode covers everyday chat and collaboration; professional mode covers the shell.
  */
+
+const SIMPLE_TOUR_STEPS: TourStep[] = [
+  {
+    target: "[data-tour='chat-input'], .chat-composer",
+    title: t("nav.chat"),
+    description: t("component.onboarding_tour.simple_chat"),
+    position: "top",
+    mode: "chat",
+    openSidebar: false,
+  },
+  {
+    target: "[data-tour='chat-sidebar-ai-chats']",
+    title: t("page.app_layout.ai_chats"),
+    description: t("component.onboarding_tour.simple_ai_chats"),
+    position: "right",
+    mode: "chat",
+    openSidebar: true,
+  },
+  {
+    target: "[data-tour='chat-sidebar-workspaces']",
+    title: t("page.app_layout.workspaces"),
+    description: t("component.onboarding_tour.simple_workspaces"),
+    position: "right",
+    mode: "chat",
+    openSidebar: true,
+  },
+  {
+    target: "[data-tour='create-workspace']",
+    title: t("page.workspaces.create_workspace"),
+    description: t("page.workspace_draft_chat.tell_me_what_you_want_to_build_i_ll_draft_the_op"),
+    position: "right",
+    mode: "chat",
+    openSidebar: true,
+  },
+  {
+    target: "[data-tour='chat-sidebar-group']",
+    title: t("component.onboarding_tour.simple_group_chats_title"),
+    description: t("component.onboarding_tour.simple_group_chats"),
+    position: "right",
+    mode: "chat",
+    openSidebar: true,
+  },
+  {
+    target: "[data-tour='chat-sidebar-dm']",
+    title: t("component.onboarding_tour.simple_direct_chats_title"),
+    description: t("component.onboarding_tour.simple_direct_chats"),
+    position: "right",
+    mode: "chat",
+    openSidebar: true,
+  },
+  {
+    target: "[data-tour='sidebar-more']",
+    title: t("nav.more"),
+    description: t("component.onboarding_tour.simple_more"),
+    position: "right",
+    mode: "chat",
+    openSidebar: true,
+  },
+];
 
 const TOUR_STEPS: TourStep[] = [
   {
@@ -51,7 +111,7 @@ const TOUR_STEPS: TourStep[] = [
   },
   {
     target: "[data-tour='nav-team']",
-    title: t("nav.team"),
+    title: t("nav.people"),
     description: t("component.onboarding_tour.invite_teammates_manage_roles_and_decide_who_can_view"),
     position: "right",
     mode: "workspace",
@@ -99,14 +159,17 @@ export function isTourSuppressedPath(pathname: string) {
   );
 }
 
-export default function OnboardingTour() {
+export default function OnboardingTour({ enabled = true }: { enabled?: boolean }) {
   const location = useLocation();
+  const interfaceMode = useDisplayPreferences((state) => state.interfaceMode);
   if (isTourSuppressedPath(location.pathname)) return null;
   return (
     <SpotlightTour
-      steps={TOUR_STEPS}
+      key={interfaceMode}
+      steps={interfaceMode === "simple" ? SIMPLE_TOUR_STEPS : TOUR_STEPS}
       storageKey={MAIN_TOUR_STORAGE_KEY}
       startEvent="manor:start-tour"
+      enabled={enabled}
     />
   );
 }

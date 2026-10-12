@@ -7,12 +7,14 @@ other one in the same transaction.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.approvals import (
+    APPROVAL_LIVE_STATUSES,
     ApprovalOriginKind,
     ApprovalStatus,
     HitlType,
@@ -22,6 +24,9 @@ from packages.core.constants.task import (
     TaskApprovalChoice,
     TaskRecoveryChoice,
     TaskType,
+)
+from packages.core.contracts.tool_effects import (
+    EffectReconciliationDecisionFactory,
 )
 from packages.core.governance.approvals import (
     ApprovalOrigin,
@@ -77,6 +82,75 @@ async def _message_for_request(
         if action.get("approval_request_id") == request_id:
             return message
     return None
+
+
+async def _supersede_conflicting_task_recovery_surfaces(
+    db: AsyncSession,
+    *,
+    task: Task,
+    keep_request_id: str,
+    plan_id: str,
+) -> None:
+    """Close older Task recovery surfaces before exposing a Plan-bound one."""
+
+    conflicts = list((await db.execute(
+        select(HitlRequest)
+        .where(
+            HitlRequest.entity_id == task.entity_id,
+            HitlRequest.workspace_id == task.workspace_id,
+            HitlRequest.origin_kind == ApprovalOriginKind.TASK.value,
+            HitlRequest.origin_task_id == task.id,
+            HitlRequest.action_key == "task.recover",
+            HitlRequest.status.in_([
+                status.value for status in APPROVAL_LIVE_STATUSES
+            ]),
+            HitlRequest.id != keep_request_id,
+        )
+        .order_by(HitlRequest.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalars().all())
+    if not conflicts:
+        return
+
+    now = datetime.now(timezone.utc)
+    from packages.core.ledger import adapters as ledger_adapters
+    from packages.core.ledger import event_types as ledger_et
+
+    conflict_ids = [request.id for request in conflicts]
+    for request in conflicts:
+        request.status = ApprovalStatus.EXPIRED.value
+        request.resolved_reason = "superseded_by_effect_reconciliation"
+        request.decided_at = now
+        request.decided_via = "effect_reconciliation"
+        await ledger_adapters.record_approval_event(
+            db,
+            request,
+            ledger_et.APPROVAL_EXPIRED,
+        )
+
+    messages = list((await db.execute(
+        select(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.entity_id == task.entity_id,
+            Conversation.workspace_id == task.workspace_id,
+            Message.resolved_at.is_(None),
+            Message.pending_action["approval_request_id"].as_string().in_(
+                conflict_ids
+            ),
+        )
+        .order_by(Message.id)
+        .with_for_update(of=Message)
+        .execution_options(populate_existing=True)
+    )).scalars().all())
+    for message in messages:
+        message.resolved_at = now
+        message.resolution = {
+            "choice": "superseded",
+            "reason": "superseded_by_effect_reconciliation",
+            "plan_id": plan_id,
+        }
 
 
 async def ensure_task_approval_hitl(
@@ -156,17 +230,59 @@ async def ensure_task_recovery_hitl(
     plan_id: Optional[str],
     prompt: str,
     issue: Optional[str] = None,
+    reconciliation: Optional[dict] = None,
 ) -> Message | None:
     """Create the one actionable recovery card for a stopped task."""
     if not task.workspace_id:
         return None
 
+    # Recovery ownership is Task-scoped even though effect reconciliation is
+    # bound to one Plan. Serializing on the Task keeps two Plan-specific dedup
+    # keys from each creating an independently actionable request/card pair.
+    locked_task_id = (await db.execute(
+        select(Task.id)
+        .where(
+            Task.id == task.id,
+            Task.entity_id == task.entity_id,
+            Task.workspace_id == task.workspace_id,
+        )
+        .with_for_update()
+    )).scalar_one_or_none()
+    if locked_task_id is None:
+        return None
+
     what_happened = "This task stopped before it finished."
+    needs_reconciliation = bool(
+        isinstance(reconciliation, dict) and reconciliation.get("effects")
+    )
+    reconciliation_snapshot = (
+        dict(reconciliation) if needs_reconciliation and reconciliation else {}
+    )
+    reconciliation_options = (
+        EffectReconciliationDecisionFactory.card_options(
+            reconciliation_snapshot
+        )
+        if needs_reconciliation
+        else []
+    )
+    if needs_reconciliation and not plan_id:
+        raise ValueError("effect reconciliation requires an exact Plan binding")
     payload = {
         "what_happened": what_happened,
         "why": (issue or prompt or "The run needs operator guidance before it can continue."),
-        "action_to_take": "Add guidance if needed, then retry the task, or cancel it.",
+        "action_to_take": (
+            EffectReconciliationDecisionFactory.action_to_take(
+                reconciliation_snapshot
+            )
+            if needs_reconciliation
+            else "Add guidance if needed, then retry the task, or cancel it."
+        ),
         "action_link": _task_url(task.id),
+        **(
+            {"reconciliation": reconciliation_snapshot}
+            if needs_reconciliation
+            else {}
+        ),
     }
     request = await mint_approval_request(
         db,
@@ -181,13 +297,46 @@ async def ensure_task_recovery_hitl(
             kind=ApprovalOriginKind.TASK.value,
             task_id=task.id,
             plan_id=plan_id,
-            context={"task_title": task.title},
+            context={
+                "task_title": task.title,
+                **(
+                    {"effect_reconciliation": reconciliation_snapshot}
+                    if needs_reconciliation
+                    else {}
+                ),
+            },
         ),
         reason=payload["why"],
         matched_rule="task.needs_recovery",
         hitl_type=HitlType.ERROR.value,
         payload=payload,
+        dedup_key=(
+            f"task:{task.id}:task.recover:effect_reconciliation:plan:{plan_id}"
+            if needs_reconciliation
+            else None
+        ),
     )
+    if needs_reconciliation:
+        if (
+            str(request.origin_task_id or "") != str(task.id)
+            or str(request.origin_plan_id or "") != str(plan_id)
+        ):
+            raise RuntimeError(
+                "effect reconciliation request lost its exact Task/Plan binding"
+            )
+        await _supersede_conflicting_task_recovery_surfaces(
+            db,
+            task=task,
+            keep_request_id=request.id,
+            plan_id=str(plan_id),
+        )
+        # A dedup hit may be an older recovery card. Refresh the authoritative
+        # snapshot in place so a late/new effect cannot leave the Task with a
+        # permanently stale but still-PENDING decision surface.
+        request_context = dict(request.context or {})
+        request_context["effect_reconciliation"] = reconciliation_snapshot
+        request.context = request_context
+        request.payload = dict(payload)
     existing = await _message_for_request(
         db,
         entity_id=task.entity_id,
@@ -195,6 +344,17 @@ async def ensure_task_recovery_hitl(
         request_id=request.id,
     )
     if existing is not None:
+        if needs_reconciliation and isinstance(existing.pending_action, dict):
+            pending_action = dict(existing.pending_action)
+            card_payload = (
+                dict(pending_action.get("payload") or {})
+                if isinstance(pending_action.get("payload"), dict)
+                else {}
+            )
+            card_payload["reconciliation"] = reconciliation_snapshot
+            pending_action["payload"] = card_payload
+            pending_action["options"] = reconciliation_options
+            existing.pending_action = pending_action
         return existing
 
     return await chat_service.post_message(
@@ -216,13 +376,166 @@ async def ensure_task_recovery_hitl(
             "hitl_type": HitlType.ERROR.value,
             "payload": payload,
             "prompt": what_happened,
-            "options": [
-                TaskRecoveryChoice.RETRY.value,
-                TaskRecoveryChoice.CANCEL.value,
-            ],
+            "options": (
+                reconciliation_options
+                if needs_reconciliation
+                else [
+                    TaskRecoveryChoice.RETRY.value,
+                    TaskRecoveryChoice.CANCEL.value,
+                ]
+            ),
         },
         meta={"task_id": task.id, "plan_id": plan_id, "task_hitl": True},
     )
+
+
+#: ``HitlRequest.action_key`` for a question a legacy agent task asked.
+TASK_INPUT_ACTION_KEY = "task.request_input"
+
+
+async def ensure_task_input_hitl(
+    db: AsyncSession,
+    task: Task,
+    *,
+    question: dict,
+) -> Message | None:
+    """Create the one input card for a task parked by ``request_input``.
+
+    Reuses the free-form ``HUMAN_INPUT`` card shape, keyed by ``task_id``
+    (no step): the workspace-chat resolve endpoint routes such a card to the
+    legacy task resume rather than to a plan step.
+    """
+    if not task.workspace_id:
+        return None
+    text = str(question.get("question") or "").strip()
+    if not text:
+        return None
+    payload = {
+        "question": text,
+        "why": str(question.get("context") or "The agent needs this to finish the task."),
+        "action_to_take": "Answer here or on the task page; the agent resumes with your answer.",
+        "action_link": _task_url(task.id),
+    }
+    for key in ("options", "fields", "context"):
+        if question.get(key):
+            payload[key] = question[key]
+    request = await mint_approval_request(
+        db,
+        subject=ApprovalSubject(
+            entity_id=task.entity_id,
+            workspace_id=task.workspace_id,
+            action_key=TASK_INPUT_ACTION_KEY,
+            resource_kind="task",
+            resource_id=task.id,
+            risk_level="low",
+        ),
+        origin=ApprovalOrigin(
+            kind=ApprovalOriginKind.TASK.value,
+            task_id=task.id,
+            context={
+                "task_title": task.title,
+                "pending_kind": PendingActionKind.HUMAN_INPUT.value,
+                "question": dict(question),
+            },
+        ),
+        reason=text,
+        matched_rule="task.request_input",
+        hitl_type=HitlType.INPUT.value,
+        payload=payload,
+    )
+    existing = await _message_for_request(
+        db,
+        entity_id=task.entity_id,
+        workspace_id=task.workspace_id,
+        request_id=request.id,
+    )
+    if existing is not None:
+        return existing
+
+    body_lines = [f"Question from the agent working on “{task.title}”:", "", text]
+    options = question.get("options")
+    if isinstance(options, list) and options:
+        body_lines.append("")
+        body_lines.append("Options: " + " / ".join(str(item) for item in options))
+    return await chat_service.post_message(
+        db,
+        entity_id=task.entity_id,
+        workspace_id=task.workspace_id,
+        body="\n".join(body_lines),
+        message_kind="hitl_request",
+        author_kind="agent",
+        refs=[{"type": "task", "id": task.id, "title": task.title}],
+        pending_action={
+            "kind": PendingActionKind.HUMAN_INPUT.value,
+            "task_id": task.id,
+            "approval_request_id": request.id,
+            "hitl_type": HitlType.INPUT.value,
+            "payload": payload,
+            "prompt": text,
+            **({"options": list(options)} if isinstance(options, list) and options else {}),
+            "input_schema": {
+                "type": "object",
+                "properties": {"response": {"type": "string"}},
+                "required": ["response"],
+            },
+        },
+        meta={"task_id": task.id, "task_hitl": True},
+    )
+
+
+async def resolve_task_input_hitl(
+    db: AsyncSession,
+    *,
+    task: Task,
+    user_id: str,
+    answer: str,
+    payload: Optional[dict] = None,
+) -> None:
+    """Grant + consume the task's open input request and close its cards."""
+    requests = list((await db.execute(
+        select(HitlRequest).where(
+            HitlRequest.entity_id == task.entity_id,
+            HitlRequest.origin_kind == ApprovalOriginKind.TASK.value,
+            HitlRequest.origin_task_id == task.id,
+            HitlRequest.action_key == TASK_INPUT_ACTION_KEY,
+            HitlRequest.status == ApprovalStatus.PENDING.value,
+        )
+    )).scalars().all())
+    for request in requests:
+        request.context = {
+            **(request.context or {}),
+            "answer": {"answer": answer, "payload": dict(payload or {}), "answered_by": user_id},
+        }
+        await grant_approval(db, request, by_user_id=user_id, via="task_hitl")
+        await consume_approval(db, request)
+
+    if not task.workspace_id:
+        return
+    rows = list((await db.execute(
+        select(Message)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.entity_id == task.entity_id,
+            Conversation.workspace_id == task.workspace_id,
+            Message.resolved_at.is_(None),
+            Message.pending_action.isnot(None),
+        )
+    )).scalars().all())
+    resolution = {"choice": "respond", "note": answer}
+    for message in rows:
+        action = message.pending_action if isinstance(message.pending_action, dict) else {}
+        if (
+            action.get("kind") == PendingActionKind.HUMAN_INPUT.value
+            and action.get("task_id") == task.id
+            and not action.get("step_id")
+        ):
+            await chat_service.resolve_pending_action(
+                db,
+                message_id=message.id,
+                user_id=user_id,
+                resolution=resolution,
+                emit_followup=False,
+            )
 
 
 async def resolve_task_hitl(

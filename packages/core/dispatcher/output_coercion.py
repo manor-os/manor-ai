@@ -24,6 +24,7 @@ from packages.core.contracts.task_output import (
     output_contract_for_schema,
 )
 from packages.core.contracts.shapes import coerce_to_shape
+from packages.core.services.file_refs import parse_file_reference
 
 
 _TEXT_KEYS = (
@@ -106,7 +107,9 @@ def coerce_step_output_for_schema(
         # never receive heuristic fields.
         parsed = _parse_wrapped_json(result, schema=contract.payload_schema or schema)
         shape_name = contract.canonical_shape_name
-        return coerce_to_shape(shape_name, parsed) if shape_name else parsed
+        if shape_name:
+            return coerce_to_shape(shape_name, parsed)
+        return _coerce_bare_payload_file_lists(parsed, contract.payload_schema or schema)
 
     schema_type = _schema_type(schema)
     coerced = _parse_wrapped_json(result, schema=schema)
@@ -345,16 +348,10 @@ def _fs_path_from_api_url(value: Any) -> str | None:
     """
     if not isinstance(value, str):
         return None
-    raw = value.split("?", 1)[0].strip().lstrip("/")
-    prefix = "api/v1/fs/"
-    if not raw.startswith(prefix):
+    ref = parse_file_reference(value)
+    if ref is None or not ref.entity_id or not ref.fs_path:
         return None
-    rest = raw[len(prefix):]
-    if rest.startswith("public/"):
-        return None
-    _entity, _, rel = rest.partition("/")
-    rel = rel.strip("/")
-    return rel or None
+    return ref.fs_path
 
 
 def _artifact_scalar_value_for_key(key: str, refs: list[dict[str, str]]) -> str | None:
@@ -399,6 +396,50 @@ def _artifact_scalar_value_for_key(key: str, refs: list[dict[str, str]]) -> str 
         return None
 
     return None
+
+
+def _coerce_bare_payload_file_lists(parsed: Any, schema: Any) -> Any:
+    """Rewrite existing file lists onto custom plan file-list schemas.
+
+    Custom bare payloads skip heuristic field inference, but agents still
+    submit mixed path strings, ``{type, source, fs_path}`` objects, and
+    URL-only fetch refs under an already-declared file-list key. Only
+    reformat those existing items; do not invent a missing ``files`` array
+    from summary text. Already conforming values and closed object contracts
+    are native payloads, not inputs for the legacy file alias projection.
+    """
+    from packages.core.dispatcher.validation import maybe_collect_errors
+
+    if not isinstance(parsed, dict) or not isinstance(schema, dict):
+        return parsed
+    props = _schema_properties(schema)
+    output = None
+    for key in _FILE_LIST_KEYS:
+        child = parsed.get(key)
+        if not isinstance(child, list) or not child:
+            continue
+        files_schema = props.get(key) if isinstance(props.get(key), dict) else {}
+        if not (
+            _array_items_are_strings(files_schema)
+            or _array_item_object_properties(files_schema)
+        ):
+            continue
+        item_schema = files_schema.get("items")
+        if (
+            isinstance(item_schema, dict)
+            and item_schema.get("additionalProperties") is False
+        ) or not maybe_collect_errors(files_schema, child):
+            # Normalization drops custom fields (including open_url/const)
+            # and adds name/path. It must neither corrupt valid submissions
+            # nor erase model-authored errors from a closed item contract.
+            continue
+        if output is None:
+            output = dict(parsed)
+        output[key] = _format_file_refs_for_schema(
+            _normalize_file_refs(child),
+            files_schema,
+        )
+    return parsed if output is None else output
 
 
 def _infer_files(output: dict[str, Any], props: dict[str, Any], required: set[str]) -> None:
@@ -990,8 +1031,8 @@ def _filter_additional_properties(schema: dict, output: dict[str, Any]) -> dict[
     return {key: value for key, value in output.items() if key in props}
 
 
-def _collect_file_refs(value: Any) -> list[dict[str, str]]:
-    refs: list[dict[str, str]] = []
+def _collect_file_refs(value: Any) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
@@ -1017,8 +1058,8 @@ def _collect_file_refs(value: Any) -> list[dict[str, str]]:
     return _dedupe_file_refs(refs)
 
 
-def _normalize_file_refs(values: list[Any]) -> list[dict[str, str]]:
-    refs: list[dict[str, str]] = []
+def _normalize_file_refs(values: list[Any]) -> list[dict[str, Any]]:
+    refs: list[dict[str, Any]] = []
     for item in values:
         if isinstance(item, dict):
             ref = _file_ref_from_dict(item)
@@ -1029,13 +1070,51 @@ def _normalize_file_refs(values: list[Any]) -> list[dict[str, str]]:
     return _dedupe_file_refs(refs)
 
 
-def _format_file_refs_for_schema(refs: list[dict[str, str]], files_schema: Any) -> list[Any]:
+def _format_file_refs_for_schema(refs: list[dict[str, Any]], files_schema: Any) -> list[Any]:
     if _array_items_are_strings(files_schema):
         return [value for ref in refs if (value := _file_ref_scalar_value(ref))]
     item_props = _array_item_object_properties(files_schema)
     if item_props:
-        return [_project_file_ref_onto_item(ref, item_props) for ref in refs]
+        projected = [_project_file_ref_onto_item(ref, item_props) for ref in refs]
+        return _drop_unsatisfiable_file_items_when_mixed(projected, files_schema)
     return refs
+
+
+def _array_item_required(schema: Any) -> list[str]:
+    if not isinstance(schema, dict):
+        return []
+    items = schema.get("items")
+    if not isinstance(items, dict):
+        return []
+    required = items.get("required") or []
+    if not isinstance(required, list):
+        return []
+    return [str(key) for key in required]
+
+
+def _drop_unsatisfiable_file_items_when_mixed(
+    items: list[Any],
+    files_schema: Any,
+) -> list[Any]:
+    """Drop extra URL/fetch refs when workspace files already satisfy the schema.
+
+    Agents often append web_fetch URLs next to real ``fs_path`` documents.
+    Keep those extras when they are the only evidence, so a genuine missing
+    path still fails validation.
+    """
+    required = _array_item_required(files_schema)
+    if not required:
+        return items
+    keep: list[Any] = []
+    drop = False
+    for item in items:
+        if isinstance(item, dict) and all(_has_value(item.get(key)) for key in required):
+            keep.append(item)
+        else:
+            drop = True
+    if keep and drop:
+        return keep
+    return items
 
 
 def _array_items_are_strings(schema: Any) -> bool:
@@ -1055,7 +1134,7 @@ def _array_item_object_properties(schema: Any) -> dict[str, Any]:
     return {}
 
 
-def _project_file_ref_onto_item(ref: dict[str, str], item_props: dict[str, Any]) -> dict[str, str]:
+def _project_file_ref_onto_item(ref: dict[str, Any], item_props: dict[str, Any]) -> dict[str, Any]:
     """Re-key a canonical file ref onto the property names an items schema asks for.
 
     The collector always normalizes references to canonical keys (``name``,
@@ -1066,24 +1145,45 @@ def _project_file_ref_onto_item(ref: dict[str, str], item_props: dict[str, Any])
     never borrows a URL. Existing keys are preserved so no evidence is dropped,
     and a property stays missing (failing validation) when no value of the right
     kind exists, so real failures are not hidden.
+
+    Boolean ``exists`` is filled ``True`` only when a filesystem ``fs_path`` or
+    ``path`` is already present. Submitted ``exists=False`` is kept. ``role``
+    and other non-path fields are never invented.
     """
-    projected = dict(ref)
+    projected: dict[str, Any] = dict(ref)
     for key, prop_schema in item_props.items():
         if _has_value(projected.get(key)):
             continue
-        if not isinstance(prop_schema, dict) or _schema_type(prop_schema) != "string":
+        if not isinstance(prop_schema, dict):
             continue
-        value = _artifact_scalar_value_for_key(key, [ref])
-        if value:
-            projected[key] = value
+        schema_type = _schema_type(prop_schema)
+        if schema_type == "string":
+            value = _artifact_scalar_value_for_key(key, [ref])
+            if value:
+                projected[key] = value
+            continue
+        if (
+            key == "exists"
+            and schema_type == "boolean"
+            and (_has_value(projected.get("fs_path")) or _has_value(projected.get("path")))
+        ):
+            projected["exists"] = True
     return projected
 
 
-def _file_ref_scalar_value(ref: dict[str, str]) -> str | None:
-    return ref.get("path") or ref.get("url") or ref.get("document_id") or ref.get("name")
+def _file_ref_scalar_value(ref: dict[str, Any]) -> str | None:
+    for key in ("path", "url", "document_id", "name"):
+        value = ref.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
 
 
-def _file_ref_from_dict(item: dict[str, Any]) -> dict[str, str] | None:
+def _is_file_ref_extra_scalar(value: Any) -> bool:
+    return type(value) in (str, bool, int, float)
+
+
+def _file_ref_from_dict(item: dict[str, Any]) -> dict[str, Any] | None:
     path = _first_string(item, _FILE_PATH_KEYS)
     url = _first_string(item, _FILE_URL_KEYS)
     document_id = _first_string(item, ("document_id",))
@@ -1091,7 +1191,17 @@ def _file_ref_from_dict(item: dict[str, Any]) -> dict[str, str] | None:
     if not value:
         return None
 
-    ref = _file_ref_from_value(value)
+    ref: dict[str, Any] = _file_ref_from_value(value)
+    for key, extra in item.items():
+        if key in {"name", "path", "url", "document_id"}:
+            continue
+        if not _is_file_ref_extra_scalar(extra):
+            continue
+        if type(extra) is str:
+            extra = extra.strip()
+            if not extra:
+                continue
+        ref[key] = extra
     if item.get("name"):
         ref["name"] = str(item["name"])
     if path:
@@ -1118,11 +1228,11 @@ def _file_ref_from_value(value: Any) -> dict[str, str]:
     return ref
 
 
-def _dedupe_file_refs(refs: list[dict[str, str]]) -> list[dict[str, str]]:
+def _dedupe_file_refs(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
-    out: list[dict[str, str]] = []
+    out: list[dict[str, Any]] = []
     for ref in refs:
-        key = ref.get("path") or ref.get("url") or ref.get("document_id") or ref.get("name")
+        key = _file_ref_scalar_value(ref)
         if not key or key in seen:
             continue
         seen.add(key)

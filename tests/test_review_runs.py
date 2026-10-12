@@ -11,8 +11,10 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import select
 
 from packages.core.ledger import event_types as et
@@ -23,6 +25,7 @@ from packages.core.models.workspace import Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.review import (
     ReviewAlreadyRunning,
+    ReviewWorkspaceUnavailable,
     begin_review,
     complete_review,
     events_in_window,
@@ -36,6 +39,14 @@ ENTITY_ID = "01REVIEWENTITY000000000000"
 WORKSPACE_ID = "01REVIEWWORKSPACE000000000"
 
 _seq = 0
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def review_workspaces(db_session):
+    # Reviews now claim a real Workspace lifecycle boundary, not a bare ID.
+    for workspace_id in (WORKSPACE_ID, "01REVIEWWORKSPACEOTHER0000", "01REVIEWWORKSPACEEMPTY0000"):
+        db_session.add(Workspace(id=workspace_id, entity_id=ENTITY_ID, name="Review WS"))
+    await db_session.flush()
 
 
 async def _emit(db, *, workspace_id: str = WORKSPACE_ID, event_type: str = et.EXECUTION_COMPLETED) -> WorkspaceEvent:
@@ -195,10 +206,43 @@ async def test_begin_review_freezes_workspace_and_policy_revisions(db_session):
     assert review.policy_revision == 3
 
 
-async def test_begin_review_without_workspace_or_policy_rows_freezes_none(db_session):
+async def test_begin_review_without_policy_row_freezes_no_policy_revision(db_session):
     review = await _begin(db_session)
-    assert review.workspace_revision is None
+    assert review.workspace_revision == 0
     assert review.policy_revision is None
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "deleted", "archived", "foreign_entity", "paused_autonomy"])
+async def test_begin_review_revalidates_workspace_after_admission_lock(db_session, unavailable):
+    workspace_id = WORKSPACE_ID
+    workspace = await db_session.get(Workspace, workspace_id)
+    if unavailable == "missing":
+        workspace_id = "01REVIEWMISSING00000000000"
+    elif unavailable == "deleted":
+        workspace.deleted_at = datetime.now(timezone.utc)
+    elif unavailable == "archived":
+        workspace.status = "archived"
+    elif unavailable == "foreign_entity":
+        workspace.entity_id = "01REVIEWFOREIGN00000000000"
+    else:
+        workspace.status = "paused"
+    await db_session.flush()
+    scoped_reviews = select(ReviewRun.id).where(
+        ReviewRun.entity_id == ENTITY_ID,
+        ReviewRun.workspace_id == workspace_id,
+    )
+    before = (await db_session.execute(scoped_reviews)).scalars().all()
+    with pytest.raises(ReviewWorkspaceUnavailable, match="no longer available"):
+        await _begin(db_session, workspace_id=workspace_id)
+    assert (await db_session.execute(scoped_reviews)).scalars().all() == before
+
+
+async def test_paused_workspace_still_admits_human_requested_review(db_session):
+    workspace = await db_session.get(Workspace, WORKSPACE_ID)
+    workspace.status = "paused"
+    await db_session.flush()
+    review = await _begin(db_session, trigger_kind="human_requested")
+    assert review.status == "running"
 
 
 # ── watermark chain ────────────────────────────────────────────────────

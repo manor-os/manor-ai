@@ -1,0 +1,7 @@
+{
+  "name": "manor-docx-sandbox-runtime",
+  "private": true,
+  "dependencies": {
+    "docx": "9.7.1"
+  }
+}

@@ -1,6 +1,8 @@
 # Node
 **/node_modules
 **/dist
+!apps/web/vendor/image-size/dist/
+!apps/web/vendor/image-size/dist/**
 
 # Python
 **/__pycache__
@@ -22,6 +24,7 @@
 
 # Docker
 docker-compose*.yml
+.v3-browser-compose.override.yml
 
 # Docs / tests
 docs

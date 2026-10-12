@@ -8,7 +8,9 @@
 没有任何东西会报错。所以这些用例按「同一份载荷的多种合法序列化」来测,而不是
 只测生产代码今天恰好产出的那一种。
 """
+import ast
 import json
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +87,48 @@ def test_marker_must_be_true_not_merely_truthy():
     assert is_hitl_envelope({"__hitl__": 1}) is False
 
 
+def _literal_prefix(candidate: ast.expr) -> str | None:
+    if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+        return candidate.value
+    if not isinstance(candidate, ast.JoinedStr):
+        return None
+    parts = []
+    for value in candidate.values:
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            break
+        parts.append(value.value)
+    return "".join(parts)
+
+
+def _is_serialized_hitl_prefix_check(node: ast.Call) -> bool:
+    if not (isinstance(node.func, ast.Attribute) and node.func.attr == "startswith" and node.args):
+        return False
+    prefix = node.args[0]
+    prefixes = prefix.elts if isinstance(prefix, ast.Tuple) else (prefix,)
+    return any(
+        (literal_prefix := _literal_prefix(candidate)) is not None
+        and literal_prefix.lstrip().startswith("{")
+        and "__hitl__" in literal_prefix
+        for candidate in prefixes
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("result.strip().startswith('{\"__hitl__\":')", True),
+        ("result.strip().startswith(('{\"__hitl__\":', '{\"ok\":'))", True),
+        ("result.strip().startswith(f'{{\"__hitl__\":')", True),
+        ('not str(key).startswith("_") or str(key) == "__hitl__"', False),
+        ('result.strip().startswith("not-json {__hitl__}")', False),
+        ("result.strip().startswith('{')", False),
+    ],
+)
+def test_hitl_prefix_guard_inspects_startswith_argument(source, expected):
+    call = next(node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Call))
+    assert _is_serialized_hitl_prefix_check(call) is expected
+
+
 def test_no_production_code_detects_hitl_by_string_prefix():
     """守一类,不守一处。
 
@@ -92,19 +136,17 @@ def test_no_production_code_detects_hitl_by_string_prefix():
     两处),PR #475 又照抄了第五、第六处。修掉六处不解决问题 —— 下一个人
     照样会写。按仓库扫。
     """
-    import pathlib
-    import re
-
-    root = pathlib.Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1]
     offenders = []
     for path in (*root.glob("packages/**/*.py"), *root.glob("apps/api/**/*.py")):
         if path.name == "hitl_envelope.py":
             continue
-        for lineno, line in enumerate(path.read_text().splitlines(), 1):
-            if re.match(r"\s*#", line):
-                continue
-            if "startswith" in line and "__hitl__" in line:
-                offenders.append(f"{path.relative_to(root)}:{lineno}")
+        tree = ast.parse(path.read_text(), filename=str(path))
+        offenders.extend(
+            f"{path.relative_to(root)}:{node.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and _is_serialized_hitl_prefix_check(node)
+        )
     assert not offenders, (
         "这些地方在用字符串前缀判断 HITL 载荷,改用 parse_hitl_envelope():\n  "
         + "\n  ".join(offenders)

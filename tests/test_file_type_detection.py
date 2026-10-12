@@ -1,10 +1,31 @@
 from __future__ import annotations
 
 import json
+import zipfile
 
 import pytest
 
 from packages.core.services.file_type_detection import detect_file_type, mime_for_extension
+
+
+def test_detect_file_type_rejects_xml_entities_in_office_manifest(tmp_path):
+    path = tmp_path / "untrusted.xlsm"
+    manifest = b"""<?xml version="1.0"?>
+<!DOCTYPE Types [<!ENTITY payload "macroEnabled">]>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Override PartName="/xl/workbook.xml"
+    ContentType="application/vnd.ms-excel.sheet.&payload;.main+xml"/>
+</Types>
+"""
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("[Content_Types].xml", manifest)
+        archive.writestr("xl/workbook.xml", "<workbook/>")
+
+    detected = detect_file_type(str(path), declared_name=path.name)
+
+    assert detected.sniffed_extension == "zip"
+    assert detected.extension == "zip"
+    assert detected.mismatch is True
 
 
 def test_detect_file_type_preserves_declared_code_extensions(tmp_path):
@@ -477,3 +498,15 @@ def test_detect_file_type_preserves_raw_diagram_identity(
     assert detected.mime_type == expected_mime
     assert detected.display_name == filename
     assert detected.mismatch is False
+
+
+def test_detect_file_type_registers_wav_as_audio(tmp_path):
+    path = tmp_path / "master.wav"
+    path.write_bytes(b"RIFF" + b"\x00" * 4 + b"WAVE" + b"\x00" * 32)
+
+    detected = detect_file_type(str(path), declared_name=path.name)
+
+    assert detected.extension == "wav"
+    assert detected.mime_type == "audio/wav"
+    assert mime_for_extension("wav") == "audio/wav"
+    assert mime_for_extension("mp3") == "audio/mpeg"

@@ -194,9 +194,14 @@ async def refresh_automation_index(
     )).scalars().all())
     jobs = [
         job for job in jobs
-        if job.workspace_id == workspace.id
-        or (job.execution_target or {}).get("workspace_id") == workspace.id
+        if (
+            job.workspace_id == workspace.id
+            or (job.execution_target or {}).get("workspace_id") == workspace.id
+        )
     ]
+    from packages.core.services.scheduler_service import is_agent_initiative_driver
+
+    jobs = [job for job in jobs if not is_agent_initiative_driver(job)]
     bindings = list((await db.execute(
         select(WorkflowBinding).where(
             WorkflowBinding.workspace_id == workspace.id,
@@ -376,6 +381,16 @@ async def _apply_automation_or_workflow(
         raise ChangeApplyError(
             f"{target_kind} {target_id} no longer exists", code="INSUFFICIENT_DATA",
         )
+    if target_kind == "scheduled_job":
+        from packages.core.services.scheduler_service import (
+            is_agent_initiative_driver,
+        )
+
+        if is_agent_initiative_driver(row):
+            raise ChangeApplyError(
+                "Agent Initiative drivers cannot be changed as generic automations",
+                code="MANAGED_AGENT_INITIATIVE",
+            )
     if operation == "update":
         if target_kind == "scheduled_job" and "execution_target" in patch:
             if not isinstance(patch["execution_target"], dict):

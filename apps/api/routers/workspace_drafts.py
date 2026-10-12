@@ -15,10 +15,11 @@ from typing import Any, AsyncGenerator, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from packages.core.constants.blueprints import BlueprintStatus
 from packages.core.database import async_session, get_db
@@ -29,9 +30,9 @@ from packages.core.services import workspace_draft_service as draft_service
 from packages.core.services.marketplace_resource_links import (
     MarketplaceIdentityConflictError,
 )
-from packages.core.services.marketplace_billing import MarketplacePaidPlanRequiredError
 from packages.core.services.plan_gate import WorkspacePlanLimitError
 from packages.core.services.sse_events import format_sse
+from packages.core.services.workspace_draft_sources import strip_source_text
 from apps.api.deps import enforce_plan_resource, get_current_user, require_plan
 from apps.api.streaming_concurrency import acquire_chat_stream_lease
 
@@ -39,6 +40,8 @@ logger = logging.getLogger(__name__)
 
 
 _sse = format_sse
+
+_DRAFT_STREAM_KEEPALIVE_SECONDS = 15.0
 
 
 class _HiddenBlockTokenFilter:
@@ -136,16 +139,43 @@ class DraftTurnResponse(BaseModel):
     draft: DraftResponse
 
 
+_ULID_PATTERN = r"^[0-9A-HJKMNP-TV-Z]{26}$"
+
+
+def _validate_ulid_list(value: Optional[list[str]]) -> Optional[list[str]]:
+    if value is None:
+        return None
+    import re
+
+    cleaned = [str(item).strip() for item in value if str(item or "").strip()]
+    bad = [item for item in cleaned if not re.match(_ULID_PATTERN, item)]
+    if bad:
+        raise ValueError(f"document_ids must be ULIDs: {bad}")
+    return cleaned
+
+
 class StartDraftRequest(BaseModel):
     initial_brief: Optional[str] = None
     draft_id: Optional[str] = Field(
         default=None,
-        pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$",
+        pattern=_ULID_PATTERN,
     )
+    document_ids: Optional[list[str]] = Field(default=None, max_length=20)
+
+    @field_validator("document_ids")
+    @classmethod
+    def _validate_document_ids(cls, value):
+        return _validate_ulid_list(value)
 
 
 class DraftMessageRequest(BaseModel):
     message: str
+    document_ids: Optional[list[str]] = Field(default=None, max_length=20)
+
+    @field_validator("document_ids")
+    @classmethod
+    def _validate_document_ids(cls, value):
+        return _validate_ulid_list(value)
 
 
 class ApplyBlueprintRequest(BaseModel):
@@ -161,12 +191,17 @@ class FinalizeDraftResponse(BaseModel):
 
 async def _hydrate_response(
     db: AsyncSession, draft: WorkspaceDraft,
+    *, blueprints: dict[str, WorkspaceBlueprint] | None = None,
 ) -> DraftResponse:
     draft_service.reconcile_draft_fields(draft)
 
     suggestion: Optional[BlueprintSuggestionResponse] = None
     if draft.suggested_blueprint_id and not draft.applied_blueprint_id:
-        bp = await db.get(WorkspaceBlueprint, draft.suggested_blueprint_id)
+        bp = (
+            blueprints.get(draft.suggested_blueprint_id)
+            if blueprints is not None
+            else await db.get(WorkspaceBlueprint, draft.suggested_blueprint_id)
+        )
         if bp is not None and bp.status == BlueprintStatus.PUBLISHED:
             suggestion = BlueprintSuggestionResponse(
                 id=bp.id,
@@ -203,10 +238,10 @@ async def _hydrate_response(
         entity_id=draft.entity_id,
         user_id=draft.user_id,
         status=draft.status,
-        fields={
+        fields=strip_source_text({
             key: value for key, value in (draft.fields or {}).items()
             if key != "_blueprint_source_payload"
-        },
+        }),
         messages=visible_messages,
         missing=list(draft.missing or []),
         ready=bool(draft.ready),
@@ -258,6 +293,7 @@ async def create_draft(
         entity_id=user.entity_id,
         user_id=user.id,
         initial_brief=req.initial_brief,
+        document_ids=req.document_ids,
     )
     await db.commit()
     return DraftTurnResponse(reply=reply, draft=await _hydrate_response(db, draft))
@@ -272,6 +308,7 @@ async def create_draft(
 # Event names emitted:
 #   start    {draft_id, status}
 #   token    {content}            -- one or more deltas of assistant text
+#   keepalive {draft_id}           -- keeps quiet tool phases connected
 #   done     {reply, draft}       -- the full final reply + hydrated draft
 #   error    {message}
 
@@ -282,6 +319,7 @@ async def _stream_turn(
     draft_id: str,
     user_message: str,
     mode: Literal["create", "message"],
+    document_ids: list[str] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Run one turn against a durable draft and stream tokens as SSE.
 
@@ -371,6 +409,7 @@ async def _stream_turn(
                     on_tool_start=on_tool_start,
                     on_tool_end=on_tool_end,
                     dedupe_opening=mode == "create",
+                    document_ids=document_ids,
                 )
                 await db.commit()
                 hydrated = await _hydrate_response(db, draft)
@@ -399,7 +438,19 @@ async def _stream_turn(
 
     try:
         while True:
-            event_name, payload = await queue.get()
+            try:
+                event_name, payload = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=_DRAFT_STREAM_KEEPALIVE_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # Capability matching can spend several minutes inside a
+                # single tool call without producing model deltas. Emit a
+                # small frame so proxies and browsers do not mistake that
+                # quiet period for an abandoned response and cancel runner
+                # before it can enqueue the terminal ``done`` event.
+                yield _sse("keepalive", {"draft_id": draft_id})
+                continue
             if (event_name, payload) == DONE:
                 break
             yield _sse(event_name, payload)
@@ -448,6 +499,7 @@ async def _persist_stream_draft_shell(
     initial_brief: str | None,
     draft_id: str | None = None,
     plan_user: User | None = None,
+    document_ids: list[str] | None = None,
 ) -> str:
     """Commit or recover the exact shell before SSE can disconnect."""
     async with async_session() as db:
@@ -470,6 +522,7 @@ async def _persist_stream_draft_shell(
                             user_id=user_id,
                             initial_brief=initial_brief,
                             draft_id=draft_id,
+                            document_ids=document_ids,
                         )
                 except IntegrityError:
                     draft = await draft_service.get_draft(
@@ -491,6 +544,7 @@ async def _persist_stream_draft_shell(
                 entity_id=entity_id,
                 user_id=user_id,
                 initial_brief=initial_brief,
+                document_ids=document_ids,
             )
         if draft.status not in {"active", "ready"}:
             raise HTTPException(
@@ -557,6 +611,7 @@ async def create_draft_stream(
             initial_brief=req.initial_brief,
             draft_id=req.draft_id,
             plan_user=user,
+            document_ids=req.document_ids,
         )
         if req.draft_id:
             opening_message = await _resume_stream_draft_shell(
@@ -600,7 +655,29 @@ async def list_my_drafts(
     stmt = stmt.order_by(WorkspaceDraft.created_at.desc()).limit(100)
     result = await db.execute(stmt)
     drafts = result.scalars().all()
-    return [await _hydrate_response(db, d) for d in drafts]
+    suggestion_ids = {
+        draft.suggested_blueprint_id for draft in drafts
+        if draft.suggested_blueprint_id and not draft.applied_blueprint_id
+    }
+    blueprints = {}
+    if suggestion_ids:
+        # Prefetch before hydration can dirty normalized draft fields. Fetch
+        # display columns only; Blueprint payloads can contain large bundles.
+        result = await db.execute(
+            select(WorkspaceBlueprint)
+            .where(
+                WorkspaceBlueprint.id.in_(suggestion_ids),
+                WorkspaceBlueprint.status == BlueprintStatus.PUBLISHED,
+            )
+            .options(load_only(
+                WorkspaceBlueprint.id, WorkspaceBlueprint.status,
+                WorkspaceBlueprint.title, WorkspaceBlueprint.summary,
+                WorkspaceBlueprint.tags, WorkspaceBlueprint.install_count,
+                raiseload=True,
+            ))
+        )
+        blueprints = {bp.id: bp for bp in result.scalars()}
+    return [await _hydrate_response(db, d, blueprints=blueprints) for d in drafts]
 
 
 @router.get("/{draft_id}", response_model=DraftResponse)
@@ -634,6 +711,7 @@ async def post_draft_message(
             entity_id=user.entity_id,
             user_id=user.id,
             user_message=req.message,
+            document_ids=req.document_ids,
         )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
@@ -661,6 +739,7 @@ async def post_draft_message_stream(
             draft_id=draft_id,
             user_message=req.message,
             mode="message",
+            document_ids=req.document_ids,
         ),
     )
 
@@ -681,8 +760,6 @@ async def apply_blueprint_to_draft(
             user_id=user.id,
             blueprint_id=req.blueprint_id,
         )
-    except MarketplacePaidPlanRequiredError as exc:
-        raise HTTPException(402, detail=exc.detail) from exc
     except PermissionError as exc:
         # Paid blueprint without a completed purchase.
         raise HTTPException(402, str(exc))
@@ -711,6 +788,8 @@ async def update_draft_fields(
             "Internal draft fields cannot be updated: "
             + ", ".join(internal_fields),
         )
+    if "heartbeat_enabled" in req and not isinstance(req["heartbeat_enabled"], bool):
+        raise HTTPException(400, "heartbeat_enabled must be a boolean")
     if "blueprint_channel_config_ids" in req:
         selections = req["blueprint_channel_config_ids"]
         if not isinstance(selections, dict) or any(
@@ -805,6 +884,8 @@ async def finalize_stream(
     """Materialize the draft and stream finalize progress as SSE events.
 
     Events emitted (in order):
+      - ``agent_bindings_repair_started`` / ``agent_bindings_repair_done``
+                                      optional pre-creation binding repair.
       - ``workspace_created``        DB row done.
       - ``provisioning_agents_started``  total / custom counts.
       - ``agent_provisioned``        per-agent (index/total + name).
@@ -925,7 +1006,15 @@ async def finalize_stream(
         try:
             yield _sse("start", {"draft_id": draft_id})
             while True:
-                event_name, payload = await queue.get()
+                try:
+                    event_name, payload = await asyncio.wait_for(
+                        queue.get(), timeout=_DRAFT_STREAM_KEEPALIVE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    # Agent repair can wait on capability matching between
+                    # progress events, just like an ordinary Architect turn.
+                    yield _sse("keepalive", {"draft_id": draft_id})
+                    continue
                 if (event_name, payload) == DONE:
                     break
                 yield _sse(event_name, payload)

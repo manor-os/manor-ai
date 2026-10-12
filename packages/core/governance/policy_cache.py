@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from uuid import uuid4
 
-from packages.core.cache import Cache, _get_redis
+from packages.core.cache import _get_redis, cache
 
 logger = logging.getLogger(__name__)
 
@@ -73,8 +73,6 @@ class RedisGovernancePolicyCache(GovernancePolicyCache):
     """
 
     _ENTRY_TTL_SECONDS = 60 * 60
-    _KEY_PREFIX = f"{Cache.PREFIX}governance:policy:"
-
     _GET_CURRENT_SCRIPT = """
         if redis.call('exists', KEYS[1]) == 1 then return nil end
         local revision = redis.call('get', KEYS[2])
@@ -113,17 +111,21 @@ class RedisGovernancePolicyCache(GovernancePolicyCache):
         return 0
     """
 
-    @classmethod
-    def _fence_key(cls, workspace_id: str) -> str:
-        return f"{cls._KEY_PREFIX}{workspace_id}:mutating"
+    @staticmethod
+    def _key_prefix() -> str:
+        # Keep v2 stable across rolling deploys: separate fences would allow
+        # one pod to serve a stale, looser policy after another tightens it.
+        # Resolve the shared prefix at use time so isolated caches own all keys.
+        return f"{cache.PREFIX}governance:policy:v2:"
 
-    @classmethod
-    def _head_key(cls, workspace_id: str) -> str:
-        return f"{cls._KEY_PREFIX}{workspace_id}:head"
+    def _fence_key(self, workspace_id: str) -> str:
+        return f"{self._key_prefix()}{workspace_id}:mutating"
 
-    @classmethod
-    def _body_prefix(cls, workspace_id: str) -> str:
-        return f"{cls._KEY_PREFIX}{workspace_id}:revision:"
+    def _head_key(self, workspace_id: str) -> str:
+        return f"{self._key_prefix()}{workspace_id}:head"
+
+    def _body_prefix(self, workspace_id: str) -> str:
+        return f"{self._key_prefix()}{workspace_id}:revision:"
 
     async def get_current(self, workspace_id: str) -> GovernancePolicySnapshot | None:
         redis = await _get_redis()

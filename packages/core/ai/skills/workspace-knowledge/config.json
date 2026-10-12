@@ -1,0 +1,56 @@
+{
+  "name": "workspace-knowledge",
+  "display_name": "Workspace Knowledge",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Find Workspace Knowledge and artifacts, manage document attachments and policy, and read or modify files through their durable Document references.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "manor",
+    "read_file",
+    "list_files",
+    "glob_files",
+    "grep_files",
+    "generate_file",
+    "patch_file",
+    "replace_file",
+    "search_documents",
+    "list_documents"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [
+      "search",
+      "list_knowledge",
+      "create_knowledge_folder",
+      "add_knowledge_documents",
+      "remove_knowledge_document",
+      "update_knowledge_policy"
+    ],
+    "patch_ops": [],
+    "route_terms": [
+      "knowledge",
+      "document",
+      "artifact",
+      "file",
+      "知识",
+      "文档",
+      "文件",
+      "资料",
+      "附件",
+      "交付物"
+    ]
+  },
+  "search": {
+    "terms": ["files", "docs", "documents", "artifacts", "attachments", "library", "folder", "search files", "read file"],
+    "examples": ["find document in workspace knowledge", "manage attachments on knowledge document", "modify file in workspace knowledge", "change workspace knowledge policy"]
+  }
+}

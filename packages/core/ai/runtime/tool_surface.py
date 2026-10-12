@@ -14,6 +14,23 @@ from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.tool_bindings import RuntimeMCPProviderToolScope
 
 
+def runtime_turn_armed_public_tools() -> set[str]:
+    """Tools a public chat turn arms for itself through a verified runtime scope.
+
+    They are outside every static profile allow-list on purpose, so both the
+    public surface and the resolver's profile filter must admit exactly this set.
+    """
+    from packages.core.services import site_content
+    from packages.core.services.webchat_resident import TOOL_NAME, current_runtime_scope
+
+    armed: set[str] = set()
+    if current_runtime_scope() is not None:
+        armed.update({TOOL_NAME, "resident_maintenance_draft"})
+    if site_content.current_site_chat_scope() is not None:
+        armed.add(site_content.TOOL_NAME)
+    return armed
+
+
 def runtime_public_agent_tool_surface(
     *,
     surface: ChatSurface,
@@ -26,10 +43,15 @@ def runtime_public_agent_tool_surface(
     if surface != ChatSurface.PUBLIC_CUSTOMER_CHAT:
         return None
     from packages.core.ai.runtime.tool_registry import runtime_tool_schemas_for_names
+    from packages.core.ai.runtime.tool_visibility import HIDDEN_RUNTIME_TOOLS
 
     bound = set(bound_tool_names or set())
     bound.update(mcp_allowed_names or set())
     allowed = set(allowed_tool_names) if allowed_tool_names is not None else None
+    armed = runtime_turn_armed_public_tools()
+    bound.update(armed)
+    if allowed is not None:
+        allowed.update(armed)
     if "workspace_agent" in bound:
         bound.add("workspace_create_task")
         if allowed is not None and "workspace_agent" in allowed:
@@ -40,6 +62,7 @@ def runtime_public_agent_tool_surface(
     bound.discard("workspace_operation")
     bound.discard("manor")
     bound.discard("workspace_update_task_runtime")
+    bound -= HIDDEN_RUNTIME_TOOLS
     return runtime_tool_schemas_for_names(sorted(bound)), bound
 
 

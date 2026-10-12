@@ -44,6 +44,22 @@ def test_workspace_access_settings_helper_sets_secure_default():
 
 
 @pytest.mark.asyncio
+async def test_only_owner_has_legacy_global_workspace_visibility():
+    assert await workspace_access.user_can_read_all_workspaces(
+        None,
+        entity_id="entity-1",
+        user_id=None,
+        role="owner",
+    )
+    assert not await workspace_access.user_can_read_all_workspaces(
+        None,
+        entity_id="entity-1",
+        user_id=None,
+        role="admin",
+    )
+
+
+@pytest.mark.asyncio
 async def test_recipient_authorization_locks_every_acl_input_for_share():
     class RecordingSession:
         def __init__(self):
@@ -181,13 +197,15 @@ async def test_chat_bookmark_merges_into_locked_workspace_settings(monkeypatch):
     )
     bookmark = datetime(2026, 8, 29, tzinfo=timezone.utc)
 
-    await chat_extractor._write_bookmark(db, stale_workspace, bookmark)
+    message_id = "message-bookmark"
+    await chat_extractor._write_bookmark(db, stale_workspace, bookmark, message_id)
 
     assert (
         locked_workspace.settings[WORKSPACE_ACCESS_MODE_KEY]
         == WORKSPACE_ACCESS_MODE_ENTITY_VISIBLE
     )
     assert locked_workspace.settings[chat_extractor.LAST_EXTRACT_KEY] == bookmark.isoformat()
+    assert locked_workspace.settings[chat_extractor.LAST_EXTRACT_ID_KEY] == message_id
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,85 @@
+"""Every built-in tool schema must be accepted by every provider we route to.
+
+Anthropic rejects a tool whose ``input_schema`` uses ``anyOf``/``oneOf``/``allOf``
+at the top level (HTTP 400 ``input_schema does not support oneOf, allOf, or anyOf
+at the top level``). Because OpenRouter forwards the whole tool list on every
+call, a single offending tool takes down every Anthropic-routed turn that loads
+it. This guard scans the real registry instead of one hand-picked schema so a
+new tool cannot reintroduce the class of failure.
+"""
+
+from __future__ import annotations
+
+from packages.core.ai.tool_pool import ToolPool
+
+_TOP_LEVEL_COMBINATORS = frozenset({"anyOf", "oneOf", "allOf"})
+
+
+def _top_level_combinators(schema: dict) -> set[str]:
+    parameters = (schema.get("function") or {}).get("parameters") or {}
+    return set(parameters) & _TOP_LEVEL_COMBINATORS
+
+
+def test_detector_sees_top_level_combinators():
+    bad = {
+        "type": "function",
+        "function": {
+            "name": "bad",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "anyOf": [{"required": ["a"]}, {"required": ["b"]}],
+            },
+        },
+    }
+    assert _top_level_combinators(bad) == {"anyOf"}
+    # Nested combinators inside a property are allowed by Anthropic.
+    nested = {
+        "type": "function",
+        "function": {
+            "name": "ok",
+            "parameters": {
+                "type": "object",
+                "properties": {"x": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+            },
+        },
+    }
+    assert _top_level_combinators(nested) == set()
+
+
+def test_no_builtin_tool_schema_uses_top_level_combinators():
+    pool = ToolPool()
+    pool.initialize()
+    schemas = pool.registered_tool_schemas(include_undiscoverable=True)
+    assert len(schemas) > 50, "registry scan did not load the built-in tools"
+    offenders = {name: sorted(found) for name, schema in schemas if (found := _top_level_combinators(schema))}
+    assert offenders == {}, f"tool schemas with top-level anyOf/oneOf/allOf are rejected by Anthropic: {offenders}"
+
+
+def test_submit_result_tool_never_uses_top_level_combinators():
+    """``submit_result`` is built per step, outside the registry the scan
+    above covers. Its hard-contract form once carried the success/failure
+    branch as a top-level ``allOf`` and every Anthropic-routed plan step with
+    an output contract died with the same HTTP 400 (e2e, 2026-09-18)."""
+    from packages.core.contracts.task_output import (
+        PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+        TASK_OUTPUT_CONTRACT_SOURCE_KEY,
+        output_contract_for_schema,
+    )
+    from packages.core.workers.submit_result import build_submit_result_tool
+
+    hard = {
+        TASK_OUTPUT_CONTRACT_SOURCE_KEY: PLAN_SCHEMA_OUTPUT_CONTRACT_SOURCE,
+        "type": "object",
+        "required": ["drill_day"],
+        "properties": {"drill_day": {"type": "string", "enum": ["Tuesday", "Thursday"]}},
+        "additionalProperties": False,
+    }
+    assert output_contract_for_schema(hard).requires_result, "fixture must be a hard contract"
+    legacy = {"type": "object", "properties": {"notice": {"type": "string"}}}
+    for label, schema in (("none", None), ("legacy", legacy), ("hard", hard)):
+        tool = build_submit_result_tool(schema)
+        assert _top_level_combinators(tool) == set(), label
+    # The hard contract still tells the model which member each outcome needs.
+    status = build_submit_result_tool(hard)["function"]["parameters"]["properties"]["status"]
+    assert "`result` is required" in status["description"]

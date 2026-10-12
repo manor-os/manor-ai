@@ -8,5 +8,9 @@
   "tags": ["webhook", "http", "events", "connectors", "runtime-guidance", "builtin", "mcp"],
   "tools": [
     "mcp__webhook__send"
-  ]
+  ],
+  "search": {
+    "terms": ["http post", "zapier", "notify", "trigger", "integration", "api call", "callback", "automation endpoint"],
+    "examples": ["trigger webhook when task completes", "notify external service with json", "post event to my webhook", "send alert to connected endpoint"]
+  }
 }

@@ -9,6 +9,7 @@ is structurally impossible.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from packages.core.contracts.envelope import (
@@ -87,7 +88,19 @@ class ArtifactResult(Shape):
                 entry["name"] = entry["fs_path"].rstrip("/").split("/")[-1]
             norm_files.append(entry)
         out = dict(raw)
-        out["files"] = norm_files
+        # Worker enrichment may append document_id-only refs next to a
+        # complete file. Drop those extras only when at least one item
+        # already satisfies the contract so a genuine missing path still
+        # fails validation.
+        complete = [
+            item
+            for item in norm_files
+            if isinstance(item.get("name"), str)
+            and item["name"].strip()
+            and isinstance(item.get("fs_path"), str)
+            and item["fs_path"].strip()
+        ]
+        out["files"] = complete if complete and len(complete) < len(norm_files) else norm_files
         return out
 
 
@@ -107,6 +120,18 @@ class TextResult(Shape):
                 out = dict(raw)
                 out["text"] = val
                 return out
+            # A StepResult's control fields are not a submitted text payload.
+            # Leave them missing so explicit TextResult contracts can reject it.
+            if not raw or raw.keys() <= {"summary", "status", "failure", "error", "retryable"}:
+                return raw
+            # Persist-via-tool steps often return a structured object
+            # (goal scores, counts) instead of prose. Fold it into text
+            # so the required field is present without inventing content.
+            out = dict(raw)
+            out["text"] = json.dumps(
+                raw, ensure_ascii=False, default=str, sort_keys=True
+            )
+            return out
         return raw
 
     def extract_from_text(self, text: str) -> Optional[dict]:

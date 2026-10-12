@@ -15,11 +15,51 @@
       const h = React.createElement;
       const longText = Array.from({ length: 18 }, (_, i) => `第 ${i + 1} 笔记录：这是一条用于验证长消息显示的测试内容。`).join("\n\n");
       const shortText = "已完成，文件已经保存，可以直接查看。";
+      const moderateAssistantText = [
+        "The draft is ready for review.",
+        "The production step is running. The planner will prepare shot-by-shot notes, asset lists, editing steps, and platform guidance for these three short videos:",
+        "- A practical introduction for new users",
+        "- A short product walkthrough",
+        "- A concise answer to a common question",
+        "You can check the task card below for progress or tell me what to adjust next.",
+      ].join("\n\n");
+      const mediumOverlapText = [
+        "发行商：没有现成账号。按 DistroKid 起草，不要登录，我自己提交。",
+        "法定姓名/艺名：Alex Chen",
+        "歌曲：Tonight（数字单曲）",
+        "词曲/制作/演唱/录音所有者：Alex Chen；词曲 100%，录音 100%；无合作者/sample/翻唱",
+        "AI-assisted，按平台披露；未克隆真人声；模型/提示词未知，不要编造",
+        "ISRC/UPC：未知",
+        "目标日：2026-10-25；市场：美国、中国；渠道：Spotify + Apple Music via DistroKid",
+        "音频/封面/歌词已上传。请用 Human queue 已履行答案更新 Release State，不要再逐字段问。",
+        "不要登录发行商、付款、签署或登记版税，也不要声称已经上线。",
+        "补充说明 1：仅用于把这条单段消息拉过折叠阈值。",
+        "补充说明 2：收起预览不得重复 ISRC 或目标日。",
+        "补充说明 3：展开后整卡应比收起更高。",
+      ].join("\n");
       function Final({ id, text, streaming = false }) {
         return h(AssistantMessageBlocks, {
           blocks: [{ id, type: "text", phase: "final", text }],
           content: text, keyPrefix: id, sourceMessageId: id,
           minimal: true, collapseLongFinal: true, streaming,
+        });
+      }
+      function HistoricalFinal() {
+        const text = `Canonical final answer.\n\n${longText}`;
+        return h(AssistantMessageBlocks, {
+          blocks: [
+            { id: "history-opening", type: "text", phase: "opening", text: "Inspecting the brief." },
+            { id: "history-process", type: "process", status: "completed", default_collapsed: false, steps: [
+              { id: "history-step", seq: 1, name: "search_tools", status: "success" },
+            ] },
+            { id: "history-progress", type: "text", phase: "progress", after_step_seq: 1, text: "The brief has been checked." },
+            { id: "history-early", type: "text", phase: "final", text: `Obsolete working summary.\n\n${longText}` },
+            { id: "history-streamed", type: "text", phase: "final", text: `\n${text}` },
+            { id: "history-persisted", type: "text", phase: "final", text },
+            { id: "history-repeated", type: "text", phase: "final", text },
+          ],
+          content: text, keyPrefix: "history", sourceMessageId: "history",
+          collapseLongFinal: true,
         });
       }
       function Example({ id, title, user = false, children }) {
@@ -36,13 +76,18 @@
           h("main", { style: { maxWidth: 800, margin: "24px auto", padding: 16 } },
             h("h1", { style: { fontSize: 20, marginBottom: 20 } }, "Workspace 消息折叠测试"),
             h(Example, { id: "short-ai", title: "AI 短回复：应完整显示" }, h(Final, { id: "short-final", text: shortText })),
+            h(Example, { id: "moderate-ai", title: "AI 中等长度回复：应完整显示" }, h(Final, { id: "moderate-final", text: moderateAssistantText })),
             h(Example, { id: "long-source", title: "Markdown 原文很长，但显示只有一行：不应折叠" },
               h(Final, { id: "source-final", text: `[查看文档](https://example.com/${"long-path-".repeat(120)})` })),
             h(Example, { id: "long-ai", title: "AI 长回复：与用户消息同一规则" }, h(Final, { id: "long-final", text: longText })),
+            h(Example, { id: "trailing-cta", title: "长回复收起后仍露出结尾行动块" }, h(Final, { id: "trailing-final", text: `${longText}\n\n## Summary\n\n- First item recorded\n- Second item recorded\n- File attached\n- Notes attached\n\nReply with the next file, or tell me to skip this step.` })),
+            h(Example, { id: "medium-overlap", title: "中等长度单段消息：收起不得重复中间行" },
+              h("div", { style: { maxWidth: 420 } }, h(CollapsibleSentMessage, { text: mediumOverlapText }, h(ChatMarkdown, { content: mediumOverlapText, isUser: true })))),
+            h(Example, { id: "historical-final", title: "历史消息：最终内容只显示一次，保留处理过程" }, h(HistoricalFinal)),
             h(Example, { id: "long-user", title: "用户长消息", user: true },
               h(CollapsibleSentMessage, { text: longText }, h(ChatMarkdown, { content: longText, isUser: true }))),
             h(Example, { id: "responsive", title: "宽屏能完整显示、窄屏自动判断换行高度" },
-              h(Final, { id: "responsive-final", text: "这是一段用于验证响应式显示的内容，宽屏只需要几行，而窄屏会自动换行。".repeat(6) })),
+              h(Final, { id: "responsive-final", text: "这是一段用于验证响应式显示的内容，宽屏只需要几行，而窄屏会自动换行。".repeat(12) })),
             h("button", { className: "btn-ghost", onClick: () => setStreaming(!streaming) }, streaming ? "完成输出" : "重新开始输出"),
             h(Example, { id: "streaming", title: "输出中保持完整，完成后才折叠" }, h(Final, { id: "stream-final", text: longText, streaming })),
             h("button", { className: "btn-ghost", onClick: () => setChangingText(changingText === longText ? shortText : longText) }, "切换长短内容"),

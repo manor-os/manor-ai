@@ -31,6 +31,26 @@ RUNTIME_AGENT_GREETING_SYSTEM_PROMPT = (
 )
 
 
+async def _workspace_creation_user_id(entity_id: str, workspace_id: str) -> str | None:
+    """Startup jobs use the saved creator, never an arbitrary tenant member."""
+    from sqlalchemy import select
+
+    from packages.core.database import create_worker_session
+    from packages.core.models.workspace import Workspace
+
+    session_factory = create_worker_session()
+    try:
+        async with session_factory() as db:
+            settings = await db.scalar(select(Workspace.settings).where(
+                Workspace.id == workspace_id,
+                Workspace.entity_id == entity_id,
+                Workspace.deleted_at.is_(None),
+            ))
+        return (settings or {}).get("created_by_user_id")
+    finally:
+        await session_factory.kw["bind"].dispose()
+
+
 def runtime_workspace_setup_status_sample(default_fields: Mapping[str, Any]) -> str:
     """Render the hidden status sample for the workspace setup wizard prompt."""
 
@@ -88,8 +108,10 @@ Collecting information:
 - Ask only the next most important question, one at a time.
 - Once you have name, kind, context, and primary work, auto-generate the full
   workspace draft without waiting for more input.
-- Never ask the user to describe rules, automations, goals, or evaluation --
+- Never ask the user to describe rules, automations, or evaluation --
   infer sensible defaults from what they told you.
+- Goals are optional. Propose measurement definitions when useful, but ask
+  the user to confirm the target, formula/rubric, evidence source and cadence.
 - Never output raw JSON or code blocks in the visible reply.
 
 Auto-generating the draft:
@@ -121,7 +143,21 @@ Auto-generating the draft:
                       ``monthly`` for "月" / "monthly", etc. Never leave
                       empty.
   Also include ``title`` (a 2-4 word headline) when natural.
+  Every Goal also needs a user-confirmed ``measurement`` object. For a
+  custom, manually recorded metric include key, name, description (formula
+  and pass criteria), source (recorder and evidence), unit, value_type
+  (number/percent/currency/duration), and window (latest/lifetime/rolling_7d/
+  rolling_30d/calendar_week/calendar_month). Explain that manual recording is
+  required; a formula or Knowledge document is not an automatic collector.
+  Do not infer a score or replace outcome measurement with task completion.
+  Propose these details together and ask for confirmation, not field by field.
 - Rules: only if the user described policies or escalation paths.
+  System-generated defaults must never prohibit an operation: use
+  rule_type="approval_required" at most, or "notice" for conditional guidance.
+  A template's "never" wording does not turn an approval rule into a ban.
+  Keep the action's capability available behind the normal human approval gate.
+  Explicit prohibitions require the typed architect's user-quote confirmation;
+  do not invent hard-block confirmation metadata in generated fields.
 - Automations: only if the user described schedules or triggers.
 - Evaluation: if goals exist, auto-generate a matching scorecard.
 - Budget: budgets are shown to users in credits, not USD. If the user
@@ -174,11 +210,12 @@ Example shape (replace with real data):
 Status block rules:
 - always valid JSON
 - missing must only contain keys from: {required_keys_text}
-- goals, rules, automations, and evaluation are optional -- never in missing
+- goals, rules, automations, and evaluation are optional. An empty goals list
+  is valid; an existing Goal with incomplete measurement keeps ready=false.
 - for services: each item needs service_key, name, description,
   autonomy_level, owner_role to be counted complete
-- for goals: each item needs goal_key, description, target, cadence
-  (do not emit a goal entry that's missing target or cadence)
+- for goals: each item needs goal_key, description, target, cadence, measurement
+  (do not mark ready when a configured goal lacks target, cadence or measurement)
 - for agent_mappings: each service must have a corresponding entry
 - for channel_config: channels list should only include channel_type
   values from available_channels where ready=true. Empty list is OK
@@ -229,6 +266,7 @@ async def runtime_execute_workspace_setup_turn_completion(
     session_messages: Sequence[Mapping[str, str]],
     metadata: dict[str, Any] | None = None,
     stream_handler: Any | None = None,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute one conversational workspace setup turn with Runtime-owned defaults."""
 
@@ -239,6 +277,7 @@ async def runtime_execute_workspace_setup_turn_completion(
         ),
         entity_id=entity_id,
         source=RUNTIME_WORKSPACE_SETUP_SOURCE,
+        user_id=user_id,
         temperature=0.7,
         metadata=metadata,
         stream_handler=stream_handler,
@@ -258,8 +297,8 @@ Workspace:
 
 Generate:
 1. services: 2-5 services with service_key, description, autonomy_level (full/assisted/supervised), owner_role
-2. goals: relevant goals with goal_key, title, description, metric_key, target_value, baseline_value, cadence (daily/weekly/hourly), priority (1-5)
-3. rules: operational rules with rule_type, description, service_key, priority
+2. goals: preserve only user-confirmed goals and their measurement definitions from the input below; use [] if none. Never invent targets, baselines, readiness scores or automatic collectors.
+3. rules: only user-described operational rules with rule_type, description, service_key, priority. System/template defaults must never prohibit an operation: use approval_required at most, or notice for conditions action patterns cannot represent. Keep capabilities available behind human approval. Do not generate deny, draft_only, never_allow lists, lower risk ceilings, or private hard-block confirmation metadata.
 4. automations: automation triggers with automation_type, service_key, trigger, schedule
 5. evaluation: scorecard with cadence, scorecard metrics, target_score, warning_score
 6. budget_policy: optional monthly_budget_credits (credits, not USD), auto_pause_on_budget
@@ -268,6 +307,8 @@ Generate:
    - "0 */4 * * *" (every 4 hours) for active workspaces with daily goals
    - "0 9 * * *" (daily at 9am) for standard workspaces
    - "0 9 * * 1" (weekly Monday 9am) for slower-paced operations like quarterly reporting
+
+Confirmed goals: {json.dumps(fields.get('goals') or [], ensure_ascii=False)}
 
 Return ONLY valid JSON with keys: services, goals, rules, automations, evaluation, budget_policy, heartbeat_cadence.
 Do not wrap in markdown fences."""
@@ -289,6 +330,7 @@ async def runtime_execute_workspace_setup_auto_model_completion(
     entity_id: str,
     fields: Mapping[str, Any],
     metadata: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute workspace operating-model generation with Runtime-owned defaults."""
 
@@ -296,6 +338,7 @@ async def runtime_execute_workspace_setup_auto_model_completion(
         runtime_workspace_setup_auto_model_messages(fields),
         entity_id=entity_id,
         source=RUNTIME_WORKSPACE_SETUP_SOURCE,
+        user_id=user_id,
         temperature=0.5,
         metadata=metadata,
     )
@@ -368,6 +411,7 @@ async def runtime_execute_workspace_setup_agent_mapping_completion(
     service_descriptions: Sequence[Mapping[str, Any]],
     agent_descriptions: Sequence[Mapping[str, Any]],
     metadata: dict[str, Any] | None = None,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute workspace service-agent matching with Runtime-owned defaults."""
 
@@ -378,6 +422,7 @@ async def runtime_execute_workspace_setup_agent_mapping_completion(
         ),
         entity_id=entity_id,
         source=RUNTIME_WORKSPACE_SETUP_SOURCE,
+        user_id=user_id,
         temperature=0.3,
         metadata=metadata,
     )
@@ -439,6 +484,7 @@ async def runtime_execute_agent_greeting_completion(
     workspace_name: str,
     workspace_kind: str,
     system_prompt: str,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute workspace setup agent greeting generation with Runtime-owned defaults."""
 
@@ -452,6 +498,7 @@ async def runtime_execute_agent_greeting_completion(
         ),
         entity_id=entity_id,
         source=RUNTIME_AGENT_GREETING_SOURCE,
+        user_id=user_id or await _workspace_creation_user_id(entity_id, workspace_id),
         workspace_id=workspace_id,
         temperature=0.7,
         max_tokens=150,
@@ -465,10 +512,11 @@ def runtime_knowledge_starter_document_prompt(
     workspace_name: str,
     workspace_kind: str,
     primary_work: str,
+    source_excerpt: str | None = None,
 ) -> str:
     """Build the Runtime-owned prompt for starter knowledge base documents."""
 
-    return (
+    prompt = (
         f"Generate a comprehensive starter document for a knowledge base.\n\n"
         f"Knowledge base: {group_name}\n"
         f"Purpose: {purpose}\n"
@@ -479,6 +527,15 @@ def runtime_knowledge_starter_document_prompt(
         f"templates. Be specific to the workspace context, not generic.\n\n"
         f"Output ONLY markdown content, no code fences."
     )
+    excerpt = (source_excerpt or "").strip()
+    if excerpt:
+        prompt += (
+            "\n\nThe user supplied source material. Ground the document in it: "
+            "reuse its terms, steps, and checks; do not invent facts absent from it; "
+            "mark gaps explicitly as 'to be confirmed'.\n"
+            f"<source_excerpt>\n{excerpt}\n</source_excerpt>"
+        )
+    return prompt
 
 
 def runtime_knowledge_starter_document_messages(
@@ -488,6 +545,7 @@ def runtime_knowledge_starter_document_messages(
     workspace_name: str,
     workspace_kind: str,
     primary_work: str,
+    source_excerpt: str | None = None,
 ) -> list[dict[str, str]]:
     """Build Runtime one-shot messages for starter knowledge base documents."""
 
@@ -499,6 +557,7 @@ def runtime_knowledge_starter_document_messages(
             workspace_name=workspace_name,
             workspace_kind=workspace_kind,
             primary_work=primary_work,
+            source_excerpt=source_excerpt,
         ),
     }]
 
@@ -512,6 +571,8 @@ async def runtime_execute_knowledge_starter_document_completion(
     workspace_name: str,
     workspace_kind: str,
     primary_work: str,
+    user_id: str | None = None,
+    source_excerpt: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute starter knowledge document generation with Runtime-owned defaults."""
 
@@ -522,9 +583,11 @@ async def runtime_execute_knowledge_starter_document_completion(
             workspace_name=workspace_name,
             workspace_kind=workspace_kind,
             primary_work=primary_work,
+            source_excerpt=source_excerpt,
         ),
         entity_id=entity_id,
         source=RUNTIME_KNOWLEDGE_GEN_SOURCE,
+        user_id=user_id or await _workspace_creation_user_id(entity_id, workspace_id),
         workspace_id=workspace_id,
         temperature=0.7,
         max_tokens=3000,

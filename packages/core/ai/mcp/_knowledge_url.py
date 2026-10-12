@@ -47,10 +47,10 @@ from __future__ import annotations
 import logging
 import os
 from typing import List, Optional
-from urllib.parse import unquote
 
 from packages.core.services.file_access_tokens import create_file_access_token
 from packages.core.services.file_access_tokens import verify_file_access_token
+from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.knowledge_visibility import (
     is_user_visible_path,
     normalize_rel_path,
@@ -174,12 +174,12 @@ def _rel_path_from_local_fs_url(value: str, *, entity_id: str) -> str | None:
             return normalize_rel_path(str(payload.get("path") or ""))
         raise KnowledgePathError("local fs public URL token is expired or belongs to another entity")
 
-    parts = path.split("/", 5)
-    if len(parts) < 6:
+    ref = parse_file_reference(path)
+    if ref is None or not ref.entity_id or not ref.fs_path:
         raise KnowledgePathError(f"invalid local fs URL: {value!r}")
-    if parts[4] != entity_id:
+    if ref.entity_id != entity_id:
         raise KnowledgePathError("local fs URL belongs to another entity")
-    return normalize_rel_path(unquote(parts[5]))
+    return normalize_rel_path(ref.fs_path)
 
 
 def safe_paths_to_signed_urls(

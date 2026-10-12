@@ -1,3 +1,4 @@
+import { agentListQueryOptions, skillListQueryOptions, useCatalogScope } from "../../lib/catalogQueries";
 import { useEffect, useId, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
@@ -13,6 +14,7 @@ import Toggle from "../ui/Toggle";
 import MediaPreview from "./MediaPreview";
 import { extractMediaRefs } from "../../lib/workflowMedia";
 import { inferredWorkflowInputs, workflowStepOutputs } from "../../lib/workflowBindings";
+import { workflowPath } from "../../lib/workflowRoutes";
 import {
   ConnectorAccountSelectionMode,
   ConnectorServerKind,
@@ -215,10 +217,13 @@ const SCHEMA: Record<string, Field[]> = {
     { key: "mode", label: "Mode", kind: "select", options: ["list", "object"] },
   ],
   wait: [
-    { key: "wait_type", label: "Wait type", kind: "select", options: ["approval", "timer", "event"] },
+    { key: "wait_type", label: "Wait type", kind: "select", options: ["approval", "input", "timer", "event"] },
     { key: "duration_seconds", label: "Duration (s)", kind: "number", hint: "For timer waits — ≤90s runs inline; longer waits pause and resume automatically." },
     { key: "message", label: "Message", kind: "text", hint: "Shown while approval / event waits are paused." },
     { key: "response_variable", label: "Response variable", kind: "text", hint: "Stores the user's decision or response for downstream nodes." },
+    { key: "collection_fields", label: "Information to collect", kind: "json", hint: '[{"key":"artist_name","label":"Artist name","required":true}]. Input waits ask again for any missing fields.' },
+    { key: "fields_per_round", label: "Questions per round", kind: "number", hint: "How many missing fields to ask for at a time. Default: 3." },
+    { key: "output_var", label: "Collected information variable", kind: "text", hint: "The complete answers become available to later nodes under this name." },
     { key: "options", label: "Choices", kind: "json", hint: "Approval choices shown in the originating Chat, for example [\"approve\", \"revise\", \"cancel\"]." },
     { key: "approval_values", label: "Approved choices", kind: "json", hint: "Choices that count as approval. Other choices can route to revision or cancellation branches." },
     { key: "allow_always", label: "Allow permanent approval", kind: "boolean", hint: "Adds Always approve. Future matching operations skip this gate until the user revokes the saved approval." },
@@ -336,13 +341,17 @@ export default function WorkflowNodeConfigPanel({
   runVariables?: Record<string, any>;
   nodes?: WorkflowNodeRef[];
   currentWorkflowId?: string;
-  onSave: (updated: Step) => void;
+  onSave: (updated: Step) => Promise<unknown>;
   onRunResult?: (stepId: string, result: NodeRunResult) => void;
   onClose: () => void;
 }) {
+  const catalogScope = useCatalogScope();
   const [name, setName] = useState(step?.name || "");
   const [config, setConfig] = useState<Record<string, any>>(step?.config || {});
   const [rawErr, setRawErr] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const savingRef = useRef(false);
   const [jsonErrs, setJsonErrs] = useState<Record<string, string>>({});
   const [liveResult, setLiveResult] = useState<NodeRunResult | null>(null);
   const [running, setRunning] = useState(false);
@@ -354,6 +363,7 @@ export default function WorkflowNodeConfigPanel({
   const resultRef = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
   const close = () => {
+    if (savingRef.current) return;
     // Force a fresh draft next time, even when the same node reopens. Cancelled
     // config edits and ephemeral test inputs must not leak into the next panel.
     setForId(undefined);
@@ -362,11 +372,9 @@ export default function WorkflowNodeConfigPanel({
   // close the panel, then jump to a bound resource's page
   const goResource = (to: string) => { close(); navigate(to); };
   const openReferencedWorkflow = (workflowId: string) => {
-    const returnTo = currentWorkflowId
-      ? `/flows?workflow=${encodeURIComponent(currentWorkflowId)}`
-      : "/flows";
+    const returnTo = currentWorkflowId ? workflowPath(currentWorkflowId) : "/flows";
     close();
-    navigate(`/flows?workflow=${encodeURIComponent(workflowId)}`, { state: { returnTo } });
+    navigate(workflowPath(workflowId), { state: { returnTo } });
   };
 
   // re-init when a different node opens
@@ -375,6 +383,7 @@ export default function WorkflowNodeConfigPanel({
     setName(step.name || "");
     setConfig(step.config || {});
     setRawErr("");
+    setSaveError("");
     setJsonErrs({});
     setLiveResult(null);
     setRunning(false);
@@ -395,20 +404,15 @@ export default function WorkflowNodeConfigPanel({
     resultRef.current.scrollIntoView({ behavior: reduceMotion ? "auto" : "smooth", block: "nearest" });
   }, [running, liveResult?.status, liveResult?.output, liveResult?.error]);
 
-  // Pickers refetch on open (staleTime 0) so newly-created agents / skills /
-  // integrations / workspaces show up without a page reload.
+  // Catalog pickers share cached lists; successful edits invalidate their keys.
   const { data: agents = [] } = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api.agents.list(),
-    enabled: step?.type === "agent",
-    staleTime: 0,
+    ...agentListQueryOptions(catalogScope),
+    enabled: !!catalogScope && step?.type === "agent",
   });
   let marketplaceAgents: { id: string; name: string }[] = [];
   const { data: skills = [] } = useQuery({
-    queryKey: ["skills"],
-    queryFn: () => api.skills.list(),
-    enabled: step?.type === "agent",
-    staleTime: 0,
+    ...skillListQueryOptions(catalogScope),
+    enabled: !!catalogScope && step?.type === "agent",
   });
   const {
     data: integrationServers = [],
@@ -593,16 +597,27 @@ export default function WorkflowNodeConfigPanel({
     return clean;
   };
 
-  const save = () => {
-    if (connectorAccountInvalid || connectorOperationInvalid) return;
-    onSave({ ...step!, name, config: cleanConfig() });
-    close();
+  const save = async () => {
+    if (savingRef.current || connectorAccountInvalid || connectorOperationInvalid) return;
+    savingRef.current = true;
+    setSaving(true);
+    setSaveError("");
+    try {
+      await onSave({ ...step!, name, config: cleanConfig() });
+      savingRef.current = false;
+      close();
+    } catch (error: any) {
+      setSaveError(error?.message || "Couldn't save this node. Please try again.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
   // Test this node with explicit, ephemeral input values. Test values replace
   // the saved mappings only in this request; Save still persists cleanConfig().
   const runNode = async () => {
-    if (!step || running || connectorAccountInvalid || connectorOperationInvalid) return;
+    if (!step || running || savingRef.current || connectorAccountInvalid || connectorOperationInvalid) return;
     const cleaned = cleanConfig();
     const inputs: Binding[] = Array.isArray(cleaned.inputs) ? cleaned.inputs : [];
     const errors: Record<string, string> = {};
@@ -669,17 +684,19 @@ export default function WorkflowNodeConfigPanel({
           <Button
             variant="outline"
             onClick={runNode}
-            disabled={running || step.type === "stage" || !!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}
+            disabled={saving || running || step.type === "stage" || !!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}
           >
             {running ? "Testing…" : "Test node"}
           </Button>
           <div className="workflow-node-dialog-primary-actions">
-            <Button variant="ghost" onClick={close}>Cancel</Button>
-            <Button onClick={save} disabled={!!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}>Save</Button>
+            <Button variant="ghost" onClick={close} disabled={saving}>Cancel</Button>
+            <Button onClick={save} loading={saving} disabled={saving || running || !!rawErr || hasBindingValueErrors || connectorAccountInvalid || connectorOperationInvalid || Object.keys(jsonErrs).length > 0}>Save</Button>
           </div>
         </div>
       }
     >
+      {saveError && <p role="alert">{saveError}</p>}
+      <fieldset disabled={saving} style={{ border: 0, margin: 0, padding: 0, minWidth: 0 }}>
       <div className="workflow-node-dialog-shell">
         <div className="workflow-node-dialog-meta" aria-label="Node identity">
           <span className="workflow-node-type-chip">{m.label}</span>
@@ -736,9 +753,6 @@ export default function WorkflowNodeConfigPanel({
                 options={[
                   { value: "", label: "— None (configure inline) —" },
                   ...(agents as { id: string; name: string }[]).map((a) => ({ value: a.id, label: a.name })),
-                  ...(marketplaceAgents as { id: string; name: string }[])
-                    .filter((m) => !(agents as { id: string }[]).some((a) => a.id === m.id))
-                    .map((m) => ({ value: m.id, label: `${m.name} · marketplace` })),
                 ]}
               />
               {config.agent_id && <OpenLink label="Open agent" onClick={() => goResource(`/agents/${config.agent_id}`)} />}
@@ -1409,6 +1423,32 @@ export default function WorkflowNodeConfigPanel({
             {rawErr && <span style={{ fontSize: 12, color: "#d65f59" }}>{rawErr}</span>}
           </Field>
         )}
+        {step.type !== "unsupported" && (
+          <details>
+            <summary style={{ cursor: "pointer", fontSize: 12.5 }}>Advanced configuration</summary>
+            <pre aria-label="Node connections" style={{ fontSize: 11, whiteSpace: "pre-wrap" }}>
+              {JSON.stringify({
+                next: step.next || [], true_next: step.true_next || [],
+                false_next: step.false_next || [], depends_on: step.depends_on || [],
+              }, null, 2)}
+            </pre>
+            {(fields || step.type === "agent" || NO_CONFIG_TYPES.has(step.type)) && <Field label="Advanced config (JSON)" hint="Inspect or edit configuration fields that are not shown in the form above.">
+              <Textarea
+                value={JSON.stringify(config, null, 2)}
+                onChange={(e) => {
+                  try {
+                    const parsed = JSON.parse(e.target.value || "{}");
+                    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Expected an object");
+                    setConfig(parsed);
+                    setRawErr("");
+                  } catch { setRawErr("Enter a valid JSON object."); }
+                }}
+                rows={8}
+              />
+              {rawErr && <span style={{ fontSize: 12, color: "#d65f59" }}>{rawErr}</span>}
+            </Field>}
+          </details>
+        )}
             </section>
 
         {/* Data flow: define this step's named inputs (mapped from upstream
@@ -1449,14 +1489,24 @@ export default function WorkflowNodeConfigPanel({
             const wholeRef = `{{${n.id}}}`;
             if (!seenSources.has(wholeRef)) {
               seenSources.add(wholeRef);
-              inputSources.push({ value: wholeRef, label: `${nodeLabel} · Entire output`, type: "any" });
+              inputSources.push({
+                value: wholeRef,
+                label: `Entire output ← ${nodeLabel}`,
+                description: `${wholeRef} · any`,
+                type: "any",
+              });
             }
             for (const o of n.outputs || []) {
               if (!o.name) continue;
               const namedRef = `{{${o.name}}}`;
               if (seenSources.has(namedRef)) continue;
               seenSources.add(namedRef);
-              inputSources.push({ value: namedRef, label: `${nodeLabel} · ${o.name}`, type: o.type || "any" });
+              inputSources.push({
+                value: namedRef,
+                label: `${o.name} ← ${nodeLabel}`,
+                description: `${namedRef} · ${o.type || "any"}`,
+                type: o.type || "any",
+              });
             }
           }
           for (const source of inputSources) outTypeByRef[source.value] = source.type || "any";
@@ -1612,6 +1662,7 @@ export default function WorkflowNodeConfigPanel({
         </div>
 
       </div>
+      </fieldset>
     </Modal>
   );
 }
@@ -1959,7 +2010,7 @@ type WorkflowRunInputBinding = Binding & {
   __schemaRaw?: string;
   __schemaError?: string;
 };
-type BindingValueOption = { value: string; label: string; type?: string };
+type BindingValueOption = { value: string; label: string; description?: string; type?: string };
 type TestInputField = {
   key: string;
   type: string;
@@ -2409,6 +2460,27 @@ function WorkflowRunInputRows({
                   />
                 )}
               </Field>
+              {type === "json" && (
+                <Field label="Input control" hint="Files can be uploaded or selected from Knowledge when starting the workflow.">
+                  <Select
+                    value={row.schema?.["x-ui"]?.control === "documents" ? "Files / Knowledge" : "JSON"}
+                    options={["JSON", "Files / Knowledge"]}
+                    onChange={(value) => {
+                      const schema = { ...(row.schema || {}) };
+                      const ui = { ...(schema["x-ui"] || {}) };
+                      if (value === "Files / Knowledge") {
+                        schema.type = "array";
+                        schema.items = { type: "object", required: ["document_id"], properties: { document_id: { type: "string", minLength: 1 } } };
+                        ui.control = "documents";
+                      } else {
+                        delete ui.control;
+                      }
+                      schema["x-ui"] = ui;
+                      update(index, { schema, __schemaRaw: undefined, __schemaError: undefined });
+                    }}
+                  />
+                </Field>
+              )}
               <Field label="Placeholder">
                 <Input
                   value={row.placeholder ?? ""}

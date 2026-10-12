@@ -52,13 +52,13 @@ from packages.core.models import (
 from packages.core.models.base import generate_ulid
 from packages.core.models.document import Document, DocumentFolder
 from packages.core.models.staff import Staff
-from packages.core.models.user import User, UserMembership
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.permissions import effective_user_has_permission, Permission
 from packages.core.services.document_access import (
-    document_is_owned_by_deleted_workspace,
+    document_entity_is_unavailable,
     effective_document_folder_policy,
     effective_folder_policy,
-    folder_is_owned_by_deleted_workspace,
+    folder_entity_is_unavailable,
     folder_grant_capabilities_for_user,
     folder_grants_for_user,
     lock_folder_policy_rows,
@@ -67,6 +67,7 @@ from packages.core.services.document_access import (
     resolve_folder_policy_lock_scope,
     user_can_read_folder_path,
     user_has_folder_capability,
+    user_owns_workspace_folder,
 )
 from packages.core.services.resource_grant_policy import (
     ResourceGrantPolicyError,
@@ -110,7 +111,7 @@ async def _load_folder(
     )
     if not for_update:
         folder = (await db.execute(stmt)).scalar_one_or_none()
-        if not folder or await folder_is_owned_by_deleted_workspace(db, folder):
+        if not folder or await folder_entity_is_unavailable(db, folder):
             raise CodedError(
                 404,
                 code="permissions.error.folder.not_found",
@@ -133,13 +134,13 @@ async def _load_folder(
                 entity_id=entity_id,
                 folder_id=folder.id,
             )
-            workspaces = await lock_workspace_policy_rows(
+            await lock_workspace_policy_rows(
                 db,
                 entity_id=entity_id,
                 workspace_ids=scope.workspace_ids,
                 read=True,
             )
-            if any(workspace.deleted_at is not None for workspace in workspaces):
+            if await folder_entity_is_unavailable(db, folder):
                 raise CodedError(
                     404,
                     code="permissions.error.folder.not_found",
@@ -193,7 +194,9 @@ async def _is_owner_or_admin(
 ) -> bool:
     if folder.owner_id and folder.owner_id == user.id:
         return True
-    return await effective_user_has_permission(db, user, Permission.ADMIN_SETTINGS)
+    if await user_owns_workspace_folder(db, folder=folder, user_id=user.id):
+        return True
+    return await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL)
 
 
 async def _can_create_internal_grant(
@@ -238,6 +241,15 @@ async def _can_manage_external_share(db: AsyncSession, folder: DocumentFolder, u
         user_id=user.id,
         capabilities={Capability.SHARE_EXTERNAL},
     )
+
+
+async def _can_manage_full_folder_access(db: AsyncSession, folder: DocumentFolder, user: User) -> bool:
+    if await _is_owner_or_admin(db, folder, user):
+        return True
+    capabilities = await folder_grant_capabilities_for_user(
+        db, entity_id=user.entity_id, folder_id=folder.id, user_id=user.id,
+    )
+    return ResourceGrantPolicyFactory.create(ResourceType.DOCUMENT_FOLDER).allowed_capabilities.issubset(capabilities)
 
 
 def _hash_token(token: str) -> str:
@@ -311,12 +323,21 @@ async def set_folder_properties(
     db: AsyncSession = Depends(get_db),
 ):
     folder = await _load_folder(db, folder_id, user.entity_id, for_update=True)
-    if not await _is_owner_or_admin(db, folder, user):
+    if not await _can_manage_full_folder_access(db, folder, user):
         raise HTTPException(
-            403, "Only the folder owner or an admin can change folder properties",
+            403, "Only the folder owner, a Co-owner, or an admin can change folder properties",
         )
 
+    from packages.core.services.workspace_artifacts import resolve_workspace_folder_binding
+
+    workspace_binding = await resolve_workspace_folder_binding(
+        db, entity_id=user.entity_id, folder_id=folder.id,
+    )
+    if workspace_binding and req.visibility not in (None, "workspace"):
+        raise HTTPException(409, "Workspace folders are shared with Workspace members")
     final_visibility = req.visibility or folder.visibility or "entity"
+    if workspace_binding:
+        final_visibility = "workspace"
     final_classification = req.classification or folder.classification or Classification.INTERNAL
     final_client_visible = (
         req.client_visible
@@ -635,7 +656,7 @@ async def list_folder_grants(
         raise CodedError(
             403,
             code="permissions.error.folder.grant_view_forbidden",
-            message="Only the folder owner/admin or a user with grant access can view grants",
+            message="Only the folder owner or a user with global management or grant access can view grants",
         )
     rows = (
         await db.execute(
@@ -679,7 +700,7 @@ async def create_folder_grant(
     ):
         raise HTTPException(
             403,
-            "Only the folder owner/admin or a user with internal share access can grant access",
+            "Only the folder owner or a user with global management or internal share access can grant access",
         )
     if req.subject_type != SubjectType.USER:
         raise HTTPException(400, "Folder grants currently support only user subjects")
@@ -759,7 +780,7 @@ async def revoke_folder_grant(
         raise CodedError(
             403,
             code="permissions.error.folder.grant_revoke_owner_only",
-            message="Only the folder owner/admin or a user with grant access can revoke",
+            message="Only the folder owner or a user with global management or grant access can revoke",
         )
     grant = (
         await db.execute(
@@ -843,7 +864,7 @@ async def list_folder_shares(
         raise CodedError(
             403,
             code="permissions.error.folder.share_view_forbidden",
-            message="Only the folder owner/admin or a user with external share access can view shares",
+            message="Only the folder owner or a user with global management or external share access can view shares",
         )
     rows = (
         await db.execute(
@@ -889,7 +910,7 @@ async def create_folder_share(
         raise CodedError(
             403,
             code="permissions.error.folder.share_external_owner_only",
-            message="Only the folder owner/admin or a user with external share access can share externally",
+            message="Only the folder owner or a user with global management or external share access can share externally",
         )
 
     cls, _effective_visibility, _effective_client_visible = await effective_folder_policy(
@@ -1018,7 +1039,7 @@ async def revoke_folder_share(
         raise CodedError(
             403,
             code="permissions.error.folder.revoke_share_owner_only",
-            message="Only the folder owner/admin or a user with external share access can revoke",
+            message="Only the folder owner or a user with global management or external share access can revoke",
         )
     share = (
         await db.execute(
@@ -1108,6 +1129,20 @@ async def _load_public_folder_share(
                 )
             if share_scope.resource_type != ResourceType.DOCUMENT_FOLDER:
                 raise HTTPException(404, "Not a folder share")
+            entity_id = await db.scalar(
+                select(Entity.id)
+                .where(
+                    Entity.id == share_scope.entity_id,
+                    Entity.deleted_at.is_(None),
+                )
+                .with_for_update(read=True)
+            )
+            if entity_id is None:
+                raise CodedError(
+                    410,
+                    code="permissions.error.share.not_found_or_revoked",
+                    message="Share is no longer available",
+                )
 
             target_folder_id = folder_id or share_scope.resource_id
             if document_id is not None:
@@ -1174,22 +1209,12 @@ async def _load_public_folder_share(
                     child_folder_scopes[child.id] = child_scope
                     workspace_ids.update(child_scope.workspace_ids)
                     folder_ids.update(child_scope.folder_ids)
-            workspaces = await lock_workspace_policy_rows(
+            await lock_workspace_policy_rows(
                 db,
                 entity_id=folder.entity_id,
                 workspace_ids=tuple(sorted(workspace_ids)),
                 read=True,
             )
-            if any(
-                workspace.id in scope.workspace_ids
-                and workspace.deleted_at is not None
-                for workspace in workspaces
-            ):
-                raise CodedError(
-                    410,
-                    code="permissions.error.share.revoked_by_workspace_lifecycle",
-                    message="Share is no longer available",
-                )
             await lock_folder_policy_rows(
                 db,
                 entity_id=folder.entity_id,
@@ -1366,7 +1391,7 @@ async def _load_shared_folder_document(
     if (
         document is None
         or document.quarantine_status in {"quarantined", "rejected"}
-        or await document_is_owned_by_deleted_workspace(db, document)
+        or await document_entity_is_unavailable(db, document)
     ):
         raise HTTPException(404, "Shared document not found")
     classification, _, _ = await effective_document_folder_policy(db, document)
@@ -1614,7 +1639,7 @@ async def view_shared_folder(
     # quarantined children. Those require their own explicit policy path.
     visible_docs: list[tuple[Document, str]] = []
     for doc in docs:
-        if await document_is_owned_by_deleted_workspace(db, doc):
+        if await document_entity_is_unavailable(db, doc):
             continue
         effective_classification, _visibility, _client_visible = (
             await effective_document_folder_policy(db, doc)
@@ -1627,7 +1652,7 @@ async def view_shared_folder(
             visible_docs.append((doc, effective_classification))
     visible_subfolders = []
     for child in subfolders:
-        if await folder_is_owned_by_deleted_workspace(db, child):
+        if await folder_entity_is_unavailable(db, child):
             continue
         effective_classification, _visibility, _client_visible = await effective_folder_policy(
             db, child

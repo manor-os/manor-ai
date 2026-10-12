@@ -1,3 +1,5 @@
+import { accessTokenExpired, getReadyAuthToken, restorePersistentSession } from "./persistentSession";
+import { approvalResourcePath, type ApprovalScope, type ApprovalSnapshot, type ApprovalWrite, type ApprovalPreview, type ApprovalOverrides, type ApprovalCommandProjection, type ApprovalSaveRuleCommand, type ApprovalCommandResult } from "./approvalTypes";
 import type {
   User,
   Task,
@@ -33,7 +35,6 @@ import type {
   ExecutionStep,
   PlanRetryResponse,
   StepRetryResponse,
-  SearchResult,
   Order,
   OrderItem,
   OrderStats,
@@ -55,6 +56,7 @@ import type {
   TaskTemplateDetail,
   DocumentGrant,
   DocumentShare,
+  DocumentSignatureRequest,
   DocumentAccessLogRow,
   DocumentFolderInfo,
   AccessRequest,
@@ -69,26 +71,52 @@ import type {
   CommentAnchor,
 } from "./types";
 import type { AiEditTargetKind } from "./editorLiveChat";
+import {
+  globalSearchPath,
+  normalizeGlobalSearchResponse,
+  type GlobalSearchResponse,
+} from "./globalSearchResponse";
+import type { ChatRoom, ChatRoomAgentBinding, ChatRoomAgentCandidate, ChatRoomFile, ChatRoomInvite, ChatRoomInviteSender, ChatRoomPendingInvite, ChatRoomMessage, ChatRoomPresence, ChatRoomReplyApproval, ChatRoomToolApproval } from "./chatRoomTypes";
+import type {
+  AgentInitiative,
+  AgentInitiativeActionResponse,
+  AgentInitiativeConversationListResponse,
+  AgentInitiativeCreateRequest,
+  AgentInitiativeListResponse,
+  AgentInitiativeRevisionRequest,
+  AgentInitiativeRunListResponse,
+  AgentInitiativeRunReceipt,
+  AgentInitiativeRun,
+  AgentInitiativeUpdateRequest,
+} from "./agentInitiativeTypes";
 
 import { useToastStore } from "../stores/toast";
 import { normalizeLocale, t } from "./i18n";
+import { browserImageBlob, prepareChatUploadFile } from "./browserImage";
 import {
   legacyManualSkillIds,
   type ManualSkillReference,
 } from "./manualSkillRefs";
 import {
+  authPrincipalKey,
+  isSameAuthIdentity,
   getAuthToken,
   clearAuthBrowserState,
+  notifyAuthTokenChanged,
 } from "./authToken";
 import { captureClientError } from "./clientErrors";
 
 const API_BASE = "/api/v1";
+
 
 export enum ConversationSurfaceKind {
   OrdinaryChat = "chat",
   AiEdit = "ai_edit",
 }
 const BACKEND_UNAVAILABLE_TOAST_ID = "backend-unavailable";
+const RATE_LIMIT_TOAST_ID = "api-rate-limit";
+let rateLimitUntil = 0;
+let backendUnavailableUntil = 0;
 
 export type DashboardAppliedModuleChange = {
   action: "create" | "update" | "remove";
@@ -125,12 +153,25 @@ export type TaskBoardPreferences = {
   configured: boolean;
 };
 
+export type WorkspaceAttentionReminder = {
+  key: string;
+  message_id: string;
+  source_id: string;
+  kind: string;
+  summary: string;
+  created_at: string;
+};
+
 type PaginatedMessagesResponse<T> = {
+  conversation_id?: string | null;
+  /** Workspace chat only: durable run state; null uses legacy message markers. */
+  has_active_runtime_run?: boolean | null;
   items: T[];
   has_more: boolean;
   next_cursor?: string | null;
   /** Workspace chat only: server-counted actions still waiting on a human. */
   open_action_count?: number;
+  unseen_action_keys?: Record<string, Record<string, string>>;
   /** True when `items` carries every open action card, so absent == answered. */
   open_actions_complete?: boolean;
 };
@@ -163,6 +204,92 @@ export type WorkspaceChatEntrypoint = {
   }>;
 };
 
+export type WorkspaceAppActionInput = WorkspaceChatEntrypoint["inputs"][number] & {
+  description?: string;
+  hidden?: boolean;
+  schema?: import("../components/workflows/workflowSchema").WorkflowInputSchema;
+};
+
+export type WorkspaceAppFormField = {
+  key: string;
+  label: string;
+  type: "text" | "long_text" | "file" | "number" | "select";
+  required: boolean;
+  placeholder: string;
+  options: string[];
+};
+
+export type WorkspaceAppAction = {
+  key: string;
+  kind: "workflow" | "chat" | "automation";
+  title: string;
+  source_title: string;
+  source_description?: string;
+  available?: boolean;
+  description: string;
+  binding_id?: string;
+  workflow_id?: string;
+  job_id?: string;
+  agent_id?: string;
+  agent_name?: string;
+  default_agent_id?: string;
+  default_agent_name?: string;
+  enabled?: boolean;
+  last_status?: string | null;
+  job_type?: string | null;
+  schedule_kind?: string | null;
+  every_seconds?: number | null;
+  run_at?: string | null;
+  cron_expr?: string | null;
+  timezone?: string | null;
+  instructions?: string | null;
+  target_title?: string | null;
+  target_workflow_id?: string | null;
+  placeholder?: string;
+  prompt?: string;
+  inputs?: WorkspaceAppActionInput[] | WorkspaceAppFormField[];
+};
+
+export type WorkspaceAppViewConfig = {
+  version: number;
+  eyebrow: string | null;
+  title: string | null;
+  description: string | null;
+  hero: string | null;
+  order: string[];
+  hidden: string[];
+  labels: Record<string, string>;
+  descriptions: Record<string, string>;
+  forms: Record<string, WorkspaceAppFormField[]>;
+  targets: Record<string, string>;
+  entries?: Record<string, { title: string }>;
+  prompts?: Record<string, string>;
+  visual: "auto" | "image" | "motion" | "plain";
+  layout: "feature" | "cover" | "list";
+  motion_cover_url: string | null;
+  motion_cover_source_url: string | null;
+};
+
+export type WorkspaceAppView = {
+  workspace_id: string;
+  eyebrow: string | null;
+  title: string;
+  description: string;
+  status: string;
+  cover_image_url?: string | null;
+  cover_source?: "workspace" | "starter" | "none";
+  can_start: boolean;
+  hero: string | null;
+  actions: WorkspaceAppAction[];
+  available_actions: WorkspaceAppAction[];
+  workflow_options: Array<{ binding_id: string; workflow_id: string; title: string; description: string; placeholder: string; inputs: WorkspaceAppActionInput[] }>;
+  automation_options: Array<{ job_id: string; title: string; description?: string; enabled: boolean } & Pick<WorkspaceAppAction, "last_status" |
+    "job_type" | "schedule_kind" | "every_seconds" | "run_at" | "cron_expr" | "timezone" | "instructions" | "target_title" | "target_workflow_id">>;
+  agent_options: Array<{ id: string; name: string }>;
+  attachable_workflow_options?: Array<{ workflow_id: string; title: string; description: string; inputs: WorkspaceAppActionInput[] }>;
+  config: WorkspaceAppViewConfig;
+};
+
 export type GlobalChatFlowEntrypoint = WorkspaceChatEntrypoint & {
   workspace_id: string;
   workspace_name: string;
@@ -190,6 +317,15 @@ type DocumentBrowseResponse = DocumentListResponse & {
   total_documents: number;
   direct_total_files?: number;
   direct_total_size?: number;
+  max_upload_mb: number;
+};
+type DocumentBrowsePageResponse = {
+  items: Document[];
+  folders: DocumentFolderInfo[];
+  next_cursor: string | null;
+  storage_used_mb: number | null;
+  storage_limit_mb: number | null;
+  max_upload_mb: number;
 };
 type DocumentIndexingStatus = Pick<Document, "id" | "vector_status" | "indexing_progress">;
 
@@ -259,6 +395,30 @@ function browseDocuments(params?: Pick<DocumentListParams, "search" | "folder_id
   if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
   if (params?.include_generated_assets !== undefined) q.set("include_generated_assets", String(params.include_generated_assets));
   return request<DocumentBrowseResponse>(`/documents/browse?${q}`);
+}
+
+function browseDocumentsPage(
+  params: Pick<DocumentListParams, "search" | "folder_id" | "scope" | "workspace_id" | "include_generated_assets"> & {
+    favorite_only?: boolean;
+    file_type_filter?: string;
+    sort_by?: "date" | "name" | "size";
+    limit?: number;
+    cursor?: string;
+  },
+  signal?: AbortSignal,
+) {
+  const q = new URLSearchParams();
+  if (params.search) q.set("search", params.search);
+  if (params.folder_id !== undefined) q.set("folder_id", params.folder_id);
+  if (params.scope) q.set("scope", params.scope);
+  if (params.workspace_id) q.set("workspace_id", params.workspace_id);
+  if (params.include_generated_assets !== undefined) q.set("include_generated_assets", String(params.include_generated_assets));
+  if (params.favorite_only) q.set("favorite_only", "true");
+  if (params.file_type_filter && params.file_type_filter !== "all") q.set("file_type_filter", params.file_type_filter);
+  if (params.sort_by) q.set("sort_by", params.sort_by);
+  q.set("limit", String(params.limit ?? 50));
+  if (params.cursor) q.set("cursor", params.cursor);
+  return request<DocumentBrowsePageResponse>(`/documents/browse-page?${q}`, { signal });
 }
 
 function listDocumentIndexingStatuses(ids: string[]) {
@@ -364,6 +524,7 @@ export interface IntegrationMCPServer {
   scopes: string | null;
   tagline: string | null;
   docs_url: string | null;
+  app_url?: string | null;
   setup_hint: string | null;
   color_hex: string | null;
   supports_multi_account: boolean;
@@ -393,10 +554,20 @@ export interface IntegrationMCPServer {
   agent_can_use: boolean;
   requires_explicit_account: boolean;
   hint: string;
+  setup_pending?: boolean;
+  setup_unavailable?: boolean;
   nango_provider_config_key?: string | null;
   oauth_configured?: boolean;
   oauth_client_secret_required?: boolean;
   coming_soon?: boolean;
+  plugin_key?: string | null;
+  plugin_enabled?: boolean | null;
+  plugin_skills?: Array<{
+    slug: string;
+    display_name: string;
+    description: string;
+    installed: boolean;
+  }>;
   cli_spec?: {
     command_template: string;
     supported_subcommands: string[];
@@ -552,6 +723,14 @@ export interface AgentDeploymentResponse {
   workspace_id: string | null;
   workspace_name: string | null;
   workspace_status: string | null;
+  name?: string | null;
+  owner_user_id?: string | null;
+  owner_name?: string | null;
+  owner_display_name?: string | null;
+  can_manage?: boolean;
+  scope_kind?: "personal" | "workspace" | "legacy" | string;
+  conversation_id?: string | null;
+  default_conversation_id?: string | null;
   service_key: string | null;
   custom_prompt: string | null;
   config: Record<string, unknown>;
@@ -601,18 +780,36 @@ export interface WorkspaceBudgetUpdate {
   reset_alert_state?: boolean;
 }
 
+export interface WorkspaceCreditUsageSummary {
+  today_credits: number;
+  week_credits: number;
+  all_time_credits: number;
+  timezone: string;
+}
+
 export interface WorkspaceSetupStatus {
   ready: boolean;
   status: string;
   summary: string;
+  automatic_setup_state?: "pending" | "running" | "retrying" | "failed" | null;
+  automatic_setup_task_id?: string | null;
   incomplete_checks: Array<{
     key?: string;
     kind?: string;
     todo_kind?: string;
     reason?: string;
     provider?: string;
+    setup_job_id?: string;
+    setup_task_key?: string;
+    accepts_text?: boolean;
     [key: string]: unknown;
   }>;
+}
+
+export interface BlueprintStartupReconcileResponse {
+  state: string;
+  dispatched_job_ids: string[];
+  blocking_check_keys: string[];
 }
 
 export interface WorkspaceEvaluationSnapshot {
@@ -691,6 +888,22 @@ export interface WorkspaceDraftFinalize {
 
 // ── Workspace Blueprint / Marketplace types (M12) ─────────────────────
 
+export interface WorkspaceConnectionStatus {
+  workspace_id: string;
+  required_issue_count: number;
+  requirements: Array<{
+    key: string;
+    kind: "integration" | "channel" | "browser_session";
+    provider: string;
+    label: string;
+    required: boolean;
+    ready: boolean;
+    reason: string;
+    service_keys: string[];
+    setup_kind?: string | null;
+  }>;
+}
+
 export interface BlueprintSetupItem {
   label: string;
   key: string | null;
@@ -721,6 +934,7 @@ export interface BlueprintSetupPreview {
   not_included: string[];
   services: BlueprintSetupItem[];
   rules: string[];
+  author_hard_blocks: string[];
 }
 
 export interface BlueprintShowcaseAsset {
@@ -757,6 +971,7 @@ export interface BlueprintSummary {
   status: "draft" | "pending_review" | "published" | "archived";
   install_count: number;
   payload_version: string;
+  content_version: string;
   source_workspace_id: string | null;
   cover_image_url: string | null;
   showcase_assets: BlueprintShowcaseAsset[];
@@ -773,6 +988,8 @@ export interface BlueprintSummary {
   updated_at: string | null;
   published_at: string | null;
   has_share_token?: boolean;
+  /** Owner-only verified-email allowlist for a private install link. */
+  share_allowed_emails?: string[];
   // Whether the current caller owns this blueprint row.
   is_owner?: boolean;
 }
@@ -788,18 +1005,17 @@ export interface UpdateBlueprintRequest {
   title?: string;
   summary?: string;
   description?: string;
+  usage_guide?: string;
   tags?: string[];
   cover_image_url?: string;
 }
 
-export interface ExportBlueprintRequest {
-  marketplace_blueprint_id?: string;
-  slug: string;
-  title: string;
+export interface ExportBlueprintPayloadRequest {
+  title?: string;
   summary?: string;
   description?: string;
+  usage_guide?: string;
   tags?: string[];
-  cover_image_url?: string;
   author_handle?: string;
   author_display_name?: string;
   install_variables?: Array<{
@@ -815,6 +1031,7 @@ export interface ExportBlueprintRequest {
   include_stats?: boolean;
   include_scheduled_jobs?: boolean;
   include_workflows?: boolean;
+  include_blocking_setup?: boolean;
   include_custom_fields?: boolean;
   include_governance?: boolean;
   include_channel_requirements?: boolean;
@@ -826,6 +1043,13 @@ export interface ExportBlueprintRequest {
   include_starter_memory?: boolean;
   include_memory_files?: boolean;
   knowledge_document_ids?: string[];
+}
+
+export interface ExportBlueprintRequest extends ExportBlueprintPayloadRequest {
+  marketplace_blueprint_id?: string;
+  slug: string;
+  title: string;
+  cover_image_url?: string;
   replace_existing?: boolean;
 }
 
@@ -839,15 +1063,9 @@ export interface BlueprintExportKnowledgeDocument {
 }
 
 export type InstallMode = "simulate" | "live";
-export type GovernancePresetKey = "safe" | "standard" | "aggressive";
+export type GovernancePresetKey = "automatic" | "follow_default" | "confirm_changes" | "risk_based";
 
 export interface GovernancePolicy {
-  never_allow_actions: string[];
-  hitl_required_actions: string[];
-  auto_approve_actions: string[];
-  never_allow_capabilities: string[];
-  hitl_required_capabilities: string[];
-  auto_approve_capabilities: string[];
   max_risk_level: "low" | "medium" | "high";
   budget_caps_per_kind: Record<string, number>;
 }
@@ -858,28 +1076,6 @@ export interface GovernancePolicyResponse {
   policy: GovernancePolicy;
   updated_by?: string | null;
   updated_at?: string | null;
-}
-
-// Mirrors backend StandingGrantsResponse (apps/api/routers/governance.py).
-export interface StandingGrantsResponse {
-  actions: string[];
-  capabilities: string[];
-}
-
-// Mirrors backend ApprovalMatrixResponse (apps/api/routers/governance.py) —
-// one row per Strategist proposal type + the non-Strategist standing grants.
-export interface ApprovalMatrixRow {
-  action_key: string;
-  kind: string;
-  operation: string;
-  label: string;
-  risk_level: string;
-  auto_approved: boolean;
-}
-
-export interface ApprovalMatrixResponse {
-  rows: ApprovalMatrixRow[];
-  other_grants: Array<{ kind: "action" | "capability"; value: string }>;
 }
 
 // ── M14 observability (apps/api/routers/observability.py) ─────────────
@@ -1071,9 +1267,11 @@ export interface InstallBlueprintRequest {
   mode?: InstallMode;
   workspace_name?: string;
   create_missing_agents?: boolean;
+  agent_ids_by_service_key?: Record<string, string>;
   variable_values?: Record<string, unknown>;
   channel_config_ids?: Record<string, string>;
   governance_preset?: GovernancePresetKey;
+  install_author_hard_blocks?: boolean;
   share_token?: string;
 }
 
@@ -1225,19 +1423,26 @@ let _sessionRedirecting = false;
  *  in-app action (e.g. clicking "add node" and nothing happening). The
  *  ``/auth/*`` endpoints legitimately 401 on bad credentials, so they're left to
  *  show their own inline error instead of redirecting. */
-function handleSessionExpired(path: string) {
+export function handleSessionExpired(path = "") {
   if (typeof window === "undefined" || _sessionRedirecting) return;
   if (path.startsWith("/auth/") && path !== "/auth/renew") return;
   if (window.location.pathname.startsWith("/login")) return;
   _sessionRedirecting = true;
-  try {
-    clearAuthBrowserState();
-    window.sessionStorage.setItem("manor_session_expired", "1");
-  } catch {
-    /* storage may be unavailable */
-  }
-  const next = window.location.pathname + window.location.search;
+  clearAuthBrowserState();
+  const next = window.location.pathname + window.location.search + window.location.hash;
   window.location.assign(`/login?next=${encodeURIComponent(next)}`);
+}
+
+function handleUnauthorizedResponse(path: string, requestToken: string | null) {
+  // A late response from an old account/token must not sign out the new one.
+  if (requestToken !== getAuthToken()) {
+    if (!getAuthToken()) notifyAuthTokenChanged();
+    return;
+  }
+  if (requestToken) handleSessionExpired(path);
+  // Missing credentials can coexist with a stale in-memory signed-in UI.
+  // The session boundary reconciles it; truly anonymous public pages stay put.
+  else notifyAuthTokenChanged();
 }
 
 export class ApiError extends Error {
@@ -1253,12 +1458,52 @@ export class ApiError extends Error {
   /** Variable substitutions for ``code`` interpolation
    *  (e.g. ``{ name: "foo.pdf" }``). */
   vars?: Record<string, string | number>;
+  /** Remaining server-directed cooldown for rate limits or unavailable dependencies. */
+  retryAfterMs?: number;
   constructor(
     public status: number,
     message: string,
   ) {
     super(message);
     this.name = "ApiError";
+  }
+}
+
+export type DocumentUploadPhase = "uploading" | "processing";
+
+export interface DocumentUploadProgress {
+  phase: DocumentUploadPhase;
+  loaded: number;
+  total: number;
+  percent: number;
+}
+
+export interface DocumentUploadRequestOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: DocumentUploadProgress) => void;
+  /** Abort only while the browser has stopped sending bytes for this long. */
+  stallTimeoutMs?: number;
+  /** Bound the server-side validation/persistence phase after all bytes arrive. */
+  processingTimeoutMs?: number;
+  /** Stable across retries so an ambiguous completion cannot create a duplicate. */
+  idempotencyKey?: string;
+  /** Bound receipt reconciliation after the browser times out waiting for processing. */
+  receiptReconcileTimeoutMs?: number;
+}
+
+export class DocumentUploadStalledError extends Error {
+  constructor(public phase: DocumentUploadPhase = "uploading") {
+    super(phase === "processing"
+      ? "Upload processing did not finish in time"
+      : "Upload stopped making progress");
+    this.name = "DocumentUploadStalledError";
+  }
+}
+
+export class DocumentUploadAuthChangedError extends Error {
+  constructor() {
+    super("Upload stopped because the authenticated account changed");
+    this.name = "DocumentUploadAuthChangedError";
   }
 }
 
@@ -1374,7 +1619,11 @@ const DOCUMENT_DOWNLOAD_CACHE_MAX_ITEMS = 96;
 const DOCUMENT_DOWNLOAD_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 const PERSISTENT_THUMBNAIL_CACHE_INDEX_KEY = "manor:document-thumbnail-cache:v1:index";
 const PERSISTENT_THUMBNAIL_CACHE_KEY_PREFIX = "manor:document-thumbnail-cache:v1:item:";
-const PERSISTENT_THUMBNAIL_CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const PERSISTENT_THUMBNAIL_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Protected blobs must reach the API for current access checks. Redis keeps
+// versioned thumbnail bytes hot for a week; browser persistence bypasses ACL
+// revocation and can survive an account switch on a shared computer.
+const ALLOW_PERSISTENT_PROTECTED_DOCUMENT_CACHE = false;
 const PERSISTENT_THUMBNAIL_CACHE_MAX_ITEMS = 48;
 const PERSISTENT_THUMBNAIL_CACHE_MAX_BYTES = 4 * 1024 * 1024;
 const PERSISTENT_THUMBNAIL_CACHE_MAX_ENTRY_BYTES = 768 * 1024;
@@ -1605,7 +1854,7 @@ function pruneDocumentDownloadCache(protectedId?: string) {
 
 function invalidateDocumentDownloadCache(id?: string) {
   if (id) {
-    [id, `download:${id}`, `thumbnail:${id}`].forEach((key) => {
+    [id, `download:${id}`, `preview:${id}`, `thumbnail:${id}`].forEach((key) => {
       documentDownloadCache.delete(key);
       documentDownloadInflight.delete(key);
     });
@@ -1615,6 +1864,32 @@ function invalidateDocumentDownloadCache(id?: string) {
   documentDownloadCache.clear();
   documentDownloadInflight.clear();
   invalidatePersistentThumbnailCache();
+}
+
+/** The file endpoint answers 503 + Retry-After while its download slots are
+ * busy. Retry a couple of times so a page that loads several files at once
+ * doesn't leave some previews permanently broken. */
+export async function fetchWithBusyRetry(
+  url: string,
+  init: RequestInit,
+  { retries = 2, maxDelayMs = 3000 }: { retries?: number; maxDelayMs?: number } = {},
+): Promise<Response> {
+  for (let attempt = 0; ; attempt += 1) {
+    const res = await fetch(url, init);
+    if (res.status !== 503 || attempt >= retries || init.signal?.aborted) return res;
+    const retryAfter = Number(res.headers.get("Retry-After"));
+    const delayMs = Math.min(
+      maxDelayMs,
+      Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 1000,
+    );
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, delayMs);
+      init.signal?.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(init.signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      }, { once: true });
+    });
+  }
 }
 
 async function fetchProtectedBlob(
@@ -1641,9 +1916,9 @@ async function fetchProtectedBlob(
     if (inflight) return inflight;
   }
 
-  const token = getAuthToken();
+  const token = await getReadyAuthToken();
   let request: Promise<Blob>;
-  request = fetch(url, {
+  request = fetchWithBusyRetry(url, {
     cache: "no-store",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     signal: options.signal,
@@ -1681,19 +1956,20 @@ async function fetchProtectedDocumentBlob(
   path: string,
   options: DocumentBlobOptions = {},
 ): Promise<Blob> {
-  return fetchProtectedBlob(cacheKey, cacheBustUrl(`${API_BASE}${path}`), options);
+  return fetchProtectedBlob(cacheKey, cacheBustUrl(`${API_BASE}${path}`), { ...options, cache: false });
 }
 
 async function fetchDocumentBlob(id: string, options: DocumentBlobOptions = {}): Promise<Blob> {
-  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, options);
+  return fetchProtectedDocumentBlob(`download:${id}`, `/documents/${id}/download`, { ...options, cache: false });
 }
 
 async function fetchDocumentResponse(
   id: string,
   options: DocumentResponseOptions = {},
+  action = "download",
 ): Promise<Response> {
-  const token = getAuthToken();
-  const response = await fetch(cacheBustUrl(`${API_BASE}/documents/${id}/download`), {
+  const token = await getReadyAuthToken();
+  const response = await fetch(cacheBustUrl(`${API_BASE}/documents/${id}/${action}`), {
     cache: "no-store",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
     signal: options.signal,
@@ -1708,7 +1984,7 @@ async function fetchDocumentThumbnailBlob(id: string, options: DocumentBlobOptio
 
 async function fetchDocumentThumbnailUrl(id: string, options: DocumentThumbnailOptions = {}): Promise<string> {
   const useCache = options.cache !== false;
-  const usePersistentCache = useCache && options.persistent !== false;
+  const usePersistentCache = ALLOW_PERSISTENT_PROTECTED_DOCUMENT_CACHE && useCache && options.persistent !== false;
   if (usePersistentCache && !options.force) {
     const cached = readPersistentThumbnailDataUrl(id, options.version);
     if (cached) return cached;
@@ -1808,7 +2084,7 @@ async function captureDocumentVideoFrame(videoUrl: string): Promise<string> {
 
 async function fetchDocumentVideoThumbnailUrl(id: string, options: DocumentThumbnailOptions = {}): Promise<string> {
   const useCache = options.cache !== false;
-  const usePersistentCache = useCache && options.persistent !== false;
+  const usePersistentCache = ALLOW_PERSISTENT_PROTECTED_DOCUMENT_CACHE && useCache && options.persistent !== false;
   if (usePersistentCache && !options.force) {
     const cached = readPersistentThumbnailDataUrl(id, options.version);
     if (cached) return cached;
@@ -1824,7 +2100,7 @@ async function fetchDocumentVideoThumbnailUrl(id: string, options: DocumentThumb
     // browser capture fallback below.
   }
 
-  const blob = await fetchDocumentBlob(id, options);
+  const blob = await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options);
   const videoUrl = URL.createObjectURL(blob);
   try {
     const dataUrl = await captureDocumentVideoFrame(videoUrl);
@@ -1848,7 +2124,7 @@ function loadDocumentImageElement(url: string): Promise<HTMLImageElement> {
 }
 
 async function captureDocumentImageThumbnail(blob: Blob): Promise<string> {
-  const imageUrl = URL.createObjectURL(blob);
+  const imageUrl = URL.createObjectURL(await browserImageBlob(blob));
   try {
     const image = await loadDocumentImageElement(imageUrl);
     const width = image.naturalWidth || image.width || 640;
@@ -1869,7 +2145,7 @@ async function captureDocumentImageThumbnail(blob: Blob): Promise<string> {
 
 async function fetchDocumentImageThumbnailUrl(id: string, options: DocumentThumbnailOptions = {}): Promise<string> {
   const useCache = options.cache !== false;
-  const usePersistentCache = useCache && options.persistent !== false;
+  const usePersistentCache = ALLOW_PERSISTENT_PROTECTED_DOCUMENT_CACHE && useCache && options.persistent !== false;
   if (usePersistentCache && !options.force) {
     const cached = readPersistentThumbnailDataUrl(id, options.version);
     if (cached) return cached;
@@ -1884,7 +2160,7 @@ async function fetchDocumentImageThumbnailUrl(id: string, options: DocumentThumb
     // client-side fallback.
   }
 
-  const blob = await fetchDocumentBlob(id, options);
+  const blob = await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options);
   if (usePersistentCache) {
     const captured = await captureDocumentImageThumbnail(blob).catch(() => null);
     const dataUrl = captured
@@ -1895,9 +2171,27 @@ async function fetchDocumentImageThumbnailUrl(id: string, options: DocumentThumb
   return URL.createObjectURL(blob);
 }
 
+const SLIDE_LIST_BUSY_BUDGET_MS = 60_000;
+
+/** `/slides` answers 503 (+ Retry-After) while render slots are busy; wait it out within a budget. */
+async function requestSlideListWhileRenderBusy(id: string) {
+  const deadline = Date.now() + SLIDE_LIST_BUSY_BUDGET_MS;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await request<{ slides: { index: number; url: string }[]; total: number }>(`/documents/${id}/slides`);
+    } catch (error) {
+      const retryable = error instanceof ApiError
+        && (error.status === 503 || (error.status === 409 && attempt < 3));
+      const delay = Math.min(8_000, 1_000 * 2 ** attempt);
+      if (!retryable || Date.now() + delay >= deadline) throw error;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+}
+
 async function fetchDocumentPresentationThumbnailUrl(id: string, options: DocumentThumbnailOptions = {}): Promise<string> {
   const useCache = options.cache !== false;
-  const usePersistentCache = useCache && options.persistent !== false;
+  const usePersistentCache = ALLOW_PERSISTENT_PROTECTED_DOCUMENT_CACHE && useCache && options.persistent !== false;
   if (usePersistentCache && !options.force) {
     const cached = readPersistentThumbnailDataUrl(id, options.version);
     if (cached) return cached;
@@ -1909,7 +2203,7 @@ async function fetchDocumentPresentationThumbnailUrl(id: string, options: Docume
     // Keep the slide endpoint fallback for legacy presentations.
   }
 
-  const slideData = await request<{ slides: { index: number; url: string }[]; total: number }>(`/documents/${id}/slides`);
+  const slideData = await requestSlideListWhileRenderBusy(id);
   const firstSlide = slideData.slides?.[0];
   if (!firstSlide?.url) throw new ApiError(404, "Presentation thumbnail unavailable");
   const blob = await fetchProtectedDocumentBlob(
@@ -1962,14 +2256,103 @@ function isAbortError(error: unknown): boolean {
   );
 }
 
-async function request<T>(
+function responseRetryAfterMs(response: Response, fallbackMs: number): number {
+  const now = Date.now();
+  const header = response.headers.get("Retry-After")?.trim();
+  const seconds = header && /^\d+(\.\d+)?$/.test(header) ? Number(header) : NaN;
+  const delay = Number.isFinite(seconds)
+    ? seconds * 1000
+    : header ? Date.parse(header) - now : NaN;
+  return Number.isFinite(delay) && delay > 0 ? delay : fallbackMs;
+}
+
+function recordRateLimit(response: Response, silent: boolean) {
+  const now = Date.now();
+  rateLimitUntil = Math.max(rateLimitUntil, now + responseRetryAfterMs(response, 60_000));
+  if (!silent && !useToastStore.getState().toasts.some((toast) => toast.id === RATE_LIMIT_TOAST_ID)) {
+    useToastStore.getState().addToast({
+      id: RATE_LIMIT_TOAST_ID,
+      type: "warning",
+      title: t("lib.api.rate_limit_title"),
+      message: t("lib.api.rate_limit_message"),
+      duration: rateLimitUntil - now,
+    });
+  }
+}
+
+async function waitForRateLimit(signal?: AbortSignal | null) {
+  // Spread reads resuming after a backend outage; do not shorten Retry-After.
+  const jitterMs = backendUnavailableUntil > Date.now() ? Math.floor(Math.random() * 500) : 0;
+  // Other in-flight responses may extend the shared cooldown while we wait.
+  while (Math.max(rateLimitUntil, backendUnavailableUntil) + jitterMs > Date.now()) {
+    if (signal?.aborted) throw new DOMException("Request aborted", "AbortError");
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => {
+        clearTimeout(timer);
+        reject(new DOMException("Request aborted", "AbortError"));
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", abort);
+        resolve();
+      }, Math.min(Math.max(rateLimitUntil, backendUnavailableUntil) + jitterMs - Date.now(), 2_147_483_647));
+      signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+}
+
+// A page load fires many reads at once and several components ask for the same
+// resource under different query keys. Identical concurrent reads share one
+// network round trip; each caller gets its own copy so mutation stays local.
+const inflightReads = new Map<string, Promise<unknown>>();
+
+function request<T>(
   path: string,
   options: RequestInit = {},
   authTokenOverride?: string | null,
+  rateLimitAttempt = 0,
 ): Promise<T> {
+  const method = (options.method || "GET").toUpperCase();
+  const headers = (options.headers as Record<string, string> | undefined) || {};
+  const coalescible =
+    method === "GET"
+    && !options.signal
+    && !options.body
+    && authTokenOverride === undefined
+    && rateLimitAttempt === 0
+    && Object.keys(headers).every((name) => name.toLowerCase() === "x-silent-error");
+  if (!coalescible) return requestUncoalesced<T>(path, options, authTokenOverride, rateLimitAttempt);
+
+  const key = [getAuthToken() || "", getStoredLocale(), headers["X-Silent-Error"] || "", path].join("\n");
+  let shared = inflightReads.get(key) as Promise<T> | undefined;
+  if (!shared) {
+    shared = requestUncoalesced<T>(path, options).finally(() => {
+      if (inflightReads.get(key) === shared) inflightReads.delete(key);
+    });
+    inflightReads.set(key, shared);
+  }
+  return shared.then((value) =>
+    value !== null && typeof value === "object" ? structuredClone(value) : value,
+  );
+}
+
+async function requestUncoalesced<T>(
+  path: string,
+  options: RequestInit = {},
+  authTokenOverride?: string | null,
+  rateLimitAttempt = 0,
+  sessionRecoveryAttempted = false,
+): Promise<T> {
+  const sessionToken = getAuthToken();
+  const refreshablePath = !path.startsWith("/auth/") || path.startsWith("/auth/me")
+    || path === "/auth/renew" || path === "/auth/entities/switch";
+  if (authTokenOverride === undefined && refreshablePath && accessTokenExpired(sessionToken)) {
+    await getReadyAuthToken();
+    sessionRecoveryAttempted = true;
+  }
   const token = authTokenOverride === undefined ? getAuthToken() : authTokenOverride;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    "X-Manor-Session": "1",
     "X-Language": getStoredLocale(),
     ...((options.headers as Record<string, string>) || {}),
   };
@@ -1979,6 +2362,16 @@ async function request<T>(
   if (token) headers["Authorization"] = `Bearer ${token}`;
   const suppressErrorToast = headers["X-Silent-Error"] === "1";
   if (suppressErrorToast) delete headers["X-Silent-Error"];
+
+  const isRead = ["GET", "HEAD"].includes((options.method || "GET").toUpperCase());
+  if (isRead && Math.max(rateLimitUntil, backendUnavailableUntil) > Date.now()) {
+    await waitForRateLimit(options.signal);
+    if (!isSameAuthIdentity(sessionToken, getAuthToken())) {
+      throw new DOMException("Session changed while waiting", "AbortError");
+    }
+    // Rebuild headers after a normal token renewal during the waiting period.
+    return requestUncoalesced<T>(path, options, authTokenOverride, rateLimitAttempt, sessionRecoveryAttempted);
+  }
 
   let res: Response;
   try {
@@ -2003,23 +2396,48 @@ async function request<T>(
   const tokenIsCurrent = () => token === getAuthToken();
 
   if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: res.statusText }));
+    const detail = body.detail;
+    const coded = _extractCodedDetail(detail);
     if (isBackendUnavailableStatus(res.status)) {
-      if (!suppressErrorToast) showBackendUnavailableToast();
+      if (!suppressErrorToast && !(res.status === 503 && coded.code === "database_busy")) showBackendUnavailableToast();
       const err = new ApiError(res.status, t("lib.api.backend_unavailable"));
-      captureClientError(err, {
-        handled: true,
-        mechanism: "api.http",
-        tags: {
-          method: options.method || "GET",
-          path,
-          status: res.status,
-        },
-      });
+      err.code = coded.code;
+      err.vars = coded.vars;
+      if (typeof detail === "object" && detail !== null) err.detail = detail;
+      if ([502, 503, 504].includes(res.status) || res.headers.has("Retry-After")) {
+        backendUnavailableUntil = Math.max(backendUnavailableUntil, Date.now() + responseRetryAfterMs(res, 2_000));
+        err.retryAfterMs = Math.max(0, backendUnavailableUntil - Date.now());
+      }
+      // Server/edge metrics own availability failures. Posting a client error
+      // for every failed read adds writes to the dependency already overloaded.
+      if (![502, 503, 504].includes(res.status)) {
+        captureClientError(err, {
+          handled: true,
+          mechanism: "api.http",
+          tags: {
+            method: options.method || "GET",
+            path,
+            status: res.status,
+          },
+        });
+      }
       throw err;
     }
 
-    const body = await res.json().catch(() => ({ detail: res.statusText }));
-    const detail = body.detail;
+    // Middleware uses this machine marker; route-specific limits (such as
+    // failed login attempts) must not pause unrelated application reads.
+    const sharedRateLimit = res.status === 429 && body.error === "Too Many Requests";
+    if (sharedRateLimit) {
+      recordRateLimit(res, suppressErrorToast);
+      // Only replay safe reads, once. Writes remain explicit user actions.
+      if (isRead && rateLimitAttempt === 0) {
+        if (!isSameAuthIdentity(sessionToken, getAuthToken())) {
+          throw new DOMException("Session changed while waiting", "AbortError");
+        }
+        return requestUncoalesced<T>(path, options, authTokenOverride, 1, sessionRecoveryAttempted);
+      }
+    }
 
     // 402 with structured plan-gate detail.
     if (res.status === 402) {
@@ -2032,24 +2450,30 @@ async function request<T>(
     const message = (typeof detail === "string" ? detail : (detail as any)?.message) || res.statusText;
     // Pull i18n code + vars out of structured CodedError responses so we
     // can show the user a translated toast instead of raw English.
-    const coded = _extractCodedDetail(detail);
     const displayMessage = coded.code
       ? t(coded.code, coded.vars) || message
       : message;
+    if (!sessionRecoveryAttempted && res.status === 401 && authTokenOverride === undefined
+      && (!path.startsWith("/auth/") || path === "/auth/renew" || path === "/auth/me")
+      && !path.startsWith("/auth/session/")) {
+      const recovered = tokenIsCurrent() ? await restorePersistentSession() : isSameAuthIdentity(token, getAuthToken());
+      if (recovered) {
+        return requestUncoalesced<T>(path, options, undefined, rateLimitAttempt, true);
+      }
+    }
     // Expired session mid-use → clear + route to login (once), so an in-app
     // action never silently dead-ends on a stale token.
     if (
       res.status === 401 &&
-      authTokenOverride === undefined &&
-      Boolean(token) &&
-      tokenIsCurrent()
-    ) handleSessionExpired(path);
+      authTokenOverride === undefined
+    ) handleUnauthorizedResponse(path, token);
     // Background reads own their loading/empty/error state. A missing resource
     // should not produce a global toast for every query that referenced it.
-    if (shouldShowRequestErrorToast(res.status, options.method, suppressErrorToast)) {
+    if (!sharedRateLimit && shouldShowRequestErrorToast(res.status, options.method, suppressErrorToast)) {
       useToastStore.getState().error(t("lib.api.request_failed"), displayMessage);
     }
     const err = new ApiError(res.status, message);
+    if (sharedRateLimit) err.retryAfterMs = Math.max(0, rateLimitUntil - Date.now());
     if (coded.code) err.code = coded.code;
     if (coded.vars) err.vars = coded.vars;
     if (typeof detail === "object" && detail !== null) err.detail = detail as Record<string, unknown>;
@@ -2057,9 +2481,417 @@ async function request<T>(
   }
 
   clearBackendUnavailableToast();
+  if (rateLimitUntil > 0 && Date.now() >= rateLimitUntil) {
+    rateLimitUntil = 0;
+    useToastStore.getState().removeToast(RATE_LIMIT_TOAST_ID);
+  }
 
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+const DEFAULT_DOCUMENT_UPLOAD_STALL_TIMEOUT_MS = 120_000;
+const DEFAULT_DOCUMENT_UPLOAD_PROCESSING_TIMEOUT_MS = 600_000;
+const DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS = 15_000;
+
+function createDocumentUploadIdempotencyKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `document-upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function documentUploadResponseBody(xhr: XMLHttpRequest): Record<string, any> {
+  let body: Record<string, any> = {};
+  try {
+    body = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+  } catch {
+    body = {};
+  }
+  return body;
+}
+
+function documentUploadHttpError(
+  xhr: XMLHttpRequest,
+  path: string,
+  requestToken: string | null,
+  body = documentUploadResponseBody(xhr),
+): ApiError {
+  const detail = body.detail;
+  const message =
+    (typeof detail === "string" ? detail : detail?.message)
+    || xhr.statusText
+    || "Upload failed";
+  const coded = _extractCodedDetail(detail);
+
+  if (xhr.status === 402) {
+    const limitDetail = normalizePlanLimitDetail(
+      detail,
+      body.error || t("component.upgrade_prompt.default_message"),
+    );
+    const error = new ApiError(xhr.status, limitDetail.message);
+    error.detail = limitDetail as unknown as Record<string, unknown>;
+    return error;
+  }
+
+  if (xhr.status === 401) {
+    handleUnauthorizedResponse(path, requestToken);
+  }
+  if (isBackendUnavailableStatus(xhr.status)) {
+    const error = new ApiError(xhr.status, t("lib.api.backend_unavailable"));
+    if (coded.code) error.code = coded.code;
+    if (coded.vars) error.vars = coded.vars;
+    if (typeof detail === "object" && detail !== null) {
+      error.detail = detail as Record<string, unknown>;
+    }
+    captureClientError(error, {
+      handled: true,
+      mechanism: "api.http",
+      tags: { method: "POST", path, status: xhr.status },
+    });
+    return error;
+  }
+
+  const error = new ApiError(xhr.status, message);
+  if (coded.code) error.code = coded.code;
+  if (coded.vars) error.vars = coded.vars;
+  if (typeof detail === "object" && detail !== null) {
+    error.detail = detail as Record<string, unknown>;
+  }
+  return error;
+}
+
+function documentUploadReceiptPause(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Upload cancelled", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Upload cancelled", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function reconcileDocumentUploadReceipt(
+  idempotencyKey: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+  expectedPrincipalKey = authPrincipalKey(getAuthToken()),
+): Promise<Document> {
+  const deadline = Date.now() + timeoutMs;
+  let pauseMs = 250;
+  while (true) {
+    if (signal?.aborted) throw new DOMException("Upload cancelled", "AbortError");
+    if (authPrincipalKey(getAuthToken()) !== expectedPrincipalKey) {
+      throw new DocumentUploadAuthChangedError();
+    }
+    const receipt = await lookupDocumentUploadReceipt(
+      idempotencyKey,
+      signal,
+      expectedPrincipalKey,
+    );
+    if (receipt) return receipt;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) throw new DocumentUploadStalledError("processing");
+    await documentUploadReceiptPause(Math.min(pauseMs, remainingMs), signal);
+    pauseMs = Math.min(pauseMs * 2, 4_000);
+  }
+}
+
+async function lookupDocumentUploadReceipt(
+  idempotencyKey: string,
+  signal?: AbortSignal,
+  expectedPrincipalKey = authPrincipalKey(getAuthToken()),
+): Promise<Document | null> {
+  const receiptToken = getAuthToken();
+  if (authPrincipalKey(receiptToken) !== expectedPrincipalKey) {
+    throw new DocumentUploadAuthChangedError();
+  }
+  try {
+    return await request<Document>(
+      `/documents/upload-receipts/${encodeURIComponent(idempotencyKey)}`,
+      {
+        signal,
+        headers: { "X-Silent-Error": "1" },
+      },
+      receiptToken,
+    );
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}
+
+async function uploadDocumentRequest(
+  file: File,
+  folderId?: string | null,
+  options?: {
+    visibility?: string;
+    classification?: string;
+    client_visible?: boolean;
+  },
+  requestOptions: DocumentUploadRequestOptions = {},
+  requestAttempt = 0,
+  expectedPrincipalKey?: string,
+): Promise<Document> {
+  const form = new FormData();
+  form.append("file", file);
+  const params = new URLSearchParams();
+  if (folderId) params.set("folder_id", folderId);
+  if (options?.visibility) params.set("visibility", options.visibility);
+  if (options?.classification) params.set("classification", options.classification);
+  if (options?.client_visible != null) params.set("client_visible", String(options.client_visible));
+  const query = params.toString();
+  const path = `/documents/upload${query ? `?${query}` : ""}`;
+  const stallTimeoutMs = Math.max(
+    1_000,
+    requestOptions.stallTimeoutMs ?? DEFAULT_DOCUMENT_UPLOAD_STALL_TIMEOUT_MS,
+  );
+  const processingTimeoutMs = Math.max(
+    1_000,
+    requestOptions.processingTimeoutMs ?? DEFAULT_DOCUMENT_UPLOAD_PROCESSING_TIMEOUT_MS,
+  );
+  const receiptReconcileTimeoutMs = Math.max(
+    0,
+    requestOptions.receiptReconcileTimeoutMs
+      ?? DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS,
+  );
+  const idempotencyKey = requestOptions.idempotencyKey || createDocumentUploadIdempotencyKey();
+  let token = getAuthToken();
+  const requestPrincipalKey = expectedPrincipalKey ?? authPrincipalKey(token);
+  if (accessTokenExpired(token)) token = await getReadyAuthToken();
+
+  return new Promise<Document>((resolve, reject) => {
+    if (authPrincipalKey(token) !== requestPrincipalKey) {
+      reject(new DocumentUploadAuthChangedError());
+      return;
+    }
+    if (requestOptions.signal?.aborted) {
+      reject(new DOMException("Upload cancelled", "AbortError"));
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    let settled = false;
+    let stalledPhase: DocumentUploadPhase | null = null;
+    let uploadBytesSent = false;
+    let lastLoaded = 0;
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    let processingTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const clearStallTimer = () => {
+      if (stallTimer !== null) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+    };
+    const armStallTimer = () => {
+      clearStallTimer();
+      stallTimer = setTimeout(() => {
+        stalledPhase = "uploading";
+        xhr.abort();
+      }, stallTimeoutMs);
+    };
+    const clearProcessingTimer = () => {
+      if (processingTimer !== null) {
+        clearTimeout(processingTimer);
+        processingTimer = null;
+      }
+    };
+    const armProcessingTimer = () => {
+      clearProcessingTimer();
+      processingTimer = setTimeout(() => {
+        stalledPhase = "processing";
+        xhr.abort();
+      }, processingTimeoutMs);
+    };
+    const cleanup = () => {
+      clearStallTimer();
+      clearProcessingTimer();
+      requestOptions.signal?.removeEventListener("abort", abortRequest);
+    };
+    const finishResolve = (document: Document) => {
+      if (settled) return;
+      if (authPrincipalKey(getAuthToken()) !== requestPrincipalKey) {
+        finishReject(new DocumentUploadAuthChangedError());
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(document);
+    };
+    const finishReject = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const finishRetry = () => {
+      if (settled) return;
+      if (authPrincipalKey(getAuthToken()) !== requestPrincipalKey) {
+        finishReject(new DocumentUploadAuthChangedError());
+        return;
+      }
+      settled = true;
+      cleanup();
+      uploadDocumentRequest(
+        file,
+        folderId,
+        options,
+        { ...requestOptions, idempotencyKey },
+        requestAttempt + 1,
+        requestPrincipalKey,
+      ).then(resolve, reject);
+    };
+    const finishProcessingReconciliation = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reconcileDocumentUploadReceipt(
+        idempotencyKey,
+        receiptReconcileTimeoutMs,
+        requestOptions.signal,
+        requestPrincipalKey,
+      ).then(resolve, reject);
+    };
+    const finishHttpFailureReconciliation = (originalError: unknown) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // A proxy can synthesize a 5xx, or corrupt a successful response, before
+      // a committed receipt is visible. Reconcile for a bounded window; one
+      // negative read is not proof that the server rolled the upload back.
+      reconcileDocumentUploadReceipt(
+        idempotencyKey,
+        receiptReconcileTimeoutMs,
+        requestOptions.signal,
+        requestPrincipalKey,
+      ).then(
+        resolve,
+        (reconciliationError) => {
+          if (
+            reconciliationError instanceof DocumentUploadAuthChangedError
+            || reconciliationError instanceof DOMException
+            || (originalError instanceof ApiError
+              && originalError.code === "document_upload_commit_uncertain")
+          ) {
+            reject(reconciliationError);
+          } else {
+            reject(originalError);
+          }
+        },
+      );
+    };
+    const abortRequest = () => xhr.abort();
+
+    xhr.open("POST", `${API_BASE}${path}`);
+    xhr.setRequestHeader("X-Language", getStoredLocale());
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.setRequestHeader("Idempotency-Key", idempotencyKey);
+
+    xhr.upload.addEventListener("loadstart", () => {
+      requestOptions.onProgress?.({ phase: "uploading", loaded: 0, total: file.size, percent: 0 });
+      armStallTimer();
+    });
+    xhr.upload.addEventListener("progress", (event) => {
+      const total = event.lengthComputable && event.total > 0 ? event.total : file.size;
+      const loaded = Math.min(event.loaded, total || event.loaded);
+      if (loaded > lastLoaded) {
+        lastLoaded = loaded;
+        armStallTimer();
+      }
+      const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      requestOptions.onProgress?.({ phase: "uploading", loaded, total, percent });
+    });
+    xhr.upload.addEventListener("load", () => {
+      uploadBytesSent = true;
+      clearStallTimer();
+      armProcessingTimer();
+      requestOptions.onProgress?.({
+        phase: "processing",
+        loaded: file.size,
+        total: file.size,
+        percent: 100,
+      });
+    });
+
+    xhr.addEventListener("load", () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const body = documentUploadResponseBody(xhr);
+        if (xhr.status === 401 && requestAttempt === 0) {
+          const latestToken = getAuthToken();
+          if (latestToken && latestToken !== token) {
+            if (authPrincipalKey(latestToken) === requestPrincipalKey) {
+              finishRetry();
+            } else {
+              finishReject(new DocumentUploadAuthChangedError());
+            }
+            return;
+          }
+        }
+        const error = documentUploadHttpError(xhr, path, token, body);
+        if (uploadBytesSent && xhr.status >= 500) {
+          finishHttpFailureReconciliation(error);
+          return;
+        }
+        finishReject(error);
+        return;
+      }
+      try {
+        const document = JSON.parse(xhr.responseText) as Document;
+        clearBackendUnavailableToast();
+        finishResolve(document);
+      } catch (error) {
+        const invalidResponse = new ApiError(
+          500,
+          error instanceof Error ? `Invalid upload response: ${error.message}` : "Invalid upload response",
+        );
+        if (uploadBytesSent) {
+          finishHttpFailureReconciliation(invalidResponse);
+          return;
+        }
+        finishReject(invalidResponse);
+      }
+    });
+    xhr.addEventListener("error", () => {
+      // Once every byte left the browser, a transport error can mean the
+      // server committed but its response was lost. Resolve the durable
+      // receipt before presenting a retryable failure, so a retry cannot
+      // create an ambiguous duplicate.
+      if (uploadBytesSent) {
+        finishProcessingReconciliation();
+        return;
+      }
+      const error = new TypeError("Network request failed");
+      captureClientError(error, {
+        handled: true,
+        mechanism: "api.network",
+        tags: { method: "POST", path },
+      });
+      finishReject(error);
+    });
+    xhr.addEventListener("abort", () => {
+      if (stalledPhase === "processing") {
+        finishProcessingReconciliation();
+        return;
+      }
+      finishReject(
+        stalledPhase
+          ? new DocumentUploadStalledError(stalledPhase)
+          : new DOMException("Upload cancelled", "AbortError"),
+      );
+    });
+
+    requestOptions.signal?.addEventListener("abort", abortRequest, { once: true });
+    xhr.send(form);
+  });
 }
 
 async function requestStreamResponse(
@@ -2067,7 +2899,7 @@ async function requestStreamResponse(
   body: FormData,
   signal?: AbortSignal,
 ): Promise<Response> {
-  let token = getAuthToken();
+  let token = await getReadyAuthToken();
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let response: Response;
     try {
@@ -2099,6 +2931,7 @@ async function requestStreamResponse(
       && attempt === 0
       && Boolean(latestToken)
       && latestToken !== token
+      && isSameAuthIdentity(token, latestToken)
     ) {
       token = latestToken;
       continue;
@@ -2132,8 +2965,8 @@ async function requestStreamResponse(
       || response.statusText;
     const coded = _extractCodedDetail(detail);
     const displayMessage = coded.code ? t(coded.code, coded.vars) || message : message;
-    if (response.status === 401 && Boolean(token) && token === getAuthToken()) {
-      handleSessionExpired(path);
+    if (response.status === 401) {
+      handleUnauthorizedResponse(path, token);
     } else {
       useToastStore.getState().error(t("lib.api.chat_failed"), displayMessage);
     }
@@ -2161,7 +2994,7 @@ async function streamSseResult<T>(
   body: unknown,
   onStep?: (label: string) => void,
 ): Promise<T> {
-  const token = getAuthToken();
+  const token = await getReadyAuthToken();
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: {
@@ -2222,7 +3055,7 @@ async function streamWorkflowRun(
   onRun?: (runId: string) => void,
   data?: Record<string, unknown>,
 ): Promise<any> {
-  const token = getAuthToken();
+  const token = await getReadyAuthToken();
   const response = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -2283,7 +3116,7 @@ export async function fetchProtectedFsResponse(
   if (!isLocalFsUrl(url)) {
     throw new Error("Protected filesystem response requires a local filesystem URL");
   }
-  const token = getAuthToken();
+  const token = await getReadyAuthToken();
   const response = await fetch(cacheBustUrl(url), {
     cache: "no-store",
     headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -2293,9 +3126,14 @@ export async function fetchProtectedFsResponse(
   return response;
 }
 
+export function isTikTokApprovalPreviewUrl(url: string): boolean {
+  return /^\/api\/v1\/chat\/approvals\/[A-Za-z0-9_-]+\/tiktok-preview\?/.test(url);
+}
+
 export async function resolveDisplayMediaUrl(url: string): Promise<{ url: string; revoke: () => void }> {
-  if (!isLocalFsUrl(url)) return { url, revoke: () => {} };
-  const blob = await fetchProtectedBlob(`media:${url}`, cacheBustUrl(url));
+  const approvalPreview = isTikTokApprovalPreviewUrl(url);
+  if (!isLocalFsUrl(url) && !approvalPreview) return { url, revoke: () => {} };
+  const blob = await fetchProtectedBlob(`media:${url}`, cacheBustUrl(url), { cache: !approvalPreview });
   const objectUrl = URL.createObjectURL(blob);
   return { url: objectUrl, revoke: () => URL.revokeObjectURL(objectUrl) };
 }
@@ -2357,7 +3195,7 @@ async function _streamFinalizeSSE(
   path: string,
   handlers: WorkspaceFinalizeStreamHandlers,
 ): Promise<WorkspaceDraftFinalize> {
-  const token = getAuthToken();
+  const token = await getReadyAuthToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "text/event-stream",
@@ -2398,6 +3236,8 @@ async function _streamFinalizeSSE(
   let streamError: Error | null = null;
   // Steps that flow through ``onProgress`` rather than start/done/error.
   const KNOWN_STEPS = new Set([
+    "agent_bindings_repair_started",
+    "agent_bindings_repair_done",
     "workspace_created",
     "provisioning_agents_started",
     "agent_provisioned",
@@ -2466,7 +3306,7 @@ async function _streamDraftSSE(
   body: Record<string, unknown>,
   handlers: WorkspaceDraftStreamHandlers,
 ): Promise<WorkspaceDraftTurn> {
-  const token = getAuthToken();
+  const token = await getReadyAuthToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     Accept: "text/event-stream",
@@ -2588,7 +3428,7 @@ export interface WorkspaceStatLibraryEntry {
   value_type: "number" | "percent" | "currency" | "duration";
   unit: string | null;
   default_window: string;
-  collector_type: "manual" | "workspace_internal" | "integration";
+  collector_type: "manual" | "workspace_internal" | "integration" | "agent_review";
   integration_key: WorkspaceStatIntegrationKey | null;
   collector_config: Record<string, unknown>;
   default_cadence: string | null;
@@ -2612,7 +3452,7 @@ export interface WorkspaceStatDefinition {
   value_type: "number" | "percent" | "currency" | "duration";
   unit: string | null;
   window: string;
-  collector_type: "manual" | "workspace_internal" | "integration";
+  collector_type: "manual" | "workspace_internal" | "integration" | "agent_review";
   collector_config: Record<string, unknown>;
   collection_cadence: string | null;
   freshness_limit_seconds: number | null;
@@ -2624,6 +3464,8 @@ export interface WorkspaceStatDefinition {
   current_value_updated_at: string | null;
   last_collection_status: string | null;
   last_collection_error: string | null;
+  last_assessment?: { observation_id: string; status: string; observed_at: string; evidence?: { gaps?: string[]; reasoning?: string } } | null;
+  assessment_runtime?: { workflow_id: string; binding_id: string; run_id: string | null; run_status: string | null; next_run_at: string | null };
   freshness_status: "fresh" | "stale" | "no_data" | "collection_error" | "paused" | string;
   revision: number;
   created_at: string;
@@ -2633,7 +3475,7 @@ export interface WorkspaceStatDefinition {
 export interface WorkspaceStatObservation {
   id: string;
   stat_id: string;
-  value: number;
+  value: number | null;
   observed_at: string;
   window_start: string | null;
   window_end: string | null;
@@ -2752,18 +3594,156 @@ interface FilesystemWriteOptions {
 }
 
 export const api = {
+  approvalCommands: {
+    get: (requestId: string) => request<ApprovalCommandProjection>(`/approval-commands/hitl/${encodeURIComponent(requestId)}`),
+    saveRule: (command: ApprovalSaveRuleCommand) => request<ApprovalCommandResult>("/approval-commands", { method: "POST", body: JSON.stringify(command) }),
+  },
+  approvalSettings: {
+    get: (scope: ApprovalScope) => request<ApprovalSnapshot>(approvalResourcePath(scope)),
+    update: (scope: ApprovalScope, data: ApprovalWrite) => request<ApprovalSnapshot>(approvalResourcePath(scope), { method: "PUT", body: JSON.stringify(data) }),
+    preview: (scope: ApprovalScope, data: ApprovalWrite) => request<ApprovalPreview>(`${approvalResourcePath(scope)}/preview`, { method: "POST", body: JSON.stringify(data) }),
+    overrides: (entityId: string, offset = 0) => request<ApprovalOverrides>(`/approval-settings/accounts/${encodeURIComponent(entityId)}/overrides?limit=50&offset=${offset}`),
+  },
+  chatRooms: {
+    list: () => request<ChatRoom[]>("/chat/rooms"),
+    groupUsage: () => request<{ used: boolean }>("/chat/rooms/group-usage"),
+    get: (id: string) => request<ChatRoom>(`/chat/rooms/${encodeURIComponent(id)}`),
+    rename: (id: string, title: string) => request<ChatRoom>(`/chat/rooms/${encodeURIComponent(id)}`, {
+      method: "PATCH", body: JSON.stringify({ title }),
+    }),
+    updateAiExecution: (id: string, enabled: boolean, expectedRevision: number) =>
+      request<ChatRoom>(`/chat/rooms/${encodeURIComponent(id)}/ai-execution`, {
+        method: "PATCH", body: JSON.stringify({ enabled, expected_revision: expectedRevision }),
+      }),
+    toolApprovals: (id: string) =>
+      request<ChatRoomToolApproval[]>(`/chat/rooms/${encodeURIComponent(id)}/ai-tool-approvals`),
+    decideToolApproval: (id: string, approvalId: string, approve: boolean) =>
+      request<ChatRoomToolApproval>(`/chat/rooms/${encodeURIComponent(id)}/ai-tool-approvals/${encodeURIComponent(approvalId)}/decision`, {
+        method: "POST", body: JSON.stringify({ approve }),
+      }),
+    replyApprovals: (id: string) =>
+      request<ChatRoomReplyApproval[]>(`/chat/rooms/${encodeURIComponent(id)}/ai-reply-approvals`),
+    decideReplyApproval: (id: string, runId: string, expectedDigest: string, approve: boolean) =>
+      request<{ run_id: string; status: "approved" | "rejected" }>(`/chat/rooms/${encodeURIComponent(id)}/ai-reply-approvals/${encodeURIComponent(runId)}/decision`, {
+        method: "POST", body: JSON.stringify({ approve, expected_digest: expectedDigest }),
+      }),
+    close: (id: string) => request<void>(`/chat/rooms/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    leave: (id: string) => request<void>(`/chat/rooms/${encodeURIComponent(id)}/membership`, { method: "DELETE" }),
+    presence: (id: string) => request<ChatRoomPresence>(`/chat/rooms/${encodeURIComponent(id)}/presence`),
+    create: (data: {
+      kind: "dm" | "group";
+      recipient_email: string;
+      title?: string;
+      owner_scope?: "personal" | "entity";
+      sender_integration_id?: string;
+    }) => request<ChatRoom>("/chat/rooms", {
+      method: "POST", body: JSON.stringify(data),
+    }),
+    messages: (id: string, options: { before?: string; after?: string; q?: string; limit?: number } = {}) => {
+      const params = new URLSearchParams();
+      if (options.before) params.set("before", options.before);
+      if (options.after) params.set("after", options.after);
+      if (options.q) params.set("q", options.q);
+      if (options.limit) params.set("limit", String(options.limit));
+      const query = params.toString();
+      return request<ChatRoomMessage[]>(`/chat/rooms/${encodeURIComponent(id)}/messages${query ? `?${query}` : ""}`);
+    },
+    markRead: (id: string, throughMessageId: string) => request<void>(`/chat/rooms/${encodeURIComponent(id)}/read`, {
+      method: "POST", body: JSON.stringify({ through_message_id: throughMessageId }),
+    }),
+    updateNotifications: (id: string, muted: boolean) => request<{ muted: boolean }>(`/chat/rooms/${encodeURIComponent(id)}/notifications`, {
+      method: "PATCH", body: JSON.stringify({ muted }),
+    }),
+    retractMessage: (id: string, messageId: string) => request<void>(
+      `/chat/rooms/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}`, { method: "DELETE" },
+    ),
+    retractions: (id: string, messageIds: string[]) => request<{ message_ids: string[] }>(
+      `/chat/rooms/${encodeURIComponent(id)}/message-retractions`, {
+        method: "POST", body: JSON.stringify({ message_ids: messageIds }),
+      },
+    ),
+    files: (id: string, options: { before?: string; limit?: number; q?: string } = {}) => {
+      const params = new URLSearchParams();
+      if (options.before) params.set("before", options.before);
+      if (options.limit) params.set("limit", String(options.limit));
+      if (options.q) params.set("q", options.q);
+      const query = params.toString();
+      return request<ChatRoomFile[]>(`/chat/rooms/${encodeURIComponent(id)}/files${query ? `?${query}` : ""}`);
+    },
+    uploadFile: (id: string, file: File, content = "", mentionedUserIds: string[] = [], replyToMessageId?: string, mentionedAgentBindingIds: string[] = []) => {
+      const body = new FormData();
+      body.append("file", file);
+      body.append("content", content);
+      body.append("mentioned_user_ids", JSON.stringify(mentionedUserIds));
+      body.append("mentioned_agent_binding_ids", JSON.stringify(mentionedAgentBindingIds));
+      if (replyToMessageId) body.append("reply_to_message_id", replyToMessageId);
+      return request<ChatRoomMessage>(`/chat/rooms/${encodeURIComponent(id)}/files`, { method: "POST", body });
+    },
+    attachKnowledgeFile: (id: string, documentId: string, content = "", mentionedUserIds: string[] = [], replyToMessageId?: string, mentionedAgentBindingIds: string[] = []) =>
+      request<ChatRoomMessage>(`/chat/rooms/${encodeURIComponent(id)}/files/from-knowledge`, {
+        method: "POST",
+        body: JSON.stringify({ document_id: documentId, content, mentioned_user_ids: mentionedUserIds, reply_to_message_id: replyToMessageId, mentioned_agent_binding_ids: mentionedAgentBindingIds }),
+      }),
+    downloadFile: (id: string, fileId: string, options: DocumentBlobOptions = {}) => fetchProtectedBlob(
+      `room:${id}:${fileId}`,
+      `${API_BASE}/chat/rooms/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}`,
+      { ...options, cache: false },
+    ),
+    deleteFile: (id: string, fileId: string) => request<void>(
+      `/chat/rooms/${encodeURIComponent(id)}/files/${encodeURIComponent(fileId)}`,
+      { method: "DELETE" },
+    ),
+    send: (id: string, content: string, mentionedUserIds: string[], mentionedAgentBindingIds: string[] = [], replyToMessageId?: string) =>
+      request<ChatRoomMessage>(`/chat/rooms/${encodeURIComponent(id)}/messages`, {
+        method: "POST", body: JSON.stringify({ content, mentioned_user_ids: mentionedUserIds, mentioned_agent_binding_ids: mentionedAgentBindingIds, reply_to_message_id: replyToMessageId }),
+      }),
+    addReaction: (id: string, messageId: string, emoji: string) => request<void>(
+      `/chat/rooms/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/reactions`,
+      { method: "PUT", body: JSON.stringify({ emoji }) },
+    ),
+    removeReaction: (id: string, messageId: string, emoji: string) => request<void>(
+      `/chat/rooms/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}/reactions/${encodeURIComponent(emoji)}`,
+      { method: "DELETE" },
+    ),
+    inviteSenders: () => request<ChatRoomInviteSender[]>("/chat/rooms/invite-senders"),
+    invite: (id: string, email: string, senderIntegrationId?: string) => request<ChatRoomInvite>(`/chat/rooms/${encodeURIComponent(id)}/invites`, {
+      method: "POST", body: JSON.stringify({ email, sender_integration_id: senderIntegrationId }),
+    }),
+    pendingInvites: (id: string) => request<ChatRoomPendingInvite[]>(`/chat/rooms/${encodeURIComponent(id)}/invites`),
+    cancelInvite: (id: string, inviteId: string) => request<void>(`/chat/rooms/${encodeURIComponent(id)}/invites/${encodeURIComponent(inviteId)}`, {
+      method: "DELETE",
+    }),
+    accept: (token: string) => request<ChatRoom>("/chat/rooms/invites/accept", {
+      method: "POST", body: JSON.stringify({ token }),
+    }),
+    removeMember: (id: string, userId: string) =>
+      request<void>(`/chat/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(userId)}`, { method: "DELETE" }),
+    updateMemberRole: (id: string, userId: string, role: "admin" | "member") =>
+      request<ChatRoom>(`/chat/rooms/${encodeURIComponent(id)}/members/${encodeURIComponent(userId)}`, {
+        method: "PATCH", body: JSON.stringify({ role }),
+      }),
+    agentCandidates: (id: string) => request<ChatRoomAgentCandidate[]>(`/chat/rooms/${encodeURIComponent(id)}/agent-candidates`),
+    bindAgent: (id: string, subscriptionId: string) => request<ChatRoomAgentBinding>(`/chat/rooms/${encodeURIComponent(id)}/agents`, {
+      method: "POST", body: JSON.stringify({ subscription_id: subscriptionId }),
+    }),
+    removeAgent: (id: string, bindingId: string) => request<void>(`/chat/rooms/${encodeURIComponent(id)}/agents/${encodeURIComponent(bindingId)}`, { method: "DELETE" }),
+  },
   platform: {
     flags: () => request<{ flags: Record<string, boolean> }>("/platform/flags"),
   },
   auth: {
+    currentEmailVerification: () => request<{ email: string; email_verified: boolean }>("/auth/me/email-verification"),
+    sendCurrentEmailVerification: () => request<{ email: string; email_verified: boolean; sent: boolean }>("/auth/me/email-verification/send", { method: "POST" }),
+    confirmCurrentEmailVerification: (code: string) => request<{ email: string; email_verified: boolean }>("/auth/me/email-verification/confirm", { method: "POST", body: JSON.stringify({ code }) }),
     register: (data: {
       email: string;
       password: string;
       entity_name?: string;
       invitation_code?: string;
       invite_token?: string;
+      chat_invite_token?: string;
     }) =>
-      request<{ access_token: string; user_id: string; entity_id: string; role: string }>("/auth/register", {
+      request<{ access_token: string; user_id: string; entity_id: string; role: string; is_new?: boolean }>("/auth/register", {
         method: "POST",
         body: JSON.stringify(data),
       }),
@@ -2782,10 +3762,10 @@ export const api = {
         method: "POST",
       }),
     logout: () => request<void>("/auth/logout", { method: "POST" }),
-    verifyEmail: (email: string, code: string) =>
+    verifyEmail: (email: string, code: string, rememberMe = false) =>
       request<{ access_token: string; user_id: string; entity_id: string; role: string }>("/auth/verify-email", {
         method: "POST",
-        body: JSON.stringify({ email, code }),
+        body: JSON.stringify({ email, code, remember_me: rememberMe }),
       }),
     resendVerification: (email: string) =>
       request<{ message: string }>("/auth/resend-verification", {
@@ -2818,10 +3798,10 @@ export const api = {
       ),
     accountGraceDays: () =>
       request<{ grace_days: number }>("/auth/me/grace-days"),
-    uploadAvatar: (file: File) => {
+    uploadAvatar: async (file: File) => {
       const formData = new FormData();
       formData.append("file", file);
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       return fetch("/api/v1/auth/me/avatar", {
         method: "POST",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -2870,14 +3850,24 @@ export const api = {
       }>("/auth/me/models", {
         method: "PUT", body: JSON.stringify(data),
       }),
-    oauthGoogle: (opts: { code?: string; redirectUri: string; invitationCode?: string; teamInviteToken?: string; oauthSession?: string; publicChatToken?: string; rememberMe?: boolean }) =>
-      request<{ access_token: string; user: User }>("/auth/oauth/google", {
+    oauthGoogle: (opts: {
+      code?: string;
+      redirectUri: string;
+      invitationCode?: string;
+      teamInviteToken?: string;
+      chatInviteToken?: string;
+      oauthSession?: string;
+      publicChatToken?: string;
+      rememberMe?: boolean;
+    }) =>
+      request<{ access_token: string; user: User; is_new?: boolean }>("/auth/oauth/google", {
         method: "POST",
         body: JSON.stringify({
           code: opts.code,
           redirect_uri: opts.redirectUri,
           ...(opts.invitationCode ? { invitation_code: opts.invitationCode } : {}),
           ...(opts.teamInviteToken ? { team_invite_token: opts.teamInviteToken } : {}),
+          ...(opts.chatInviteToken ? { chat_invite_token: opts.chatInviteToken } : {}),
           ...(opts.oauthSession ? { oauth_session: opts.oauthSession } : {}),
           ...(opts.publicChatToken ? { public_chat_token: opts.publicChatToken } : {}),
           remember_me: Boolean(opts.rememberMe),
@@ -2958,9 +3948,10 @@ export const api = {
       }),
     delete: (id: string) =>
       request<void>(`/tasks/${id}`, { method: "DELETE" }),
-    board: (workspaceId?: string) => {
-      const q = workspaceId ? `?workspace_id=${workspaceId}` : "";
-      return request<Record<string, Task[]>>(`/tasks/board${q}`);
+    board: (workspaceId?: string, offset = 0, limit = 50, signal?: AbortSignal) => {
+      const q = new URLSearchParams({ offset_per_status: String(offset), limit_per_status: String(limit) });
+      if (workspaceId) q.set("workspace_id", workspaceId);
+      return request<Record<string, Task[]> & { _counts: Record<string, number> }>(`/tasks/board?${q}`, { signal });
     },
     move: (taskId: string, status: string) =>
       request<Task>(`/tasks/${taskId}/move`, {
@@ -2989,7 +3980,7 @@ export const api = {
     addLog: (taskId: string, content: string, logType: string = "comment", attachments?: any[], mentions?: { type: "agent" | "user"; id: string }[]) =>
       request<any>(`/tasks/${taskId}/logs`, { method: "POST", body: JSON.stringify({ content, log_type: logType, attachments: attachments || [], mentions: mentions || [] }) }),
     uploadAttachment: async (taskId: string, file: File) => {
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       const form = new FormData();
       form.append("file", file);
       const res = await fetch(`/api/v1/tasks/${taskId}/attachments`, {
@@ -3122,21 +4113,44 @@ export const api = {
   },
 
   chat: {
-    listFlowEntrypoints: () =>
-      request<GlobalChatFlowEntrypoint[]>("/chat/flow-entrypoints"),
+    refreshTikTokPublishReview: (hitlId: string, signal?: AbortSignal) =>
+      request<unknown>(`/chat/approvals/${encodeURIComponent(hitlId)}/tiktok-review`, {
+        method: "POST", body: "{}", signal,
+      }),
+    listComposerSkills: (scope: {
+      conversation_id?: string; workspace_id?: string; agent_id?: string;
+      thread_ref_kind?: string; thread_ref_id?: string;
+    }) => {
+      const query = new URLSearchParams();
+      Object.entries(scope).forEach(([key, value]) => { if (value) query.set(key, value); });
+      return request<any[]>(`/chat/composer/skills?${query}`);
+    },
+    listFlowEntrypoints: (workspaceId?: string) => {
+      const query = new URLSearchParams();
+      if (workspaceId) query.set("workspace_id", workspaceId);
+      const suffix = query.toString() ? `?${query}` : "";
+      return request<GlobalChatFlowEntrypoint[]>(`/chat/flow-entrypoints${suffix}`);
+    },
     streamFlowEntrypoint: async (
       bindingId: string,
       message: string,
       conversationId?: string,
-      opts?: { files?: File[]; documentIds?: string[]; agentId?: string; localWorkerId?: string },
+      opts?: {
+        files?: File[];
+        documentIds?: string[];
+        agentId?: string;
+        workspaceId?: string;
+        localWorkerId?: string;
+      },
     ): Promise<Response> => {
       const form = new FormData();
       form.append("message", message);
       if (conversationId) form.append("conversation_id", conversationId);
       if (opts?.agentId) form.append("agent_id", opts.agentId);
+      if (opts?.workspaceId) form.append("workspace_id", opts.workspaceId);
       if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
       if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
-      if (opts?.files) opts.files.forEach((file) => form.append("files", file));
+      for (const file of opts?.files || []) form.append("files", await prepareChatUploadFile(file));
       return requestStreamResponse(
         `/chat/flow-entrypoints/${encodeURIComponent(bindingId)}/stream`,
         form,
@@ -3146,6 +4160,7 @@ export const api = {
       message: string,
       conversationId?: string,
       opts?: {
+        clientMessageId?: string;
         files?: File[];
         documentIds?: string[];
         manualSkillIds?: string[];
@@ -3171,6 +4186,7 @@ export const api = {
           mimeType?: string | null;
           editorType?: string | null;
           supportsImageGeneration?: boolean | null;
+          supportsNativeFilePatch?: boolean | null;
           currentDocumentContent?: string | null;
         };
         conversationSurface?: ConversationSurfaceKind;
@@ -3180,6 +4196,7 @@ export const api = {
     ): Promise<Response> => {
       const form = new FormData();
       form.append("message", message);
+      if (opts?.clientMessageId) form.append("client_message_id", opts.clientMessageId);
       if (conversationId) form.append("conversation_id", conversationId);
       if (opts?.agentId) form.append("agent_id", opts.agentId);
       if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
@@ -3208,11 +4225,16 @@ export const api = {
       if (opts?.editorContext) form.append("editor_context", JSON.stringify(opts.editorContext));
       if (opts?.conversationSurface) form.append("conversation_surface", opts.conversationSurface);
       if (opts?.ephemeral) form.append("ephemeral", "true");
-      if (opts?.files) opts.files.forEach((f) => form.append("files", f));
+      for (const file of opts?.files || []) form.append("files", await prepareChatUploadFile(file));
       return requestStreamResponse("/chat/stream", form, opts?.signal);
     },
     listConversations: (wsId?: string) =>
       request<Conversation[]>(`/chat/conversations${wsId ? `?workspace_id=${wsId}` : ""}`),
+    startAgentConversation: (agentId: string, title: string) =>
+      request<Conversation>("/chat/conversations/agent-draft", {
+        method: "POST",
+        body: JSON.stringify({ agent_id: agentId, title }),
+      }),
     getMessages: (convId: string, opts?: { silent?: boolean; limit?: number }) =>
       request<GlobalChatMessage[]>(`/chat/conversations/${convId}/messages?limit=${encodeURIComponent(String(opts?.limit ?? 500))}`, {
         headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
@@ -3295,7 +4317,7 @@ export const api = {
         headers: opts?.silent ? { "X-Silent-Error": "1" } : undefined,
       }),
     tts: async (text: string, voice?: string): Promise<ArrayBuffer> => {
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       const resp = await fetch(`${API_BASE}/chat/tts`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
@@ -3357,9 +4379,10 @@ export const api = {
     list: listDocuments,
     listAll: listAllDocuments,
     browse: browseDocuments,
+    browsePage: browseDocumentsPage,
     indexingStatuses: listDocumentIndexingStatuses,
-    move: (id: string, folderId: string | null) =>
-      request<Document>(`/documents/${id}/move`, { method: "POST", body: JSON.stringify({ folder_id: folderId }) }),
+    move: (id: string, folderId: string | null, filingOnly = false) =>
+      request<Document>(`/documents/${id}/move`, { method: "POST", body: JSON.stringify({ folder_id: folderId, filing_only: filingOnly }) }),
     get: (id: string) => request<Document>(`/documents/${id}`),
     upload: (
       file: File,
@@ -3369,21 +4392,21 @@ export const api = {
         classification?: string;
         client_visible?: boolean;
       },
-    ): Promise<Document> => {
-      const form = new FormData();
-      form.append("file", file);
-      const params = new URLSearchParams();
-      if (folderId) params.set("folder_id", folderId);
-      if (options?.visibility) params.set("visibility", options.visibility);
-      if (options?.classification) params.set("classification", options.classification);
-      if (options?.client_visible != null) params.set("client_visible", String(options.client_visible));
-      const q = params.toString();
-      return request<Document>(`/documents/upload${q ? `?${q}` : ""}`, {
-        method: "POST",
-        headers: { "X-Silent-Error": "1" },
-        body: form,
-      });
-    },
+      requestOptions?: DocumentUploadRequestOptions,
+    ): Promise<Document> => uploadDocumentRequest(file, folderId, options, requestOptions),
+    reconcileUploadReceipt: (
+      idempotencyKey: string,
+      options?: Pick<DocumentUploadRequestOptions, "signal" | "receiptReconcileTimeoutMs">,
+    ): Promise<Document> => reconcileDocumentUploadReceipt(
+      idempotencyKey,
+      Math.max(
+        0,
+        options?.receiptReconcileTimeoutMs
+          ?? DEFAULT_DOCUMENT_UPLOAD_RECEIPT_RECONCILE_TIMEOUT_MS,
+      ),
+      options?.signal,
+      authPrincipalKey(getAuthToken()),
+    ),
     delete: async (id: string) => {
       const result = await request<void>(`/documents/${id}`, { method: "DELETE" });
       invalidateDocumentDownloadCache(id);
@@ -3415,13 +4438,17 @@ export const api = {
       file: File,
       saveIntent?: EditorSaveIntent,
       authTokenOverride?: string | null,
+      expectedSourceSha256?: string | null,
     ): Promise<Document> => {
-      const token = authTokenOverride === undefined ? getAuthToken() : authTokenOverride;
+      const token = authTokenOverride === undefined ? await getReadyAuthToken() : authTokenOverride;
       const form = new FormData();
       form.append("file", file);
       if (saveIntent) {
         form.append("save_session_id", saveIntent.sessionId);
         form.append("save_sequence", String(saveIntent.sequence));
+      }
+      if (expectedSourceSha256) {
+        form.append("expected_source_sha256", expectedSourceSha256);
       }
       const headers: Record<string, string> = {};
       if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -3451,10 +4478,16 @@ export const api = {
     },
     downloadBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
       fetchDocumentBlob(id, options),
-    editableBlob: (id: string): Promise<Blob> =>
-      fetchProtectedDocumentBlob(`editable:${id}`, `/documents/${id}/editable-file`, { cache: false }),
+    editableResponse: (id: string): Promise<Response> =>
+      fetchDocumentResponse(id, {}, "editable-file"),
     downloadResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
       fetchDocumentResponse(id, options),
+    preview: async (id: string, options?: DocumentBlobOptions): Promise<string> =>
+      URL.createObjectURL(await fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options)),
+    previewBlob: (id: string, options?: DocumentBlobOptions): Promise<Blob> =>
+      fetchProtectedDocumentBlob(`preview:${id}`, `/documents/${id}/preview/content`, options),
+    previewResponse: (id: string, options?: DocumentResponseOptions): Promise<Response> =>
+      fetchDocumentResponse(id, options, "preview/content"),
     thumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentThumbnailUrl(id, options),
     imageThumbnail: (id: string, options?: DocumentThumbnailOptions): Promise<string> => fetchDocumentImageThumbnailUrl(id, options),
     localImageThumbnail: (file: Blob): Promise<string> => captureDocumentImageThumbnail(file),
@@ -3538,7 +4571,7 @@ export const api = {
 
   folders: {
     list: () => request<DocumentFolderInfo[]>("/documents/folders"),
-    tree: () => request<DocumentFolderInfo[]>("/documents/folder-tree"),
+    tree: (includeCounts = true) => request<DocumentFolderInfo[]>(`/documents/folder-tree?include_counts=${includeCounts}`),
     create: (data: { name: string; parent_id?: string }) =>
       request<DocumentFolderInfo>("/documents/folders", { method: "POST", body: JSON.stringify(data) }),
     rename: (id: string, name: string) =>
@@ -3595,6 +4628,41 @@ export const api = {
       ),
     revokeShare: (docId: string, shareId: string) =>
       request<void>(`/documents/${docId}/shares/${shareId}`, { method: "DELETE" }),
+
+    // External PDF signature requests
+    listSignatureSenders: (docId: string) =>
+      request<Array<import("./emailAccounts").EmailAccount>>(`/documents/${docId}/signature-senders`),
+    listSignatureRequests: (docId: string) =>
+      request<DocumentSignatureRequest[]>(`/documents/${docId}/signature-requests`),
+    createSignatureRequest: (
+      docId: string,
+      data: {
+        recipient_name: string;
+        recipient_email: string;
+        recipient_emails?: string[];
+        message?: string;
+        expires_in_days?: number;
+        placement?: DocumentSignatureRequest["placement"];
+        fields?: DocumentSignatureRequest["fields"];
+        additional_recipients?: Array<{
+          recipient_name: string;
+          recipient_email: string;
+          recipient_emails?: string[];
+          fields: NonNullable<DocumentSignatureRequest["fields"]>;
+        }>;
+        sender_integration_id?: string;
+      },
+    ) => request<DocumentSignatureRequest>(`/documents/${docId}/signature-requests`, {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+    resendSignatureRequest: (docId: string, requestId: string) =>
+      request<DocumentSignatureRequest>(
+        `/documents/${docId}/signature-requests/${requestId}/resend`,
+        { method: "POST" },
+      ),
+    revokeSignatureRequest: (docId: string, requestId: string) =>
+      request<void>(`/documents/${docId}/signature-requests/${requestId}`, { method: "DELETE" }),
 
     // Access log
     accessLog: (docId: string, limit = 50) =>
@@ -3766,6 +4834,10 @@ export const api = {
 
   agents: {
     list: () => request<Agent[]>("/agents"),
+    catalog: (knownVersion?: string) =>
+      request<{ version: string; items: Agent[] | null }>(
+        `/agents/catalog${knownVersion ? `?known_version=${encodeURIComponent(knownVersion)}` : ""}`,
+      ),
     get: (id: string) => request<Agent>(`/agents/${id}`),
     create: (data: Partial<Agent>) =>
       request<Agent>("/agents", { method: "POST", body: JSON.stringify(data) }),
@@ -3814,6 +4886,8 @@ export const api = {
       request<void>(`/agents/subscriptions/${subscriptionId}`, { method: "DELETE" }),
     deployments: (agentId: string) =>
       request<AgentDeploymentResponse[]>(`/agents/${agentId}/deployments`),
+    allDeployments: () =>
+      request<Record<string, AgentDeploymentResponse[]>>("/agents/deployments"),
     runtimeEvidence: (agentId: string, params?: { limit?: number; evidence_type?: string; status?: string }) => {
       const q = new URLSearchParams();
       if (params?.limit) q.set("limit", String(params.limit));
@@ -3847,6 +4921,74 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ system_prompt: systemPrompt, test_message: testMessage }),
       }),
+  },
+
+  agentInitiatives: {
+    listForConversation: (conversationId: string) =>
+      request<AgentInitiativeConversationListResponse>(
+        `/agent-initiatives/conversation/${encodeURIComponent(conversationId)}`,
+      ),
+    list: (subscriptionId: string) =>
+      request<AgentInitiativeListResponse>(
+        `/agent-subscriptions/${subscriptionId}/initiatives`,
+      ),
+    create: (subscriptionId: string, data: AgentInitiativeCreateRequest) =>
+      request<AgentInitiative>(`/agent-subscriptions/${subscriptionId}/initiatives`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    get: (initiativeId: string) =>
+      request<AgentInitiative>(`/agent-initiatives/${initiativeId}`),
+    update: (initiativeId: string, data: AgentInitiativeUpdateRequest) =>
+      request<AgentInitiative>(`/agent-initiatives/${initiativeId}`, {
+        method: "PATCH",
+        body: JSON.stringify(data),
+      }),
+    delete: (initiativeId: string, data: AgentInitiativeRevisionRequest) =>
+      request<AgentInitiativeActionResponse | void>(`/agent-initiatives/${initiativeId}`, {
+        method: "DELETE",
+        body: JSON.stringify(data),
+      }),
+    mute: (initiativeId: string, data: AgentInitiativeRevisionRequest) =>
+      request<AgentInitiativeActionResponse>(`/agent-initiatives/${initiativeId}/mute`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    unmute: (initiativeId: string, data: AgentInitiativeRevisionRequest) =>
+      request<AgentInitiativeActionResponse>(`/agent-initiatives/${initiativeId}/unmute`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    pause: (initiativeId: string, data: AgentInitiativeRevisionRequest) =>
+      request<AgentInitiativeActionResponse>(`/agent-initiatives/${initiativeId}/pause`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    resume: (initiativeId: string, data: AgentInitiativeRevisionRequest) =>
+      request<AgentInitiativeActionResponse>(`/agent-initiatives/${initiativeId}/resume`, {
+        method: "POST",
+        body: JSON.stringify(data),
+      }),
+    run: (initiativeId: string, idempotencyKey: string, confirmCost = false) =>
+      request<AgentInitiativeRunReceipt>(`/agent-initiatives/${initiativeId}/run`, {
+        method: "POST",
+        body: JSON.stringify({
+          idempotency_key: idempotencyKey,
+          confirm_cost: confirmCost,
+        }),
+      }),
+    runs: (initiativeId: string, params?: { beforeId?: string | null; cursor?: string | null; limit?: number }) => {
+      const q = new URLSearchParams();
+      const beforeId = params?.beforeId || params?.cursor;
+      if (beforeId) q.set("before_id", beforeId);
+      if (params?.limit) q.set("limit", String(params.limit));
+      const suffix = q.size ? `?${q}` : "";
+      return request<AgentInitiativeRunListResponse>(
+        `/agent-initiatives/${initiativeId}/runs${suffix}`,
+      );
+    },
+    getRun: (runId: string) =>
+      request<AgentInitiativeRun>(`/agent-initiative-runs/${runId}`),
   },
 
   executions: {
@@ -3915,9 +5057,49 @@ export const api = {
       }),
   },
 
+  crm: {
+    clients: (query = "", signal?: AbortSignal) => request<CrmPage<ClientRecord>>(`/crm/clients?${query}`, { signal }),
+    create: (data: CrmProfile) => request<ClientRecord>("/crm/clients", { method: "POST", body: JSON.stringify(data) }),
+    profile: (id: string, data: CrmProfile) => request<ClientRecord>(`/clients/${id}/crm`, { method: "PUT", body: JSON.stringify(data) }),
+    overview: (signal?: AbortSignal) => request<CrmOverview>("/crm/overview", { signal }),
+    pipeline: (query = "", signal?: AbortSignal) => request<CrmPage<CrmOpportunity>>(`/crm/opportunities?${query}`, { signal }),
+    queue: (query = "", signal?: AbortSignal) => request<CrmPage<CrmFollowup>>(`/crm/followups?${query}`, { signal }),
+    activities: (id: string, offset = 0, signal?: AbortSignal) => request<CrmPage<CrmActivity>>(`/clients/${id}/activities?limit=25&offset=${offset}`, { signal }),
+    opportunities: (id: string, offset = 0, signal?: AbortSignal) => request<CrmPage<CrmOpportunity>>(`/clients/${id}/opportunities?limit=25&offset=${offset}`, { signal }),
+    followups: (id: string, offset = 0, signal?: AbortSignal) => request<CrmPage<CrmFollowup>>(`/clients/${id}/followups?limit=25&offset=${offset}`, { signal }),
+    saveActivity: (client: string, data: CrmActivityInput, id?: string) => request<CrmActivity>(`/clients/${client}/activities${id ? `/${id}` : ""}`, { method: id ? "PUT" : "POST", body: JSON.stringify(data) }),
+    saveOpportunity: (client: string, data: CrmOpportunityInput, id?: string) => request<CrmOpportunity>(`/clients/${client}/opportunities${id ? `/${id}` : ""}`, { method: id ? "PUT" : "POST", body: JSON.stringify(data) }),
+    saveFollowup: (client: string, data: CrmFollowupInput, id?: string) => request<CrmFollowup>(`/clients/${client}/followups${id ? `/${id}` : ""}`, { method: id ? "PUT" : "POST", body: JSON.stringify(data) }),
+    remove: (client: string, kind: "activities" | "opportunities" | "followups", id: string) => request<void>(`/clients/${client}/${kind}/${id}`, { method: "DELETE" }),
+  },
+  collaboration: {
+    management: (workspaceId: string, signal?: AbortSignal) => request<CollaborationManagement>(`/workspaces/${workspaceId}/collaboration`, { signal }),
+    invite: (workspaceId: string, data: CollaborationInvite) => request<CollaborationGrant>(`/workspaces/${workspaceId}/collaboration`, { method: "POST", body: JSON.stringify(data) }),
+    change: (workspaceId: string, id: string, action: "authorize" | "revoke" | "update", data?: CollaborationInvite) => request<CollaborationGrant>(`/workspaces/${workspaceId}/collaboration/${id}/${action}`, { method: "POST", ...(data ? { body: JSON.stringify(data) } : {}) }),
+    linkGroup: (workspaceId: string, groupId: string | null) => request<CollaborationCommunication>(`/workspaces/${workspaceId}/collaboration-group`, { method: "PUT", body: JSON.stringify({ group_id: groupId }) }),
+    phase: (workspaceId: string, action: "request_acceptance" | "accept", note: string) => request(`/workspaces/${workspaceId}/delivery-phase`, { method: "POST", body: JSON.stringify({ action, note }) }),
+    portal: (id: string, signal?: AbortSignal) => request<CollaborationPortal>(`/workspace-collaborations/${id}`, { signal }),
+    accept: (id: string) => request<CollaborationGrant>(`/workspace-collaborations/${id}/accept`, { method: "POST" }),
+  },
+  clients: {
+    list: () => request<{ items: ClientRecord[]; total: number }>("/clients"),
+    get: (id: string, signal?: AbortSignal) => request<ClientRecord>(`/clients/${id}`, { signal }),
+    create: (data: { name: string; email?: string }) => request<ClientRecord>("/clients", { method: "POST", body: JSON.stringify(data) }),
+    contacts: (id: string, signal?: AbortSignal) => request<ClientContactRecord[]>(`/clients/${id}/contacts`, { signal }),
+    addContact: (id: string, data: ClientContactInput) => request<ClientContactRecord>(`/clients/${id}/contacts`, { method: "POST", body: JSON.stringify(data) }),
+    editContact: (client: string, id: string, data: ClientContactInput) => request<ClientContactRecord>(`/clients/${client}/contacts/${id}`, { method: "PUT", body: JSON.stringify(data) }),
+    removeContact: (client: string, id: string) => request<void>(`/clients/${client}/contacts/${id}`, { method: "DELETE" }),
+    deliveries: (id: string, signal?: AbortSignal) => request<ClientDeliveryReceipt[]>(`/clients/${id}/deliveries`, { signal }),
+    prepareDelivery: (id: string, data: { contact_id: string; workspace_id: string; phase?: "trial" | "delivered"; knowledge_document_ids?: string[] }) => request<ClientDeliveryReceipt>(`/clients/${id}/deliveries`, { method: "POST", body: JSON.stringify(data) }),
+    requestMaintenance: (clientId: string, deliveryId: string) => request<CollaborationGrant>(`/clients/${clientId}/deliveries/${deliveryId}/maintenance/request`, { method: "POST" }),
+    changeInvite: (clientId: string, deliveryId: string, action: "rotate" | "revoke") => request<ClientDeliveryReceipt>(`/clients/${clientId}/deliveries/${deliveryId}/${action}`, { method: "POST" }),
+    invitation: (token: string) => request<ClientDeliveryReceipt>(`/client-deliveries/invites/${encodeURIComponent(token)}`),
+    acceptDelivery: (token: string) => request<ClientDeliveryReceipt>(`/client-deliveries/invites/${encodeURIComponent(token)}/accept`, { method: "POST", body: JSON.stringify({}) }),
+  },
+
   people: {
     me: () => request<PeopleContext>("/people/me"),
-    directory: () => request<PeopleDirectoryEntry[]>("/people/directory"),
+    directory: (signal?: AbortSignal) => request<PeopleDirectoryEntry[]>("/people/directory", { signal }),
     acceptInvite: (inviteId: string) =>
       request<PeopleContextActionResponse>(`/people/invites/${inviteId}/accept`, {
         method: "POST",
@@ -3938,9 +5120,77 @@ export const api = {
 
   workspaces: {
     list: () => request<Workspace[]>("/workspaces"),
-    get: (id: string) => request<Workspace>(`/workspaces/${id}`),
-    setupStatus: (id: string) =>
-      request<WorkspaceSetupStatus>(`/workspaces/${id}/setup-status`),
+    get: (id: string, signal?: AbortSignal) => request<Workspace>(`/workspaces/${id}`, { signal }),
+    appView: (id: string, options?: { includeCatalog?: boolean; signal?: AbortSignal }) => request<WorkspaceAppView>(
+      `/workspaces/${id}/app-view${options?.includeCatalog === false ? "?include_catalog=false" : ""}`,
+      { signal: options?.signal },
+    ),
+    saveAppView: async (id: string, config: WorkspaceAppViewConfig, previous: WorkspaceAppViewConfig) => {
+      const path = `/workspaces/${id}/operation/drafts`;
+      const entries = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.entries || {}), ...Object.keys(config.entries || {})])).map((key) => [key, config.entries?.[key] ?? null]),
+      );
+      const prompts = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.prompts || {}), ...Object.keys(config.prompts || {})])).map((key) => [key, config.prompts?.[key] ?? null]),
+      );
+      const labels = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.labels), ...Object.keys(config.labels)])).map((key) => [key, config.labels[key] ?? null]),
+      );
+      const descriptions = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.descriptions), ...Object.keys(config.descriptions)])).map((key) => [key, config.descriptions[key] ?? null]),
+      );
+      const forms = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.forms || {}), ...Object.keys(config.forms || {})])).map((key) => [key, config.forms?.[key] ?? null]),
+      );
+      const targets = Object.fromEntries(
+        Array.from(new Set([...Object.keys(previous.targets || {}), ...Object.keys(config.targets || {})])).map((key) => [key,
+          config.targets?.[key]?.startsWith("attach:") ? null : config.targets?.[key] ?? null]),
+      );
+      const attachments: Array<{ op: string; payload: { workflow_id: string; service_key?: string; action_key?: string; primary?: boolean } }> = Object.entries(config.targets).filter(([, target]) => target.startsWith("attach:")).map(([key, target]) => ({
+        op: "workflow_binding.attach", payload: { workflow_id: target.slice(7), ...(key.startsWith("service:") ? { service_key: key.slice(8) } : { action_key: key }) },
+      }));
+      const attachPrimary = config.hero?.startsWith("attach:");
+      if (attachPrimary) attachments.push({
+        op: "workflow_binding.attach", payload: { workflow_id: config.hero!.slice(7), primary: true },
+      });
+      const draft = await request<{ id: string; validation: { valid: boolean; errors?: Array<{ message?: string }> } }>(path, {
+        method: "POST",
+        body: JSON.stringify({ patches: [{ op: "app_view.update", payload: {
+          eyebrow: config.eyebrow?.trim() || null,
+          title: config.title?.trim() || null, description: config.description?.trim() ?? null,
+          hero: attachPrimary ? null : config.hero, order: config.order, hidden: config.hidden,
+          labels, descriptions, forms, targets, entries, prompts, visual: config.visual, layout: config.layout,
+          ...(config.motion_cover_url !== previous.motion_cover_url || config.motion_cover_source_url !== previous.motion_cover_source_url
+            ? { motion_cover_url: config.motion_cover_url, motion_cover_source_url: config.motion_cover_source_url }
+            : {}),
+        } }, ...attachments] }),
+      });
+      if (!draft.validation.valid) {
+        await request(`${path}/${draft.id}/discard`, { method: "POST" }).catch(() => undefined);
+        throw new Error(draft.validation.errors?.map((error) => error.message).filter(Boolean).join("; ") || "Invalid page configuration");
+      }
+      try {
+        return await request(`${path}/${draft.id}/apply`, {
+          method: "POST",
+          body: JSON.stringify({ user_confirmation: true }),
+        });
+      } catch (error) {
+        await request(`${path}/${draft.id}/discard`, { method: "POST" }).catch(() => undefined);
+        throw error;
+      }
+    },
+    setupStatus: (id: string, signal?: AbortSignal) =>
+      request<WorkspaceSetupStatus>(`/workspaces/${id}/setup-status`, { signal }),
+    submitSetupInput: (id: string, checkKey: string, text: string) =>
+      request<{ accepted: boolean }>(`/workspaces/${id}/setup-input`, {
+        method: "POST",
+        body: JSON.stringify({ check_key: checkKey, text }),
+      }),
+    reconcileBlueprintStartup: (id: string) =>
+      request<BlueprintStartupReconcileResponse>(
+        `/workspaces/${id}/blueprint-startup/reconcile`,
+        { method: "POST" },
+      ),
     blueprintUpgradePlan: (
       id: string,
       variableValues?: Record<string, unknown>,
@@ -3952,27 +5202,37 @@ export const api = {
         workspace_name: string;
         blueprint_slug: string | null;
         blueprint_fingerprint: string | null;
+        plan_fingerprint: string | null;
+        baseline_known: boolean;
+        synchronization_status?: "current" | "customized";
         can_revert: boolean;
+        restore_point?: { applied_at: string; blueprint_version?: string | null } | null;
+        active_runs: Array<{ id: string; name: string; kind: string; status: string }>;
         setup_preflight: BlueprintInstallPreflight;
+        kept_setup_preflight?: BlueprintInstallPreflight;
         setup_preview: BlueprintSetupPreview;
         variables_ready: boolean;
         resolved_variable_keys: string[];
+        resolved_variable_values: Record<string, unknown>;
         items: Array<{
-          kind: "skill" | "agent" | "workflow" | "knowledge_document" | "blueprint_configuration";
+          key: string;
+          kind: string;
           slug: string;
           name: string;
           id?: string;
           revision?: number;
-          action: "update" | "keep_yours" | "unchanged" | "missing" | "baseline_unknown" | "reconfigure";
+          action: "update" | "keep_yours" | "unchanged" | "missing" | "remove";
           changes: string[];
-          /** The new version's actual content, per field, for reading before
-           *  agreeing to overwrite what the agents currently run. */
-          new_content: Record<string, string>;
+          current_content: unknown;
+          new_content: unknown;
+          baseline_content?: unknown;
+          baseline_known: boolean;
+          blocked_reason?: string;
         }>;
       }>(
         variableValues === undefined && channelConfigIds === undefined
-          ? `/workspaces/${id}/blueprint/upgrade`
-          : `/workspaces/${id}/blueprint/upgrade/preview`,
+          ? `/workspaces/${id}/blueprint/upgrade/v3`
+          : `/workspaces/${id}/blueprint/upgrade/v3/preview`,
         variableValues === undefined && channelConfigIds === undefined
           ? undefined
           : {
@@ -3985,13 +5245,12 @@ export const api = {
       ),
     applyBlueprintUpgrade: (id: string, data: {
       expected_blueprint_fingerprint: string;
+      expected_plan_fingerprint: string;
       variable_values?: Record<string, unknown>;
       channel_config_ids?: Record<string, string>;
-      conflict_resolutions: Array<{
-        kind: "skill" | "agent" | "workflow";
-        slug: string;
+      configuration_resolutions: Array<{
+        key: string;
         resolution: "keep_yours" | "use_blueprint";
-        expected_revision: number;
       }>;
     }) =>
       request<{
@@ -4001,7 +5260,8 @@ export const api = {
         kept_yours: Array<{ kind: string; name: string }>;
         can_revert: boolean;
         fully_synchronized: boolean;
-      }>(`/workspaces/${id}/blueprint/upgrade/v2`, {
+        synchronization_status: "current" | "customized";
+      }>(`/workspaces/${id}/blueprint/upgrade/v3`, {
         method: "POST",
         body: JSON.stringify(data),
       }),
@@ -4090,7 +5350,7 @@ export const api = {
             role_label?: string | null;
           }>;
         }>(`/workspaces/${wsId}/agents/assignable`),
-      map: (wsId: string, data: { service_key: string; agent_id: string; custom_prompt?: string }) =>
+      map: (wsId: string, data: { service_key: string; agent_id: string; custom_prompt?: string; new_service?: { key: string; name: string } }) =>
         request<any>(`/workspaces/${wsId}/agents`, { method: "POST", body: JSON.stringify(data) }),
       unmap: (wsId: string, serviceKey: string) =>
         request<any>(`/workspaces/${wsId}/agents/${serviceKey}`, { method: "DELETE" }),
@@ -4104,20 +5364,7 @@ export const api = {
         }),
       revisions: (wsId: string, limit = 20) =>
         request<any[]>(`/workspaces/${wsId}/governance/revisions?limit=${limit}`),
-      standingGrants: (wsId: string) =>
-        request<StandingGrantsResponse>(`/workspaces/${wsId}/governance/standing-grants`),
-      revokeStandingGrant: (wsId: string, kind: "action" | "capability", value: string) =>
-        request<StandingGrantsResponse>(
-          `/workspaces/${wsId}/governance/standing-grants/${kind}/${encodeURIComponent(value)}`,
-          { method: "DELETE" },
-        ),
-      approvalMatrix: (wsId: string) =>
-        request<ApprovalMatrixResponse>(`/workspaces/${wsId}/governance/approval-matrix`),
-      setApprovalMatrix: (wsId: string, action_key: string, auto_approved: boolean) =>
-        request<ApprovalMatrixResponse>(`/workspaces/${wsId}/governance/approval-matrix`, {
-          method: "PUT",
-          body: JSON.stringify({ action_key, auto_approved }),
-        }),
+
     },
     observability: {
       timeline: (wsId: string, selector: { root_execution_id?: string; review_id?: string; correlation_id?: string }, limit = 100) => {
@@ -4181,6 +5428,7 @@ export const api = {
         request<void>(`/workspaces/${wsId}/staff/${staffId}`, { method: "DELETE" }),
     },
     channels: (wsId: string) => request<any[]>(`/workspaces/${wsId}/channels`),
+    residentPmsAccounts: (wsId: string) => request<{ accounts: { id: string; display_name: string }[] }>(`/workspaces/${wsId}/resident-pms/accounts`),
     webchatResources: (wsId: string, documentCursor = 0) => request<import("./webchatPage").WebchatWorkspaceResources>(`/workspaces/${wsId}/webchat/resources?document_cursor=${documentCursor}`),
     reviewWebchatPage: (wsId: string, page: import("./webchatPage").WebchatPage) =>
       request<import("./webchatPage").WebchatPage>(`/workspaces/${wsId}/webchat/review`, {
@@ -4206,6 +5454,7 @@ export const api = {
       body: JSON.stringify(data),
     }),
     updateChannel: (wsId: string, channelBindingId: string, data: {
+      channel_config_id?: string;
       name?: string;
       purpose?: string;
       role?: string;
@@ -4219,6 +5468,11 @@ export const api = {
     }),
     removeChannel: (wsId: string, channelBindingId: string) =>
       request<void>(`/workspaces/${wsId}/channels/${channelBindingId}`, { method: "DELETE" }),
+    connectionStatus: (wsId: string, signal?: AbortSignal) =>
+      request<WorkspaceConnectionStatus>(
+        `/workspaces/${wsId}/connection-status`,
+        { signal },
+      ),
     resolveIntegrations: (wsId: string) => request<{ resolved: string[]; remaining: string[] }>(`/workspaces/${wsId}/resolve-integrations`, { method: "POST" }),
     documents: (wsId: string) => request<any[]>(`/workspaces/${wsId}/documents`),
     knowledge: {
@@ -4277,6 +5531,8 @@ export const api = {
           body: JSON.stringify(data),
         }),
     },
+    creditUsageSummary: (wsId: string) =>
+      request<WorkspaceCreditUsageSummary>(`/workspaces/${wsId}/credit-usage-summary`),
     setup: {
       turn: (wsId: string, data: { session_id?: string; message: string }) =>
         request<any>(`/workspaces/${wsId}/setup/turn`, { method: "POST", body: JSON.stringify(data) }),
@@ -4291,6 +5547,11 @@ export const api = {
     exportBlueprint: (wsId: string, data: ExportBlueprintRequest) =>
       request<BlueprintDetail>(
         `/workspaces/${wsId}/export-blueprint`,
+        { method: "POST", body: JSON.stringify(data) },
+      ),
+    exportBlueprintPayload: (wsId: string, data: ExportBlueprintPayloadRequest = {}) =>
+      request<Record<string, unknown>>(
+        `/workspaces/${wsId}/export-blueprint-payload`,
         { method: "POST", body: JSON.stringify(data) },
       ),
     promote: (wsId: string, force = false) =>
@@ -4312,56 +5573,26 @@ export const api = {
         message: string,
         conversationId?: string,
         opts?: {
+          clientMessageId?: string;
           files?: File[];
           documentIds?: string[];
           localWorkerId?: string;
           threadRef?: { kind: string; id: string };
         },
       ): Promise<Response> => {
-        const token = getAuthToken();
         const form = new FormData();
         form.append("message", message);
+        if (opts?.clientMessageId) form.append("client_message_id", opts.clientMessageId);
         if (conversationId) form.append("conversation_id", conversationId);
         if (opts?.localWorkerId) form.append("local_worker_id", opts.localWorkerId);
         if (opts?.threadRef?.kind) form.append("thread_ref_kind", opts.threadRef.kind);
         if (opts?.threadRef?.id) form.append("thread_ref_id", opts.threadRef.id);
         if (opts?.documentIds?.length) form.append("document_ids", opts.documentIds.join(","));
-        if (opts?.files) opts.files.forEach((file) => form.append("files", file));
-        const response = await fetch(
-          `${API_BASE}/workspaces/${wsId}/chat/entrypoints/${bindingId}/stream`,
-          {
-            method: "POST",
-            headers: { Authorization: `Bearer ${token}` },
-            body: form,
-          },
+        for (const file of opts?.files || []) form.append("files", await prepareChatUploadFile(file));
+        return requestStreamResponse(
+          `/workspaces/${wsId}/chat/entrypoints/${encodeURIComponent(bindingId)}/stream`,
+          form,
         );
-        if (!response.ok) {
-          const body = await response.json().catch(() => ({ detail: response.statusText }));
-          const detail = body.detail;
-          if (response.status === 402) {
-            const limitDetail = normalizePlanLimitDetail(
-              detail,
-              body.error || t("component.upgrade_prompt.default_message"),
-            );
-            const err = new ApiError(response.status, limitDetail.message);
-            err.detail = limitDetail as unknown as Record<string, unknown>;
-            throw err;
-          }
-          const message = (typeof detail === "string" ? detail : (detail as any)?.message)
-            || response.statusText;
-          const coded = _extractCodedDetail(detail);
-          const displayMessage = coded.code
-            ? t(coded.code, coded.vars) || message
-            : message;
-          if (response.status !== 401) {
-            useToastStore.getState().error(t("lib.api.chat_failed"), displayMessage);
-          }
-          const err = new ApiError(response.status, message);
-          if (coded.code) err.code = coded.code;
-          if (coded.vars) err.vars = coded.vars;
-          throw err;
-        }
-        return response;
       },
       listMessages: (wsId: string, opts?: { thread_ref_kind?: string; thread_ref_id?: string; limit?: number }) => {
         const q = new URLSearchParams();
@@ -4378,21 +5609,42 @@ export const api = {
           limit?: number;
           before?: string | null;
         },
+        signal?: AbortSignal,
       ) => {
         const q = new URLSearchParams();
         if (opts?.thread_ref_kind) q.set("thread_ref_kind", opts.thread_ref_kind);
         if (opts?.thread_ref_id) q.set("thread_ref_id", opts.thread_ref_id);
         q.set("limit", String(opts?.limit ?? 75));
         if (opts?.before) q.set("before", opts.before);
-        return request<PaginatedMessagesResponse<any>>(`/workspaces/${wsId}/chat/messages/page?${q}`);
+        return request<PaginatedMessagesResponse<any>>(
+          `/workspaces/${wsId}/chat/messages/page?${q}`,
+          { signal },
+        );
       },
       getMessage: (wsId: string, messageId: string, signal?: AbortSignal) =>
         request<any>(`/workspaces/${wsId}/chat/messages/${messageId}`, { signal }),
-      postMessage: (wsId: string, body: string, threadRef?: { kind: string; id: string }) =>
+      postMessage: (
+        wsId: string,
+        body: string,
+        threadRef?: { kind: string; id: string },
+        audience: "ai" | "team" = "ai",
+      ) =>
         request<any>(`/workspaces/${wsId}/chat/messages`, {
           method: "POST",
-          body: JSON.stringify({ body, thread_ref_kind: threadRef?.kind, thread_ref_id: threadRef?.id }),
+          body: JSON.stringify({
+            body,
+            audience,
+            thread_ref_kind: threadRef?.kind,
+            thread_ref_id: threadRef?.id,
+          }),
         }),
+      listUnreadAttention: (wsId: string, signal?: AbortSignal) =>
+        request<{ items: WorkspaceAttentionReminder[] }>(`/workspaces/${wsId}/chat/attention`, { signal }),
+      markAttentionSeen: (wsId: string, keys: string[]) =>
+        request<{ unseen_actions: number; unseen_action_keys: Record<string, Record<string, string>> }>(
+          `/workspaces/${wsId}/chat/attention/seen`,
+          { method: "POST", body: JSON.stringify({ keys }) },
+        ),
       resolveAction: (wsId: string, msgId: string, choice: string, note?: string, payload?: Record<string, any>) =>
         request<any>(`/workspaces/${wsId}/chat/messages/${msgId}/resolve`, {
           method: "POST",
@@ -4453,7 +5705,7 @@ export const api = {
      * `onToken`; the final hydrated draft + reply via `onDone`.
      */
     createStream: (
-      data: { initial_brief?: string; draft_id?: string } = {},
+      data: { initial_brief?: string; draft_id?: string; document_ids?: string[] } = {},
       handlers: WorkspaceDraftStreamHandlers = {},
     ) =>
       _streamDraftSSE(
@@ -4461,15 +5713,17 @@ export const api = {
         data,
         handlers,
       ),
-    /** Stream the assistant's reply to one user message (for an existing draft). */
+    /** Stream the assistant's reply to one user message (for an existing draft).
+     *  `document_ids` are uploaded/knowledge documents the architect should read
+     *  as sources for this turn. */
     sendMessageStream: (
       id: string,
-      message: string,
+      payload: { message: string; document_ids?: string[] },
       handlers: WorkspaceDraftStreamHandlers = {},
     ) =>
       _streamDraftSSE(
         `/workspace-drafts/${id}/messages/stream`,
-        { message },
+        payload,
         handlers,
       ),
     applyBlueprint: (id: string, blueprint_id: string) =>
@@ -4556,9 +5810,14 @@ export const api = {
       ),
     installPayload: (data: {
       payload: Record<string, any>;
+      workspace_source?: {
+        workspace_id: string;
+        export_options?: ExportBlueprintPayloadRequest;
+      };
       mode?: InstallMode;
       workspace_name?: string;
       create_missing_agents?: boolean;
+      agent_ids_by_service_key?: Record<string, string>;
       governance_preset?: GovernancePresetKey;
       variable_values?: Record<string, unknown>;
       channel_config_ids?: Record<string, string>;
@@ -4567,11 +5826,22 @@ export const api = {
         "/blueprints/install-payload",
         { method: "POST", body: JSON.stringify(data) },
       ),
+    installPayloadPreflight: (data: {
+      payload: Record<string, unknown>;
+      mode?: InstallMode;
+      variable_values?: Record<string, unknown>;
+      channel_config_ids?: Record<string, string>;
+    }) =>
+      request<BlueprintInstallPreflight>(
+        "/blueprints/install-payload-preflight",
+        { method: "POST", body: JSON.stringify(data) },
+      ),
     governancePresets: () =>
       request<GovernancePresetSummary[]>("/blueprints/governance-presets"),
-    createShareToken: (id: string) =>
+    createShareToken: (id: string, allowedEmails?: string[]) =>
       request<{ share_token: string }>(`/blueprints/${id}/share-token`, {
         method: "POST",
+        body: allowedEmails === undefined ? undefined : JSON.stringify({ allowed_emails: allowedEmails }),
       }),
     revokeShareToken: (id: string) =>
       request<void>(`/blueprints/${id}/share-token`, { method: "DELETE" }),
@@ -4582,9 +5852,10 @@ export const api = {
 
 
   notifications: {
-    list: (params?: { unread_only?: boolean }) => {
+    list: (params?: { unread_only?: boolean; limit?: number }) => {
       const q = new URLSearchParams();
       if (params?.unread_only) q.set("unread_only", "true");
+      if (params?.limit) q.set("limit", String(params.limit));
       return request<
         PaginatedResponse<Notification> & { unread_count: number }
       >(`/notifications?${q}`);
@@ -4901,15 +6172,15 @@ export const api = {
         method: "POST",
         body: JSON.stringify({ task_ids: taskIds, status }),
       }),
-    exportTasksCsv: (status?: string) => {
-      const token = getAuthToken();
+    exportTasksCsv: async (status?: string) => {
+      const token = await getReadyAuthToken();
       const q = status ? `?status=${status}` : "";
       return fetch(`${API_BASE}/bulk/export/tasks${q}`, {
         headers: { Authorization: `Bearer ${token}` || "" },
       }).then((r) => r.text());
     },
-    importTasksCsv: (file: File) => {
-      const token = getAuthToken();
+    importTasksCsv: async (file: File) => {
+      const token = await getReadyAuthToken();
       const form = new FormData();
       form.append("file", file);
       return fetch(`${API_BASE}/bulk/import/tasks`, {
@@ -5002,6 +6273,12 @@ export const api = {
       }),
     delete: (id: string) =>
       request<void>(`/staff/${id}`, { method: "DELETE" }),
+    transferKnowledgeToEntity: (staffId: string) =>
+      request<{
+        departed_user_id: string;
+        documents_transferred: number;
+        folders_transferred: number;
+      }>(`/staff/${staffId}/transfer-knowledge-to-entity`, { method: "POST" }),
     leaveTeam: () =>
       request<{ staff_id: string; status: string }>("/staff/me/leave", { method: "POST" }),
     createAccount: (staffId: string) =>
@@ -5098,6 +6375,7 @@ export const api = {
         attention_total: number;
       }>(`/jobs?${q}`);
     },
+    get: (jobId: string) => request<any>(`/jobs/${encodeURIComponent(jobId)}`),
     create: (data: any) =>
       request<any>("/jobs", { method: "POST", body: JSON.stringify(data) }),
     update: (id: string, data: any) =>
@@ -5125,15 +6403,35 @@ export const api = {
   },
 
   search: {
-    global: (query: string, limit?: number) => {
-      const q = new URLSearchParams({ query });
-      if (limit) q.set("limit", String(limit));
-      return request<SearchResult[]>(`/search?${q}`);
-    },
+    global: (query: string, limit?: number) =>
+      request<GlobalSearchResponse>(globalSearchPath(query, limit))
+        .then(normalizeGlobalSearchResponse),
   },
 
   workflows: {
     list: () => request<any[]>("/workflows"),
+    listProjectCandidates: (params: {
+      workspace_id: string;
+      project_type: string;
+      stages: string[];
+      limit?: number;
+    }) => {
+      const q = new URLSearchParams({
+        workspace_id: params.workspace_id,
+        project_type: params.project_type,
+      });
+      for (const stage of params.stages) q.append("stage", stage);
+      if (params.limit) q.set("limit", String(params.limit));
+      return request<Array<{
+        id: string;
+        project_type: string;
+        current_stage: string;
+        title: string;
+        youtube_video_id?: string | null;
+        created_at: string;
+        updated_at?: string | null;
+      }>>(`/workflows/projects/candidates?${q}`);
+    },
     templates: () => request<any[]>("/workflows/templates"),
     installTemplate: (templateId: string, workspaceId?: string) =>
       request<any>(`/workflows/templates/${encodeURIComponent(templateId)}/install`, {
@@ -5158,7 +6456,7 @@ export const api = {
       data?: { variables?: Record<string, any>; trigger_data?: Record<string, any> },
     ) => streamWorkflowRun(`/workflows/${id}/run-stream`, onNode, onRun, data),
     runs: (id: string) => request<any[]>(`/workflows/${id}/runs`),
-    listRuns: (params?: { workspace_id?: string; binding_id?: string; status?: string; limit?: number }) => {
+    listRuns: (params?: { workspace_id?: string; binding_id?: string; status?: string; limit?: number }, signal?: AbortSignal) => {
       const q = new URLSearchParams();
       if (params?.workspace_id) q.set("workspace_id", params.workspace_id);
       if (params?.binding_id) q.set("binding_id", params.binding_id);
@@ -5166,14 +6464,24 @@ export const api = {
       if (params?.limit) q.set("limit", String(params.limit));
       return request<any[]>(`/workflows/runs${q.toString() ? `?${q}` : ""}`, {
         headers: { "X-Silent-Error": "1" },
+        signal,
       });
     },
-    getRun: (runId: string, detail = true) => request<any>(
+    getRun: (runId: string, detail = true, signal?: AbortSignal) => request<any>(
       `/workflows/runs/${runId}${detail ? "" : "?detail=false"}`,
+      { signal },
     ),
-    getRunFamily: (runId: string) => request<any[]>(`/workflows/runs/${runId}/family`),
+    getRunFamily: (runId: string, signal?: AbortSignal) => request<any[]>(
+      `/workflows/runs/${runId}/family`,
+      { signal },
+    ),
     cancelRun: (runId: string) => request<any>(`/workflows/runs/${runId}/cancel`, { method: "POST" }),
     pauseRun: (runId: string) => request<any>(`/workflows/runs/${runId}/pause`, { method: "POST" }),
+    resolveRuntimeApproval: (runId: string, requestId: string, choice: "approve" | "reject") =>
+      request<any>(`/workflows/runs/${encodeURIComponent(runId)}/approvals/${encodeURIComponent(requestId)}/resolve`, {
+        method: "POST",
+        body: JSON.stringify({ choice }),
+      }),
     retryRun: (runId: string, data: {
       from_step_id?: string;
       variables?: Record<string, any>;
@@ -5182,10 +6490,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(data),
     }),
-    resumeRun: (runId: string, variables?: Record<string, any>) =>
+    resumeRun: (runId: string, variables?: Record<string, any>, expectedStepId?: string) =>
       request<any>(`/workflows/runs/${runId}/resume`, {
         method: "POST",
-        body: JSON.stringify({ variables: variables ?? null }),
+        body: JSON.stringify({ variables: variables ?? null, expected_step_id: expectedStepId }),
       }),
     executeStep: (runId: string) =>
       request<any>(`/workflows/runs/${runId}/step`, { method: "POST" }),
@@ -5259,6 +6567,14 @@ export const api = {
   },
 
   skills: {
+    catalog: (params?: { include_platform?: boolean; category?: string; known_version?: string }) => {
+      const q = new URLSearchParams();
+      if (params?.include_platform) q.set("include_platform", "true");
+      if (params?.category) q.set("category", params.category);
+      if (params?.known_version) q.set("known_version", params.known_version);
+      const suffix = q.toString() ? `?${q}` : "";
+      return request<{ version: string; items: any[] | null }>(`/skills/catalog${suffix}`);
+    },
     list: (params?: { include_platform?: boolean; category?: string }) => {
       const q = new URLSearchParams();
       if (params?.include_platform) q.set("include_platform", "true");
@@ -5386,6 +6702,13 @@ export const api = {
   },
 
 
+  emailAccounts: {
+    list: () => request<import("./emailAccounts").EmailAccountSettings>("/integrations/email-accounts"),
+    setDefault: (senderId: string) => request<void>("/integrations/email-accounts/default", {
+      method: "PUT", body: JSON.stringify({ sender_id: senderId }),
+    }),
+  },
+
   integrations: {
     list: () => request<any[]>("/integrations"),
     create: (data: any) =>
@@ -5445,8 +6768,16 @@ export const api = {
           { method: "POST", body: JSON.stringify(data) },
         ),
     },
-    mcpServers: () =>
-      request<IntegrationMCPServer[]>("/integrations/mcp-servers"),
+    mcpServers: (options?: { snapshot?: boolean }) =>
+      request<IntegrationMCPServer[]>(
+        `/integrations/mcp-servers${options?.snapshot ? "?snapshot=true" : ""}`,
+        { headers: { "X-Silent-Error": "1" } },
+      ),
+    setBuiltinPluginEnabled: (pluginKey: string, enabled: boolean) =>
+      request<{ plugin_key: string; enabled: boolean }>(
+        `/integrations/plugins/${encodeURIComponent(pluginKey)}`,
+        { method: "PUT", body: JSON.stringify({ enabled }) },
+      ),
     operations: (serverKey: string) =>
       request<IntegrationOperationCatalog>(
         `/integrations/mcp-servers/${encodeURIComponent(serverKey)}/tools`,
@@ -5658,7 +6989,7 @@ export const api = {
         body: JSON.stringify({ url }),
       }),
     screenshot: async (id: string) => {
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       const res = await fetch(`${API_BASE}/browser/sessions/${id}/screenshot`, {
         method: "POST",
         headers: { Authorization: `Bearer ${token}` || "" },
@@ -5738,7 +7069,7 @@ export const api = {
   docgen: {
     formats: () => request<DocGenFormat[]>("/docgen/formats"),
     generate: async (title: string, content: string, format: string, options?: Record<string, any>) => {
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       const res = await fetch(`${API_BASE}/docgen/generate`, {
         method: "POST",
         headers: {
@@ -5750,7 +7081,7 @@ export const api = {
       return res.blob();
     },
     aiGenerate: async (prompt: string, format: string, options?: Record<string, any>) => {
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       const res = await fetch(`${API_BASE}/docgen/ai-generate`, {
         method: "POST",
         headers: {
@@ -5974,10 +7305,10 @@ export const api = {
       request<{ status: string; src: string; dest: string }>("/fs/move", { method: "POST", body: JSON.stringify({ src, dest }) }),
     delete: (path: string) =>
       request<{ status: string; path: string }>("/fs/delete", { method: "POST", body: JSON.stringify({ path }) }),
-    upload: (path: string, file: globalThis.File) => {
+    upload: async (path: string, file: globalThis.File) => {
       const formData = new FormData();
       formData.append("file", file);
-      const token = getAuthToken();
+      const token = await getReadyAuthToken();
       return fetch(`${API_BASE}/fs/upload?path=${encodeURIComponent(path)}`, {
         method: "POST",
         headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -5988,14 +7319,6 @@ export const api = {
       request<{ results: any[]; query: string; count: number }>(`/fs/search?query=${encodeURIComponent(query)}&glob=${encodeURIComponent(glob)}&max_results=${maxResults}`),
     wikiLinks: (path: string) =>
       request<{ links: any[]; file: string; count: number }>(`/fs/wiki-links?path=${encodeURIComponent(path)}`),
-    wikiIndex: (opts?: { netId?: string; groupId?: string; workspaceId?: string }) => {
-      const params = new URLSearchParams();
-      if (opts?.netId) params.set("net_id", opts.netId);
-      if (opts?.groupId) params.set("group_id", opts.groupId);
-      if (opts?.workspaceId) params.set("workspace_id", opts.workspaceId);
-      const qs = params.toString();
-      return request<any>(`/fs/wiki-index${qs ? `?${qs}` : ""}`);
-    },
     lint: () =>
       request<any>("/fs/lint"),
   },
@@ -6129,3 +7452,39 @@ export interface SitePublishResult extends SiteInfo {
   excluded: { path: string; sensitive: boolean }[];
   auto_connected: boolean;
 }
+
+export interface ClientRecord { id: string; name: string; email?: string; phone?: string; address?: string; status: string; metadata?: { crm?: Partial<CrmProfile> }; }
+export interface ClientContactRecord extends Omit<ClientContactInput, "phone" | "job_title"> { id: string; user_id?: string | null; phone: string | null; job_title: string | null; }
+export interface ClientDeliveryReceipt {
+  id: string; client_id: string; contact_id: string; source_workspace_id: string; title: string;
+  recipient_email: string; status: string; expires_at: string; invite_path?: string;
+  target_workspace_id?: string; target_entity_id?: string; provider_access: "none"; can_manage?: boolean;
+  phase?: string; acceptance?: Record<string, unknown>; maintenance?: CollaborationGrant | null;
+  email_delivery?: { status?: "pending" | "sent" | "failed" | "disabled" | "unconfigured"; sent_at?: string; attempted_at?: string; locale?: string };
+}
+
+export type CrmLifecycle = "lead" | "prospect" | "customer" | "partner";
+export type CrmStage = "qualified" | "discovery" | "proposal" | "negotiation" | "won" | "lost";
+export interface CrmProfile {
+  name: string; email: string; phone: string; address: string; industry: string; website: string;
+  source: string; company_size: string; lifecycle: CrmLifecycle; owner_id: string | null;
+  tags: string[]; notes: string; status: "active" | "inactive";
+}
+export interface CrmPage<T> { items: T[]; total: number; }
+export interface CrmActivityInput { kind: "note" | "call" | "email" | "meeting"; subject: string; body: string; occurred_at: string; }
+export interface CrmActivity extends Omit<CrmActivityInput, "kind"> { id: string; client_id: string; kind: CrmActivityInput["kind"] | "deal"; }
+export interface CrmOpportunityInput { title: string; stage: CrmStage; amount: string; currency: string; probability: number; expected_close: string | null; owner_id: string | null; description: string; loss_reason: string; }
+export interface CrmOpportunity extends CrmOpportunityInput { id: string; client_id: string; client_name?: string; }
+export interface CrmFollowupInput { title: string; body: string; due_at: string; owner_id: string | null; priority: "low" | "normal" | "high"; status: "open" | "done"; }
+export interface CrmFollowup extends CrmFollowupInput { id: string; client_id: string; client_name?: string; completed_at: string | null; }
+export interface CrmOverview { clients: Partial<Record<CrmLifecycle, number>>; overdue: number; pipeline: {stage: CrmStage; currency: string; count: number; amount: string; weighted: string}[]; followups: CrmFollowup[]; }
+export interface ClientContactInput { name: string; email: string; phone: string; job_title: string; is_primary: boolean; }
+
+
+export interface CollaborationInvite { email: string; role: "tester" | "maintainer"; days: number; share_configuration: boolean; }
+export interface CollaborationGrant { id: string; workspace_id: string; delivery_id?: string; email: string; role: "tester" | "maintainer"; status: string; expires_at: string; share_configuration: boolean; path: string; }
+export interface CollaborationManagement { workspace_id: string; title: string; status: string; phase?: string; acceptance?: Record<string, unknown>; grants: CollaborationGrant[]; communication: CollaborationCommunication; group_options: CollaborationGroup[]; }
+export interface CollaborationPortal { grant: CollaborationGrant; title: string; configuration?: {revision: number; services: Record<string, unknown>[]; processes: Record<string, unknown>[]}; communication: CollaborationCommunication; }
+
+export interface CollaborationGroup { id: string; title: string; path: string; }
+export interface CollaborationCommunication { linked: boolean; group: CollaborationGroup | null; }

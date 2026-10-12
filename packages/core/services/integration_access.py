@@ -64,11 +64,13 @@ async def _load_source(
         row = await db.get(OAuthAccount, connection_id)
         if not row:
             return None
+        from packages.core.services.manor_integration_oauth import is_manor_oauth_provider, manor_oauth_binding
+
         return _ConnectionSource(
             id=row.id,
             kind=kind,
             owner_user_id=row.user_id,
-            entity_id=None,
+            entity_id=(manor_oauth_binding(row).get("entity_id") or "invalid") if is_manor_oauth_provider(row.provider) else None,
         )
     raise ValueError(f"Unsupported connection kind: {kind}")
 

@@ -26,6 +26,11 @@ import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from tests.strategist_helpers import proposal_with_execution_review
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
+
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
@@ -167,7 +172,7 @@ async def _set_flag(db, enabled: bool) -> None:
 
 def _fake_completion(payload: dict):
     async def fake(system_prompt, user_prompt, **kwargs):
-        return SimpleNamespace(content=json.dumps(payload))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payload, user_prompt)))
     return fake
 
 
@@ -177,6 +182,8 @@ async def _seed_cohort(
     username: str,
     *,
     payload_for,
+    task_approval: str | None = None,
+    simulation: bool = False,
 ) -> dict:
     """Register an owner, seed a workspace + automation + goal, then run one
     v2 review whose scripted completion is ``payload_for(job, goal)``.
@@ -196,7 +203,10 @@ async def _seed_cohort(
             entity_id=entity_id,
             name="Item Cohort WS",
             status="active",
-            settings={},
+            settings=(
+                {"sandbox": True, "strategist": {"proposal_task_approval_source": "blueprint_simulation"}}
+                if simulation else {}
+            ),
             operating_model={},
         )
         goal = Goal(
@@ -232,7 +242,19 @@ async def _seed_cohort(
             enabled=True,
         )
         db.add_all([workspace, goal, agent, subscription, job])
+        await db.flush()
+        await initialize_test_approval_owners(db, workspace, user_id=owner["user_id"])
         await db.commit()
+
+        if task_approval is not None:
+            from packages.core.proposals.constants import TASK_ACTION_KEY
+
+            await set_workspace_test_approval(
+                db, entity_id=entity_id, workspace_id=workspace.id,
+                actor_id=owner["user_id"],
+                user_rules=[action_rule(TASK_ACTION_KEY, effect=task_approval)],
+            )
+            await db.commit()
 
         await _set_flag(db, True)
         _seq += 1
@@ -399,6 +421,81 @@ async def test_change_only_cohort_reject_leaves_row_untouched(
     assert request.status == "denied"
 
 
+@pytest.mark.parametrize("scope", ["account", "workspace"])
+@pytest.mark.parametrize("item_kind", ["task", "automation_change", "experiment"])
+async def test_saved_deny_blocks_pending_cohort_without_effects_and_still_allows_reject(
+    client: AsyncClient, monkeypatch, scope, item_kind,
+):
+    builders = {
+        "task": lambda job, goal: _payload(tasks=[_task_entry()]),
+        "automation_change": lambda job, goal: _payload(automation_changes=[_pause_automation(job.id)]),
+        "experiment": lambda job, goal: _payload(experiments=[_experiment(job.id)]),
+    }
+    ctx = await _seed_cohort(client, monkeypatch, f"pending_deny_{scope}_{item_kind}",
+        payload_for=builders[item_kind])
+    card = await _proposal_card(ctx["workspace_id"])
+    [item] = await _items(ctx["review_id"])
+    assert item.status == "proposed"
+    request_id = item.approval_request_id
+    assert (await _get(HitlRequest, request_id)).status == "pending"
+    suffix = f"accounts/{ctx['entity_id']}" if scope == "account" else f"workspaces/{ctx['workspace_id']}"
+    path = f"/api/v1/approval-settings/{suffix}"
+    current = await client.get(path, headers=ctx["headers"])
+    assert current.status_code == 200, current.text
+    saved = await client.put(path, headers=ctx["headers"], json={
+        "expected_version": current.json()["version"], "draft": {
+            "mode": current.json()["policy"]["mode"],
+            "user_rules": [action_rule(item.action_key, effect="deny")],
+        },
+    })
+    assert saved.status_code == 200, saved.text
+
+    denied = await _resolve(client, ctx, card.id, {"choice": "approve"})
+    assert denied.status_code == 403, denied.text
+    [unchanged] = await _items(ctx["review_id"])
+    assert unchanged.status == "proposed" and unchanged.execution_root_id is None
+    assert (await _get(HitlRequest, request_id)).status == "pending"
+    assert (await _get(Message, card.id)).resolved_at is None
+    job = await _get(ScheduledJob, ctx["job_id"])
+    assert job.enabled is True and job.revision == 1
+    if item_kind == "task":
+        assert (await _get(Task, item.payload["task_id"])).status == "proposed"
+    import packages.core.database as dbmod
+    async with dbmod.async_session() as db:
+        assert not (await db.execute(select(Experiment.id).where(
+            Experiment.workspace_id == ctx["workspace_id"]))).scalars().all()
+
+    rejected = await _resolve(client, ctx, card.id, {"choice": "reject",
+        "payload": {"reason_code": "BAD_TIMING"}})
+    assert rejected.status_code == 200, rejected.text
+    assert (await _items(ctx["review_id"]))[0].status == "rejected"
+    assert (await _get(HitlRequest, request_id)).status == "denied"
+
+
+async def test_proposal_card_remains_open_if_dispatch_commits_then_policy_recheck_blocks(client, monkeypatch):
+    import packages.core.strategist as strategist
+    from packages.core.proposals.approval_guard import ProposalApprovalBlocked
+
+    ctx = await _seed_cohort(client, monkeypatch, "cohort_partial_commit_policy",
+        payload_for=lambda job, goal: _payload(automation_changes=[_pause_automation(job.id)]))
+    card = await _proposal_card(ctx["workspace_id"])
+    request_id = (await _items(ctx["review_id"]))[0].approval_request_id
+
+    async def dispatch_commit_then_block(db, **kwargs):
+        # Fault injection at the Flow commit boundary, with no external effect.
+        await db.commit()
+        raise ProposalApprovalBlocked("Current policy changed before the next item")
+
+    monkeypatch.setattr(strategist, "approve_proposal", dispatch_commit_then_block)
+    response = await _resolve(client, ctx, card.id, {"choice": "approve"})
+    assert response.status_code == 403, response.text
+    assert (await _get(Message, card.id)).resolved_at is None
+    assert (await _get(HitlRequest, request_id)).status == "pending"
+    response = await _resolve(client, ctx, card.id, {"choice": "reject"})
+    assert response.status_code == 200, response.text
+    assert (await _get(HitlRequest, request_id)).status == "denied"
+
+
 async def test_goal_change_summary_reads_the_direction(
     client: AsyncClient, monkeypatch,
 ):
@@ -448,6 +545,39 @@ async def test_experiment_only_cohort_card_and_approval_starts_it(
 
 
 # ── mixed cohort ──────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("task_approval", ["allow", "deny"])
+@pytest.mark.parametrize("simulation", [False, True])
+@pytest.mark.parametrize("choice", ["approve", "reject"])
+async def test_task_policy_never_decides_independent_change_item(
+    client: AsyncClient, monkeypatch, task_approval, simulation, choice,
+):
+    ctx = await _seed_cohort(
+        client, monkeypatch, f"mixed_scope_{task_approval}_{simulation}_{choice}",
+        task_approval=task_approval, simulation=simulation,
+        payload_for=lambda job, goal: _payload(
+            tasks=[_task_entry()], automation_changes=[_pause_automation(job.id)],
+        ),
+    )
+    items = {item.kind: item for item in await _items(ctx["review_id"])}
+    assert items["task"].status == ("approved" if task_approval == "allow" else "rejected")
+    change = items["automation_change"]
+    assert change.status == "proposed"
+    request = await _get(HitlRequest, change.approval_request_id)
+    assert request.status == "pending"
+    assert (await _get(ScheduledJob, ctx["job_id"])).enabled is True
+    card = await _proposal_card(ctx["workspace_id"])
+    assert card.pending_action["task_ids"] == []
+    assert card.pending_action["items"][0]["item_id"] == change.id
+    assert card.meta["proposal"]["approval"]["status"] == "pending"
+
+    expected_task_status = "in_progress" if task_approval == "allow" else "cancelled"
+    response = await _resolve(client, ctx, card.id, {"choice": choice})
+    assert response.status_code == 200, response.text
+    assert (await _get(Task, ctx["task_ids"][0])).status == expected_task_status
+    assert (await _get(ScheduledJob, ctx["job_id"])).enabled is (choice != "approve")
+    assert (await _get(HitlRequest, change.approval_request_id)).status == ("consumed" if choice == "approve" else "denied")
 
 
 async def test_mixed_cohort_approves_task_and_change(
@@ -518,7 +648,8 @@ async def _add_editor(ctx: dict, username: str) -> dict:
     """A workspace ``editor``: approve_tasks + approve_goal_changes by the
     role default map, never approve_automation_changes."""
     import packages.core.database as dbmod
-    from packages.core.models.user import User
+    from packages.core.models.user import User, UserMembership
+    from packages.core.governance.approval_policy_service import initialize_personal_approval
     from packages.core.services.auth_service import create_access_token, hash_password
 
     async with dbmod.async_session() as db:
@@ -532,6 +663,9 @@ async def _add_editor(ctx: dict, username: str) -> dict:
         )
         db.add(editor)
         await db.flush()
+        db.add(UserMembership(user_id=editor.id, entity_id=ctx["entity_id"],
+            role="member", status="active", is_primary=True))
+        await initialize_personal_approval(db, user_id=editor.id, entity_id=ctx["entity_id"])
         db.add(WorkspaceStaff(
             workspace_id=ctx["workspace_id"],
             user_id=editor.id,
@@ -672,14 +806,12 @@ async def test_approve_selected_mixed_subset_splits_tasks_and_items(
     assert job.enabled is True  # unpicked → untouched
 
 
-async def test_always_approve_grants_every_strategist_action_key(
+async def test_retired_always_approve_preserves_cohort_and_policy(
     client: AsyncClient, monkeypatch,
 ):
-    """"Always approve" is blanket: one click, every proposal type."""
+    """An obsolete blanket decision cannot grant or execute this cohort."""
     import packages.core.database as dbmod
-    from packages.core.governance import get_policy
     from packages.core.models.governance import GovernanceRevision
-    from packages.core.proposals.constants import STRATEGIST_ACTION_KEYS
 
     ctx = await _seed_cohort(
         client, monkeypatch, "item_cohort_always",
@@ -689,30 +821,39 @@ async def test_always_approve_grants_every_strategist_action_key(
         ),
     )
     card = await _proposal_card(ctx["workspace_id"])
+    path = f"/api/v1/approval-settings/workspaces/{ctx['workspace_id']}"
+    before = await client.get(path, headers=ctx["headers"])
+    assert before.status_code == 200, before.text
+    async with dbmod.async_session() as db:
+        revisions_before = list((await db.execute(select(GovernanceRevision.id).where(
+            GovernanceRevision.workspace_id == ctx["workspace_id"]
+        ))).scalars())
 
     resp = await _resolve(client, ctx, card.id, {"choice": "always_approve"})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 410, resp.text
+    assert "Execution & approvals" in resp.json()["detail"]
+    after = await client.get(path, headers=ctx["headers"])
+    assert after.json() == before.json()
 
     async with dbmod.async_session() as db:
-        policy = await get_policy(db, ctx["workspace_id"])
         revisions = list((await db.execute(
-            select(GovernanceRevision).where(
+            select(GovernanceRevision.id).where(
                 GovernanceRevision.workspace_id == ctx["workspace_id"]
             )
         )).scalars().all())
-    granted = set(policy.auto_approve_actions)
-    assert set(STRATEGIST_ACTION_KEYS) <= granted, sorted(granted)
-    # Each key is its own auditable revision.
-    summaries = {rev.change_summary for rev in revisions}
-    for action_key in STRATEGIST_ACTION_KEYS:
-        assert f"always-approve action: {action_key}" in summaries
-
-    # The current cohort is still approved as before.
+    assert revisions == revisions_before
+    assert (await _get(Message, card.id)).resolved_at is None
+    assert (await _get(ScheduledJob, ctx["job_id"])).enabled is True
+    items = await _items(ctx["review_id"])
+    assert all(item.status == "proposed" for item in items)
+    for item in items:
+        if item.approval_request_id:
+            assert (await _get(HitlRequest, item.approval_request_id)).status == "pending"
     task = await _get(Task, ctx["task_ids"][0])
-    assert task.status == "in_progress"
+    assert task.status == "proposed"
 
 
-async def test_always_approve_requires_standing_grant_authority(
+async def test_retired_always_approve_cannot_promote_editor_authority(
     client: AsyncClient, monkeypatch,
 ):
     """Proposal authority alone cannot create blanket future consent."""
@@ -731,8 +872,19 @@ async def test_always_approve_requires_standing_grant_authority(
         headers=editor_headers,
     )
 
-    assert resp.status_code == 403, resp.text
-    assert "manage_standing_grants" in resp.json()["detail"]
+    assert resp.status_code == 410, resp.text
+    path = f"/api/v1/approval-settings/workspaces/{ctx['workspace_id']}"
+    before = await client.get(path, headers=editor_headers)
+    assert before.status_code == 200, before.text
+    assert before.json()["capabilities"]["can_save_rule"] is False
+    from packages.core.proposals.constants import TASK_ACTION_KEY
+    denied = await client.put(path, headers=editor_headers, json={
+        "expected_version": before.json()["version"],
+        "draft": {"mode": None, "user_rules": [action_rule(TASK_ACTION_KEY)]},
+    })
+    assert denied.status_code == 403, denied.text
+    after = await client.get(path, headers=editor_headers)
+    assert after.json() == before.json()
     unresolved = await _get(Message, card.id)
     assert unresolved.resolved_at is None
     task = await _get(Task, ctx["task_ids"][0])

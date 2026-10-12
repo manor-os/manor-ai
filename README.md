@@ -173,6 +173,8 @@ Use the first run to verify the whole system, not just the login page:
 | Agent runtime | Tool-calling loop, skills, scoped tools, HITL approvals, task runners, and goal workflows. |
 | Sandbox | Isolated execution service for code-producing tools and file-generating workflows. |
 | Integrations | Webhooks, OAuth provider configuration, optional Nango, API keys, MCP catalog, and connector surfaces. |
+| Collaboration | CRM, Team & Clients, resource permissions and authorized same-instance customer delivery. |
+| Blueprints | Portable JSON export/install, simulation and upgrades from a registered published source. |
 | Docs and operations | Docusaurus docs, Docker Compose guide, configuration guide, security notes, backup/restore, and upgrade docs. |
 
 The public OSS tree is designed for self-hosted deployments and local
@@ -180,6 +182,12 @@ evaluation. Managed hosting, private deployment automation, and commercial
 cloud operations are separate from this repository. If you are extending Manor
 AI, start from the OSS surfaces above: tools, skills, workers, webhooks,
 OpenAPI clients, and deployment configuration.
+
+One operator manages the self-hosted deployment; multiple users and Entities
+retain their existing isolation. All AI entry points use your Entity's BYOK
+configuration, not platform keys. Chrome/CLI/Remote Coding/mobile clients,
+hosted marketplaces and curated commercial product packages are not included.
+The existing license restrictions on third-party hosted services still apply.
 
 ## Extend Manor AI
 

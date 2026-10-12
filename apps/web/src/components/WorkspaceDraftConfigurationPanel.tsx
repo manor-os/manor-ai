@@ -80,6 +80,20 @@ function detailItem(
   };
 }
 
+// Say what a rule type does before the workspace exists. draft_only reads
+// like a soft preference but is a hard block: the agent never publishes.
+function ruleEnforcementCopy(rule: any): string {
+  const ruleType = String(rule?.rule_type || "").trim().toLowerCase();
+  const enforceable = asList(rule?.approval_selectors).length > 0;
+  if (!ruleType || ruleType === "notice" || !enforceable) {
+    return t("page.workspace_draft_chat.value.enforcement_guidance");
+  }
+  if (["draft_only", "deny", "never_allow", "block"].includes(ruleType)) {
+    return t("page.workspace_draft_chat.value.enforcement_hard_block");
+  }
+  return t("page.workspace_draft_chat.value.enforcement_approval");
+}
+
 function bindingLabel(value: any) {
   if (value == null) return "";
   if (typeof value !== "object") return String(value);
@@ -283,6 +297,14 @@ export default function WorkspaceDraftConfigurationPanel({
   });
 
   const draft = controlledDraft || query.data;
+  const measurementLibrary = useQuery({
+    queryKey: ["workspace-stat-library"],
+    queryFn: () => api.workspaces.stats.library(),
+    enabled: Boolean(draft && (
+      asList(draft.fields.goals).some((goal) => goal.measurement?.library_key)
+      || asList(draft.fields.stats).some((stat) => stat.library_key)
+    )),
+  });
   const channelRequirements = asList<BlueprintInstallPreflightRequirement>(
     draft?.fields._blueprint_channel_requirements,
   ).filter((requirement) => (requirement.resource_options ?? []).length > 0);
@@ -427,10 +449,29 @@ export default function WorkspaceDraftConfigurationPanel({
           ],
         );
       }),
-      goalDetails: goals.map((item, index) => detailItem(
-        labelFor(item, `Goal ${index + 1}`),
-        [item.target, humanize(item.cadence), humanize(item.metric || item.metric_key)],
-      )),
+      goalDetails: goals.map((item, index) => {
+        const configured = item.measurement || asList(fields.stats).find(
+          (stat) => (stat.key || stat.library_key) === item.stat_key,
+        );
+        const entry = measurementLibrary.data?.items.find((candidate) => candidate.key === configured?.library_key);
+        const measurement = configured ? { ...entry, window: entry?.default_window, ...configured } : null;
+        const automatic = Boolean(measurement?.library_key
+          || (measurement?.collector_type && measurement.collector_type !== "manual"));
+        return detailItem(
+          labelFor(item, `Goal ${index + 1}`),
+          [item.target ?? item.target_value, humanize(item.cadence || item.measurement_cadence || measurement?.collection_cadence || entry?.default_cadence)],
+          [
+            { label: t("page.workspace_stats.measurement"), value: measurement?.name || humanize(measurement?.key || measurement?.library_key || item.metric_key) },
+            { label: t("page.workspace_draft_chat.measurement.definition"), value: measurement?.description },
+            { label: t("page.workspace_draft_chat.measurement.source"), value: measurement?.source || measurement?.collector_config?.source || measurement?.library_key },
+            { label: t("page.workspace_draft_chat.measurement.unit"), value: measurement?.unit },
+            { label: t("page.workspace_draft_chat.measurement.window"), value: humanize(measurement?.window) },
+            { label: t("page.workspace_draft_chat.measurement.collection"), value: !measurement
+              ? t("page.workspace_draft_chat.measurement.missing")
+              : t(automatic ? "page.workspace_draft_chat.measurement.automatic" : "page.workspace_draft_chat.measurement.manual") },
+          ],
+        );
+      }),
       staffDetails: staff.map((item, index) => detailItem(
         item.staff_name || item.name || item.staff_id || `Member ${index + 1}`,
         [item.role, humanize(item.service_key), item.rationale],
@@ -469,7 +510,8 @@ export default function WorkspaceDraftConfigurationPanel({
       }),
       ruleDetails: rules.map((item, index) => detailItem(
         labelFor(item, `Rule ${index + 1}`),
-        [humanize(item.rule_type), humanize(item.severity), humanize(item.scope), asList(item.action_patterns).map(humanize)],
+        [humanize(item.rule_type), humanize(item.severity), humanize(item.scope), asList(item.approval_selectors).map((selector) => humanize(selector.category || selector.action_key))],
+        [{ label: t("page.workspace_draft_chat.field.enforcement"), value: ruleEnforcementCopy(item) }],
       )),
       automationDetails: automations.map((item, index) => detailItem(
         labelFor(item, `Automation ${index + 1}`),
@@ -522,7 +564,7 @@ export default function WorkspaceDraftConfigurationPanel({
       notes: String(fields.notes || "").trim(),
       percent: completeness(draft),
     };
-  }, [draft]);
+  }, [draft, measurementLibrary.data]);
 
   if (!draft || !view) {
     return (
@@ -630,18 +672,18 @@ export default function WorkspaceDraftConfigurationPanel({
           </section>
           <section className="workspace-draft-runtime">
             <div className="workspace-draft-runtime__copy">
-              <span>{t("page.workspace_detail.workspace_runtime")}</span>
+              <span>{t("page.workspace_draft_chat.runtime_mode")}</span>
               <strong>
                 {view.autonomousEnabled
-                  ? t("page.workspace_detail.workspace_runtime_enabled")
-                  : t("page.workspace_detail.workspace_runtime_disabled")}
+                  ? t("page.workspace_draft_chat.runtime_automatic")
+                  : t("page.workspace_draft_chat.runtime_manual")}
               </strong>
-              <small>{t("page.workspace_detail.workspace_runtime_desc")}</small>
+              <small>{t("page.workspace_draft_chat.runtime_mode_desc")}</small>
             </div>
             <Toggle
               checked={view.autonomousEnabled}
               disabled={!editable || busy}
-              aria-label={t("page.workspace_detail.workspace_runtime")}
+              aria-label={t("page.workspace_draft_chat.runtime_mode")}
               onChange={() => autonomyMutation.mutate(!view.autonomousEnabled)}
             />
           </section>

@@ -22,10 +22,17 @@ from apps.api.chat_audio import ChatAudioScope
 from packages.core.services.voice import realtime, whisper
 from packages.core.services.voice.browser import browser_session_update
 from packages.core.services.voice.gateway_call import GatewayVoiceSession, SpeechDetector, pcm_wav, speech_chunks
+from packages.core.services.voice.work_queue import VoiceWorkReceipt
 from packages.core.services.voice.latency import VoiceTurnTiming
+from packages.core.services.voice.live_agent import (
+    LiveVoiceTextDecision,
+    LiveVoiceTurnAction,
+    live_voice_session_factory,
+)
 from packages.core.services.voice.realtime import RealtimeRoute, VoiceAgentOutcome, build_spoken_response_event
 from packages.core.services.voice.profiles import speech_voice
 from packages.core.services.voice.speech_request import begin_speech_provider_request
+from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
 from tests.test_browser_voice import Socket, eventually
 
 
@@ -231,13 +238,99 @@ def test_voice_profiles_map_only_to_compatible_provider_voices():
     assert speech_voice("deep", "zyphra/zonos-v0.1-transformer") is None
 
 
-def test_gateway_input_overload_keeps_the_newest_recording():
+async def test_gateway_input_overload_applies_backpressure_without_dropping_speech():
     call, _ = gateway_session()
-    for input_id in range(1, 6):
-        call.queue_input((input_id, bytes([input_id])))
+    for input_id in range(1, 5):
+        await call.queue_input((input_id, bytes([input_id])))
+
+    blocked = asyncio.create_task(call.queue_input((5, b"\x05")))
+    await asyncio.sleep(0)
+    assert not blocked.done()
+
+    first = call.inputs.get_nowait()
+    call.inputs.task_done()
+    await asyncio.wait_for(blocked, 1)
 
     assert call.inputs.qsize() == 4
+    assert first[0] == 1
     assert [call.inputs.get_nowait()[0] for _ in range(4)] == [2, 3, 4, 5]
+
+
+async def test_gateway_final_transcript_is_visible_before_live_agent_finishes():
+    call, ws = gateway_session()
+    decision_started = asyncio.Event()
+    release_decision = asyncio.Event()
+
+    async def decide(_text, _active_receipt):
+        decision_started.set()
+        await release_decision.wait()
+        return LiveVoiceTextDecision(spoken_reply="我听完整了。")
+
+    call.foreground_agent = decide
+    call.transcribe.return_value = "这句话要先完整显示"
+    task = asyncio.create_task(call.run())
+    try:
+        await eventually(lambda: bool(ws.events))
+        await utterance(ws)
+        await asyncio.wait_for(decision_started.wait(), 2)
+        transcript = next(event for event in ws.events if event["type"] == "transcript")
+        assert transcript["text"] == "这句话要先完整显示"
+        assert transcript["item_id"].startswith(f"input-{call.call_id}-")
+        assert not any(event["type"] == "audio_clip" for event in ws.events)
+    finally:
+        release_decision.set()
+        await eventually(lambda: any(event["type"] == "audio_clip" for event in ws.events))
+        clip = next(event for event in ws.events if event["type"] == "audio_clip")
+        await ws.incoming.put({"type": "clip_done", "item_id": clip["item_id"]})
+        await ws.incoming.put({"type": "end"})
+        await asyncio.wait_for(task, 2)
+
+
+def test_gateway_transcript_previews_keep_only_the_latest_bounded_snapshot():
+    call, _ = gateway_session()
+    call.detector.speaking = True
+    call.detector.frames = [b"\x00" * 960] * 60
+    call.detector.total_ms = 1200
+    call.queue_transcript_preview(1)
+    call.detector.frames.extend([b"\x00" * 960] * 60)
+    call.detector.total_ms = 2400
+    call.queue_transcript_preview(1)
+    call.detector.frames.extend([b"\x00" * 960] * 60)
+    call.detector.total_ms = 3600
+    call.queue_transcript_preview(1)
+    call.detector.frames.extend([b"\x00" * 960] * 60)
+    call.detector.total_ms = 4800
+    call.queue_transcript_preview(1)
+
+    assert call.preview_counts == {1: 3}
+    assert call.transcript_previews.qsize() == 1
+    input_id, audio = call.transcript_previews.get_nowait()
+    assert input_id == 1
+    assert len(audio) == 180 * 960
+
+
+async def test_gateway_upload_stt_emits_replaceable_transcript_preview():
+    call, ws = gateway_session()
+    call.transcribe.return_value = "我正在说一段完整的话"
+    call.transcript_previews.put_nowait((1, pcm() * 30))
+
+    worker = asyncio.create_task(call.transcribe_previews())
+    try:
+        await eventually(
+            lambda: any(event["type"] == "transcript_preview" for event in ws.events)
+        )
+        preview = next(
+            event for event in ws.events if event["type"] == "transcript_preview"
+        )
+        assert preview == {
+            "type": "transcript_preview",
+            "role": "user",
+            "item_id": f"input-{call.call_id}-1",
+            "text": "我正在说一段完整的话",
+        }
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
 
 
 async def test_gateway_chat_backlog_does_not_block_or_drop_accepted_turns():
@@ -346,13 +439,22 @@ async def test_next_sentence_is_prepared_during_playback_but_not_sent_before_ack
     assert call.speak.await_args_list[0].args == ("你好，我在。", "warm")
     phases = [e["type"] for e in ws.events if e["type"] in {"transcribing", "thinking", "synthesizing"}]
     assert phases == ["transcribing", "thinking", "synthesizing", "synthesizing"]
-    turn = next(e for e in ws.events if e["type"] == "turn")
-    assert turn["generation"] == 1 and turn["text"] == call.agent.return_value.spoken_reply
+    assert not any(e["type"] == "turn" for e in ws.events)
+    captions = [e for e in ws.events if e["type"] == "caption"]
+    assert [e["delta"] for e in captions] == ["你好，我在。"]
     await ws.incoming.put({"type": "clip_done", "item_id": clips[0]["item_id"]})
     await eventually(lambda: len([e for e in ws.events if e["type"] == "audio_clip"]) == 2)
     last_clip = next(e for e in reversed(ws.events) if e["type"] == "audio_clip")
+    await eventually(lambda: len([e for e in ws.events if e["type"] == "caption"]) == 2)
+    captions = [e for e in ws.events if e["type"] == "caption"]
+    assert len({e["item_id"] for e in captions}) == 1
+    assert "".join(e["delta"] for e in captions) == call.agent.return_value.spoken_reply
+    assert not any(e["type"] == "turn" for e in ws.events)
     assert not any(e["type"] == "listening" for e in ws.events)
     await ws.incoming.put({"type": "clip_done", "item_id": last_clip["item_id"]})
+    await eventually(lambda: any(e["type"] == "turn" for e in ws.events))
+    turn = next(e for e in ws.events if e["type"] == "turn")
+    assert turn["generation"] == 1 and turn["text"] == call.agent.return_value.spoken_reply
     await eventually(lambda: ws.events[-1]["type"] == "listening")
     await ws.incoming.put({"type": "end"})
     await asyncio.wait_for(task, 2)
@@ -494,6 +596,847 @@ async def test_hangup_turn_settlement_is_bounded(monkeypatch, caplog):
 
     assert stopped.is_set()
     assert "Voice turn settlement exceeded its deadline" in caplog.text
+    call.speak.assert_not_awaited()
+
+
+async def test_gateway_durable_work_returns_to_listening_without_timeout_reply():
+    call, ws = gateway_session()
+    receipt = VoiceWorkReceipt("work-1", "message-1", "Run the report")
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def execute(work):
+        assert work == receipt
+        entered.set()
+        await release.wait()
+        return VoiceAgentOutcome(
+            status="ok",
+            spoken_reply="The report is ready.",
+            conversation_id="conversation",
+        )
+
+    call.admit_work = AsyncMock()
+    call.execute_work = AsyncMock(side_effect=execute)
+
+    worker = asyncio.create_task(call.run_turns())
+    call.generation = 1
+    call.queue_turn((1, receipt.text, receipt))
+
+    await asyncio.wait_for(entered.wait(), 2)
+    await eventually(
+        lambda: {"type": "work", "status": "running"} in ws.events
+    )
+    assert {"type": "listening", "generation": 1} in ws.events
+    assert not any(event.get("type") == "turn" for event in ws.events)
+    call.speak.assert_not_awaited()
+    assert not call.execute_work.await_args.args[0].recovered
+
+    release.set()
+    await eventually(
+        lambda: {"type": "work", "status": "completed"} in ws.events
+    )
+    await eventually(lambda: len([event for event in ws.events if event.get("type") == "audio_clip"]) == 1)
+    call.finish_clip("played")
+    await eventually(
+        lambda: any(
+            event.get("type") == "turn" and event.get("text") == "The report is ready."
+            for event in ws.events
+        )
+    )
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_live_agent_answers_greeting_without_durable_chat_work(caplog):
+    caplog.set_level("INFO", logger="packages.core.services.voice.gateway_call")
+    call, ws = gateway_session()
+    call.foreground_agent = AsyncMock(
+        return_value=LiveVoiceTextDecision(spoken_reply="在的，您请说。")
+    )
+    call.admit_work = AsyncMock()
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "喂"
+    task = asyncio.create_task(call.run())
+
+    await eventually(lambda: bool(ws.events))
+    await utterance(ws)
+    await eventually(lambda: any(event["type"] == "audio_clip" for event in ws.events))
+
+    call.foreground_agent.assert_awaited_once_with("喂", None)
+    call.admit_work.assert_not_awaited()
+    call.agent.assert_not_awaited()
+    call.record_control_turn.assert_awaited_once_with("喂", "在的，您请说。")
+    clip = next(event for event in ws.events if event["type"] == "audio_clip")
+    await ws.incoming.put({"type": "clip_done", "item_id": clip["item_id"]})
+    await ws.incoming.put({"type": "end"})
+    await asyncio.wait_for(task, 2)
+    logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert "stage=live_agent_decision" in logs
+    assert "stage=live_agent_delivery" in logs
+    assert "stage=work_persist" not in logs
+    assert "stage=agent_queue" not in logs
+
+
+@pytest.mark.parametrize("content", ["", "I'll search for the current rates now."])
+async def test_gateway_live_agent_delegates_tool_work_once(content):
+    call, ws = gateway_session()
+    receipt = VoiceWorkReceipt("work-1", "message-1", "查一下今天的房贷利率")
+    call.foreground_agent = AsyncMock(
+        side_effect=lambda _text, _active: live_voice_session_factory.text_decision(
+            content,
+            [{"name": "delegate_to_main_agent", "arguments": {"utterance": "Check rates"}}],
+        )
+    )
+    call.admit_work = AsyncMock(return_value=receipt)
+    call.record_control_turn = AsyncMock()
+    call.execute_work = AsyncMock(
+        return_value=VoiceAgentOutcome(
+            status="ok",
+            spoken_reply="我查到了。",
+            conversation_id="conversation",
+        )
+    )
+    call.render_result = AsyncMock(return_value="我已经查到结果了。")
+    call.transcribe.return_value = receipt.text
+    task = asyncio.create_task(call.run())
+
+    await eventually(lambda: bool(ws.events))
+    await utterance(ws)
+    await eventually(lambda: any(event["type"] == "audio_clip" for event in ws.events))
+
+    call.foreground_agent.assert_awaited_once_with(receipt.text, None)
+    call.admit_work.assert_awaited_once_with(receipt.text)
+    call.execute_work.assert_awaited_once_with(receipt)
+    call.render_result.assert_awaited_once()
+    call.agent.assert_not_awaited()
+    call.record_control_turn.assert_not_awaited()
+    call.speak.assert_awaited_once_with("我已经查到结果了。", "warm")
+    assert [event["delta"] for event in ws.events if event["type"] == "caption"] == [
+        "我已经查到结果了。"
+    ]
+    clip = next(event for event in ws.events if event["type"] == "audio_clip")
+    await ws.incoming.put({"type": "clip_done", "item_id": clip["item_id"]})
+    await ws.incoming.put({"type": "end"})
+    await asyncio.wait_for(task, 2)
+
+
+async def test_gateway_live_agent_semantically_cancels_active_work():
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("active", "message-active", "Plan the trip")
+    call.agent_active = True
+    call.agent_active_receipt = active
+    call.foreground_agent = AsyncMock(
+        return_value=LiveVoiceTextDecision(action=LiveVoiceTurnAction.CANCEL)
+    )
+    call.route_work_action = AsyncMock(
+        return_value=VoiceWorkDecision(
+            VoiceWorkAction.CANCEL,
+            "好的，我停下来了。",
+        )
+    )
+    call.cancel_work = AsyncMock(return_value=True)
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "算了，不用弄了"
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(lambda: call.cancel_work.await_count == 1)
+    await eventually(lambda: call.record_control_turn.await_count == 1)
+
+    call.foreground_agent.assert_awaited_once_with("算了，不用弄了", active)
+    call.route_work_action.assert_awaited_once_with(
+        "算了，不用弄了",
+        active,
+        VoiceWorkAction.CANCEL,
+    )
+    call.cancel_work.assert_awaited_once_with(active, None)
+    assert call.turns.empty()
+
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_live_queue_persists_before_ack_and_uses_durable_execution():
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("active", "message-active", "Run the report")
+    queued = VoiceWorkReceipt("queued", "message-queued", "Email it to Alice")
+    call.agent_active = True
+    call.agent_active_receipt = active
+    call.foreground_agent = AsyncMock(
+        return_value=LiveVoiceTextDecision(action=LiveVoiceTurnAction.QUEUE)
+    )
+    call.route_work_action = AsyncMock(
+        return_value=VoiceWorkDecision(VoiceWorkAction.QUEUE, "")
+    )
+
+    async def admit(text):
+        assert text == queued.text
+        assert {"type": "work", "status": "queued"} not in ws.events
+        return queued
+
+    call.admit_work = AsyncMock(side_effect=admit)
+    call.execute_work = AsyncMock(
+        return_value=VoiceAgentOutcome(
+            status="ok", spoken_reply="", conversation_id="conversation"
+        )
+    )
+    call.transcribe.return_value = queued.text
+    call.input_id = 1
+    transcription = asyncio.create_task(call.transcribe_inputs())
+    execution = None
+    try:
+        await call.inputs.put((1, pcm()))
+        await eventually(lambda: {"type": "work", "status": "queued"} in ws.events)
+        call.admit_work.assert_awaited_once_with(queued.text)
+        call.route_work_action.assert_awaited_once_with(
+            queued.text, active, VoiceWorkAction.QUEUE
+        )
+        assert queued.id in call.acknowledged_work_ids
+        call.agent_active = False
+        call.agent_active_receipt = None
+        execution = asyncio.create_task(call.run_turns())
+        await eventually(lambda: call.execute_work.await_count == 1)
+        call.execute_work.assert_awaited_once_with(queued)
+        call.agent.assert_not_awaited()
+    finally:
+        tasks = [transcription, *tuple(call.control_tasks)]
+        if execution is not None:
+            tasks.append(execution)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("action", [LiveVoiceTurnAction.QUEUE, LiveVoiceTurnAction.REPLACE])
+async def test_gateway_new_work_survives_completion_during_live_decision(action):
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("active", "message-active", "Run the report")
+    next_work = VoiceWorkReceipt("next", "message-next", "Check tomorrow's tour")
+    call.agent_active = True
+    call.agent_active_receipt = active
+    deciding, finish_decision = asyncio.Event(), asyncio.Event()
+
+    async def decide(text, receipt):
+        assert (text, receipt) == (next_work.text, active)
+        deciding.set()
+        await finish_decision.wait()
+        return LiveVoiceTextDecision(action=action)
+
+    call.foreground_agent = AsyncMock(side_effect=decide)
+    call.admit_work = AsyncMock(return_value=next_work)
+    call.cancel_work = AsyncMock()
+    call.transcribe.return_value = next_work.text
+    call.input_id = 1
+    worker = asyncio.create_task(call.transcribe_inputs())
+    try:
+        await call.inputs.put((1, pcm()))
+        await asyncio.wait_for(deciding.wait(), 2)
+        call.agent_active = False
+        call.agent_active_receipt = None
+        call.last_work_completed_at = time.monotonic()
+        call.last_work_status = "ok"
+        finish_decision.set()
+        await eventually(lambda: not call.turns.empty())
+        queued_turn = call.turns.get_nowait()
+        assert queued_turn[1:3] == (next_work.text, next_work)
+        call.admit_work.assert_awaited_once_with(next_work.text)
+        call.cancel_work.assert_not_awaited()
+        assert not call.control_tasks
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+async def test_gateway_live_result_may_stay_silent_without_reading_main_text():
+    call, ws = gateway_session()
+    receipt = VoiceWorkReceipt("work", "message", "Run the report")
+    outcome = VoiceAgentOutcome(
+        status="ok", spoken_reply="Raw Main result", conversation_id="conversation"
+    )
+    call.admit_work = AsyncMock()
+    call.execute_work = AsyncMock(return_value=outcome)
+    call.render_result = AsyncMock(return_value="  ")
+    call.generation = 1
+    call.queue_turn((1, receipt.text, receipt))
+    worker = asyncio.create_task(call.run_turns())
+    try:
+        await eventually(lambda: {"type": "work", "status": "completed"} in ws.events)
+        await eventually(lambda: 1 not in call.turn_timings)
+        call.render_result.assert_awaited_once_with(receipt.text, outcome)
+        call.speak.assert_not_awaited()
+        assert not any(event["type"] in {"audio_clip", "caption", "turn"} for event in ws.events)
+        assert outcome.spoken_reply == "Raw Main result"
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize("delivery_state", ["cancelled", "suppressed", "closed"])
+async def test_gateway_skips_live_render_for_undeliverable_main_results(delivery_state):
+    call, ws = gateway_session()
+    receipt = VoiceWorkReceipt("work", "message", "Run the report")
+    entered, finish = asyncio.Event(), asyncio.Event()
+
+    async def execute(_receipt):
+        entered.set()
+        await finish.wait()
+        return VoiceAgentOutcome(
+            status="cancelled" if delivery_state == "cancelled" else "ok",
+            spoken_reply="Raw Main result",
+            conversation_id="conversation",
+        )
+
+    call.admit_work = AsyncMock()
+    call.execute_work = AsyncMock(side_effect=execute)
+    call.render_result = AsyncMock(return_value="Rendered result")
+    call.generation = 1
+    call.queue_turn((1, receipt.text, receipt))
+    worker = asyncio.create_task(call.run_turns())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        if delivery_state == "suppressed":
+            call.suppressed_work_ids.add(receipt.id)
+        elif delivery_state == "closed":
+            call.closed = True
+        finish.set()
+        await eventually(lambda: 1 not in call.turn_timings)
+        call.render_result.assert_not_awaited()
+        call.speak.assert_not_awaited()
+        assert not any(event["type"] == "audio_clip" for event in ws.events)
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.parametrize("action", [LiveVoiceTurnAction.CANCEL, LiveVoiceTurnAction.REPLACE, None])
+async def test_gateway_live_controls_pending_result_while_renderer_is_in_flight(action):
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("active", "message-active", "Run the report")
+    replacement = VoiceWorkReceipt("replacement", "message-replacement", "Check tomorrow's tour")
+    rendering, release_render = asyncio.Event(), asyncio.Event()
+
+    async def render(text, outcome):
+        if text == active.text:
+            rendering.set()
+            await release_render.wait()
+            return "The report is ready."
+        return ""
+
+    call.admit_work = AsyncMock(return_value=replacement)
+    call.execute_work = AsyncMock(
+        return_value=VoiceAgentOutcome(
+            status="ok", spoken_reply="Raw Main result", conversation_id="conversation"
+        )
+    )
+    call.render_result = AsyncMock(side_effect=render)
+    call.foreground_agent = AsyncMock(
+        return_value=LiveVoiceTextDecision(action=action, spoken_reply="It is Tuesday.")
+    )
+    call.route_work_action = AsyncMock(
+        return_value=VoiceWorkDecision(
+            VoiceWorkAction.REPLACE if action is LiveVoiceTurnAction.REPLACE else VoiceWorkAction.STATUS,
+            "The work already completed.",
+        )
+    )
+    call.cancel_work = AsyncMock(return_value=False)
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = replacement.text if action is LiveVoiceTurnAction.REPLACE else "Stop that" if action else "What day is it?"
+    call.generation = 1
+    call.queue_turn((1, active.text, active))
+    execution = asyncio.create_task(call.run_turns())
+    transcription = asyncio.create_task(call.transcribe_inputs())
+    try:
+        await asyncio.wait_for(rendering.wait(), 2)
+        assert call.agent_active_receipt is active
+        assert call.agent_execution_completed
+        call.input_id = 2
+        await call.inputs.put((2, pcm()))
+        await eventually(lambda: call.record_control_turn.await_count == 1)
+        call.foreground_agent.assert_awaited_once_with(call.transcribe.return_value, active)
+        call.cancel_work.assert_not_awaited()
+        if action is None:
+            await eventually(lambda: any(event["type"] == "audio_clip" for event in ws.events))
+            call.speak.assert_awaited_once_with("It is Tuesday.", "warm")
+            call.finish_clip("played")
+            assert active.id not in call.suppressed_work_ids
+        else:
+            assert active.id in call.suppressed_work_ids
+            assert not any(event["type"] == "audio_clip" for event in ws.events)
+        release_render.set()
+        if action is LiveVoiceTurnAction.REPLACE:
+            await eventually(lambda: call.execute_work.await_count == 2)
+            call.admit_work.assert_awaited_once_with(replacement.text)
+            assert call.execute_work.await_args_list[1].args == (replacement,)
+        elif action is None:
+            await eventually(lambda: call.speak.await_count == 2)
+            assert call.speak.await_args_list[1].args == ("The report is ready.", "warm")
+            await eventually(lambda: len([event for event in ws.events if event["type"] == "audio_clip"]) == 2)
+            call.finish_clip("played")
+        await eventually(lambda: not call.agent_active)
+        if action is not None:
+            call.speak.assert_not_awaited()
+        call.agent.assert_not_awaited()
+    finally:
+        tasks = [execution, transcription, *tuple(call.control_tasks)]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.parametrize("phase", ["speech_lock", "tts"])
+async def test_gateway_suppression_is_rechecked_after_presentation_waits(phase):
+    call, ws = gateway_session()
+    receipt = VoiceWorkReceipt("work", "message", "Run the report")
+    synthesizing, release_tts = asyncio.Event(), asyncio.Event()
+
+    async def speak(text, voice):
+        synthesizing.set()
+        await release_tts.wait()
+        return b"mp3"
+
+    call.admit_work = AsyncMock()
+    call.execute_work = AsyncMock(
+        return_value=VoiceAgentOutcome(
+            status="ok", spoken_reply="Raw Main result", conversation_id="conversation"
+        )
+    )
+    call.render_result = AsyncMock(return_value="The report is ready.")
+    call.speak = AsyncMock(side_effect=speak)
+    call.generation = 1
+    call.queue_turn((1, receipt.text, receipt))
+    if phase == "speech_lock":
+        await call.speech_lock.acquire()
+    worker = asyncio.create_task(call.run_turns())
+    try:
+        await eventually(lambda: {"type": "work", "status": "completed"} in ws.events)
+        if phase == "tts":
+            await asyncio.wait_for(synthesizing.wait(), 2)
+        call.suppressed_work_ids.add(receipt.id)
+        if phase == "speech_lock":
+            call.speech_lock.release()
+        release_tts.set()
+        await eventually(lambda: not call.agent_active)
+        assert not any(event["type"] in {"audio_clip", "turn", "caption"} for event in ws.events)
+        if phase == "speech_lock":
+            call.speak.assert_not_awaited()
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+async def test_gateway_cancel_completion_race_suppresses_presentation_without_rollback_claim():
+    call, ws = gateway_session()
+    receipt = VoiceWorkReceipt("work", "message", "Run the report")
+    executing, finish_execution = asyncio.Event(), asyncio.Event()
+    cancelling, finish_cancel = asyncio.Event(), asyncio.Event()
+    rendering, finish_render = asyncio.Event(), asyncio.Event()
+
+    async def execute(_receipt):
+        executing.set()
+        await finish_execution.wait()
+        return VoiceAgentOutcome(
+            status="ok", spoken_reply="Raw Main result", conversation_id="conversation"
+        )
+
+    async def cancel(_receipt, _replacement):
+        cancelling.set()
+        await finish_cancel.wait()
+        return False
+
+    async def render(_text, _outcome):
+        rendering.set()
+        await finish_render.wait()
+        return "The report is ready."
+
+    call.admit_work = AsyncMock()
+    call.execute_work = AsyncMock(side_effect=execute)
+    call.cancel_work = AsyncMock(side_effect=cancel)
+    call.render_result = AsyncMock(side_effect=render)
+    call.foreground_agent = AsyncMock(
+        return_value=LiveVoiceTextDecision(action=LiveVoiceTurnAction.CANCEL)
+    )
+    call.route_work_action = AsyncMock(
+        return_value=VoiceWorkDecision(VoiceWorkAction.CANCEL, "I will stop the task.")
+    )
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "Stop that"
+    call.generation = 1
+    call.queue_turn((1, receipt.text, receipt))
+    execution = asyncio.create_task(call.run_turns())
+    transcription = asyncio.create_task(call.transcribe_inputs())
+    try:
+        await asyncio.wait_for(executing.wait(), 2)
+        call.input_id = 2
+        await call.inputs.put((2, pcm()))
+        await asyncio.wait_for(cancelling.wait(), 2)
+        finish_execution.set()
+        await asyncio.wait_for(rendering.wait(), 2)
+        finish_cancel.set()
+        await eventually(lambda: receipt.id in call.suppressed_work_ids)
+        finish_render.set()
+        await eventually(lambda: not call.agent_active)
+        call.cancel_work.assert_awaited_once_with(receipt, None)
+        call.record_control_turn.assert_awaited_once_with("Stop that", "")
+        call.speak.assert_not_awaited()
+        assert {"type": "work", "status": "cancelled"} not in ws.events
+        assert not any(event["type"] == "audio_clip" for event in ws.events)
+    finally:
+        tasks = [execution, transcription, *tuple(call.control_tasks)]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def test_gateway_live_agent_wait_tool_stays_silent():
+    call, ws = gateway_session()
+    call.foreground_agent = AsyncMock(
+        return_value=LiveVoiceTextDecision(wait_for_user=True)
+    )
+    call.admit_work = AsyncMock()
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "嗯……"
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(
+        lambda: {"type": "listening", "generation": 1} in ws.events
+    )
+
+    call.foreground_agent.assert_awaited_once_with("嗯……", None)
+    call.admit_work.assert_not_awaited()
+    call.record_control_turn.assert_not_awaited()
+    call.speak.assert_not_awaited()
+    assert call.turns.empty()
+
+    worker.cancel()
+    await asyncio.gather(worker, return_exceptions=True)
+
+
+def test_text_gateway_uses_the_typed_live_agent_bridge_contract():
+    tools = live_voice_session_factory.chat_tools()
+    assert [tool["function"]["name"] for tool in tools] == [
+        "delegate_to_main_agent",
+        "update_active_work",
+        "wait_for_user",
+    ]
+    assert live_voice_session_factory.text_decision(
+        "在的。",
+        None,
+    ) == LiveVoiceTextDecision(spoken_reply="在的。")
+    assert live_voice_session_factory.text_decision(
+        "",
+        [
+            {
+                "name": "delegate_to_main_agent",
+                "arguments": {"utterance": "查利率"},
+            }
+        ],
+    ) == LiveVoiceTextDecision(action=LiveVoiceTurnAction.DELEGATE)
+
+
+@pytest.mark.parametrize("arguments_as_json", [False, True])
+@pytest.mark.parametrize(
+    "name,action",
+    [
+        ("delegate_to_main_agent", LiveVoiceTurnAction.DELEGATE),
+        ("update_active_work", LiveVoiceTurnAction.STATUS),
+        ("update_active_work", LiveVoiceTurnAction.QUEUE),
+        ("update_active_work", LiveVoiceTurnAction.CANCEL),
+        ("update_active_work", LiveVoiceTurnAction.REPLACE),
+        ("wait_for_user", None),
+    ],
+)
+def test_text_gateway_bridge_takes_priority_over_nonempty_content(name, action, arguments_as_json):
+    arguments = {"utterance": "Check the current rates"}
+    if name == "update_active_work":
+        arguments["action"] = action.value
+
+    decision = live_voice_session_factory.text_decision(
+        "I'll take care of that now.",
+        [{"name": name, "arguments": json.dumps(arguments) if arguments_as_json else arguments}],
+    )
+
+    assert decision.action is action
+    assert decision.spoken_reply == ""
+    assert decision.wait_for_user is (name == "wait_for_user")
+
+
+async def test_gateway_live_turn_inherits_chat_prompt_history_and_billing(monkeypatch):
+    from packages.core.ai import llm_client
+    from packages.core.ai import runtime as ai_runtime
+    from packages.core.ai.runtime import completions
+
+    resolve_context = AsyncMock(
+        return_value=(
+            "You are the California mortgage specialist.",
+            [{"role": "user", "content": "我们在聊加州房贷。"}],
+        )
+    )
+    complete = AsyncMock(return_value=("在的，继续说。", None, {}))
+    resolve_route = AsyncMock(
+        return_value=("provider/model", {"llm_api_key": "private"}, True)
+    )
+    billing_calls = []
+
+    @asynccontextmanager
+    async def billing_context(**kwargs):
+        billing_calls.append(kwargs)
+        yield
+
+    monkeypatch.setattr(chat_voice, "resolve_live_call_context", resolve_context)
+    monkeypatch.setattr(llm_client, "chat_completion_with_tools", complete)
+    monkeypatch.setattr(completions, "runtime_resolve_text_completion_route", resolve_route)
+    monkeypatch.setattr(ai_runtime, "runtime_llm_billing_context", billing_context)
+    scope = ChatAudioScope(
+        "entity",
+        "owner",
+        conversation_id="conversation",
+        agent_id="agent",
+    )
+
+    decision = await chat_voice.decide_gateway_live_turn(
+        object(),
+        chat_voice.CallStart(token="test"),
+        scope,
+        "喂",
+    )
+
+    assert decision == LiveVoiceTextDecision(spoken_reply="在的，继续说。")
+    system_prompt = complete.await_args.args[0][0]["content"]
+    assert "California mortgage specialist" in system_prompt
+    assert "我们在聊加州房贷" in system_prompt
+    assert complete.await_args.args[0][1] == {"role": "user", "content": "喂"}
+    assert complete.await_args.kwargs["max_tokens"] == 4096
+    assert billing_calls == [
+        {
+            "entity_id": "entity",
+            "user_id": "owner",
+            "workspace_id": None,
+            "conversation_id": "conversation",
+            "agent_id": "agent",
+            "source": "chat_voice",
+            "byok": True,
+        }
+    ]
+
+
+async def test_gateway_progress_question_stays_in_foreground_control_plane():
+    call, ws = gateway_session()
+    call.agent_active = True
+    call.admit_work = AsyncMock()
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "Any update?"
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(lambda: call.record_control_turn.await_count == 1)
+
+    call.admit_work.assert_not_awaited()
+    assert call.turns.empty()
+    assert "still working" in call.record_control_turn.await_args.args[1]
+    await eventually(
+        lambda: any(
+            event.get("type") == "turn" and "still working" in event.get("text", "")
+            for event in ws.events
+        )
+    )
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_progress_race_reports_the_task_that_just_finished():
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("old", "message-old", "Run the report")
+    call.agent_active = True
+    call.agent_active_receipt = active
+    call.admit_work = AsyncMock()
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "Any update?"
+
+    async def finish_during_route(_text, _receipt):
+        call.agent_active = False
+        call.agent_active_receipt = None
+        call.last_work_completed_at = time.monotonic()
+        call.last_work_status = "ok"
+        return VoiceWorkDecision(
+            VoiceWorkAction.STATUS,
+            "I'm still working on it.",
+        )
+
+    call.route_followup = AsyncMock(side_effect=finish_during_route)
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(lambda: call.record_control_turn.await_count == 1)
+
+    call.admit_work.assert_not_awaited()
+    assert call.turns.empty()
+    assert "just finished" in call.record_control_turn.await_args.args[1]
+
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_call_correction_stays_in_foreground_control_plane():
+    call, ws = gateway_session()
+    call.agent_active = True
+    call.admit_work = AsyncMock()
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = "为什么说韩语?"
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(lambda: call.record_control_turn.await_count == 1)
+
+    call.admit_work.assert_not_awaited()
+    assert call.turns.empty()
+    assert "语言识别错了" in call.record_control_turn.await_args.args[1]
+    await eventually(lambda: any(event["type"] == "audio_clip" for event in ws.events))
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_new_instruction_is_queued_with_one_foreground_reply():
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("active", "message-active", "Run the report")
+    receipt = VoiceWorkReceipt("queued", "message-queued", "Email it to Alice")
+    call.agent_active = True
+    call.agent_active_receipt = active
+    call.admit_work = AsyncMock(return_value=receipt)
+    call.route_followup = AsyncMock(
+        return_value=VoiceWorkDecision(
+            VoiceWorkAction.QUEUE,
+            "I'll finish “Run the report” first, then handle “Email it to Alice.”",
+        )
+    )
+    call.transcribe.return_value = receipt.text
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(lambda: any(event["type"] == "audio_clip" for event in ws.events))
+
+    assert call.turns.get_nowait() == (1, receipt.text, receipt)
+    assert {"type": "work", "status": "queued"} in ws.events
+    call.speak.assert_awaited_once_with(
+        "I'll finish “Run the report” first, then handle “Email it to Alice.”",
+        "warm",
+    )
+    assert receipt.id in call.acknowledged_work_ids
+
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_explicit_replacement_cancels_and_queues_new_receipt():
+    call, ws = gateway_session()
+    active = VoiceWorkReceipt("old", "message-old", "Run the report")
+    replacement = VoiceWorkReceipt(
+        "new",
+        "message-new",
+        "Stop that and instead email Alice",
+    )
+    call.agent_active = True
+    call.agent_active_receipt = active
+    call.route_followup = AsyncMock(
+        return_value=VoiceWorkDecision(
+            VoiceWorkAction.REPLACE,
+            "Okay, I'll switch to the new request.",
+        )
+    )
+    call.cancel_work = AsyncMock(return_value=True)
+    call.admit_work = AsyncMock(return_value=replacement)
+    call.record_control_turn = AsyncMock()
+    call.transcribe.return_value = replacement.text
+    call.input_id = 1
+    call.input_timings[1] = VoiceTurnTiming(turn_id=1)
+    worker = asyncio.create_task(call.transcribe_inputs())
+
+    await call.inputs.put((1, pcm()))
+    await eventually(lambda: call.cancel_work.await_count == 1)
+    await eventually(lambda: call.record_control_turn.await_count == 1)
+
+    call.cancel_work.assert_awaited_once_with(active, replacement)
+    assert active.id in call.suppressed_work_ids
+    assert call.record_control_turn.await_args.args[0] == ""
+    assert call.turns.get_nowait() == (1, replacement.text, replacement)
+    assert {"type": "work", "status": "queued"} in ws.events
+
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_skips_a_superseded_queued_replacement():
+    call, _ = gateway_session()
+    first = VoiceWorkReceipt("first", "message-first", "Email Alice")
+    second = VoiceWorkReceipt("second", "message-second", "Email Bob")
+    call.execute_work = AsyncMock(
+        return_value=VoiceAgentOutcome(
+            status="ok",
+            spoken_reply="Done.",
+            conversation_id="conversation",
+        )
+    )
+    call.suppressed_work_ids.add(first.id)
+    call.queue_turn((1, first.text, first))
+    call.queue_turn((2, second.text, second))
+    worker = asyncio.create_task(call.run_turns())
+
+    await eventually(lambda: call.execute_work.await_count == 1)
+
+    assert call.execute_work.await_args.args[0] == second
+    assert first.id not in call.suppressed_work_ids
+
+    worker.cancel()
+    for task in tuple(call.control_tasks):
+        task.cancel()
+    await asyncio.gather(worker, *tuple(call.control_tasks), return_exceptions=True)
+
+
+async def test_gateway_old_control_reply_is_not_relabelled_as_a_new_turn():
+    call, ws = gateway_session()
+    release_record = asyncio.Event()
+
+    async def record_control_turn(_user_text, _reply):
+        await release_record.wait()
+
+    call.record_control_turn = record_control_turn
+    task = asyncio.create_task(
+        call._send_control_reply(0, "Any update?", "progress", record=True)
+    )
+    await asyncio.sleep(0)
+    call.generation = 1
+    release_record.set()
+    await task
+
+    assert not any(
+        event["type"] in {"caption", "audio_clip", "turn"}
+        for event in ws.events
+    )
     call.speak.assert_not_awaited()
 
 
@@ -765,7 +1708,7 @@ async def test_native_openai_primary_byok_uses_browser_realtime(monkeypatch):
         respect_audio_role_overrides=True,
     )
     assert route and route.byok and route.provider == "openai"
-    assert route.model == "openai/gpt-realtime"
+    assert route.model == "openai/gpt-realtime-2.1"
 
 
 @pytest.mark.parametrize("provider", ["vercel", "openai"])
@@ -803,13 +1746,13 @@ async def test_platform_voice_uses_shared_gateway_precedence(monkeypatch, provid
         required=False,
         respect_audio_role_overrides=True,
     )
-    assert resolver.await_args.args[0] == "openai/gpt-realtime"
+    assert resolver.await_args.args[0] == "openai/gpt-realtime-2.1"
     assert resolver.await_args.kwargs["provider_chain"] == ("vercel", "openai")
     assert route is not None
     assert route.model == (
-        "openai/gpt-realtime-mini"
+        "openai/gpt-realtime-2.1"
         if provider == "vercel"
-        else "openai/gpt-realtime"
+        else "openai/gpt-realtime-2.1"
     )
 
 
@@ -860,7 +1803,7 @@ async def test_self_hosted_does_not_borrow_platform_realtime_credentials(monkeyp
     resolver.assert_not_awaited()
 
 
-async def test_vercel_protocol_keeps_transcription_manual_responses_and_usage():
+async def test_vercel_protocol_keeps_live_tools_and_manual_responses():
     socket = SimpleNamespace(send=AsyncMock(), recv=AsyncMock())
     adapter = realtime._VercelRealtimeConnection(
         RealtimeRoute(
@@ -872,13 +1815,19 @@ async def test_vercel_protocol_keeps_transcription_manual_responses_and_usage():
         )
     )
     adapter._socket = socket
-    config = browser_session_update("gpt-realtime")
+    config = browser_session_update("gpt-realtime", provider="vercel")
     await adapter.send(config)
     payload = json.loads(socket.send.await_args.args[0])
+    # The AI SDK field is numeric-only. Omitting Manor's native ``inf`` lets
+    # the selected Realtime model use its own output limit.
+    assert "maxOutputTokens" not in payload["config"]
     options = payload["config"]["providerOptions"]
     assert options["audio"]["input"]["turn_detection"]["create_response"] is False
-    assert options["audio"]["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe"
-    assert "tool_choice" not in options
+    assert options["audio"]["input"]["noise_reduction"] == {"type": "far_field"}
+    assert options["audio"]["input"]["transcription"] == {
+        "model": "gpt-4o-mini-transcribe",
+    }
+    assert options["tool_choice"] == "auto"
     socket.recv.return_value = json.dumps(
         {"type": "session-updated", "raw": {"type": "session.updated", "session": config["session"]}}
     )
@@ -890,7 +1839,7 @@ async def test_vercel_protocol_keeps_transcription_manual_responses_and_usage():
     assert updates[-1]["options"]["modalities"] == ["audio"]
     await adapter.send({"type": "response.create"})
     updates = [json.loads(c.args[0]) for c in socket.send.await_args_list]
-    assert updates[-2]["config"]["providerOptions"]["tool_choice"] == "none"
+    assert updates[-2]["config"]["providerOptions"]["tool_choice"] == "auto"
     raw = {"type": "response.done", "response": {"id": "r", "usage": {"input_tokens": 50}}}
     socket.recv.return_value = json.dumps({"type": "response-done", "raw": raw})
     assert await anext(adapter) == raw
@@ -1083,7 +2032,7 @@ async def test_openrouter_stt_uses_documented_json_endpoint_and_reports_cost(mon
         resolver.assert_not_awaited()
 
 
-async def test_gateway_preflight_explains_missing_role_without_asking_for_openai(monkeypatch):
+async def test_oss_gateway_preflight_explains_missing_role_with_byok_only(monkeypatch):
     from packages.core.services import model_resolver
 
     monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
@@ -1091,12 +2040,29 @@ async def test_gateway_preflight_explains_missing_role_without_asking_for_openai
     with pytest.raises(HTTPException) as error:
         await chat_voice.prepare_gateway_call(ChatAudioScope("entity", "owner"))
     assert error.value.status_code == 503
-    assert "Speech-to-text" in error.value.detail and "OpenRouter" in error.value.detail
-    assert "native OpenAI Realtime" not in error.value.detail
+    assert "Speech-to-text" in error.value.detail and "your own provider BYOK" in error.value.detail
+    assert "Vercel" not in error.value.detail and "OpenRouter" not in error.value.detail
 
 
+async def test_cloud_gateway_preflight_keeps_managed_route_guidance(monkeypatch):
+    from packages.core.services import model_resolver
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
+    monkeypatch.setattr(model_resolver, "resolve_llm_metadata_for_user", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        "packages.core.services.model_gateway.resolve_official_model_route",
+        AsyncMock(return_value=None),
+    )
+    with pytest.raises(HTTPException) as error:
+        await chat_voice.prepare_gateway_call(ChatAudioScope("entity", "owner"))
+    assert error.value.status_code == 503
+    assert "Vercel AI Gateway / OpenRouter" in error.value.detail
+
+
+@pytest.mark.parametrize("deployment_mode", ["oss", "cloud"])
 @pytest.mark.parametrize("provider", ["openai", "vercel"])
-async def test_browser_realtime_uses_shared_provider_transport(monkeypatch, provider):
+async def test_browser_realtime_uses_shared_provider_transport(monkeypatch, provider, deployment_mode):
+    monkeypatch.setenv("DEPLOYMENT_MODE", deployment_mode)
     route = RealtimeRoute(
         "private",
         "https://api.openai.com/v1" if provider == "openai" else "https://ai-gateway.vercel.sh/v1",
@@ -1112,7 +2078,33 @@ async def test_browser_realtime_uses_shared_provider_transport(monkeypatch, prov
     await chat_voice.run_voice_session(
         Socket(), object(), chat_voice.CallStart(token="test"), scope
     )
+    chat_voice.resolve_realtime_route.assert_awaited_once_with(
+        "entity",
+        user_id="owner",
+        required=False,
+        allow_managed=deployment_mode == "cloud",
+        respect_audio_role_overrides=False,
+    )
     assert constructor.call_args.kwargs["connection_factory"] is chat_voice.open_realtime_connection
+    assert callable(constructor.call_args.kwargs["admit_input_work"])
+    assert "transcription_language" not in constructor.call_args.kwargs
+
+
+async def test_gateway_fallback_keeps_language_detection_per_utterance(monkeypatch):
+    gateway = SimpleNamespace(run=AsyncMock())
+    constructor = Mock(return_value=gateway)
+    transcribe = AsyncMock(return_value=SimpleNamespace(text="hello", cost_usd=0.0))
+    monkeypatch.setattr(chat_voice, "resolve_realtime_route", AsyncMock(return_value=None))
+    monkeypatch.setattr(chat_voice, "GatewayVoiceSession", constructor)
+    monkeypatch.setattr(chat_voice, "transcribe_call_audio", transcribe)
+    scope = ChatAudioScope("entity", "owner", conversation_id="conversation")
+
+    await chat_voice.run_voice_session(
+        Socket(), object(), chat_voice.CallStart(token="test"), scope
+    )
+    await constructor.call_args.kwargs["transcribe"](b"audio")
+
+    transcribe.assert_awaited_once_with(scope, b"audio")
 
 
 @pytest.mark.parametrize("failure", [RuntimeError, TimeoutError, ConnectionError])
@@ -1126,7 +2118,17 @@ async def test_realtime_transport_failure_falls_back_only_before_ready(
     caplog.set_level("WARNING", logger="apps.api.chat_voice")
     realtime = SimpleNamespace(ready=ready, run=AsyncMock(side_effect=failure("Transport failed")))
     gateway = SimpleNamespace(run=AsyncMock())
-    monkeypatch.setattr(chat_voice, "resolve_realtime_route", AsyncMock(return_value=object()))
+    monkeypatch.setattr(
+        chat_voice,
+        "resolve_realtime_route",
+        AsyncMock(return_value=RealtimeRoute(
+            api_key="test-key",
+            base_url="https://api.openai.com/v1",
+            byok=True,
+            model="openai/gpt-realtime",
+            provider="openai",
+        )),
+    )
     monkeypatch.setattr(chat_voice, "BrowserVoiceSession", Mock(return_value=realtime))
     monkeypatch.setattr(chat_voice, "GatewayVoiceSession", Mock(return_value=gateway))
     scope = ChatAudioScope("entity", "owner", conversation_id="conversation")
@@ -1139,9 +2141,12 @@ async def test_realtime_transport_failure_falls_back_only_before_ready(
         await operation
         gateway.run.assert_awaited_once()
         messages = [record.getMessage() for record in caplog.records]
-        assert "Realtime setup failed; trying the shared speech gateway" in messages
+        assert any(
+            "Realtime setup exhausted; trying the shared speech gateway" in message
+            for message in messages
+        )
         assert all("Vercel realtime setup failed" not in message for message in messages)
-    realtime.run.assert_awaited_once()
+    assert realtime.run.await_count == (1 if ready else chat_voice.REALTIME_SETUP_ATTEMPTS)
 
 
 @pytest.mark.parametrize(

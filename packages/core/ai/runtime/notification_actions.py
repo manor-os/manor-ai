@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -224,62 +225,180 @@ async def runtime_find_team_members_action(
 ) -> str:
     """Find team members through the Runtime action boundary."""
 
-    from sqlalchemy import and_, or_, select
+    from sqlalchemy import and_, func, or_, select
 
     from packages.core.database import async_session
     from packages.core.models.user import User, UserMembership
 
     raw_params = dict(params or {})
-    query = (raw_params.get("query") or "").strip()
-    workspace_id = raw_params.get("workspace_id")
-    raw_limit = raw_params.get("limit")
     try:
-        limit = max(1, min(int(raw_limit) if raw_limit is not None else 20, 50))
-    except (TypeError, ValueError):
-        limit = 20
+        query = str(raw_params.get("query") or "").strip()
+        limit = max(1, min(int(raw_params.get("limit") or 20), 50))
+        offset = max(0, int(raw_params.get("offset") or 0))
+        workspace_ids = _runtime_member_filter_values(
+            raw_params.get("workspace_ids"),
+            single=raw_params.get("workspace_id"),
+            field_name="workspace_ids",
+        )
+        roles = _runtime_member_filter_values(
+            raw_params.get("roles"),
+            field_name="roles",
+            lowercase=True,
+        )
+        datetime_ranges = {
+            field_name: _runtime_member_datetime_range(
+                raw_params.get(f"{field_name}_after"),
+                raw_params.get(f"{field_name}_before"),
+                field_name,
+            )
+            for field_name in ("created", "updated", "last_login")
+        }
+    except (TypeError, ValueError) as exc:
+        return _runtime_notification_err(
+            str(exc),
+            code="invalid_team_member_filters",
+        )
 
     async with async_session() as db:
-        stmt = select(User).outerjoin(
-            UserMembership,
-            and_(
-                UserMembership.user_id == User.id,
-                UserMembership.entity_id == entity_id,
-                UserMembership.status == "active",
-            ),
-        ).where(
+        effective_role = func.lower(func.coalesce(UserMembership.role, User.role))
+        conditions = [
             User.status == "active",
+            User.deleted_at.is_(None),
             or_(
                 User.entity_id == entity_id,
                 UserMembership.id.is_not(None),
             ),
-        )
+        ]
         if query:
-            like = f"%{query.lower()}%"
-            stmt = stmt.where(
-                or_(
-                    User.display_name.ilike(like),
-                    User.first_name.ilike(like),
-                    User.last_name.ilike(like),
-                    User.email.ilike(like),
-                )
-            )
-        if workspace_id and isinstance(workspace_id, str):
+            like = f"%{query}%"
+            conditions.append(or_(
+                User.display_name.ilike(like),
+                User.first_name.ilike(like),
+                User.last_name.ilike(like),
+                User.email.ilike(like),
+            ))
+        if workspace_ids:
             from packages.core.models.workspace import WorkspaceStaff
 
-            stmt = stmt.join(
-                WorkspaceStaff,
-                WorkspaceStaff.user_id == User.id,
-            ).where(WorkspaceStaff.workspace_id == workspace_id)
-        stmt = stmt.order_by(User.display_name.asc()).limit(limit)
-        rows = (await db.execute(stmt)).scalars().all()
+            conditions.append(
+                select(WorkspaceStaff.id).where(
+                    WorkspaceStaff.user_id == User.id,
+                    WorkspaceStaff.workspace_id.in_(workspace_ids),
+                    WorkspaceStaff.status == "active",
+                ).exists()
+            )
+        if roles:
+            conditions.append(effective_role.in_(roles))
+        for column, field_name in (
+            (User.created_at, "created"),
+            (User.updated_at, "updated"),
+            (User.last_login_at, "last_login"),
+        ):
+            after, before = datetime_ranges[field_name]
+            if after is not None:
+                conditions.append(column >= after)
+            if before is not None:
+                conditions.append(column <= before)
+        membership_join = and_(
+            UserMembership.user_id == User.id,
+            UserMembership.entity_id == entity_id,
+            UserMembership.status == "active",
+            UserMembership.deleted_at.is_(None),
+        )
+        stmt = select(User, effective_role.label("effective_role")).outerjoin(
+            UserMembership,
+            membership_join,
+        ).where(*conditions).order_by(
+            User.display_name.asc().nulls_last(),
+            User.email.asc(),
+            User.id.asc(),
+        ).limit(limit).offset(offset)
+        count_stmt = select(func.count()).select_from(User).outerjoin(
+            UserMembership,
+            membership_join,
+        ).where(*conditions)
+        rows = (await db.execute(stmt)).all()
+        total = int((await db.execute(count_stmt)).scalar_one())
 
     items = [
         {
             "user_id": user.id,
             "display_name": user.display_name,
             "email": user.email,
-            "role": user.role,
+            "role": role,
+            "created_at": user.created_at.isoformat() if user.created_at else None,
+            "updated_at": user.updated_at.isoformat() if user.updated_at else None,
+            "last_login_at": (
+                user.last_login_at.isoformat() if user.last_login_at else None
+            ),
         }
-        for user in rows
+        for user, role in rows
     ]
-    return _runtime_notification_ok({"members": items, "count": len(items)})
+    return _runtime_notification_ok({
+        "members": items,
+        "total": total,
+        "count": len(items),
+        "limit": limit,
+        "offset": offset,
+        "has_more": offset + len(items) < total,
+        "next_offset": offset + len(items) if offset + len(items) < total else None,
+    })
+
+
+def _runtime_member_filter_values(
+    raw: Any,
+    *,
+    single: Any = None,
+    field_name: str,
+    lowercase: bool = False,
+) -> tuple[str, ...]:
+    if raw in (None, ""):
+        values: list[Any] = []
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        values = list(raw)
+    else:
+        raise ValueError(f"{field_name} must be an array")
+    if single not in (None, ""):
+        values.insert(0, single)
+    normalized: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if lowercase:
+            text = text.lower()
+        if text and text not in normalized:
+            normalized.append(text)
+        if len(normalized) >= 50:
+            break
+    return tuple(normalized)
+
+
+def _runtime_member_datetime_range(
+    after: Any,
+    before: Any,
+    field_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    def parse(value: Any) -> datetime | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            parsed = value
+        else:
+            try:
+                parsed = datetime.fromisoformat(
+                    str(value).strip().replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"{field_name} range endpoints must be ISO-8601 datetimes"
+                ) from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    after_dt = parse(after)
+    before_dt = parse(before)
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(
+            f"{field_name}_after must be less than or equal to {field_name}_before"
+        )
+    return after_dt, before_dt

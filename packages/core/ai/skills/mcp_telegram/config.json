@@ -12,5 +12,9 @@
     "mcp__telegram__send_document",
     "mcp__telegram__get_me",
     "mcp__telegram__answer_callback_query"
-  ]
+  ],
+  "search": {
+    "terms": ["bot", "chat message", "channel post", "group", "photo", "notification", "tg"],
+    "examples": ["send message to telegram channel", "post photo to telegram group", "send document through telegram bot", "verify my telegram bot works"]
+  }
 }

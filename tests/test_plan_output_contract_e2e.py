@@ -22,6 +22,7 @@ from packages.core.contracts.task_output import (
 from packages.core.dispatcher import Dispatcher, MISSING_RESULT
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
+from packages.core.models.runtime_run import RuntimeOutboxEvent
 from packages.core.models.task import Task
 from packages.core.models.worker import WorkLease, Worker
 from packages.core.plans.executor import (
@@ -30,9 +31,14 @@ from packages.core.plans.executor import (
 )
 from packages.core.plans.schema import Plan
 from packages.core.plans.service import create_plan_from_dag
+from packages.core.plans.wakeup import (
+    PLAN_CYCLE_OUTBOX_EVENT,
+    plan_cycle_outbox_dedupe_key,
+)
 from packages.core.workers.submit_result import (
     build_submit_result_tool,
     step_result_from_submit,
+    submit_result_contract_schema,
 )
 
 
@@ -111,6 +117,7 @@ async def _create_runtime(
                     "service_key": "contract_test",
                     "output_shape": "TextResult",
                     "params": {"prompt": "Produce the final deliverable."},
+                    "execution_contract": {"delivery": "inline", "effects": "read_only"},
                 }
             ]
         }
@@ -228,11 +235,6 @@ async def test_worker_v2_http_completion_reaches_reviewer_and_task_output(
         "Manor-Worker-Id": worker_payload["worker_id"],
         "Manor-Protocol-Version": "2",
     }
-    wakeups: list[str] = []
-    monkeypatch.setattr(
-        "packages.core.plans.wakeup.wake_plan_cycle",
-        wakeups.append,
-    )
     completed = await client.post(
         f"/api/v1/workers/leases/{lease_id}/complete",
         headers=worker_headers,
@@ -242,7 +244,6 @@ async def test_worker_v2_http_completion_reaches_reviewer_and_task_output(
         },
     )
     assert completed.status_code == 204, completed.text
-    assert wakeups == [plan_id]
 
     captured: list[dict[str, Any]] = []
     _install_completed_supervisor(monkeypatch, captured)
@@ -251,6 +252,17 @@ async def test_worker_v2_http_completion_reaches_reviewer_and_task_output(
         plan = await db.get(ExecutionPlan, plan_id)
         step = await db.get(ExecutionStep, step_id)
         assert task is not None and plan is not None and step is not None
+        wake = (await db.execute(
+            select(RuntimeOutboxEvent).where(
+                RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
+                RuntimeOutboxEvent.aggregate_id == plan_id,
+                RuntimeOutboxEvent.dedupe_key
+                == plan_cycle_outbox_dedupe_key(plan_id),
+                RuntimeOutboxEvent.delivered_at.is_(None),
+            )
+        )).scalar_one()
+        assert wake.payload["reason"] == "lease_completed"
+        assert wake.payload["wake_generation"]
         assert step.result == {
             "status": "succeeded",
             "summary": "structured task output submitted",
@@ -516,10 +528,16 @@ async def test_omitted_result_fails_but_explicit_json_null_can_satisfy_null_sche
     tool = build_submit_result_tool(step.expected_output_schema)
     parameters = tool["function"]["parameters"]
     assert parameters["required"] == ["summary"]
-    tool_validator = Draft202012Validator(parameters)
+    # The advertised tool never carries the success/failure branch: Anthropic
+    # rejects top-level combinators in input_schema. The submitted payload is
+    # judged against the contract schema, which does carry it.
+    assert not {"allOf", "anyOf", "oneOf"} & parameters.keys()
+    contract_validator = Draft202012Validator(
+        submit_result_contract_schema(step.expected_output_schema)
+    )
     with pytest.raises(ValidationError):
-        tool_validator.validate({"summary": "missing contracted value"})
-    tool_validator.validate({"summary": "explicit null", "result": None})
+        contract_validator.validate({"summary": "missing contracted value"})
+    contract_validator.validate({"summary": "explicit null", "result": None})
 
     omitted_lease = await _start_lease(db_session, plan, step, worker)
     await Dispatcher().complete_lease(
@@ -808,9 +826,11 @@ async def test_refinalize_requires_prior_supervisor_acceptance_for_formal_result
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("evidenced", [True, False])
 async def test_dynamic_provider_schema_is_additive_not_plan_drift(
     db_session,
     monkeypatch,
+    evidenced,
 ) -> None:
     entity_id = generate_ulid()
     task = Task(
@@ -852,6 +872,9 @@ async def test_dynamic_provider_schema_is_additive_not_plan_drift(
     step.expected_output_schema = provider_schema
     step.step_status = "done"
     step.result = {"resource_id": "resource-1"}
+    step.evidence_refs = [{"kind": "tool_effect", "effect": "action", "fields": {
+        "provider": "test_provider", "action_key": "create",
+    }}] if evidenced else []
     plan.status = "completed"
     await db_session.flush()
 
@@ -863,6 +886,12 @@ async def test_dynamic_provider_schema_is_additive_not_plan_drift(
         ExecutionPlanStatus.COMPLETED,
     )
 
+    if not evidenced:
+        assert decision.verdict is SupervisorVerdict.FAILED
+        assert "no captured receipt" in decision.evidence
+        assert captured == []
+        return
     assert decision.verdict is SupervisorVerdict.COMPLETED
     assert captured[0]["steps"][0]["output_contract"] == provider_schema
     assert captured[0]["steps"][0]["contract_check"] == "passed"
+    assert captured[0]["steps"][0]["evidence_refs"] == step.evidence_refs

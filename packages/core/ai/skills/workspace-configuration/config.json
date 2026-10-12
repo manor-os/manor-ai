@@ -1,0 +1,97 @@
+{
+  "name": "workspace-configuration",
+  "display_name": "Workspace Configuration",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Adjust Workspace services, Agent assignments, tool and Skill bindings, integrations, rules, budget and governance through configuration drafts.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "manor",
+    "query_entity_agents",
+    "query_agent_capabilities",
+    "search_tools"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [
+      "operation",
+      "add_rule"
+    ],
+    "patch_ops": [
+      "service_role.upsert",
+      "service_role.remove",
+      "agent_binding.upsert",
+      "agent_binding.remove",
+      "capability_binding.upsert",
+      "capability_binding.remove",
+      "skill_binding.upsert",
+      "integration_scope.update",
+      "integration.remove",
+      "integration.enable",
+      "rule.add",
+      "rule.update",
+      "rule.remove",
+      "budget_policy.update",
+      "governance_policy.update",
+      "knowledge_policy.update",
+      "channel.upsert",
+      "operating_model.update",
+      "evaluation.update",
+      "heartbeat_policy.update",
+      "strategist.update",
+      "operating_model.replace",
+      "rules.replace",
+      "agent_mappings.replace",
+      "process.upsert"
+    ],
+    "route_terms": [
+      "agent",
+      "service",
+      "rule",
+      "budget",
+      "integration",
+      "governance",
+      "智能体",
+      "服务",
+      "规则",
+      "预算",
+      "权限",
+      "集成",
+      "绑定技能",
+      "绑定工具",
+      "工作区配置",
+      "workspace configuration",
+      "integrations",
+      "agents",
+      "services",
+      "rules",
+      "workspaces",
+      "workspace settings",
+      "连接账号",
+      "连接账户",
+      "添加连接",
+      "停用连接",
+      "恢复连接",
+      "移除连接",
+      "工作空间配置"
+    ],
+    "manor_actions": [
+      "get_workspace",
+      "update_workspace",
+      "list_integrations",
+      "list_ready_integrations"
+    ]
+  },
+  "search": {
+    "terms": ["settings", "permissions", "agents", "budget", "spend limit", "governance", "bindings", "connect tools", "setup", "approval rules", "assign skills"],
+    "examples": ["assign skills to workspace agent", "set monthly budget for workspace", "change governance rules draft", "bind tool integration to agent"]
+  }
+}

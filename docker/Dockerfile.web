@@ -6,9 +6,11 @@ ARG BUILD_VERSION=dev
 ENV VITE_GOOGLE_CLIENT_ID=$VITE_GOOGLE_CLIENT_ID
 ENV VITE_GOOGLE_DRIVE_API_KEY=$VITE_GOOGLE_DRIVE_API_KEY
 ENV BUILD_VERSION=$BUILD_VERSION
+ENV NODE_OPTIONS=--max-old-space-size=4096
 
 WORKDIR /app
 COPY apps/web/package*.json ./
+COPY apps/web/vendor/ ./vendor/
 RUN npm config set registry https://registry.npmjs.org/ \
     && for attempt in 1 2 3; do \
          rm -rf node_modules; \

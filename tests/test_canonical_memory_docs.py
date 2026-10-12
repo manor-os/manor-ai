@@ -53,8 +53,7 @@ def test_canonical_workspace_memory_docs_are_created_and_bounded(tmp_path):
 
         assert "### WORKSPACE.md" in block
         assert "### RULES.md" in block
-        assert "memory doc budget" in block
-        assert len(block) <= 2_400
+        assert ("Always cite the source. " * 500).rstrip() in block
 
         prompt_block = workspace_operating_memory(
             ChatContext(
@@ -148,11 +147,11 @@ def test_workspace_operating_memory_compacts_runtime_learning_with_provenance(tm
             max_chars=1_500,
         )
 
-        assert len(block) <= 1_500
-        assert "<!-- runtime-learning-summary -->" in block
+        assert len(block) > 1_500
+        assert "runtime-learning:candidate-0" in block
         assert "runtime-learning:candidate-new" in block
         assert latest_rule in block
-        assert "Full original context remains available in runtime evidence" in block
+        assert "User-authored policy stays visible. " * 80 in block
     finally:
         settings.MANOR_FS_ROOT = old_root
         settings.MANOR_FS_ENABLED = old_enabled

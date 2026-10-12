@@ -519,6 +519,7 @@ async def test_invite_sends_email_and_notifies_inviter(
         "packages.core.services.email_service.send_staff_invite_email",
         fake_send_staff_invite_email,
     )
+    monkeypatch.setenv("APP_URL", "https://invite.test")
 
     headers, user_id, _ = await _owner_headers(client, "inv_notify")
     roles = (await client.get("/api/v1/staff/roles", headers=headers)).json()
@@ -533,7 +534,7 @@ async def test_invite_sends_email_and_notifies_inviter(
     assert resp.status_code == 201
     data = resp.json()
     assert data["email_sent"] is True
-    assert data["invite_url"].startswith("http://localhost:3010/login?")
+    assert data["invite_url"].startswith("https://invite.test/login?")
     assert f"invite_token={data['invite_token']}" in data["invite_url"]
     assert "email=mailme%40test.com" in data["invite_url"]
     assert sent == [

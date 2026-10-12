@@ -1,4 +1,5 @@
 import type { ToolCall } from "./chatStream";
+import { workflowPath } from "./workflowRoutes";
 
 export type ChatCreatedResourceKind = "workflow" | "automation";
 
@@ -78,7 +79,7 @@ function workflowReference(
     kind: "workflow",
     id,
     name,
-    href: `/flows?workflow=${encodeURIComponent(id)}`,
+    href: workflowPath(id),
     subtitle: description || undefined,
   };
 }

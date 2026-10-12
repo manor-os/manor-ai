@@ -10,6 +10,7 @@ from jsonschema import Draft202012Validator, ValidationError
 from sqlalchemy import select
 
 from packages.core.contracts.task_output import (
+    TaskOutputProtocolError,
     TaskOutputValueKind,
     is_plan_output_contract_schema,
     is_task_output_contract_schema,
@@ -39,6 +40,7 @@ from packages.core.plans.service import (
 from packages.core.workers.submit_result import (
     build_submit_result_tool,
     step_result_from_submit,
+    submit_result_contract_schema,
 )
 
 
@@ -158,21 +160,27 @@ def test_submit_result_tool_preserves_hard_fields_and_exact_record_count() -> No
     assert result_schema["required"] == ["leads"]
     assert result_schema["properties"]["leads"]["minItems"] == 10
     assert result_schema["properties"]["leads"]["maxItems"] == 10
-    tool_validator.validate({"summary": "done", "result": _valid_leads()})
-    tool_validator.validate({
-        "summary": "blocked",
-        "status": "failed",
-        "failure": {"reason": "docs.upload is blocked", "retryable": False},
-    })
+    # The advertised tool carries no top-level combinator (Anthropic rejects
+    # them in input_schema); the exclusive success/failure branch is applied
+    # to the submitted payload through the contract schema.
+    assert not {"allOf", "anyOf", "oneOf"} & params.keys()
+    contract_validator = Draft202012Validator(submit_result_contract_schema(schema))
+    for validator in (tool_validator, contract_validator):
+        validator.validate({"summary": "done", "result": _valid_leads()})
+        validator.validate({
+            "summary": "blocked",
+            "status": "failed",
+            "failure": {"reason": "docs.upload is blocked", "retryable": False},
+        })
     with pytest.raises(ValidationError):
-        tool_validator.validate({
+        contract_validator.validate({
             "summary": "contradictory success",
             "status": "succeeded",
             "result": _valid_leads(),
             "failure": {"reason": "also failed", "retryable": False},
         })
     with pytest.raises(ValidationError):
-        tool_validator.validate({
+        contract_validator.validate({
             "summary": "contradictory failure",
             "status": "failed",
             "result": _valid_leads(),
@@ -189,20 +197,21 @@ def test_submit_result_tool_preserves_hard_fields_and_exact_record_count() -> No
         "outputs": {"data": _valid_leads()},
     }
 
-    failed = step_result_from_submit(
-        {
-            "summary": "cannot create the required file",
-            "status": "failed",
-            "result": {"leads": []},
-            "failure": {
-                "reason": "docs.upload is blocked",
-                "blockers": ["docs.upload"],
-                "retryable": False,
-                "requires_human": True,
-            },
+    failed_submission = {
+        "summary": "cannot create the required file",
+        "status": "failed",
+        "result": {"leads": []},
+        "failure": {
+            "reason": "docs.upload is blocked",
+            "blockers": ["docs.upload"],
+            "retryable": False,
+            "requires_human": True,
         },
-        schema,
-    )
+    }
+    with pytest.raises(TaskOutputProtocolError, match="failed submit_result"):
+        step_result_from_submit(failed_submission, schema)
+    failed_submission.pop("result")
+    failed = step_result_from_submit(failed_submission, schema)
     assert failed["status"] == "failed"
     # A failed control result cannot smuggle a bogus partial deliverable into
     # the hard Task output validator; usable partial work must use status=partial.
@@ -569,7 +578,19 @@ def test_explicit_plan_output_shape_is_hard_but_legacy_schema_stays_advisory() -
     assert is_plan_output_contract_schema(step.expected_output_schema)
     assert output_schema_is_advisory("llm", step.expected_output_schema) is False
     tool = build_submit_result_tool(step.expected_output_schema)
-    assert tool["function"]["parameters"]["required"] == ["summary", "result"]
+    submit_validator = Draft202012Validator(tool["function"]["parameters"])
+    # Missing-deliverable rejection lives on the contract schema; the advertised
+    # tool stays combinator-free for Anthropic.
+    assert not {"allOf", "anyOf", "oneOf"} & tool["function"]["parameters"].keys()
+    contract_validator = Draft202012Validator(
+        submit_result_contract_schema(step.expected_output_schema)
+    )
+    assert not contract_validator.is_valid({"summary": "missing deliverable"})
+    assert submit_validator.is_valid({"summary": "done", "result": {"text": "response"}})
+    assert submit_validator.is_valid({
+        "summary": "blocked", "status": "failed",
+        "failure": {"reason": "permission denied", "retryable": False},
+    })
     assert tool["function"]["parameters"]["properties"]["result"]["required"] == ["text"]
 
     legacy_schema = {
@@ -610,7 +631,13 @@ def test_explicit_plan_output_shape_is_hard_but_legacy_schema_stays_advisory() -
     assert output_schema_is_advisory("subagent", custom_step.expected_output_schema) is False
     custom_tool = build_submit_result_tool(custom_step.expected_output_schema)
     leads_schema = custom_tool["function"]["parameters"]["properties"]["result"]["properties"]["leads"]
-    assert leads_schema["minItems"] == leads_schema["maxItems"] == 10
+    # The Planner's "exactly ten" is a target, not a contract an agent can
+    # keep: the hard contract keeps the fields and their requiredness but
+    # relaxes the record count to "at least one" so a run that found fewer
+    # leads submits them honestly instead of inventing the rest.
+    assert leads_schema["minItems"] == 1
+    assert "maxItems" not in leads_schema
+    assert leads_schema["items"]["required"] == ["name", "source_url"]
     exact_custom = step_result_from_submit(
         {"summary": "ten leads", "status": "succeeded", "result": _valid_leads()},
         custom_step.expected_output_schema,
@@ -618,6 +645,10 @@ def test_explicit_plan_output_shape_is_hard_but_legacy_schema_stays_advisory() -
     assert exact_custom == _valid_leads()
     assert "summary" not in exact_custom
     assert "status" not in exact_custom
+    custom_validator = Draft202012Validator(custom_tool["function"]["parameters"])
+    two_leads = {"leads": _valid_leads()["leads"][:2]}
+    assert custom_validator.is_valid({"summary": "two leads", "result": two_leads})
+    assert not custom_validator.is_valid({"summary": "nothing found", "result": {"leads": []}})
 
 
 def test_planning_rejects_ambiguous_terminal_structured_producers() -> None:
@@ -696,6 +727,7 @@ async def test_persisted_plan_and_terminal_step_share_the_task_contract(db_sessi
         {
             "steps": [{
                 "key": "deliver_shortlist",
+                "execution_contract": {"delivery": "inline", "effects": "read_only"},
                 "kind": "subagent",
                 "service_key": "apartment_partner_leads",
                 "output_shape": "TextResult",
@@ -743,6 +775,7 @@ async def test_format_only_task_contract_survives_materialization_and_supervisor
             "steps": [
                 {
                     "key": "deliver_url",
+                    "execution_contract": {"delivery": "inline", "effects": "read_only"},
                     "kind": "subagent",
                     "service_key": "research",
                     "params": {"prompt": "Return the source URL."},

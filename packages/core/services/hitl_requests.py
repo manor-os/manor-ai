@@ -59,7 +59,7 @@ def workspace_operation_pending_action_from_data(
     return {
         "kind": PendingActionKind.WORKSPACE_OPERATION_REVIEW.value,
         "draft_id": draft_id,
-        "approval_token": draft_id,
+        "approval_token": hitl.get("id") or hitl_data.get("approval_token") or draft_id,
         "prompt": hitl.get("prompt") or "Apply this workspace operation draft?",
         "action": hitl.get("action") or "workspace.operation.apply",
         "tool": hitl.get("tool") or "workspace_operation",
@@ -117,9 +117,13 @@ async def mark_hitl_request_resolved(
         return 0
     rows = list((await db.execute(
         select(Message)
-        .where(Message.conversation_id == conversation_id)
-        .order_by(Message.created_at.desc())
-        .limit(100)
+        .where(
+            Message.conversation_id == conversation_id,
+            Message.meta.contains({"hitl_requests": [{"id": str(hitl_id)}]}),
+        )
+        .order_by(Message.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
     )).scalars().all())
     updated = 0
     for msg in rows:

@@ -1,90 +1,169 @@
-import { useState } from "react";
+import { useMemo, useState, type ComponentType } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { relativeTime } from "../lib/format";
 import PageHeader from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
+import Select from "../components/ui/Select";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
 import Modal from "../components/ui/Modal";
 import Button from "../components/ui/Button";
 import {
+  IconAgent,
+  IconBell,
+  IconBolt,
+  IconBug,
+  IconCalendar,
+  IconChat,
+  IconChatBubble,
   IconChecklist,
   IconCheckCircle,
+  IconClipboard,
+  IconClock,
+  IconComment,
+  IconConnection,
+  IconDocument,
+  IconError,
+  IconFilter,
+  IconFlag,
+  IconFlow,
+  IconImage,
+  IconMail,
+  IconMegaphone,
+  IconPause,
+  IconPlay,
+  IconRefresh,
+  IconReopen,
+  IconReport,
+  IconSend,
+  IconServer,
+  IconSettings,
+  IconSparkles,
+  IconTimeline,
+  IconUserPlus,
+  IconUsers,
   IconWarning,
+  type IconProps,
 } from "../components/icons";
 
 import { t } from "../lib/i18n";
-type FilterMode = "all" | "unread";
+import { parseFileReference } from "../lib/fileReferences";
+type StatusFilter = "all" | "unread";
 
-const TYPE_STYLES: Record<string, { bg: string; color: string; icon: string }> = {
-  task: {
-    bg: "#e3ebe8",
-    color: "#436b65",
-    icon: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z",
-  },
-  system: {
-    bg: "#e3e9f1",
-    color: "#4869ac",
-    icon: "M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z M15 12a3 3 0 11-6 0 3 3 0 016 0z",
-  },
-  warning: {
-    bg: "#f3ecd6",
-    color: "#b27c34",
-    icon: "M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z",
-  },
-  document: {
-    bg: "#f3e8ff",
-    color: "#6f4ba8",
-    icon: "M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z",
-  },
-  agent: {
-    bg: "#dceae3",
-    color: "#437f6b",
-    icon: "M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z",
-  },
-  chat: {
-    bg: "#e8eff4",
-    color: "#4a7d96",
-    icon: "M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z",
-  },
-  team_invite_received: {
-    bg: "#e5eeeb",
-    color: "#436b65",
-    icon: "M18 9v3m0 0v3m0-3h3m-3 0h-3m-2.25-4.125A3.375 3.375 0 118.625 4.5a3.375 3.375 0 014.125 3.375zM3 19.5a7.5 7.5 0 0115 0v.75H3v-.75z",
-  },
-  team_invite_sent: {
-    bg: "#f1f6f5",
-    color: "#4f7e87",
-    icon: "M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0l-7.5-4.615a2.25 2.25 0 01-1.07-1.916V6.75",
-  },
-  error: {
-    bg: "#f1dddb",
-    color: "#c14a44",
-    icon: "M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z",
-  },
+const ALL_NOTIFICATION_TYPES = "all_types";
+
+
+const TYPE_ICONS: Record<string, ComponentType<IconProps>> = {
+  task: IconChecklist,
+  task_created: IconClipboard,
+  task_assigned: IconUserPlus,
+  task_status_changed: IconTimeline,
+  task_updated: IconRefresh,
+  task_succeeded: IconCheckCircle,
+  task_failed: IconBug,
+  task_hitl_requested: IconComment,
+  task_hitl_reminder: IconBell,
+  task_retried: IconReopen,
+  task_sla_breach: IconClock,
+  sla_escalation: IconFlag,
+  proposal: IconSparkles,
+  booking_confirmed: IconCalendar,
+  video: IconPlay,
+  image: IconImage,
+  document: IconDocument,
+  agent: IconAgent,
+  agent_message: IconChat,
+  agent_initiative_update: IconBolt,
+  chat: IconChatBubble,
+  channel_inbound_message: IconMail,
+  workflow: IconFlow,
+  automation_paused: IconPause,
+  workspace_setup_required: IconConnection,
+  system_health: IconServer,
+  daily_briefing: IconReport,
+  system: IconSettings,
+  warning: IconWarning,
+  team_invite_received: IconUsers,
+  team_invite_sent: IconSend,
+  error: IconError,
 };
 
-const DEFAULT_TYPE = {
-  bg: "#f5f5f4",
-  color: "#78716c",
-  icon: "M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9",
+const TYPE_LABELS: Record<string, string> = {
+  task: "Task",
+  task_created: "Task created",
+  task_assigned: "Task assigned",
+  task_status_changed: "Task status changed",
+  task_updated: "Task updated",
+  task_succeeded: "Task completed",
+  task_failed: "Task failed",
+  task_hitl_requested: "Input needed",
+  task_hitl_reminder: "Input reminder",
+  task_retried: "Task retried",
+  task_sla_breach: "Task SLA breach",
+  sla_escalation: "SLA escalation",
+  proposal: "Proposal",
+  booking_confirmed: "Booking confirmed",
+  video: "Video",
+  image: "Image",
+  document: "Document",
+  agent: "Agent",
+  agent_message: "Agent message",
+  agent_initiative_update: "Agent initiative",
+  chat: "Chat",
+  channel_inbound_message: "Channel message",
+  workflow: "Workflow",
+  automation_paused: "Automation paused",
+  workspace_setup_required: "Workspace setup",
+  system_health: "System health",
+  daily_briefing: "Daily briefing",
+  system: "System",
+  warning: "Warning",
+  team_invite_received: "Team invitation",
+  team_invite_sent: "Invitation sent",
+  error: "Error",
 };
+
+function notificationTypeCategory(type: string): "task" | "agent" | "chat" | null {
+  if (type.startsWith("task_")) return "task";
+  if (type.startsWith("agent_")) return "agent";
+  if (type.includes("message")) return "chat";
+  return null;
+}
+
+function notificationTypeLabel(type: string): string {
+  return TYPE_LABELS[type] || type
+    .split("_")
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function NotificationTypeIcon({ type, size = 20 }: { type: string; size?: number }) {
+  const category = notificationTypeCategory(type);
+  const TypeIcon = TYPE_ICONS[type] || (category ? TYPE_ICONS[category] : undefined) || IconBell;
+  return <TypeIcon size={size} style={{ color: "var(--text-muted)" }} />;
+}
 
 export default function Notifications() {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
-  const [filter, setFilter] = useState<FilterMode>("all");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const initialFilter = searchParams.get("filter");
+  let statusFilter: StatusFilter = initialFilter === "unread" ? "unread" : "all";
+  let typeFilter = searchParams.get("type") || ALL_NOTIFICATION_TYPES;
   const [detailOpen, setDetailOpen] = useState<any | null>(null);
 
-  const { data, isLoading } = useQuery({
-    queryKey: ["notifications", filter],
+  const showStandardNotifications = statusFilter === "all" || statusFilter === "unread";
+  const notificationQuery = useQuery({
+    queryKey: ["notifications", statusFilter === "unread" ? "unread" : "all"],
     queryFn: () =>
       api.notifications.list({
-        unread_only: filter === "unread" ? true : undefined,
+        unread_only: statusFilter === "unread" ? true : undefined,
       }),
   });
+
 
   const markReadMutation = useMutation({
     mutationFn: (id: string) => api.notifications.markRead(id),
@@ -92,8 +171,13 @@ export default function Notifications() {
   });
 
   const markAllReadMutation = useMutation({
-    mutationFn: () => api.notifications.markAllRead(),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+    mutationFn: async () => {
+      const requests: Promise<unknown>[] = [api.notifications.markAllRead()];
+      await Promise.all(requests);
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ["notifications"] });
+    },
   });
 
   const deleteMutation = useMutation({
@@ -129,12 +213,69 @@ export default function Notifications() {
     if (link) navigate(link);
   };
 
-  const unreadCount = data?.unread_count ?? 0;
 
-  const filterTabs = [
+  let unreadCount = notificationQuery.data?.unread_count ?? 0;
+
+  const rows = useMemo(() => {
+    const standardRows = showStandardNotifications
+      ? (notificationQuery.data?.items || [])
+          .filter((notification) => (
+            typeFilter === ALL_NOTIFICATION_TYPES || notification.type === typeFilter
+          ))
+          .map((notification) => ({
+            key: `notification:${notification.id}`,
+            source: "notification" as const,
+            notification,
+            actionLabel: undefined,
+          }))
+      : [];
+    return standardRows;
+  }, [
+    statusFilter,
+    notificationQuery.data?.items,
+    showStandardNotifications,
+    typeFilter,
+  ]);
+
+  const isLoading = notificationQuery.isLoading
+    ;
+  let showEmpty = !isLoading && rows.length === 0;
+
+  const statusTabs = [
     { key: "all", label: t("page.workspaces.filter_all") },
     { key: "unread", label: t("page.notifications.unread"), count: unreadCount || undefined },
   ];
+  const typeOptions = useMemo(() => {
+    const availableTypes = new Set<string>();
+    for (const notification of notificationQuery.data?.items || []) {
+      if (notification.type) availableTypes.add(notification.type);
+    }
+    if (typeFilter !== ALL_NOTIFICATION_TYPES) availableTypes.add(typeFilter);
+    return [
+      {
+        value: ALL_NOTIFICATION_TYPES,
+        label: t("page.knowledge.all_types"),
+        icon: <IconFilter size={16} style={{ color: "var(--text-muted)" }} />,
+      },
+      ...Array.from(availableTypes)
+        .sort((a, b) => notificationTypeLabel(a).localeCompare(notificationTypeLabel(b)))
+        .map((type) => ({
+          value: type,
+          label: notificationTypeLabel(type),
+          icon: <NotificationTypeIcon type={type} size={16} />,
+        })),
+    ];
+  }, [
+    notificationQuery.data?.items,
+    typeFilter,
+  ]);
+
+  const updateFilters = (nextStatus: StatusFilter, nextType: string) => {
+    const nextParams = new URLSearchParams();
+    if (nextStatus !== "all") nextParams.set("filter", nextStatus);
+    if (nextType !== ALL_NOTIFICATION_TYPES) nextParams.set("type", nextType);
+    setSearchParams(nextParams, { replace: true });
+  };
 
   return (
     <div style={{ height: "100%", overflowY: "auto", padding: 0 }}>
@@ -156,11 +297,29 @@ export default function Notifications() {
         }
       />
 
-      <div style={{ marginBottom: 20 }}>
+      <div style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        flexWrap: "wrap",
+        gap: 12,
+        marginBottom: 20,
+      }}>
         <TabSwitcher
-          tabs={filterTabs}
-          value={filter}
-          onChange={(v) => setFilter(v as FilterMode)}
+          tabs={statusTabs}
+          value={statusFilter}
+          onChange={(value) => updateFilters(value as StatusFilter, typeFilter)}
+        />
+        <Select
+          value={typeFilter}
+          onChange={(value) => updateFilters(statusFilter, value)}
+          options={typeOptions}
+          appearance="ghost"
+          filterable={typeOptions.length > 7}
+          showSelectedIcon
+          ariaLabel={t("page.knowledge.all_types")}
+          style={{ width: 220, maxWidth: "100%" }}
+          dropdownMinWidth={220}
         />
       </div>
 
@@ -171,28 +330,44 @@ export default function Notifications() {
         </div>
       )}
 
+
       {/* Empty */}
-      {!isLoading && (!data?.items || data.items.length === 0) && (
+      {showEmpty && (
         <EmptyState
           icon={
             <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#d6d3d1" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" />
             </svg>
           }
-          title={t("page.notifications.no_notifications_yet")}
-          description={t("page.notifications.you_will_see_updates_here_when_something_happens")}
+          title={
+            t("page.notifications.no_notifications_yet")
+          }
+          description={
+            t("page.notifications.you_will_see_updates_here_when_something_happens")
+          }
         />
       )}
 
       {/* List */}
-      {!isLoading && data?.items && data.items.length > 0 && (
+      {!isLoading && rows.length > 0 && (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {data.items.map((n: any) => (
+          {rows.map((row) => (
             <StandardRow
-              key={n.id}
-              notification={n}
-              onClick={() => handleClick(n)}
-              onDelete={() => deleteMutation.mutate(n.id)}
+              key={row.key}
+              notification={row.notification}
+              onClick={() => {
+                if (row.source === "notification") {
+                  void handleClick(row.notification);
+                  return;
+                }
+              }}
+              onDelete={() => {
+                if (row.source === "notification") {
+                  deleteMutation.mutate(row.notification.id);
+                  return;
+                }
+              }}
+              actionLabel={row.actionLabel}
             />
           ))}
         </div>
@@ -214,36 +389,49 @@ export default function Notifications() {
    ══════════════════════════════════════════════════════════════════════════ */
 
 function StandardRow({
-  notification: n, onClick, onDelete,
-}: { notification: any; onClick: () => void; onDelete: () => void }) {
-  const style = TYPE_STYLES[n.type] || DEFAULT_TYPE;
+  notification: n, onClick, onDelete, actionLabel,
+}: {
+  notification: any;
+  onClick: () => void;
+  onDelete: () => void;
+  actionLabel?: string;
+}) {
   return (
     <div
       onClick={onClick}
+      onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onClick();
+        }
+      }}
+      role="button"
+      tabIndex={0}
       className="glass-card-sm"
       style={{
         cursor: "pointer",
-        borderLeft: !n.read_at ? "3px solid #4f7d75" : undefined,
+        boxSizing: "border-box",
+        height: 76,
+        overflow: "hidden",
       }}
     >
-      <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, height: "100%" }}>
         <div
           style={{
             width: 40, height: 40, borderRadius: 10,
-            background: style.bg,
+            background: "var(--surface-sunken)",
             display: "flex", alignItems: "center", justifyContent: "center",
             flexShrink: 0,
           }}
         >
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={style.color} strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d={style.icon} />
-          </svg>
+          <NotificationTypeIcon type={n.type} />
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <p style={{
               fontSize: 14, fontWeight: !n.read_at ? 700 : 600,
-              color: !n.read_at ? "#292524" : "#78716c",
+              color: !n.read_at ? "var(--text-default)" : "var(--text-muted)",
               margin: 0, overflow: "hidden",
               textOverflow: "ellipsis", whiteSpace: "nowrap",
             }}>
@@ -252,46 +440,52 @@ function StandardRow({
             {!n.read_at && (
               <span style={{
                 width: 6, height: 6, borderRadius: "50%",
-                background: "#4f7d75", flexShrink: 0,
-                boxShadow: "0 0 0 3px rgba(79, 125, 117, 0.15)",
-                animation: "pulse 2s cubic-bezier(0.4,0,0.6,1) infinite",
+                background: "var(--text-muted)", flexShrink: 0,
               }} />
             )}
           </div>
           {n.content && (
             <p style={{
-              fontSize: 13, color: "#a8a29e", margin: "4px 0 0 0",
-              display: "-webkit-box", WebkitLineClamp: 2,
-              WebkitBoxOrient: "vertical", overflow: "hidden",
+              fontSize: 13, color: "var(--text-faint)", margin: "4px 0 0 0",
+              overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
             }}>
               {n.content}
             </p>
           )}
         </div>
-        <RowMeta n={n} onDelete={onDelete} />
+        <RowMeta n={n} onDelete={onDelete} actionLabel={actionLabel} />
       </div>
     </div>
   );
 }
 
-function RowMeta({ n, onDelete }: { n: any; onDelete: () => void }) {
+function RowMeta({
+  n,
+  onDelete,
+  actionLabel,
+}: {
+  n: any;
+  onDelete: () => void;
+  actionLabel?: string;
+}) {
   return (
     <div style={{
       display: "flex", flexDirection: "column",
       alignItems: "flex-end", gap: 4, flexShrink: 0,
     }}>
-      <span style={{ fontSize: 12, color: "#a8a29e" }}>
+      <span style={{ fontSize: 12, color: "var(--text-faint)" }}>
         {n.created_at ? relativeTime(n.created_at) : ""}
       </span>
       <button
         onClick={(e) => { e.stopPropagation(); onDelete(); }}
         style={{
           background: "none", border: "none", cursor: "pointer",
-          color: "#d6d3d1", padding: 2, transition: "color 0.2s", lineHeight: 0,
+          color: "var(--border-strong)", padding: 2, transition: "color 0.2s", lineHeight: 0,
         }}
-        onMouseEnter={(e) => { e.currentTarget.style.color = "#d65f59"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.color = "#d6d3d1"; }}
-        title={t("action.delete")}
+        onMouseEnter={(e) => { e.currentTarget.style.color = "var(--text-default)"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.color = "var(--border-strong)"; }}
+        title={actionLabel || t("action.delete")}
+        aria-label={actionLabel || t("action.delete")}
       >
         <svg width="14" height="14" fill="none" viewBox="0 0 24 24"
              stroke="currentColor" strokeWidth={2}>
@@ -817,13 +1011,6 @@ async function resolveVideoNotificationViewerLink(notification: any): Promise<st
 }
 
 function fsPathFromResultUrl(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const parsed = new URL(value, window.location.origin);
-    const path = parsed.pathname;
-    const match = path.match(/^\/api\/v1\/fs\/[^/]+\/(.+)$/);
-    return match ? decodeURIComponent(match[1]) : null;
-  } catch {
-    return null;
-  }
+  const parsed = parseFileReference(value);
+  return parsed?.kind === "fs" && parsed.entity ? parsed.fs_path : null;
 }

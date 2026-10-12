@@ -11,7 +11,9 @@ interface Props {
 
 export default function CreditLimitNotice({ detail, compact = false }: Props) {
   const navigate = useNavigate();
-  const creditsUnlimited = useConfigStore((s) => s.ai_credits_unlimited);
+  // Only the server's loaded config can say credits are unlimited; the
+  // local default must not turn a real credit stop into "unlimited".
+  const creditsUnlimited = useConfigStore((s) => s.loaded && s.ai_credits_unlimited);
   const message =
     detail?.message ||
     t("component.upgrade_prompt.default_message");

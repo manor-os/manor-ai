@@ -23,6 +23,7 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from packages.core.ai.runtime import capability_for_id, runtime_capability_id_for_action_key
+from packages.core.contracts.step_execution import StepExecutionContract
 
 StepKind = Literal[
     "llm", "action", "sleep", "human",
@@ -79,6 +80,12 @@ class PlanStep(BaseModel):
     declare either this or an exact expected_output_schema, except the unique
     terminal step governed by Task.expected_output. Legacy materialized schemas
     without provenance remain readable through the advisory path."""
+
+    execution_contract: Optional[StepExecutionContract] = None
+    """Step-local delivery and effect limits, separate from its payload schema.
+    New agent Steps declare both axes. Missing historical declarations retain
+    their existing authorization behavior. This can restrict, never grant,
+    Agent permissions; artifact delivery may reference an existing file."""
 
     depends_on: list[str] = Field(default_factory=list)
     """List of prior step keys that must reach ``done`` before this
@@ -183,6 +190,23 @@ class PlanStep(BaseModel):
         return self
 
 
+class PlanAcceptanceCriterion(BaseModel):
+    """One task-specific success condition and the steps that prove it."""
+
+    key: str = Field(..., min_length=1, max_length=128)
+    deliverable_name: str = Field(..., min_length=1, max_length=255)
+    description: str = Field(..., min_length=1, max_length=1000)
+    evidence_step_keys: list[str] = Field(..., min_length=1)
+
+
+class PlanAcceptanceContract(BaseModel):
+    """Task acceptance criteria snapshotted onto an executable Plan."""
+
+    expected_result: str = Field(..., min_length=1, max_length=2000)
+    criteria: list[PlanAcceptanceCriterion] = Field(..., min_length=1)
+    task_expected_output: Optional[dict[str, Any]] = None
+
+
 class PlanMetadata(BaseModel):
     """Free-form fields the Planner attaches for audit / display."""
 
@@ -190,6 +214,7 @@ class PlanMetadata(BaseModel):
     estimated_cost_usd: Optional[float] = None
     estimated_duration_seconds: Optional[int] = None
     rationale: Optional[str] = None
+    acceptance_contract: Optional[PlanAcceptanceContract] = None
     # Why the Planner chose this shape — shown in the plan detail UI
     # so the user understands the agent's reasoning at approve time.
 
@@ -215,6 +240,20 @@ class Plan(BaseModel):
                     raise ValueError(
                         f"step {s.key} depends_on unknown step {dep!r}"
                     )
+
+        acceptance_contract = self.metadata.acceptance_contract
+        if acceptance_contract is not None:
+            unknown_evidence = sorted({
+                evidence_key
+                for criterion in acceptance_contract.criteria
+                for evidence_key in criterion.evidence_step_keys
+                if evidence_key not in keys
+            })
+            if unknown_evidence:
+                raise ValueError(
+                    "acceptance contract references unknown evidence steps: "
+                    + ", ".join(unknown_evidence)
+                )
 
         # Cycle check via DFS — small N, no need for fancier algo.
         graph = {s.key: list(s.depends_on) for s in self.steps}

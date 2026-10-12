@@ -4,6 +4,7 @@
  * The opaque token is the entitlement. Public previews are deliberately
  * read-only and obtain all bytes through token-scoped routes.
  */
+import { fetchServerSlideList } from "../lib/pptxServerPreview";
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { ClassificationBadge } from "../components/permissions";
@@ -80,11 +81,14 @@ export default function SharedDocument() {
   const contentUrl = token ? `/api/v1/shared-doc/${encodeURIComponent(token)}/content` : "";
   const source = useMemo(() => {
     const baseUrl = token ? `/api/v1/shared-doc/${encodeURIComponent(token)}` : "";
-    const getOfficePreview = async (kind: "pages" | "slides") => {
-      const response = await fetch(`${baseUrl}/preview/${kind}`);
-      if (!response.ok) throw new Error("Office preview is unavailable");
-      return response.json();
-    };
+    // A busy render queue answers 503 + Retry-After (and 409 when the file
+    // changed mid-render); keep retrying within the preview budget instead of
+    // dropping straight to the fallback.
+    const getOfficePreview = (kind: "pages" | "slides") => fetchServerSlideList(token || "", {
+      url: `${baseUrl}/preview/${kind}`,
+      headers: {},
+      signal: new AbortController().signal,
+    }) as Promise<any>;
     return {
       contentUrl,
       getPages: () => getOfficePreview("pages"),

@@ -1,11 +1,12 @@
 import { useState, useEffect, type ComponentType } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   api,
 } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
+import { useDisplayPreferences } from "../stores/displayPreferences";
 import Modal from "../components/ui/Modal";
 import Button from "../components/ui/Button";
 import EmptyState from "../components/ui/EmptyState";
@@ -755,8 +756,8 @@ const PERSONAL_SETTINGS: SettingsNavItem[] = [
   },
   {
     key: "files",
-    label: "File permissions",
-    description: "Control how agents can read, create, and update files.",
+    label: t("approval_settings.title"),
+    description: t("approval_settings.description"),
     icon: IconDocument,
   },
   {
@@ -788,6 +789,8 @@ const DEVELOPER_SETTINGS: SettingsNavItem = {
 const SHOW_DEVELOPER_TAB = false;
 
 export default function Settings() {
+  const location = useLocation();
+  const simpleMode = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const user = useAuthStore((s) => s.user);
   const isAdmin = user?.role === "admin" || user?.role === "owner";
   const navigate = useNavigate();
@@ -832,8 +835,13 @@ export default function Settings() {
 
   const handleTabChange = (nextTab: SettingsTabKey) => {
     setTab(nextTab);
-    navigate(`/settings?tab=${encodeURIComponent(nextTab)}`, { replace: true });
+    navigate(`/settings?tab=${encodeURIComponent(nextTab)}`, { replace: true, state: location.state });
   };
+  const returnTo = location.state?.returnTo;
+  const backToApp = typeof returnTo === "string" && returnTo.startsWith("/")
+    && !returnTo.startsWith("//") && !returnTo.startsWith("/settings")
+    ? returnTo
+    : simpleMode ? "/chat" : "/dashboard";
 
   const content = (() => {
     if (tab === "appearance") return <AppearanceSection embedded />;
@@ -870,7 +878,7 @@ export default function Settings() {
           <button
             type="button"
             className="settings-back-to-app"
-            onClick={() => navigate("/dashboard")}
+            onClick={() => navigate(backToApp)}
           >
             <IconArrowLeft size={16} aria-hidden />
             Back to app

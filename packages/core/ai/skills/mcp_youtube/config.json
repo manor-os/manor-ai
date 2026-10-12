@@ -2,7 +2,7 @@
   "id": "mcp_youtube",
   "name": "mcp_youtube",
   "type": "runtime_guidance",
-  "description": "Operate a connected YouTube account: search videos and channels, read video details, comments, and caption-track metadata, upload videos from public HTTPS URLs, manage owned video metadata and comments, rate videos, and manage playlists. Studio-only release settings remain on the Chrome route.",
+  "description": "Operate a connected YouTube account: search videos and channels, paginate the complete owned-video inventory, read video details, comments, and caption-track metadata, upload public HTTPS videos or authorized current-conversation attachments, manage metadata and comments, rate videos, and manage playlists. Studio-only release settings remain on the Chrome route.",
   "category": "social-media",
   "output_format": "guidance",
   "tags": ["youtube", "video", "social-media", "runtime-guidance", "builtin", "mcp"],
@@ -21,5 +21,9 @@
     "mcp__youtube__update_video",
     "mcp__youtube__create_playlist",
     "mcp__youtube__add_to_playlist"
-  ]
+  ],
+  "search": {
+    "terms": ["video upload", "channel", "playlist", "subtitles", "captions", "comments", "studio", "thumbnail", "shorts"],
+    "examples": ["upload video to youtube from url", "list all videos on my channel", "update youtube video title description", "add video to playlist"]
+  }
 }

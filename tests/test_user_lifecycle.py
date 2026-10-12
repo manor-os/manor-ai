@@ -604,3 +604,253 @@ async def test_purge_last_user_deletes_unowned_entity_voice_sessions(db_session)
 
     assert await db_session.get(TwilioVoiceCallSession, legacy_session.id) is None
     assert await db_session.get(Entity, entity.id) is None
+
+
+@pytest.mark.asyncio
+async def test_purge_last_user_removes_all_entity_knowledge(db_session):
+    """Terminal entity deletion owns every Knowledge projection, not just a Workspace."""
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import (
+        Document,
+        DocumentChunk,
+        DocumentFolder,
+        DocumentGroup,
+        DocumentGroupMember,
+    )
+    from packages.core.models.document_version import DocumentVersion
+    from packages.core.models.artifact_purge import WorkspaceArtifactPurgeJob
+    from packages.core.models.permission import (
+        ResourceGrant,
+        ResourceGrantPending,
+        ResourceType,
+        Share,
+    )
+    from packages.core.models.user import Entity, User
+    from packages.core.services.auth_service import hash_password
+    from packages.core.services.user_lifecycle import purge_user
+
+    deleted_at = datetime.now(timezone.utc)
+    entity = Entity(
+        id=generate_ulid(),
+        name="Knowledge entity purge",
+        deleted_at=deleted_at,
+    )
+    user = User(
+        entity_id=entity.id,
+        email="knowledge-entity-purge@test.com",
+        password_hash=hash_password("pass123"),
+        role="owner",
+        status="active",
+        deleted_at=deleted_at,
+    )
+    root_folder = DocumentFolder(
+        entity_id=entity.id,
+        name="Root knowledge",
+        owner_id=user.id,
+    )
+    workspace_folder = DocumentFolder(
+        entity_id=entity.id,
+        name="Retained workspace folder",
+        owner_id=user.id,
+    )
+    root_document = Document(
+        entity_id=entity.id,
+        name="Root document",
+        owner_id=user.id,
+        folder_id=root_folder.id,
+        fs_path="knowledge/root.txt",
+    )
+    trashed_document = Document(
+        entity_id=entity.id,
+        name="Trashed document",
+        owner_id=user.id,
+        is_trashed=True,
+        trashed_at=deleted_at,
+        fs_path="knowledge/trashed.txt",
+    )
+    workspace_document = Document(
+        entity_id=entity.id,
+        name="Workspace document",
+        owner_id=user.id,
+        folder_id=workspace_folder.id,
+        fs_path="artifacts/workspace-document.txt",
+    )
+    group = DocumentGroup(entity_id=entity.id, name="Knowledge group")
+    db_session.add_all([
+        entity,
+        user,
+        root_folder,
+        workspace_folder,
+        root_document,
+        trashed_document,
+        workspace_document,
+        group,
+    ])
+    await db_session.flush()
+    db_session.add_all([
+        DocumentChunk(document_id=root_document.id, chunk_index=0, content="root"),
+        DocumentVersion(
+            document_id=trashed_document.id,
+            version_number=1,
+            name="Trashed document",
+            fs_path=".versions/documents/trashed",
+        ),
+        DocumentGroupMember(document_id=workspace_document.id, group_id=group.id),
+        ResourceGrant(
+            entity_id=entity.id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=root_document.id,
+            subject_type="user",
+            subject_id=user.id,
+            capabilities=["view"],
+            granted_at=deleted_at,
+        ),
+        ResourceGrantPending(
+            entity_id=entity.id,
+            resource_type=ResourceType.DOCUMENT_FOLDER,
+            resource_id=root_folder.id,
+            requester_user_id=user.id,
+            requested_capabilities=["view"],
+        ),
+        Share(
+            entity_id=entity.id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=trashed_document.id,
+            token_hash=f"knowledge-purge-{generate_ulid()}",
+            created_by=user.id,
+            created_at=deleted_at,
+        ),
+    ])
+    await db_session.commit()
+
+    assert await purge_user(db_session, user.id) is True
+    await db_session.commit()
+
+    document_ids = {
+        root_document.id,
+        trashed_document.id,
+        workspace_document.id,
+    }
+    assert (await db_session.execute(select(Document).where(
+        Document.entity_id == entity.id,
+    ))).scalars().all() == []
+    assert (await db_session.execute(select(DocumentFolder).where(
+        DocumentFolder.entity_id == entity.id,
+    ))).scalars().all() == []
+    assert (await db_session.execute(select(DocumentGroup).where(
+        DocumentGroup.entity_id == entity.id,
+    ))).scalars().all() == []
+    assert (await db_session.execute(select(DocumentChunk).where(
+        DocumentChunk.document_id.in_(document_ids),
+    ))).scalars().all() == []
+    assert (await db_session.execute(select(DocumentVersion).where(
+        DocumentVersion.document_id.in_(document_ids),
+    ))).scalars().all() == []
+    assert (await db_session.execute(select(DocumentGroupMember).where(
+        DocumentGroupMember.document_id.in_(document_ids),
+    ))).scalars().all() == []
+    for model in (ResourceGrant, ResourceGrantPending, Share):
+        assert (await db_session.execute(select(model).where(
+            model.entity_id == entity.id,
+        ))).scalars().all() == []
+    assert await db_session.get(Entity, entity.id) is None
+    cleanup_paths = set((await db_session.execute(
+        select(WorkspaceArtifactPurgeJob.storage_base).where(
+            WorkspaceArtifactPurgeJob.entity_id == entity.id,
+            WorkspaceArtifactPurgeJob.target_kind == "file",
+        )
+    )).scalars())
+    assert {
+        "knowledge/root.txt", "knowledge/trashed.txt",
+        "artifacts/workspace-document.txt", ".versions/documents/trashed",
+    } <= cleanup_paths
+
+
+@pytest.mark.asyncio
+async def test_purge_user_rechecks_entity_after_concurrent_restore(
+    db_session,
+    monkeypatch,
+):
+    import asyncio
+
+    import packages.core.database as database
+    import packages.core.services.apify_collections as apify_collections
+    import packages.core.services.user_lifecycle as user_lifecycle
+    from packages.core.models.artifact_purge import WorkspaceArtifactPurgeJob
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.user import Entity, User
+    from packages.core.services.auth_service import hash_password
+
+    deleted_at = datetime.now(timezone.utc)
+    entity = Entity(
+        id=generate_ulid(),
+        name="Concurrent Entity restore",
+        deleted_at=deleted_at,
+    )
+    user = User(
+        entity_id=entity.id,
+        email="concurrent-entity-restore@test.com",
+        password_hash=hash_password("pass123"),
+        role="owner",
+        status="active",
+        deleted_at=deleted_at,
+    )
+    document = Document(
+        entity_id=entity.id,
+        name="Retained after restore",
+        fs_path="knowledge/retained.txt",
+    )
+    db_session.add_all([entity, user, document])
+    await db_session.commit()
+    entity_id = entity.id
+    user_id = user.id
+    document_id = document.id
+
+    guard_entered = asyncio.Event()
+    continue_guard = asyncio.Event()
+    original_guard = apify_collections.guard_collection_purge
+
+    async def pause_before_entity_guard(
+        db,
+        *,
+        entity_id,
+        workspace_id=None,
+        user_id=None,
+    ):
+        guard_entered.set()
+        await continue_guard.wait()
+        return await original_guard(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            user_id=user_id,
+        )
+
+    monkeypatch.setattr(
+        apify_collections,
+        "guard_collection_purge",
+        pause_before_entity_guard,
+    )
+    purge_task = asyncio.create_task(user_lifecycle.purge_user(db_session, user_id))
+    await asyncio.wait_for(guard_entered.wait(), timeout=5)
+
+    async with database.async_session() as restoring_db:
+        restored_entity = await restoring_db.get(Entity, entity_id)
+        assert restored_entity is not None
+        restored_entity.deleted_at = None
+        await restoring_db.commit()
+
+    continue_guard.set()
+    assert await asyncio.wait_for(purge_task, timeout=5) is True
+    await db_session.commit()
+
+    db_session.expire_all()
+    restored_entity = await db_session.get(Entity, entity_id)
+    retained_document = await db_session.get(Document, document_id)
+    assert restored_entity is not None
+    assert restored_entity.deleted_at is None
+    assert retained_document is not None
+    assert (await db_session.execute(select(WorkspaceArtifactPurgeJob).where(
+        WorkspaceArtifactPurgeJob.entity_id == entity_id,
+    ))).scalars().all() == []

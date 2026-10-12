@@ -6,6 +6,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from packages.core.ai.agentic_loop import agentic_loop
 from packages.core.ai.runtime.harness import (
     runtime_execute_agentic_loop,
@@ -134,6 +136,43 @@ def test_runtime_omits_policy_for_legacy_agentic_loop_signature() -> None:
     assert "required_tool_completion_policy" not in captured
 
 
+@pytest.mark.parametrize("cap", [None, 40_000])
+def test_runtime_passes_a_tool_result_cap_only_when_one_is_set(cap) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_route(**_kwargs):
+        return "test-model", {}, None
+
+    async def current_agentic_loop(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(usage={}, rounds=0, tool_calls_made=[])
+
+    with (
+        patch(
+            "packages.core.ai.runtime.completions.runtime_resolve_text_completion_route",
+            new=fake_route,
+        ),
+        patch(
+            "packages.core.ai.runtime.billing.runtime_ensure_billing_context",
+            new=lambda *_args, **_kwargs: None,
+        ),
+        patch("packages.core.ai.agentic_loop.agentic_loop", new=current_agentic_loop),
+    ):
+        asyncio.run(
+            runtime_execute_agentic_loop(
+                runtime_envelope=None,
+                system_prompt="system",
+                user_message="continue",
+                tools=[],
+                entity_id="entity",
+                agent_id=None,
+                tool_result_max_chars=cap,
+            )
+        )
+
+    assert captured.get("tool_result_max_chars") == cap
+
+
 def test_agentic_loop_returns_cancelled_result_before_next_round() -> None:
     async def is_cancelled() -> bool:
         return True
@@ -157,7 +196,195 @@ def test_agentic_loop_returns_cancelled_result_before_next_round() -> None:
     mock_completion.assert_not_awaited()
 
 
-def test_tool_pool_forwards_manual_skill_ids_without_legacy_step_id() -> None:
+def test_agentic_loop_cancels_inflight_tool_executor() -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_tool_completion(messages, tools, **kwargs):
+        return (
+            "",
+            [{
+                "id": "call_1",
+                "name": "read_file",
+                "arguments": {"path": "README.md"},
+            }],
+            {"prompt": 10, "completion": 1, "total": 11},
+        )
+
+    async def hung_executor(name, args):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def scenario():
+        task = asyncio.create_task(
+            agentic_loop(
+                system_prompt="system",
+                user_message="read the file",
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {"type": "object"},
+                    },
+                }],
+                tool_executor=hung_executor,
+                is_cancelled=cancelled.is_set,
+                max_rounds=1,
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            cancelled.set()
+            result = await asyncio.wait_for(asyncio.shield(task), 2)
+            assert result.stop_reason == "cancelled"
+            assert result.error == "chat_turn_cancelled"
+            assert stopped.is_set()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        new=fake_tool_completion,
+    ):
+        asyncio.run(scenario())
+
+
+def test_agentic_loop_cancels_inflight_serial_skill() -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_tool_completion(messages, tools, **kwargs):
+        return (
+            "",
+            [{
+                "id": "call_1",
+                "name": "invoke_skill",
+                "arguments": {"skill": "local-coding-operations", "input": "edit the local file"},
+            }],
+            {"prompt": 10, "completion": 1, "total": 11},
+        )
+
+    async def hung_executor(name, args):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def scenario():
+        task = asyncio.create_task(
+            agentic_loop(
+                system_prompt="system",
+                user_message="update daily tasks",
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": "invoke_skill",
+                        "parameters": {"type": "object"},
+                    },
+                }],
+                tool_executor=hung_executor,
+                is_cancelled=cancelled.is_set,
+                max_rounds=1,
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            cancelled.set()
+            result = await asyncio.wait_for(asyncio.shield(task), 2)
+            assert result.stop_reason == "cancelled"
+            assert result.error == "chat_turn_cancelled"
+            assert stopped.is_set()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        new=fake_tool_completion,
+    ):
+        asyncio.run(scenario())
+
+
+def test_agentic_loop_cancels_inflight_model_round() -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def hung_completion(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def scenario():
+        task = asyncio.create_task(
+            agentic_loop(
+                system_prompt="system",
+                user_message="summarize this",
+                tools=[{
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {"type": "object"},
+                    },
+                }],
+                tool_executor=lambda *_args, **_kwargs: None,
+                is_cancelled=cancelled.is_set,
+                max_rounds=1,
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            cancelled.set()
+            result = await asyncio.wait_for(asyncio.shield(task), 2)
+            assert result.stop_reason == "cancelled"
+            assert result.error == "chat_turn_cancelled"
+            assert stopped.is_set()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        new=hung_completion,
+    ):
+        asyncio.run(scenario())
+
+
+def test_cancellation_during_final_provider_response_is_settled_but_not_success() -> None:
+    cancelled = False
+
+    async def complete(*_args, **_kwargs):
+        nonlocal cancelled
+        cancelled = True
+        return "Late answer", {"prompt": 10, "completion": 5, "total": 15}
+
+    async def check():
+        return cancelled
+
+    settled = AsyncMock()
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_text_completion", new=complete,
+    ):
+        result = asyncio.run(agentic_loop(
+            system_prompt="system", user_message="request", tools=[], tool_executor=AsyncMock(),
+            runtime_cancel_checker=check, on_llm_usage_settled=settled,
+        ))
+    assert result.stop_reason == "cancelled"
+    assert result.content == ""
+    assert result.usage["total"] == 15
+    settled.assert_awaited_once()
+
+
+def test_tool_pool_forwards_manual_skill_ids_and_step_scope() -> None:
     from packages.core.ai.tool_pool import ToolPool
 
     captured: dict[str, object] = {}
@@ -185,4 +412,4 @@ def test_tool_pool_forwards_manual_skill_ids_without_legacy_step_id() -> None:
     assert result == "ok"
     assert captured["manual_skill_ids"] == ["skill-1"]
     assert captured["manual_skill_slugs"] == ["skill-one"]
-    assert "step_id" not in captured
+    assert captured["step_id"] == "legacy-step"

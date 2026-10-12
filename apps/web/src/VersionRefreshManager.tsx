@@ -3,6 +3,8 @@ import { t } from "./lib/i18n";
 import { useToastStore } from "./stores/toast";
 import {
   clearRecoverableErrorAutoReloadAttempt,
+  ApplicationReloadMode,
+  reloadApplication,
   isRecoverableErrorAutoReloadScheduled,
   isStatefulEditingRoute,
   isStaleChunkError,
@@ -92,11 +94,11 @@ function wasChunkDismissed(buildVersion: string) {
   return getSessionValue(CHUNK_DISMISS_KEY) === buildVersion;
 }
 
-function reloadToLatestVersion() {
+function reloadToLatestVersion(mode = ApplicationReloadMode.Refresh) {
   clearSessionValue(VERSION_DISMISS_KEY);
   clearSessionValue(CHUNK_DISMISS_KEY);
   clearRecoverableErrorAutoReloadAttempt();
-  window.location.reload();
+  reloadApplication(mode);
 }
 
 export default function VersionRefreshManager() {
@@ -119,7 +121,7 @@ export default function VersionRefreshManager() {
         message: t("component.version_refresh.new_version_message"),
         duration: 0,
         actionLabel: t("component.version_refresh.refresh_now"),
-        onAction: reloadToLatestVersion,
+        onAction: () => reloadToLatestVersion(),
         onDismiss: () => {
           markVersionDismissed(nextVersion);
           currentVersionToastId = null;
@@ -136,16 +138,16 @@ export default function VersionRefreshManager() {
         message: t("component.version_refresh.page_needs_refresh_message"),
         duration: 0,
         actionLabel: t("component.version_refresh.refresh_now"),
-        onAction: reloadToLatestVersion,
+        onAction: () => reloadToLatestVersion(ApplicationReloadMode.RecoverAssets),
         onDismiss: () => {
           markChunkDismissed(__APP_VERSION__);
         },
       });
     };
 
-    const handleChunkFailure = () => {
+    const handleChunkFailure = (error: unknown) => {
       if (!isStatefulEditingRoute()) {
-        const reloadDelayMs = scheduleRecoverableErrorAutoReload();
+        const reloadDelayMs = scheduleRecoverableErrorAutoReload(error);
         if (reloadDelayMs !== null || isRecoverableErrorAutoReloadScheduled()) return;
       }
       showChunkFailureToast();
@@ -168,13 +170,13 @@ export default function VersionRefreshManager() {
 
     const handleWindowError = (event: ErrorEvent) => {
       if (isChunkLoadFailureMessage(getErrorMessage(event.error) || event.message || "")) {
-        handleChunkFailure();
+        handleChunkFailure(event.error || event.message);
       }
     };
 
     const handleUnhandledRejection = (event: PromiseRejectionEvent) => {
       if (isChunkLoadFailureMessage(getErrorMessage(event.reason))) {
-        handleChunkFailure();
+        handleChunkFailure(event.reason);
       }
     };
 

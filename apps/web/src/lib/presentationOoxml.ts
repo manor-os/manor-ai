@@ -36,7 +36,7 @@ export function presentationRelationshipsPart(sourcePart: string): string {
 /** Return DrawingML object ids in their source paint order. */
 export function presentationObjectIdsInOrder(slideXml: string): string[] {
   const ids: string[] = [];
-  for (const match of slideXml.matchAll(/<p:cNvPr\b[^>]*\bid="([^"]+)"/gi)) {
+  for (const match of slideXml.matchAll(/<p:cNvPr\b[^>]*\sid="([^"]+)"/gi)) {
     if (!ids.includes(match[1])) ids.push(match[1]);
   }
   return ids;

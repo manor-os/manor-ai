@@ -108,11 +108,6 @@ async def main() -> int:
 
     scenarios = [
         (
-            "reload_extension",
-            {},
-            expected_dispatch("reload_extension", {}),
-        ),
-        (
             "read_page",
             {"tabId": 321},
             expected_dispatch("read_page", {"tabId": 321}),

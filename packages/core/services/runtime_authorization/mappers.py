@@ -38,6 +38,14 @@ class SubjectRule(Generic[T]):
 
 class RegistryEntityPermissionMapper(EntityPermissionMapper):
     _RULES: tuple[SubjectRule[Permission], ...] = (
+        # Match the existing company CRM HTTP access; Staff admin is independent.
+        # Current actor membership, source Workspace management and ordinary
+        # runtime Workspace/action/approval checks remain mandatory.
+        SubjectRule(
+            Permission.CHAT_USE,
+            action_prefixes=("workspace.client.",),
+            capability_ids=frozenset({"crm.read"}),
+        ),
         SubjectRule(
             Permission.TASKS_READ,
             capability_ids=frozenset({Permission.TASKS_READ.value}),

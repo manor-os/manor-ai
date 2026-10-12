@@ -232,29 +232,18 @@ async def rotate_worker_secret(
     return secret
 
 
-def verify_worker_secret(worker: Worker, presented_secret: str) -> bool:
-    """Constant-time check of a presented secret against the stored hash.
+def _worker_secret_is_usable(worker: Worker) -> bool:
+    return bool(
+        worker.secret_hash
+        and worker.status != WorkerStatus.REVOKED
+        and (not worker.expires_at or worker.expires_at >= datetime.now(timezone.utc))
+    )
 
-    Returns False for internal workers (no secret) — those cross the
-    in-process boundary, never the HTTP one. Returns False for revoked
-    workers so they can't reach the API at all.
 
-    Paused and quarantined workers are allowed through so the heartbeat
-    endpoint can return a ``pause`` instruction — workers shouldn't have
-    to guess at why their hb is failing; they should hear "you're paused,
-    back off" explicitly.
-    """
-    if not worker.secret_hash:
-        return False
-    if worker.status == WorkerStatus.REVOKED:
-        return False
-    if worker.expires_at and worker.expires_at < datetime.now(timezone.utc):
-        return False
+def _verify_secret_hash(secret_hash: str, presented_secret: str) -> bool:
     try:
-        return bcrypt.checkpw(
-            presented_secret.encode(), worker.secret_hash.encode(),
-        )
-    except Exception:
+        return bcrypt.checkpw(presented_secret.encode(), secret_hash.encode())
+    except (ValueError, TypeError):
         return False
 
 
@@ -311,9 +300,10 @@ async def list_workers_for_subscription(
 
 # ── Lookups + state ─────────────────────────────────────────────────
 
-async def get_worker(db: AsyncSession, worker_id: str) -> Optional[Worker]:
+async def get_worker(db: AsyncSession, worker_id: str, *, fresh: bool = False) -> Optional[Worker]:
     return (await db.execute(
         select(Worker).where(Worker.id == worker_id)
+        .execution_options(populate_existing=fresh)
     )).scalar_one_or_none()
 
 

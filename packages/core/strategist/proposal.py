@@ -41,6 +41,35 @@ class Deliverable(BaseModel):
     usage: str = Field(..., min_length=1, max_length=400)
     """How this deliverable is consumed downstream."""
 
+    document_id_path: str | None = Field(default=None, max_length=300)
+    """Optional JSON Pointer to the canonical Document ID in the Task result."""
+
+    workspace_folder: str | None = Field(default=None, max_length=500)
+    """Exact logical Knowledge folder relative to the Workspace, for file outputs."""
+
+    require_readback: bool = False
+    """Require actual file-tool write and subsequent read of the same final bytes."""
+
+    @model_validator(mode="after")
+    def _validate_document_contract(self):
+        if self.document_id_path is not None:
+            if self.kind != "file" or not self.document_id_path.startswith("/"):
+                raise ValueError("document_id_path must be a JSON Pointer for a file deliverable")
+            if re.search(r"~(?![01])", self.document_id_path):
+                raise ValueError("invalid JSON Pointer escape")
+        if self.workspace_folder is not None or self.require_readback:
+            if not self.document_id_path:
+                raise ValueError("file folder/readback requires document_id_path")
+        if self.workspace_folder is not None:
+            folder = self.workspace_folder.rstrip("/")
+            if (
+                "\\" in folder or ":" in folder
+                or any(part in {"", ".", ".."} for part in folder.split("/"))
+            ):
+                raise ValueError("workspace_folder must be a relative folder without traversal")
+            self.workspace_folder = folder
+        return self
+
     @field_validator("shape")
     @classmethod
     def _validate_shape(cls, value: str) -> str:
@@ -102,6 +131,12 @@ class EstimatedImpact(BaseModel):
 
     rationale: Optional[str] = Field(default=None, max_length=400)
 
+    @model_validator(mode="after")
+    def _drop_unlinked_delta(self):
+        if not self.goal_id:
+            self.metric_delta = None
+        return self
+
 
 class ProposedExternalAction(BaseModel):
     """Narrow external side effect that one approved Proposal may authorize."""
@@ -141,6 +176,9 @@ class ProposedTask(BaseModel):
 
     delegate_service_keys: list[str] = Field(default_factory=list)
     """Other services the Planner is allowed to use for steps."""
+
+    required_skills: list[str] = Field(default_factory=list)
+    """Owner-bound Skill slugs that must run before the Task can complete."""
 
     depends_on_task_keys: list[str] = Field(default_factory=list)
     """Other task_key values in this proposal that must complete before
@@ -203,6 +241,14 @@ class ProposedTask(BaseModel):
         if isinstance(v, str):
             return [s.strip() for s in v.split(",") if s.strip()]
         return list(v)
+
+    @field_validator("required_skills", mode="before")
+    @classmethod
+    def _coerce_required_skills(cls, v):
+        if v is None:
+            return []
+        values = v.split(",") if isinstance(v, str) else list(v)
+        return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
     @field_validator("depends_on_task_keys", mode="before")
     @classmethod
@@ -472,6 +518,24 @@ class ProposedGoalChange(_ProposedChangeBase):
     ]
 
 
+class ExecutionReference(BaseModel):
+    """One exact Task observation, not a model-authored execution claim."""
+
+    model_config = {"extra": "forbid"}
+    task_id: str = Field(min_length=1, max_length=64)
+    plan_id: str | None = Field(default=None, max_length=64)
+    observed_state: str = Field(min_length=1, max_length=64)
+    blocker_ref: str | None = Field(default=None, max_length=128)
+
+
+class ExecutionReview(BaseModel):
+    """References to the server snapshot used for this decision."""
+
+    model_config = {"extra": "forbid"}
+    revision: str = Field(min_length=1, max_length=128)
+    references: list[ExecutionReference] = Field(max_length=8)
+
+
 class Proposal(BaseModel):
     """Full Strategist output for one review cycle."""
 
@@ -491,6 +555,10 @@ class Proposal(BaseModel):
     notes: Optional[str] = Field(default=None, max_length=1500)
     """Free-form observations — not actioned, surfaced in chat for
     the operator's awareness ("noticed engagement dropping on Tue")."""
+
+    execution_review: ExecutionReview | None = None
+    """Required during generation with a current snapshot. Optional when reading
+    historical proposals created before execution evidence was recorded."""
 
     human_requests: list[ProposedHumanRequest] = Field(
         default_factory=list, max_length=3,

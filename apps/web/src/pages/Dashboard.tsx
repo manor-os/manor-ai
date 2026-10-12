@@ -1293,6 +1293,9 @@ export default function Dashboard() {
   );
   const { data: taskTrends, isLoading: _trendsLoading } = useQuery({
     queryKey: ["dashboard-task-trends", taskTrendDays, wsFilter],
+    enabled: isWidgetVisible("task_trend") || visibleGeneratedModules.some(
+      (module) => module.code.data_requests.some((request) => request.source === "task_trends"),
+    ),
     queryFn: () => api.dashboard.taskTrends(taskTrendDays, wsFilter),
   });
 
@@ -1302,11 +1305,6 @@ export default function Dashboard() {
     // disable the query outright, which is a guaranteed empty panel.
     queryFn: () =>
       api.dashboard.recentActivity(100, wsFilter, dashboardLastSeenAt),
-  });
-
-  const { data: activeGoals } = useQuery({
-    queryKey: ["dashboard-active-goals", wsFilter],
-    queryFn: () => api.dashboard.activeGoals(5, wsFilter),
   });
 
   const { data: workspaces, isLoading: workspacesLoading } = useQuery({
@@ -1321,11 +1319,6 @@ export default function Dashboard() {
     queryKey: ["dashboard-generated-module-tasks", wsFilter],
     enabled: generatedModulesNeedTasks,
     queryFn: () => api.tasks.list({ limit: 200, workspace_id: wsFilter }),
-  });
-
-  const { data: usageData } = useQuery({
-    queryKey: ["dashboard-usage"],
-    queryFn: () => api.usage.summary(30),
   });
 
   /* Derived metrics — API returns nested: stats.tasks.by_status.completed, etc. */

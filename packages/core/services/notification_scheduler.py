@@ -7,6 +7,7 @@ after a provider accepts a message but before the outbox commit may retry it.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -19,6 +20,7 @@ from packages.core.constants.notification_types import (
 )
 from packages.core.models.base import generate_ulid
 from packages.core.models.notification import Notification, NotificationOutboxEvent
+from packages.core.services.external_delivery_capacity import external_delivery_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,12 @@ logger = logging.getLogger(__name__)
 _SWEEP_BATCH = 50
 _OUTBOX_LEASE = timedelta(minutes=5)
 _MAX_ATTEMPTS = 5
+_OUTBOX_ATTEMPT_TIMEOUT_SECONDS = 30.0
+_OUTBOX_ADMISSION_WAIT_SECONDS = 2.0
+# A send may start just before this deadline. With the 30 s attempt bound and
+# 2 s receipt drain, the sweeper stays below Celery's 60 s soft limit.
+_OUTBOX_SWEEP_BUDGET_SECONDS = 20.0
+_OUTBOX_CHECKPOINT_DRAIN_SECONDS = 2.0
 _RETRY_DELAYS = (
     timedelta(minutes=1),
     timedelta(minutes=5),
@@ -61,11 +69,15 @@ async def _claim_outbox_events(
     when: datetime,
     batch_size: int,
     notification_id: str | None = None,
+    exclude_event_ids: tuple[str, ...] = (),
 ) -> tuple[list[tuple[str, str]], int]:
+    eligible = _eligible_outbox(when)
+    if exclude_event_ids:
+        eligible = and_(eligible, NotificationOutboxEvent.id.not_in(exclude_event_ids))
     exhausted_query = (
         update(NotificationOutboxEvent)
         .where(
-            _eligible_outbox(when),
+            eligible,
             NotificationOutboxEvent.attempt_count >= _MAX_ATTEMPTS,
         )
         .values(
@@ -83,7 +95,7 @@ async def _claim_outbox_events(
     query = (
         select(NotificationOutboxEvent)
         .where(
-            _eligible_outbox(when),
+            eligible,
             NotificationOutboxEvent.attempt_count < _MAX_ATTEMPTS,
         )
         .order_by(NotificationOutboxEvent.available_at.asc())
@@ -144,6 +156,46 @@ async def _cancel_inaccessible(
     return bool(result.rowcount)
 
 
+async def _cancel_external_outbox(
+    db: AsyncSession,
+    *,
+    event_id: str,
+    notification_id: str,
+    claim_token: str,
+    reason: str,
+) -> bool:
+    """Cancel external fan-out without retracting its in-app parent fact."""
+
+    notification = (
+        await db.execute(
+            select(Notification)
+            .where(Notification.id == notification_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if notification is None:
+        await db.rollback()
+        return False
+    result = await db.execute(
+        update(NotificationOutboxEvent)
+        .where(
+            NotificationOutboxEvent.id == event_id,
+            NotificationOutboxEvent.notification_id == notification_id,
+            NotificationOutboxEvent.status
+            == NotificationOutboxStatus.PROCESSING.value,
+            NotificationOutboxEvent.claim_token == claim_token,
+        )
+        .values(
+            status=NotificationOutboxStatus.CANCELED.value,
+            locked_until=None,
+            claim_token=None,
+            last_error=f"agent_initiative_delivery_suppressed:{reason}"[:2_000],
+        )
+    )
+    await db.commit()
+    return bool(result.rowcount)
+
+
 async def _lock_authorized_workspace_for_delivery(
     db: AsyncSession,
     *,
@@ -156,6 +208,35 @@ async def _lock_authorized_workspace_for_delivery(
 ) -> bool:
     """Lock lifecycle, then revalidate recipient access for one external send."""
     from packages.core.services.notify import notification_recipient_is_authorized
+
+    notification = (
+        await db.execute(
+            select(Notification)
+            .where(Notification.id == notification_id)
+            # Keep cancellation serialized while allowing the separate delivery
+            # transaction to take the FK's KEY SHARE lock on this parent.
+            .with_for_update(key_share=True)
+        )
+    ).scalar_one_or_none()
+    if notification is None:
+        await db.rollback()
+        return False
+    owned = (
+        await db.execute(
+            select(NotificationOutboxEvent.id)
+            .where(
+                NotificationOutboxEvent.id == event_id,
+                NotificationOutboxEvent.notification_id == notification_id,
+                NotificationOutboxEvent.status
+                == NotificationOutboxStatus.PROCESSING.value,
+                NotificationOutboxEvent.claim_token == claim_token,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if owned is None:
+        await db.rollback()
+        return False
 
     if not workspace_id:
         authorized = await notification_recipient_is_authorized(
@@ -182,7 +263,27 @@ async def _lock_authorized_workspace_for_delivery(
         workspace_id=workspace_id,
         entity_id=entity_id,
     )
-    if workspace is None or workspace.deleted_at is not None or workspace.status != "active":
+    manual_initiative_allowed = False
+    if (
+        workspace is not None
+        and workspace.deleted_at is None
+        and workspace.status == "paused"
+        and notification.type == "agent_initiative_update"
+    ):
+        from packages.core.services.agent_initiative_delivery import (
+            lock_agent_initiative_notification_delivery_authority,
+        )
+
+        manual_initiative_allowed, _reason = await lock_agent_initiative_notification_delivery_authority(
+            db, notification_id=notification_id, entity_id=entity_id,
+            user_id=user_id, workspace_id=workspace_id,
+            idempotency_key=notification.idempotency_key, meta=notification.meta,
+            require_manual_run=True,
+        )
+    if (
+        workspace is None or workspace.deleted_at is not None
+        or workspace.status != "active" and not manual_initiative_allowed
+    ):
         await _cancel_inaccessible(
             db,
             event_id=event_id,
@@ -362,6 +463,35 @@ async def _process_claimed_event(
     claim_token: str,
     when: datetime,
 ) -> str:
+    try:
+        async with asyncio.timeout(_OUTBOX_ATTEMPT_TIMEOUT_SECONDS):
+            return await _process_claimed_event_in_session(
+                db, event_id=event_id, claim_token=claim_token, when=when,
+            )
+    except TimeoutError:
+        await db.rollback()
+        attempt_count = await db.scalar(select(NotificationOutboxEvent.attempt_count).where(
+            NotificationOutboxEvent.id == event_id,
+            NotificationOutboxEvent.status == NotificationOutboxStatus.PROCESSING.value,
+            NotificationOutboxEvent.claim_token == claim_token,
+        ))
+        if attempt_count is None:
+            await db.rollback()
+            return "canceled"
+        return await _record_failure(
+            db, event_id=event_id, claim_token=claim_token,
+            attempt_count=attempt_count, when=when,
+            exc=TimeoutError(f"notification delivery exceeded {_OUTBOX_ATTEMPT_TIMEOUT_SECONDS:g}s"),
+        )
+
+
+async def _process_claimed_event_in_session(
+    db: AsyncSession,
+    *,
+    event_id: str,
+    claim_token: str,
+    when: datetime,
+) -> str:
     row = (
         await db.execute(
             select(NotificationOutboxEvent, Notification)
@@ -391,6 +521,7 @@ async def _process_claimed_event(
     notification_title = notification.title or ""
     notification_body = notification.content
     notification_meta = dict(notification.meta or {})
+    notification_idempotency_key = notification.idempotency_key
     await db.commit()
 
     from packages.core.services.notify import (
@@ -444,6 +575,32 @@ async def _process_claimed_event(
 
         async def authorize_external_target() -> bool:
             nonlocal delivery_canceled
+            if notification_type == "agent_initiative_update":
+                from packages.core.services.agent_initiative_delivery import (
+                    lock_agent_initiative_notification_delivery_authority,
+                )
+
+                producer_allowed, reason = (
+                    await lock_agent_initiative_notification_delivery_authority(
+                        db,
+                        notification_id=notification_id,
+                        entity_id=notification_entity_id,
+                        user_id=notification_user_id,
+                        workspace_id=notification_workspace_id,
+                        idempotency_key=notification_idempotency_key,
+                        meta=notification_meta,
+                    )
+                )
+                if not producer_allowed:
+                    await _cancel_external_outbox(
+                        db,
+                        event_id=event_id,
+                        notification_id=notification_id,
+                        claim_token=claim_token,
+                        reason=reason or "initiative_notification_unauthorized",
+                    )
+                    delivery_canceled = True
+                    return False
             allowed = await _lock_authorized_workspace_for_delivery(
                 db,
                 event_id=event_id,
@@ -458,12 +615,19 @@ async def _process_claimed_event(
             return allowed
 
         async def record_delivered_target(target_key: str) -> None:
-            await _record_delivered_target(
-                db,
-                event_id=event_id,
-                claim_token=claim_token,
-                target_key=target_key,
-            )
+            checkpoint = asyncio.create_task(_record_delivered_target(
+                db, event_id=event_id, claim_token=claim_token, target_key=target_key,
+            ))
+            try:
+                await asyncio.shield(checkpoint)
+            except asyncio.CancelledError:
+                # The child borrows this session. Finish or cancel it before
+                # timeout handling or the caller rolls back/closes the session.
+                try:
+                    await asyncio.wait_for(checkpoint, _OUTBOX_CHECKPOINT_DRAIN_SECONDS)
+                except Exception:
+                    logger.warning("Notification checkpoint did not finish during cancellation", exc_info=True)
+                raise
 
         await dispatch_persisted_notification(
             notification_id=notification_id,
@@ -480,6 +644,7 @@ async def _process_claimed_event(
             ),
             before_external_target=authorize_external_target,
             on_target_delivered=record_delivered_target,
+            db=db,
         )
         if delivery_canceled:
             return "canceled"
@@ -525,30 +690,8 @@ async def dispatch_notification_outbox(
     notification_id: str,
     now: datetime | None = None,
 ) -> dict[str, int]:
-    """Claim and process one immediate notification outbox event."""
-    when = now or datetime.now(timezone.utc)
-    claimed, exhausted = await _claim_outbox_events(
-        db,
-        when=when,
-        batch_size=1,
-        notification_id=notification_id,
-    )
-    counts = {
-        "due": len(claimed) + exhausted,
-        "dispatched": 0,
-        "retried": 0,
-        "failed": exhausted,
-        "canceled": 0,
-    }
-    for event_id, claim_token in claimed:
-        outcome = await _process_claimed_event(
-            db,
-            event_id=event_id,
-            claim_token=claim_token,
-            when=when,
-        )
-        counts[outcome] += 1
-    return counts
+    """Attempt immediate fan-out when capacity is available; retain pending work."""
+    return await _dispatch_outbox(db, now=now, batch_size=1, notification_id=notification_id)
 
 
 async def dispatch_due_notifications(
@@ -557,28 +700,53 @@ async def dispatch_due_notifications(
     now: datetime | None = None,
     batch_size: int = _SWEEP_BATCH,
 ) -> dict[str, int]:
-    """Claim due or stale outbox rows and fan them out with bounded retry."""
-    when = now or datetime.now(timezone.utc)
-    claimed, exhausted = await _claim_outbox_events(
-        db,
-        when=when,
-        batch_size=batch_size,
-    )
-    counts = {
-        "due": len(claimed) + exhausted,
-        "dispatched": 0,
-        "retried": 0,
-        "failed": exhausted,
-        "canceled": 0,
-    }
-    for event_id, claim_token in claimed:
-        outcome = await _process_claimed_event(
-            db,
-            event_id=event_id,
-            claim_token=claim_token,
-            when=when,
-        )
-        counts[outcome] += 1
+    """Claim just-in-time, leaving queued work available to other sweepers."""
+    return await _dispatch_outbox(db, now=now, batch_size=batch_size)
+
+
+async def _dispatch_outbox(
+    db: AsyncSession,
+    *,
+    now: datetime | None,
+    batch_size: int,
+    notification_id: str | None = None,
+) -> dict[str, int]:
+    counts = {"due": 0, "dispatched": 0, "retried": 0, "failed": 0, "canceled": 0}
+    claimed_ids: set[str] = set()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _OUTBOX_SWEEP_BUDGET_SECONDS
+    gate = external_delivery_semaphore(db)
+    for _ in range(max(0, batch_size)):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            async with asyncio.timeout(min(remaining, _OUTBOX_ADMISSION_WAIT_SECONDS)):
+                await gate.acquire()
+        except TimeoutError:
+            break  # No claim or attempt is consumed while waiting for capacity.
+        try:
+            when = now or datetime.now(timezone.utc)
+            claimed, exhausted = await _claim_outbox_events(
+                db, when=when, batch_size=1, notification_id=notification_id,
+                exclude_event_ids=tuple(claimed_ids),
+            )
+            counts["due"] += len(claimed) + exhausted
+            counts["failed"] += exhausted
+            if not claimed:
+                break
+            event_id, claim_token = claimed[0]
+            claimed_ids.add(event_id)
+            outcome = await _process_claimed_event(
+                db, event_id=event_id, claim_token=claim_token, when=when,
+            )
+            counts[outcome] += 1
+        finally:
+            try:
+                if db.in_transaction():
+                    await db.rollback()
+            finally:
+                gate.release()
     return counts
 
 

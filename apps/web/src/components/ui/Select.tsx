@@ -5,13 +5,18 @@ import { t } from "../../lib/i18n";
 interface SelectOption {
   value: string;
   label: string;
+  description?: string;
   icon?: ReactNode;
+  disabled?: boolean;
 }
 
 interface SelectProps {
+  id?: string;
+  role?: "combobox";
   value: string;
   onChange: (value: string) => void;
   options: SelectOption[] | string[];
+  appearance?: "field" | "ghost";
   placeholder?: string;
   filterable?: boolean;
   style?: React.CSSProperties;
@@ -25,6 +30,9 @@ interface SelectProps {
   selectedOptionCheckColor?: string;
   disabled?: boolean;
   ariaLabel?: string;
+  ariaRequired?: boolean;
+  ariaInvalid?: boolean;
+  ariaDescribedBy?: string;
 }
 
 function nonPositionalDropdownStyle(style?: React.CSSProperties): React.CSSProperties {
@@ -42,9 +50,12 @@ function nonPositionalDropdownStyle(style?: React.CSSProperties): React.CSSPrope
 }
 
 export default function Select({
+  id,
+  role,
   value,
   onChange,
   options,
+  appearance = "field",
   placeholder,
   filterable,
   style,
@@ -58,6 +69,9 @@ export default function Select({
   selectedOptionCheckColor = "#436b65",
   disabled = false,
   ariaLabel,
+  ariaRequired,
+  ariaInvalid,
+  ariaDescribedBy,
 }: SelectProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -80,11 +94,13 @@ export default function Select({
     typeof o === "string" ? { value: o, label: o } : o
   );
 
-  const selectedLabel = normalizedOptions.find((o) => o.value === value)?.label || value || placeholder || "";
-  const selectedIcon = normalizedOptions.find((o) => o.value === value)?.icon;
+  const selectedOption = normalizedOptions.find((o) => o.value === value);
+  const selectedLabel = selectedOption?.label || value || placeholder || "";
+  const selectedIcon = selectedOption?.icon;
 
   const filtered = query
-    ? normalizedOptions.filter((o) => o.label.toLowerCase().includes(query.toLowerCase()))
+    ? normalizedOptions.filter((o) =>
+      `${o.label} ${o.description || ""} ${o.value}`.toLowerCase().includes(query.toLowerCase()))
     : normalizedOptions;
   const safeDropdownStyle = nonPositionalDropdownStyle(dropdownStyle);
 
@@ -92,7 +108,8 @@ export default function Select({
   const openMenu = () => {
     const selectedIndex = normalizedOptions.findIndex((option) => option.value === value);
     setQuery("");
-    setActiveIndex(selectedIndex >= 0 ? selectedIndex : normalizedOptions.length ? 0 : -1);
+    setActiveIndex(selectedIndex >= 0 && !normalizedOptions[selectedIndex].disabled
+      ? selectedIndex : normalizedOptions.findIndex((option) => !option.disabled));
     setOpen(true);
   };
   const closeMenu = (restoreFocus = false) => {
@@ -101,6 +118,7 @@ export default function Select({
     if (restoreFocus) window.requestAnimationFrame(() => triggerRef.current?.focus());
   };
   const chooseOption = (option: SelectOption) => {
+    if (option.disabled) return;
     onChange(option.value);
     closeMenu(true);
   };
@@ -108,7 +126,11 @@ export default function Select({
     if (!filtered.length) return;
     setActiveIndex((current) => {
       const start = current >= 0 && current < filtered.length ? current : direction > 0 ? -1 : 0;
-      return (start + direction + filtered.length) % filtered.length;
+      for (let offset = 1; offset <= filtered.length; offset += 1) {
+        const next = (start + direction * offset + filtered.length) % filtered.length;
+        if (!filtered[next].disabled) return next;
+      }
+      return -1;
     });
   };
   const handleListKeyDown = (event: KeyboardEvent<HTMLElement>) => {
@@ -129,7 +151,8 @@ export default function Select({
     }
     if (event.key === "Home" || event.key === "End") {
       event.preventDefault();
-      setActiveIndex(event.key === "Home" ? 0 : filtered.length - 1);
+      const enabledIndexes = filtered.flatMap((option, index) => option.disabled ? [] : [index]);
+      setActiveIndex(event.key === "Home" ? enabledIndexes[0] ?? -1 : enabledIndexes.at(-1) ?? -1);
       return;
     }
     if (event.key === "Enter" && activeIndex >= 0 && filtered[activeIndex]) {
@@ -159,15 +182,15 @@ export default function Select({
     const place = () => {
       const r = triggerRef.current?.getBoundingClientRect();
       if (r) {
-        const menuWidth = Math.max(r.width, dropdownMinWidth);
         const viewportPadding = 12;
+        const menuWidth = Math.min(Math.max(r.width, dropdownMinWidth), window.innerWidth - viewportPadding * 2);
         const configuredMaxHeight = typeof dropdownStyle?.maxHeight === "number"
           ? dropdownStyle.maxHeight
           : 240;
         const optionHeight = typeof optionStyle?.height === "number" ? optionStyle.height : 36;
         const estimatedMenuHeight = Math.min(
           configuredMaxHeight,
-          Math.max(44, filtered.length * optionHeight + (filterable ? 50 : 8)),
+          Math.max(44, filtered.reduce((height, option) => height + (option.description ? 54 : optionHeight), 0) + (filterable ? 50 : 8)),
         );
         const menuHeight = menuRef.current?.getBoundingClientRect().height || estimatedMenuHeight;
         const availableBelow = window.innerHeight - r.bottom - viewportPadding;
@@ -182,7 +205,7 @@ export default function Select({
             ? Math.max(viewportPadding, r.top - visibleMenuHeight - 4)
             : Math.min(r.bottom + 4, window.innerHeight - viewportPadding - visibleMenuHeight),
           left: Math.min(Math.max(viewportPadding, r.left), maxLeft),
-          width: r.width,
+          width: menuWidth,
           maxHeight,
         });
       }
@@ -214,7 +237,8 @@ export default function Select({
     if (!open) return;
     setActiveIndex((current) => {
       if (!filtered.length) return -1;
-      return current >= 0 && current < filtered.length ? current : 0;
+      return current >= 0 && current < filtered.length && !filtered[current].disabled
+        ? current : filtered.findIndex((option) => !option.disabled);
     });
   }, [open, filtered.length]);
 
@@ -228,9 +252,15 @@ export default function Select({
       {/* Trigger */}
       <button
         ref={triggerRef}
+        id={id}
+        role={role}
         type="button"
         disabled={disabled}
         aria-label={ariaLabel}
+        aria-required={ariaRequired}
+        aria-invalid={ariaInvalid}
+        aria-describedby={ariaDescribedBy}
+        title={selectedOption ? [selectedOption.label, selectedOption.description].filter(Boolean).join("\n") : undefined}
         aria-haspopup="listbox"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
@@ -242,15 +272,16 @@ export default function Select({
           if (open) closeMenu();
           else openMenu();
         }}
-        className={`manor-input manor-select-trigger${disabled ? " is-disabled" : ""}${open ? " is-open" : ""}`}
+        className={`manor-input manor-select-trigger${appearance === "ghost" ? " manor-select-trigger--ghost" : ""}${disabled ? " is-disabled" : ""}${open ? " is-open" : ""}`}
         style={{
           width: "100%", textAlign: "left", cursor: disabled ? "not-allowed" : "pointer",
           display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8,
           color: value ? "var(--text-default)" : "var(--text-faint)",
           opacity: disabled ? 0.52 : 1,
           ...buttonStyle,
-          ...(open ? { borderColor: "var(--accent)", boxShadow: "0 0 0 3px var(--accent-ring)", background: "var(--surface-panel)" } : {}),
+          ...(open && appearance === "field" ? { borderColor: "var(--accent)", boxShadow: "0 0 0 3px var(--accent-ring)", background: "var(--surface-panel)" } : {}),
           ...(open ? openButtonStyle : {}),
+          ...(ariaInvalid ? { boxShadow: "0 0 0 3px color-mix(in srgb, var(--danger) 22%, transparent)" } : {}),
         }}
       >
         {showSelectedIcon && selectedIcon && (
@@ -271,7 +302,7 @@ export default function Select({
         <div
           ref={menuRef}
           id={menuId}
-          className="manor-select-menu"
+          className={`manor-select-menu${appearance === "ghost" ? " manor-select-menu--ghost" : ""}`}
           role="listbox"
           aria-label={ariaLabel || placeholder}
           data-manor-popup-open="true"
@@ -282,7 +313,7 @@ export default function Select({
           WebkitBackdropFilter: "blur(28px) saturate(140%)",
           border: "1px solid var(--border-default)", borderRadius: 14,
           boxShadow: "var(--shadow-lg)",
-          minWidth: dropdownMinWidth,
+          minWidth: 0,
           maxHeight: coords.maxHeight, overflowY: "auto", padding: 4,
           animation: "dialog-in 0.15s ease-out",
           ...safeDropdownStyle,
@@ -321,19 +352,23 @@ export default function Select({
                 type="button"
                 role="option"
                 aria-selected={isSelected}
+                aria-label={o.description ? `${o.label}, ${o.description}` : undefined}
+                title={o.description ? `${o.label}\n${o.description}` : o.label}
+                disabled={o.disabled}
                 tabIndex={-1}
                 className={`manor-select-option${isSelected ? " is-selected" : ""}`}
                 onClick={() => chooseOption(o)}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "space-between",
-                  width: "100%", padding: "0 14px", height: 36, fontSize: 13, fontWeight: isSelected ? 600 : 400,
+                  width: "100%", padding: "0 14px", height: o.description ? 54 : 36, fontSize: 13, fontWeight: isSelected ? 600 : 400,
                   color: isSelected ? selectedOptionColor : "var(--text-default)",
                   background: isActive ? "var(--surface-muted)" : "transparent",
-                  border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left",
+                  border: "none", borderRadius: 8, cursor: o.disabled ? "not-allowed" : "pointer", textAlign: "left",
+                  opacity: o.disabled ? 0.5 : 1,
                   transition: "background 0.1s",
                   ...optionStyle,
                 }}
-                onMouseEnter={() => setActiveIndex(index)}
+                onMouseEnter={() => { if (!o.disabled) setActiveIndex(index); }}
               >
                 <span style={{ display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
                   {o.icon && (
@@ -341,10 +376,17 @@ export default function Select({
                       {o.icon}
                     </span>
                   )}
-                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.label}</span>
+                  <span style={{ display: "flex", flexDirection: "column", minWidth: 0, gap: 2 }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{o.label}</span>
+                    {o.description && (
+                      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 11, fontWeight: 400, color: "var(--text-muted)" }}>
+                        {o.description}
+                      </span>
+                    )}
+                  </span>
                 </span>
                 {isSelected && (
-                  <svg width="14" height="14" viewBox="0 0 24 24" fill={selectedOptionCheckColor} style={{ flexShrink: 0 }}>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill={appearance === "ghost" ? "currentColor" : selectedOptionCheckColor} style={{ flexShrink: 0 }}>
                     <path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z" />
                   </svg>
                 )}

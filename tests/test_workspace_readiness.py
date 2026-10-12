@@ -72,6 +72,7 @@ def test_declared_external_channel_is_missing_until_configured() -> None:
             "provider": "gmail",
             "purpose": "Send launch announcements.",
             "linked_service_key": "",
+            "required": True,
         }
     ]
 
@@ -195,3 +196,32 @@ def test_readiness_blocks_when_only_some_declared_integrations_are_connected() -
     assert integrations.status == "partial"
     assert integrations.missing_setup_key == "no_integrations"
     assert integrations.details["missing"] == ["twitter_x"]
+
+
+def test_other_channel_declaration_is_optional_and_never_a_missing_channel():
+    """``other`` names a platform with no channel adapter; nothing can be attached."""
+    from packages.core.services.workspace_readiness import (
+        channel_type_has_account_model,
+        describe_unbacked_channel,
+    )
+
+    assert channel_type_has_account_model("other") is False
+    assert channel_type_has_account_model("made_up_platform") is False
+    assert channel_type_has_account_model("webchat") is True
+    assert channel_type_has_account_model("email") is True
+
+    block = {"channel_type": "other", "provider": "X", "purpose": "Publish X posts"}
+    operating_model = {"channel_config": {"primary_external_channel": block}}
+    [requirement] = declared_channel_requirements(operating_model)
+    assert requirement["required"] is False
+    assert requirement["provider"] == "X"
+    assert missing_required_channels([], operating_model) == []
+
+    label, reason = describe_unbacked_channel(block)
+    assert label == "X (no built-in channel)"
+    assert "Publish X posts" in reason
+    assert "Chrome extension" in reason and "dedicated integration" in reason
+
+    # An author can still insist on it; then it is missing like any other channel.
+    required_model = {"channel_config": {"primary_external_channel": {**block, "required": True}}}
+    assert [item["provider"] for item in missing_required_channels([], required_model)] == ["X"]

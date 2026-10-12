@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import csv
 import io
-from datetime import datetime, timezone
+from datetime import datetime
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
@@ -30,15 +30,24 @@ async def bulk_update_tasks(
     clean = {k: v for k, v in updates.items() if k in allowed}
     if not clean:
         return 0
-    result = await db.execute(
-        update(Task)
+    from packages.core.services.task_service import update_task
+
+    # Stable ordering keeps concurrent overlapping bulk requests on one lock
+    # order. Every row enters the canonical Task state machine/factory so an
+    # in_progress Workspace Task gets its durable execution intent in this
+    # transaction instead of becoming a stranded raw status update.
+    matching_ids = list((await db.execute(
+        select(Task.id)
         .where(Task.id.in_(task_ids), Task.entity_id == entity_id)
-        .values(**clean)
-    )
-    await db.flush()
-    if result.rowcount:
+        .order_by(Task.id.asc())
+    )).scalars())
+    updated_count = 0
+    for task_id in matching_ids:
+        if await update_task(db, task_id, entity_id, **clean) is not None:
+            updated_count += 1
+    if updated_count:
         await bump_tool_cache_version(entity_id, "documents")
-    return result.rowcount
+    return updated_count
 
 
 async def bulk_delete_documents(
@@ -73,16 +82,21 @@ async def bulk_update_task_status(
     """Change status of multiple tasks at once."""
     if not task_ids:
         return 0
-    values: dict = {"status": status}
-    if status == "completed":
-        values["completed_at"] = datetime.now(timezone.utc)
-    result = await db.execute(
-        update(Task)
+    from packages.core.services.task_service import update_task
+
+    matching_ids = list((await db.execute(
+        select(Task.id)
         .where(Task.id.in_(task_ids), Task.entity_id == entity_id)
-        .values(**values)
-    )
-    await db.flush()
-    return result.rowcount
+        .order_by(Task.id.asc())
+    )).scalars())
+    updated_count = 0
+    for task_id in matching_ids:
+        if (
+            await update_task(db, task_id, entity_id, status=status)
+            is not None
+        ):
+            updated_count += 1
+    return updated_count
 
 
 # ── CSV export ──

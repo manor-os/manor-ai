@@ -133,8 +133,36 @@ class RateLimiter:
 _limiter = RateLimiter()
 
 
-def _path_group(path: str) -> str:
+def is_chat_read_request(method: str, path: str) -> bool:
+    """Separate chat UI reads from writes without relaxing file downloads."""
+    if method.upper() != "GET" or not path.startswith("/api/v1/chat/"):
+        return False
+    parts = path.split("/")
+    if parts[4] == "shared":
+        return False
+    if parts[-1] in {"export", "tiktok-preview"}:
+        return False
+    return not (len(parts) >= 8 and parts[4] == "rooms" and parts[6] == "files")
+
+
+def authenticated_chat_user_id(request: Request) -> str | None:
+    """Verify identity before assigning a per-user chat rate-limit bucket."""
+    if not request.url.path.startswith("/api/v1/chat/"):
+        return None
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    from packages.core.services.auth_service import decode_token
+
+    claims = decode_token(token.strip())
+    user_id = claims.get("sub") if claims else None
+    return user_id if isinstance(user_id, str) and user_id else None
+
+
+def _path_group(path: str, method: str = "GET") -> str:
     """Group similar paths for rate limiting."""
+    if is_chat_read_request(method, path):
+        return "chat_read"
     if "/chat/" in path:
         return "chat"
     if "/api/v1/" in path:
@@ -171,14 +199,15 @@ class ChatRateLimitMiddleware(BaseHTTPMiddleware):
         if not CHAT_RATE_LIMIT_ENABLED or request.url.path in _HEALTH_PATHS:
             return await call_next(request)
 
-        # Build key from authenticated user or client IP
-        user_id = getattr(request.state, "user_id", None)
+        # Dependencies authenticate after middleware. Verify the bearer token
+        # here so users behind one IP do not share a chat rate-limit budget.
+        user_id = authenticated_chat_user_id(request) or getattr(request.state, "user_id", None)
         ip = client_ip(request)
         key = f"user:{user_id}" if user_id else f"ip:{ip}"
 
         # Chat endpoints get stricter limits
         path = request.url.path
-        group = _path_group(path)
+        group = _path_group(path, request.method)
         if group == "chat":
             max_req, window = CHAT_RATE_LIMIT_REQUESTS, CHAT_RATE_LIMIT_WINDOW
         else:

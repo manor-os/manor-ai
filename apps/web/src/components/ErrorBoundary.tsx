@@ -1,6 +1,8 @@
 import { Component, ReactNode } from "react";
 import {
   clearRecoverableErrorAutoReloadAttempt,
+  ApplicationReloadMode,
+  reloadApplication,
   isExternalDomMutationError,
   isRecoverableErrorAutoReloadScheduled,
   isRecoverableUiRuntimeError,
@@ -43,7 +45,7 @@ export default class ErrorBoundary extends Component<Props, State> {
     console.error("Unhandled UI error:", error, errorInfo);
 
     if (isRecoverableUiRuntimeError(error)) {
-      const reloadDelayMs = scheduleRecoverableErrorAutoReload();
+      const reloadDelayMs = scheduleRecoverableErrorAutoReload(error);
       if (reloadDelayMs === null) {
         if (!isRecoverableErrorAutoReloadScheduled()) {
           this.setState({ autoReloadUnavailable: true });
@@ -97,7 +99,7 @@ export default class ErrorBoundary extends Component<Props, State> {
               <button
                 onClick={() => {
                   clearRecoverableErrorAutoReloadAttempt();
-                  window.location.reload();
+                  reloadApplication(stale ? ApplicationReloadMode.RecoverAssets : ApplicationReloadMode.Refresh);
                 }}
                 className="px-4 py-2 btn-manor"
               >

@@ -13,9 +13,11 @@ from sqlalchemy import select
 import packages.core.database as db_module
 import packages.core.services.document_access as access
 from packages.core.models import (
+    Capability,
     Document,
     DocumentFolder,
     Entity,
+    ResourceType,
     ResourceGrant,
     Share,
     User,
@@ -258,20 +260,6 @@ async def test_redacted_access_does_not_imply_full_content_access(
             )
             == []
         )
-        from apps.api.routers.filesystem import _wiki_index_consistent
-
-        monkeypatch.setattr(
-            "packages.core.services.wiki_service.build_wiki_graph",
-            lambda *_args, **_kwargs: {"pages": []},
-        )
-        graph = await _wiki_index_consistent(
-            db=session,
-            user=SimpleNamespace(entity_id=owner["entity_id"], id=member["user_id"], role="member"),
-            net_id=None,
-            group_id=None,
-            workspace_id=None,
-        )
-        assert graph["pages"] == []
         doc.fs_path = "private.md"
         await session.commit()
         assert await access.unreadable_document_paths(
@@ -919,6 +907,7 @@ async def test_metadata_office_files_return_real_bytes_or_fail_explicitly(client
         "folder_moved",
         "foreign",
         "workspace_deleted",
+        "entity_deleted",
     ],
 )
 async def test_folder_content_revalidates_authority_on_every_request(client, mutation):
@@ -944,11 +933,17 @@ async def test_folder_content_revalidates_authority_on_every_request(client, mut
             (await session.get(DocumentFolder, child_id)).parent_id = None
         elif mutation == "foreign":
             doc.entity_id = "another-entity"
+        elif mutation == "entity_deleted":
+            from packages.core.models.user import Entity
+
+            (await session.get(Entity, owner["entity_id"])).deleted_at = datetime.now(timezone.utc)
         else:
             from packages.core.models.workspace import Workspace
 
             workspace = Workspace(
-                entity_id=owner["entity_id"], name="Deleted owner", deleted_at=datetime.now(timezone.utc)
+                entity_id=owner["entity_id"], name="Deleted owner",
+                artifact_folder_id=child_id,
+                deleted_at=datetime.now(timezone.utc),
             )
             session.add(workspace)
             await session.flush()
@@ -956,7 +951,10 @@ async def test_folder_content_revalidates_authority_on_every_request(client, mut
         await session.commit()
     for action in ("content", "download"):
         response = await client.get(f"{base}/documents/{doc_id}/{action}")
-        assert response.status_code in {404, 410}, response.text
+        if mutation == "workspace_deleted":
+            assert response.status_code == 200, response.text
+        else:
+            assert response.status_code in {404, 410}, response.text
 
 
 @pytest.mark.asyncio
@@ -1029,13 +1027,20 @@ async def test_folder_share_implicit_view_respects_ancestor_ceiling(
     _patch_filesystem_settings(monkeypatch, tmp_path, enabled=True)
     headers, owner, member_headers, member = await _actors(client)
     root = await _create_folder(client, headers, "Ancestor")
-    changed = await client.post(
-        f"/api/v1/folders/{root['id']}/properties", headers=headers, json={"visibility": "entity", "cascade": True}
-    )
-    assert changed.status_code == 200, changed.text
     middle = await _create_folder(client, headers, "Middle", root["id"])
     child = await _create_folder(client, headers, "Child", middle["id"])
     doc = await _upload(client, headers, folder_id=child["id"])
+    # Broaden each level explicitly: cascading a parent update intentionally
+    # does not publish descendants that were created private.
+    for folder in (root, middle, child):
+        changed = await client.post(
+            f"/api/v1/folders/{folder['id']}/properties", headers=headers,
+            json={"visibility": "entity", "cascade": False},
+        )
+        assert changed.status_code == 200, changed.text
+    async with db_module.async_session() as session:
+        (await session.get(Document, doc["id"])).visibility = "entity"
+        await session.commit()
     preview = f"/api/v1/documents/{doc['id']}/preview/content"
     assert (await client.get(preview, headers=member_headers)).status_code == 200
     if ancestor_visibility == "workspace":
@@ -1340,7 +1345,7 @@ async def test_live_ledger_read_does_not_reacquire_workspace_mutation_lock(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["content", "preview/content", "download"])
-async def test_document_read_rechecks_legacy_role_after_cache_wait(
+async def test_document_read_rechecks_owner_role_after_cache_wait(
     client,
     monkeypatch,
     action,
@@ -1354,7 +1359,7 @@ async def test_document_read_rechecks_legacy_role_after_cache_wait(
     reader = await _create_entity_user(
         owner["entity_id"],
         f"gate_legacy_reader_{action.replace('/', '_')}",
-        role="admin",
+        role="owner",
     )
     doc_id, _ = await _document(owner)
     ready, proceed = asyncio.Event(), asyncio.Event()
@@ -1431,14 +1436,14 @@ async def test_document_read_rechecks_staff_identity_after_policy_wait(
     )
     assert granted.status_code == 201, granted.text
     ready, proceed = asyncio.Event(), asyncio.Event()
-    original = documents.get_document_for_update
+    original = documents.get_document_for_read
 
     async def policy_barrier(*args, **kwargs):
         ready.set()
         await proceed.wait()
         return await original(*args, **kwargs)
 
-    monkeypatch.setattr(documents, "get_document_for_update", policy_barrier)
+    monkeypatch.setattr(documents, "get_document_for_read", policy_barrier)
     pending = asyncio.create_task(client.get(f"/api/v1/documents/{doc_id}/{action}", headers=member_headers))
     try:
         await asyncio.wait_for(ready.wait(), timeout=60)
@@ -2428,6 +2433,121 @@ async def test_browse_never_switches_to_users_current_primary_entity(client):
     )
     assert response.status_code == 200, response.text
     assert secret_id not in {row["id"] for row in response.json()["items"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["document", "folder"])
+@pytest.mark.parametrize("release", ["rollback", "close"])
+async def test_public_retained_share_fences_entity_deletion_until_reader_releases(
+    db_session,
+    resource,
+    release,
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from apps.api.routers.document_permissions import (
+        _hash_token,
+        _load_public_document_share,
+    )
+    from apps.api.routers.folder_permissions import _load_public_folder_share
+    from packages.core.services.user_lifecycle import _cascade_delete_entity
+    from tests.test_document_access_batch import _cross_workspace_source
+
+    case = await _cross_workspace_source(db_session)
+    case.source.deleted_at = datetime.now(timezone.utc)
+    token = f"entity-fence-{generate_ulid()}"
+    resource_type = (
+        ResourceType.DOCUMENT if resource == "document" else ResourceType.DOCUMENT_FOLDER
+    )
+    resource_id = case.document.id if resource == "document" else case.root.id
+    db_session.add(Share(
+        id=generate_ulid(),
+        entity_id=case.entity_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        token_hash=_hash_token(token),
+        capabilities=[Capability.VIEW],
+        created_by=case.user.id,
+        created_at=datetime.now(timezone.utc),
+        status="active",
+        metadata_={},
+    ))
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    reader = session_factory()
+    try:
+        if resource == "document":
+            await _load_public_document_share(reader, token)
+        else:
+            await _load_public_folder_share(reader, token)
+
+        async def delete_entity():
+            async with session_factory() as deleter:
+                await _cascade_delete_entity(
+                    deleter,
+                    case.entity_id,
+                    datetime.now(timezone.utc),
+                )
+                await deleter.commit()
+
+        deletion = asyncio.create_task(delete_entity())
+        try:
+            done, _ = await asyncio.wait({deletion}, timeout=0.5)
+            assert not done, "Entity deletion committed during an authorized public share read"
+        finally:
+            if release == "rollback":
+                await reader.rollback()
+            else:
+                await reader.close()
+        await asyncio.wait_for(deletion, timeout=5)
+        entity = await db_session.get(Entity, case.entity_id, populate_existing=True)
+        assert entity.deleted_at is not None
+    finally:
+        await reader.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource", ["document", "folder"])
+async def test_public_share_denies_reader_after_entity_deletion(db_session, resource):
+    from apps.api.errors import CodedError
+    from apps.api.routers.document_permissions import (
+        _hash_token,
+        _load_public_document_share,
+    )
+    from apps.api.routers.folder_permissions import _load_public_folder_share
+    from packages.core.services.user_lifecycle import _cascade_delete_entity
+    from tests.test_document_access_batch import _cross_workspace_source
+
+    case = await _cross_workspace_source(db_session)
+    case.source.deleted_at = datetime.now(timezone.utc)
+    token = f"entity-deleted-{generate_ulid()}"
+    resource_type = (
+        ResourceType.DOCUMENT if resource == "document" else ResourceType.DOCUMENT_FOLDER
+    )
+    resource_id = case.document.id if resource == "document" else case.root.id
+    db_session.add(Share(
+        id=generate_ulid(),
+        entity_id=case.entity_id,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        token_hash=_hash_token(token),
+        capabilities=[Capability.VIEW],
+        created_by=case.user.id,
+        created_at=datetime.now(timezone.utc),
+        status="active",
+        metadata_={},
+    ))
+    await db_session.commit()
+    await _cascade_delete_entity(db_session, case.entity_id, datetime.now(timezone.utc))
+    await db_session.commit()
+
+    with pytest.raises(CodedError) as denied:
+        if resource == "document":
+            await _load_public_document_share(db_session, token)
+        else:
+            await _load_public_folder_share(db_session, token)
+    assert denied.value.status_code == 410
 
 
 @pytest.mark.asyncio

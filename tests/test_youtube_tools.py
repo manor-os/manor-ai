@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 import importlib
 import json
@@ -76,11 +77,17 @@ async def test_record_workspace_metrics_writes_daily_idempotent_observations(
     db_session,
 ) -> None:
     module = _module()
+    from packages.core.models.workspace import Workspace
     from packages.core.stats.service import (
         create_stat,
         list_observations,
     )
 
+    db_session.add(Workspace(
+        id="workspace-1", entity_id="entity-1",
+        name="YouTube metrics", status="active",
+    ))
+    await db_session.flush()
     stats = {}
     for metric_name, key in module.YOUTUBE_WORKSPACE_STAT_KEYS.items():
         stats[metric_name] = await create_stat(
@@ -153,8 +160,14 @@ async def test_record_workspace_metrics_keeps_two_publications_on_same_day(
     db_session,
 ) -> None:
     module = _module()
+    from packages.core.models.workspace import Workspace
     from packages.core.stats.service import create_stat, list_observations
 
+    db_session.add(Workspace(
+        id="workspace-1", entity_id="entity-1",
+        name="YouTube metrics", status="active",
+    ))
+    await db_session.flush()
     stats = {}
     for metric_name, key in module.YOUTUBE_WORKSPACE_STAT_KEYS.items():
         stats[metric_name] = await create_stat(
@@ -302,6 +315,10 @@ async def test_record_publication_uses_runtime_task_provenance(
     assert result["ok"] is True
     assert result["receipt_status"] == "recorded"
     assert result["video_id"] == "tsJff6wc2XQ"
+    fetch_metrics.assert_awaited_once_with(
+        "https://youtu.be/tsJff6wc2XQ",
+        include_comments=False,
+    )
     assert build_receipt.call_args.kwargs["source_task_id"] == expected_task_id
     write_receipt.assert_awaited_once()
 

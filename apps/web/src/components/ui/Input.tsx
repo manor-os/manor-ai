@@ -3,6 +3,7 @@ import { useId } from "react";
 interface InputProps {
   id?: string;
   label?: string;
+  appearance?: "default" | "quiet";
   /** Persistent guidance under the field — unlike a placeholder it
    *  survives the user starting to type. */
   hint?: string;
@@ -11,7 +12,9 @@ interface InputProps {
   onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   placeholder?: string;
   type?: string;
+  multiple?: boolean;
   disabled?: boolean;
+  readOnly?: boolean;
   className?: string;
   autoFocus?: boolean;
   autoComplete?: string;
@@ -30,13 +33,16 @@ interface InputProps {
 export default function Input({
   id,
   label,
+  appearance = "default",
   hint,
   error,
   value,
   onChange,
   placeholder,
   type = "text",
+  multiple = false,
   disabled = false,
+  readOnly = false,
   className = "",
   autoFocus = false,
   autoComplete,
@@ -65,10 +71,12 @@ export default function Input({
       <input
         id={inputId}
         type={type}
+        multiple={multiple}
         value={value}
         onChange={onChange}
         placeholder={placeholder}
         disabled={disabled}
+        readOnly={readOnly}
         autoFocus={autoFocus}
         autoComplete={autoComplete}
         inputMode={inputMode}
@@ -83,7 +91,7 @@ export default function Input({
         min={min}
         max={max}
         step={step}
-        className="manor-input"
+        className={`manor-input${appearance === "quiet" ? " manor-input--quiet" : ""}`}
         style={error ? { background: "var(--surface-panel)", boxShadow: "0 0 0 3px rgba(214,95,89,0.22)" } : undefined}
       />
       {hint && !error && (

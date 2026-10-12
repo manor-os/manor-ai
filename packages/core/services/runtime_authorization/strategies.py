@@ -31,6 +31,16 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 
+def _envelope_granted_sandbox_skips_durable_catalog(request: RuntimeAuthorizationRequest) -> bool:
+    if "sandbox" not in request.bound_tool_names:
+        return False
+    if not request.tool_name or request.tool_name not in request.bound_tool_names:
+        return False
+    from packages.core.ai.runtime.composite_tools import SANDBOX_LEGACY_TOOL_BY_ACTION
+
+    return request.tool_name in {"sandbox", *SANDBOX_LEGACY_TOOL_BY_ACTION.values()}
+
+
 class DelegatedRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
     def __init__(
         self,
@@ -86,9 +96,20 @@ class DelegatedRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
         # Runtime-owned control tools are created for one concrete loop and
         # have no durable catalog binding. The envelope is sufficient only
         # after the non-master agent identity has been revalidated above.
-        # A master Host normally keeps its broad first-party surface, but an
-        # MCP call inside a Workspace/Task must still re-read the current
-        # contextual provider scope contributed by service Agents.
+        # Master defaults are server-owned; a Task Host's non-default tools
+        # must still have a current Agent/Workspace deployment binding.
+        from packages.core.ai.runtime.approval_classifier import RUNTIME_LOOP_CONTROL_TOOL_NAMES
+        from packages.core.ai.runtime.profiles import WORKSPACE_AGENT_TOOL_PROFILE
+        from packages.core.ai.runtime.tool_visibility import runtime_tool_auto_pass_names
+
+        contextual_task_master_tool = bool(
+            principal_is_master
+            and request.task_id
+            and request.tool_name not in runtime_tool_auto_pass_names(
+                is_master=True,
+                tool_profile=WORKSPACE_AGENT_TOOL_PROFILE,
+            )
+        )
         contextual_master_mcp = bool(
             principal_is_master
             and request.tool_name
@@ -96,11 +117,12 @@ class DelegatedRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
             and (request.workspace_id or request.task_id or request.conversation_id)
         )
         if (
-            (not principal_is_master or contextual_master_mcp)
+            (not principal_is_master or contextual_task_master_tool or contextual_master_mcp)
             and not (
                 request.access is RuntimeAuthorizationAccess.CONTROL
-                and request.tool_name == "submit_result"
+                and request.tool_name in RUNTIME_LOOP_CONTROL_TOOL_NAMES
             )
+            and not _envelope_granted_sandbox_skips_durable_catalog(request)
         ):
             binding = await self._binding_verifier.verify(db, request)
             if not binding.current:
@@ -196,6 +218,19 @@ class ExternalRuntimeAuthorizationStrategy(RuntimeAuthorizationStrategy):
             RuntimeAuthorizationAccess.USE,
         }:
             return PermissionDecision.allow(AuthorizationRule.EXTERNAL_TOOL_BINDING)
+        if (
+            request.access is RuntimeAuthorizationAccess.CONTROL
+            and request.tool_name == "resident_maintenance_draft"
+            and request.subject.action_key == "runtime.control.resident_maintenance_draft"
+            and request.runtime_surface == "public_customer_chat"
+        ):
+            # A request-local verified resident may prepare their own draft.
+            # This grants no PMS write; the handler rechecks both delegations.
+            from packages.core.services.webchat_resident import current_runtime_scope
+
+            scope = current_runtime_scope()
+            if scope and scope.entity_id == request.entity_id and scope.conversation_id == request.conversation_id:
+                return PermissionDecision.allow(AuthorizationRule.EXTERNAL_RESIDENT_DRAFT)
         if request.subject.action_key == "channel.reply":
             return PermissionDecision.allow(AuthorizationRule.EXTERNAL_SUPPORT_REPLY)
         if request.workspace_id and request.subject.action_key == "workspace.task.create":

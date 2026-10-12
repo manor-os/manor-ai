@@ -10,15 +10,16 @@ import { IconTrash } from "../icons";
 import { t } from "../../lib/i18n";
 import Select from "../ui/Select";
 import UserAvatar from "../ui/UserAvatar";
+import type { ShareRole } from "../../lib/shareRoles";
 
-export type ShareRole = "viewer" | "commenter" | "editor" | "curator";
+export type { ShareRole } from "../../lib/shareRoles";
 
 function _roleOptions(): { value: ShareRole; label: string; hint: string }[] {
   return [
     { value: "viewer", label: t("permissions.role.viewer.label"), hint: t("permissions.role.viewer.hint") },
     { value: "commenter", label: t("permissions.role.commenter.label"), hint: t("permissions.role.commenter.hint") },
     { value: "editor", label: t("permissions.role.editor.label"), hint: t("permissions.role.editor.hint") },
-    { value: "curator", label: t("permissions.role.curator.label"), hint: t("permissions.role.curator.hint") },
+    { value: "co_owner", label: t("permissions.role.co_owner.label"), hint: t("permissions.role.co_owner.hint") },
   ];
 }
 
@@ -109,7 +110,7 @@ export default function PersonRow({
           <Select
             value={role}
             onChange={(v) => onRoleChange?.(v as ShareRole)}
-            options={roleOpts.map((r) => ({ value: r.value, label: r.label }))}
+            options={roleOpts.map((r) => ({ value: r.value, label: r.label, description: r.hint }))}
           />
         </div>
       )}

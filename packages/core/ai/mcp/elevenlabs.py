@@ -571,13 +571,15 @@ async def _register_document(name: str, fs_path: str, file_size: int) -> None:
 
         rel_dir = str(Path(rel_path).parent).replace("\\", "/")
         rel_dir = "" if rel_dir == "." else rel_dir
-        folder_id = await ensure_folder_path(entity_id, rel_dir)
         call_context = _call_context_var.get()
         workspace_id = call_context.get("workspace_id")
         task_id = call_context.get("task_id")
         agent_id = call_context.get("agent_id")
         conversation_id = call_context.get("conversation_id")
         user_id = call_context.get("user_id")
+        folder_id = await ensure_folder_path(
+            entity_id, rel_dir, owner_id=user_id or None,
+        )
         document_id = None
         async with async_session() as db:
             doc = await upsert_document_by_fs_path(
@@ -590,6 +592,8 @@ async def _register_document(name: str, fs_path: str, file_size: int) -> None:
                 mime_type="audio/mpeg",
                 source="elevenlabs",
                 created_by=user_id,
+                owner_id=user_id,
+                visibility="private",
                 folder_id=folder_id,
             )
             doc.source = "elevenlabs"

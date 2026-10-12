@@ -7,6 +7,7 @@ execution context (set by WorkspaceChat or EmbeddedChat).
 from __future__ import annotations
 
 from typing import Any
+from packages.core.contracts.workspace_search import WORKSPACE_SEARCH_CATEGORIES
 
 WORKSPACE_SEARCH_SCHEMA = {
     "type": "function",
@@ -15,8 +16,8 @@ WORKSPACE_SEARCH_SCHEMA = {
         "description": (
             "Search this workspace's goals, tasks, agents, knowledge, "
             "generated artifacts/files, execution plans, rules, runtime evidence, "
-            "learning candidates, and decision history. Use when the "
-            "user asks about workspace status, progress, specific items, "
+            "learning candidates, decision history, and Need Input answers. "
+            "Use when the user asks about workspace status, progress, specific items, "
             "or anything about what's happening in this workspace."
         ),
         "parameters": {
@@ -28,11 +29,7 @@ WORKSPACE_SEARCH_SCHEMA = {
                 },
                 "category": {
                     "type": "string",
-                    "enum": [
-                        "goals", "tasks", "agents", "knowledge", "artifacts",
-                        "files", "generated_files", "plans", "rules", "history",
-                        "runtime", "evidence", "learning", "all",
-                    ],
+                    "enum": list(WORKSPACE_SEARCH_CATEGORIES),
                     "description": "Narrow search to a category. Default: all.",
                 },
                 "status": {

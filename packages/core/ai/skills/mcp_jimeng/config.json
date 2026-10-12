@@ -10,5 +10,9 @@
     "mcp__jimeng__generate_image",
     "mcp__jimeng__edit_image",
     "mcp__jimeng__generate_video"
-  ]
+  ],
+  "search": {
+    "terms": ["seedream", "seedance", "bytedance", "chinese prompt", "text to image", "text to video", "ai picture"],
+    "examples": ["generate image from chinese prompt", "edit photo with jimeng", "make short video clip jimeng", "create poster picture jimeng"]
+  }
 }

@@ -9,6 +9,7 @@ Ported from manor-multi-agent operation_create.py / operation_create_prompt.py.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -95,6 +96,7 @@ DEFAULT_FIELDS: Dict[str, Any] = {
     "services": [],
     "agent_mappings": [],
     "goals": [],
+    "stats": [],
     "rules": [],
     "automations": [],
     "evaluation": {
@@ -116,7 +118,7 @@ DEFAULT_FIELDS: Dict[str, Any] = {
     },
     # Global autonomous runtime is independent from service-level autonomy
     # and from whether the workspace tracks any Goals.
-    "heartbeat_enabled": False,
+    "heartbeat_enabled": True,
     "notes": "",
 }
 
@@ -174,9 +176,17 @@ SETUP_SYSTEM_PROMPT = runtime_workspace_setup_system_prompt(
 
 async def start_setup(entity_id: str) -> WorkspaceSetupSession:
     """Initialize a new workspace setup session."""
+    from packages.core.constants.workspace_drafts import (
+        CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
+        WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
+    )
+
     return WorkspaceSetupSession(
         entity_id=entity_id,
-        fields=copy.deepcopy(DEFAULT_FIELDS),
+        fields={
+            **copy.deepcopy(DEFAULT_FIELDS),
+            WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD: CURRENT_WORKSPACE_DRAFT_SCHEMA_VERSION,
+        },
         messages=[],
         ready=False,
         missing=sorted(REQUIRED_FIELDS),
@@ -226,15 +236,41 @@ async def process_setup_turn(
         session_messages=session.messages,
         metadata=metadata,
         stream_handler=stream_handler,
+        user_id=session.user_id,
     )
     response_text = completion.content
 
     # Parse status block from response
     status = _extract_status_block(response_text)
     if status:
-        session.fields = status.get("fields", session.fields)
+        from packages.core.constants.workspace_drafts import (
+            WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD,
+            uses_ui_runtime_mode,
+        )
+        from packages.core.services.workspace_goal_measurements import resolve_draft_goal_measurements
+
+        schema_version = session.fields.get(WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD)
+        runtime_mode = session.fields.get("heartbeat_enabled")
+        preserve_runtime_mode = uses_ui_runtime_mode(session.fields)
+        generated_fields = dict(status.get("fields", session.fields))
+        # A model-authored status block cannot mint a manual prohibition.
+        generated_fields.pop(EXPLICIT_HARD_BLOCK_RULES_FIELD, None)
+        if EXPLICIT_HARD_BLOCK_RULES_FIELD in session.fields:
+            generated_fields[EXPLICIT_HARD_BLOCK_RULES_FIELD] = copy.deepcopy(
+                session.fields[EXPLICIT_HARD_BLOCK_RULES_FIELD]
+            )
+        session.fields = normalize_workspace_draft_governance(generated_fields)
+        if preserve_runtime_mode:
+            session.fields["heartbeat_enabled"] = runtime_mode
+        if schema_version is not None:
+            session.fields[WORKSPACE_DRAFT_SCHEMA_VERSION_FIELD] = schema_version
         session.ready = status.get("ready", False)
         session.missing = status.get("missing", [])
+        try:
+            resolve_draft_goal_measurements(session.fields)
+        except ValueError:
+            session.ready = False
+            session.missing = sorted(set(session.missing) | {"goals"})
 
     # Strip the status block from the visible response
     visible_response = _strip_status_block(response_text).strip()
@@ -262,6 +298,7 @@ async def auto_generate_model(
         entity_id=session.entity_id,
         fields=session.fields,
         metadata=metadata,
+        user_id=session.user_id,
     )
     response_text = completion.content
 
@@ -279,6 +316,13 @@ async def auto_generate_model(
         else:
             model = {}
 
+    if isinstance(model, dict):
+        model.pop(EXPLICIT_HARD_BLOCK_RULES_FIELD, None)
+        if EXPLICIT_HARD_BLOCK_RULES_FIELD in session.fields:
+            model[EXPLICIT_HARD_BLOCK_RULES_FIELD] = copy.deepcopy(
+                session.fields[EXPLICIT_HARD_BLOCK_RULES_FIELD]
+            )
+        model = normalize_workspace_draft_governance(model)
     return model
 
 
@@ -352,6 +396,7 @@ async def resolve_agent_mappings(
         service_descriptions=service_descriptions,
         agent_descriptions=agent_descriptions,
         metadata=metadata,
+        user_id=session.user_id,
     )
     response_text = completion.content
 
@@ -731,6 +776,82 @@ async def _install_workspace_draft_automations(
     return created
 
 
+def _draft_source_excerpt(fields: dict[str, Any], source_ids: list[str]) -> str:
+    """Bounded excerpt of the draft sources that ground a starter document."""
+    from packages.core.services.workspace_draft_sources import source_excerpt
+
+    return source_excerpt(fields, source_ids)
+
+
+def _link_document_name(url: str) -> str:
+    """Stable, filesystem-safe markdown name for a link source."""
+    import re
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    slug = re.sub(r"[^a-zA-Z0-9一-鿿]+", "-", (parsed.path or "").strip("/")).strip("-")[:60]
+    host = (parsed.netloc or "link").replace(":", "-")
+    return f"{host}-{slug}.md" if slug else f"{host}.md"
+
+
+async def _attach_draft_sources_to_group(
+    db: AsyncSession,
+    *,
+    session: "WorkspaceSetupSession",
+    workspace_id: str,
+    group_id: str,
+    source_ids: list[str],
+) -> None:
+    """Add draft sources to a knowledge net: documents as members, links as markdown docs."""
+    from packages.core.models.document import Document, DocumentGroupMember
+    from packages.core.services.document_metadata import merge_document_metadata
+    from packages.core.services import knowledge_starter
+    from packages.core.services.workspace_draft_sources import find_source
+
+    wanted = list(dict.fromkeys(str(s).strip() for s in source_ids if str(s or "").strip()))
+    if not wanted:
+        return
+    existing_members = set((await db.execute(
+        select(DocumentGroupMember.document_id).where(DocumentGroupMember.group_id == group_id)
+    )).scalars().all())
+    for source_id in wanted:
+        source = find_source(session.fields, source_id)
+        if not source or source.get("status") != "ready":
+            continue
+        if source.get("kind") == "document" and source.get("document_id"):
+            document = (await db.execute(
+                select(Document).where(
+                    Document.id == str(source["document_id"]),
+                    Document.entity_id == session.entity_id,
+                    Document.is_trashed == False,  # noqa: E712
+                )
+            )).scalar_one_or_none()
+            if document is None or document.id in existing_members:
+                continue
+            db.add(DocumentGroupMember(document_id=document.id, group_id=group_id))
+            existing_members.add(document.id)
+            continue
+        if source.get("kind") == "link" and source.get("url"):
+            url = str(source["url"])
+            body = (
+                f"# {source.get('name') or url}\n\nSource: {url}\n\n"
+                f"{str(source.get('text') or '').strip()}"
+            )
+            doc = await knowledge_starter.write_markdown_document(
+                db,
+                entity_id=session.entity_id,
+                name=_link_document_name(url),
+                content=body,
+                source="workspace_draft_link",
+                metadata=merge_document_metadata(
+                    origin={"workspace_id": workspace_id, "url": url, "tool_name": "workspace_draft_source"},
+                    extra={"draft_source_id": source_id},
+                ),
+            )
+            db.add(DocumentGroupMember(document_id=doc.id, group_id=group_id))
+            existing_members.add(doc.id)
+
+
 def _should_generate_starter_doc(attachment: dict[str, Any], mode: str) -> bool:
     explicit = _optional_bool(attachment.get("generate_starter_doc"))
     if explicit is not None:
@@ -740,21 +861,7 @@ def _should_generate_starter_doc(attachment: dict[str, Any], mode: str) -> bool:
     return mode == "create_new"
 
 
-_GOVERNANCE_POLICY_KEYS = {
-    "never_allow_actions",
-    "hitl_required_actions",
-    "auto_approve_actions",
-    "never_allow_capabilities",
-    "hitl_required_capabilities",
-    "auto_approve_capabilities",
-    "max_risk_level",
-    "budget_caps_per_kind",
-}
-_GOVERNANCE_ACTION_TO_CAPABILITY_FIELD = {
-    "never_allow_actions": "never_allow_capabilities",
-    "hitl_required_actions": "hitl_required_capabilities",
-    "auto_approve_actions": "auto_approve_capabilities",
-}
+_GOVERNANCE_POLICY_KEYS = {"approval", "max_risk_level", "budget_caps_per_kind"}
 
 
 def _unique_strings(values: Any) -> list[str]:
@@ -788,33 +895,21 @@ def _explicit_rule_capability_patterns(rule: dict[str, Any]) -> list[str]:
     return []
 
 
-def _capability_patterns_for_action_patterns(patterns: list[str]) -> list[str]:
-    from packages.core.ai.runtime import runtime_capability_id_for_action_key
-
-    capability_patterns: list[str] = []
-    for pattern in patterns:
-        capability_id = runtime_capability_id_for_action_key(pattern)
-        if capability_id:
-            capability_patterns.append(capability_id)
-    return _unique_strings(capability_patterns)
-
-
 def _infer_rule_enforcement(rule: dict[str, Any]) -> dict[str, Any] | None:
     explicit_capability_patterns = _explicit_rule_capability_patterns(rule)
     explicit_patterns = _explicit_rule_patterns(rule)
-    if not explicit_patterns and not explicit_capability_patterns:
+    if not explicit_patterns and not explicit_capability_patterns and not rule.get("approval_selectors"):
         return None
 
     patterns = explicit_patterns
-    capability_patterns = explicit_capability_patterns or _capability_patterns_for_action_patterns(patterns)
+    capability_patterns = explicit_capability_patterns
     rule_type = str(rule.get("rule_type") or "").strip().lower()
 
     def _result(field: str, rule_type_value: str) -> dict[str, Any]:
         return {
-            "field": field,
+            "effect": {"auto_approve_actions": "allow", "hitl_required_actions": "ask", "never_allow_actions": "deny"}[field],
             "rule_type": rule_type_value,
             "patterns": patterns,
-            "capability_field": _GOVERNANCE_ACTION_TO_CAPABILITY_FIELD[field],
             "capability_patterns": capability_patterns,
         }
 
@@ -825,6 +920,157 @@ def _infer_rule_enforcement(rule: dict[str, Any]) -> dict[str, Any] | None:
     if rule_type in {"deny", "never_allow", "block", "draft_only"}:
         return _result("never_allow_actions", rule_type)
     return None
+
+
+_HARD_BLOCK_RULE_TYPES = frozenset({"deny", "never_allow", "block", "draft_only"})
+EXPLICIT_HARD_BLOCK_RULES_FIELD = "_explicit_hard_block_rules"
+
+
+def workspace_rule_fingerprint(rule: dict[str, Any]) -> str:
+    """Bind a verified human prohibition to its exact draft rule, not its key."""
+
+    payload = json.dumps(rule, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def normalize_workspace_draft_governance(fields: dict[str, Any]) -> dict[str, Any]:
+    """Project system-authored draft defaults without weakening confirmed bans.
+
+    Confirmation fingerprints are server-owned draft state. Only the typed
+    architect tool writes them after checking the user's actual quote; public
+    field updates and legacy model output cannot create that authority.
+    Existing Workspace rules and the ordinary governance API do not use this
+    new-Workspace configuration projection.
+    """
+    from packages.core.governance import WorkspacePolicy, policy_to_dict
+    from packages.core.governance.defaults import normalize_default_workspace_governance
+
+    projected = copy.deepcopy(fields)
+    rules = [rule for rule in projected.get("rules") or [] if isinstance(rule, dict)]
+    confirmations = projected.get(EXPLICIT_HARD_BLOCK_RULES_FIELD)
+    confirmations = confirmations if isinstance(confirmations, dict) else {}
+    manual_indexes = {
+        idx for idx, rule in enumerate(rules)
+        if str(rule.get("rule_type") or "").strip().lower() in _HARD_BLOCK_RULE_TYPES
+        and str(rule.get("rule_key") or "")
+        and confirmations.get(str(rule.get("rule_key") or "")) == workspace_rule_fingerprint(rule)
+    }
+    manual_rules = [rule for idx, rule in enumerate(rules) if idx in manual_indexes]
+    defaults = [rule for idx, rule in enumerate(rules) if idx not in manual_indexes]
+    raw_policy = projected.get("governance_policy") or projected.get("governance")
+    policy = _build_governance_policy_from_rules([], raw_policy) or WorkspacePolicy()
+    # Reconciliation is repeatable: previously compiled, confirmed bans are
+    # put back by the same rules, not converted into duplicate approval gates.
+    normalized_rules, normalized_policy, _ = normalize_default_workspace_governance(defaults, policy)
+    remaining = iter(normalized_rules)
+    if "rules" in projected:
+        projected["rules"] = [rule if idx in manual_indexes else next(remaining) for idx, rule in enumerate(rules)]
+    effective_policy = _build_governance_policy_from_rules(manual_rules + normalized_rules, policy_to_dict(normalized_policy))
+    # A wholly unconfigured Workspace must retain DEFAULT_POLICY's normal
+    # routine grants, rather than persisting an empty "no opinion" row.
+    if raw_policy or _build_governance_policy_from_rules(rules, {}) is not None:
+        projected["governance_policy"] = policy_to_dict(effective_policy)
+        if "governance" in projected:
+            projected["governance"] = copy.deepcopy(projected["governance_policy"])
+    valid_confirmations = {
+        str(rule["rule_key"]): workspace_rule_fingerprint(rule)
+        for rule in manual_rules
+    }
+    if valid_confirmations:
+        projected[EXPLICIT_HARD_BLOCK_RULES_FIELD] = valid_confirmations
+    else:
+        projected.pop(EXPLICIT_HARD_BLOCK_RULES_FIELD, None)
+    return projected
+
+# Words a person uses when they ask for a prohibition. A hard block may only
+# be installed on the strength of the user's own words containing one of
+# these; "draft first" / "show me before posting" / "只出草稿" are review
+# wishes and become approval gates instead.
+USER_PROHIBITION_MARKERS: tuple[str, ...] = (
+    "禁止", "不允许", "不要", "不得", "不准", "不能", "绝不", "严禁",
+    "只能添加", "只允许添加",
+    "never", "do not", "don't", "must not", "mustn't", "forbid", "prohibit",
+    "not allowed", "no publishing", "add-only", "add only", "create-only", "create only",
+)
+
+
+def user_requested_hard_block(text: str) -> bool:
+    """Whether ``text`` (the user's own words) asks for a prohibition."""
+
+    lowered = " ".join(str(text or "").split()).casefold()
+    return bool(lowered) and any(marker in lowered for marker in USER_PROHIBITION_MARKERS)
+_APPROVAL_RULE_TYPES = frozenset({
+    "approval_required", "hitl_required", "require_approval", "review_required",
+})
+
+
+def rule_enforcement_conflicts(rules: Any) -> list[dict[str, Any]]:
+    """Patterns claimed by both a hard-block rule and an approval rule.
+
+    Deny gates win at evaluation time, so an approval rule on the same
+    action never fires. That is almost always a drafting mistake (a
+    ``draft_only`` rule next to an "ask before posting" rule) and must be
+    surfaced wherever rules are authored: draft lint, ``ws_propose_rule``
+    and operation-draft validation.
+    """
+
+    blocking: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    approval: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for raw_rule in rules if isinstance(rules, list) else []:
+        if not isinstance(raw_rule, dict):
+            continue
+        enforcement = _infer_rule_enforcement(raw_rule)
+        if not enforcement:
+            continue
+        rule_type = str(raw_rule.get("rule_type") or enforcement["rule_type"]).strip().lower()
+        if rule_type in _HARD_BLOCK_RULE_TYPES:
+            bucket = blocking
+        elif rule_type in _APPROVAL_RULE_TYPES:
+            bucket = approval
+        else:
+            continue
+        for kind, patterns in (
+            ("action", enforcement["patterns"]),
+            ("capability", enforcement["capability_patterns"]),
+        ):
+            for pattern in patterns:
+                bucket.setdefault((kind, pattern), []).append(raw_rule)
+
+    conflicts: list[dict[str, Any]] = []
+    for key in blocking:
+        if key not in approval:
+            continue
+        kind, pattern = key
+        conflicts.append({
+            "kind": kind,
+            "pattern": pattern,
+            "blocking_rule_keys": [
+                str(r.get("rule_key") or r.get("description") or "?") for r in blocking[key]
+            ],
+            "blocking_rule_types": [
+                str(r.get("rule_type") or "").strip().lower() for r in blocking[key]
+            ],
+            "approval_rule_keys": [
+                str(r.get("rule_key") or r.get("description") or "?") for r in approval[key]
+            ],
+        })
+    return conflicts
+
+
+def describe_rule_enforcement_conflict(conflict: dict[str, Any]) -> str:
+    blockers = ", ".join(
+        f"{key} (rule_type={rule_type})"
+        for key, rule_type in zip(
+            conflict["blocking_rule_keys"], conflict["blocking_rule_types"], strict=False
+        )
+    )
+    approvers = ", ".join(conflict["approval_rule_keys"])
+    return (
+        f"{conflict['pattern']!r} is hard-blocked by {blockers} and approval-required "
+        f"by {approvers}; the hard block wins and the approval never happens. Keep one: "
+        f"retype the blocking rule to approval_required if the agent may act after "
+        f"approval, or drop the approval rule if the agent must never do this."
+    )
 
 
 def _enrich_operating_rules(rules: Any) -> list[dict[str, Any]]:
@@ -852,44 +1098,15 @@ def _build_governance_policy_from_rules(
     rules: list[dict[str, Any]],
     raw_policy: Any,
 ):
-    from packages.core.governance import WorkspacePolicy
+    from packages.core.governance import policy_from_dict
+    from packages.core.governance.approval_projection import replace_workspace_rules
 
     raw = raw_policy if isinstance(raw_policy, dict) else {}
-    policy = WorkspacePolicy()
-    policy.never_allow_actions = _unique_strings(raw.get("never_allow_actions"))
-    policy.hitl_required_actions = _unique_strings(raw.get("hitl_required_actions"))
-    policy.auto_approve_actions = _unique_strings(raw.get("auto_approve_actions"))
-    policy.never_allow_capabilities = _unique_strings(raw.get("never_allow_capabilities"))
-    policy.hitl_required_capabilities = _unique_strings(raw.get("hitl_required_capabilities"))
-    policy.auto_approve_capabilities = _unique_strings(raw.get("auto_approve_capabilities"))
-    if raw.get("max_risk_level") in {"low", "medium", "high"}:
-        policy.max_risk_level = raw["max_risk_level"]
-    caps = raw.get("budget_caps_per_kind")
-    if isinstance(caps, dict):
-        policy.budget_caps_per_kind = {
-            str(k): int(v) for k, v in caps.items()
-            if isinstance(k, str) and isinstance(v, int) and v >= 0
-        }
-
-    inferred_any = False
-    for rule in rules:
-        enforcement = _infer_rule_enforcement(rule)
-        if not enforcement:
-            continue
-        field = enforcement["field"]
-        merged = _unique_strings(getattr(policy, field) + enforcement["patterns"])
-        setattr(policy, field, merged)
-        capability_field = enforcement["capability_field"]
-        capability_merged = _unique_strings(
-            getattr(policy, capability_field) + enforcement["capability_patterns"]
-        )
-        setattr(policy, capability_field, capability_merged)
-        inferred_any = True
-
-    has_raw_policy = any(key in raw for key in _GOVERNANCE_POLICY_KEYS)
-    if not has_raw_policy and not inferred_any:
+    policy = policy_from_dict(raw)
+    projected = replace_workspace_rules(policy, rules)
+    if not any(key in raw for key in _GOVERNANCE_POLICY_KEYS) and not (projected.approval.policy if hasattr(projected.approval, "policy") else projected.approval).rules:
         return None
-    return policy
+    return projected
 
 
 def _build_knowledge_policy(
@@ -961,7 +1178,12 @@ async def finalize_setup(
         except Exception:
             pass
 
-    fields = session.fields
+    fields = normalize_workspace_draft_governance(session.fields)
+
+    from packages.core.constants.workspace_drafts import uses_ui_runtime_mode
+
+    if uses_ui_runtime_mode(fields) and not isinstance(fields.get("heartbeat_enabled"), bool):
+        raise WorkspaceProvisioningError("Choose Automatic or Manual mode before creating the Workspace")
 
     operating_rules = _enrich_operating_rules(fields.get("rules", []))
     raw_budget_policy = fields.get("budget_policy") if isinstance(fields.get("budget_policy"), dict) else {}
@@ -985,9 +1207,16 @@ async def finalize_setup(
     if not isinstance(blueprint_operating_model, dict):
         blueprint_operating_model = {}
 
-    normalized_goals = GoalIdentityFactory.normalize_records(
-        list(fields.get("goals") or [])
+    from packages.core.services.workspace_goal_measurements import (
+        materialize_draft_stats,
+        resolve_draft_goal_measurements,
     )
+
+    try:
+        measured_goals, stat_definitions = resolve_draft_goal_measurements(fields)
+    except ValueError as exc:
+        raise WorkspaceProvisioningError(str(exc)) from exc
+    normalized_goals = GoalIdentityFactory.normalize_records(measured_goals)
 
     # Build operating model
     operating_model: Dict[str, Any] = {
@@ -1001,6 +1230,9 @@ async def finalize_setup(
         "channel_config": fields.get("channel_config", {}),
         "agent_mappings": fields.get("agent_mappings", []),
     }
+    if "app_view" in fields:
+        from packages.core.services.workspace_app_view import normalize_app_view_config
+        operating_model["app_view"] = normalize_app_view_config(fields["app_view"])
 
     # Create Workspace record
     from packages.core.services.plan_gate import enforce_workspace_capacity
@@ -1036,6 +1268,8 @@ async def finalize_setup(
     )
     db.add(workspace)
     await db.flush()
+    from packages.core.governance.approval_policy_service import initialize_workspace_approval
+    await initialize_workspace_approval(db, workspace)
     from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
     await ensure_workspace_artifact_folder(db, workspace)
     await ensure_workspace_owner_membership(
@@ -1330,11 +1564,22 @@ async def finalize_setup(
             if existing.workspace_id == workspace_id:
                 purpose = ka.get("purpose") or (existing.settings or {}).get("purpose", "")
                 if generate_starter_doc:
-                    existing.settings = with_starter_document_settings(
+                    updated_settings = with_starter_document_settings(
                         existing.settings,
                         group_name=existing.name,
                         status="scheduled",
                     )
+                    excerpt = _draft_source_excerpt(fields, ka.get("source_ids") or [])
+                    if excerpt:
+                        updated_settings["starter_document"]["source_excerpt"] = excerpt
+                    existing.settings = updated_settings
+                await _attach_draft_sources_to_group(
+                    db,
+                    session=session,
+                    workspace_id=workspace_id,
+                    group_id=existing.id,
+                    source_ids=list(ka.get("source_ids") or []),
+                )
                 materialized_knowledge.append({
                     "group_id": existing.id,
                     "name": existing.name,
@@ -1369,6 +1614,9 @@ async def finalize_setup(
                         group_name=name,
                         status="scheduled",
                     )
+                    excerpt = _draft_source_excerpt(fields, ka.get("source_ids") or [])
+                    if excerpt:
+                        settings["starter_document"]["source_excerpt"] = excerpt
                 db.add(DocumentGroup(
                     id=group_id,
                     entity_id=session.entity_id,
@@ -1387,6 +1635,13 @@ async def finalize_setup(
                 )).scalars().all()
                 for document_id in member_rows:
                     db.add(DocumentGroupMember(document_id=document_id, group_id=group_id))
+                await _attach_draft_sources_to_group(
+                    db,
+                    session=session,
+                    workspace_id=workspace_id,
+                    group_id=group_id,
+                    source_ids=list(ka.get("source_ids") or []),
+                )
                 materialized_knowledge.append({
                     "group_id": group_id,
                     "name": name,
@@ -1437,6 +1692,9 @@ async def finalize_setup(
                 group_name=kname,
                 status="scheduled",
             )
+            excerpt = _draft_source_excerpt(fields, ka.get("source_ids") or [])
+            if excerpt:
+                group_settings["starter_document"]["source_excerpt"] = excerpt
 
         db.add(DocumentGroup(
             id=group_id,
@@ -1458,6 +1716,14 @@ async def finalize_setup(
             for document_id in member_rows:
                 db.add(DocumentGroupMember(document_id=document_id, group_id=group_id))
 
+        await _attach_draft_sources_to_group(
+            db,
+            session=session,
+            workspace_id=workspace_id,
+            group_id=group_id,
+            source_ids=list(ka.get("source_ids") or []),
+        )
+
         if generate_starter_doc:
             starter_doc_requests.append({
                 "group_id": group_id,
@@ -1471,8 +1737,16 @@ async def finalize_setup(
             "purpose": ka.get("purpose", ""),
         })
 
-    operating_model["knowledge"] = _build_knowledge_policy(fields, materialized_knowledge)
-    workspace.operating_model = dict(operating_model)
+    # ``operating_model`` is the very dict object that was handed to the
+    # ``Workspace`` constructor above, and the row has already been flushed.
+    # Mutating that shared dict in place and then re-assigning an equal copy
+    # leaves SQLAlchemy comparing two identical values, so it emits no UPDATE
+    # and the knowledge policy is silently dropped. Build a fresh dict instead.
+    operating_model = {
+        **operating_model,
+        "knowledge": _build_knowledge_policy(fields, materialized_knowledge),
+    }
+    workspace.operating_model = operating_model
 
     governance_policy = _build_governance_policy_from_rules(
         operating_rules,
@@ -1492,8 +1766,8 @@ async def finalize_setup(
             )
             _report(
                 "governance_policy_created",
-                hitl=len(governance_policy.hitl_required_actions),
-                blocked=len(governance_policy.never_allow_actions),
+                hitl=sum(rule.effect == "ask" for rule in (governance_policy.approval.policy if hasattr(governance_policy.approval, "policy") else governance_policy.approval).rules),
+                blocked=sum(rule.effect == "deny" for rule in (governance_policy.approval.policy if hasattr(governance_policy.approval, "policy") else governance_policy.approval).rules),
             )
         except Exception:
             logger.exception("Failed to create governance policy for workspace %s", workspace_id)
@@ -1605,6 +1879,7 @@ async def finalize_setup(
         db.add(ChannelConfig(
             id=cc_id,
             entity_id=session.entity_id,
+            owner_user_id=session.user_id if ch_type == "webchat" else None,
             workspace_id=workspace_id,
             channel_type=ch_type,
             provider=provider,
@@ -1690,6 +1965,7 @@ async def finalize_setup(
         db.add(Channel(
             id=generate_ulid(),
             entity_id=session.entity_id,
+            user_id=session.user_id if ch_type == "webchat" else None,
             workspace_id=workspace_id,
             type=ch_type,
             name=ch_type,
@@ -1775,6 +2051,11 @@ async def finalize_setup(
 
     # ── Materialize Goal DB rows from operating_model.goals[] ──────────
     # Without real Goal rows, the Strategist has nothing to reason about.
+    stats_by_key = await materialize_draft_stats(
+        db, entity_id=session.entity_id, workspace_id=workspace_id,
+        definitions=stat_definitions,
+        goal_stat_keys={goal["stat_key"] for goal in normalized_goals if goal.get("stat_key")},
+    )
     goals_data = operating_model.get("goals", [])
     goals_created = 0
     for g in goals_data:
@@ -1809,7 +2090,8 @@ async def finalize_setup(
             is_workspace_internal_measurement_source,
         )
 
-        measurement_source = default_workspace_measurement_source(
+        linked_stat = stats_by_key.get(g.get("stat_key"))
+        measurement_source = None if linked_stat else default_workspace_measurement_source(
             g.get("measurement_source"),
             workspace_id=workspace_id,
         )
@@ -1820,6 +2102,7 @@ async def finalize_setup(
             id=generate_ulid(),
             entity_id=session.entity_id,
             workspace_id=workspace_id,
+            stat_id=linked_stat.id if linked_stat else None,
             title=title,
             description=g.get("description"),
             goal_key=goal_key,
@@ -1827,7 +2110,7 @@ async def finalize_setup(
             target_value=target_val,
             baseline_value=baseline_val,
             measurement_source=measurement_source,
-            measurement_cadence=measurement_cadence,
+            measurement_cadence=None if linked_stat else measurement_cadence,
             priority=int(g.get("priority", 3)),
             status="active",
             pace_status="unknown",
@@ -1903,12 +2186,15 @@ async def finalize_setup(
     workspace.heartbeat_enabled = runtime_ready and autonomous_enabled
     workspace.heartbeat_cadence = heartbeat_cadence
     workspace_settings = dict(workspace.settings or {})
+    # Scheduling is not approval. Automatic reviews may prepare proposals,
+    # but only the Workspace governance policy can authorize their execution.
     workspace_settings["provisioning"] = {
         "status": "ready" if runtime_ready else "needs_setup",
         "declared_service_count": len(declared_service_keys),
         "materialized_service_count": len(materialized_service_keys),
         "worker_bound_subscription_count": len(created_subs),
         "goal_count": goals_created,
+        "stat_count": len(stats_by_key),
         "starter_document_count": len(starter_doc_requests),
         "post_commit_dispatch": "pending" if runtime_ready else "not_required",
     }
@@ -1920,7 +2206,9 @@ async def finalize_setup(
     if workspace.heartbeat_enabled:
         try:
             from packages.core.services.workspace_runtime import install_workspace_runtime_schedules
-            await install_workspace_runtime_schedules(db, workspace, cadence=heartbeat_cadence)
+            await install_workspace_runtime_schedules(
+                db, workspace, cadence=heartbeat_cadence, user_id=session.user_id,
+            )
         except Exception as exc:
             logger.exception(
                 "Failed to install workspace runtime schedules for %s",
@@ -1930,6 +2218,9 @@ async def finalize_setup(
                 "Could not install the workspace runtime schedules"
             ) from exc
         _report("runtime_scheduled", heartbeat_cadence=heartbeat_cadence)
+        from packages.core.services.workspace_initial_review import prepare_initial_workspace_review
+
+        await prepare_initial_workspace_review(db, workspace)
     elif not runtime_ready:
         missing_runtime_parts: list[str] = []
         if not declared_service_keys or not created_subs:
@@ -1966,6 +2257,173 @@ async def finalize_setup(
     # transaction commits. Workers must never observe an uncommitted workspace.
     _report("post_commit_dispatch_pending", workspace_id=workspace_id)
     return workspace_id
+
+
+async def _workspace_agent_greeting_payload(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    entity_id: str,
+) -> list[dict[str, str]]:
+    subscriptions = list((await db.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.workspace_id == workspace_id,
+            AgentSubscription.entity_id == entity_id,
+            AgentSubscription.status == "active",
+        ).order_by(AgentSubscription.created_at.asc(), AgentSubscription.id.asc())
+    )).scalars().all())
+    # Chat membership is per Agent, even when that Agent serves several roles.
+    subscriptions_by_agent: dict[str, list[AgentSubscription]] = {}
+    for subscription in subscriptions:
+        subscriptions_by_agent.setdefault(subscription.agent_id, []).append(subscription)
+    agent_ids = list(subscriptions_by_agent)
+    agents = list((await db.execute(
+        select(Agent).where(Agent.id.in_(agent_ids))
+    )).scalars().all()) if agent_ids else []
+    agents_by_id = {agent.id: agent for agent in agents}
+    return [
+        {
+            "subscription_id": agent_subscriptions[0].id,
+            "agent_id": agent_id,
+            "agent_name": getattr(agents_by_id.get(agent_id), "name", None) or "Agent",
+            "service_key": ", ".join(dict.fromkeys(
+                subscription.service_key or "general"
+                for subscription in agent_subscriptions
+            )),
+            "system_prompt": getattr(agents_by_id.get(agent_id), "system_prompt", None) or "",
+        }
+        for agent_id, agent_subscriptions in subscriptions_by_agent.items()
+    ]
+
+
+async def dispatch_workspace_agent_greetings_once(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    entity_id: str,
+    progress: Optional[Any] = None,
+) -> dict[str, Any]:
+    """Dispatch Blueprint-path greetings without consuming normal startup."""
+
+    def _report(step: str, **payload: Any) -> None:
+        if progress is None:
+            return
+        try:
+            progress(step, payload)
+        except Exception:
+            pass
+
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if workspace is None:
+        return {
+            "workspace_id": workspace_id,
+            "agent_greetings_dispatched": False,
+            "reason": "not_found",
+        }
+
+    settings = dict(workspace.settings or {})
+    provisioning = dict(settings.get("provisioning") or {})
+    dispatch_status = str(
+        provisioning.get("agent_greetings_dispatch") or "pending"
+    )
+    if (
+        dispatch_status in {"dispatching", "dispatched"}
+        or provisioning.get("agent_greetings_dispatched") is True
+    ):
+        return {
+            "workspace_id": workspace_id,
+            "agent_greetings_dispatched": bool(
+                provisioning.get("agent_greetings_dispatched")
+            ),
+            "reason": f"already_{dispatch_status}",
+        }
+    if workspace.status != "active":
+        provisioning["agent_greetings_dispatch"] = "not_required"
+        provisioning["agent_greetings_dispatched"] = False
+        settings["provisioning"] = provisioning
+        workspace.settings = settings
+        await db.flush()
+        return {
+            "workspace_id": workspace_id,
+            "agent_greetings_dispatched": False,
+            "reason": f"workspace_{workspace.status}",
+        }
+
+    workspace_name = workspace.name
+    workspace_kind = workspace.kind or ""
+    provisioning["agent_greetings_dispatch"] = "dispatching"
+    settings["provisioning"] = provisioning
+    workspace.settings = settings
+    await db.commit()
+
+    greeting_payload = await _workspace_agent_greeting_payload(
+        db,
+        workspace_id=workspace_id,
+        entity_id=entity_id,
+    )
+    greeting_dispatched = False
+    warning = ""
+    if greeting_payload:
+        from packages.core.tasks.ai_tasks import send_agent_greetings
+
+        try:
+            send_agent_greetings.delay(
+                entity_id,
+                workspace_id,
+                workspace_name,
+                workspace_kind,
+                greeting_payload,
+            )
+            greeting_dispatched = True
+            _report("agent_greetings_dispatched", count=len(greeting_payload))
+        except Exception as exc:
+            logger.warning(
+                "Failed to dispatch agent greetings for %s",
+                workspace_id,
+                exc_info=True,
+            )
+            warning = str(exc)[:500] or type(exc).__name__
+
+    locked_workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if locked_workspace is not None:
+        final_settings = dict(locked_workspace.settings or {})
+        final_provisioning = dict(final_settings.get("provisioning") or {})
+        final_provisioning["agent_greetings_dispatch"] = (
+            "failed" if warning else "dispatched"
+        )
+        final_provisioning["agent_greetings_dispatched"] = greeting_dispatched
+        if warning:
+            final_provisioning["agent_greetings_dispatch_error"] = warning
+        else:
+            final_provisioning.pop("agent_greetings_dispatch_error", None)
+        final_settings["provisioning"] = final_provisioning
+        locked_workspace.settings = final_settings
+        await db.flush()
+
+    return {
+        "workspace_id": workspace_id,
+        "agent_greetings_dispatched": greeting_dispatched,
+        "reason": (
+            "dispatch_failed"
+            if warning
+            else "dispatched"
+            if greeting_payload
+            else "no_active_agents"
+        ),
+        "warnings": [f"agent_greetings: {warning}"] if warning else [],
+    }
 
 
 async def dispatch_workspace_post_commit(
@@ -2043,28 +2501,11 @@ async def dispatch_workspace_post_commit(
         send_agent_greetings,
     )
 
-    subscriptions = list((await db.execute(
-        select(AgentSubscription).where(
-            AgentSubscription.workspace_id == workspace.id,
-            AgentSubscription.entity_id == workspace.entity_id,
-            AgentSubscription.status == "active",
-        ).order_by(AgentSubscription.created_at.asc())
-    )).scalars().all())
-    agent_ids = [subscription.agent_id for subscription in subscriptions if subscription.agent_id]
-    agents = list((await db.execute(
-        select(Agent).where(Agent.id.in_(agent_ids))
-    )).scalars().all()) if agent_ids else []
-    agents_by_id = {agent.id: agent for agent in agents}
-    greeting_payload = [
-        {
-            "subscription_id": subscription.id,
-            "agent_id": subscription.agent_id,
-            "agent_name": getattr(agents_by_id.get(subscription.agent_id), "name", None) or "Agent",
-            "service_key": subscription.service_key or "general",
-            "system_prompt": getattr(agents_by_id.get(subscription.agent_id), "system_prompt", None) or "",
-        }
-        for subscription in subscriptions
-    ]
+    greeting_payload = await _workspace_agent_greeting_payload(
+        db,
+        workspace_id=workspace.id,
+        entity_id=workspace.entity_id,
+    )
     if greeting_payload:
         try:
             send_agent_greetings.delay(
@@ -2101,6 +2542,7 @@ async def dispatch_workspace_post_commit(
                 workspace.kind or "",
                 workspace.primary_work or "",
                 starter.get("task_key"),
+                starter.get("source_excerpt"),
             )
             starter_documents_dispatched += 1
         except Exception as exc:
@@ -2117,16 +2559,27 @@ async def dispatch_workspace_post_commit(
     if workspace.heartbeat_enabled:
         try:
             from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
+            if ((workspace.settings or {}).get("provisioning") or {}).get("initial_review_run_id"):
+                from packages.core.services.workspace_initial_review import dispatch_initial_workspace_review
 
-            run_strategist_review.apply_async(
-                args=[workspace.id],
-                kwargs=ReviewTrigger(
-                    kind=ReviewTriggerKind.EVENT, detail="workspace created",
-                ).celery_kwargs(),
-                countdown=strategist_eta_s,
-            )
-            strategist_dispatched = True
-            _report("strategist_dispatched", eta_seconds=strategist_eta_s)
+                strategist_eta_s = 0
+                strategist_dispatched = await dispatch_initial_workspace_review(db, workspace)
+                if not strategist_dispatched:
+                    warnings.append("strategist_review: durable initial dispatch pending")
+            else:
+                run_strategist_review.apply_async(
+                    args=[workspace.id],
+                    kwargs={
+                        **ReviewTrigger(
+                            kind=ReviewTriggerKind.EVENT, detail="workspace created",
+                        ).celery_kwargs(),
+                        "user_id": (workspace.settings or {}).get("created_by_user_id"),
+                    },
+                    countdown=strategist_eta_s,
+                )
+                strategist_dispatched = True
+            if strategist_dispatched:
+                _report("strategist_dispatched", eta_seconds=strategist_eta_s)
         except Exception as exc:
             logger.warning("Failed to dispatch first strategist review for %s", workspace.id, exc_info=True)
             warnings.append(f"strategist_review: {exc}")
@@ -2420,6 +2873,7 @@ async def _provision_custom_agent_for_mapping(
     operating_context: str,
     primary_work: str,
     mapping: Dict[str, Any],
+    requester_user_id: str | None = None,
 ) -> Tuple[str, str]:
     """Thin adapter from a workspace-architect mapping to the public
     ``agent_provisioning_service.provision_custom_agent`` function.
@@ -2443,7 +2897,9 @@ async def _provision_custom_agent_for_mapping(
         primary_work=primary_work,
         service_key=mapping.get("service_key", ""),
     )
-    result = await provision_custom_agent(db, entity_id=entity_id, spec=spec)
+    result = await provision_custom_agent(
+        db, entity_id=entity_id, spec=spec, requester_user_id=requester_user_id,
+    )
     unresolved_bindings = [
         warning
         for warning in result.warnings

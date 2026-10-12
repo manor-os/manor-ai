@@ -1,0 +1,17 @@
+{
+  "id": "motion-design",
+  "name": "motion-design",
+  "display_name": "Motion Design",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Technique guidance for designed motion in a Video Edit project: deterministic seek-driven animation, GSAP timelines and beat grids, 3D and 2.5D scenes, captions and audio mixing, transitions, and platform safe zones.",
+  "category": "video",
+  "output_format": "guidance",
+  "bundle_roots": ["references"],
+  "tags": ["video", "motion-graphics", "animation", "typography", "runtime-guidance", "builtin"],
+  "tools": [],
+  "search": {
+    "terms": ["animation", "gsap", "captions", "subtitles", "transitions", "3d", "audio mix", "safe zone", "beat sync"],
+    "examples": ["add word synced captions to video", "animate title with gsap timeline", "smooth transitions between video scenes", "make 3d scene motion for video"]
+  }
+}

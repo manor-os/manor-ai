@@ -64,7 +64,8 @@ test("PPTX CSS fallback thumbnails preserve 4:3 content and virtualize distant s
 
     await page.route(`**/api/v1/documents/${documentId}/slides`, async (route) => {
       await route.fulfill({
-        status: 503,
+        // 502 is a hard render failure; 503 would be retried as "still rendering".
+        status: 502,
         contentType: "application/json",
         body: JSON.stringify({ detail: "E2E forces the browser CSS fallback" }),
       });

@@ -62,6 +62,10 @@ class ReviewAlreadyRunning(Exception):
         super().__init__(f"a review is already running for workspace {workspace_id}")
 
 
+class ReviewWorkspaceUnavailable(ValueError):
+    """The Workspace disappeared or no longer admits this review trigger."""
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -145,6 +149,20 @@ async def begin_review(
     """
     trigger = ReviewTrigger.coerce(trigger)
     trigger_kind = trigger.kind.value
+
+    # Serialize admission with Blueprint reconfiguration before freezing any
+    # Workspace or policy revision. The durable running receipt becomes visible
+    # in the same transaction that releases this lifecycle boundary.
+    from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+    from packages.core.services.workspace_access import lock_workspace_access_boundary
+    from packages.core.services.workspace_autonomy import workspace_allows_manual_work
+
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    workspace = await lock_workspace_access_boundary(db, workspace_id=workspace_id, entity_id=entity_id)
+    if not workspace_allows_manual_work(workspace) or (
+        workspace.status == "paused" and not trigger.is_human_initiated
+    ):
+        raise ReviewWorkspaceUnavailable("Workspace is no longer available for this review")
 
     previous = await latest_succeeded_review(db, workspace_id)
     watermark_start = previous.watermark_end if previous is not None else None

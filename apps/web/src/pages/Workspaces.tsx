@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { api, type GovernancePresetKey } from "../lib/api";
 import { useToastStore } from "../stores/toast";
 import type { Workspace, WorkspaceStaff } from "../lib/types";
 import { useAuthStore } from "../stores/auth";
 import { canManageWorkspace } from "../lib/permissions";
 import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
+import BlueprintAgentSelection, { blueprintAgentSubscriptions } from "../components/blueprints/BlueprintAgentSelection";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
 import Dropdown from "../components/ui/Dropdown";
@@ -21,6 +22,7 @@ import ConfirmDialog from "../components/ui/ConfirmDialog";
 import EmptyState from "../components/ui/EmptyState";
 import Button from "../components/ui/Button";
 import Input from "../components/ui/Input";
+import Select from "../components/ui/Select";
 import Textarea from "../components/ui/Textarea";
 import Chip from "../components/ui/Chip";
 import { CardGridSkeleton, ListRowsSkeleton } from "../components/ui/Skeleton";
@@ -34,6 +36,7 @@ import {
   IconChecklist,
   IconDocument,
   IconEdit,
+  IconInfo,
   IconLock,
   IconPlus,
   IconTrash,
@@ -42,6 +45,11 @@ import {
 } from "../components/icons";
 import { t } from "../lib/i18n";
 import { formatDate } from "../lib/format";
+import {
+  formatBlueprintVariableValue,
+  parseBlueprintVariableValue,
+} from "../lib/blueprintVariables.mjs";
+import { resolveBlueprintChannelSelections } from "../lib/blueprintSetup.mjs";
 
 interface WorkspaceForm {
   name: string;
@@ -318,9 +326,10 @@ function WorkspaceAccessRow({
 }
 
 function parseWorkspaceView(value: string | null, includeMarketplace = true): WorkspaceView {
+  let fallbackView: WorkspaceView = "workspaces";
   const parsed = WORKSPACE_VIEW_KEYS.includes(value as WorkspaceView)
     ? (value as WorkspaceView)
-    : "workspaces";
+    : fallbackView;
   return parsed;
 }
 
@@ -359,7 +368,16 @@ function ImportWorkspaceDialog({
   const [payload, setPayload] = useState<Record<string, any> | null>(null);
   const [workspaceName, setWorkspaceName] = useState("");
   const [mode, setMode] = useState<"live" | "simulate">("live");
+  const [preset, setPreset] = useState<GovernancePresetKey>("automatic");
+  const { data: presets } = useQuery({
+    queryKey: ["governance-presets"],
+    queryFn: () => api.blueprints.governancePresets(),
+    enabled: open,
+  });
   const [createMissingAgents, setCreateMissingAgents] = useState(true);
+  const [selectedAgentIds, setSelectedAgentIds] = useState<Record<string, string>>({});
+  const [variableValues, setVariableValues] = useState<Record<string, string>>({});
+  const [channelConfigIds, setChannelConfigIds] = useState<Record<string, string>>({});
   const [error, setError] = useState("");
   const [importing, setImporting] = useState(false);
 
@@ -369,7 +387,11 @@ function ImportWorkspaceDialog({
     setPayload(null);
     setWorkspaceName("");
     setMode("live");
+    setPreset("automatic");
     setCreateMissingAgents(true);
+    setSelectedAgentIds({});
+    setVariableValues({});
+    setChannelConfigIds({});
     setError("");
     setImporting(false);
   }, [open]);
@@ -377,6 +399,9 @@ function ImportWorkspaceDialog({
   const onFileChange = async (file?: File | null) => {
     setError("");
     setPayload(null);
+    setSelectedAgentIds({});
+    setVariableValues({});
+    setChannelConfigIds({});
     setFileName(file?.name || "");
     if (!file) return;
     try {
@@ -395,6 +420,41 @@ function ImportWorkspaceDialog({
     }
   };
 
+  const installVariables = (payload?.contract && isRecord(payload.contract)
+    && Array.isArray(payload.contract.variables)
+    ? payload.contract.variables : [])
+    .filter((item): item is Record<string, any> => isRecord(item) && typeof item.key === "string");
+  const variableOverrides: Record<string, unknown> = {};
+  const invalidVariableKeys = new Set<string>();
+  for (const variable of installVariables) {
+    const input = variableValues[variable.key] ?? "";
+    if (!input.trim()) continue;
+    const parsed = parseBlueprintVariableValue(input, variable.default);
+    if (parsed.ok) variableOverrides[variable.key] = parsed.value;
+    else invalidVariableKeys.add(variable.key);
+  }
+  const missingRequiredVariable = installVariables.some((variable) => (
+    variable.required && !(variableValues[variable.key] ?? formatBlueprintVariableValue(variable.default)).trim()
+  ));
+  const serializedVariables = JSON.stringify(variableOverrides);
+  const preflightQuery = useQuery({
+    queryKey: ["install-payload-preflight", payload, mode, serializedVariables, channelConfigIds],
+    queryFn: () => api.blueprints.installPayloadPreflight({
+      payload: payload!, mode, variable_values: variableOverrides, channel_config_ids: channelConfigIds,
+    }),
+    enabled: open && !!payload && !missingRequiredVariable && invalidVariableKeys.size === 0,
+    refetchOnMount: "always",
+  });
+  const resolvedChannelConfigIds = resolveBlueprintChannelSelections(
+    preflightQuery.data?.requirements ?? [], channelConfigIds,
+  );
+  const hasLiveBlocker = mode === "live" && (preflightQuery.isPending || preflightQuery.isError
+    || (preflightQuery.data?.requirements ?? []).some((requirement) => (
+      requirement.blocking && !(requirement.kind === "channel" && requirement.resource_options.length
+        ? requirement.ready && Boolean(requirement.requirement_key && resolvedChannelConfigIds[requirement.requirement_key])
+        : requirement.ready)
+    )));
+
   const doImport = async () => {
     if (!payload) {
       setError(t("page.workspaces.import_select_file_first"));
@@ -408,7 +468,10 @@ function ImportWorkspaceDialog({
         mode,
         workspace_name: workspaceName.trim() || undefined,
         create_missing_agents: createMissingAgents,
-        governance_preset: "standard",
+        agent_ids_by_service_key: selectedAgentIds,
+        governance_preset: preset,
+        variable_values: variableOverrides,
+        channel_config_ids: resolvedChannelConfigIds,
       });
       toast.success(t("page.workspaces.imported_workspace"));
       onImported(result.workspace_id);
@@ -429,7 +492,7 @@ function ImportWorkspaceDialog({
       footer={
         <>
           <Button variant="outline" onClick={onClose} disabled={importing}>{t("action.cancel")}</Button>
-          <Button variant="primary" onClick={doImport} disabled={!payload || importing} loading={importing}>
+          <Button variant="primary" onClick={doImport} disabled={!payload || importing || missingRequiredVariable || invalidVariableKeys.size > 0 || hasLiveBlocker} loading={importing}>
             {importing ? t("page.workspaces.importing_workspace") : t("page.workspaces.import_workspace")}
           </Button>
         </>
@@ -468,6 +531,42 @@ function ImportWorkspaceDialog({
           onChange={(e) => setWorkspaceName(e.target.value)}
           placeholder={t("page.workspaces.workspace_name")}
         />
+        {payload && (
+          <BlueprintAgentSelection
+            open={open}
+            subscriptions={blueprintAgentSubscriptions(payload)}
+            selectedAgentIds={selectedAgentIds}
+            onChange={setSelectedAgentIds}
+          />
+        )}
+        {installVariables.map((variable) => (
+          <Input
+            key={variable.key}
+            label={`${variable.label || variable.key}${variable.required ? " *" : ""}`}
+            value={variableValues[variable.key] ?? ""}
+            onChange={(event) => setVariableValues((current) => ({ ...current, [variable.key]: event.target.value }))}
+            placeholder={formatBlueprintVariableValue(variable.default)}
+            error={invalidVariableKeys.has(variable.key) ? t("page.workspaces.import_invalid_blueprint") : undefined}
+          />
+        ))}
+        {preflightQuery.data?.requirements.filter((requirement) => requirement.kind === "channel" && requirement.resource_options.length > 1).map((requirement) => (
+          <label key={requirement.requirement_key} style={{ display: "grid", gap: 6 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e" }}>{requirement.label}</span>
+            <select
+              value={requirement.requirement_key ? resolvedChannelConfigIds[requirement.requirement_key] || "" : ""}
+              onChange={(event) => requirement.requirement_key && setChannelConfigIds((current) => ({ ...current, [requirement.requirement_key!]: event.target.value }))}
+              style={{ height: 38, borderRadius: 10, border: "1px solid #e7e5e4", padding: "0 10px", background: "#fff", color: "#292524" }}
+            >
+              <option value="">{t("page.workspace_detail.select_account")}</option>
+              {requirement.resource_options.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+            </select>
+          </label>
+        ))}
+        {(missingRequiredVariable || invalidVariableKeys.size > 0 || hasLiveBlocker) && payload && (
+          <div style={{ color: "#b91c1c", fontSize: 12, lineHeight: 1.5 }}>
+            {preflightQuery.data?.requirements.filter((requirement) => requirement.blocking && !requirement.ready).map((requirement) => requirement.reason).join(" ") || t("page.workspaces.import_invalid_blueprint")}
+          </div>
+        )}
         <label style={{ display: "grid", gap: 6 }}>
           <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e" }}>{t("page.workspaces.import_mode")}</span>
           <select
@@ -479,6 +578,16 @@ function ImportWorkspaceDialog({
             <option value="simulate">{t("page.workspaces.import_mode_simulate")}</option>
           </select>
         </label>
+        <div style={{ display: "grid", gap: 6 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: "#57534e" }}>{t("approval_settings.local_mode")}</span>
+          <Select
+            value={preset}
+            onChange={(value) => setPreset(value as GovernancePresetKey)}
+            options={(presets ?? []).map((p) => ({ value: p.key, label: t(p.key === "follow_default" ? "approval_settings.follow" : `approval_settings.${p.key}`), description: p.summary }))}
+            ariaLabel={t("approval_settings.local_mode")}
+            disabled={!presets}
+          />
+        </div>
         <label style={{ display: "flex", alignItems: "center", gap: 8, color: "#57534e", fontSize: 13 }}>
           <input
             type="checkbox"
@@ -545,6 +654,10 @@ export default function Workspaces() {
   });
 
   const allWs = workspaces || [];
+  const deleteTarget = confirmDelete
+    ? allWs.find((ws: Workspace) => ws.id === confirmDelete)
+    : null;
+  const canDeleteTarget = deleteTarget?.can_delete === true;
   const activeCount = allWs.filter((ws: Workspace) => ws.status === "active").length;
   const pausedCount = allWs.filter((ws: Workspace) => ws.status === "paused").length;
   const totalTasks = allWs.reduce((sum, ws: any) => sum + ((ws.stats?.tasks) || 0), 0);
@@ -569,9 +682,16 @@ export default function Workspaces() {
     },
   });
 
-  const { data: trashedWorkspaces, isLoading: trashLoading } = useQuery({
+  const [showTrash, setShowTrash] = useState(false);
+  const {
+    data: trashedWorkspaces,
+    isLoading: trashLoading,
+    isError: trashFailed,
+    refetch: refetchTrash,
+  } = useQuery({
     queryKey: ["workspaces-trash"],
     queryFn: () => api.workspaces.trash(),
+    enabled: showTrash,
   });
   const { data: graceDaysResp } = useQuery({
     queryKey: ["workspaces-grace-days"],
@@ -579,7 +699,6 @@ export default function Workspaces() {
     staleTime: 60 * 60 * 1000,
   });
   const graceDays = graceDaysResp?.grace_days ?? 30;
-  const [showTrash, setShowTrash] = useState(false);
 
   const restoreMutation = useMutation({
     mutationFn: (id: string) => api.workspaces.restore(id),
@@ -627,10 +746,14 @@ export default function Workspaces() {
   }
   function closeModal() { setShowModal(false); setEditing(null); setForm(emptyForm); }
   function handleSave() { if (editing) updateMutation.mutate({ id: editing.id, data: form }); }
+  useEffect(() => {
+    if (confirmDelete && !canDeleteTarget) setConfirmDelete(null);
+  }, [canDeleteTarget, confirmDelete]);
   function handleViewChange(next: string) {
     let nextView = parseWorkspaceView(next, false);
+    let defaultView: WorkspaceView = "workspaces";
     const params = new URLSearchParams(searchParams);
-    if (nextView === "workspaces") {
+    if (nextView === defaultView) {
       params.delete("view");
     } else {
       params.set("view", nextView);
@@ -735,6 +858,7 @@ export default function Workspaces() {
               navigate(`/workspaces/${editing.id}?tab=staff`);
             }}
           />}
+          {editing?.can_manage && <Button variant="outline" onClick={()=>{setShowModal(false);navigate(`/workspaces/${editing.id}?tab=collaboration`);}}>{t("page.collaboration.manage")}</Button>}
           {editing && (
             <div
               style={{
@@ -765,7 +889,7 @@ export default function Workspaces() {
           workspaceName={upgrading.name}
         />
       )}
-      <ConfirmDialog open={!!confirmDelete} onClose={() => setConfirmDelete(null)} onConfirm={() => { if (confirmDelete) deleteMutation.mutate(confirmDelete); }} title={t("page.workspaces.delete_workspace")} message={t("page.workspaces.delete_workspace_msg").replace("{days}", String(graceDays))} confirmLabel={t("page.workspaces.move_to_trash")} danger />
+      <ConfirmDialog open={canDeleteTarget} onClose={() => setConfirmDelete(null)} onConfirm={() => { if (deleteTarget?.can_delete) deleteMutation.mutate(deleteTarget.id); }} title={t("page.workspaces.delete_workspace")} message={t("page.workspaces.delete_workspace_msg").replace("{days}", String(graceDays))} confirmLabel={t("page.workspaces.move_to_trash")} danger />
       <ConfirmDialog open={!!confirmDraftDelete} onClose={() => setConfirmDraftDelete(null)} onConfirm={() => { if (confirmDraftDelete) deleteDraftMutation.mutate(confirmDraftDelete); }} title={t("page.workspaces.delete_draft")} message={t("page.workspaces.delete_draft_msg")} confirmLabel={t("action.delete")} danger />
       <ImportWorkspaceDialog
         open={showImportModal}
@@ -966,13 +1090,15 @@ export default function Workspaces() {
                       >
                         <IconEdit size={12} />
                       </button>
-                      <button
-                        onClick={(e) => { e.stopPropagation(); setConfirmDelete(ws.id); }}
-                        title={t("action.delete")}
-                        style={{ width: 28, height: 28, borderRadius: 8, border: "1px solid rgba(28,25,23,0.055)", background: "#ffffff", color: "#78716c", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.15s" }}
-                      >
-                        <IconTrash size={12} />
-                      </button>
+                      {ws.can_delete === true && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); setConfirmDelete(ws.id); }}
+                          title={t("action.delete")}
+                          style={{ width: 28, height: 28, borderRadius: 8, border: "1px solid rgba(28,25,23,0.055)", background: "#ffffff", color: "#78716c", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", transition: "all 0.15s" }}
+                        >
+                          <IconTrash size={12} />
+                        </button>
+                      )}
                     </div>
                   </div>
                 }
@@ -989,25 +1115,36 @@ export default function Workspaces() {
                           <StatusBadge type="gray" dot={ws.status === "active"} pulse={false}>
                             {statusText}
                           </StatusBadge>
-                          {ws.blueprint_update?.status === "update_available" && (
+                          {(ws.blueprint_update?.status === "update_available"
+                            || ws.blueprint_update?.status === "reconfigure_required") && (
                             <button
                               type="button"
-                              title={t("page.workspaces.blueprint_update_title")}
+                              title={ws.blueprint_update.status === "reconfigure_required"
+                                ? t("page.workspaces.blueprint_reconfigure_title")
+                                : t("page.workspaces.blueprint_update_title")}
                               onClick={(e) => { e.stopPropagation(); setUpgrading(ws); }}
                               style={{
                                 display: "inline-flex", alignItems: "center", gap: 4,
                                 fontSize: 9.5, fontWeight: 850, letterSpacing: "0.04em",
-                                textTransform: "uppercase", color: "#3f6f68",
-                                background: "#eaf1ef", borderRadius: 999, padding: "2px 7px",
+                                textTransform: "uppercase",
+                                color: ws.blueprint_update.status === "reconfigure_required" ? "#8a5d1f" : "#3f6f68",
+                                background: ws.blueprint_update.status === "reconfigure_required" ? "#fff5df" : "#eaf1ef",
+                                borderRadius: 999, padding: "2px 7px",
                                 whiteSpace: "nowrap", border: "none", cursor: "pointer",
                               }}
                             >
-                              <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
-                                   stroke="currentColor" strokeWidth={3}>
-                                <path strokeLinecap="round" strokeLinejoin="round"
-                                      d="M12 19V5M5 12l7-7 7 7" />
-                              </svg>
-                              {t("page.workspaces.blueprint_update_available")}
+                              {ws.blueprint_update.status === "reconfigure_required" ? (
+                                <IconInfo size={9} />
+                              ) : (
+                                <svg width="9" height="9" viewBox="0 0 24 24" fill="none"
+                                     stroke="currentColor" strokeWidth={3}>
+                                  <path strokeLinecap="round" strokeLinejoin="round"
+                                        d="M12 19V5M5 12l7-7 7 7" />
+                                </svg>
+                              )}
+                              {ws.blueprint_update.status === "reconfigure_required"
+                                ? t("page.workspaces.blueprint_reconfigure_required")
+                                : t("page.workspaces.blueprint_update_available")}
                             </button>
                           )}
                         </div>
@@ -1076,12 +1213,7 @@ export default function Workspaces() {
         </div>
 
         {/* Trash — soft-deleted workspaces in the grace window */}
-        {trashLoading ? (
-          <div style={{ marginTop: 32, paddingTop: 16 }}>
-            <ListRowsSkeleton rows={2} avatar={false} action />
-          </div>
-        ) : trashedWorkspaces && trashedWorkspaces.length > 0 && (
-          <div style={{ marginTop: 32, borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 16 }}>
+        <div style={{ marginTop: 32, borderTop: "1px solid rgba(28,25,23,0.06)", paddingTop: 16 }}>
             <button
               onClick={() => setShowTrash((v) => !v)}
               style={{
@@ -1094,11 +1226,21 @@ export default function Workspaces() {
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5} style={{ transform: showTrash ? "rotate(90deg)" : "none", transition: "transform 0.15s" }}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
               </svg>
-              {t("page.workspaces.trash")} ({trashedWorkspaces.length})
+              {t("page.workspaces.trash")}{trashedWorkspaces ? ` (${trashedWorkspaces.length})` : ""}
             </button>
             {showTrash && (
-              <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
-                {trashedWorkspaces.map((ws) => {
+              trashLoading ? (
+                <div style={{ marginTop: 12 }}>
+                  <ListRowsSkeleton rows={2} avatar={false} action />
+                </div>
+              ) : trashFailed ? (
+                <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8, color: "#a23e38", fontSize: 12 }} role="alert">
+                  <span>{t("page.tasks.load_more_failed")}</span>
+                  <Button size="sm" variant="outline" onClick={() => void refetchTrash()}>{t("page.tasks.retry_load_more")}</Button>
+                </div>
+              ) : trashedWorkspaces?.length ? (
+                <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                  {trashedWorkspaces.map((ws) => {
                   const days = daysUntilPurge(ws.deleted_at);
                   return (
                     <ItemCard
@@ -1119,11 +1261,15 @@ export default function Workspaces() {
                       }
                     />
                   );
-                })}
-              </div>
+                  })}
+                </div>
+              ) : (
+                <div style={{ marginTop: 12 }}>
+                  <EmptyState title={t("page.workspaces.trash")} description={t("page.knowledge.trash_is_empty")} />
+                </div>
+              )
             )}
-          </div>
-        )}
+        </div>
       </div>
       </>
       )}

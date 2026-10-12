@@ -158,6 +158,15 @@ PROVIDER_HANDLERS: dict[str, ModelProviderHandler] = {
         api_shape="openrouter_audio",
         roles=("voice",),
     ),
+    "suno": ModelProviderHandler(
+        provider="suno",
+        display_name="Suno",
+        base_url="https://api.suno.com/v0",
+        env_vars=("SUNO_API_KEY",),
+        key_prefixes=("sk_live_",),
+        api_shape="suno_audio_jobs",
+        roles=("audio",),
+    ),
     "openrouter": ModelProviderHandler(
         provider="openrouter",
         display_name="OpenRouter",
@@ -223,6 +232,7 @@ CATALOG_PROVIDER_CAPABILITIES: dict[
     ("voice", "sesame"): CatalogProviderCapability("model_endpoint_lookup", "openrouter_audio"),
     ("audio", "google"): CatalogProviderCapability("model_lookup", "google_interactions_audio"),
     ("audio", "openai"): CatalogProviderCapability("model_lookup", "openai_chat_audio"),
+    ("audio", "suno"): CatalogProviderCapability("account_usage", "suno_audio_jobs"),
     ("sfx", "openai"): CatalogProviderCapability("model_lookup", "openai_chat_audio"),
     ("stt", "openai"): CatalogProviderCapability("model_lookup", "openai_audio_transcriptions"),
     ("stt", "groq"): CatalogProviderCapability("model_lookup", "groq_audio_transcriptions"),
@@ -299,6 +309,7 @@ VERCEL_CATALOG_MEDIA_MODEL_TYPES: dict[tuple[str, str], str] = {
     ("stt", "openai/gpt-4o-transcribe"): "transcription",
     ("video", "bytedance/seedance-2.0"): "video",
     ("video", "bytedance/seedance-2.0-fast"): "video",
+    ("video", "bytedance/seedance-v1.0-pro-fast"): "video",
     ("video", "kwaivgi/kling-v3.0-std"): "video",
     ("video", "kwaivgi/kling-v3.0-pro"): "video",
     ("embedding", "openai/text-embedding-3-small"): "embedding",
@@ -483,6 +494,8 @@ def detect_provider_from_key(api_key: str) -> str | None:
     """Best-effort provider detection from API key prefix."""
 
     key = str(api_key or "").strip()
+    if key.startswith("sk_live_"):
+        return "suno"
     if key.startswith("sk-or-"):
         return "openrouter"
     if key.startswith("gsk_"):

@@ -1,6 +1,6 @@
 import { type MouseEvent, type ReactNode, useCallback, useRef } from "react";
 import { t } from "../../lib/i18n";
-import { IconCheckCircle } from "../icons";
+import { IconCheckCircle, IconManorLogo } from "../icons";
 
 interface AuthShellProps {
   children: ReactNode;
@@ -11,11 +11,11 @@ export function AuthBrand() {
     <div className="flex items-center gap-2">
       <div
         className="flex items-center justify-center"
-        style={{ width: 32, height: 32, borderRadius: 10, background: "#292524" }}
+        style={{ width: 32, height: 32, borderRadius: 8, background: "#000000" }}
       >
-        <svg viewBox="0 0 1024 1024" width="16" height="16" fill="white" aria-hidden="true">
-          <path d="M295.152941 0l224.376471 224.376471L743.905882 0H1024v63.247059L519.529412 567.717647 0 49.694118V0h295.152941zM0 256l243.952941 243.952941V1024H0V256z m1024 15.058824v752.941176H780.047059V515.011765L1024 271.058824z" />
-        </svg>
+        <span aria-hidden="true" style={{ display: "flex", color: "#ffffff" }}>
+          <IconManorLogo size={24} />
+        </span>
       </div>
       <span style={{ fontSize: 18, fontWeight: 800, color: "#292524" }}>
         {t("page.chat_history.manor_ai")}

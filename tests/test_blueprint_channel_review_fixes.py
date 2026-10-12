@@ -23,7 +23,7 @@ from packages.core.blueprints.upgrade import (
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel
-from packages.core.models.workspace import AgentSubscription, Workspace
+from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.services.channel_bindings import (
     load_channel_binding_by_id_for_config,
     load_channel_binding_for_config,
@@ -182,9 +182,14 @@ async def test_workspace_manager_can_upgrade_existing_other_members_channel(db_s
     assert before.ready
     payload["contract"]["channels"][0][changed] = "Revised" if changed != "role" else "secondary_external"
     if changed == "linked_service_key":
+        agent = Agent(
+            entity_id=workspace.entity_id, name="Revised", status="active", config={},
+        )
+        db_session.add(agent)
+        await db_session.flush()
         db_session.add(AgentSubscription(
             entity_id=workspace.entity_id, workspace_id=workspace.id,
-            agent_id=subscription.agent_id, service_key="Revised", status="active",
+            agent_id=agent.id, service_key="Revised", status="active",
         ))
         await db_session.flush()
     after = await BlueprintSetupPreflightFactory.from_contract(

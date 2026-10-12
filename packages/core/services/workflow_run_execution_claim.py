@@ -13,10 +13,10 @@ import contextlib
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import AsyncIterator
 
-from sqlalchemy import text
+from sqlalchemy import delete, text
 
 from packages.core.constants.execution import (
     ExecutionClaimKind,
@@ -24,6 +24,7 @@ from packages.core.constants.execution import (
     SCHEDULED_RUN_EXECUTION_RECHECK_SECONDS,
 )
 from packages.core.models.base import generate_ulid
+from packages.core.models.execution_claim import RuntimeExecutionClaim
 
 
 WORKFLOW_RUN_EXECUTION_LEASE_TTL_SECONDS = 660
@@ -268,6 +269,18 @@ _EXTEND_POSTGRES_CLAIM = text("""
     RETURNING claim_token
 """)
 
+_TAKE_OVER_EXPIRED_POSTGRES_CLAIM = text("""
+    UPDATE runtime_execution_claims
+    SET claim_token = :claim_token,
+        expires_at = CURRENT_TIMESTAMP
+            + CAST(:ttl_seconds AS DOUBLE PRECISION) * INTERVAL '1 second',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE claim_key = :claim_key
+      AND claim_token = :expired_claim_token
+      AND expires_at <= CURRENT_TIMESTAMP
+    RETURNING claim_token
+""")
+
 _RELEASE_POSTGRES_CLAIM = text("""
     DELETE FROM runtime_execution_claims
     WHERE claim_key = :claim_key
@@ -304,6 +317,27 @@ async def scheduled_run_has_live_execution_claim(db, run_id: str) -> bool:
     return current is not None
 
 
+async def revoke_workflow_run_execution_claims(
+    db,
+    run_ids: Iterable[str],
+) -> int:
+    """Revoke Workflow Run leases inside the caller's control transaction."""
+
+    claim_keys = {
+        f"{ExecutionClaimKind.WORKFLOW_RUN.value}:{str(run_id).strip()}"
+        for run_id in run_ids
+        if str(run_id).strip()
+    }
+    if not claim_keys:
+        return 0
+    result = await db.execute(
+        delete(RuntimeExecutionClaim).where(
+            RuntimeExecutionClaim.claim_key.in_(claim_keys)
+        )
+    )
+    return int(result.rowcount or 0)
+
+
 async def _run_claim_statement(statement, parameters: dict) -> bool:
     """Execute one short claim transaction on a disposable worker session."""
     from packages.core.database import create_worker_session
@@ -319,7 +353,18 @@ async def _acquire_postgres_execution_claim(
     token: str,
     *,
     lease_ttl_seconds: int,
+    expired_claim_token: str | None = None,
 ) -> bool:
+    if expired_claim_token is not None:
+        return await _run_claim_statement(
+            _TAKE_OVER_EXPIRED_POSTGRES_CLAIM,
+            {
+                "claim_key": claim_key,
+                "claim_token": token,
+                "ttl_seconds": lease_ttl_seconds,
+                "expired_claim_token": expired_claim_token,
+            },
+        )
     return await _run_claim_statement(
         _ACQUIRE_POSTGRES_CLAIM,
         {
@@ -363,12 +408,14 @@ async def _postgres_execution_claim(
     *,
     claim_key: str,
     lease_ttl_seconds: int,
+    expired_claim_token: str | None = None,
 ) -> AsyncIterator[WorkflowRunExecutionClaim]:
     """Own one durable PostgreSQL lease without holding its DB connection."""
     granted = await _acquire_postgres_execution_claim(
         claim_key,
         token,
         lease_ttl_seconds=lease_ttl_seconds,
+        **({"expired_claim_token": expired_claim_token} if expired_claim_token is not None else {}),
     )
     try:
         yield _claim(
@@ -397,6 +444,7 @@ async def _renewable_execution_claim(
     resource_id: str,
     *,
     kind: ExecutionClaimKind,
+    expired_claim_token: str | None = None,
 ) -> AsyncIterator[WorkflowRunExecutionClaim]:
     policy = ExecutionClaimPolicyFactory.create(kind)
     token = generate_ulid()
@@ -406,6 +454,7 @@ async def _renewable_execution_claim(
         token,
         claim_key=claim_key,
         lease_ttl_seconds=policy.lease_ttl_seconds,
+        **({"expired_claim_token": expired_claim_token} if expired_claim_token is not None else {}),
     ) as postgres_claim:
         if not postgres_claim:
             yield postgres_claim
@@ -518,12 +567,15 @@ async def _renewable_execution_claim(
 @asynccontextmanager
 async def workflow_run_execution_claim(
     run_id: str,
+    *,
+    expired_claim_token: str | None = None,
 ) -> AsyncIterator[WorkflowRunExecutionClaim]:
     """Yield one renewable, exclusive execution claim for ``run_id``."""
 
     async with _renewable_execution_claim(
         run_id,
         kind=ExecutionClaimKind.WORKFLOW_RUN,
+        **({"expired_claim_token": expired_claim_token} if expired_claim_token is not None else {}),
     ) as claim:
         yield claim
 
@@ -607,5 +659,6 @@ __all__ = [
     "scheduled_run_has_live_execution_claim",
     "scheduled_job_skill_generation_claim",
     "task_plan_execution_claim",
+    "revoke_workflow_run_execution_claims",
     "workflow_run_execution_claim",
 ]

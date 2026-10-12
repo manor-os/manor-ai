@@ -46,9 +46,13 @@ async def _live_approval_requests(
         for request in await find_requests_by_dedup(
             db,
             entity_id=record.entity_id,
-            dedup_key=f"proposal_item:{item.id}",
+            dedup_key=f"operation:proposal_item:{item.id}",
         )
         if request.status in APPROVAL_LIVE_STATUSES
+        and request.workspace_id == record.workspace_id
+        and request.resource_kind == "proposal_item"
+        and request.resource_id == item.id
+        and request.action_key == item.action_key
     ]
 
 
@@ -148,6 +152,11 @@ async def apply_non_task_cohort_decision(
         ).scalars().all()
     )
 
+    if approved:
+        from packages.core.proposals.approval_guard import require_current_proposal_policy
+
+        await require_current_proposal_policy(db, record=record, items=items,
+            actor_id=actor_id, actor_kind=actor_kind)
     now = datetime.now(timezone.utc)
     decision_kind = (
         ProposalDecisionKind.APPROVED
@@ -155,6 +164,9 @@ async def apply_non_task_cohort_decision(
         else ProposalDecisionKind.REJECTED
     )
     for item in items:
+        if approved:
+            await require_current_proposal_policy(db, record=record, items=[item],
+                actor_id=actor_id, actor_kind=actor_kind)
         requests = await _live_approval_requests(db, record=record, item=item)
         item.status = (
             ProposalItemStatus.APPROVED

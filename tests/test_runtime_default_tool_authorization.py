@@ -130,7 +130,7 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     from packages.core.ai.runtime.tool_registry import runtime_registered_tool_schemas
     from packages.core.ai.runtime.tool_search import runtime_execute_search_tools_handler
     from packages.core.ai.tools.generate_file_tool import _generate_file_handler
-    from packages.core.ai.tools.workspace_agent_tools import _workspace_update_task_runtime_handler
+    from packages.core.ai.tools.manor_tool import _manor_handler
     from packages.core.config import get_settings
     from packages.core.constants.agent_capabilities import AGENT_EAGER_BOUND_TOOL_LIMIT
     from packages.core.models.document import Document
@@ -147,9 +147,10 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     monkeypatch.setattr("packages.core.database.async_session", async_sessionmaker(db_session.bind, expire_on_commit=False))
     # Only asynchronous external embedding work is excluded from this local test.
     monkeypatch.setattr("packages.core.services.knowledge_sync._schedule_document_reembed", lambda _id: None)
+    from packages.core.governance.approval_policy_service import account_defaults, initialize_workspace_approval
     scope = await _seed(db_session)
     db_session.add_all([
-        Entity(id=scope.entity_id, name="Diagnostic test entity"),
+        Entity(id=scope.entity_id, name="Diagnostic test entity", settings={"approval_defaults": account_defaults()}),
         AgentSubscription(entity_id=scope.entity_id, agent_id=scope.agent.id, workspace_id=scope.workspace.id),
     ])
     registry_schemas = runtime_registered_tool_schemas()
@@ -161,11 +162,12 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     ]
     wide_bound_names = [
         "generate_file",
+        "manor",
         *[
             name
             for name in registry_names
-            if name != "generate_file"
-        ][:AGENT_EAGER_BOUND_TOOL_LIMIT],
+            if name not in {"generate_file", "manor"}
+        ][: AGENT_EAGER_BOUND_TOOL_LIMIT - 1],
     ]
     assert len(wide_bound_names) == AGENT_EAGER_BOUND_TOOL_LIMIT + 1
     unbound_name = next(
@@ -190,8 +192,21 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
         db_session.add(
             AgentToolBinding(agent_id=scope.agent.id, tool_id=tool.id)
         )
+    await db_session.flush()
+    await initialize_workspace_approval(db_session, scope.workspace)
+    from tests.approval_settings_test_utils import (
+        action_rule, initialize_test_account_approval, set_workspace_test_approval,
+    )
+    owner = await initialize_test_account_approval(db_session, entity_id=scope.entity_id)
+    # The owner consents to updating this Task; execution still runs as the
+    # delegated Agent and must pass its actual tool bindings independently.
+    await set_workspace_test_approval(
+        db_session, workspace_id=scope.workspace.id, entity_id=scope.entity_id,
+        actor_id=owner.id, user_rules=[action_rule("workspace.task.update")],
+    )
     await ensure_workspace_artifact_folder(db_session, scope.workspace)
     await db_session.commit()
+    generate_file_tool_id = existing_tools["generate_file"].id
     entity_root = Path(provision_entity_filesystem(scope.entity_id))
     workspace_runtime = await resolve_workspace_runtime(
         db_session,
@@ -222,6 +237,14 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
         is_master=workspace_runtime.is_master,
         mcp_allowed_names=workspace_runtime.mcp_allowed_names,
     )
+    # Production prepares the prompt in a short-lived session that is closed
+    # before Runtime tools open their own sessions.  Release any lazy built-in
+    # Skill projection transaction here as well; otherwise this test can
+    # self-deadlock when search_tools projects the same Skill rows.
+    await db_session.rollback()
+    await db_session.refresh(scope.agent)
+    await db_session.refresh(scope.workspace)
+    await db_session.refresh(scope.task)
     envelope = prepared.envelope
     prompt_tool_names = {
         schema.get("function", {}).get("name")
@@ -242,26 +265,44 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     handlers = {
         "search_tools": search_handler,
         "generate_file": _generate_file_handler,
-        "workspace_update_task_runtime": _workspace_update_task_runtime_handler,
+        "manor": _manor_handler,
     }
 
     async def execute(name, arguments):
-        return json.loads(await runtime_execute_registered_tool(
-            tool_name=name, arguments=arguments, handler_resolver=handlers.get,
+        raw_result = await runtime_execute_registered_tool(
+            tool_name=name, arguments={**arguments,
+                "_runtime_run_id_from_context": scope.task.id,
+                "_runtime_tool_call_id_from_context": name}, handler_resolver=handlers.get,
             entity_id=scope.entity_id, agent_id=scope.agent.id,
             workspace_id=scope.workspace.id, task_id=scope.task.id,
             tool_profile="workspace_agent", runtime_envelope=envelope,
-        ))
+        )
+        return json.loads(raw_result)
 
-    updated = await execute("workspace_update_task_runtime", {
-        "task_id": scope.task.id, "runtime_instructions": "Save the diagnostic packet in this task's artifact folder.",
-    })
+    updated = await execute(
+        "manor",
+        {
+            "action": "workspace",
+            "params": {
+                "action": "update_task_runtime",
+                "params": {
+                    "task_id": scope.task.id,
+                    "runtime_instructions": (
+                        "Save the diagnostic packet in this task's artifact folder."
+                    ),
+                },
+            },
+        },
+    )
     assert updated.get("updated") is True, updated
     await db_session.refresh(scope.task)
     assert "diagnostic packet" in str(scope.task.details["runtime_context"])
     discovered = await execute(
         "search_tools",
-        {"query": f"select:generate_file,{unbound_name}"},
+        {
+            "mode": "exact",
+            "exact_names": ["generate_file", unbound_name],
+        },
     )
     assert not discovered.get("error"), discovered
     assert discovered["loaded_tools"] == ["generate_file"], discovered
@@ -286,7 +327,7 @@ async def test_delegated_discovery_to_saved_workspace_file_uses_real_guards(db_s
     await db_session.execute(
         delete(AgentToolBinding).where(
             AgentToolBinding.agent_id == scope.agent.id,
-            AgentToolBinding.tool_id == existing_tools["generate_file"].id,
+            AgentToolBinding.tool_id == generate_file_tool_id,
         )
     )
     await db_session.commit()
@@ -322,6 +363,7 @@ async def test_workspace_runtime_preserves_semantic_mcp_scope_through_search(
 ):
     """Workspace -> Prompt -> RuntimeEnvelope -> search_tools keeps MCP semantics."""
     import json
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
     from packages.core.ai.runtime import (
         AIRuntimeRequest,
@@ -333,6 +375,10 @@ async def test_workspace_runtime_preserves_semantic_mcp_scope_through_search(
     from packages.core.models.mcp import AgentMCPBinding, MCPServer
     from packages.core.services.workspace_runtime import resolve_workspace_runtime
 
+    monkeypatch.setattr(
+        "packages.core.database.async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
     scope = await _seed(db_session)
     server = (
         await db_session.execute(
@@ -404,6 +450,10 @@ async def test_workspace_runtime_preserves_semantic_mcp_scope_through_search(
     )
     assert prepared.envelope.mcp_provider_scopes == workspace_runtime.mcp_provider_scopes
 
+    # Tool search revalidates durable Workspace policy in its own session,
+    # as it does after a real Workspace/Agent configuration request commits.
+    await db_session.commit()
+
     public_name = "mcp__stripe__future_stripe_tool"
 
     async def load_live(provider_keys):
@@ -434,7 +484,8 @@ async def test_workspace_runtime_preserves_semantic_mcp_scope_through_search(
     payload = json.loads(
         await runtime_execute_search_tools_handler(
             arguments={
-                "query": f"select:{public_name}",
+                "mode": "exact",
+                "exact_names": [public_name],
                 "_runtime_envelope_from_context": prepared.envelope,
             },
             # This test exercises Runtime-envelope scope propagation, not the
@@ -490,30 +541,17 @@ async def test_master_task_service_provider_scope_is_not_unrestricted(
     db_session,
     monkeypatch,
 ):
-    from packages.core.ai.runtime.tool_bindings import (
-        RuntimeMCPProviderToolScopeFactory,
-    )
     from packages.core.services import workspace_runtime as workspace_runtime_module
 
     scope = await _seed(db_session)
-    provider_scopes = RuntimeMCPProviderToolScopeFactory.create({"stripe": None})
-    active_provider_scopes = provider_scopes
 
     async def load_service_agent_ids(*_args, **_kwargs):
         return ["service-agent"]
-
-    async def resolve_service_scope(*_args, **_kwargs):
-        return set(), set(), active_provider_scopes
 
     monkeypatch.setattr(
         workspace_runtime_module,
         "_load_task_service_agent_ids",
         load_service_agent_ids,
-    )
-    monkeypatch.setattr(
-        workspace_runtime_module,
-        "_resolve_service_agent_tool_scope",
-        resolve_service_scope,
     )
 
     runtime = await workspace_runtime_module.resolve_workspace_runtime(
@@ -526,11 +564,11 @@ async def test_master_task_service_provider_scope_is_not_unrestricted(
         include_prompt_context=False,
     )
 
-    # Master is the host identity, not an implicit MCP wildcard. A semantic
-    # service scope with no currently registered schemas must close the exact
-    # name set so unrelated providers cannot enter the prompt surface.
+    # The Task Host delegates to its service Agent. Neither the Agent's
+    # provider scope nor the master's legacy global wildcard applies here.
+    assert runtime.service_agent_ids == ["service-agent"]
     assert runtime.mcp_allowed_names == set()
-    assert runtime.mcp_provider_scopes == provider_scopes
+    assert runtime.mcp_provider_scopes == ()
     assert runtime.mcp_scope_unrestricted is False
 
     from packages.core.ai.runtime import (
@@ -560,7 +598,7 @@ async def test_master_task_service_provider_scope_is_not_unrestricted(
     }
     assert not any(name.startswith("mcp__paypal__") for name in prompt_names)
     assert not any(name.startswith("mcp__stripe__") for name in prompt_names)
-    assert prepared.envelope.mcp_provider_scopes == provider_scopes
+    assert prepared.envelope.mcp_provider_scopes == ()
 
     from packages.core.constants.agents import MANOR_AGENT_ID
 
@@ -594,7 +632,7 @@ async def test_master_task_service_provider_scope_is_not_unrestricted(
         access="read",
         runtime_surface=ChatSurface.WORKSPACE_CHAT,
     )
-    assert stripe.allowed
+    assert not stripe.allowed
     assert not paypal.allowed
 
     from packages.core.models.user import Entity, User, UserMembership
@@ -638,12 +676,10 @@ async def test_master_task_service_provider_scope_is_not_unrestricted(
             runtime_surface=ChatSurface.WORKSPACE_CHAT,
         )
 
-    assert (await authorize_human("mcp__stripe__future_action")).allowed
+    assert not (await authorize_human("mcp__stripe__future_action")).allowed
     assert not (await authorize_human("mcp__paypal__future_action")).allowed
 
-    # Revoking the final service-Agent MCP binding must close the Task scope;
-    # it must never restore the master Host's legacy global MCP wildcard.
-    active_provider_scopes = ()
+    # The closed Task scope is stable even when there are no service grants.
     revoked_master = await authorize_runtime_action(
         db_session,
         entity_id=scope.entity_id,

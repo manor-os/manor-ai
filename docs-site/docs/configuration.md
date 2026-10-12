@@ -82,8 +82,10 @@ The shared speech path uses local speech detection to reduce background noise.
 Suspected speech temporarily pauses playback; recognized words confirm an interruption.
 An empty transcript resumes the paused audio, and completed replies stay visible
 in the call panel even when their audio is interrupted.
-The call panel shows microphone level. If a call is silent, check the input
-meter, browser output device and volume, then check the server's gateway connectivity.
+The call panel shows microphone level and provides a
+**Test speaker** tone that does not send audio to a provider. If a call is silent,
+check the input meter, speaker test, browser output device and volume, then check
+the server's gateway connectivity.
 
 Hanging up stops capture, cancels request preparation, and prevents new retries.
 A speech gateway request already submitted may finish and have its usage recorded after the call ends.
@@ -102,11 +104,49 @@ actions are not automatically replayed. The previous `/chat/voice-session` and
 | `DATABASE_MAX_OVERFLOW` | `2` | Extra connections allowed above the pool size under burst load. |
 | `DATABASE_POOL_TIMEOUT` | `10` | Seconds to wait for a free connection before failing. |
 | `DATABASE_POOL_RECYCLE` | `1800` | Seconds before a pooled connection is recycled. |
+| `DATABASE_ADMISSION_LIMIT` | `0` | Concurrent managed Session transactions per process/event loop. `0` preserves pool size + overflow − 1 (minimum 1) for local pools and direct-PostgreSQL workers. With PgBouncer it selects app `4` / worker `1`; other application `NullPool` engines use `4`. |
+| `DATABASE_MAX_WAITERS` | `14` | Maximum queued transactions when admission is full. |
+| `DATABASE_ADMISSION_TIMEOUT` | `2` | Maximum admission wait in seconds. Saturation returns HTTP 503 with `detail.code=database_busy` and `Retry-After`. |
+| `DATABASE_HOLD_WARN_SECONDS` | `5` | Log a long connection checkout with its request ID after this many seconds. |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `0` | Optional transaction-local PostgreSQL statement deadline in milliseconds. `0` preserves the database default. |
+| `DATABASE_LOCK_TIMEOUT_MS` | `0` | Optional transaction-local PostgreSQL lock-wait deadline in milliseconds. |
+| `DATABASE_IDLE_TRANSACTION_TIMEOUT_MS` | `0` | Optional transaction-local PostgreSQL idle-in-transaction deadline in milliseconds. |
 
-The pool defaults are sized for a single-host deployment. If you raise
-`API_WORKERS`, remember each worker process opens its own pool:
-total connections ≈ `API_WORKERS × (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW)`
-plus the Celery worker. Keep that sum below your PostgreSQL `max_connections`.
+Budget every API/chat replica and process: their pool ceiling is
+`sum(replicas × processes × (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW))`.
+Also include each Celery process's transaction budget, migration/operational connections and a safety
+reserve below PostgreSQL `max_connections`. Celery uses disposable `NullPool`
+engines; a conservative worker ceiling is concurrency × admission limit.
+Admission is shared only within one event loop, not across worker processes.
+Direct-PostgreSQL workers keep their legacy automatic budget (6 with the
+default pool settings) despite using `NullPool`, so existing nested Sessions
+are not reduced to a single permit. This is a compatibility default, not a
+local connection pool. An explicit limit of 1 still cannot accommodate a
+second Session while the caller holds its transaction.
+With `NullPool`, a positive admission limit is independent of the unused
+`DATABASE_POOL_SIZE` and `DATABASE_MAX_OVERFLOW`. For PgBouncer, budget client
+slots as replicas × processes × admission limit, plus independent probes,
+rolling-update surge, draining pods and jobs. PgBouncer's backend pools enforce
+the separate global PostgreSQL connection ceiling. Bound its backend queue wait
+as well; client capacity and backend capacity are different limits.
+
+Admission lasts for a database transaction, not the lifetime of a request,
+WebSocket, LLM call or file stream. With an actual local pool, the automatic
+limit leaves one connection for bounded readiness probes when capacity is at
+least two; explicit admission cannot exceed that pool's size + overflow.
+NullPool probes use a separate single-slot gate. Overload is not an automatic replay
+of writes; respect `Retry-After` and use the operation's idempotency contract.
+
+Audit long-running task/approval lock protocols before enabling the optional
+deadlines. They use transaction-local settings, including through PgBouncer,
+and do not terminate slow LLM or sandbox work that has released its connection.
+`/health/deep` in self-hosted mode reports pool checkout/long-hold counts,
+transaction admission activity, waiting/rejected counts and maximum waits.
+`queue_full` counts transactions rejected before entering the bounded queue;
+`wait_timeouts` counts queued transactions that exceeded the admission deadline.
+`peak_active_transactions` and `peak_waiters` show high-water marks for the
+current process/event loop, not fleet-wide capacity. Restarting resets these counters.
+Long-hold logs contain request IDs, not SQL arguments or credentials.
 
 ## Redis
 
@@ -131,6 +171,17 @@ evaluation; measure CPU, p95 latency, and DB connections before raising them.
 | `API_LIMIT_CONCURRENCY` | `120` | Maximum concurrent connections per worker before requests are rejected. |
 | `API_BACKLOG` | `256` | Socket backlog for pending connections. |
 | `API_TIMEOUT_KEEP_ALIVE` | `5` | Keep-alive timeout in seconds. |
+
+The shared WebSocket push manager uses at most 32 simultaneous sends per
+process and a two-second deadline for each send and failed-connection close.
+It serializes sends on each socket and resolves only the candidate users in
+the target Entity; that connection index does not cache authorization.
+Current membership, visibility and token versions are still checked before
+relaying content. Slow clients are closed; reconnecting clients reconcile
+with persisted messages. Realtime pushes remain best-effort, not durable
+delivery receipts. These bounds do not establish a supported user count:
+load-test real sockets, message rates, database latency and background jobs
+together before changing process, replica or connection budgets.
 
 ## Rate Limits
 
@@ -199,7 +250,7 @@ See [Sandbox operations](operations/sandbox) for what runs inside the boundary.
 | --- | --- | --- |
 | `JWT_SECRET_KEY` | `change-this-to-a-random-string` | **Must** be replaced before any shared deployment. |
 | `JWT_ALGORITHM` | `HS256` | Token signing algorithm. |
-| `JWT_EXPIRE_MINUTES` | `1440` | Session lifetime (24 hours by default). |
+| `JWT_EXPIRE_MINUTES` | `1440` | Access-token lifetime, capped at 24 hours. Remember me uses a separate 30-day browser session. |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | unset | Enables "Sign in with Google". Create a Web OAuth client in Google Cloud Console. |
 | `VITE_GOOGLE_CLIENT_ID` / `VITE_GOOGLE_DRIVE_API_KEY` | unset | Enables the Google Drive Picker on the Knowledge page. Requires the Google Picker API and Google Drive API enabled in your Google Cloud project. |
 
@@ -250,12 +301,76 @@ For local webhook testing, use a trusted HTTPS tunnel and set
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `FLOWS_AVAILABLE` | unset | Workflow launch gate. Local and development environments enable Flows by default; when `MANOR_ENV` is `prod`/`production` the navigation entry shows as **Soon** until this is `true`. |
+| `FLOWS_AVAILABLE` | unset | Stable Flows are enabled by default in self-hosted mode, including `prod`/`production`. Set `false` to disable explicitly. Cloud production retains its launch gate. |
+| `FLOWS_RELEASED` | unset | Self-hosted mode omits the **Soon** label by default; an explicit value overrides the default. |
 | `MANOR_PREVIEW_INTEGRATIONS` | unset | Comma-separated provider keys to surface "Coming Soon" integrations (for example `facebook,gmail`) on non-production deployments for test-user work. |
 | `MANOR_PREVIEW_CHANNELS` | unset | Same as above for message channels. |
 
 `MANOR_ENV` itself defaults to `local` when `DEPLOYMENT_MODE=oss`, so a stock
 self-hosted install has Flows enabled without extra configuration.
+
+## Manor PMS and Minutes {#manor-pms}
+
+Connect both applications in **Integrations → Manor PMS / Manor Minutes**.
+Select **Connect**, sign in to the application and approve the requested access.
+The application returns to Integrations, where the account appears with its
+connection status. No Apps installation or personal access-token copy is needed.
+Use the account menu to test, reconnect or disconnect it.
+
+Operators register Manor as an OAuth client in each application and configure
+the matching client credentials in Manor. Each application's callback allowlist
+must contain the exact URL for this deployment:
+
+- PMS: `{APP_URL}/api/v1/integrations/oauth/manor_pms/callback`
+- Minutes: `{APP_URL}/api/v1/integrations/oauth/manor_mcp_minutes/callback`
+
+| Variable | Purpose |
+| --- | --- |
+| `PMS_OAUTH_CLIENT_ID` / `PMS_OAUTH_CLIENT_SECRET` | Registered PMS client credentials for Manor. |
+| `PMS_OAUTH_BASE_URL` | Deployment-controlled PMS API origin for token exchange, identity and revocation. |
+| `PMS_OAUTH_AUTHORIZE_URL` | Browser-facing PMS authorization URL, ending in `/oauth/authorize`; set it when the web and API origins differ. |
+| `MINUTES_OAUTH_CLIENT_ID` / `MINUTES_OAUTH_CLIENT_SECRET` | Registered Minutes client credentials for Manor. |
+| `MINUTES_OAUTH_BASE_URL` | Deployment-controlled Minutes API origin. |
+| `MINUTES_OAUTH_AUTHORIZE_URL` | Browser-facing Minutes authorization URL, ending in `/oauth/authorize`. |
+
+Configure these settings on the API and workers. Client secrets and connected
+account tokens use the credential vault. Keep them out of prompts, task
+parameters and Blueprints. The applications also need their existing
+**Sign in with Manor** client configuration to authenticate their users.
+
+The authorization code flow uses PKCE. Connections bind the authenticated Manor
+user and organization to the application's verified identity. Refresh tokens
+rotate through the OAuth worker; a changed deployment endpoint or invalid grant
+requires reconnection. Disconnecting removes local tool access immediately. If
+remote revocation fails, the connection reports that failure and can be
+retried; it must not be treated as successfully revoked at the application.
+Reconnecting also revokes the previous grant. If that step fails, the
+connection stays disabled and Disconnect retries cleanup of both grants.
+Before changing an application's API origin, disconnect under the previous
+configuration; old credentials are never sent to a new origin.
+
+PMS management access requires an owner/admin account. Its 44 tools cover
+properties, tenants, leases, maintenance, payments and short stays. The gateway
+uses the selected connection's token, and writes still follow Manor's approval
+rules. Existing manually configured PMS credentials remain available for
+migration; new connections use OAuth. `PMS_API_URL` continues to configure the
+PMS tool gateway for the deployment.
+
+Minutes tools use the connected account for meeting search, transcripts,
+summaries and action items. Connection does not bypass meeting access rules or
+billing for meeting Q&A. `MINUTES_MCP_URL` configures its HTTP MCP endpoint.
+
+Deploy the matching application OAuth endpoints and database migrations before
+enabling these connections. New Manor identities receive isolated application
+namespaces. Existing portfolios or meeting records require an explicit,
+operator-managed identity mapping; matching a name or email does not grant
+access to historical data.
+
+When upgrading, run the catalog and OAuth client bootstrap on the API service
+that owns startup initialization. The standard OSS API does this at startup;
+split deployments need the designated startup owner
+(`MANOR_STARTUP_SIDE_EFFECTS_OWNER=1`). Chat and worker services do not refresh
+the catalog by themselves.
 
 ## Channel Integrations
 
@@ -273,6 +388,7 @@ portal, with the callback URL set to
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | Slack OAuth app. |
 | `NOTION_CLIENT_ID` / `NOTION_CLIENT_SECRET` | Notion OAuth app. |
 | `QUICKBOOKS_CLIENT_ID` / `QUICKBOOKS_CLIENT_SECRET` | QuickBooks OAuth app. |
+| `LARK_APP_ID` / `LARK_APP_SECRET` | International Lark OAuth app credentials. |
 | `ROBINHOOD_CLIENT_ID` | Public OAuth client for the official Robinhood Trading MCP; no client secret. |
 | `MS_CLIENT_ID` / `MS_CLIENT_SECRET` | One Azure AD app registration powers Outlook, OneDrive, Microsoft Calendar, Teams, and Excel. Set the redirect URI to the callback URL above; the required delegated Microsoft Graph permissions are listed in `.env.example`. |
 | `MS_TENANT` | `common` (work/school + personal accounts), `organizations`, `consumers`, or a specific Azure AD tenant GUID. |
@@ -281,8 +397,42 @@ portal, with the callback URL set to
 | `DISCORD_BOT_TOKEN` | Required if the bot sends messages. |
 | `TWILIO_ALLOW_UNSIGNED_LOCAL` | Local-only Twilio webhook override; keep `false` in staging/production. Twilio Account SID, Auth Token, and phone number are supplied per Integration. |
 | `OPENAI_REALTIME_MODEL` | Native OpenAI Realtime model shared by Browser and Twilio Voice. Defaults to `gpt-realtime`. |
-| `VERCEL_REALTIME_MODEL` | Managed Vercel Realtime model shared by Browser and Twilio Voice. Currently only `openai/gpt-realtime-mini` is supported. |
-| `OPENAI_API_KEY` | Optional managed native OpenAI route. A native OpenAI Primary AI key in Account → Models takes precedence as BYOK. |
+
+Configure speech synthesis credentials for **Text-to-Speech** in Account → Models.
+For the `suno/music` model, configure a native Suno BYOK key for **Music & Score**.
+These role-specific credentials follow the Entity's model configuration. A
+missing or incompatible key blocks generation before any provider request;
+self-hosted audio never falls back to a deployment's managed credentials.
+
+
+### International Lark OAuth
+
+Lark user OAuth supports the international Lark service only. Create an OAuth
+app in the [Lark developer console](https://open.larksuite.com/app), and
+register this exact redirect URI:
+
+`{APP_URL}/api/v1/integrations/oauth/lark/callback`
+
+Enable the following user scopes for the app:
+
+```text
+offline_access contact:user.base:readonly im:chat:read im:message
+im:message.send_as_user im:message.group_msg:get_as_user
+im:message.p2p_msg:get_as_user docx:document bitable:app
+```
+
+Set `LARK_APP_ID` and `LARK_APP_SECRET` in the API and worker environment, or
+as a self-hosted administrator, save them in the local OAuth client
+configuration. The application stores locally saved secrets in its credential
+vault; a local administrator configuration takes precedence over environment
+bootstrap values.
+
+Each user then selects **Connect** for Lark in **Integrations** and grants the
+requested access to their own account. Connections are bound to both that user
+and the registered Lark app. Reconnect with the same account and app after a
+revoked or expired grant; changing the app credentials requires a new user
+consent flow. Legacy Feishu app or bot accounts remain separate integrations:
+their credentials cannot be used for international Lark OAuth.
 
 ### Robinhood Trading MCP
 

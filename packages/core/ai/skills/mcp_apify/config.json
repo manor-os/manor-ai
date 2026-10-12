@@ -1,0 +1,19 @@
+{
+  "id": "mcp_apify",
+  "name": "mcp_apify",
+  "type": "runtime_guidance",
+  "description": "Search public Instagram creators and collect recent posts and Reels through Apify's official MCP with a quoted budget.",
+  "category": "search",
+  "output_format": "guidance",
+  "tags": ["apify", "instagram", "reels", "research", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__apify__quote_instagram_collection",
+    "mcp__apify__start_instagram_collection",
+    "mcp__apify__get_instagram_collection",
+    "mcp__apify__cancel_instagram_collection"
+  ],
+  "search": {
+    "terms": ["instagram", "ig", "scraping", "scrape", "reels", "influencer research", "social media research"],
+    "examples": ["find instagram creators in my niche", "collect recent reels from public profile", "scrape instagram posts for inspiration", "research competitor instagram accounts"]
+  }
+}

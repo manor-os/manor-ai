@@ -15,7 +15,11 @@ from types import SimpleNamespace
 import pytest
 
 import packages.core.workers.internal as internal
+from packages.core.contracts.json_schema import SchemaContractValidatorFactory
+from packages.core.contracts.shapes import get_shape
 from packages.core.contracts.task_output import (
+    SubmittedStepFailure,
+    TaskOutputProtocolError,
     TaskOutputValueKind,
     plan_output_contract_schema,
     task_output_envelope_schema,
@@ -24,6 +28,7 @@ from packages.core.workers.submit_result import (
     SUBMIT_RESULT_TERMINAL_POLICY,
     SUBMIT_RESULT_TOOL_NAME,
     build_submit_result_tool,
+    submit_result_contract_schema,
     step_result_from_submit,
     submit_result_capture,
     submit_result_followup_message,
@@ -138,6 +143,86 @@ def test_step_result_from_submit_keeps_canonical_output_text_authoritative():
     assert "text" not in out
 
 
+def _hard_output_schema(kind):
+    if kind == "task":
+        return task_output_envelope_schema({"type": "object"})
+    if kind == "canonical":
+        return plan_output_contract_schema(get_shape("ArtifactResult").json_schema())
+    return plan_output_contract_schema(
+        {"type": "string"}, source="plan.expected_output_schema",
+    )
+
+
+def _failed_submission(**failure_overrides):
+    return {
+        "summary": "The required artifact could not be written.",
+        "status": "failed",
+        "failure": {
+            "reason": "file.write is blocked by governance",
+            "blockers": ["file.write"],
+            "retryable": False,
+            "requires_human": True,
+            **failure_overrides,
+        },
+    }
+
+
+@pytest.mark.parametrize("kind", ["task", "canonical", "custom"])
+def test_hard_submit_schema_accepts_failure_without_fabricated_deliverable(kind):
+    # The exclusive branch lives on the validation contract, not on the
+    # advertised tool: Anthropic rejects top-level combinators in input_schema.
+    validator = SchemaContractValidatorFactory.build(submit_result_contract_schema(_hard_output_schema(kind)))
+    assert validator.is_valid(_failed_submission())
+    assert not validator.is_valid({**_failed_submission(), "result": None})
+    assert not validator.is_valid({"summary": "missing success result", "status": "succeeded"})
+
+
+@pytest.mark.parametrize("kind", ["task", "canonical", "custom"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"failure": None},
+        {"failure": {"reason": "blocked"}},
+        {"failure": {"reason": "", "retryable": False}},
+        {"failure": {"reason": "   ", "retryable": False}},
+        {"failure": {"reason": "blocked", "retryable": "false"}},
+        {"failure": {"reason": "blocked", "retryable": False, "requires_human": "true"}},
+        {"failure": {"reason": "blocked", "retryable": True, "requires_human": True}},
+        {"failure": {"reason": "blocked", "retryable": False, "blockers": "file.write"}},
+        {"result": None},
+        {"summary": 42},
+    ],
+)
+def test_hard_failed_submission_rejects_malformed_control_before_normalization(kind, change):
+    payload = {**_failed_submission(), **change}
+    with pytest.raises(TaskOutputProtocolError, match="failed submit_result"):
+        step_result_from_submit(payload, _hard_output_schema(kind))
+
+
+@pytest.mark.parametrize("kind", ["canonical", "custom"])
+def test_bare_failed_submission_is_typed_control_not_a_success_payload(kind):
+    payload = _failed_submission()
+    with pytest.raises(SubmittedStepFailure) as raised:
+        step_result_from_submit(payload, _hard_output_schema(kind))
+    assert raised.value.summary == payload["summary"]
+    assert raised.value.failure == payload["failure"]
+
+
+@pytest.mark.parametrize("kind", ["task", "canonical", "custom"])
+def test_hard_success_cannot_hide_an_outer_failure_block(kind):
+    with pytest.raises(TaskOutputProtocolError, match="successful submit_result"):
+        step_result_from_submit(
+            {**_failed_submission(), "status": "succeeded", "result": "value"},
+            _hard_output_schema(kind),
+        )
+
+
+def test_bare_payload_business_failure_field_is_not_runtime_control():
+    value = {"status": "failed", "failure": {"reason": "provider business data"}}
+    schema = plan_output_contract_schema({"type": "object"}, source="plan.expected_output_schema")
+    assert step_result_from_submit({"summary": "inspected", "result": value}, schema) == value
+
+
 def test_followup_message_lists_schema_fields():
     msg = submit_result_followup_message({
         "type": "object", "properties": {"b": {}, "a": {}},
@@ -239,7 +324,17 @@ def test_submit_payload_becomes_the_step_result(monkeypatch):
     tool_names = [t["function"]["name"] for t in captured_kwargs["tools"]]
     assert SUBMIT_RESULT_TOOL_NAME in tool_names and "existing_tool" in tool_names
     assert SUBMIT_RESULT_TOOL_NAME in captured_kwargs["allowed_tool_names"]
-    assert captured_kwargs["terminal_tool_result_policy"] is SUBMIT_RESULT_TERMINAL_POLICY
+    # The worker's terminal policy still ends the loop on submit_result; it
+    # now also covers request_input (a pause is a success terminator too).
+    armed = {
+        name
+        for rule in captured_kwargs["terminal_tool_result_policy"]["terminal_tool_results"]
+        for name in rule["tool_names"]
+    }
+    assert SUBMIT_RESULT_TOOL_NAME in armed
+    assert {rule["stop_reason"] for rule in SUBMIT_RESULT_TERMINAL_POLICY["terminal_tool_results"]} <= {
+        rule["stop_reason"] for rule in captured_kwargs["terminal_tool_result_policy"]["terminal_tool_results"]
+    }
     assert "submit_result" in captured_kwargs["user_message"]
 
 
@@ -323,6 +418,29 @@ def test_explicit_contract_does_not_fall_back_to_plain_text_after_missing_submit
                 }
             )
         )))
+
+
+@pytest.mark.parametrize("kind", ["canonical", "custom"])
+def test_forced_followup_preserves_bare_failure_control(monkeypatch, kind):
+    _wire_common(monkeypatch)
+    followups = []
+
+    async def fake_worker_loop(**_kwargs):
+        return SimpleNamespace(result=_loop_result(content="blocked"), run=None)
+
+    async def fake_fallback(**kwargs):
+        followups.append(kwargs)
+        kwargs["dynamic_tool_handlers"][SUBMIT_RESULT_TOOL_NAME](_failed_submission())
+        return _loop_result(rounds=1)
+
+    monkeypatch.setattr(internal, "runtime_execute_worker_subagent_loop", fake_worker_loop)
+    monkeypatch.setattr("packages.core.ai.runtime.runtime_execute_worker_subagent_followup", fake_fallback)
+
+    with pytest.raises(SubmittedStepFailure) as raised:
+        asyncio.run(internal._exec_subagent(_step(_hard_output_schema(kind))))
+    assert raised.value.failure == _failed_submission()["failure"]
+    assert len(followups) == 1
+    assert [t["function"]["name"] for t in followups[0]["tools"]] == [SUBMIT_RESULT_TOOL_NAME]
 
 
 def test_fallback_round_failure_is_swallowed(monkeypatch):

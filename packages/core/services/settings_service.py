@@ -12,6 +12,9 @@ from packages.core.constants.integrations import (
     INTEGRATION_ACCOUNT_DEFAULTS_PREFERENCE_KEY,
 )
 from packages.core.models.user import Entity, User
+from packages.core.governance.approval_policy_service import (
+    LEGACY_APPROVAL_PREFERENCES, ProtectedApprovalSettingsError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +36,8 @@ async def get_entity_settings(db: AsyncSession, entity_id: str) -> dict:
 
 
 async def update_entity_settings(db: AsyncSession, entity_id: str, settings: dict) -> dict:
+    if 'approval_defaults' in settings:
+        raise ProtectedApprovalSettingsError('Use execution and approval settings to edit approval_defaults')
     public_settings = settings
     get_bind = getattr(db, "get_bind", None)
     bind = get_bind() if callable(get_bind) else None
@@ -89,6 +94,8 @@ async def get_user_preferences(db: AsyncSession, user_id: str) -> dict:
 
 
 async def update_user_preferences(db: AsyncSession, user_id: str, preferences: dict) -> dict:
+    if set(preferences) & (LEGACY_APPROVAL_PREFERENCES | {'approval_policy'}):
+        raise ProtectedApprovalSettingsError('Approval preferences were replaced; refresh the client and use execution and approval settings')
     # Integration account defaults are an internal runtime pointer. General
     # settings writes must neither accept nor overwrite that reserved branch.
     public_preferences = {

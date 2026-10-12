@@ -42,6 +42,7 @@ Public surface:
                               before complete_lease persists it.
 """
 from packages.core.dispatcher.service import (
+    CoordinatorCompletionRejected,
     Dispatcher,
     DispatchError,
     LeaseNotActive,
@@ -55,6 +56,7 @@ from packages.core.dispatcher.validation import (
 )
 
 __all__ = [
+    "CoordinatorCompletionRejected",
     "Dispatcher",
     "DispatchError",
     "LeaseNotActive",

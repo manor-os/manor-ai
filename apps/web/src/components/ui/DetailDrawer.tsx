@@ -1,10 +1,21 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useDetailStore, type DetailAction } from "../../stores/detail";
+import { trapDialogTabKey } from "./Modal";
+
+function isTopDetailLayer(): boolean {
+  const renderedLayers = document.body.querySelectorAll<HTMLElement>(
+    "[data-manor-modal-layer-id]",
+  );
+  return renderedLayers.item(renderedLayers.length - 1)?.dataset.manorModalLayerId
+    === "detail-drawer";
+}
 
 /**
- * DetailDrawer — the global detail pop-up. Mounted once at the app root
- * (see main.tsx); driven entirely by the `detail` store. Cards/rows call
- * `openDetail({ icon, title, subtitle, badges, body, actions })` to show it.
+ * DetailDrawer — the global detail pop-up. Mounted once in the app shell
+ * (see main.tsx) and portaled to document.body; driven entirely by the
+ * `detail` store. Cards/rows call `openDetail({ icon, title, subtitle, badges,
+ * body, actions })` to show it.
  *
  * Follows the design system: a centered, borderless frosted-glass card on a
  * dimmed scrim, low-saturation tokens throughout; Esc / scrim-click to close.
@@ -13,34 +24,97 @@ export default function DetailDrawer() {
   const payload = useDetailStore((s) => s.payload);
   const closeDetail = useDetailStore((s) => s.closeDetail);
   const open = !!payload;
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  const returnFocusFrameRef = useRef<number | null>(null);
+  const payloadRef = useRef(payload);
+  payloadRef.current = payload;
 
   useEffect(() => {
     if (!open) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeDetail();
+    if (returnFocusFrameRef.current !== null) {
+      window.cancelAnimationFrame(returnFocusFrameRef.current);
+      returnFocusFrameRef.current = null;
+    }
+    const activeElement = document.activeElement;
+    returnFocusRef.current = payloadRef.current?.returnFocusTo
+      ?? (activeElement instanceof HTMLElement ? activeElement : null);
+    const onKey = (event: KeyboardEvent) => {
+      const drawer = drawerRef.current;
+      if (!drawer || !isTopDetailLayer()) return;
+      if (event.key === "Escape") {
+        const target = event.target;
+        if (
+          target instanceof Element
+          && target.closest('[data-manor-popup-open="true"]')
+        ) {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        closeDetail();
+        return;
+      }
+      if (event.key === "Tab") {
+        event.stopPropagation();
+        trapDialogTabKey(event, drawer);
+      }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      const returnFocusTo = returnFocusRef.current;
+      returnFocusRef.current = null;
+      returnFocusFrameRef.current = window.requestAnimationFrame(() => {
+        returnFocusFrameRef.current = null;
+        if (
+          returnFocusTo?.isConnected
+          && !returnFocusTo.closest("[inert]")
+          && !document.body.querySelector("[data-manor-modal-layer-id]")
+        ) {
+          returnFocusTo.focus();
+        }
+      });
+    };
   }, [open, closeDetail]);
 
-  if (!payload) return null;
+  // Keep the final return target for the drawer's whole lifetime, but move
+  // focus into every replacement payload (for example list → detail → list).
+  // Otherwise the focused card can unmount and leave focus on document.body.
+  useEffect(() => {
+    if (!payload) return;
+    const focusFrame = window.requestAnimationFrame(() => {
+      const drawer = drawerRef.current;
+      if (!drawer?.contains(document.activeElement)) {
+        closeButtonRef.current?.focus();
+      }
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [payload]);
+
+  if (!payload || typeof document === "undefined") return null;
   const width = payload.width ?? 520;
 
-  return (
+  return createPortal(
     <div
       className="detail-scrim"
+      data-manor-modal-layer-id="detail-drawer"
       onClick={closeDetail}
       role="presentation"
     >
       <aside
+        ref={drawerRef}
         className="detail-drawer"
         style={{ width: `min(${width}px, calc(100vw - 32px))` }}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
         aria-label={typeof payload.title === "string" ? payload.title : undefined}
+        tabIndex={-1}
       >
         <button
+          ref={closeButtonRef}
           className="detail-drawer-close"
           onClick={closeDetail}
           aria-label="Close"
@@ -79,7 +153,8 @@ export default function DetailDrawer() {
           />
         )}
       </aside>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

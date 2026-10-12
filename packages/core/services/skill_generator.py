@@ -7,11 +7,13 @@ from typing import AsyncIterator, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.response_language import resolve_response_locale
 from packages.core.ai.runtime import (
     runtime_execute_skill_generation_completion,
     runtime_execute_skill_patch_completion,
     runtime_execute_skill_review_completion,
 )
+from packages.core.i18n import get_locale, t
 from packages.core.models.skill import Skill
 from packages.core.models.permission import Visibility
 from packages.core.services.skill_bundle import assemble_skill_bundle, extract_json_object
@@ -105,12 +107,14 @@ async def _draft_skill_spec(
     entity_id: str,
     category: Optional[str],
     tags: Optional[list[str]],
+    user_id: str | None = None,
 ) -> dict:
     completion = await runtime_execute_skill_generation_completion(
         prompt,
         entity_id=entity_id,
         category=category,
         tags=tags,
+        user_id=user_id,
     )
     raw = completion.content
     if not raw or not raw.strip():
@@ -122,6 +126,7 @@ async def _review_skill_spec(
     spec: dict,
     *,
     entity_id: str,
+    user_id: str | None = None,
 ) -> GeneratedSkillDraft:
     """Review one draft without requiring or retaining a database session."""
 
@@ -130,6 +135,7 @@ async def _review_skill_spec(
         review = await runtime_execute_skill_review_completion(
             spec,
             entity_id=entity_id,
+            user_id=user_id,
         )
         test_result = review.content
 
@@ -152,11 +158,11 @@ async def _review_skill_spec(
         except ValueError:
             refined = None
         if refined and refined.get("system_prompt"):
-            # A reviewer that trims the bundle objects must not silently
-            # degrade a sandbox bundle into a prompt-only skill.
+            # Review updates file contents; only the manual file editor has
+            # replacement/deletion semantics. Partial maps cannot lose files.
             for key in ("scripts", "references"):
-                if key not in refined and spec.get(key):
-                    refined[key] = spec[key]
+                if key in refined or spec.get(key):
+                    refined[key] = _merge_bundle_files(spec.get(key), refined.get(key))
             logger.info("Skill '%s' refined on attempt %d", spec.get("name"), attempt + 1)
             spec = refined
         else:
@@ -175,6 +181,7 @@ async def generate_skill_draft(
     *,
     category: Optional[str] = None,
     tags: Optional[list[str]] = None,
+    user_id: str | None = None,
 ) -> GeneratedSkillDraft:
     """Run all billable generation passes without a database connection."""
 
@@ -183,8 +190,9 @@ async def generate_skill_draft(
         entity_id=entity_id,
         category=category,
         tags=tags,
+        user_id=user_id,
     )
-    return await _review_skill_spec(spec, entity_id=entity_id)
+    return await _review_skill_spec(spec, entity_id=entity_id, user_id=user_id)
 
 
 async def persist_generated_skill_draft(
@@ -251,6 +259,7 @@ async def generate_skill_streaming(
     owner_user_id: str | None = None,
     workspace_id: str | None = None,
     visibility: str = Visibility.ENTITY,
+    user_id: str | None = None,
 ) -> AsyncIterator[Tuple[str, object]]:
     """Generate a skill, yielding progress as it goes.
 
@@ -260,18 +269,20 @@ async def generate_skill_streaming(
     timeout) and lets the UI show the build steps like the chat tool trace.
     """
 
-    yield ("step", "Drafting the skill")
+    progress_locale = await resolve_response_locale(user_id or owner_user_id, db=db) or get_locale()
+    yield ("step", t("generation.skill.drafting", locale=progress_locale))
     spec = await _draft_skill_spec(
         prompt,
         entity_id=entity_id,
         category=category,
         tags=tags,
+        user_id=user_id or owner_user_id,
     )
-    yield ("step", "Reviewing and refining")
-    draft = await _review_skill_spec(spec, entity_id=entity_id)
+    yield ("step", t("generation.skill.reviewing", locale=progress_locale))
+    draft = await _review_skill_spec(spec, entity_id=entity_id, user_id=user_id or owner_user_id)
     # Standalone scripts/references become a sandbox bundle; prompt-only
     # definitions keep the ordinary Skill representation.
-    yield ("step", "Packaging and saving")
+    yield ("step", t("generation.skill.saving", locale=progress_locale))
     skill = await persist_generated_skill_draft(
         draft,
         prompt=prompt,
@@ -298,6 +309,7 @@ async def generate_skill(
     owner_user_id: str | None = None,
     workspace_id: str | None = None,
     visibility: str = Visibility.ENTITY,
+    user_id: str | None = None,
 ) -> Skill:
     """Generate a skill using the draft → review → package flow.
 
@@ -315,6 +327,7 @@ async def generate_skill(
         owner_user_id=owner_user_id,
         workspace_id=workspace_id,
         visibility=visibility,
+        user_id=user_id,
     ):
         if kind == "skill":
             skill = payload  # type: ignore[assignment]
@@ -328,6 +341,8 @@ async def update_skill(
     change_description: str,
     entity_id: str,
     db: AsyncSession,
+    *,
+    user_id: str | None = None,
 ) -> Skill:
     """Patch an existing Skill by describing the desired change in natural language.
 
@@ -350,6 +365,7 @@ async def update_skill(
         existing,
         change_description,
         entity_id,
+        user_id=user_id,
     )
 
     updated = await skill_service.update_skill(
@@ -367,6 +383,8 @@ async def build_skill_update_patch(
     existing: Skill,
     change_description: str,
     entity_id: str,
+    *,
+    user_id: str | None = None,
 ) -> dict:
     """Produce an LLM Skill patch without performing a database write."""
 
@@ -374,6 +392,7 @@ async def build_skill_update_patch(
         existing,
         change_description,
         entity_id=entity_id,
+        user_id=user_id,
     )
     raw = completion.content
 
@@ -382,7 +401,54 @@ async def build_skill_update_patch(
 
     patch = _extract_json(raw)
 
+    # The generation schema uses top-level scripts/references, whereas saved
+    # Skills store file maps in config. Normalize both forms before persistence
+    # so a model-returned file edit is neither ignored nor a bundle replacement.
+    file_keys = ("scripts", "extra_files", "requirements", "references")
+    if "config" in patch or any(key in patch for key in file_keys):
+        updates = dict(patch.get("config") or {})
+        config = {**(getattr(existing, "config", None) or {}), **updates}
+        for key in ("scripts", "extra_files"):
+            files = _merge_bundle_files((existing.config or {}).get(key), updates.get(key))
+            if key in patch:
+                files = _merge_bundle_files(files, patch.pop(key))
+            if files or key in config:
+                config[key] = files
+        if "references" in patch:
+            references = _merge_bundle_files({}, patch.pop("references"))
+            config["extra_files"] = _merge_bundle_files(config.get("extra_files"), {
+                name if name.startswith("references/") else f"references/{name}": content
+                for name, content in references.items()
+            })
+        if "requirements" in patch:
+            config["requirements"] = patch.pop("requirements")
+        # Match save_skill_files: bare script names get a scripts/ prefix;
+        # already qualified paths are written as-is after slash normalization.
+        script_paths = {
+            name.replace("\\", "/").lstrip("/")
+            for name in (config.get("scripts") or {})
+        }
+        config["extra_file_paths"] = sorted({
+            name if "/" in name else f"scripts/{name}"
+            for name in script_paths
+        } | {
+            name.replace("\\", "/").strip().lstrip("/")
+            for name in (config.get("extra_files") or {})
+        })
+        patch["config"] = config
+
     # Bump version
     new_version = _bump_version(existing.version or "1.0.0")
     patch["version"] = new_version
     return patch
+
+
+def _merge_bundle_files(original: dict | None, updates: dict | None) -> dict:
+    """Preserve omitted files during AI edits; malformed bodies fail closed."""
+    if updates is not None and (
+        not isinstance(updates, dict)
+        or any(not isinstance(name, str) or not isinstance(body, str)
+               for name, body in updates.items())
+    ):
+        raise ValueError("Skill bundle file updates must map paths to full text bodies")
+    return {**(original or {}), **(updates or {})}

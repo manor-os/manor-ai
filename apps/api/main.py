@@ -206,6 +206,9 @@ async def lifespan(app: FastAPI):
         # by id like any contributor's — rather than a parallel code path. A
         # redeploy of unchanged configs writes nothing; a corrected one bumps its
         # version, which is what tells installed workspaces an update exists.
+        # K8s disables API startup side effects and publishes only after every
+        # runtime rollout succeeds. Single-owner Compose/OSS deployments keep
+        # the existing startup-compatible path.
         try:
             from packages.core.blueprints.seed import seed_platform_blueprints
             from packages.core.database import async_session
@@ -465,20 +468,27 @@ async def lifespan(app: FastAPI):
         startup_tasks.append(workspace_operation_repair_task)
 
     async def _stale_stream_repair_task() -> None:
-        try:
-            from packages.core.database import async_session
-            from packages.core.services.conversation_messages import (
-                mark_stale_assistant_streams_interrupted,
-            )
-            async with async_session() as _db:
-                count = await mark_stale_assistant_streams_interrupted(_db)
-            if count:
-                logger.info(
-                    "Assistant stream startup repair marked %d stale checkpoint(s) interrupted",
-                    count,
-                )
-        except Exception as e:
-            logger.warning("Assistant stream startup repair skipped: %s", e, exc_info=True)
+        from packages.core.database import async_session
+        from packages.core.services.conversation_messages import (
+            mark_stale_assistant_streams_interrupted,
+        )
+
+        while True:
+            try:
+                async with async_session() as _db:
+                    count = await mark_stale_assistant_streams_interrupted(_db)
+                if count:
+                    logger.info(
+                        "Assistant stream repair marked %d stale checkpoint(s) interrupted",
+                        count,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Assistant stream repair skipped: %s", e, exc_info=True)
+            # A checkpoint can become stale after startup when its API process
+            # dies. Keep recovery bounded without polling on every chat read.
+            await asyncio.sleep(120)
 
     if _run_api_side_effects:
         stale_stream_repair_task = asyncio.create_task(
@@ -564,7 +574,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Manor AI",
         description="The AI operating system for autonomous enterprise management",
-        version="0.1.0",
+        version="0.1.1",
         docs_url=None if cloud_mode else "/api/docs",
         redoc_url=None if cloud_mode else "/api/redoc",
         openapi_url=None if cloud_mode else "/api/openapi.json",
@@ -584,6 +594,7 @@ def create_app() -> FastAPI:
             "Content-Type",
             "Range",
             "X-Language",
+            "X-Manor-Session",
             "X-Portal-Token",
             "X-Request-ID",
             "X-Silent-Error",
@@ -592,6 +603,10 @@ def create_app() -> FastAPI:
             "Content-Disposition",
             "Content-Length",
             "X-Request-ID",
+            "X-Conversation-ID",
+            "X-User-Message-ID",
+            "X-Client-Message-ID",
+            "X-Runtime-Run-ID",
             "X-Response-Surface-Event-ID",
         ],
     )
@@ -652,7 +667,7 @@ def create_app() -> FastAPI:
         return JSONResponse(status_code=409, content={"detail": str(exc)})
 
     # ── Core routers (always loaded) ──
-    from apps.api.routers import auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, messages, agents, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support, sites
+    from apps.api.routers import llm_gateway, auth, health, entities, workspaces, workspace_stats, workspace_drafts, tasks, chat, chat_rooms, messages, agents, agent_initiatives, documents, integrations, notifications, admin, admin_oauth, oauth_provider, people, usage, goals, plans, workspace_chat, workers, scheduler, ws, search, dashboard, bulk, activity, webhooks, api_keys, templates, backup, skills, custom_fields, memories, comments, quotas, favorites, tags, presence, workflows, reports, portal, orders, docgen, browser, staff_management, calendar_settings, filesystem, nango_oauth, nango_webhooks, platform_public, business, audio, media, permissions as permissions_router, permissions_v1, document_permissions, folder_permissions, client_errors, support, sites
     from apps.api.routers import internal_capacity
     from apps.api.routers.channels import wechat as wechat_channel
     from apps.api.routers.channels import twilio as twilio_channel
@@ -678,10 +693,14 @@ def create_app() -> FastAPI:
     app.include_router(tasks.router)
     app.include_router(calendar_settings.router)
     app.include_router(chat.router)
+    app.include_router(chat_rooms.router)
     app.include_router(messages.router)
     # Cloud marketplace routes must be registered before the base agents/skills
     # routers, otherwise /marketplace and /manor are shadowed by /{id} routes.
     app.include_router(agents.router)
+    app.include_router(agent_initiatives.subscription_router)
+    app.include_router(agent_initiatives.initiative_router)
+    app.include_router(agent_initiatives.run_router)
     app.include_router(documents.router)
     app.include_router(document_permissions.router)         # /api/v1/documents/{id}/grants, /shares, /access-log, /access-requests
     app.include_router(document_permissions.public_router)  # /api/v1/shared-doc/{token} — unauth
@@ -708,7 +727,14 @@ def create_app() -> FastAPI:
     app.include_router(permissions_router.router)  # /permissions, /staff/roles, /staff/invite
     app.include_router(permissions_v1.router)      # /permissions/v1 — classify/visibility/access-requests (RFC §13)
     app.include_router(people.router)
+    from apps.api.routers import client_delivery
+    app.include_router(client_delivery.router)
+    from apps.api.routers import workspace_collaboration
+    app.include_router(workspace_collaboration.router)
+    from apps.api.routers import crm
+    app.include_router(crm.router)
     app.include_router(usage.router)
+    app.include_router(llm_gateway.router)  # OpenAI-compatible gateway for downstream apps (Minutes etc.)
     app.include_router(goals.router)
     app.include_router(plans.router)
     app.include_router(workspace_chat.router)
@@ -742,6 +768,10 @@ def create_app() -> FastAPI:
     from apps.api.routers import public_task, public_chat
     app.include_router(public_task.router)
     app.include_router(public_chat.router)
+    from apps.api.routers import public_pms_resident, public_pms_resident_create
+    app.include_router(public_pms_resident_create.router)
+    app.include_router(public_pms_resident.router)
+    app.include_router(public_pms_resident.owner_router)
     app.include_router(wechat_channel.router)
     app.include_router(slack_channel.router)
     app.include_router(discord_channel.router)
@@ -766,6 +796,9 @@ def create_app() -> FastAPI:
     )
     app.include_router(goal_templates_router.router)
     app.include_router(goal_templates_router.apply_router)
+    from apps.api.routers import approval_settings, approval_commands
+    app.include_router(approval_settings.router)
+    app.include_router(approval_commands.router)
     app.include_router(governance_router.router)
     app.include_router(humans_router.router)
     app.include_router(observability_router.router)

@@ -15,6 +15,8 @@ of the API operations exposed here, including ``videos.insert``; requesting
 """
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import json
 import logging
 import mimetypes
@@ -30,6 +32,7 @@ from packages.core.services.dashboard_http import (
     create_public_https_transport,
     resolve_public_https_target,
 )
+from packages.core.services.file_refs import parse_file_reference
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +43,17 @@ _TIMEOUT = 30.0
 _UPLOAD_TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 _UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024  # YouTube chunks must be a multiple of 256 KiB.
 _MAX_VIDEO_BYTES = 256 * 1024 * 1024 * 1024
+_call_ctx_var: contextvars.ContextVar[Dict[str, str]] = contextvars.ContextVar(
+    "youtube_mcp_call_ctx", default={},
+)
+
+
+def set_call_context(ctx: Dict[str, str]) -> None:
+    _call_ctx_var.set(dict(ctx or {}))
+
+
+def clear_call_context() -> None:
+    _call_ctx_var.set({})
 
 
 # ── MCP Protocol ─────────────────────────────────────────────────────────────
@@ -100,6 +114,8 @@ async def _api(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     body: Optional[Dict] = None,
+    *,
+    truncate: bool = True,
 ) -> str:
     qs = ""
     if params:
@@ -130,7 +146,7 @@ async def _api(
     except Exception:
         return resp.text[:_MAX_CHARS]
     out = json.dumps(data, ensure_ascii=False, indent=2, default=str)
-    if len(out) > _MAX_CHARS:
+    if truncate and len(out) > _MAX_CHARS:
         return out[:_MAX_CHARS] + "\n… (truncated)"
     return out
 
@@ -194,14 +210,76 @@ async def _list_captions(token: str, args: Dict) -> str:
 
 
 async def _list_my_videos(token: str, args: Dict) -> str:
-    return await _api(token, "GET", "search", {
-        "part": "snippet",
-        "forMine": "true",
-        "type": "video",
-        "maxResults": int(args.get("max_results", 10)),
-        "q": args.get("query"),
-        "order": args.get("order", "date"),
-    })
+    max_results = int(args.get("max_results", 10))
+    if not 1 <= max_results <= 50:
+        raise _YouTubeError("max_results must be between 1 and 50.")
+    # Search is still useful for an explicit query/order, but its delayed index
+    # is not the inventory of uploads needed before creating another video.
+    use_search = bool(args.get("query")) or args.get("order", "date") != "date"
+    # The model's ordinary tool-result budget is 4,000 characters. Small API
+    # pages plus identity-only summaries keep every item and cursor visible.
+    page_params = {"maxResults": min(max_results, 4), "pageToken": args.get("page_token")}
+    if use_search:
+        data = json.loads(await _api(token, "GET", "search", {
+            **page_params,
+            "part": "snippet", "forMine": "true", "type": "video",
+            "q": args.get("query"), "order": args.get("order", "date"),
+            "fields": "nextPageToken,prevPageToken,pageInfo,items(id,snippet(title,publishedAt))",
+        }, truncate=False))
+    else:
+        channels = json.loads(await _api(token, "GET", "channels", {
+            "part": "contentDetails", "mine": "true",
+            "fields": "items(id,contentDetails/relatedPlaylists/uploads)",
+        }, truncate=False)).get("items", [])
+        if len(channels) != 1:
+            raise _YouTubeError("Could not resolve exactly one authenticated YouTube channel.")
+        playlist_id = channels[0].get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads")
+        if not playlist_id:
+            raise _YouTubeError("The authenticated channel has no uploads playlist reference.")
+        data = json.loads(await _api(token, "GET", "playlistItems", {
+            **page_params,
+            "part": "snippet,contentDetails,status", "playlistId": playlist_id,
+            "fields": "nextPageToken,prevPageToken,pageInfo,items(snippet(title,publishedAt,resourceId/videoId),contentDetails(videoId,videoPublishedAt),status/privacyStatus)",
+        }, truncate=False))
+
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        raise _YouTubeError("YouTube returned an invalid video list; inventory is incomplete.")
+    result = {key: data[key] for key in ("nextPageToken", "prevPageToken", "pageInfo") if key in data}
+    result["source"] = "search" if use_search else "uploads_playlist"
+    result["items"] = []
+    for item in data["items"]:
+        snippet = item.get("snippet", {})
+        details = item.get("contentDetails", {})
+        video_id = (
+            item.get("id", {}).get("videoId") if use_search
+            else details.get("videoId") or snippet.get("resourceId", {}).get("videoId")
+        )
+        if not video_id:
+            raise _YouTubeError("YouTube returned an item without a video ID; inventory is incomplete.")
+        summary = {
+            "id": {"kind": "youtube#video", "videoId": video_id},
+            "snippet": {key: snippet[key] for key in (
+                "title", "publishedAt",
+            ) if key in snippet},
+        }
+        if details.get("videoPublishedAt"):
+            summary["snippet"]["publishedAt"] = details["videoPublishedAt"]
+        if item.get("status", {}).get("privacyStatus"):
+            summary["status"] = {"privacyStatus": item["status"]["privacyStatus"]}
+        result["items"].append(summary)
+    result["note"] = (
+        "Search results can lag or omit uploads; use the default uploads inventory before publishing."
+        if use_search else
+        "Follow nextPageToken until absent. Use get_video for current duration, processing, and publication status."
+    )
+    # Never let generic model-context compaction drop items behind a cursor.
+    encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded) > 4000:
+        raise _YouTubeError(
+            "YouTube inventory page is unusually large; retry the same page_token "
+            "with max_results=1. Inventory remains incomplete until all pages are read."
+        )
+    return encoded
 
 
 # ── Publish / engagement ──────────────────────────────────────────────────────
@@ -301,13 +379,15 @@ async def _add_to_playlist(token: str, args: Dict) -> str:
 
 
 async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
-    """Download one public HTTPS video to a temporary file without buffering
-    it in process memory.
+    """Stage an authorized chat attachment or public HTTPS video with bounded memory.
 
     The public-host checks and no-redirect policy keep the server-side fetch
     from becoming an internal-network proxy. The temporary file lets the
     subsequent YouTube upload retry by chunk while keeping memory bounded.
     """
+    file_ref = parse_file_reference(source_url)
+    if source_url.startswith("uploads/") or (file_ref is not None and file_ref.entity_id):
+        return await _stage_chat_video(source_url)
     try:
         target = await resolve_public_https_target(source_url)
     except Exception as exc:
@@ -365,6 +445,67 @@ async def _stage_video_source(source_url: str) -> tuple[Path, int, str]:
         raise
 
 
+async def _stage_chat_video(reference: str) -> tuple[Path, int, str]:
+    """Copy an authorized, exact chat attachment without creating a public URL."""
+    from packages.core.services.ai_file_permissions import (
+        guard_ai_file_read_access, is_chat_upload_path,
+    )
+    from packages.core.services.entity_fs import (
+        canonical_entity_root, entity_filesystem_read_lock, is_fs_enabled,
+        open_entity_file_snapshot,
+    )
+
+    ctx = _call_ctx_var.get()
+    entity_id = ctx.get("entity_id", "")
+    if not entity_id or not ctx.get("user_id") or not ctx.get("conversation_id"):
+        raise _YouTubeError("Chat attachment upload requires the current user and conversation context.")
+    rel_path = reference
+    file_ref = parse_file_reference(reference)
+    if file_ref is not None and file_ref.entity_id:
+        if file_ref.entity_id != entity_id:
+            raise _YouTubeError("Chat attachment URL does not belong to the current entity.")
+        rel_path = file_ref.fs_path
+    if not is_chat_upload_path(rel_path):
+        raise _YouTubeError("Use the exact uploads/chat attachment reference from this conversation.")
+    if not is_fs_enabled():
+        raise _YouTubeError("Entity filesystem is unavailable for chat attachment upload.")
+    media_type = mimetypes.guess_type(rel_path)[0] or "application/octet-stream"
+    if not media_type.startswith("video/"):
+        raise _YouTubeError("The chat attachment must be a video file.")
+
+    path: Path | None = None
+    try:
+        async with entity_filesystem_read_lock(canonical_entity_root(entity_id)):
+            denied = await guard_ai_file_read_access(
+                entity_id=entity_id, user_id=ctx["user_id"],
+                conversation_id=ctx["conversation_id"], workspace_id=ctx.get("workspace_id"),
+                tool_name="mcp__youtube__upload_video", paths=[rel_path],
+            )
+            if denied:
+                raise _YouTubeError("The chat attachment is unavailable or is not readable in this conversation.")
+            with open_entity_file_snapshot(entity_id, rel_path) as snapshot:
+                size = snapshot.stat.st_size
+                if not 0 < size <= _MAX_VIDEO_BYTES:
+                    raise _YouTubeError("The video must be nonempty and within YouTube's 256 GB upload limit.")
+                fd, raw_path = tempfile.mkstemp(prefix="manor-youtube-", suffix=Path(rel_path).suffix)
+                os.close(fd)
+                path = Path(raw_path)
+                with open(snapshot.descriptor_path, "rb") as source, path.open("wb") as output:
+                    remaining = size
+                    while remaining:
+                        chunk = source.read(min(_UPLOAD_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise _YouTubeError("The chat attachment changed while preparing the upload.")
+                        output.write(chunk)
+                        remaining -= len(chunk)
+                        await asyncio.sleep(0)
+        return path, size, media_type
+    except BaseException:
+        if path is not None:
+            path.unlink(missing_ok=True)
+        raise
+
+
 def _upload_error(response: httpx.Response) -> str:
     if response.status_code == 401:
         return "YouTube authentication failed. Reconnect Google/YouTube on the Integration page."
@@ -374,7 +515,7 @@ def _upload_error(response: httpx.Response) -> str:
 
 
 async def _upload_video(token: str, args: Dict) -> str:
-    """Upload a public HTTPS video with YouTube's resumable upload protocol."""
+    """Upload an authorized source with YouTube's resumable upload protocol."""
     privacy = str(args.get("privacy", "private")).lower()
     if privacy not in {"private", "unlisted", "public"}:
         raise _YouTubeError("privacy must be one of: private, unlisted, public.")
@@ -527,19 +668,20 @@ _TOOLS: Dict[str, Dict[str, Any]] = {
         "required": ["video_id"],
     },
     "list_my_videos": {
-        "description": "List the authenticated user's own videos",
+        "description": "Page through the authenticated channel's uploads, including non-public videos. Use get_video for duration/status. Explicit query or non-date order uses search, which may omit recent uploads.",
         "properties": {
             "query": _prop("Optional filter query"),
-            "max_results": _prop("Max results (default: 10)", "integer"),
+            "max_results": {**_prop("Requested upper bound (1–50); each API page is capped at 4 to preserve every item in context", "integer"), "minimum": 1, "maximum": 50},
             "order": _prop("date, rating, title, viewCount (default: date)"),
+            "page_token": _prop("nextPageToken from the previous response; keep query/order/account unchanged"),
         },
         "required": [],
     },
     # ── Publish / engagement ──
     "upload_video": {
-        "description": "Upload a new YouTube video from a public HTTPS URL using resumable upload",
+        "description": "Upload a new YouTube video from a public HTTPS URL or an exact current-conversation chat attachment using resumable upload",
         "properties": {
-            "video_url": _prop("Public standard-port HTTPS URL of the video file"),
+            "video_url": _prop("Public standard-port HTTPS video URL, or exact uploads/chat/<hash>.mp4 or /api/v1/fs/<entity>/uploads/chat/<hash>.mp4 attachment reference from this conversation"),
             "title": _prop("Video title"),
             "description": _prop("Video description (optional)"),
             "tags": _prop("Tags (comma-separated or array)"),

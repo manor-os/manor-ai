@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.goals import GoalStatus
@@ -30,6 +30,11 @@ from packages.core.services.oauth_account_credentials import (
     oauth_account_is_runtime_usable_clause,
 )
 from packages.core.services.provider_keys import canonical_provider_key
+from packages.core.services.agent_effective_capabilities import (
+    AgentEffectiveCapabilityFactory,
+    EffectiveAgentCapabilities,
+)
+from packages.core.services.workspace_integration_scope import disabled_workspace_providers
 from packages.core.services.workspace_readiness import (
     check_workspace_readiness,
     iter_workspace_channel_blocks,
@@ -47,6 +52,11 @@ class StrategistContext:
     """Services the Strategist may name as owner/delegate. Derived from
     the subscriptions list, *not* from operating_model.services — what
     actually exists in DB wins over what setup intended."""
+    bound_skills_by_service: dict[str, list[str]] = field(default_factory=dict)
+    bound_skill_contracts_by_service: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    service_capabilities: dict[str, EffectiveAgentCapabilities] = field(default_factory=dict)
+    """Scheduled worker scopes, not the global configuration catalog or grants."""
 
     installed_flows: list[dict[str, Any]] = field(default_factory=list)
     """Active user-facing Blueprint Flows callable by workflow_run items."""
@@ -54,8 +64,13 @@ class StrategistContext:
     goals: list[Goal] = field(default_factory=list)
     recent_tasks: list[Task] = field(default_factory=list)
     recent_plans: list[ExecutionPlan] = field(default_factory=list)
+    execution_snapshot: dict[str, Any] = field(default_factory=dict)
+    """Read-only, Task-owned execution evidence; never an execution or tool grant."""
     recent_activity: list[WorkspaceActivity] = field(default_factory=list)
     """Recent workspace activity/events that may not be represented as tasks."""
+
+    declined_human_requests: list[str] = field(default_factory=list)
+    """Recent declined questions, so a resumed review can honor Skip."""
 
     work_batch_reconciliation: list[dict[str, Any]] = field(default_factory=list)
     """Stale/completed batch reconciliation snapshots from the current review."""
@@ -77,7 +92,7 @@ class StrategistContext:
     recent_proposal_outcomes: dict[str, list[Task]] = field(default_factory=dict)
     """Past Strategist proposals (last 30d) bucketed by what happened
     to them. Keys: ``completed``, ``rejected``, ``abandoned``,
-    ``in_progress``. Used so the Strategist can learn from approval /
+    ``pending``, ``blocked``, ``in_progress``. Used so the Strategist can learn from approval /
     rejection patterns instead of repeating misses."""
 
     configured_integrations: list[str] = field(default_factory=list)
@@ -172,6 +187,7 @@ async def gather_context(
     workspace: Workspace,
     *,
     trigger: str = "scheduled",
+    user_id: str | None = None,
     recent_task_limit: int = 15,
     recent_plan_limit: int = 10,
     memory_top_k: int = 12,
@@ -179,15 +195,28 @@ async def gather_context(
     subs = await _list_subscriptions(db, workspace.id)
     agents_by_id = await _agents_by_id(db, [s.agent_id for s in subs])
     allowed = sorted({s.service_key for s in subs if s.service_key})
+    skill_contracts = await _bound_skill_contracts_by_service(db, subs, workspace.entity_id, workspace.id)
+    bound_skills = {key: [item["slug"] for item in items] for key, items in skill_contracts.items()}
+    service_capabilities = await AgentEffectiveCapabilityFactory.create(
+        db, entity_id=workspace.entity_id, user_id=user_id,
+        workspace_id=workspace.id, subscriptions=subs, agents_by_id=agents_by_id,
+    )
     installed_flows = await _installed_workspace_flows(db, workspace)
 
     goals = await _active_goals(db, workspace.entity_id, workspace.id)
     recent_tasks = await _recent_tasks(db, workspace.id, limit=recent_task_limit)
     recent_plans = await _recent_plans(db, workspace.id, limit=recent_plan_limit)
     recent_activity = await _recent_activity(db, workspace.id)
+    declined_human_requests = await _declined_human_requests(db, workspace.id)
     open_proposed = await _open_proposed_tasks(db, workspace.id)
     open_proposed_items = await _open_proposed_items(db, workspace.id)
     recent_outcomes = await _recent_proposal_outcomes(db, workspace.id)
+    from packages.core.strategist.execution_snapshot import gather_execution_snapshot
+
+    execution_snapshot = await gather_execution_snapshot(
+        db, workspace=workspace, tasks=recent_tasks, plans=recent_plans,
+        outcomes=recent_outcomes, service_capabilities=service_capabilities,
+    )
 
     relevant_memory = await _gather_memory(
         db,
@@ -203,7 +232,9 @@ async def gather_context(
     # entity-level integrations such as a connected LinkedIn account must not
     # make an X-only workspace propose LinkedIn work.
     declared_provider_keys = _workspace_declared_provider_keys(workspace, goals)
-    active_provider_keys = await _active_provider_keys(db, workspace.entity_id)
+    active_provider_keys = (
+        await _active_provider_keys(db, workspace.entity_id)
+    ) - disabled_workspace_providers(workspace.operating_model)
     if declared_provider_keys:
         configured_integrations = sorted(declared_provider_keys & active_provider_keys)
     else:
@@ -245,11 +276,16 @@ async def gather_context(
         subscriptions=subs,
         agents_by_id=agents_by_id,
         allowed_service_keys=allowed,
+        bound_skills_by_service=bound_skills,
+        bound_skill_contracts_by_service=skill_contracts,
+        service_capabilities=service_capabilities,
         installed_flows=installed_flows,
         goals=goals,
         recent_tasks=recent_tasks,
         recent_plans=recent_plans,
+        execution_snapshot=execution_snapshot,
         recent_activity=recent_activity,
+        declined_human_requests=declined_human_requests,
         relevant_memory=relevant_memory,
         operating_memory=operating_memory,
         open_proposed_tasks=open_proposed,
@@ -282,6 +318,56 @@ async def _list_subscriptions(
             AgentSubscription.status == "active",
         )
     )).scalars().all())
+
+
+async def _bound_skills_by_service(
+    db: AsyncSession, subscriptions: list[AgentSubscription], entity_id: str,
+    workspace_id: str,
+) -> dict[str, list[str]]:
+    contracts = await _bound_skill_contracts_by_service(db, subscriptions, entity_id, workspace_id)
+    return {key: [item["slug"] for item in items] for key, items in contracts.items()}
+
+
+async def _bound_skill_contracts_by_service(
+    db: AsyncSession, subscriptions: list[AgentSubscription], entity_id: str,
+    workspace_id: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Expose bounded prerequisites from installed, owner-bound Skill schemas."""
+    from packages.core.models.skill import AgentSkillBinding, Skill
+
+    agent_ids = {sub.agent_id for sub in subscriptions if sub.service_key}
+    if not agent_ids:
+        return {}
+    rows = (await db.execute(
+        select(AgentSkillBinding.agent_id, Skill.slug, Skill.description, Skill.input_schema)
+        .join(Skill, Skill.id == AgentSkillBinding.skill_id)
+        .where(
+            AgentSkillBinding.agent_id.in_(agent_ids),
+            AgentSkillBinding.status == "active",
+            Skill.status == "active",
+            Skill.slug.is_not(None),
+            (Skill.entity_id == entity_id) | Skill.entity_id.is_(None),
+            or_(Skill.workspace_id.is_(None), Skill.workspace_id == workspace_id),
+        )
+    )).all()
+    by_agent: dict[str, dict[str, dict[str, Any]]] = {}
+    for agent_id, slug, description, schema in rows:
+        schema = schema if isinstance(schema, dict) else {}
+        properties = schema.get("properties") or {}
+        required = schema.get("required") or []
+        inputs = {}
+        for key in required[:32] if isinstance(required, list) else []:
+            if isinstance(key, str):
+                field_schema = properties.get(key) if isinstance(properties, dict) else None
+                inputs[key] = str((field_schema or {}).get("description") or "")[:240] if isinstance(field_schema, dict) else ""
+        by_agent.setdefault(agent_id, {})[slug] = {
+            "slug": slug, "description": str(description or "")[:400], "required_inputs": inputs,
+        }
+    by_service: dict[str, dict[str, dict[str, Any]]] = {}
+    for sub in subscriptions:
+        if sub.service_key and sub.agent_id in by_agent:
+            by_service.setdefault(sub.service_key, {}).update(by_agent[sub.agent_id])
+    return {key: [items[slug] for slug in sorted(items)] for key, items in by_service.items()}
 
 
 async def _installed_workspace_flows(
@@ -393,7 +479,7 @@ def _workspace_declared_provider_keys(workspace: Workspace, goals: list[Goal]) -
             if key and key not in _GENERIC_CHANNEL_KEYS:
                 out.add(key)
 
-    return out
+    return out - disabled_workspace_providers(operating_model)
 
 
 async def _knowledge_nets(db: AsyncSession, workspace: Workspace) -> list[dict[str, Any]]:
@@ -502,6 +588,21 @@ async def _recent_activity(
     )).scalars().all())
 
 
+async def _declined_human_requests(
+    db: AsyncSession, workspace_id: str, *, limit: int = 6,
+) -> list[str]:
+    from packages.core.models.participant import HumanCommitment
+
+    rows = (await db.execute(
+        select(HumanCommitment.expected_input).where(
+            HumanCommitment.workspace_id == workspace_id,
+            HumanCommitment.status == "declined",
+            HumanCommitment.expected_input.isnot(None),
+        ).order_by(desc(HumanCommitment.requested_at)).limit(limit)
+    )).scalars().all()
+    return [question.strip()[:500] for question in rows if question and question.strip()]
+
+
 async def _open_proposed_tasks(
     db: AsyncSession, workspace_id: str,
 ) -> list[Task]:
@@ -558,9 +659,12 @@ async def _recent_proposal_outcomes(
 
     Buckets:
       * ``completed``     — approved + finished (LLM should keep doing similar)
-      * ``rejected``      — operator cancelled with a rejection_reason
-      * ``abandoned``     — cancelled with no reason, or stuck >30d
-      * ``in_progress``   — accepted but still running (informational only)
+      * ``rejected``      — operator rejected the ProposalItem, or a legacy
+                            Task has a rejection reason or reason code
+      * ``abandoned``     — cancelled with no recorded reason, or stuck >30d
+      * ``pending``      — queued, not execution evidence
+      * ``blocked``      — paused/blocked, not abandoned
+      * ``in_progress``  — recorded status only; snapshot supplies execution proof
 
     Bucket sizes are capped so the prompt doesn't balloon.
     """
@@ -574,22 +678,49 @@ async def _recent_proposal_outcomes(
         ).order_by(desc(Task.created_at)).limit(60)
     )).scalars().all())
 
+    from packages.core.models.proposal import ProposalItemRecord
+
+    item_ids = {
+        str((task.details or {}).get("strategist_proposal_item_id"))
+        for task in rows
+        if (task.details or {}).get("strategist_proposal_item_id")
+    }
+    rejected_item_ids: set[str] = set()
+    if item_ids:
+        rejected_item_ids = set((await db.execute(
+            select(ProposalItemRecord.id).where(
+                ProposalItemRecord.workspace_id == workspace_id,
+                ProposalItemRecord.id.in_(item_ids),
+                ProposalItemRecord.kind == ProposalItemKind.TASK,
+                ProposalItemRecord.status == ProposalItemStatus.REJECTED,
+            )
+        )).scalars().all())
+
     buckets: dict[str, list[Task]] = {
-        "completed": [], "rejected": [], "abandoned": [], "in_progress": [],
+        "completed": [], "rejected": [], "abandoned": [], "pending": [],
+        "blocked": [], "in_progress": [],
     }
     for t in rows:
         details = t.details or {}
         if t.status == TaskStatus.COMPLETED:
             buckets["completed"].append(t)
         elif t.status == TaskStatus.CANCELLED:
-            if details.get("rejection_reason"):
+            if (
+                details.get("rejection_reason")
+                or details.get("rejection_reason_code")
+                or details.get("strategist_proposal_item_id") in rejected_item_ids
+            ):
                 buckets["rejected"].append(t)
             else:
                 buckets["abandoned"].append(t)
-        elif t.status in {TaskStatus.FAILED, TaskStatus.BLOCKED}:
+        elif t.status == TaskStatus.FAILED:
             buckets["abandoned"].append(t)
-        else:
+        elif t.status in {TaskStatus.BLOCKED, TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.ON_HOLD}:
+            buckets["blocked"].append(t)
+        elif t.status == TaskStatus.IN_PROGRESS:
             buckets["in_progress"].append(t)
+        else:
+            buckets["pending"].append(t)
 
     return {k: v[:6] for k, v in buckets.items() if v}
 

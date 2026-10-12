@@ -20,6 +20,11 @@ def test_strip_drops_progress_before_marker():
     assert _strip_final_response_sentinel(text) == "Here is the final answer."
 
 
+def test_marker_after_answer_does_not_erase_skill_result():
+    text = f"Here is the completed campaign.{FINAL_RESPONSE_SENTINEL}</manor-final-response>"
+    assert _strip_final_response_sentinel(text) == "Here is the completed campaign."
+
+
 def test_no_marker_is_unchanged_apart_from_trim():
     assert _strip_final_response_sentinel("  just a normal answer  ") == "just a normal answer"
 

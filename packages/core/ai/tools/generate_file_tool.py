@@ -27,14 +27,20 @@ async def _generate_file_handler(
     conversation_id: str = "",
     **kwargs: Any,
 ) -> str:
+    previous_scope = common._scope_workspace_output_name
+    previous_invoke = office_common._invoke_builtin_skill
     common._scope_workspace_output_name = _scope_workspace_output_name
     office_common._invoke_builtin_skill = _invoke_builtin_skill
-    return await _package_generate_file_handler(
-        entity_id=entity_id,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        **kwargs,
-    )
+    try:
+        return await _package_generate_file_handler(
+            entity_id=entity_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            **kwargs,
+        )
+    finally:
+        common._scope_workspace_output_name = previous_scope
+        office_common._invoke_builtin_skill = previous_invoke
 
 
 def get_tools() -> list[tuple[dict[str, Any], Any]]:

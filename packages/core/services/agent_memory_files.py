@@ -187,6 +187,7 @@ async def sync_agent_memory_files(
     entity_id: str,
     agent_id: str | None = None,
     user_id: str | None = None,
+    exact_scope: bool = False,
 ) -> int:
     """Walk agent memory MD files and upsert rows into agent_memories."""
     if not is_fs_enabled():
@@ -197,6 +198,7 @@ async def sync_agent_memory_files(
         entity_id,
         agent_id=agent_id,
         user_id=user_id,
+        exact_scope=exact_scope,
     ):
         if not os.path.isdir(root):
             continue
@@ -206,6 +208,7 @@ async def sync_agent_memory_files(
             root=root,
             agent_id=root_agent_id,
             user_id=root_user_id,
+            exact_scope=exact_scope,
         )
 
     await db.flush()
@@ -217,13 +220,14 @@ def _memory_roots_to_sync(
     *,
     agent_id: str | None,
     user_id: str | None,
+    exact_scope: bool = False,
 ) -> list[tuple[str, str | None, str | None]]:
     """Return agent memory roots to scan.
 
     A specific agent/user request only scans that scope. A broad list request
     scans all existing agent memory roots so file-edited memories are indexed.
     """
-    if agent_id is not None or user_id is not None:
+    if exact_scope or agent_id is not None or user_id is not None:
         return [(agent_memory_root(entity_id, agent_id, user_id=user_id), agent_id, user_id)]
 
     agents_dir = os.path.join(get_entity_root(entity_id), ".ai", "agents")
@@ -248,9 +252,12 @@ async def _sync_memory_root(
     root: str,
     agent_id: str | None,
     user_id: str | None,
+    exact_scope: bool = False,
 ) -> int:
     synced = 0
     for dirpath, _dirnames, filenames in os.walk(root):
+        if exact_scope and user_id is None and "users" in _dirnames:
+            _dirnames.remove("users")
         for fname in filenames:
             if not fname.endswith(".md"):
                 continue
@@ -259,6 +266,8 @@ async def _sync_memory_root(
             if not parsed:
                 continue
             fm, body = parsed
+            if exact_scope and (fm.get("user_id") != user_id or fm.get("agent_id") != agent_id):
+                continue
             mem_id = str(fm.get("id") or "").strip() or generate_ulid()
             memory_type = str(fm.get("memory_type") or _type_from_dir(dirpath)).strip() or "fact"
             content, metadata = _prepare_file_synced_content(body, fm.get("metadata") or {})
@@ -269,6 +278,12 @@ async def _sync_memory_root(
                     AgentMemory.entity_id == entity_id,
                 )
             )).scalar_one_or_none()
+            if exact_scope and row is not None and (
+                row.workspace_id is not None or row.agent_id != agent_id or row.user_id != user_id
+            ):
+                # A file's frontmatter cannot reassign a row owned by another
+                # user/agent/workspace, even if it copies that row's ID.
+                continue
             if row is None:
                 row = AgentMemory(
                     id=mem_id,
@@ -300,8 +315,10 @@ async def _sync_memory_root(
 
 def _read_memory_md(path: str) -> tuple[dict, str] | None:
     try:
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
+        from packages.core.memory.cache import read_memory_text
+        text = read_memory_text(path)
+        if text is None:
+            return None
     except OSError:
         return None
     m = _FRONTMATTER_RE.match(text)

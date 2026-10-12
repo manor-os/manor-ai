@@ -11,6 +11,17 @@ from packages.core.services.hitl_options import approval_options
 logger = logging.getLogger(__name__)
 
 
+async def external_reply_policy(db, *, workspace_id: str, resource_id: str):
+    """The Workspace outbound-message gate shared by channel and room replies."""
+    from packages.core.governance import check_step_policy
+
+    return await check_step_policy(
+        db, workspace_id=workspace_id, kind="action",
+        action_key=ExternalMessageActionKey.SEND.value,
+        resource_id=resource_id, risk_level="high",
+    )
+
+
 async def maybe_hold_external_reply_for_approval(
     *,
     entity_id: str,
@@ -37,15 +48,8 @@ async def maybe_hold_external_reply_for_approval(
         return None
 
     async with async_session() as db:
-        from packages.core.governance import check_step_policy
-
-        decision = await check_step_policy(
-            db,
-            workspace_id=workspace_id,
-            kind="action",
-            action_key=ExternalMessageActionKey.SEND.value,
-            resource_id=channel_config_id,
-            risk_level="high",
+        decision = await external_reply_policy(
+            db, workspace_id=workspace_id, resource_id=channel_config_id,
         )
         if decision.allowed:
             return None

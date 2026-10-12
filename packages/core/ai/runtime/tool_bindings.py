@@ -264,6 +264,7 @@ async def runtime_agent_tool_scope(
             str(tool.name)
             for tool in await get_agent_tools(db, agent_id)
             if str(getattr(tool, "name", "") or "").strip()
+            and getattr(tool, "status", "active") == "active"
         )
     except Exception:
         errors.append("agent_tool_bindings")
@@ -296,6 +297,17 @@ async def runtime_agent_tool_scope(
             agent_id,
             exc_info=True,
         )
+
+    from packages.core.ai.runtime.capability_bindings import (
+        expand_authorized_runtime_file_read_bindings,
+    )
+
+    expanded_bound = expand_authorized_runtime_file_read_bindings(bound_tool_names)
+    bound_tool_names = (
+        frozenset(expanded_bound)
+        if expanded_bound is not None
+        else bound_tool_names
+    )
 
     return RuntimeAgentToolScope(
         bound_tool_names=bound_tool_names,

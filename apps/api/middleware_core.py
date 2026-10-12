@@ -19,15 +19,19 @@ from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, WebSocket
+from asyncpg import PostgresError
 from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
+from sqlalchemy.exc import DBAPIError, TimeoutError as SQLAlchemyTimeoutError
 
 from apps.api.chat_stream_routes import is_chat_stream_path
+from apps.api.websocket_backpressure import close_for_backpressure
 from packages.core.i18n import set_locale, SUPPORTED_LOCALES
 from packages.core.service_role import SERVICE_ROLE_API, SERVICE_ROLE_CHAT, normalize_service_role
+from packages.core.database_runtime import DatabaseFailureKind, database_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -141,14 +145,17 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         rid = request.headers.get("x-request-id") or uuid.uuid4().hex
         request_id_var.set(rid)
         request.state.request_id = rid
+        token = database_request_id.set(rid[:128])
+        try:
+            if _is_streaming(request):
+                return await call_next(request)
 
-        if _is_streaming(request):
-            return await call_next(request)
-
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = rid
-        response.headers["X-API-Version"] = "0.1.0"
-        return response
+            response = await call_next(request)
+            response.headers["X-Request-ID"] = rid
+            response.headers["X-API-Version"] = "0.1.1"
+            return response
+        finally:
+            database_request_id.reset(token)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -301,6 +308,22 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not _RATE_LIMIT_ENABLED or request.url.path in _HEALTH_PATHS or _is_streaming(request):
             return await call_next(request)
 
+        from apps.api.middleware.rate_limit import (
+            CHAT_RATE_LIMIT_ENABLED,
+            authenticated_chat_user_id,
+            is_chat_read_request,
+        )
+
+        # Authenticated chat reads have their own bounded, per-user bucket;
+        # counting them again against one shared-IP global bucket blocks normal
+        # polling and everyone behind the same proxy.
+        if (
+            CHAT_RATE_LIMIT_ENABLED
+            and is_chat_read_request(request.method, request.url.path)
+            and authenticated_chat_user_id(request)
+        ):
+            return await call_next(request)
+
         global _last_cleanup
         now = time.time()
         window = 60.0
@@ -340,7 +363,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
     """Preserve HTTPException status/detail in structured JSON."""
     rid = getattr(request.state, "request_id", request_id_var.get(""))
-    if exc.status_code >= 500:
+    auth_busy = (
+        exc.status_code == 503 and isinstance(exc.detail, dict)
+        and exc.detail.get("code") == "worker_auth_busy"
+    )
+    if auth_busy:
+        # CPU admission is expected backpressure. Persisting an ErrorEvent here
+        # would consume the DB slot that authentication deliberately released.
+        logger.warning("worker_auth_busy request_id=%s", rid)
+    elif exc.status_code >= 500:
         await _record_server_error(request, exc, rid, status_code=exc.status_code, handled=True)
     detail = exc.detail
     error_msg = detail if isinstance(detail, str) else (detail.get("message", str(detail)) if isinstance(detail, dict) else str(detail))
@@ -373,6 +404,8 @@ async def validation_error_handler(request: Request, exc: ValidationError) -> JS
 
 async def generic_error_handler(request: Request, exc: Exception) -> JSONResponse:
     """Catch-all for unhandled exceptions — no stack traces in production."""
+    if DatabaseFailureKind.from_exception(exc) is not None:
+        return await database_busy_handler(request, exc)
     rid = getattr(request.state, "request_id", request_id_var.get(""))
     stack = traceback.format_exc()
     logger.error(
@@ -393,6 +426,36 @@ async def generic_error_handler(request: Request, exc: Exception) -> JSONRespons
         },
         headers={"X-Request-ID": rid},
     )
+
+
+async def database_busy_handler(
+    request: Request | WebSocket, exc: Exception,
+) -> JSONResponse | None:
+    """Do not acquire another DB connection to persist an overload error."""
+    rid = getattr(request.state, "request_id", request_id_var.get(""))
+    kind = DatabaseFailureKind.from_exception(exc) or DatabaseFailureKind.BUSY
+    logger.warning("%s request_id=%s exception_type=%s", kind.value, rid, type(exc).__name__)
+    if isinstance(request, WebSocket):
+        await close_for_backpressure(request, code=kind.value, message="Database is busy. Retry later.")
+        return None
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "Service temporarily busy",
+            "detail": {"code": kind.value, "message": "Database is temporarily unavailable. Please retry later."},
+            "request_id": rid,
+        },
+        headers={"Retry-After": "2", "X-Request-ID": rid},
+    )
+
+
+async def database_error_handler(request: Request | WebSocket, exc: Exception):
+    if DatabaseFailureKind.from_exception(exc) is not None:
+        return await database_busy_handler(request, exc)
+    if isinstance(request, WebSocket):
+        await request.close(code=1011, reason="Database operation failed.")
+        return None
+    return await generic_error_handler(request, exc)
 
 
 async def _record_server_error(
@@ -509,6 +572,9 @@ def setup_middleware(app: FastAPI) -> None:
     # Exception handlers (not middleware)
     app.add_exception_handler(HTTPException, http_error_handler)  # type: ignore[arg-type]
     app.add_exception_handler(ValidationError, validation_error_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(SQLAlchemyTimeoutError, database_busy_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(DBAPIError, database_error_handler)  # type: ignore[arg-type]
+    app.add_exception_handler(PostgresError, database_error_handler)  # type: ignore[arg-type]
     app.add_exception_handler(Exception, generic_error_handler)  # type: ignore[arg-type]
 
     # Middleware — added in reverse execution order

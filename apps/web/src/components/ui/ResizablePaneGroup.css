@@ -1,4 +1,12 @@
+@property --pane-size {
+  syntax: "<number>";
+  inherits: false;
+  initial-value: 0;
+}
+
 .resizable-pane-group {
+  --pane-motion-duration: 480ms;
+  --pane-motion-easing: cubic-bezier(0.32, 0.72, 0, 1);
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -13,8 +21,20 @@
 
 .resizable-pane-group__pane {
   flex: var(--pane-size) 1 0;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
+  opacity: 1;
+}
+
+.resizable-pane-group .resizable-pane-group__pane > * {
+  min-width: var(--pane-content-min, 0px);
+}
+
+.resizable-pane-group__pane.is-collapsed {
+  min-width: 0 !important;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .resizable-pane-group__handle {
@@ -29,6 +49,7 @@
   background: transparent;
   cursor: col-resize;
   touch-action: none;
+  opacity: 1;
 }
 
 .resizable-pane-group__handle::after {
@@ -36,7 +57,10 @@
   position: absolute;
   inset: 0 4px;
   background: rgba(168, 162, 158, 0.18);
-  transition: background 140ms ease, box-shadow 140ms ease;
+  transition:
+    background 140ms ease,
+    box-shadow 140ms ease,
+    opacity var(--pane-motion-duration) var(--pane-motion-easing);
 }
 
 .resizable-pane-group__handle:hover::after,
@@ -50,14 +74,44 @@
   outline: none;
 }
 
+.resizable-pane-group__handle.is-collapsed {
+  flex-basis: 0;
+  width: 0;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.resizable-pane-group.is-ready .resizable-pane-group__pane {
+  transition:
+    --pane-size var(--pane-motion-duration) var(--pane-motion-easing),
+    flex-grow var(--pane-motion-duration) var(--pane-motion-easing),
+    opacity var(--pane-motion-duration) var(--pane-motion-easing);
+}
+
+.resizable-pane-group.is-ready .resizable-pane-group__handle {
+  transition:
+    flex-basis var(--pane-motion-duration) var(--pane-motion-easing),
+    width var(--pane-motion-duration) var(--pane-motion-easing),
+    margin var(--pane-motion-duration) var(--pane-motion-easing),
+    opacity var(--pane-motion-duration) var(--pane-motion-easing);
+}
+
 .resizable-pane-group.is-resizing,
 .resizable-pane-group.is-resizing * {
   cursor: col-resize !important;
   user-select: none !important;
 }
 
+.resizable-pane-group.is-resizing .resizable-pane-group__pane,
+.resizable-pane-group.is-resizing .resizable-pane-group__handle {
+  transition: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .resizable-pane-group__handle::after {
+  .resizable-pane-group__handle::after,
+  .resizable-pane-group.is-ready .resizable-pane-group__pane,
+  .resizable-pane-group.is-ready .resizable-pane-group__handle {
     transition: none;
   }
 }

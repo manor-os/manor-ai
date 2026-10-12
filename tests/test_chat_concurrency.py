@@ -226,6 +226,87 @@ async def test_chat_concurrency_lease_renews_redis_slot_while_wrapped_stream_is_
 
 
 @pytest.mark.asyncio
+async def test_wrapped_stream_stops_and_releases_capacity_when_global_lease_is_lost():
+    redis = FakeLuaRedis()
+    gate = ChatConcurrencyGate(
+        redis_getter=lambda: redis,
+        config=ChatConcurrencyConfig(
+            enabled=True,
+            global_limit=1,
+            per_instance_limit=1,
+            wait_timeout_seconds=0,
+            slot_ttl_seconds=900,
+            heartbeat_interval_seconds=0.005,
+        ),
+    )
+    lease = await gate.acquire(scope="chat")
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    async def source():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+            yield "unreachable"
+        finally:
+            closed.set()
+
+    task = asyncio.create_task(anext(lease.wrap(source())))
+    await asyncio.wait_for(entered.wait(), 2)
+    redis.zsets[gate.config.key].clear()
+
+    with pytest.raises(ChatConcurrencyExceeded, match="lease was lost"):
+        await asyncio.wait_for(task, 2)
+
+    assert closed.is_set()
+    assert gate.local_active == 0
+
+
+@pytest.mark.asyncio
+async def test_wrapped_stream_stops_and_releases_capacity_when_renewal_stalls():
+    renewal_started = asyncio.Event()
+
+    class StalledRedis(FakeLuaRedis):
+        async def eval(self, script, *args):
+            if "XX" in script:
+                renewal_started.set()
+                await asyncio.Event().wait()
+            return await super().eval(script, *args)
+
+    redis = StalledRedis()
+    gate = ChatConcurrencyGate(
+        redis_getter=lambda: redis,
+        config=ChatConcurrencyConfig(
+            enabled=True,
+            global_limit=1,
+            per_instance_limit=1,
+            wait_timeout_seconds=0,
+            slot_ttl_seconds=900,
+            heartbeat_interval_seconds=0.005,
+        ),
+    )
+    lease = await gate.acquire(scope="chat")
+    entered, closed = asyncio.Event(), asyncio.Event()
+
+    async def source():
+        try:
+            entered.set()
+            await asyncio.Event().wait()
+            yield "unreachable"
+        finally:
+            closed.set()
+
+    task = asyncio.create_task(anext(lease.wrap(source())))
+    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(renewal_started.wait(), 2)
+
+    with pytest.raises(ChatConcurrencyExceeded, match="lease was lost"):
+        await asyncio.wait_for(task, 2)
+
+    assert closed.is_set()
+    assert gate.local_active == 0
+
+
+@pytest.mark.asyncio
 async def test_non_streaming_call_renews_beyond_ttl_and_during_cancelled_cleanup():
     redis, now = FakeLuaRedis(), 1_000.0
     gate = ChatConcurrencyGate(

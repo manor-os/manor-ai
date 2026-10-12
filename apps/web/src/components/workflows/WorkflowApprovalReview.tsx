@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingText } from "../../lib/taskDisplay";
 import InlineFileReferenceCard from "../InlineFileReferenceCard";
+import MediaPreview from "./MediaPreview";
+import { workflowFinalMediaRefs } from "../../lib/workflowMedia";
 import Input from "../ui/Input";
 import Textarea from "../ui/Textarea";
 
@@ -44,6 +46,43 @@ function stringList(value: unknown): string[] {
   return [];
 }
 
+function hasReviewValue(value: unknown): boolean {
+  if (value == null || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
+}
+
+function StructuredReviewValue({ value }: { value: unknown }) {
+  if (Array.isArray(value)) {
+    const compact = value.length >= 6 && value.every((item) => typeof item === "string" && item.length < 70);
+    return <ul className={`chat-workflow-review-items${compact ? " is-compact" : ""}`}>
+      {value.filter(hasReviewValue).map((item, index) => (
+        <li key={index}><StructuredReviewValue value={item} /></li>
+      ))}
+    </ul>;
+  }
+  const record = asRecord(value);
+  if (record) {
+    return <dl className="chat-workflow-review-pairs">
+      {Object.entries(record).filter(([, item]) => hasReviewValue(item)).map(([key, item]) => (
+        <div key={key}>
+          <dt>{formatUserFacingLabel(key)}</dt>
+          <dd><StructuredReviewValue value={item} /></dd>
+        </div>
+      ))}
+    </dl>;
+  }
+  if (typeof value === "boolean") {
+    return <span>{t(value ? "component.workflow_review.yes" : "component.workflow_review.no")}</span>;
+  }
+  const text = String(value ?? "").trim();
+  const href = reviewHref(text);
+  return href ? (
+    <a className="chat-workflow-review-link" href={href} target={href.startsWith("http") ? "_blank" : undefined} rel={href.startsWith("http") ? "noreferrer" : undefined}>{text}</a>
+  ) : <span className="chat-workflow-review-value">{formatUserFacingText(text)}</span>;
+}
+
 export function workflowReviewIsEditable(review: unknown): review is Record<string, unknown> {
   return Boolean(review && typeof review === "object" && !Array.isArray(review));
 }
@@ -81,12 +120,17 @@ export function EditableWorkflowApprovalReview({
     ),
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const editDetailsRef = useRef<HTMLDetailsElement>(null);
   const hasErrors = Object.values(errors).some(Boolean);
   const changed = JSON.stringify(draft) !== JSON.stringify(review);
 
   useEffect(() => {
     onDraftState(draft, !hasErrors);
   }, [draft, hasErrors, onDraftState]);
+
+  useEffect(() => {
+    if (hasErrors && editDetailsRef.current) editDetailsRef.current.open = true;
+  }, [hasErrors]);
 
   const updateValue = (key: string, value: unknown) => {
     setDraft((current) => ({ ...current, [key]: value }));
@@ -111,16 +155,13 @@ export function EditableWorkflowApprovalReview({
 
   return (
     <div className="approval-review-editor">
-      <div className="chat-hitl-title">
-        {reviewTitle || t("component.chat_action_card.workflow_review_title")}
-      </div>
-      {prompt && <div className="chat-hitl-description">{formatUserFacingText(prompt)}</div>}
-      <div className="approval-review-editor__notice">
-        <span>{t("component.approval_action_bar.edit_then_approve")}</span>
-        {changed && <strong>{t("component.approval_action_bar.edited")}</strong>}
-      </div>
-      <div className="approval-review-editor__fields">
-        {Object.entries(draft).map(([key, value]) => {
+      <WorkflowApprovalReview review={draft} reviewTitle={reviewTitle} prompt={prompt} />
+      <details ref={editDetailsRef} className="approval-review-editor__edit">
+        <summary>{t("component.workflow_review.suggest_changes")}{changed && <strong>{t("component.approval_action_bar.edited")}</strong>}</summary>
+        <div className="approval-review-editor__notice">{t("component.approval_action_bar.edit_then_approve")}</div>
+        <div className="approval-review-editor__fields">
+          {Object.entries(draft).map(([key, value]) => {
+          if (["review_artifacts", "artifacts", "files"].includes(key)) return null;
           const label = formatUserFacingLabel(key);
           if (value != null && typeof value === "object") {
             return (
@@ -172,8 +213,9 @@ export function EditableWorkflowApprovalReview({
               )}
             </div>
           );
-        })}
-      </div>
+          })}
+        </div>
+      </details>
     </div>
   );
 }
@@ -294,7 +336,6 @@ export default function WorkflowApprovalReview({
   prompt,
   reviewTitle,
   review,
-  full = false,
 }: WorkflowApprovalReviewProps) {
   const plan = asRecord(review);
   const scenes = Array.isArray(plan?.scenes)
@@ -311,21 +352,29 @@ export default function WorkflowApprovalReview({
   const hasProductVideoPlan = Boolean(productPromise || narration || scenes.length || outputProfile);
 
   if (!hasProductVideoPlan) {
-    const fallback = previewText(review, full);
     const entries = plan
       ? Object.entries(plan).filter(([key, value]) => (
         !["review_artifacts", "artifacts", "files", "checklist"].includes(key)
-        && previewText(value, full) != null
+        && hasReviewValue(value)
       ))
       : [];
+    const facts = entries.filter(([, value]) => !Array.isArray(value) && !asRecord(value));
+    const sections = entries.filter(([, value]) => Array.isArray(value) || Boolean(asRecord(value)));
+    // "Review the actual generated video" needs a player, not its link.
+    const media = workflowFinalMediaRefs(review);
     return (
       <div className="chat-hitl-summary chat-workflow-review">
         <div className="chat-hitl-title">
-          {reviewTitle || t("component.chat_action_card.workflow_review_title")}
+          {reviewTitle ? formatUserFacingLabel(reviewTitle) : t("component.chat_action_card.workflow_review_title")}
         </div>
         {prompt && <div className="chat-hitl-description">{formatUserFacingText(prompt)}</div>}
-        {(artifacts.length > 0 || checklist.length > 0 || entries.length > 0) ? (
-          <div className="chat-workflow-review-scroll">
+        {(media.length > 0 || artifacts.length > 0 || checklist.length > 0 || entries.length > 0 || hasReviewValue(review)) && (
+          <div className="chat-workflow-review-scroll chat-workflow-review-scroll--structured">
+            {media.length > 0 && (
+              <section className="chat-workflow-review-section chat-workflow-review-media">
+                {media.map((item, index) => <MediaPreview key={`${item.url}-${index}`} refItem={item} maxHeight={320} />)}
+              </section>
+            )}
             {artifacts.length > 0 && (
               <section className="chat-workflow-review-section">
                 <span className="chat-workflow-review-label">
@@ -344,36 +393,23 @@ export default function WorkflowApprovalReview({
               </section>
             )}
             <ReviewChecklist items={checklist} />
-            {entries.map(([key, value]) => {
-              const href = reviewHref(value);
-              return (
-                <section className="chat-workflow-review-section" key={key}>
-                  <span className="chat-workflow-review-label">
-                    {formatUserFacingLabel(key)}
-                  </span>
-                  {href ? (
-                    <a
-                      className="chat-workflow-review-link"
-                      href={href}
-                      target={href.startsWith("http") ? "_blank" : undefined}
-                      rel={href.startsWith("http") ? "noreferrer" : undefined}
-                    >
-                      {href}
-                    </a>
-                  ) : (
-                    <div className="chat-workflow-review-value">
-                      {previewText(value, full)}
-                    </div>
-                  )}
-                </section>
-              );
-            })}
+            {facts.length > 0 && <div className="chat-workflow-review-facts">
+              {facts.map(([key, value]) => <div key={key} className={String(value).length > 100 ? "is-wide" : undefined}>
+                <span className="chat-workflow-review-label">{formatUserFacingLabel(key)}</span>
+                <StructuredReviewValue value={value} />
+              </div>)}
+            </div>}
+            {sections.map(([key, value]) => <section className="chat-workflow-review-section" key={key}>
+              <span className="chat-workflow-review-label">{formatUserFacingLabel(key)}</span>
+              <StructuredReviewValue value={value} />
+            </section>)}
+            {!plan && <StructuredReviewValue value={review} />}
+            {plan && <details className="chat-workflow-review-raw">
+              <summary>{t("component.workflow_review.original_data")}</summary>
+              <pre>{previewText(review, true)}</pre>
+            </details>}
           </div>
-        ) : fallback ? (
-          <pre className="chat-hitl-content" aria-label={t("component.chat_action_card.approval_content_preview")}>
-            {fallback}
-          </pre>
-        ) : null}
+        )}
       </div>
     );
   }
@@ -392,7 +428,7 @@ export default function WorkflowApprovalReview({
   return (
     <div className="chat-hitl-summary chat-workflow-review">
       <div className="chat-hitl-title">
-        {reviewTitle || t("component.chat_action_card.workflow_review_title")}
+        {reviewTitle ? formatUserFacingLabel(reviewTitle) : t("component.chat_action_card.workflow_review_title")}
       </div>
       {prompt && <div className="chat-hitl-description">{formatUserFacingText(prompt)}</div>}
 

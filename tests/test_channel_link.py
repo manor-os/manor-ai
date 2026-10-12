@@ -133,6 +133,8 @@ async def _seed_whatsapp_route(
     legacy_binding: bool = False,
 ) -> SimpleNamespace:
     from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+    from packages.core.governance.approval_policy_service import initialize_workspace_approval
+    from tests.approval_settings_test_utils import set_workspace_test_approval
 
     owner = await _register(client, username)
     workspace = Workspace(
@@ -158,6 +160,12 @@ async def _seed_whatsapp_route(
     )
     db.add_all([workspace, agent, channel_config])
     await db.flush()
+    await initialize_workspace_approval(db, workspace)
+    await set_workspace_test_approval(db, workspace_id=workspace.id, entity_id=owner["entity_id"],
+        actor_id=owner["user_id"], user_rules=[{"effect": "allow", "selector": {
+            "kind": "resource", "action_key": "external_message.send", "account_id": None,
+            "resource_kind": "resource", "resource_ids": [channel_config.id],
+        }}])
 
     subscription = None
     if not legacy_binding:
@@ -185,6 +193,7 @@ async def _seed_whatsapp_route(
         )
         db.add_all([override_workspace, override_agent])
         await db.flush()
+        await initialize_workspace_approval(db, override_workspace)
         override_subscription = AgentSubscription(
             entity_id=owner["entity_id"],
             agent_id=override_agent.id,

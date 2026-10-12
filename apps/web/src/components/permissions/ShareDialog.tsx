@@ -122,12 +122,12 @@ export interface NewExternalShareConfig {
   approval_reason?: string;
 }
 
-function _roleOptions(): { value: ShareRole; label: string }[] {
+function _roleOptions(): { value: ShareRole; label: string; description?: string }[] {
   return [
     { value: "viewer", label: t("permissions.role.viewer.label") },
     { value: "commenter", label: t("permissions.role.commenter.label") },
     { value: "editor", label: t("permissions.role.editor.label") },
-    { value: "curator", label: t("permissions.role.curator.label") },
+    { value: "co_owner", label: t("permissions.role.co_owner.label"), description: t("permissions.role.co_owner.hint") },
   ];
 }
 

@@ -1,20 +1,8 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
-
-def coerce_params(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return {}
-        if isinstance(parsed, dict):
-            return dict(parsed)
-    return {}
+from packages.core.contracts.generate_file_input import coerce_params as coerce_params
 
 
 def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -66,6 +54,7 @@ def _merge_params(kwargs: dict[str, Any]) -> dict[str, Any]:
         "response_format",
         "format",
         "model",
+        "expected_model",
     ):
         if kwargs.get(key) is not None and key not in params:
             params[key] = kwargs[key]

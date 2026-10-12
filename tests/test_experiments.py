@@ -17,7 +17,7 @@ Covers:
   running) is unit-tested via ``effective_dispatch_config`` directly —
   driving a second full dispatch adds nothing over the helper contract
 * v2 review proposing an experiment: standing-grant path (policy
-  auto_approve_actions) → Experiment created + running, item executing;
+  exact action allow rule) → Experiment created + running, item executing;
   needs_human path → item proposed with a pending per-item
   HitlRequest, then the existing approve flow starts the experiment
   and consumes the request
@@ -30,7 +30,13 @@ import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from tests.strategist_helpers import proposal_with_execution_review
+
 import pytest
+
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
 from sqlalchemy import select
 
 from packages.core.experiments import (
@@ -46,6 +52,7 @@ from packages.core.experiments import (
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
 from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.agent_initiative import AgentInitiative
 from packages.core.models.base import generate_ulid
 from packages.core.models.experiment import Experiment
 from packages.core.models.feature_flag import FeatureFlag
@@ -120,6 +127,8 @@ async def _seed_workspace(db) -> Workspace:
         agent,
         subscription,
     ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=entity_id)
     await db.commit()
     return workspace
 
@@ -142,6 +151,43 @@ async def _seed_job(db, workspace: Workspace, **overrides) -> ScheduledJob:
     db.add(job)
     await db.commit()
     return job
+
+
+async def _mark_as_initiative_driver(
+    db,
+    workspace: Workspace,
+    job: ScheduledJob,
+) -> AgentInitiative:
+    subscription = await db.scalar(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace.id,
+    ))
+    assert subscription is not None
+    initiative = AgentInitiative(
+        id=generate_ulid(),
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        agent_subscription_id=subscription.id,
+        owner_user_id=workspace.entity_id,
+        name="Managed digest",
+        instruction="Check for relevant changes",
+        trigger_kind="interval",
+        trigger_config={"version": "1", "kind": "interval", "every_seconds": 3600},
+        condition_config={"version": "1"},
+        decision_policy={"version": "1", "mode": "on_change"},
+        delivery_policy={"version": "1"},
+        interruption_policy={"version": "1"},
+        status="active",
+    )
+    db.add(initiative)
+    await db.flush()
+    job.agent_initiative_id = initiative.id
+    job.execution_type = "agent_initiative"
+    job.execution_target = {
+        "managed_by": "agent_initiative",
+        "initiative_id": initiative.id,
+    }
+    await db.commit()
+    return initiative
 
 
 def _experiment_row(workspace: Workspace, job: ScheduledJob, **overrides) -> Experiment:
@@ -320,6 +366,25 @@ async def test_start_rejects_bad_states_and_missing_target(db_session):
         await start_experiment(db_session, missing_target)
     with pytest.raises(ExperimentTargetError):
         await start_experiment(db_session, cross_workspace)
+
+
+async def test_start_rejects_agent_initiative_driver_without_overlay(db_session):
+    workspace = await _seed_workspace(db_session)
+    job = await _seed_job(db_session, workspace)
+    await _mark_as_initiative_driver(db_session, workspace, job)
+    experiment = _experiment_row(workspace, job)
+    db_session.add(experiment)
+    await db_session.flush()
+
+    with pytest.raises(
+        ExperimentTargetError,
+        match="managed by an Agent Initiative",
+    ):
+        await start_experiment(db_session, experiment)
+
+    await db_session.refresh(job)
+    assert EXPERIMENT_OVERLAY_KEY not in (job.execution_target or {})
+    assert experiment.status == "pending"
 
 
 # ── controller: stop ──────────────────────────────────────────────────
@@ -659,7 +724,7 @@ def _review_payload(job_id: str, *, max_cost: float = 15) -> dict:
 
 def _fake_completion(payload: dict):
     async def fake(system_prompt, user_prompt, **kwargs):
-        return SimpleNamespace(content=json.dumps(payload))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payload, user_prompt)))
     return fake
 
 
@@ -704,16 +769,11 @@ async def _experiment_items(db, review_id: str) -> list[ProposalItemRecord]:
 
 
 async def test_v2_review_standing_grant_starts_experiment(db_session, monkeypatch):
-    from packages.core.governance.policy import WorkspacePolicy
-    from packages.core.governance.service import update_policy
-
     workspace = await _seed_workspace(db_session)
     job = await _seed_job(db_session, workspace)
-    await update_policy(
-        db_session,
-        entity_id=workspace.entity_id,
-        workspace_id=workspace.id,
-        policy=WorkspacePolicy(auto_approve_actions=[EXPERIMENT_ACTION_KEY]),
+    await set_workspace_test_approval(
+        db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        actor_id=workspace.entity_id, user_rules=[action_rule(EXPERIMENT_ACTION_KEY, effect="allow")],
     )
     await db_session.commit()
 
@@ -779,7 +839,9 @@ async def test_v2_review_needs_human_then_approve_flow_starts_experiment(db_sess
     request = await db_session.get(HitlRequest, item.approval_request_id)
     assert request.status == "pending"
     assert request.action_key == EXPERIMENT_ACTION_KEY
-    assert request.dedup_key == f"proposal_item:{item.id}"
+    assert request.dedup_key == f"operation:proposal_item:{item.id}"
+    assert request.entity_id == workspace.entity_id
+    assert request.workspace_id == workspace.id
     assert request.resource_kind == "proposal_item"
     assert request.resource_id == item.id
 

@@ -1,0 +1,23 @@
+{
+  "id": "remotion-best-practices",
+  "name": "remotion-best-practices",
+  "display_name": "Remotion Best Practices",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Route Remotion tasks to the right workflow.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "best-practices",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["react video", "remotion", "programmatic video", "video code", "entry point", "router"],
+    "examples": ["which remotion workflow should i use", "build programmatic video with react", "remotion captions and media setup", "upgrade remotion project version"]
+  }
+}

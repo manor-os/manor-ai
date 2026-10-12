@@ -226,6 +226,24 @@ async def test_update_skill_same_value_write_does_not_bump(db_session):
     assert await _audit_rows(db_session, skill.id) == []
 
 
+async def test_skill_editor_same_name_preserves_explicit_slug(db_session):
+    entity_id = generate_ulid()
+    skill = await _mk_skill(db_session, entity_id)
+    skill.name = "jr-release-intake-state"
+    skill.slug = "jr-release-intake-state"
+    await db_session.flush()
+
+    updated = await update_skill(
+        db_session, skill.id, entity_id,
+        name=skill.name,
+        description="Per-release intake",
+        system_prompt="One release per state.",
+    )
+
+    assert updated.slug == "jr-release-intake-state"
+    assert updated.revision == 2
+
+
 async def test_repeated_skill_content_changes_stack_revisions(db_session):
     entity_id = generate_ulid()
     skill = await _mk_skill(db_session, entity_id)

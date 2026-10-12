@@ -19,8 +19,28 @@ async def handle_document(
     params: dict[str, Any],
     kwargs: dict[str, Any],
     agent_id: str | None,
+    default_subdir: str | None = None,
 ) -> str:
     runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    from packages.core.services.room_generation_scope import current_room_generation_scope
+
+    group_scope = current_room_generation_scope()
+    if group_scope is not None:
+        from packages.core.services.room_generate_document_file import room_generate_document_file
+
+        return await room_generate_document_file(
+            scope=group_scope, entity_id=entity_id,
+            name=name or str(params.get("name") or "generated-document.md"),
+            content=kwargs.get("content") if kwargs.get("content") is not None else params.get("content"),
+            file_type=str(kwargs.get("file_type") or params.get("file_type") or "md"),
+            operations=kwargs.get("operations"), template=kwargs.get("template"),
+            source=kwargs.get("source"),
+        )
+    operation_args = {"operations": kwargs["operations"]} if "operations" in kwargs else {}
+    if "template" in kwargs:
+        operation_args["template"] = kwargs["template"]
+    if "source" in kwargs:
+        operation_args["source"] = kwargs["source"]
     content = kwargs.get("content")
     if content is None:
         content = params.get("content")
@@ -31,7 +51,7 @@ async def handle_document(
         requested_file_type in {"diagram", "diagram.json"}
         or name.lower().endswith((".diagram", ".diagram.json"))
     )
-    if not content and requested_diagram:
+    if not operation_args and not content and requested_diagram:
         if not prompt:
             return json.dumps({"error": "diagram documents require prompt or content"}, ensure_ascii=False)
         return await generate_diagram_file(
@@ -47,8 +67,9 @@ async def handle_document(
             approval_token=kwargs.get("approval_token") or params.get("approval_token"),
             expected_sha256=kwargs.get("expected_sha256") or params.get("expected_sha256"),
             runtime_envelope=runtime_context.runtime_envelope,
+            storage_scope=str(kwargs.get("storage_scope") or "task").strip().lower(),
         )
-    if not content:
+    if content is None and not operation_args:
         return json.dumps({
             "error": "kind=document requires complete content. Use prompt for skill/media kinds.",
         }, ensure_ascii=False)
@@ -57,7 +78,7 @@ async def handle_document(
         user_id=user_id,
         conversation_id=conversation_id,
         name=name or params.get("name") or "generated-document.md",
-        content=str(content),
+        content=None if operation_args else str(content),
         file_type=kwargs.get("file_type") or params.get("file_type") or "md",
         approval_token=kwargs.get("approval_token") or params.get("approval_token"),
         expected_sha256=kwargs.get("expected_sha256") or params.get("expected_sha256"),
@@ -65,4 +86,7 @@ async def handle_document(
         task_id=kwargs.get("task_id"),
         agent_id=agent_id,
         runtime_envelope=runtime_context.runtime_envelope,
+        storage_scope=str(kwargs.get("storage_scope") or "task").strip().lower(),
+        default_subdir=default_subdir,
+        **operation_args,
     )

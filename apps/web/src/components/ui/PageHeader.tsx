@@ -42,6 +42,8 @@ export interface PageHeaderProps {
   children?: ReactNode;
   /** Keep a section-level header in place instead of using the app-level header slot. */
   inline?: boolean;
+  /** Align the header with a centered page body without changing shell gutters. */
+  contentMaxWidth?: number;
 }
 
 interface PageHeaderAddButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -131,6 +133,7 @@ export default function PageHeader({
   toolbar,
   children,
   inline = false,
+  contentMaxWidth,
 }: PageHeaderProps) {
   const portalContext = useContext(PageHeaderPortalContext);
   const hasControls = tabs || toolbar || children || actions;
@@ -144,7 +147,7 @@ export default function PageHeader({
   const groupClass =
     "flex min-w-0 max-w-full flex-none flex-wrap items-center gap-2.5 md:flex-nowrap md:justify-end";
   const actionsClass =
-    "flex min-w-0 max-w-full flex-wrap items-center gap-2.5 md:flex-none md:justify-end";
+    "flex min-w-0 max-w-full flex-wrap items-center gap-2.5 self-end md:flex-none md:justify-end";
 
   const header = (
     <header
@@ -153,6 +156,7 @@ export default function PageHeader({
         : "page-header mb-4 shrink-0 px-2 pt-1"}
       data-page-header-layout={portalContext && !inline ? "app" : "inline"}
     >
+      <div style={contentMaxWidth ? { width: "100%", maxWidth: contentMaxWidth, marginInline: "auto" } : undefined}>
       {breadcrumb && (
         <div className="page-header-breadcrumb mb-2 flex items-center">
           {breadcrumb}
@@ -192,6 +196,7 @@ export default function PageHeader({
             )}
           </div>
         )}
+      </div>
       </div>
     </header>
   );

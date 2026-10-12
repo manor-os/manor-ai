@@ -11,7 +11,9 @@ Flag ON (end-to-end-ish through the celery task's inner cycle):
 
 Flag OFF:
 * prompts are the legacy ones — no briefing markers anywhere, and no
-  ReviewRun / consolidation rows are written.
+  consolidation rows are written.
+* the durable ReviewRun blocks configuration upgrades while the legacy
+  model call runs, then records the terminal receipt.
 """
 from __future__ import annotations
 
@@ -19,17 +21,27 @@ import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from tests.strategist_helpers import proposal_with_execution_review
+
+from packages.core.blueprints.upgrade_activity import active_runs
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
 from packages.core.models.base import generate_ulid
 from packages.core.models.consolidation_report import ConsolidationReport
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
+from packages.core.humans import open_commitment, resolve_commitment
+from packages.core.models.proposal import ProposalRecord
 from packages.core.models.review_run import ReviewRun
+from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace
+from packages.core.review.service import latest_succeeded_review
 from packages.core.services import feature_flags as feature_flags_service
+from packages.core.strategist.prompt import StrategistProposalGenerationError
 from packages.core.tasks.ai_tasks import _execute_strategist_review_cycle
 
 FLAG_KEY = "strategist_review_v2"
@@ -95,12 +107,12 @@ async def _set_flag(db, enabled: bool) -> None:
 
 def _fake_completion(captured: list):
     async def fake_runtime_execute_strategist_completion(system_prompt, user_prompt, **kwargs):
-        captured.append({"system": system_prompt, "user": user_prompt})
+        captured.append({"system": system_prompt, "user": user_prompt, **kwargs})
         # No review_id key: the parser injects the caller's review_id.
-        return SimpleNamespace(content=json.dumps({
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review({
             "summary": "All domains healthy; no action needed this cycle.",
             "tasks": [],
-        }))
+        }, user_prompt)))
     return fake_runtime_execute_strategist_completion
 
 
@@ -110,6 +122,47 @@ async def _reviews(db, workspace_id: str) -> list[ReviewRun]:
         .where(ReviewRun.workspace_id == workspace_id)
         .order_by(ReviewRun.id.asc())
     )).scalars().all())
+
+
+@pytest.mark.parametrize("briefing_enabled", [False, True])
+async def test_execution_reference_mismatch_fails_review_without_empty_proposal_or_watermark(
+    db_session, monkeypatch, briefing_enabled,
+):
+    workspace = await _seed_workspace(db_session)
+    await _emit(db_session, workspace)
+    await _set_flag(db_session, briefing_enabled)
+    captured = []
+
+    async def mismatched_completion(system_prompt, user_prompt, **kwargs):
+        captured.append(user_prompt)
+        payload = proposal_with_execution_review({
+            "summary": "No new action proposed.", "tasks": [],
+        }, user_prompt)
+        payload["execution_review"]["revision"] += "-stale"
+        return SimpleNamespace(content=json.dumps(payload))
+
+    monkeypatch.setattr(
+        "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+        mismatched_completion,
+    )
+    with pytest.raises(StrategistProposalGenerationError) as caught:
+        await _execute_strategist_review_cycle(db_session, workspace.id, "scheduled")
+
+    assert caught.value.code == "proposal_execution_evidence_mismatch"
+    assert caught.value.details["attempts"] == 2
+    assert len(captured) == 2
+    assert "proposal_execution_evidence_mismatch" in captured[1]
+    reviews = await _reviews(db_session, workspace.id)
+    assert len(reviews) == 1
+    assert reviews[0].status == "failed"
+    assert reviews[0].error
+    assert await latest_succeeded_review(db_session, workspace.id) is None
+    assert not (await db_session.execute(select(ProposalRecord.id).where(
+        ProposalRecord.review_id == reviews[0].id,
+    ))).all()
+    assert not (await db_session.execute(select(Task.id).where(
+        Task.workspace_id == workspace.id,
+    ))).all()
 
 
 # ── flag ON ────────────────────────────────────────────────────────────
@@ -131,9 +184,11 @@ async def test_flag_on_briefing_driven_review_succeeds_and_advances_watermark(
 
     result = await _execute_strategist_review_cycle(
         db_session, workspace.id, "scheduled",
+        user_id="review-requester",
     )
 
     assert not result.get("skipped")
+    assert captured[0]["user_id"] == "review-requester"
     assert result["task_count"] == 0
 
     reviews = await _reviews(db_session, workspace.id)
@@ -190,9 +245,60 @@ async def test_flag_on_briefing_driven_review_succeeds_and_advances_watermark(
     assert isinstance(second.briefing, dict)
 
 
+async def test_declined_human_input_is_visible_to_next_review(db_session, monkeypatch):
+    workspace = await _seed_workspace(db_session)
+    commitment = await open_commitment(
+        db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        request_kind="input", source_kind="chat", source_id="optional-artwork",
+        expected_input="Do you want optional cover artwork?",
+    )
+    await resolve_commitment(
+        db_session, commitment, status="declined", response={"choice": "skip"},
+    )
+    await db_session.commit()
+    await _set_flag(db_session, True)
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+        _fake_completion(captured),
+    )
+
+    await _execute_strategist_review_cycle(db_session, workspace.id, "event")
+
+    assert len(captured) == 1
+    assert "Do you want optional cover artwork?" in captured[0]["user"]
+    assert "declined" in captured[0]["user"]
+
+
+async def test_fulfilled_human_input_is_visible_to_next_review(db_session, monkeypatch):
+    workspace = await _seed_workspace(db_session)
+    commitment = await open_commitment(
+        db_session, entity_id=workspace.entity_id, workspace_id=workspace.id,
+        request_kind="input", source_kind="chat", source_id="release-materials",
+        expected_input="Provide release materials",
+    )
+    await resolve_commitment(
+        db_session, commitment, status="fulfilled",
+        response={"text": "The track is instrumental", "choice": "respond"},
+    )
+    await db_session.commit()
+    await _set_flag(db_session, True)
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+        _fake_completion(captured),
+    )
+
+    await _execute_strategist_review_cycle(db_session, workspace.id, "event")
+
+    assert len(captured) == 1
+    assert "Provide release materials" in captured[0]["user"]
+    assert "The track is instrumental" in captured[0]["user"]
+
+
 # ── flag OFF ───────────────────────────────────────────────────────────
 
-async def test_flag_off_keeps_legacy_prompt_and_writes_no_review_rows(
+async def test_flag_off_keeps_legacy_prompt_but_claims_durable_admission_before_model_call(
     db_session, monkeypatch,
 ):
     workspace = await _seed_workspace(db_session)
@@ -200,22 +306,43 @@ async def test_flag_off_keeps_legacy_prompt_and_writes_no_review_rows(
     await _set_flag(db_session, False)
 
     captured: list[dict] = []
+    complete = _fake_completion(captured)
+
+    async def checked_completion(system_prompt, user_prompt, **kwargs):
+        async with AsyncSession(bind=db_session.bind, expire_on_commit=False) as observer:
+            reviews = await _reviews(observer, workspace.id)
+            assert len(reviews) == 1
+            assert reviews[0].status == "running"
+            assert reviews[0].lease_owner
+            assert reviews[0].briefing is None
+            assert reviews[0].id in {
+                row["id"] for row in await active_runs(observer, workspace=workspace)
+            }
+        return await complete(system_prompt, user_prompt, **kwargs)
+
     monkeypatch.setattr(
         "packages.core.strategist.prompt.runtime_execute_strategist_completion",
-        _fake_completion(captured),
+        checked_completion,
     )
 
     result = await _execute_strategist_review_cycle(
-        db_session, workspace.id, "scheduled",
+        db_session, workspace.id, "human_requested",
     )
 
     assert not result.get("skipped")
     assert result["task_count"] == 0
-    # Legacy review ids keep the rv_ prefix (no ReviewRun row backing them).
-    assert result["review_id"].startswith("rv_")
+    reviews = await _reviews(db_session, workspace.id)
+    assert len(reviews) == 1
+    assert result["review_id"] == reviews[0].id
+    assert reviews[0].status == "succeeded"
+    # Legacy mode still has no domain briefing, but the common execution
+    # observation receipt is retained for audit on both generation paths.
+    assert set(reviews[0].briefing) == {"execution_evidence"}
+    assert reviews[0].briefing["execution_evidence"]["source"] == "server_observation"
+    assert reviews[0].lease_owner is None
+    assert not await active_runs(db_session, workspace=workspace)
 
-    # No ReviewRun / consolidation rows on the legacy path.
-    assert await _reviews(db_session, workspace.id) == []
+    # Consolidation/briefing behavior remains exclusive to the v2 flag.
     report_rows = list((await db_session.execute(
         select(ConsolidationReport).where(
             ConsolidationReport.workspace_id == workspace.id

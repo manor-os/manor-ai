@@ -150,7 +150,7 @@ class TestResolveProviderBaseUrl:
 
     def test_unknown_zyphra_key_uses_zyphra_model_provider(self):
         url = resolve_provider_base_url("zyphra/zonos-v0.1-hybrid", "zyphra-test-key", None)
-        assert url == "https://api.zyphra.com/v1"
+        assert url == "https://api.zyphracloud.com/api/v1"
 
 
 @pytest.mark.asyncio
@@ -731,9 +731,9 @@ class TestVisionFallbackRoutingMetadata:
         assert models.model_input_modalities("openai/gpt-5.6-luna") == frozenset({"text", "image"})
         assert models.model_input_modalities("openai/gpt-5.5") == frozenset({"text", "image"})
         assert models.model_input_modalities("openai/gpt-5.5-pro") == frozenset({"text", "image"})
-        assert models.model_input_modalities("moonshotai/kimi-k3") == frozenset({"text", "image"})
-        assert models.model_input_modalities("qwen/qwen3.8-max") == frozenset({"text", "image"})
-        assert models.model_input_modalities("qwen/qwen3.7-flash") == frozenset({"text", "image"})
+        assert models.model_input_modalities("moonshotai/kimi-k3") == frozenset({"text", "image", "video"})
+        assert models.model_input_modalities("qwen/qwen3.8-max") == frozenset({"text", "image", "video"})
+        assert models.model_input_modalities("qwen/qwen3.7-flash") == frozenset({"text", "image", "video"})
         assert models.model_input_modalities("custom/unknown") is None
 
     def test_explicit_text_only_model_uses_configured_vision_fallback(self, monkeypatch):
@@ -918,6 +918,34 @@ class TestAnthropicSamplingParamsGate:
         )
         assert wire == "claude-fable-5"
         assert _anthropic_accepts_sampling_params(wire) is False
+
+    def test_fable_51_routes_to_every_provider_and_rejects_sampling(self):
+        from packages.core.ai.llm_client import _anthropic_accepts_sampling_params
+
+        catalog_id = "anthropic/claude-fable-5.1"
+        # Anthropic native uses hyphenated point releases; the gateways keep
+        # the dotted catalog id verbatim.
+        assert normalize_model_for_provider(catalog_id, "https://api.anthropic.com/v1") == "claude-fable-5-1"
+        assert normalize_model_for_provider(catalog_id, "https://openrouter.ai/api/v1") == catalog_id
+        assert normalize_model_for_provider(catalog_id, "https://ai-gateway.vercel.sh/v1") == catalog_id
+        assert _anthropic_accepts_sampling_params("claude-fable-5-1") is False
+
+    def test_opus_55_routes_to_every_provider_and_rejects_sampling(self):
+        from packages.core.ai.llm_client import _anthropic_accepts_sampling_params
+
+        catalog_id = "anthropic/claude-opus-5.5"
+        assert normalize_model_for_provider(catalog_id, "https://api.anthropic.com/v1") == "claude-opus-5-5"
+        assert normalize_model_for_provider(catalog_id, "https://openrouter.ai/api/v1") == catalog_id
+        assert normalize_model_for_provider(catalog_id, "https://ai-gateway.vercel.sh/v1") == catalog_id
+        from packages.core.services.model_provider_handlers import (
+            CATALOG_PROVIDER_CAPABILITIES,
+            vercel_model_id,
+        )
+
+        assert vercel_model_id(catalog_id) == catalog_id
+        assert ("primary", "anthropic") in CATALOG_PROVIDER_CAPABILITIES
+        assert _anthropic_accepts_sampling_params("claude-opus-5-5") is False
+        assert _anthropic_accepts_sampling_params("claude-opus-5") is False
 
     def test_opus_47_and_newer_reject_sampling(self):
         from packages.core.ai.llm_client import _anthropic_accepts_sampling_params

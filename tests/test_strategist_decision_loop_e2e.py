@@ -47,9 +47,15 @@ import json
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
+from tests.strategist_helpers import proposal_with_execution_review
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
+
 import pytest
 from sqlalchemy import select
 
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.goals.service import record_measurement
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
@@ -149,6 +155,8 @@ async def _seed_workspace(db, *, name: str, entity_id: str | None = None) -> Wor
         agent,
         subscription,
     ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=actor_id)
     await db.commit()
     return workspace
 
@@ -244,7 +252,7 @@ def _scripted_completion(payloads: list[dict], captured: list[dict]):
     """One queued proposal payload per review cycle; prompts captured."""
     async def fake(system_prompt, user_prompt, **kwargs):
         captured.append({"system": system_prompt, "user": user_prompt})
-        return SimpleNamespace(content=json.dumps(payloads.pop(0)))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payloads.pop(0), user_prompt)))
     return fake
 
 
@@ -311,17 +319,15 @@ async def _max_event_id(db, workspace: Workspace) -> str:
 # ── Test A: full loop with a standing grant ────────────────────────────
 
 async def test_full_loop_with_standing_grant(db_session, monkeypatch):
-    from packages.core.governance.service import add_auto_approve_action
-
     db = db_session
     workspace = await _seed_workspace(db, name="E2E Standing Grant WS")
     await _set_flag(db, True)
-    await add_auto_approve_action(
+    await set_workspace_test_approval(
         db,
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        action_key="workspace.proposal.task",
-        changed_by="operator",
+        actor_id=workspace.entity_id,
+        user_rules=[action_rule("workspace.proposal.task")],
     )
     await db.commit()
 
@@ -505,7 +511,8 @@ async def test_full_loop_with_standing_grant(db_session, monkeypatch):
 
 # ── Test B: needs_human + rejection learning signal ────────────────────
 
-async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch):
+@pytest.mark.parametrize("rejection_comment", [None, "Wrong direction — focus on retention, not hacks."])
+async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch, rejection_comment):
     db = db_session
     workspace = await _seed_workspace(db, name="E2E Needs Human WS")
     await _set_flag(db, True)
@@ -543,7 +550,11 @@ async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch
     assert result["auto_approved"] is False
     req = (await db.execute(
         select(HitlRequest).where(
-            HitlRequest.dedup_key == f"proposal:{result['proposal_id']}",
+            HitlRequest.dedup_key == f"operation:proposal:{result['proposal_id']}",
+            HitlRequest.entity_id == workspace.entity_id,
+            HitlRequest.workspace_id == workspace.id,
+            HitlRequest.resource_kind == "proposal",
+            HitlRequest.resource_id == result["proposal_id"],
         )
     )).scalar_one()
     assert req.status == "pending"
@@ -557,7 +568,6 @@ async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch
 
     # Operator pushes back with a coded reason.
     operator_id = workspace.entity_id
-    rejection_comment = "Wrong direction — focus on retention, not hacks."
     cancelled = await strategist_service.reject_proposal(
         db,
         entity_id=workspace.entity_id,
@@ -584,12 +594,13 @@ async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch
         select(Task).where(Task.id == result["task_ids"][0])
     )).scalar_one()
     assert task.status == "cancelled"
+    assert task.details["rejection_reason_code"] == "WRONG_DIRECTION"
 
     rejected_events = await _events_of(db, workspace, et.PROPOSAL_ITEM_REJECTED)
     assert len(rejected_events) == 1
     assert rejected_events[0].source_id == task.id
     assert rejected_events[0].causation_id == result["review_id"]
-    assert rejected_events[0].payload["rejection_reason"] == rejection_comment
+    assert rejected_events[0].payload.get("rejection_reason") == rejection_comment
     assert rejected_events[0].actor_id == operator_id
 
     # Next review: the rejection is a learning signal in the briefing.
@@ -609,7 +620,12 @@ async def test_needs_human_rejection_feeds_next_briefing(db_session, monkeypatch
     assert decisions[0]["review_id"] == result["review_id"]
     assert decisions[0]["reason"] == rejection_comment
     # …and the rendered prompt carries it verbatim to the Strategist.
-    assert "Wrong direction" in captured[1]["user"]
+    assert decisions[0]["reason_code"] == "WRONG_DIRECTION"
+    assert decisions[0]["task_title"] == task.title
+    assert "WRONG_DIRECTION" in captured[1]["user"]
+    assert task.title in captured[1]["user"]
+    if rejection_comment:
+        assert rejection_comment in captured[1]["user"]
 
 
 # ── Test C: review failure does not lose the window ────────────────────
@@ -663,6 +679,122 @@ async def test_review_failure_preserves_window_for_next_review(db_session, monke
     window_ids = await _window_event_ids(db, recovered)
     assert seeded_ids <= window_ids
     assert len(captured) == 1  # the failed run never reached the LLM
+
+
+@pytest.mark.parametrize("briefing_enabled", [False, True])
+@pytest.mark.parametrize("failure_kind", ["invalid", "unavailable"])
+async def test_proposal_generation_failure_never_persists_fallback_work(
+    db_session, monkeypatch, briefing_enabled, failure_kind,
+):
+    from packages.core.review import latest_succeeded_review
+    from packages.core.strategist.prompt import StrategistProposalGenerationError
+
+    db = db_session
+    workspace = await _seed_workspace(db, name="Failed proposal must not synthesize work")
+    workspace_id = workspace.id
+    await _set_flag(db, briefing_enabled)
+    # This service + an unmeasured goal previously activated the scorer fallback.
+    subscription = (await db.execute(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace_id,
+    ))).scalar_one()
+    subscription.service_key = "readiness_and_learning"
+    await db.commit()
+    event = await _emit(db, workspace)
+    event_id = event.id
+    captured = []
+
+    async def _broken_completion(system_prompt, user_prompt, **kwargs):
+        captured.append(user_prompt)
+        if failure_kind == "unavailable":
+            raise RuntimeError("test provider unavailable")
+        return SimpleNamespace(content='{"tasks": "invalid"}')
+
+    monkeypatch.setattr(
+        "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+        _broken_completion,
+    )
+    _quiet_side_surfaces(monkeypatch)
+    terminal_states = []
+
+    async def _finish_activity(**kwargs):
+        terminal_states.append(kwargs["state"])
+
+    monkeypatch.setattr(strategist_service, "finish_strategist_review_activity", _finish_activity)
+    with pytest.raises(StrategistProposalGenerationError) as raised:
+        await _execute_strategist_review_cycle(db, workspace_id, "scheduled")
+
+    assert raised.value.code == (
+        "proposal_invalid_output" if failure_kind == "invalid" else "proposal_llm_unavailable"
+    )
+    assert len(captured) == (2 if failure_kind == "invalid" else 1)
+    if failure_kind == "invalid":
+        assert "tool_error" in captured[1]
+        assert "validation_errors" in captured[1]
+    reviews = await _reviews(db, workspace_id)
+    assert len(reviews) == 1
+    assert reviews[0].status == "failed"
+    assert reviews[0].error
+    assert terminal_states == ["failed"]
+    assert await latest_succeeded_review(db, workspace_id) is None
+    assert not (await db.execute(select(Task.id).where(Task.workspace_id == workspace_id))).all()
+    assert not (await db.execute(select(ProposalRecord.id).where(
+        ProposalRecord.review_id == reviews[0].id,
+    ))).all()
+
+    # An explicit later review can recover, still consuming the failed window.
+    monkeypatch.setattr(
+        "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+        _scripted_completion([dict(_EMPTY_PAYLOAD)], []),
+    )
+    recovered = await _execute_strategist_review_cycle(db, workspace_id, "manual")
+    assert recovered["task_count"] == 0
+    reviews = await _reviews(db, workspace_id)
+    assert reviews[-1].status == "succeeded"
+    assert event_id in await _window_event_ids(db, reviews[-1])
+
+
+@pytest.mark.parametrize("goal_value", [None, 0.5, 100])
+async def test_valid_empty_proposal_does_not_recreate_rejected_scorer(
+    db_session, monkeypatch, goal_value,
+):
+    db = db_session
+    workspace = await _seed_workspace(db, name="Respect empty proposal after rejection")
+    await _set_flag(db, True)
+    goal = await _active_goal(db, workspace)
+    goal.current_value = goal_value
+    goal.current_value_updated_at = datetime.now(timezone.utc) - timedelta(days=1)
+    subscription = (await db.execute(select(AgentSubscription).where(
+        AgentSubscription.workspace_id == workspace.id,
+    ))).scalar_one()
+    subscription.service_key = "readiness_and_learning"
+    rejected = Task(
+        id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+        title="Score active Goals from current evidence", status="cancelled",
+        details={"strategist_task_key": "score_goals", "rejection_reason_code": "WRONG_DIRECTION"},
+    )
+    completed = Task(
+        id=generate_ulid(), entity_id=workspace.entity_id, workspace_id=workspace.id,
+        title="Deliver campaign analysis", status="completed",
+        completed_at=datetime.now(timezone.utc),
+    )
+    db.add_all([rejected, completed])
+    await db.commit()
+    captured = []
+    monkeypatch.setattr(
+        "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+        _scripted_completion([dict(_EMPTY_PAYLOAD)], captured),
+    )
+    _quiet_side_surfaces(monkeypatch)
+
+    result = await _execute_strategist_review_cycle(db, workspace.id, "scheduled")
+
+    assert len(captured) == 1
+    assert result["task_count"] == 0
+    assert "Injected score_goals" not in (result.get("notes") or "")
+    assert set((await db.execute(select(Task.id).where(
+        Task.workspace_id == workspace.id,
+    ))).scalars()) == {rejected.id, completed.id}
+    assert (await _reviews(db, workspace.id))[0].status == "succeeded"
 
 
 # ── Test D: human_request + meta-suppression loop ──────────────────────
@@ -730,7 +862,6 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
     from packages.core.consolidators.human_participation import (
         HumanParticipationConsolidator,
     )
-    from packages.core.governance.service import add_auto_approve_action
     from packages.core.models.participant import HumanCommitment
     from packages.core.models.task import Conversation, Message
 
@@ -754,12 +885,12 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
         db, name="E2E Human Loop WS", entity_id=entity_id,
     )
     await _set_flag(db, True)
-    await add_auto_approve_action(
+    await set_workspace_test_approval(
         db,
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        action_key="workspace.proposal.task",
-        changed_by="operator",
+        actor_id=workspace.entity_id,
+        user_rules=[action_rule("workspace.proposal.task")],
     )
     await db.commit()
     goal = await _active_goal(db, workspace)
@@ -828,7 +959,7 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
     assert timedelta(hours=23) < delta < timedelta(hours=25)
 
     # Chat surface: one REAL hitl_request message with the commitment ref
-    # and deliberately no pending_action (the queue is the action surface).
+    # and an answerable pending action (the queue is a second surface).
     chat_messages = list((await db.execute(
         select(Message)
         .join(Conversation, Message.conversation_id == Conversation.id)
@@ -839,7 +970,12 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
     )).scalars().all())
     assert len(chat_messages) == 1
     assert chat_messages[0].refs == [{"type": "human_commitment", "id": commitment.id}]
-    assert chat_messages[0].pending_action is None
+    assert chat_messages[0].pending_action == {
+        "kind": PendingActionKind.HUMAN_INPUT.value,
+        "hitl_type": "input",
+        "commitment_id": commitment.id,
+        "prompt": _HR_QUESTION,
+    }
     assert _HR_QUESTION in chat_messages[0].content
     assert chat_messages[0].author_kind == "agent"
 
@@ -869,6 +1005,12 @@ async def test_human_request_and_meta_suppression_loop(client, db_session, monke
     await db.refresh(hr_item)
     assert hr_item.status == "succeeded"
     assert hr_item.finished_at is not None
+    await db.refresh(chat_messages[0])
+    assert chat_messages[0].resolved_at is not None
+    assert chat_messages[0].resolution == {
+        "choice": "fulfilled",
+        "source": "human_commitment",
+    }
 
     fulfilled_events = await _events_of(db, workspace, et.HUMAN_COMMITMENT_FULFILLED)
     assert len(fulfilled_events) == 1
@@ -967,7 +1109,6 @@ async def test_experiment_lifecycle_loop(client, db_session, monkeypatch):
         EXPERIMENT_OVERLAY_KEY,
         check_experiment_guardrails,
     )
-    from packages.core.governance.service import add_auto_approve_action
     from packages.core.models.experiment import Experiment
     from packages.core.models.scheduler import ScheduledJob
 
@@ -990,12 +1131,12 @@ async def test_experiment_lifecycle_loop(client, db_session, monkeypatch):
         db, name="E2E Experiment WS", entity_id=entity_id,
     )
     await _set_flag(db, True)
-    await add_auto_approve_action(
+    await set_workspace_test_approval(
         db,
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        action_key="workspace.proposal.experiment",
-        changed_by="operator",
+        actor_id=workspace.entity_id,
+        user_rules=[action_rule("workspace.proposal.experiment")],
     )
     await db.commit()
 

@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import logging
 import shlex
+import os
 import subprocess
 import time
 import uuid
@@ -25,6 +26,7 @@ from typing import Optional
 from sandbox_config import config as app_config
 
 from .models import ContainerConfig, ExecResponse, SandboxStatus, SkillManifest
+from .security import EVENT_SECRET_TEXT_PATTERNS, EVENT_SENSITIVE_KEYS
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,151 @@ _HOT_WINDOW_SECONDS = 300
 _CANCEL_GRACE_SECONDS = 1.0
 _CANCEL_POLL_INTERVAL_SECONDS = 0.1
 _EXECUTION_PID_WAIT_SECONDS = 0.5
+_EXECUTION_EVENT_BYTES_LIMIT = 128 * 1024
+_EXECUTION_RESPONSE_BYTES_LIMIT = 16 * 1024
+
+_SANDBOX_BRIDGE_SOURCE = r'''#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import re
+import time
+import uuid
+
+EVENT_TYPES = {
+    "progress", "warning", "error", "need_input", "need_file",
+    "need_tool", "need_credential", "result",
+}
+SECRET_KEYS = __EVENT_SENSITIVE_KEYS__
+SECRET_TEXT_PATTERNS = tuple(
+    re.compile(pattern) for pattern in __EVENT_SECRET_TEXT_PATTERNS__
+)
+MAX_EVENT_BYTES = 8192
+MAX_STREAM_BYTES = 128 * 1024
+
+
+def _response_path(event_id):
+    digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:32]
+    return os.path.join(os.environ["MANOR_SANDBOX_RESPONSE_DIR"], digest + ".json")
+
+
+def _normalize_key(key):
+    value = str(key or "").strip().replace("-", "_")
+    value = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", value)
+    return value.casefold()
+
+
+def _has_secret_key(value):
+    if isinstance(value, dict):
+        return any(_normalize_key(key) in SECRET_KEYS or _has_secret_key(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_has_secret_key(item) for item in value)
+    return False
+
+
+def _has_secret_text(value):
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in SECRET_TEXT_PATTERNS)
+    if isinstance(value, dict):
+        return any(_has_secret_text(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_has_secret_text(item) for item in value)
+    return False
+
+
+def emit(args):
+    if args.type not in EVENT_TYPES:
+        raise SystemExit("unsupported event type")
+    try:
+        payload = json.loads(args.payload)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid payload JSON: {exc}")
+    if not isinstance(payload, dict):
+        raise SystemExit("payload must be a JSON object")
+    if _has_secret_key(payload) or _has_secret_text({"message": args.message, "payload": payload}):
+        raise SystemExit("sandbox events accept references only, not secret values")
+    event_id = args.event_id or uuid.uuid4().hex
+    if len(event_id) > 128 or not event_id or any(not (char.isalnum() or char in "_.:-") for char in event_id):
+        raise SystemExit("invalid event id")
+    event = {
+        "event_id": event_id,
+        "type": args.type,
+        "message": args.message[:2000],
+        "payload": payload,
+        "requires_response": bool(args.requires_response or args.type.startswith("need_")),
+    }
+    encoded = (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_EVENT_BYTES:
+        raise SystemExit("event exceeds 8192 bytes")
+    event_file = os.environ["MANOR_SANDBOX_EVENT_FILE"]
+    try:
+        current_size = os.path.getsize(event_file)
+    except FileNotFoundError:
+        current_size = 0
+    if current_size + len(encoded) > MAX_STREAM_BYTES:
+        raise SystemExit("execution event stream exceeds 131072 bytes")
+    fd = os.open(event_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, encoded)
+    finally:
+        os.close(fd)
+    print(event_id)
+
+
+def wait(args):
+    path = _response_path(args.event_id)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                print(handle.read())
+            return
+        except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                raise SystemExit("timed out waiting for Agent response")
+            time.sleep(0.1)
+
+
+parser = argparse.ArgumentParser(description="Sandbox-to-Agent event bridge")
+subparsers = parser.add_subparsers(dest="action", required=True)
+emit_parser = subparsers.add_parser("emit")
+emit_parser.add_argument("--type", required=True)
+emit_parser.add_argument("--message", default="")
+emit_parser.add_argument("--payload", default="{}")
+emit_parser.add_argument("--event-id")
+emit_parser.add_argument("--requires-response", action="store_true")
+emit_parser.set_defaults(handler=emit)
+wait_parser = subparsers.add_parser("wait")
+wait_parser.add_argument("--event-id", required=True)
+wait_parser.add_argument("--timeout", type=float, default=300.0)
+wait_parser.set_defaults(handler=wait)
+arguments = parser.parse_args()
+arguments.handler(arguments)
+'''
+
+_SANDBOX_BRIDGE_SOURCE = _SANDBOX_BRIDGE_SOURCE.replace(
+    "__EVENT_SENSITIVE_KEYS__",
+    repr(tuple(sorted(EVENT_SENSITIVE_KEYS))),
+).replace(
+    "__EVENT_SECRET_TEXT_PATTERNS__",
+    repr(EVENT_SECRET_TEXT_PATTERNS),
+)
+
+
+def _redact_docker_args(args: list[str]) -> list[str]:
+    """Hide env values (``--env KEY=VALUE``) before an argv reaches a log or an error body."""
+    redacted: list[str] = []
+    hide_next = False
+    for item in args:
+        if hide_next:
+            key = item.split("=", 1)[0]
+            redacted.append(f"{key}=<redacted>")
+            hide_next = False
+            continue
+        if item in ("--env", "-e"):
+            hide_next = True
+        redacted.append(item)
+    return redacted
 
 
 def _run_docker(
@@ -57,7 +204,9 @@ def _run_docker(
             "Install Docker and ensure it is on PATH."
         )
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Docker command timed out after {timeout}s: {args}") from exc
+        raise RuntimeError(
+            f"Docker command timed out after {timeout}s: {_redact_docker_args(args)}"
+        ) from exc
 
     if result.returncode != 0 and not allow_failure:
         stderr = result.stderr.decode("utf-8", errors="replace").strip()
@@ -107,10 +256,10 @@ def _missing_image_message(image: str) -> str:
     )
 
 
-def list_managed_sandbox_containers() -> list[str]:
-    """List containers owned by this runner family using the Docker label."""
+def list_managed_sandbox_containers(service_scope: str = "1") -> list[str]:
+    """List only containers belonging to this sandbox service deployment."""
     result = _run_docker(
-        ["docker", "ps", "-aq", "--filter", "label=sandbox.service=1"],
+        ["docker", "ps", "-aq", "--filter", f"label=sandbox.service={service_scope}"],
         allow_failure=True,
     )
     if result.returncode != 0:
@@ -143,6 +292,69 @@ def _config_hash(cfg: ContainerConfig, skill_dir: str) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
+# The sandbox image preinstalls the dependencies of every Skill shipped in the
+# repository (docker/Dockerfile.sandbox, skill-manifests stage), keyed by
+# ``preinstalled_manifest_digest`` of the manifest bytes:
+#   python/<digest>.txt             its packages are in system site-packages
+#   node/<digest>/node_modules      a read-only tree linked into the workdir
+# Installing at create time instead puts hundreds of MB into the workdir and
+# home tmpfs, which count against the container's memory limit.
+PREINSTALLED_SKILL_DEPS_ROOT = "/opt/manor/skill-deps"
+
+
+def preinstalled_manifest_digest(content: bytes) -> str:
+    """Key of a dependency manifest in the image (must match the Dockerfile)."""
+    return hashlib.sha256(content).hexdigest()[:16]
+
+
+def _host_manifest_digest(skill_dir: str, relative_path: str) -> str | None:
+    try:
+        with open(os.path.join(skill_dir, relative_path), "rb") as handle:
+            return preinstalled_manifest_digest(handle.read())
+    except OSError:
+        return None
+
+
+_SKILL_ENV_FILE_PREFIX = "sbx-env-"
+# Env-file variable listing the keys whose values are base64-encoded (multi-line).
+_B64_ENV_KEYS_VAR = "MANOR_SANDBOX_B64_ENV"
+_SKILL_ENV_FILE_SUFFIX = ".env"
+# A secret file older than this is an orphan (an exec never runs that long
+# without the service noticing); the startup sweep removes it.
+_SKILL_ENV_FILE_STALE_SECONDS = 24 * 3600
+
+
+def _remove_skill_env_file(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.warning("Could not remove sandbox env file %s", path, exc_info=True)
+
+
+def sweep_stale_skill_env_files(*, max_age_seconds: int = _SKILL_ENV_FILE_STALE_SECONDS) -> int:
+    """Remove leftover per-exec secret files (a SIGKILL mid-exec leaves them)."""
+    import glob
+    import tempfile
+
+    removed = 0
+    cutoff = time.time() - max_age_seconds
+    pattern = os.path.join(tempfile.gettempdir(), f"{_SKILL_ENV_FILE_PREFIX}*{_SKILL_ENV_FILE_SUFFIX}")
+    for path in glob.glob(pattern):
+        try:
+            if os.stat(path).st_mtime <= cutoff:
+                os.unlink(path)
+                removed += 1
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.warning("Could not sweep sandbox env file %s", path, exc_info=True)
+    return removed
+
+
 class DockerSandbox:
     """
     Manages a single Docker container for skill execution.
@@ -151,6 +363,7 @@ class DockerSandbox:
     """
 
     def __init__(self, sandbox_id: str, config: ContainerConfig):
+        self._skill_env: dict[str, str] = {}
         self.sandbox_id = sandbox_id
         self.config = config
         self.container_name: str = ""
@@ -187,8 +400,7 @@ class DockerSandbox:
     def touch(self) -> None:
         """Refresh the idle lease without executing untrusted project code."""
 
-        if self.status in (SandboxStatus.DESTROYED, SandboxStatus.DESTROYING):
-            raise RuntimeError(f"Sandbox is not running (status={self.status.value})")
+        self.ensure_available()
         self.last_used_at = time.time()
 
     def is_active(self) -> bool:
@@ -221,7 +433,12 @@ class DockerSandbox:
             self.container_name = name
             self._config_hash = _config_hash(self.config, skill.skill_dir)
 
-            await self._ensure_container(skill, env)
+            # Skill env is handed to each ``docker exec`` (see
+            # ``_skill_env_args``) rather than baked into the container, so a
+            # later ``load_skill`` can replace it and a reused container never
+            # carries the previous skill's credentials.
+            self._skill_env = dict(env)
+            await self._ensure_container(skill, {})
 
             self.status = SandboxStatus.RUNNING
             await self._inject_files(skill)
@@ -244,6 +461,7 @@ class DockerSandbox:
         timeout: int | None = None,
         workdir: str | None = None,
         execution_id: str | None = None,
+        interactive: bool = False,
     ) -> ExecResponse:
         """Execute a command inside the running container."""
         self.ensure_available()
@@ -268,9 +486,66 @@ class DockerSandbox:
                 workdir=wd,
                 mark_status=SandboxStatus.EXECUTING,
                 execution_id=resolved_execution_id,
+                interactive=interactive,
             )
 
         return result
+
+    def _prepare_skill_env(self, *, decode_multiline: bool = True) -> tuple[str | None, list[str]]:
+        """Materialise the current skill env for one ``docker exec``.
+
+        Values travel through a 0600 temp file and ``--env-file`` so they never
+        appear on the docker command line (``ps`` on the host). ``--env-file``
+        cannot express a newline, so a multi-line value (a PEM key, say) is
+        base64-encoded in the file and its key listed in
+        ``MANOR_SANDBOX_B64_ENV``; the exec launcher decodes those before the
+        command starts, so the process sees the original value. The file lives
+        until the exec completes; ``_exec_in_container`` removes it.
+
+        ``decode_multiline`` is False on the non-launcher path (dependency
+        installs), where nothing decodes the marker: multi-line values are
+        omitted there so pip/npm see the variable absent rather than a
+        base64 blob under the real name.
+
+        Returns ``(env_file, extra_argv)``; ``extra_argv`` is always empty and
+        kept only so callers need not change when the transport does.
+        """
+        if not self._skill_env:
+            return None, []
+        import base64
+        import tempfile
+
+        file_lines: list[str] = []
+        encoded_keys: list[str] = []
+        for key, value in self._skill_env.items():
+            if key == _B64_ENV_KEYS_VAR:
+                # Reserved control name; a skill must not steer the launcher.
+                continue
+            text = str(value)
+            if "\n" in text or "\r" in text:
+                if not decode_multiline:
+                    continue
+                file_lines.append(f"{key}={base64.b64encode(text.encode('utf-8')).decode('ascii')}")
+                encoded_keys.append(key)
+            else:
+                file_lines.append(f"{key}={text}")
+        if not file_lines:
+            return None, []
+        if encoded_keys:
+            file_lines.append(f"{_B64_ENV_KEYS_VAR}={','.join(encoded_keys)}")
+        fd, env_file = tempfile.mkstemp(prefix=_SKILL_ENV_FILE_PREFIX, suffix=_SKILL_ENV_FILE_SUFFIX)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(file_lines) + "\n")
+        except Exception:
+            os.unlink(env_file)
+            raise
+        return env_file, []
+
+    @staticmethod
+    def _skill_env_args(env_file: str | None, argv: list[str] | None = None) -> list[str]:
+        args = ["--env-file", env_file] if env_file else []
+        return [*args, *(argv or [])]
 
     async def _exec_in_container(
         self,
@@ -280,6 +555,7 @@ class DockerSandbox:
         workdir: str,
         mark_status: SandboxStatus,
         execution_id: str | None = None,
+        interactive: bool = False,
     ) -> ExecResponse:
         """Internal docker exec helper. Caller must already hold _state_lock."""
         self.status = mark_status
@@ -291,23 +567,40 @@ class DockerSandbox:
         if execution_id is not None:
             pid_file = self._execution_pid_file(execution_id)
             await self._set_active_execution(execution_id)
-            args = self._execution_command_args(command, workdir, pid_file)
-        else:
-            args = [
-                "docker", "exec", "-i",
-                "-w", workdir,
-                self.container_name,
-                "sh", "-c", command,
-            ]
+        # The secret file is written as late as possible and removed on every
+        # exit from here on, so a cancellation or a failure while building the
+        # command cannot leave live credentials in the host tmp dir.
+        env_file, env_argv = self._prepare_skill_env(decode_multiline=execution_id is not None)
+        try:
+            if execution_id is not None:
+                args = self._execution_command_args(
+                    command,
+                    workdir,
+                    pid_file,
+                    execution_id,
+                    interactive,
+                    env_file=env_file,
+                    env_argv=env_argv,
+                )
+            else:
+                args = [
+                    "docker", "exec", "-i",
+                    "-w", workdir,
+                    *self._skill_env_args(env_file, env_argv),
+                    self.container_name,
+                    "sh", "-c", command,
+                ]
+        except BaseException:
+            _remove_skill_env_file(env_file)
+            raise
 
-        docker_task = asyncio.create_task(
-            asyncio.to_thread(
-                _run_docker,
-                args,
-                timeout=timeout,
-                allow_failure=True,
-            )
-        )
+        def _run_and_release() -> subprocess.CompletedProcess:
+            try:
+                return _run_docker(args, timeout=timeout, allow_failure=True)
+            finally:
+                _remove_skill_env_file(env_file)
+
+        docker_task = asyncio.create_task(asyncio.to_thread(_run_and_release))
         try:
             result = await asyncio.shield(docker_task)
         except BaseException as exc:
@@ -377,27 +670,199 @@ class DockerSandbox:
         command: str,
         workdir: str,
         pid_file: str,
+        execution_id: str,
+        interactive: bool,
+        env_file: str | None = None,
+        env_argv: list[str] | None = None,
     ) -> list[str]:
-        launcher = (
-            "import os,subprocess,sys;"
-            "proc=subprocess.Popen(['sh','-c',sys.argv[1]],start_new_session=True);"
-            "fd=os.open(sys.argv[2],os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600);"
-            "os.write(fd,str(proc.pid).encode('ascii'));"
-            "os.close(fd);"
-            "code=proc.wait();"
-            "raise SystemExit(code if code>=0 else 128-code)"
+        event_file, response_dir, bridge_file = self._execution_mailbox_paths(
+            execution_id=execution_id
         )
+        launcher = """
+import os
+import shutil
+import subprocess
+import sys
+
+command, pid_file, event_file, response_dir, bridge_file, bridge_source, execution_id, interactive = sys.argv[1:]
+_b64_keys = os.environ.pop("MANOR_SANDBOX_B64_ENV", "")
+if _b64_keys:
+    import base64 as _b64
+    for _k in [_x for _x in _b64_keys.split(",") if _x]:
+        if _k in os.environ:
+            os.environ[_k] = _b64.b64decode(os.environ[_k]).decode("utf-8")
+for path in (pid_file, event_file, bridge_file):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+shutil.rmtree(response_dir, ignore_errors=True)
+env = dict(os.environ)
+if interactive == "1":
+    os.makedirs(response_dir, mode=0o700, exist_ok=True)
+    fd = os.open(bridge_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+    try:
+        os.write(fd, bridge_source.encode("utf-8"))
+    finally:
+        os.close(fd)
+    env.update({
+        "MANOR_EXECUTION_ID": execution_id,
+        "MANOR_SANDBOX_EVENT_FILE": event_file,
+        "MANOR_SANDBOX_RESPONSE_DIR": response_dir,
+        "MANOR_SANDBOX_BRIDGE": bridge_file,
+    })
+proc = subprocess.Popen(["sh", "-c", command], start_new_session=True, env=env)
+fd = os.open(pid_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+try:
+    os.write(fd, str(proc.pid).encode("ascii"))
+finally:
+    os.close(fd)
+code = proc.wait()
+raise SystemExit(code if code >= 0 else 128 - code)
+"""
         return [
             "docker", "exec", "-i",
             "-w", workdir,
+            *self._skill_env_args(env_file, env_argv),
             self.container_name,
-            "python", "-c", launcher, command, pid_file,
+            "python", "-c", launcher, command, pid_file, event_file,
+            response_dir, bridge_file,
+            _SANDBOX_BRIDGE_SOURCE if interactive else "", execution_id,
+            "1" if interactive else "0",
         ]
 
     @staticmethod
     def _execution_pid_file(execution_id: str) -> str:
         safe_id = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:24]
         return f"/tmp/manor-exec-{safe_id}.pid"
+
+    @staticmethod
+    def _execution_mailbox_paths(execution_id: str) -> tuple[str, str, str]:
+        safe_id = hashlib.sha256(execution_id.encode("utf-8")).hexdigest()[:24]
+        prefix = f"/tmp/manor-exec-{safe_id}"
+        return f"{prefix}.events.jsonl", f"{prefix}.responses", f"{prefix}.bridge.py"
+
+    async def read_execution_event_lines(
+        self,
+        execution_id: str,
+    ) -> tuple[list[str], bool]:
+        """Read the bounded structured event stream without taking the command lock."""
+
+        event_file, _response_dir, _bridge_file = self._execution_mailbox_paths(
+            execution_id
+        )
+        reader = (
+            "import pathlib,sys;"
+            "path=pathlib.Path(sys.argv[1]);limit=int(sys.argv[2]);"
+            "data=path.open('rb').read(limit+1) if path.exists() else b'';"
+            "sys.stdout.buffer.write(data)"
+        )
+        result = await asyncio.to_thread(
+            _run_docker,
+            [
+                "docker", "exec", self.container_name, "python", "-c", reader,
+                event_file, str(_EXECUTION_EVENT_BYTES_LIMIT),
+            ],
+            # Include Docker startup while reading the bounded event mailbox.
+            timeout=30,
+            allow_failure=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to read sandbox execution events: {stderr}")
+        truncated = len(result.stdout) > _EXECUTION_EVENT_BYTES_LIMIT
+        data = result.stdout[:_EXECUTION_EVENT_BYTES_LIMIT]
+        return data.decode("utf-8", errors="replace").splitlines(), truncated
+
+    async def write_execution_response(
+        self,
+        execution_id: str,
+        event_id: str,
+        response_json: bytes,
+    ) -> None:
+        """Atomically deliver one bounded response to the running process."""
+
+        if len(response_json) > _EXECUTION_RESPONSE_BYTES_LIMIT:
+            raise ValueError("Sandbox execution response exceeds 16384 bytes")
+        _event_file, response_dir, _bridge_file = self._execution_mailbox_paths(
+            execution_id
+        )
+        digest = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:32]
+        response_file = f"{response_dir}/{digest}.json"
+        temp_file = f"{response_file}.{uuid.uuid4().hex}.tmp"
+        writer = """
+import os
+import sys
+
+target, temporary, limit = sys.argv[1], sys.argv[2], int(sys.argv[3])
+data = sys.stdin.buffer.read(limit + 1)
+if len(data) > limit:
+    raise SystemExit(2)
+fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+try:
+    os.write(fd, data)
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.replace(temporary, target)
+"""
+        result = await asyncio.to_thread(
+            _run_docker,
+            [
+                "docker", "exec", "-i", self.container_name, "python", "-c",
+                writer, response_file, temp_file, str(_EXECUTION_RESPONSE_BYTES_LIMIT),
+            ],
+            input_data=response_json,
+            timeout=5,
+            allow_failure=True,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Failed to deliver sandbox execution response: {stderr}")
+
+    async def cleanup_execution_mailbox(self, execution_id: str) -> None:
+        await self.cleanup_execution_mailboxes([execution_id])
+
+    async def cleanup_execution_mailboxes(self, execution_ids: list[str]) -> None:
+        if not execution_ids:
+            return
+        paths: list[str] = []
+        for execution_id in execution_ids:
+            event_file, response_dir, bridge_file = self._execution_mailbox_paths(
+                execution_id
+            )
+            paths.extend((event_file, bridge_file, response_dir))
+        cleanup = """
+import os
+import shutil
+import sys
+
+paths = sys.argv[1:]
+for index in range(0, len(paths), 3):
+    event_file, bridge_file, response_dir = paths[index:index + 3]
+    for path in (event_file, bridge_file):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    shutil.rmtree(response_dir, ignore_errors=True)
+"""
+        try:
+            result = await asyncio.to_thread(
+                _run_docker,
+                [
+                    "docker", "exec", self.container_name, "python", "-c", cleanup,
+                    *paths,
+                ],
+                timeout=5,
+                allow_failure=True,
+            )
+            if result.returncode != 0:
+                logger.debug(
+                    "Execution mailbox cleanup failed for %s", execution_ids
+                )
+        except Exception:
+            logger.debug("Failed to clean execution mailbox", exc_info=True)
 
     async def _set_active_execution(self, execution_id: str) -> None:
         async with self._execution_state_lock:
@@ -556,7 +1021,8 @@ class DockerSandbox:
 
     def _build_create_args(self, env: dict[str, str]) -> list[str]:
         cfg = self.config
-        args = ["docker", "create", "--name", self.container_name]
+        # Reap orphaned browser and worker processes in long-lived sandboxes.
+        args = ["docker", "create", "--init", "--name", self.container_name]
 
         # Security hardening
         if cfg.read_only_root:
@@ -597,7 +1063,7 @@ class DockerSandbox:
         for volume in getattr(cfg, "volumes", []) or []:
             args.extend(["--volume", volume])
 
-        args.extend(["--label", "sandbox.service=1"])
+        args.extend(["--label", f"sandbox.service={cfg.service_scope}"])
         args.extend(["--label", f"sandbox.id={self.sandbox_id}"])
         if self._config_hash:
             args.extend(["--label", f"sandbox.configHash={self._config_hash}"])
@@ -684,13 +1150,16 @@ class DockerSandbox:
         files: dict[str, str],
         auto_install: bool = True,
         idle_threshold: int = 30,
+        env: dict[str, str] | None = None,
     ) -> "SkillManifest":
         """
         Load a new skill into this sandbox (reuse mode).
 
         Copies the new skill's files into the running container and optionally
         re-installs Python dependencies. Rejects the call if the sandbox is
-        not truly idle.
+        not truly idle. ``env`` replaces the skill env that later ``exec``
+        calls receive; ``None`` or ``{}`` clears it, so a reused container
+        never carries the previous skill's credentials.
         """
         import shutil
         import tempfile
@@ -725,6 +1194,7 @@ class DockerSandbox:
 
                 same_skill = self.skill is not None and self.skill.name == skill_name
                 self.status = SandboxStatus.RUNNING
+                self._skill_env = dict(env or {})
                 await self._inject_files(
                     new_skill,
                     clear_existing=not same_skill,
@@ -748,9 +1218,19 @@ class DockerSandbox:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
     async def _install_dependencies(self, skill: SkillManifest) -> ExecResponse:
-        """Run pip install and/or npm install inside the container."""
+        """Install the Skill's dependencies, reusing what the image preinstalled.
+
+        A manifest the image already holds (``PREINSTALLED_SKILL_DEPS_ROOT``)
+        needs no create-time install: its Python packages are in the system
+        site-packages and its node_modules is linked into the workdir. Any
+        other manifest is installed with pip / npm as before.
+        """
         needs_pip = bool(skill.requirements_txt)
         needs_npm = bool(skill.package_json)
+        if needs_pip and await self._python_requirements_preinstalled(skill):
+            needs_pip = False
+        if needs_npm and await self._link_preinstalled_node_modules(skill):
+            needs_npm = False
 
         if not needs_pip and not needs_npm:
             return ExecResponse(stdout="", stderr="", exit_code=0)
@@ -808,3 +1288,74 @@ class DockerSandbox:
             stderr="\n".join(combined_stderr),
             exit_code=last_exit_code,
         )
+
+    async def _python_requirements_preinstalled(self, skill: SkillManifest) -> bool:
+        digest = _host_manifest_digest(skill.skill_dir, skill.requirements_txt or "")
+        if digest is None:
+            return False
+        marker = f"{PREINSTALLED_SKILL_DEPS_ROOT}/python/{digest}.txt"
+        result = await self._exec_in_container(
+            f"test -f {shlex.quote(marker)}",
+            timeout=30,
+            workdir=self.config.workdir,
+            mark_status=SandboxStatus.INSTALLING,
+        )
+        if result.exit_code != 0:
+            return False
+        logger.info(
+            "install_dependencies: requirements %s preinstalled in the image (%s)",
+            skill.requirements_txt, digest,
+        )
+        return True
+
+    async def _link_preinstalled_node_modules(self, skill: SkillManifest) -> bool:
+        """Link the image's node_modules for this package.json into the workdir.
+
+        ``node_modules`` and its ``@scope`` / ``.bin`` directories are real
+        writable directories holding one symlink per package, so an entry the
+        Skill installed itself is kept and npm can rename or remove links
+        without writing into the read-only tree. Node and bundlers resolve the
+        links to their real paths, where the hoisted dependencies live.
+        """
+        digest = _host_manifest_digest(skill.skill_dir, skill.package_json or "")
+        if digest is None:
+            return False
+        source = f"{PREINSTALLED_SKILL_DEPS_ROOT}/node/{digest}/node_modules"
+        package_json = f"{self.config.workdir}/{skill.package_json}"
+        target = package_json.rsplit("/", 1)[0] + "/node_modules"
+        script = (
+            f"src={shlex.quote(source)}; dst={shlex.quote(target)}; "
+            '[ -d "$src" ] || exit 64; '
+            'link() { [ -e "$2" ] || [ -L "$2" ] || ln -s "$1" "$2"; }; '
+            'mkdir -p "$dst" || exit 1; '
+            'for entry in "$src"/* "$src"/.bin; do '
+            '[ -e "$entry" ] || continue; '
+            'name="$(basename "$entry")"; '
+            'case "$name" in '
+            '@*|.bin) mkdir -p "$dst/$name" || exit 1; '
+            'for child in "$entry"/*; do '
+            '[ -e "$child" ] || [ -L "$child" ] || continue; '
+            'link "$child" "$dst/$name/$(basename "$child")" || exit 1; '
+            "done ;; "
+            '*) link "$entry" "$dst/$name" || exit 1 ;; '
+            "esac; "
+            "done"
+        )
+        result = await self._exec_in_container(
+            script,
+            timeout=30,
+            workdir=self.config.workdir,
+            mark_status=SandboxStatus.INSTALLING,
+        )
+        if result.exit_code != 0:
+            if result.exit_code != 64:
+                logger.warning(
+                    "install_dependencies: linking preinstalled node_modules failed "
+                    "(exit %d): %s", result.exit_code, result.stderr[-500:],
+                )
+            return False
+        logger.info(
+            "install_dependencies: %s linked to the image's node_modules (%s)",
+            skill.package_json, digest,
+        )
+        return True

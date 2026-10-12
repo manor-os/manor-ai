@@ -1,29 +1,17 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 from collections.abc import Callable
 from typing import Any, Literal
 
-from packages.core.ai.runtime.chrome_routing import detect_chrome_local_browser_route
-from packages.core.ai.runtime.skill_routing import (
-    is_chrome_skill,
-    is_local_coding_skill,
-    local_coding_cli_intent,
-)
+from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.prompt_tools import runtime_prompt_tool_name
-
-logger = logging.getLogger(__name__)
 
 _MANUAL_SKILL_BASE_TOOL_NAMES = (
     "invoke_skill",
     "generate_file",
-    "sandbox_exec",
-    "sandbox_read_file",
-    "sandbox_write_file",
-    "sandbox_save_result",
-    "sandbox_destroy",
+    "sandbox",
 )
 
 
@@ -199,8 +187,10 @@ async def runtime_resolve_manual_skill_refs(
     *,
     entity_id: str,
     agent_id: str | None,
+    workspace_id: str | None = None,
     user_id: str | None = None,
     user_role: str | None = None,
+    surface: ChatSurface | str | None = None,
     manual_skill_ids: str | None = None,
     manual_skill_refs: str | None = None,
     list_skills_fn: Callable[..., Any] | None = None,
@@ -222,11 +212,23 @@ async def runtime_resolve_manual_skill_refs(
     if not requested:
         return [], []
 
-    if agent_id:
+    from packages.core.ai.runtime.skills import (
+        runtime_master_uses_owner_chat_skill_scope,
+    )
+
+    owner_chat_master_scope = runtime_master_uses_owner_chat_skill_scope(
+        agent_id=agent_id,
+        user_id=user_id,
+        surface=surface,
+    )
+    if agent_id and not owner_chat_master_scope:
         if list_skills_for_agent_fn is None:
             from packages.core.services.skill_service import list_skills_for_agent
             list_skills_for_agent_fn = list_skills_for_agent
-        skills = await list_skills_for_agent_fn(db, entity_id, agent_id)
+        skills = await list_skills_for_agent_fn(
+            db, entity_id, agent_id,
+            **({"workspace_id": workspace_id} if workspace_id else {}),
+        )
     else:
         if list_skills_fn is None:
             from packages.core.services.skill_service import list_skills
@@ -467,58 +469,7 @@ async def runtime_auto_skill_forced_tool_calls(
     ctx: Any,
     message: str | list[dict],
 ) -> list[dict]:
-    if getattr(ctx, "manual_skill_selected", False) or not getattr(ctx, "db", None) or not getattr(ctx, "entity_id", None):
-        return []
-    if "invoke_skill" not in set(getattr(ctx, "tool_names", None) or []):
-        return []
-    active_user_message = getattr(ctx, "active_user_message", None)
-    chrome_route = detect_chrome_local_browser_route(active_user_message)
-    local_coding_route = local_coding_cli_intent(active_user_message)
-    if not chrome_route and not local_coding_route:
-        return []
-    skill_matches_route = is_chrome_skill if chrome_route else is_local_coding_skill
-    try:
-        if getattr(ctx, "agent_id", None):
-            from packages.core.services.skill_service import list_skills_for_agent
-            envelope = getattr(ctx, "runtime_envelope", None)
-            envelope_metadata = getattr(envelope, "metadata", None)
-            subscription_id = (
-                envelope_metadata.get("agent_subscription_id")
-                if isinstance(envelope_metadata, dict)
-                else None
-            )
-            skills = await list_skills_for_agent(
-                ctx.db,
-                ctx.entity_id,
-                ctx.agent_id,
-                workspace_id=getattr(ctx, "workspace_id", None),
-                **(
-                    {"agent_subscription_id": subscription_id}
-                    if subscription_id
-                    else {}
-                ),
-            )
-        else:
-            from packages.core.services.skill_service import list_skills
-            skills = await list_skills(ctx.db, ctx.entity_id)
-    except Exception:
-        logger.debug("Auto skill resolution failed", exc_info=True)
-        return []
-    for skill in skills:
-        slug = getattr(skill, "slug", "") or ""
-        name = getattr(skill, "name", "") or getattr(skill, "display_name", "") or ""
-        if not skill_matches_route(slug, name):
-            continue
-        skill_id = getattr(skill, "id", None)
-        if not skill_id:
-            continue
-        return [{
-            "name": "invoke_skill",
-            "arguments": {
-                "skill_id": str(skill_id),
-                "input": runtime_manual_skill_input(message),
-            },
-        }]
+    """Leave automatic Skill choice to the tool-capable Chat model."""
     return []
 
 

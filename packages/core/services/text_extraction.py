@@ -11,7 +11,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
+
+from packages.core.services.office_process import run_in_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +22,16 @@ logger = logging.getLogger(__name__)
 MAX_EXTRACT_CHARS = 100_000
 MAX_SPREADSHEET_EXTRACT_CHARS = 300_000
 MAX_SPREADSHEET_ROWS_PER_SHEET = 5_000
+PDF_OCR_MAX_PAGES = 50
+PDF_OCR_MAX_SECONDS = 120
+PDF_OCR_PROCESS_TIMEOUT_SECONDS = 30
+PDF_OCR_RENDER_MAX_DIMENSION = 3000
 
 
-async def extract_text(file_path: str, mime_type: str = None, file_type: str = None) -> str:
+async def extract_text(
+    file_path: str, mime_type: str = None, file_type: str = None,
+    *, pdf_max_chars: int = MAX_EXTRACT_CHARS,
+) -> str:
     """Extract text from a file based on its type.
 
     Priority: mime_type > file_type > file extension.
@@ -41,7 +51,7 @@ async def extract_text(file_path: str, mime_type: str = None, file_type: str = N
         elif effective_type in ("html", "htm"):
             return _extract_html(file_path)
         elif effective_type in ("pdf",):
-            return await _extract_pdf(file_path)
+            return await _extract_pdf(file_path, max_chars=pdf_max_chars)
         elif effective_type in ("csv", "tsv"):
             return _extract_csv(file_path)
         elif effective_type in ("json", "jsonl"):
@@ -52,7 +62,7 @@ async def extract_text(file_path: str, mime_type: str = None, file_type: str = N
             return _extract_docx(file_path)
         elif effective_type in ("doc",):
             return await _extract_legacy_doc(file_path)
-        elif effective_type in ("xlsx", "xls", "et"):
+        elif effective_type in ("xlsx", "xlsm", "xls", "et"):
             return _extract_xlsx(file_path)
         elif effective_type in ("pptx", "ppt", "dps"):
             return _extract_pptx(file_path)
@@ -101,25 +111,43 @@ def _extract_html(path: str) -> str:
     return text[:MAX_EXTRACT_CHARS]
 
 
-async def _extract_pdf(path: str) -> str:
+async def _extract_pdf(path: str, *, max_chars: int = MAX_EXTRACT_CHARS) -> str:
+    return await asyncio.to_thread(_extract_pdf_sync, path, max_chars=max_chars)
+
+
+def _extract_pdf_sync(path: str, *, max_chars: int) -> str:
     """Extract text from PDF using pypdf, PyPDF2, or pdfplumber.
 
     Tries libs in order of preference. ``pypdf`` is the maintained
-    fork of PyPDF2. Returns empty string only when no supported PDF
-    extraction backend is installed.
+    fork of PyPDF2. When the selected backend returns only whitespace, render
+    the PDF page-by-page and run local Tesseract OCR. Missing OCR binaries or
+    OCR failures preserve the native extraction result.
     """
+    text, page_count = _extract_pdf_native(path, max_chars=max_chars)
+    if text.strip():
+        return text[:max_chars]
+
+    ocr_text = _ocr_pdf_sync(path, page_count)
+    return (ocr_text if ocr_text.strip() else text)[:max_chars]
+
+
+def _extract_pdf_native(path: str, *, max_chars: int = MAX_EXTRACT_CHARS) -> tuple[str, int]:
+    """Return the native PDF text and page count without performing OCR."""
     # Try pypdf (modern, maintained)
     try:
         from pypdf import PdfReader
         text_parts = []
+        chars = 0
         with open(path, "rb") as f:
             reader = PdfReader(f)
             for page in reader.pages[:200]:  # cap at 200 pages
                 page_text = page.extract_text() or ""
                 text_parts.append(page_text)
-                if sum(len(t) for t in text_parts) > MAX_EXTRACT_CHARS:
+                chars += len(page_text)
+                if chars > max_chars:
                     break
-        return "\n".join(text_parts)[:MAX_EXTRACT_CHARS]
+            page_count = len(reader.pages)
+        return "\n".join(text_parts)[:max_chars], page_count
     except ImportError:
         pass
 
@@ -127,14 +155,17 @@ async def _extract_pdf(path: str) -> str:
     try:
         import PyPDF2
         text_parts = []
+        chars = 0
         with open(path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages[:200]:
                 page_text = page.extract_text() or ""
                 text_parts.append(page_text)
-                if sum(len(t) for t in text_parts) > MAX_EXTRACT_CHARS:
+                chars += len(page_text)
+                if chars > max_chars:
                     break
-        return "\n".join(text_parts)[:MAX_EXTRACT_CHARS]
+            page_count = len(reader.pages)
+        return "\n".join(text_parts)[:max_chars], page_count
     except ImportError:
         pass
 
@@ -142,17 +173,138 @@ async def _extract_pdf(path: str) -> str:
     try:
         import pdfplumber
         text_parts = []
+        chars = 0
         with pdfplumber.open(path) as pdf:
             for page in pdf.pages[:200]:
-                text_parts.append(page.extract_text() or "")
-                if sum(len(t) for t in text_parts) > MAX_EXTRACT_CHARS:
+                page_text = page.extract_text() or ""
+                text_parts.append(page_text)
+                chars += len(page_text)
+                if chars > max_chars:
                     break
-        return "\n".join(text_parts)[:MAX_EXTRACT_CHARS]
+            page_count = len(pdf.pages)
+        return "\n".join(text_parts)[:max_chars], page_count
     except ImportError:
         pass
 
     logger.warning("No PDF extraction library available. Install pypdf or pdfplumber.")
-    return ""
+    return "", 0
+
+
+def _ocr_pdf_sync(path: str, page_count: int) -> str:
+    """OCR a bounded number of PDF pages using local Poppler and Tesseract."""
+    pdftoppm = shutil.which("pdftoppm")
+    tesseract = shutil.which("tesseract")
+    if not pdftoppm or not tesseract or page_count <= 0:
+        logger.info(
+            "PDF OCR fallback unavailable for %s (pdftoppm=%s, tesseract=%s, pages=%s)",
+            os.path.basename(path),
+            bool(pdftoppm),
+            bool(tesseract),
+            page_count,
+        )
+        return ""
+
+    language = _tesseract_languages(tesseract)
+    deadline = time.monotonic() + PDF_OCR_MAX_SECONDS
+    text_parts: list[str] = []
+    pages_to_read = min(page_count, PDF_OCR_MAX_PAGES)
+
+    with tempfile.TemporaryDirectory(prefix="manor-pdf-ocr-") as tmpdir:
+        for page_number in range(1, pages_to_read + 1):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("PDF OCR timed out after %s pages for %s", page_number - 1, os.path.basename(path))
+                break
+
+            output_prefix = os.path.join(tmpdir, f"page-{page_number:04d}")
+            timeout = max(1, min(PDF_OCR_PROCESS_TIMEOUT_SECONDS, remaining))
+            try:
+                rendered = subprocess.run(
+                    [
+                        pdftoppm,
+                        "-f",
+                        str(page_number),
+                        "-l",
+                        str(page_number),
+                        "-singlefile",
+                        "-gray",
+                        "-png",
+                        "-scale-to",
+                        str(PDF_OCR_RENDER_MAX_DIMENSION),
+                        path,
+                        output_prefix,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("PDF OCR render failed on page %s for %s: %s", page_number, os.path.basename(path), exc)
+                continue
+            if rendered.returncode != 0:
+                logger.warning(
+                    "PDF OCR render failed on page %s for %s: %s",
+                    page_number,
+                    os.path.basename(path),
+                    rendered.stderr.strip()[:500],
+                )
+                continue
+
+            image_path = f"{output_prefix}.png"
+            if not os.path.isfile(image_path):
+                logger.warning("PDF OCR render produced no image on page %s for %s", page_number, os.path.basename(path))
+                continue
+
+            ocr_command = [tesseract, image_path, "stdout"]
+            if language:
+                ocr_command.extend(["-l", language])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = max(1, min(PDF_OCR_PROCESS_TIMEOUT_SECONDS, remaining))
+            try:
+                recognized = subprocess.run(
+                    ocr_command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("PDF OCR failed on page %s for %s: %s", page_number, os.path.basename(path), exc)
+                continue
+            if recognized.returncode != 0:
+                logger.warning(
+                    "PDF OCR failed on page %s for %s: %s",
+                    page_number,
+                    os.path.basename(path),
+                    recognized.stderr.strip()[:500],
+                )
+                continue
+
+            text_parts.append(recognized.stdout.strip())
+            if sum(len(part) for part in text_parts) >= MAX_EXTRACT_CHARS:
+                break
+
+    return "\n\n".join(text_parts)[:MAX_EXTRACT_CHARS]
+
+
+def _tesseract_languages(tesseract: str) -> str | None:
+    """Select installed English/Simplified Chinese OCR data without assuming both exist."""
+    try:
+        result = subprocess.run(
+            [tesseract, "--list-langs"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    available = {line.strip() for line in result.stdout.splitlines()}
+    selected = [language for language in ("eng", "chi_sim") if language in available]
+    return "+".join(selected) or None
 
 
 def _extract_csv(path: str) -> str:
@@ -204,7 +356,7 @@ def _extract_legacy_doc_sync(path: str) -> str:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            subprocess.run(
+            run_in_process_group(
                 [soffice, "--headless", "--convert-to", "docx", "--outdir", tmpdir, path],
                 check=False,
                 stdout=subprocess.PIPE,
@@ -221,7 +373,7 @@ def _extract_legacy_doc_sync(path: str) -> str:
                 return text[:MAX_EXTRACT_CHARS]
 
         try:
-            subprocess.run(
+            run_in_process_group(
                 [soffice, "--headless", "--convert-to", "txt:Text", "--outdir", tmpdir, path],
                 check=False,
                 stdout=subprocess.PIPE,
@@ -241,13 +393,12 @@ def _extract_legacy_doc_sync(path: str) -> str:
 
 
 def _extract_xlsx(path: str) -> str:
-    """Extract text from .xlsx/.et files using openpyxl."""
+    """Extract bounded text from OOXML workbooks, including macro-enabled ones."""
     try:
         from openpyxl import load_workbook
         # ``openpyxl`` validates filename extensions when given a path. The
-        # optimistic-concurrency guard intentionally reads through an already
-        # opened ``/dev/fd`` descriptor, whose path has no suffix; pass the
-        # binary stream so the declared file type remains authoritative.
+        # legacy aliases and descriptor paths may not have a supported suffix;
+        # pass the binary stream so the declared type chooses the extractor.
         with open(path, "rb") as source:
             wb = load_workbook(source, read_only=True, data_only=True)
             try:

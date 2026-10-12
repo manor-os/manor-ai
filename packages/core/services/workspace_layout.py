@@ -1,21 +1,16 @@
-"""The declared storage layout for everything a workspace task produces.
+"""Minimal Knowledge layout; directories are created only for actual content.
 
-Before this module the layout existed only as string literals scattered
-across the tools that write files — ``"images"`` here, ``"videos"`` there,
-``"documents"`` in five more places — so nothing could answer "what IS the
-workspace structure?", and a new tool could invent an eighth bucket without
-anything noticing. One staging workspace ended up with five parallel
-layouts.
+    Knowledge root/                           files without a Workspace
+    Workspaces/_by_id/<artifact folder id>/    immutable Workspace storage
+        <Blueprint or user directory>/        open, not a global registry
+        <existing ledger name>/               shared Workspace state
+        workflow/<lineage root run id>/       real Workflow execution outputs
+        tasks/<task id>/<type>/                Task execution outputs
 
-The layout::
-
-    Workspaces/_by_id/<artifact folder id>/     workspace physical root
-    └── tasks/<task id>/                        one archive per task
-        ├── images/  videos/  audio/            generated media
-        ├── documents/  presentations/          generated documents
-        ├── spreadsheets/  code/
-        ├── artifacts/                          anything else written
-        └── <model-chosen path>/                nested here, never outside
+DocumentFolder projects physical Workspace files into Workspaces/<name>.
+Ordinary files have no automatic type directory outside an execution archive.
+Workflow retries reuse their lineage directory; existing canonical references
+and historical execution directories remain valid.
 
 Files never move once written. "Which of these is the deliverable" is
 answered by ``ArtifactRole`` in the document's metadata and surfaced in the
@@ -25,6 +20,17 @@ would break every reference an earlier step already handed downstream.
 from __future__ import annotations
 
 from enum import Enum
+
+
+WORKFLOW_ARTIFACT_SEGMENT = "workflow"
+TASK_ARTIFACT_SEGMENT = "tasks"
+WORKSPACE_LEDGER_DIRECTORIES = frozenset({
+    "topic-ledger", "content-ledger", "finance-ledger",
+    "recruiting-ledger", "relationship-ledger",
+})
+WORKSPACE_RESERVED_DIRECTORIES = WORKSPACE_LEDGER_DIRECTORIES | {
+    WORKFLOW_ARTIFACT_SEGMENT, TASK_ARTIFACT_SEGMENT,
+}
 
 
 class WorkspaceArtifactDir(str, Enum):

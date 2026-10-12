@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useLocation } from "react-router-dom";
 
@@ -13,9 +13,10 @@ import { fileReferenceKind } from "../../lib/fileReferences";
 import { relativeTime } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel } from "../../lib/taskDisplay";
-import type { Document, Task } from "../../lib/types";
+import type { Document, Task, Workspace } from "../../lib/types";
 import {
   formatWorkspaceStatValue,
+  workspaceStatAssessmentNote,
   workspaceStatAttentionPresentation,
 } from "../../lib/workspaceStats";
 import {
@@ -28,7 +29,9 @@ import { useAuthStore } from "../../stores/auth";
 import {
   IconArrowDown,
   IconArrowUp,
+  IconBell,
   IconCheck,
+  IconChevronLeft,
   IconChevronRight,
   IconEye,
   IconEyeOff,
@@ -36,24 +39,35 @@ import {
   IconList,
   IconPlus,
   IconSort,
+  IconSettings,
   IconTrendingUp,
   IconViewOptions,
   IconWarning,
 } from "../icons";
 import { getFileReferenceIcon } from "../contentTypeIcons";
+import {
+  conversationInitiativeItems,
+  ConversationInitiativesQuickList,
+  useConversationInitiativesQuery,
+} from "../agents/ConversationInitiativesButton";
 import AnchoredPopover from "../ui/AnchoredPopover";
 import Button from "../ui/Button";
+import Input from "../ui/Input";
 import LoadingSpinner from "../ui/LoadingSpinner";
 import StatusBadge from "../ui/StatusBadge";
-import TabSwitcher from "../ui/TabSwitcher";
+import Textarea from "../ui/Textarea";
 
 interface WorkspaceStatsQuickAccessProps {
+  enabled?: boolean;
   workspaceId: string;
+  workspace?: Workspace;
   workspaceName?: string;
+  initiativeConversationId?: string | null;
+  canManage?: boolean;
 }
 
 type QuickViewPreference = Omit<WorkspaceStatsQuickView, "configured">;
-type WorkspaceQuickTab = "metrics" | "files" | "tasks";
+type WorkspaceQuickTab = "initiatives" | "metrics" | "files" | "tasks" | "settings";
 
 const TASK_ATTENTION_SEEN_STORAGE_PREFIX = "manor-workspace-task-attention-seen";
 
@@ -89,7 +103,79 @@ interface WorkspaceDocumentGroup {
   is_workspace_file_bucket?: boolean;
   is_default_collection?: boolean;
   document_count?: number;
+  folders?: WorkspaceDocumentFolder[];
   documents?: Document[];
+}
+
+interface WorkspaceDocumentFolder {
+  id: string;
+  name: string;
+  parent_id?: string | null;
+}
+
+interface WorkspaceDocumentFolderNode extends WorkspaceDocumentFolder {
+  children: WorkspaceDocumentFolderNode[];
+  documents: Document[];
+  documentCount: number;
+}
+
+interface WorkspaceDocumentTree {
+  folders: WorkspaceDocumentFolderNode[];
+  documents: Document[];
+}
+
+function workspaceQuickFolderKey(groupId: string, folderId: string): string {
+  return `${groupId}/${folderId}`;
+}
+
+function buildWorkspaceDocumentTree(group: WorkspaceDocumentGroup): WorkspaceDocumentTree {
+  const nodeById = new Map<string, WorkspaceDocumentFolderNode>();
+  for (const folder of group.folders || []) {
+    nodeById.set(folder.id, {
+      ...folder,
+      children: [],
+      documents: [],
+      documentCount: 0,
+    });
+  }
+
+  const parentWouldCreateCycle = (folderId: string, parentId: string): boolean => {
+    const seen = new Set([folderId]);
+    let currentId: string | null | undefined = parentId;
+    while (currentId) {
+      if (seen.has(currentId)) return true;
+      seen.add(currentId);
+      currentId = nodeById.get(currentId)?.parent_id;
+    }
+    return false;
+  };
+
+  const rootFolders: WorkspaceDocumentFolderNode[] = [];
+  for (const node of nodeById.values()) {
+    const parent = node.parent_id ? nodeById.get(node.parent_id) : undefined;
+    if (parent && !parentWouldCreateCycle(node.id, parent.id)) parent.children.push(node);
+    else rootFolders.push(node);
+  }
+
+  const rootDocuments: Document[] = [];
+  for (const document of group.documents || []) {
+    const folder = document.folder_id ? nodeById.get(document.folder_id) : undefined;
+    if (folder) folder.documents.push(document);
+    else rootDocuments.push(document);
+  }
+
+  const finalizeFolder = (folder: WorkspaceDocumentFolderNode): number => {
+    folder.children.sort((left, right) => left.name.localeCompare(right.name));
+    const childCount = folder.children.reduce(
+      (total, child) => total + finalizeFolder(child),
+      0,
+    );
+    folder.documentCount = folder.documents.length + childCount;
+    return folder.documentCount;
+  };
+  rootFolders.sort((left, right) => left.name.localeCompare(right.name));
+  rootFolders.forEach(finalizeFolder);
+  return { folders: rootFolders, documents: rootDocuments };
 }
 
 function queryErrorMessage(error: unknown): string {
@@ -165,9 +251,9 @@ function WorkspaceStatsQuickBody({
       <div className="workspace-chat-stats-quick-list" role="list">
         {stats.map((stat) => {
           const attention = workspaceStatAttentionPresentation(stat.freshness_status);
-          const timing = stat.current_value_updated_at
+          const timing = workspaceStatAssessmentNote(stat) || (stat.current_value_updated_at
             ? `${t("page.workspace_stats.updated")} ${relativeTime(stat.current_value_updated_at)}`
-            : t("page.workspace_stats.waiting_for_value");
+            : t("page.workspace_stats.waiting_for_value"));
           return (
             <div className="workspace-chat-stat-quick-row" role="listitem" key={stat.id}>
               <div className="workspace-chat-stat-quick-copy">
@@ -385,6 +471,100 @@ interface WorkspaceFilesQuickBodyProps {
   onRetry: () => void;
 }
 
+interface WorkspaceQuickFileRowProps {
+  document: Document;
+  returnTo: string;
+}
+
+function WorkspaceQuickFileRow({ document, returnTo }: WorkspaceQuickFileRowProps) {
+  const documentKind = fileReferenceKind(
+    document.name,
+    document.mime_type,
+    document.file_type,
+  );
+  const DocumentTypeIcon = getFileReferenceIcon(documentKind);
+  return (
+    <Link
+      className="workspace-chat-quick-file-row"
+      to={`/viewer/${document.id}`}
+      state={{ returnTo, chatReturnTo: returnTo }}
+      role="listitem"
+      onClick={() => preserveReturnToInHistory(returnTo)}
+    >
+      <span
+        aria-hidden="true"
+        className="workspace-chat-quick-file-type-icon"
+        data-file-kind={documentKind}
+      >
+        <DocumentTypeIcon size={15} />
+      </span>
+      <span className="workspace-chat-quick-file-copy">
+        <strong title={document.name}>{document.name}</strong>
+        <small>{document.file_type || t("page.workspace_detail.file")}</small>
+      </span>
+      <IconChevronRight size={13} />
+    </Link>
+  );
+}
+
+interface WorkspaceQuickFolderNodeProps {
+  groupId: string;
+  folder: WorkspaceDocumentFolderNode;
+  returnTo: string;
+  expandedFolderIds: Set<string>;
+  onToggle: (folderId: string) => void;
+}
+
+function WorkspaceQuickFolderNode({
+  groupId,
+  folder,
+  returnTo,
+  expandedFolderIds,
+  onToggle,
+}: WorkspaceQuickFolderNodeProps) {
+  const folderKey = workspaceQuickFolderKey(groupId, folder.id);
+  const expanded = expandedFolderIds.has(folderKey);
+  const folderName = folder.name || t("component.workspace_chat.untitled_folder");
+  const contentId = `workspace-quick-folder-${groupId}-${folder.id}`;
+  return (
+    <div className="workspace-chat-quick-nested-folder" role="listitem">
+      <button
+        type="button"
+        className="workspace-chat-quick-folder-toggle workspace-chat-quick-folder-toggle--nested"
+        aria-expanded={expanded}
+        aria-controls={contentId}
+        onClick={() => onToggle(folderKey)}
+      >
+        <IconChevronRight className="workspace-chat-quick-folder-chevron" size={14} />
+        <IconFolder size={16} />
+        <span title={folderName}>{folderName}</span>
+        <small>{folder.documentCount}</small>
+      </button>
+      {expanded && (
+        <div id={contentId} className="workspace-chat-quick-folder-children" role="list">
+          {folder.children.map((child) => (
+            <WorkspaceQuickFolderNode
+              groupId={groupId}
+              folder={child}
+              returnTo={returnTo}
+              expandedFolderIds={expandedFolderIds}
+              onToggle={onToggle}
+              key={child.id}
+            />
+          ))}
+          {folder.documents.map((document) => (
+            <WorkspaceQuickFileRow
+              document={document}
+              returnTo={returnTo}
+              key={document.id}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function WorkspaceFilesQuickBody({
   groups,
   returnTo,
@@ -400,14 +580,27 @@ function WorkspaceFilesQuickBody({
     )),
     [groups],
   );
-  const folderSignature = sortedGroups.map((group) => group.id).join(":");
+  const folderSignature = sortedGroups.map((group) => (
+    `${group.id}:${(group.folders || []).map((folder) => folder.id).join(",")}`
+  )).join("|");
 
   useEffect(() => {
     setExpandedFolderIds((current) => {
-      if (current.size > 0 || sortedGroups.length === 0) return current;
+      if (sortedGroups.length === 0) return new Set();
+      const availableFolderIds = new Set(sortedGroups.flatMap((group) => [
+        group.id,
+        ...(group.folders || []).map((folder) => (
+          workspaceQuickFolderKey(group.id, folder.id)
+        )),
+      ]));
+      const next = new Set([...current].filter((folderId) => (
+        availableFolderIds.has(folderId)
+      )));
+      if (sortedGroups.some((group) => next.has(group.id))) return next;
       const firstFolder = sortedGroups.find((group) => group.is_workspace_file_bucket)
         || sortedGroups[0];
-      return new Set([firstFolder.id]);
+      next.add(firstFolder.id);
+      return next;
     });
   }, [folderSignature]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -455,8 +648,8 @@ function WorkspaceFilesQuickBody({
     <div className="workspace-chat-quick-folder-list" role="list">
       {sortedGroups.map((group) => {
         const expanded = expandedFolderIds.has(group.id);
-        const documents = group.documents || [];
-        const documentCount = group.document_count ?? documents.length;
+        const tree = buildWorkspaceDocumentTree(group);
+        const documentCount = group.document_count ?? (group.documents || []).length;
         const folderName = group.name || (
           group.is_workspace_file_bucket
             ? t("page.workspace_detail.workspace_files")
@@ -482,37 +675,24 @@ function WorkspaceFilesQuickBody({
                 className="workspace-chat-quick-file-list"
                 role="list"
               >
-                {documents.length > 0 ? documents.map((document) => {
-                  const documentKind = fileReferenceKind(
-                    document.name,
-                    document.mime_type,
-                    document.file_type,
-                  );
-                  const DocumentTypeIcon = getFileReferenceIcon(documentKind);
-                  return (
-                    <Link
-                      className="workspace-chat-quick-file-row"
-                      to={`/viewer/${document.id}`}
-                      state={{ returnTo, chatReturnTo: returnTo }}
-                      role="listitem"
-                      key={document.id}
-                      onClick={() => preserveReturnToInHistory(returnTo)}
-                    >
-                      <span
-                        aria-hidden="true"
-                        className="workspace-chat-quick-file-type-icon"
-                        data-file-kind={documentKind}
-                      >
-                        <DocumentTypeIcon size={15} />
-                      </span>
-                      <span className="workspace-chat-quick-file-copy">
-                        <strong title={document.name}>{document.name}</strong>
-                        <small>{document.file_type || t("page.workspace_detail.file")}</small>
-                      </span>
-                      <IconChevronRight size={13} />
-                    </Link>
-                  );
-                }) : (
+                {tree.folders.map((folder) => (
+                  <WorkspaceQuickFolderNode
+                    groupId={group.id}
+                    folder={folder}
+                    returnTo={returnTo}
+                    expandedFolderIds={expandedFolderIds}
+                    onToggle={toggleFolder}
+                    key={folder.id}
+                  />
+                ))}
+                {tree.documents.map((document) => (
+                  <WorkspaceQuickFileRow
+                    document={document}
+                    returnTo={returnTo}
+                    key={document.id}
+                  />
+                ))}
+                {tree.folders.length === 0 && tree.documents.length === 0 && (
                   <div className="workspace-chat-quick-folder-empty">
                     {t("component.workspace_chat.folder_is_empty")}
                   </div>
@@ -558,6 +738,89 @@ function taskStatusNeedsAttention(status: string): boolean {
 
 function taskAttentionOccurrenceKey(task: Task): string {
   return `${task.id}:${task.status}:${task.status_changed_at || task.created_at || "unknown"}`;
+}
+
+interface WorkspaceQuickAccessMenuItemProps {
+  section: WorkspaceQuickTab;
+  icon: ReactNode;
+  label: string;
+  description: string;
+  status?: "warning" | "danger";
+  statusLabel?: string;
+  buttonRef: (node: HTMLButtonElement | null) => void;
+  onSelect: (section: WorkspaceQuickTab) => void;
+}
+
+function WorkspaceQuickAccessMenuItem({
+  section,
+  icon,
+  label,
+  description,
+  status,
+  statusLabel,
+  buttonRef,
+  onSelect,
+}: WorkspaceQuickAccessMenuItemProps) {
+  return (
+    <button
+      type="button"
+      ref={buttonRef}
+      className="chat-quick-access-row workspace-chat-quick-menu-row"
+      data-testid={`workspace-chat-quick-access-${section}`}
+      aria-label={statusLabel ? `${label}: ${description}. ${statusLabel}` : `${label}: ${description}`}
+      onClick={() => onSelect(section)}
+    >
+      <span className="chat-quick-access-row-icon" aria-hidden="true">
+        {icon}
+      </span>
+      <span className="chat-quick-access-row-copy">
+        <strong>{label}</strong>
+        <span>{description}</span>
+      </span>
+      <span className="workspace-chat-quick-menu-trailing" aria-hidden="true">
+        {status && (
+          <span
+            className={`workspace-chat-quick-menu-status ${status === "danger" ? "bg-red-500" : "bg-amber-500"}`}
+          />
+        )}
+        <IconChevronRight className="chat-quick-access-row-chevron" size={15} />
+      </span>
+    </button>
+  );
+}
+
+interface WorkspaceQuickDetailHeaderProps {
+  title: string;
+  actions?: ReactNode;
+  backButtonRef: RefObject<HTMLButtonElement>;
+  onBack: () => void;
+}
+
+function WorkspaceQuickDetailHeader({
+  title,
+  actions,
+  backButtonRef,
+  onBack,
+}: WorkspaceQuickDetailHeaderProps) {
+  return (
+    <div className="workspace-chat-quick-detail-header">
+      <button
+        type="button"
+        ref={backButtonRef}
+        className="workspace-chat-quick-detail-back"
+        aria-label={`${t("page.agent_initiative.back")}: ${t("component.workspace_chat.workspace_quick_access")}`}
+        onClick={onBack}
+      >
+        <IconChevronLeft size={16} aria-hidden="true" />
+        <strong>{title}</strong>
+      </button>
+      {actions && (
+        <div className="workspace-chat-quick-detail-actions">
+          {actions}
+        </div>
+      )}
+    </div>
+  );
 }
 
 interface WorkspaceTasksQuickBodyProps {
@@ -633,10 +896,145 @@ function WorkspaceTasksQuickBody({
   );
 }
 
+interface WorkspaceSettingsQuickBodyProps {
+  workspace?: Workspace;
+  canManage: boolean;
+  loading: boolean;
+  loadError: unknown;
+  saving: boolean;
+  saveError: unknown;
+  saved: boolean;
+  onRetry: () => void;
+  onEdit: () => void;
+  onSave: (data: Pick<Workspace, "name" | "description">) => void;
+}
+
+function WorkspaceSettingsQuickBody({
+  workspace,
+  canManage,
+  loading,
+  loadError,
+  saving,
+  saveError,
+  saved,
+  onRetry,
+  onEdit,
+  onSave,
+}: WorkspaceSettingsQuickBodyProps) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+
+  useEffect(() => {
+    setName(workspace?.name || "");
+    setDescription(workspace?.description || "");
+  }, [workspace?.description, workspace?.id, workspace?.name]);
+
+  if (loading && !workspace) {
+    return (
+      <div className="workspace-chat-stats-quick-state" aria-live="polite">
+        <LoadingSpinner size={18} />
+        <span>{t("component.workspace_chat.loading")}</span>
+      </div>
+    );
+  }
+
+  if (!workspace) {
+    return (
+      <div className="workspace-chat-stats-quick-state workspace-chat-stats-quick-state--error" role="alert">
+        <IconWarning className="text-red-500" size={18} />
+        <strong>{t("component.workspace_chat.settings_load_failed")}</strong>
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          {t("page.workspace_stats.try_again")}
+        </Button>
+      </div>
+    );
+  }
+
+  const normalizedName = name.trim();
+  const normalizedDescription = description.trim();
+  const dirty = normalizedName !== workspace.name
+    || normalizedDescription !== (workspace.description || "");
+
+  return (
+    <form
+      className="workspace-chat-quick-settings-form"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!canManage || !normalizedName || !dirty) return;
+        onSave({ name: normalizedName, description: normalizedDescription });
+      }}
+    >
+      <Input
+        label={t("page.task_collections.name")}
+        value={name}
+        required
+        error={canManage && !normalizedName
+          ? t("component.workspace_chat.settings_name_required")
+          : undefined}
+        disabled={!canManage || saving}
+        onChange={(event) => {
+          setName(event.target.value);
+          onEdit();
+        }}
+      />
+      <Textarea
+        label={t("page.task_collections.description")}
+        value={description}
+        rows={3}
+        disabled={!canManage || saving}
+        onChange={(event) => {
+          setDescription(event.target.value);
+          onEdit();
+        }}
+      />
+      {!canManage && (
+        <p className="workspace-chat-quick-settings-note">
+          {t("component.workspace_chat.settings_read_only")}
+        </p>
+      )}
+      {Boolean(loadError) && (
+        <p className="workspace-chat-quick-settings-error" role="alert">
+          {t("component.workspace_chat.settings_refresh_failed")}
+        </p>
+      )}
+      {Boolean(saveError) && (
+        <p className="workspace-chat-quick-settings-error" role="alert">
+          {t("page.workspace_detail.could_not_update_workspace")}
+        </p>
+      )}
+      {saved && !dirty && (
+        <p className="workspace-chat-quick-settings-success" role="status">
+          {t("page.workspace_detail.workspace_updated")}
+        </p>
+      )}
+      {canManage && (
+        <div className="workspace-chat-quick-settings-actions">
+          <Button
+            type="submit"
+            size="sm"
+            loading={saving}
+            disabled={!normalizedName || !dirty}
+          >
+            {t("action.save")}
+          </Button>
+        </div>
+      )}
+    </form>
+  );
+}
+
 export default function WorkspaceStatsQuickAccess({
+  enabled = true,
   workspaceId,
+  workspace,
   workspaceName,
+  initiativeConversationId,
+  canManage = false,
 }: WorkspaceStatsQuickAccessProps) {
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const detailBackRef = useRef<HTMLButtonElement>(null);
+  const menuItemRefs = useRef<Partial<Record<WorkspaceQuickTab, HTMLButtonElement | null>>>({});
+  const overviewReturnFocusRef = useRef<WorkspaceQuickTab | null>(null);
   const queryClient = useQueryClient();
   const location = useLocation();
   const currentUserId = useAuthStore((state) => state.user?.id);
@@ -647,7 +1045,7 @@ export default function WorkspaceStatsQuickAccess({
     const serializedSearch = returnSearch.toString();
     return `${location.pathname}${serializedSearch ? `?${serializedSearch}` : ""}${location.hash}`;
   }, [location.hash, location.pathname, location.search, workspaceId]);
-  const [activeTab, setActiveTab] = useState<WorkspaceQuickTab>("metrics");
+  const [activeTab, setActiveTab] = useState<WorkspaceQuickTab | null>(null);
   const [quickAccessOpen, setQuickAccessOpen] = useState(false);
   const [pageIsActive, setPageIsActive] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -657,16 +1055,22 @@ export default function WorkspaceStatsQuickAccess({
     storageKey: taskAttentionSeenStorageKey,
     attentionKeys: readSeenTaskAttention(taskAttentionSeenStorageKey),
   }));
+  const initiativesQuery = useConversationInitiativesQuery(initiativeConversationId);
+  const conversationInitiatives = conversationInitiativeItems(initiativesQuery.data);
+  const hasInitiatives = conversationInitiatives.length > 0;
+  const resolvedActiveTab: WorkspaceQuickTab | null = (
+    activeTab === "initiatives" && !hasInitiatives
+  ) ? null : activeTab;
   const statsQuery = useQuery({
     queryKey: ["workspace-stats", workspaceId],
     queryFn: () => api.workspaces.stats.list(workspaceId),
-    enabled: Boolean(workspaceId),
+    enabled: Boolean(workspaceId && enabled && quickAccessOpen),
     staleTime: 30_000,
   });
   const quickViewQuery = useQuery({
     queryKey: ["workspace-stats-quick-view", workspaceId],
     queryFn: () => api.workspaces.stats.quickView(workspaceId),
-    enabled: Boolean(workspaceId),
+    enabled: Boolean(workspaceId && enabled && quickAccessOpen),
     staleTime: 30_000,
   });
   const libraryQuery = useQuery({
@@ -677,21 +1081,31 @@ export default function WorkspaceStatsQuickAccess({
     refetchOnMount: "always",
   });
   const filesQuery = useQuery({
-    queryKey: ["workspace-quick-files", workspaceId],
+    // Share the full file page's cache and mutation invalidations. Start while
+    // the overview is open so selecting Files can use the in-flight result.
+    queryKey: ["workspace-documents", workspaceId],
     queryFn: () => api.workspaces.documents(workspaceId),
-    enabled: Boolean(workspaceId) && activeTab === "files",
+    enabled: Boolean(workspaceId) && (quickAccessOpen || activeTab === "files"),
     staleTime: 30_000,
   });
   const taskBriefsQuery = useQuery({
     queryKey: ["tasks", "workspace-quick-briefs", workspaceId],
     queryFn: () => api.tasks.list({ workspace_id: workspaceId, limit: 20 }),
-    enabled: Boolean(workspaceId),
+    enabled: Boolean(workspaceId && enabled && quickAccessOpen),
     staleTime: 30_000,
   });
   const taskAttentionQuery = useQuery({
     queryKey: ["tasks", "workspace-attention", workspaceId],
     queryFn: () => api.tasks.listAttention(workspaceId),
-    enabled: Boolean(workspaceId),
+    enabled: Boolean(workspaceId && enabled),
+    staleTime: 30_000,
+  });
+  const workspaceQuery = useQuery({
+    queryKey: ["workspace", workspaceId],
+    queryFn: () => api.workspaces.get(workspaceId),
+    enabled: Boolean(workspaceId) && activeTab === "settings",
+    initialData: workspace,
+    initialDataUpdatedAt: 0,
     staleTime: 30_000,
   });
   const saveViewMutation = useMutation({
@@ -699,13 +1113,47 @@ export default function WorkspaceStatsQuickAccess({
       api.workspaces.stats.updateQuickView(workspaceId, next)
     ),
   });
+  const updateWorkspaceMutation = useMutation({
+    mutationFn: (data: Pick<Workspace, "name" | "description">) => (
+      api.workspaces.update(workspaceId, data)
+    ),
+    onSuccess: (updatedWorkspace) => {
+      queryClient.setQueryData(["workspace", workspaceId], updatedWorkspace);
+      void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    },
+  });
 
   useEffect(() => {
-    setActiveTab("metrics");
+    overviewReturnFocusRef.current = null;
+    setActiveTab(null);
     setEditing(false);
     setAdding(false);
     setPreference(null);
   }, [workspaceId]);
+
+  useEffect(() => {
+    if (activeTab !== "initiatives" || hasInitiatives) return;
+    overviewReturnFocusRef.current = "metrics";
+    setActiveTab(null);
+  }, [activeTab, hasInitiatives]);
+
+  useEffect(() => {
+    const focusFrame = window.requestAnimationFrame(() => {
+      if (resolvedActiveTab) {
+        detailBackRef.current?.focus();
+        return;
+      }
+      const returnSection = overviewReturnFocusRef.current;
+      if (!returnSection) return;
+      const returnTarget = menuItemRefs.current[returnSection];
+      const connectedTarget = returnTarget?.isConnected
+        ? returnTarget
+        : menuItemRefs.current.metrics;
+      connectedTarget?.focus();
+      overviewReturnFocusRef.current = null;
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [resolvedActiveTab]);
 
   useEffect(() => {
     setTaskAttentionSeenState({
@@ -790,7 +1238,7 @@ export default function WorkspaceStatsQuickAccess({
   const seenTaskAttentionKeys = taskAttentionSeenState.storageKey === taskAttentionSeenStorageKey
     ? taskAttentionSeenState.attentionKeys
     : [];
-  const taskAttentionIsVisible = quickAccessOpen && activeTab === "tasks" && pageIsActive;
+  const taskAttentionIsVisible = quickAccessOpen && resolvedActiveTab === "tasks" && pageIsActive;
   const unseenAttentionSeverity = unseenTaskAttentionSeverity(
     tasksNeedingAttention.map((task) => ({
       key: taskAttentionOccurrenceKey(task),
@@ -802,14 +1250,14 @@ export default function WorkspaceStatsQuickAccess({
     !taskAttentionIsVisible
     && unseenAttentionSeverity,
   );
-  const metricsTabStatus: "warning" | "danger" | undefined = statsQuery.isError
+  const metricsSectionStatus: "warning" | "danger" | undefined = statsQuery.isError
     ? "danger"
     : hasCollectionError
       ? "danger"
       : attention.length > 0
         ? "warning"
         : undefined;
-  const tasksTabStatus: "warning" | "danger" | undefined = (
+  const tasksSectionStatus: "warning" | "danger" | undefined = (
     taskBriefsQuery.isError || taskAttentionQuery.isError
   )
     ? "danger"
@@ -904,33 +1352,57 @@ export default function WorkspaceStatsQuickAccess({
   ]
     .filter(Boolean)
     .join(" · ");
-  const quickTabs = [
-    {
-      key: "metrics",
-      label: t("page.workspace_stats.title"),
-      icon: <IconTrendingUp size={14} />,
-      status: metricsTabStatus,
-      statusLabel: statsQuery.isError
-        ? t("page.workspace_stats.load_failed")
-        : attention[0]?.label,
-    },
-    {
-      key: "files",
-      label: t("component.workspace_chat.files"),
-      icon: <IconFolder size={14} />,
-    },
-    {
-      key: "tasks",
-      label: t("component.workspace_chat.tasks"),
-      icon: <IconList size={14} />,
-      status: tasksTabStatus,
-      statusLabel: taskBriefsQuery.isError || taskAttentionQuery.isError
-        ? t("component.workspace_chat.task_briefs_load_failed")
-        : hasUnseenTaskAttention
-          ? t("page.tasks.needs_attention")
-          : undefined,
-    },
-  ];
+  const metricsStatusLabel = statsQuery.isError
+    ? t("page.workspace_stats.load_failed")
+    : attention[0]?.label;
+  const tasksStatusLabel = taskBriefsQuery.isError || taskAttentionQuery.isError
+    ? t("component.workspace_chat.task_briefs_load_failed")
+    : hasUnseenTaskAttention
+      ? t("page.tasks.needs_attention")
+      : undefined;
+  const metricsMenuDescription = statsQuery.isLoading || quickViewQuery.isLoading
+    ? t("component.workspace_chat.loading")
+    : statsQuery.isError || quickViewQuery.isError
+      ? t("page.workspace_stats.load_failed")
+      : selectedCountLabel;
+  const tasksMenuDescription = taskBriefsQuery.isLoading
+    ? t("component.workspace_chat.loading")
+    : taskBriefsQuery.isError
+      ? t("component.workspace_chat.task_briefs_load_failed")
+      : hasUnseenTaskAttention
+        ? t("page.tasks.needs_attention")
+        : taskBriefs.length === 0
+          ? t("component.workspace_chat.no_task_briefs")
+          : t("component.workspace_chat.no_task_briefs_description");
+
+  const openSection = (section: WorkspaceQuickTab) => {
+    overviewReturnFocusRef.current = null;
+    updateWorkspaceMutation.reset();
+    setActiveTab(section);
+    setEditing(false);
+    setAdding(false);
+    addStatMutation.reset();
+  };
+
+  const returnToOverview = () => {
+    overviewReturnFocusRef.current = resolvedActiveTab;
+    updateWorkspaceMutation.reset();
+    setActiveTab(null);
+    setEditing(false);
+    setAdding(false);
+    addStatMutation.reset();
+  };
+
+  const handleOpenChange = (open: boolean) => {
+    setQuickAccessOpen(open);
+    if (open) return;
+    overviewReturnFocusRef.current = null;
+    updateWorkspaceMutation.reset();
+    setActiveTab(null);
+    setEditing(false);
+    setAdding(false);
+    addStatMutation.reset();
+  };
 
   return (
     <AnchoredPopover
@@ -940,12 +1412,13 @@ export default function WorkspaceStatsQuickAccess({
       persistentBreakpoint={1280}
       persistentPlacement="below-anchor"
       persistentInlineInset={24}
-      onOpenChange={setQuickAccessOpen}
+      onOpenChange={handleOpenChange}
       ariaLabel={ariaLabel}
       panelClassName="workspace-chat-stats-popover"
       trigger={(
         <button
           type="button"
+          ref={triggerRef}
           className="workspace-chat-stats-trigger"
           aria-label={ariaLabel}
           title={t("component.workspace_chat.workspace_quick_access")}
@@ -955,33 +1428,94 @@ export default function WorkspaceStatsQuickAccess({
         </button>
       )}
     >
-      {() => (
+      {({ close }) => (
         <div className="workspace-chat-stats-popover-content">
-          <TabSwitcher
-            tabs={quickTabs}
-            value={activeTab}
-            size="sm"
-            className="workspace-chat-quick-tabs"
-            ariaLabel={t("component.workspace_chat.workspace_quick_access_sections")}
-            onChange={(key) => {
-              setActiveTab(key as WorkspaceQuickTab);
-              setEditing(false);
-              setAdding(false);
-              addStatMutation.reset();
-            }}
-          />
+          {resolvedActiveTab === null && (
+            <div
+              className="chat-quick-access-panel workspace-chat-quick-menu"
+              data-testid="workspace-chat-quick-access-menu"
+            >
+              {hasInitiatives && (
+                <WorkspaceQuickAccessMenuItem
+                  key="initiatives"
+                  section="initiatives"
+                  icon={<IconBell size={16} />}
+                  label={t("page.agent_initiative.title")}
+                  description={t("page.agent_initiative.quick_access_description")}
+                  buttonRef={(node) => { menuItemRefs.current.initiatives = node; }}
+                  onSelect={openSection}
+                />
+              )}
+              <WorkspaceQuickAccessMenuItem
+                key="metrics"
+                section="metrics"
+                icon={<IconTrendingUp size={16} />}
+                label={t("page.workspace_stats.title")}
+                description={metricsMenuDescription}
+                status={metricsSectionStatus}
+                statusLabel={metricsStatusLabel}
+                buttonRef={(node) => { menuItemRefs.current.metrics = node; }}
+                onSelect={openSection}
+              />
+              <WorkspaceQuickAccessMenuItem
+                key="files"
+                section="files"
+                icon={<IconFolder size={16} />}
+                label={t("component.workspace_chat.files")}
+                description={t("component.workspace_chat.workspace_folders")}
+                buttonRef={(node) => { menuItemRefs.current.files = node; }}
+                onSelect={openSection}
+              />
+              <WorkspaceQuickAccessMenuItem
+                key="tasks"
+                section="tasks"
+                icon={<IconList size={16} />}
+                label={t("component.workspace_chat.tasks")}
+                description={tasksMenuDescription}
+                status={tasksSectionStatus}
+                statusLabel={tasksStatusLabel}
+                buttonRef={(node) => { menuItemRefs.current.tasks = node; }}
+                onSelect={openSection}
+              />
+              <WorkspaceQuickAccessMenuItem
+                key="settings"
+                section="settings"
+                icon={<IconSettings size={16} />}
+                label={t("component.workspace_chat.settings")}
+                description={t("component.workspace_chat.settings_quick_description")}
+                buttonRef={(node) => { menuItemRefs.current.settings = node; }}
+                onSelect={openSection}
+              />
+            </div>
+          )}
 
-          {activeTab === "metrics" && (
-            <div className="workspace-chat-quick-section" role="tabpanel">
-              <div className="workspace-chat-stats-popover-header">
-                <strong>
-                  {adding
-                    ? t("page.workspace_stats.add")
-                    : editing
-                      ? t("component.workspace_chat.customize_stats")
-                      : t("page.workspace_stats.title")}
-                </strong>
-                {editing || adding ? (
+          {resolvedActiveTab === "initiatives" && initiativesQuery.data && (
+            <div className="workspace-chat-quick-section">
+              <WorkspaceQuickDetailHeader
+                title={t("page.agent_initiative.title")}
+                backButtonRef={detailBackRef}
+                onBack={returnToOverview}
+              />
+              <ConversationInitiativesQuickList
+                response={initiativesQuery.data}
+                fallbackTitle={workspaceName}
+                onSelect={close}
+                returnFocusTo={triggerRef.current}
+              />
+            </div>
+          )}
+
+          {resolvedActiveTab === "metrics" && (
+            <div className="workspace-chat-quick-section">
+              <WorkspaceQuickDetailHeader
+                title={adding
+                  ? t("page.workspace_stats.add")
+                  : editing
+                    ? t("component.workspace_chat.customize_stats")
+                    : t("page.workspace_stats.title")}
+                backButtonRef={detailBackRef}
+                onBack={returnToOverview}
+                actions={editing || adding ? (
                   <button
                     key="done"
                     type="button"
@@ -1029,7 +1563,7 @@ export default function WorkspaceStatsQuickAccess({
                     </button>
                   </div>
                 )}
-              </div>
+              />
               {adding ? (
                 <WorkspaceStatsQuickAdder
                   entries={availableLibraryEntries}
@@ -1070,19 +1604,23 @@ export default function WorkspaceStatsQuickAccess({
             </div>
           )}
 
-          {activeTab === "files" && (
-            <div className="workspace-chat-quick-section" role="tabpanel">
-              <div className="workspace-chat-quick-section-header">
-                <strong>{t("component.workspace_chat.workspace_folders")}</strong>
-                <Link
-                  to={`/workspaces/${workspaceId}?tab=documents`}
-                  state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
-                  onClick={() => preserveReturnToInHistory(currentReturnTo)}
-                >
-                  {t("component.workspace_chat.view_all")}
-                  <IconChevronRight size={13} />
-                </Link>
-              </div>
+          {resolvedActiveTab === "files" && (
+            <div className="workspace-chat-quick-section">
+              <WorkspaceQuickDetailHeader
+                title={t("component.workspace_chat.files")}
+                backButtonRef={detailBackRef}
+                onBack={returnToOverview}
+                actions={(
+                  <Link
+                    to={`/knowledge?workspace_id=${encodeURIComponent(workspaceId)}`}
+                    state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
+                    onClick={() => preserveReturnToInHistory(currentReturnTo)}
+                  >
+                    {t("component.workspace_chat.view_all")}
+                    <IconChevronRight size={13} />
+                  </Link>
+                )}
+              />
               <WorkspaceFilesQuickBody
                 groups={documentGroups}
                 returnTo={currentReturnTo}
@@ -1093,25 +1631,61 @@ export default function WorkspaceStatsQuickAccess({
             </div>
           )}
 
-          {activeTab === "tasks" && (
-            <div className="workspace-chat-quick-section" role="tabpanel">
-              <div className="workspace-chat-quick-section-header">
-                <strong>{t("component.workspace_chat.tasks")}</strong>
-                <Link
-                  to={`/tasks?workspaceId=${encodeURIComponent(workspaceId)}`}
-                  state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
-                  onClick={() => preserveReturnToInHistory(currentReturnTo)}
-                >
-                  {t("component.workspace_chat.view_all")}
-                  <IconChevronRight size={13} />
-                </Link>
-              </div>
+          {resolvedActiveTab === "tasks" && (
+            <div className="workspace-chat-quick-section">
+              <WorkspaceQuickDetailHeader
+                title={t("component.workspace_chat.tasks")}
+                backButtonRef={detailBackRef}
+                onBack={returnToOverview}
+                actions={(
+                  <Link
+                    to={`/tasks?workspaceId=${encodeURIComponent(workspaceId)}`}
+                    state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
+                    onClick={() => preserveReturnToInHistory(currentReturnTo)}
+                  >
+                    {t("component.workspace_chat.view_all")}
+                    <IconChevronRight size={13} />
+                  </Link>
+                )}
+              />
               <WorkspaceTasksQuickBody
                 tasks={taskBriefs}
                 returnTo={currentReturnTo}
                 loading={taskBriefsQuery.isLoading}
                 error={taskBriefsQuery.error}
                 onRetry={() => void taskBriefsQuery.refetch()}
+              />
+            </div>
+          )}
+
+          {resolvedActiveTab === "settings" && (
+            <div className="workspace-chat-quick-section">
+              <WorkspaceQuickDetailHeader
+                title={t("component.workspace_chat.settings")}
+                backButtonRef={detailBackRef}
+                onBack={returnToOverview}
+                actions={(
+                  <Link
+                    to={`/workspaces/${workspaceId}?tab=settings`}
+                    state={{ returnTo: currentReturnTo, chatReturnTo: currentReturnTo }}
+                    onClick={() => preserveReturnToInHistory(currentReturnTo)}
+                  >
+                    {t("component.workspace_chat.view_all")}
+                    <IconChevronRight size={13} />
+                  </Link>
+                )}
+              />
+              <WorkspaceSettingsQuickBody
+                workspace={workspaceQuery.data}
+                canManage={canManage}
+                loading={workspaceQuery.isLoading}
+                loadError={workspaceQuery.error}
+                saving={updateWorkspaceMutation.isPending}
+                saveError={updateWorkspaceMutation.error}
+                saved={updateWorkspaceMutation.isSuccess}
+                onRetry={() => void workspaceQuery.refetch()}
+                onEdit={() => updateWorkspaceMutation.reset()}
+                onSave={(data) => updateWorkspaceMutation.mutate(data)}
               />
             </div>
           )}

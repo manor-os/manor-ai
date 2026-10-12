@@ -17,10 +17,15 @@ from apps.api.middleware_core import (  # noqa: F401
 from apps.api.middleware.degraded import DegradedModeMiddleware
 from apps.api.middleware.http_stats import HttpStatsMiddleware
 from apps.api.middleware.rate_limit import ChatRateLimitMiddleware
+from apps.api.middleware.room_file_ingress import RoomFileIngressLimitMiddleware
 
 
 def setup_middleware(app: FastAPI) -> None:
     """Register all middleware on the app (called from main.py)."""
+    # Add first so every rate limiter runs before the bounded body precheck;
+    # it still runs before routing/dependencies trigger multipart parsing.
+    app.add_middleware(RoomFileIngressLimitMiddleware)
+
     # Core middleware (request ID, logging, global rate limit, error handlers)
     _setup_core_middleware(app)
 

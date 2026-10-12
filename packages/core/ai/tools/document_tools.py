@@ -1,4 +1,4 @@
-"""Document tools — search, list, and generate Knowledge documents."""
+"""Document tools — search and list Knowledge documents."""
 from __future__ import annotations
 
 from typing import Any
@@ -6,7 +6,6 @@ from typing import Any
 from packages.core.ai.runtime import (
     runtime_document_cache_key,
     runtime_document_to_dict,
-    runtime_generate_document_file,
     runtime_list_documents_action,
     runtime_search_documents_action,
 )
@@ -16,18 +15,85 @@ from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from
 # Schemas
 # ---------------------------------------------------------------------------
 
+DOCUMENT_QUERY_FILTER_PROPERTIES = {
+    "workspace_ids": {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 50,
+        "uniqueItems": True,
+        "description": "Match documents associated with any listed Workspace (OR).",
+    },
+    "folder_ids": {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 50,
+        "uniqueItems": True,
+        "description": "Match any listed folder ID; use 'root' for top level (OR).",
+    },
+    "file_types": {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 30,
+        "uniqueItems": True,
+        "description": "Match any file extension/type (OR).",
+    },
+    "sources": {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 30,
+        "uniqueItems": True,
+        "description": "Match any document source (OR).",
+    },
+    "vector_statuses": {
+        "type": "array",
+        "items": {"type": "string"},
+        "minItems": 1,
+        "maxItems": 10,
+        "uniqueItems": True,
+        "description": "Match any indexing status (OR).",
+    },
+    "file_size_min": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Inclusive byte-size lower bound.",
+    },
+    "file_size_max": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Inclusive byte-size upper bound.",
+    },
+    **{
+        field: {
+            "type": "string",
+            "format": "date-time",
+            "description": f"Inclusive {label} bound.",
+        }
+        for field, label in (
+            ("created_after", "created-at lower"),
+            ("created_before", "created-at upper"),
+            ("updated_after", "updated-at lower"),
+            ("updated_before", "updated-at upper"),
+        )
+    },
+}
+
 SEARCH_DOCUMENTS_SCHEMA = {
     "type": "function",
     "function": {
         "name": "search_documents",
         "description": (
-            "Search user-visible Knowledge documents by filename and metadata. "
+            "Search user-visible Knowledge documents by file type, source, vector status, "
+            "Workspace, folder, size, and created or updated date in one call. "
+            "Plural filters are ORed; different filters and inclusive ranges are ANDed. "
+            "Filtering happens before pagination and total is exact. "
             "Use this when the user asks what files/documents they can see, "
             "when resolving # references, or when searching uploaded / AI-created "
-            "deliverables. This tool does not retrieve document-body evidence. "
-            "For facts, values, passages, summaries, comparisons, or calculations "
-            "from inside documents, use rag. If the intent is mixed or uncertain, "
-            "prefer rag; never infer document contents from a filename match. Do "
+            "deliverables. This tool does not retrieve document-body evidence "
+            "and never infers document contents from a filename match. Do "
             "not use raw filesystem tools for user-visible Knowledge lists. Each "
             "result includes a markdown_link; copy it verbatim when mentioning a file."
         ),
@@ -38,9 +104,15 @@ SEARCH_DOCUMENTS_SCHEMA = {
                     "type": "string",
                     "description": "Search text to match against document names.",
                 },
+                **DOCUMENT_QUERY_FILTER_PROPERTIES,
                 "limit": {
                     "type": "integer",
                     "description": "Max results (default 20).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Filtered-result offset (default 0).",
                 },
                 "detail": {
                     "type": "string",
@@ -58,7 +130,10 @@ LIST_DOCUMENTS_SCHEMA = {
     "function": {
         "name": "list_documents",
         "description": (
-            "List user-visible Knowledge documents for the current entity. "
+            "List user-visible Knowledge documents by file type, source, vector status, "
+            "Workspace, folder, size, and created or updated date in one call. Plural "
+            "filters are ORed; different filters and inclusive ranges are ANDed. "
+            "Filtering happens before pagination and total is exact. "
             "This is the user-facing document list: uploaded files, manually "
             "created files, and AI-created deliverables that are visible in "
             "Knowledge. Hidden/system paths, trash, sandbox output, and internal "
@@ -69,6 +144,11 @@ LIST_DOCUMENTS_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional filename and metadata search.",
+                },
+                **DOCUMENT_QUERY_FILTER_PROPERTIES,
                 "limit": {
                     "type": "integer",
                     "description": "Max results (default 20).",
@@ -84,58 +164,6 @@ LIST_DOCUMENTS_SCHEMA = {
                 },
             },
             "required": [],
-        },
-    },
-}
-
-GENERATE_DOCUMENT_FILE_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "generate_document_file",
-        "description": (
-            "Generate a user-visible document file from text/Markdown content "
-            "and save it to Knowledge. Use this for final deliverables such as "
-            ".md, .txt, .csv, .json, .html, .docx, .pptx, or .pdf. For .pdf, "
-            ".docx, and .pptx this renders a real binary document, not a text "
-            "file with a misleading extension. For editable AI diagrams from a "
-            "prompt, use generate_file(kind='diagram') so a valid .diagram.json "
-            "canvas is created. For low-level filesystem writes or internal "
-            "notes, use write_file instead. For complex PDF editing such as "
-            "merge/split/forms/OCR/watermarks, use the pdf skill."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": (
-                        "Visible filename or relative Knowledge path, e.g. "
-                        "'融资/Manor AI intro.pdf' or 'notes/summary.md'. "
-                        "Hidden/system paths such as .ai/** are rejected."
-                    ),
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Source text or Markdown content to render/save.",
-                },
-                "file_type": {
-                    "type": "string",
-                    "description": (
-                        "Output extension without dot when name has no extension "
-                        "(default 'txt'). Supported: md, txt, csv, json, html, "
-                        "diagram.json, docx, pptx, pdf."
-                    ),
-                },
-                "approval_token": {
-                    "type": "string",
-                    "description": "One-time token returned after the user approves creating/updating a user-visible document.",
-                },
-                "expected_sha256": {
-                    "type": "string",
-                    "description": "Optional previous source_sha256; refuses overwrite if target file changed.",
-                },
-            },
-            "required": ["name", "content"],
         },
     },
 }
@@ -176,24 +204,6 @@ async def _list_documents(entity_id: str, user_id: str = "", **kwargs: Any) -> s
     )
 
 
-async def _generate_document_file(entity_id: str, user_id: str = "", **kwargs: Any) -> str:
-    runtime_context = runtime_tool_call_context_from_handler(kwargs, user_id=user_id)
-    return await runtime_generate_document_file(
-        entity_id=entity_id,
-        user_id=runtime_context.user_id or "",
-        conversation_id=runtime_context.conversation_id or "",
-        name=kwargs.get("name") or "",
-        content=kwargs.get("content") or "",
-        file_type=kwargs.get("file_type") or "txt",
-        approval_token=kwargs.get("approval_token"),
-        expected_sha256=kwargs.get("expected_sha256"),
-        workspace_id=runtime_context.workspace_id,
-        task_id=runtime_context.task_id,
-        agent_id=runtime_context.agent_id,
-        runtime_envelope=runtime_context.runtime_envelope,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Export
 # ---------------------------------------------------------------------------
@@ -202,5 +212,4 @@ def get_tools() -> list[tuple[dict, callable]]:
     return [
         (SEARCH_DOCUMENTS_SCHEMA, _search_documents),
         (LIST_DOCUMENTS_SCHEMA, _list_documents),
-        (GENERATE_DOCUMENT_FILE_SCHEMA, _generate_document_file),
     ]

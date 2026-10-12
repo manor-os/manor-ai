@@ -1,0 +1,23 @@
+{
+  "id": "remotion-render",
+  "name": "remotion-render",
+  "display_name": "Remotion Render",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Export Remotion videos and stills.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "render",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["export", "mp4", "still", "render video", "output", "thumbnail", "encode", "final video"],
+    "examples": ["render remotion video to mp4", "export still frame from composition", "validate remotion composition before render", "produce final remotion video file"]
+  }
+}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -55,6 +55,12 @@ def test_celery_worker_tracing_uses_specific_service_role(monkeypatch):
     assert pricing_syncs == [10.0]
 
 
+def test_celery_worker_allows_pricing_warmups_to_finish() -> None:
+    from packages.core.celery_app import celery_app
+
+    assert celery_app.conf.worker_proc_alive_timeout == 30.0
+
+
 def test_sandbox_allocation_task_uses_existing_interactive_queue() -> None:
     assert queue_for_task("runtime.allocate_sandbox") is CeleryQueue.INTERACTIVE
 
@@ -105,6 +111,285 @@ def test_non_heavy_process_schedules_video_job_through_celery(monkeypatch) -> No
     media_tasks.schedule_video_job("job-2")
 
     assert queued == ["job-2"]
+
+
+def _host_loop():
+    """The parking host's own agent loop, as the harness enters it."""
+    from packages.core.ai.runtime.execution_nesting import runtime_nested_execution_scope
+
+    return runtime_nested_execution_scope()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("scheduler", "task_attr", "process_attr"), [
+    ("schedule_video_job", "process_video_job_task", "process_video_job"),
+    ("schedule_suno_audio_job", "process_suno_audio_job_task", "process_suno_audio_job"),
+])
+async def test_parking_host_dispatches_media_jobs_through_celery(
+    monkeypatch, scheduler, task_attr, process_attr,
+) -> None:
+    """A Task agent loop parks instead of waiting: a job on its loop would be
+    drained by run_in_worker after the park, holding the heavy worker."""
+    from packages.core.ai.runtime.media_job_scope import runtime_media_jobs_detached_scope
+    from packages.core.tasks import media_tasks
+
+    queued: list[str] = []
+
+    async def must_not_run_inline(job_id: str) -> None:
+        raise AssertionError("a parked Task's media job must not run on its loop")
+
+    monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
+    monkeypatch.setattr(media_tasks, process_attr, must_not_run_inline)
+    monkeypatch.setattr(getattr(media_tasks, task_attr), "delay", lambda job_id: queued.append(job_id))
+    before = set(media_tasks._background_tasks)
+
+    with runtime_media_jobs_detached_scope(task_id="task-1", run_id="run-1"), _host_loop():
+        getattr(media_tasks, scheduler)("job-parked")
+
+    assert queued == ["job-parked"]
+    assert set(media_tasks._background_tasks) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("scheduler", "task_attr"), [
+    ("schedule_video_job", "process_video_job_task"),
+    ("schedule_suno_audio_job", "process_suno_audio_job_task"),
+])
+async def test_parking_host_leaves_a_job_pending_when_the_broker_is_down(
+    monkeypatch, caplog, scheduler, task_attr,
+) -> None:
+    """Neither its own loop (drained while parked) nor a daemon thread: the job
+    stays PENDING and the stale-job sweeper dispatches it again."""
+    import threading
+
+    from packages.core.ai.runtime.media_job_scope import runtime_media_jobs_detached_scope
+    from packages.core.tasks import media_tasks
+
+    def broker_down(_job_id):
+        raise RuntimeError("broker unavailable")
+
+    def no_thread(*_args, **_kwargs):
+        raise AssertionError("a parked Task's job must not start a daemon thread")
+
+    monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
+    monkeypatch.setattr(getattr(media_tasks, task_attr), "delay", broker_down)
+    monkeypatch.setattr(threading, "Thread", no_thread)
+    before = set(media_tasks._background_tasks)
+
+    with runtime_media_jobs_detached_scope(task_id="task-1", run_id="run-1"), _host_loop():
+        getattr(media_tasks, scheduler)("job-broker-down")
+
+    assert set(media_tasks._background_tasks) == before
+    assert "left pending for the stale-job sweeper" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["video", "audio"])
+async def test_stale_job_sweeper_dispatches_a_pending_job_that_never_started(
+    monkeypatch, db_session, kind,
+) -> None:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    import packages.core.database as database
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.media_job import MediaJob
+    from packages.core.tasks import media_tasks
+
+    monkeypatch.setattr(
+        database, "async_session",
+        async_sessionmaker(db_session.bind, class_=AsyncSession, expire_on_commit=False),
+    )
+    queued: list[str] = []
+    task_attr = "process_video_job_task" if kind == "video" else "process_suno_audio_job_task"
+    monkeypatch.setattr(getattr(media_tasks, task_attr), "delay", lambda job_id: queued.append(job_id))
+    job = MediaJob(
+        id=generate_ulid(), entity_id=generate_ulid(), kind=kind, status="pending", prompt="x",
+        model="suno/music" if kind == "audio" else "bytedance/seedance-2.0",
+        params={"task_id": generate_ulid(), "provider_submit_state": "not_started"},
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    if kind == "video":
+        await media_tasks.recover_stale_video_jobs(stale_after_seconds=60)
+    else:
+        await media_tasks.recover_stale_suno_audio_jobs(stale_after_seconds=60)
+
+    assert job.id in queued
+
+
+def test_media_job_lineage_names_only_the_scope_task_run() -> None:
+    from packages.core.ai.runtime.media_job_scope import (
+        runtime_media_job_lineage,
+        runtime_media_jobs_detached,
+        runtime_media_jobs_detached_scope,
+    )
+
+    kwargs = {"_runtime_tool_call_id_from_context": "call-7"}
+    assert runtime_media_jobs_detached() is None
+    assert runtime_media_job_lineage("task-1", kwargs) == {}
+    with runtime_media_jobs_detached_scope(task_id="task-1", run_id="run-1"), _host_loop():
+        assert runtime_media_jobs_detached() == {"task_id": "task-1", "run_id": "run-1"}
+        assert runtime_media_job_lineage("task-1", kwargs) == {
+            "task_coordinator_run_id": "run-1", "tool_call_id": "call-7",
+        }
+        assert runtime_media_job_lineage("task-2", {}) == {}
+    assert runtime_media_jobs_detached() is None
+
+
+_NESTED_LOOPS = ["prompt_skill", "delegated_agent", "workflow_agent_node", "generic_agent_loop", "workflow_run"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nested", _NESTED_LOOPS)
+async def test_nested_executions_inside_a_parking_host_keep_inline_media(monkeypatch, nested) -> None:
+    """Only the parking host's own loop is detached. Any nested agent loop or
+    workflow run waits for its media jobs in process; queueing them on
+    heavy -c 1 would leave that wait behind its own worker."""
+    from contextlib import asynccontextmanager
+
+    from packages.core.ai import workflow_runner
+    from packages.core.ai.runtime import harness, workspace_delegation_actions as delegation
+    from packages.core.ai.runtime.execution_nesting import runtime_nested_execution_scope
+    from packages.core.ai.runtime.media_job_scope import (
+        runtime_media_jobs_detached,
+        runtime_media_jobs_detached_scope,
+    )
+    from packages.core.tasks import media_tasks
+
+    queued: list[str] = []
+    ran: list[str] = []
+    seen_scopes: list = []
+
+    async def inline_job(job_id: str) -> None:
+        ran.append(job_id)
+
+    monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
+    monkeypatch.setattr(media_tasks, "process_video_job", inline_job)
+    monkeypatch.setattr(media_tasks.process_video_job_task, "delay", lambda job_id: queued.append(job_id))
+
+    async def nested_work(*_args, **_kwargs):
+        seen_scopes.append(runtime_media_jobs_detached())
+        media_tasks.schedule_video_job(f"job-{nested}")
+        return "ok"
+
+    # The core loop body is faked; every real nested entry point is used.
+    monkeypatch.setattr(harness, "_runtime_execute_agentic_loop", nested_work)
+    entries = {
+        "prompt_skill": harness.runtime_execute_skill_agent_loop,
+        "workflow_agent_node": harness.runtime_execute_workflow_agent_loop,
+        "generic_agent_loop": harness.runtime_execute_agentic_loop,
+    }
+    if nested == "delegated_agent":
+        async def delegated_child(**_kwargs):
+            return await harness.runtime_execute_agentic_loop()
+
+        monkeypatch.setattr(delegation, "_runtime_workspace_delegate_service_action", delegated_child)
+        run_nested = delegation.runtime_workspace_delegate_service_action
+    elif nested == "workflow_run":
+        class Claim:
+            def __bool__(self):
+                return True
+
+            def raise_if_lost(self):
+                return None
+
+            def mark_terminal_committed(self):
+                return None
+
+        @asynccontextmanager
+        async def claim(_run_id):
+            yield Claim()
+
+        async def run_claimed(self, *_args, **_kwargs):
+            await nested_work()
+
+        monkeypatch.setattr(workflow_runner, "workflow_run_execution_claim", claim)
+        monkeypatch.setattr(workflow_runner.WorkflowRunner, "_run_claimed", run_claimed)
+
+        async def run_nested():
+            await workflow_runner.WorkflowRunner().run("run-1")
+            return "ok"
+    else:
+        run_nested = entries[nested]
+
+    with runtime_media_jobs_detached_scope(task_id="task-1", run_id="run-1"):
+        # The parking host's own loop: its direct calls are detached.
+        with runtime_nested_execution_scope():
+            assert runtime_media_jobs_detached() == {"task_id": "task-1", "run_id": "run-1"}
+            assert await run_nested() == "ok"
+            assert runtime_media_jobs_detached() == {"task_id": "task-1", "run_id": "run-1"}
+        # Outside any loop the scope does not apply either.
+        assert runtime_media_jobs_detached() is None
+    await asyncio.gather(*list(media_tasks._background_tasks))
+
+    assert seen_scopes == [None]
+    assert queued == [] and ran == [f"job-{nested}"]
+
+
+@pytest.mark.asyncio
+async def test_nesting_depth_is_restored_when_a_nested_loop_raises(monkeypatch) -> None:
+    from packages.core.ai.runtime import harness
+    from packages.core.ai.runtime.execution_nesting import runtime_execution_nesting_depth
+
+    async def boom(**_kwargs):
+        raise RuntimeError("nested loop failed")
+
+    monkeypatch.setattr(harness, "_runtime_execute_agentic_loop", boom)
+    before = runtime_execution_nesting_depth()
+    with pytest.raises(RuntimeError, match="nested loop failed"):
+        await harness.runtime_execute_agentic_loop()
+    assert runtime_execution_nesting_depth() == before
+
+
+@pytest.mark.parametrize("parent_fails", [False, True])
+def test_worker_teardown_preserves_pending_inline_media(monkeypatch, parent_fails) -> None:
+    """A pending tool receipt must not cancel its already-started child job."""
+    import packages.core.database as dbmod
+    from packages.core.tasks import media_tasks
+
+    events = []
+
+    class FakeEngine:
+        async def dispose(self, *, close=True):
+            if close:
+                events.append("pool-closed")
+
+    async def child(job_id):
+        events.append("child-started")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        events.append("provider-state-and-output-saved")
+
+    async def parent():
+        media_tasks.schedule_video_job("already-submitted")
+        events.append("pending-receipt-returned")
+        if parent_fails:
+            raise ValueError("later workflow node failed")
+        return {"status": "pending"}
+
+    monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
+    monkeypatch.setattr(dbmod, "engine", FakeEngine())
+    monkeypatch.setattr(media_tasks, "process_video_job", child)
+    if parent_fails:
+        with pytest.raises(ValueError, match="later workflow node failed"):
+            run_in_worker(parent())
+    else:
+        assert run_in_worker(parent()) == {"status": "pending"}
+    assert events == ["pending-receipt-returned", "child-started",
+        "provider-state-and-output-saved", "pool-closed"]
+
+
+def test_document_upload_recovery_cleanup_has_a_daily_schedule() -> None:
+    from packages.core.celery_app import celery_app
+
+    entry = celery_app.conf.beat_schedule[
+        "maintenance-cleanup-document-upload-recovery"
+    ]
+    assert entry["task"] == "maintenance.cleanup_document_upload_recovery"
+
+
 
 
 
@@ -575,6 +860,10 @@ async def test_sandbox_scheduler_only_queues_external_allocation(monkeypatch) ->
         lambda runner_id: health_calls.append(runner_id) or _async_result(None),
     )
     monkeypatch.setattr(runtime_tasks, "expire_sandbox_reservations", lambda _db: _async_result(0))
+    async def _no_timeouts(_db, **_kwargs):
+        return []
+
+    monkeypatch.setattr(runtime_tasks, "expire_runtime_human_input_requests", _no_timeouts)
     monkeypatch.setattr(
         runtime_tasks,
         "recover_stale_sandbox_allocations",
@@ -598,3 +887,22 @@ async def test_sandbox_scheduler_only_queues_external_allocation(monkeypatch) ->
 
 async def _async_result(value):
     return value
+
+
+def test_worker_process_start_warms_the_tool_registry(monkeypatch):
+    """Lazy registration blocked the first chat turn of every child process."""
+    from packages.core import celery_app as module
+    from packages.core.ai.runtime import tool_registry
+
+    calls = []
+    monkeypatch.setattr(
+        tool_registry, "runtime_ensure_tool_registry_initialized", lambda: calls.append(1),
+    )
+    module._warm_tool_registry()
+    assert calls == [1]
+
+    def broken():
+        raise RuntimeError("catalog unavailable")
+
+    monkeypatch.setattr(tool_registry, "runtime_ensure_tool_registry_initialized", broken)
+    module._warm_tool_registry()  # never blocks worker boot

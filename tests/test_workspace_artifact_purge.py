@@ -25,14 +25,14 @@ from packages.core.models.document import (
     DocumentGroupMember,
 )
 from packages.core.models.document_version import DocumentVersion
-from packages.core.models.user import Entity
+from packages.core.models.permission import ResourceGrant, ResourceType
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace
 from packages.core.services.entity_service import purge_workspace
+from packages.core.services.document_access import user_can_read_document
 from packages.core.services.workspace_artifact_purge import (
     ARTIFACT_CLEANUP_KIND_EMPTY_DIRECTORY,
     ARTIFACT_CLEANUP_KIND_FILE,
-    document_derived_file_cleanup_bases,
-    document_derived_tree_cleanup_bases,
     drain_workspace_artifact_purge_jobs,
     enqueue_artifact_cleanup_jobs,
 )
@@ -170,6 +170,58 @@ async def test_empty_directory_cleanup_never_widens_to_nonempty_tree(
     )).scalar_one()
     await db_session.delete(retained_job)
     await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_tree_cleanup_discards_obsolete_job_when_document_version_is_retained(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from packages.core.services import entity_fs
+
+    entity_id = generate_ulid()
+    document_id = generate_ulid()
+    storage_base = "Workspaces/_by_id/retained-version"
+    target = tmp_path / entity_id / storage_base
+    target.mkdir(parents=True)
+    (target / "snapshot.json").write_text("{}", encoding="utf-8")
+    db_session.add_all([
+        Document(
+            id=document_id,
+            entity_id=entity_id,
+            name="retained.json",
+        ),
+        DocumentVersion(
+            document_id=document_id,
+            version_number=1,
+            name="retained.json",
+            fs_path=f"{storage_base}/snapshot.json",
+        ),
+    ])
+    await enqueue_artifact_cleanup_jobs(db_session, entity_id, {storage_base})
+    await db_session.commit()
+    monkeypatch.setattr(
+        entity_fs,
+        "get_settings",
+        lambda: SimpleNamespace(
+            MANOR_FS_ENABLED=True,
+            MANOR_FS_ROOT=str(tmp_path),
+            DEPLOYMENT_MODE="oss",
+        ),
+    )
+
+    assert await drain_workspace_artifact_purge_jobs(
+        db_session,
+        entity_id=entity_id,
+    ) == (1, 0)
+    assert (target / "snapshot.json").exists()
+    assert (await db_session.execute(
+        select(WorkspaceArtifactPurgeJob).where(
+            WorkspaceArtifactPurgeJob.entity_id == entity_id,
+            WorkspaceArtifactPurgeJob.storage_base == storage_base,
+        )
+    )).scalar_one_or_none() is None
 
 
 @pytest.mark.asyncio
@@ -368,7 +420,7 @@ async def test_document_source_cleanup_preserves_a_reused_path(
 
 
 @pytest.mark.asyncio
-async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
+async def test_workspace_purge_retains_knowledge_and_removes_only_source_group(
     db_session,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -385,6 +437,10 @@ async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
     chunk_id = generate_ulid()
     version_id = generate_ulid()
     group_id = generate_ulid()
+    retained_group_id = generate_ulid()
+    retained_workspace_id = generate_ulid()
+    document_grant_id = generate_ulid()
+    folder_grant_id = generate_ulid()
     storage_base = workspace_artifact_storage_base(artifact_folder_id)
     fs_path = f"{storage_base}/recruiting-ledger/events/event.json"
     external_fs_path = "Knowledge/imports/people-policy.md"
@@ -417,6 +473,11 @@ async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
             deleted_at=datetime.now(timezone.utc),
             settings={"ledger_contracts": []},
         ),
+        Workspace(
+            id=retained_workspace_id,
+            entity_id=entity_id,
+            name="Knowledge consumer",
+        ),
         Document(
             id=document_id,
             entity_id=entity_id,
@@ -436,6 +497,32 @@ async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
             entity_id=entity_id,
             workspace_id=workspace_id,
             name="Recruiting Ledger",
+        ),
+        DocumentGroup(
+            id=retained_group_id,
+            entity_id=entity_id,
+            workspace_id=retained_workspace_id,
+            name="Knowledge consumers",
+        ),
+        ResourceGrant(
+            id=document_grant_id,
+            entity_id=entity_id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=document_id,
+            subject_type="user",
+            subject_id=generate_ulid(),
+            capabilities=["view"],
+            granted_at=datetime.now(timezone.utc),
+        ),
+        ResourceGrant(
+            id=folder_grant_id,
+            entity_id=entity_id,
+            resource_type=ResourceType.DOCUMENT_FOLDER,
+            resource_id=ledger_folder_id,
+            subject_type="user",
+            subject_id=generate_ulid(),
+            capabilities=["view"],
+            granted_at=datetime.now(timezone.utc),
         ),
         Comment(
             entity_id=entity_id,
@@ -465,9 +552,10 @@ async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
             document_id=document_id,
             version_number=1,
             name="event.json",
-            fs_path=fs_path,
+            fs_path=f".versions/documents/{document_id}/{version_id}",
         ),
         DocumentGroupMember(document_id=document_id, group_id=group_id),
+        DocumentGroupMember(document_id=document_id, group_id=retained_group_id),
     ])
     await db_session.commit()
 
@@ -483,6 +571,9 @@ async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
     file_path = tmp_path / entity_id / fs_path
     file_path.parent.mkdir(parents=True)
     file_path.write_text("{}", encoding="utf-8")
+    snapshot_path = tmp_path / entity_id / ".versions" / "documents" / document_id / version_id
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text("{}", encoding="utf-8")
     external_file_path = tmp_path / entity_id / external_fs_path
     external_file_path.parent.mkdir(parents=True)
     external_file_path.write_text("policy", encoding="utf-8")
@@ -519,37 +610,230 @@ async def test_workspace_purge_removes_ledger_files_and_knowledge_projection(
             WorkspaceArtifactPurgeJob.entity_id == entity_id,
         )
     )).scalars().all()
-    assert {job.entity_id for job in cleanup_jobs} == {entity_id}
-    document_ids = {document_id, folder_only_document_id}
-    assert {job.storage_base for job in cleanup_jobs} == (
-        {storage_base}
-        | document_derived_tree_cleanup_bases(document_ids)
-        | document_derived_file_cleanup_bases(document_ids)
-        | {external_fs_path}
-    )
-    assert await drain_workspace_artifact_purge_jobs(
-        db_session,
-        entity_id=entity_id,
-    ) == (12, 0)
+    assert cleanup_jobs == []
 
-    assert not (tmp_path / entity_id / storage_base).exists()
-    assert not external_file_path.exists()
-    assert not page_cache.exists()
-    assert (await db_session.execute(
-        select(WorkspaceArtifactPurgeJob).where(
-            WorkspaceArtifactPurgeJob.entity_id == entity_id,
-        )
-    )).scalar_one_or_none() is None
-    assert await db_session.get(Document, document_id) is None
-    assert await db_session.get(Document, folder_only_document_id) is None
-    assert await db_session.get(DocumentFolder, artifact_folder_id) is None
-    assert await db_session.get(DocumentFolder, ledger_folder_id) is None
+    assert file_path.exists()
+    assert snapshot_path.exists()
+    assert external_file_path.exists()
+    assert page_cache.exists()
+    assert await db_session.get(Document, document_id) is not None
+    assert await db_session.get(Document, folder_only_document_id) is not None
+    assert await db_session.get(DocumentFolder, artifact_folder_id) is not None
+    assert await db_session.get(DocumentFolder, ledger_folder_id) is not None
     assert await db_session.get(DocumentGroup, group_id) is None
-    assert await db_session.get(DocumentChunk, chunk_id) is None
-    assert await db_session.get(DocumentVersion, version_id) is None
+    assert await db_session.get(DocumentGroup, retained_group_id) is not None
+    assert await db_session.get(DocumentChunk, chunk_id) is not None
+    assert await db_session.get(DocumentVersion, version_id) is not None
+    assert await db_session.get(ResourceGrant, document_grant_id) is not None
+    assert await db_session.get(ResourceGrant, folder_grant_id) is not None
+    assert (await db_session.execute(
+        select(DocumentGroupMember).where(
+            DocumentGroupMember.document_id == document_id,
+        )
+    )).scalars().all()[0].group_id == retained_group_id
     assert (await db_session.execute(
         select(Comment).where(Comment.resource_id.in_({document_id, folder_only_document_id}))
-    )).scalars().all() == []
+    )).scalars().all()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artifact_root_visibility", ["entity", "public"])
+async def test_workspace_purge_preserves_members_only_knowledge_restrictions(
+    db_session,
+    artifact_root_visibility: str,
+) -> None:
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    foreign_workspace_id = generate_ulid()
+    artifact_folder_id = generate_ulid()
+    child_folder_id = generate_ulid()
+    source_group_id = generate_ulid()
+    foreign_group_id = generate_ulid()
+    owner_id = generate_ulid()
+    outsider_id = generate_ulid()
+    grantee_id = generate_ulid()
+    group_only_document_id = generate_ulid()
+    folder_document_id = generate_ulid()
+    foreign_link_document_id = generate_ulid()
+    public_document_id = generate_ulid()
+
+    users = [
+        User(
+            id=owner_id,
+            entity_id=entity_id,
+            email=f"knowledge-owner-{owner_id}@example.test",
+            password_hash="test",
+            role="owner",
+        ),
+        User(
+            id=outsider_id,
+            entity_id=entity_id,
+            email=f"knowledge-outsider-{outsider_id}@example.test",
+            password_hash="test",
+            role="member",
+        ),
+        User(
+            id=grantee_id,
+            entity_id=entity_id,
+            email=f"knowledge-grantee-{grantee_id}@example.test",
+            password_hash="test",
+            role="member",
+        ),
+    ]
+    db_session.add_all([
+        Entity(id=entity_id, name="Knowledge restriction entity"),
+        Workspace(
+            id=workspace_id,
+            entity_id=entity_id,
+            name="Deleted restricted workspace",
+            artifact_folder_id=artifact_folder_id,
+            deleted_at=datetime.now(timezone.utc),
+            settings={"access_mode": "members_only"},
+        ),
+        Workspace(
+            id=foreign_workspace_id,
+            entity_id=entity_id,
+            name="Live linked workspace",
+            settings={"access_mode": "entity_visible"},
+        ),
+        DocumentFolder(
+            id=artifact_folder_id,
+            entity_id=entity_id,
+            name="Legacy artifact root",
+            visibility=artifact_root_visibility,
+        ),
+        DocumentFolder(
+            id=child_folder_id,
+            entity_id=entity_id,
+            name="Legacy child",
+            parent_id=artifact_folder_id,
+            visibility="entity",
+        ),
+        DocumentGroup(
+            id=source_group_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            name="Deleted source group",
+        ),
+        DocumentGroup(
+            id=foreign_group_id,
+            entity_id=entity_id,
+            workspace_id=foreign_workspace_id,
+            name="Live foreign group",
+        ),
+        Document(
+            id=group_only_document_id,
+            entity_id=entity_id,
+            owner_id=owner_id,
+            name="legacy-group-only.md",
+            fs_path="Knowledge/legacy-group-only.md",
+            visibility="entity",
+        ),
+        Document(
+            id=folder_document_id,
+            entity_id=entity_id,
+            owner_id=owner_id,
+            name="legacy-folder-only.md",
+            folder_id=child_folder_id,
+            fs_path="Knowledge/legacy-folder-only.md",
+            visibility="entity",
+        ),
+        Document(
+            id=foreign_link_document_id,
+            entity_id=entity_id,
+            owner_id=owner_id,
+            name="live-foreign-link.md",
+            fs_path="Knowledge/live-foreign-link.md",
+            visibility="entity",
+        ),
+        Document(
+            id=public_document_id,
+            entity_id=entity_id,
+            name="public-source-link.md",
+            fs_path="Knowledge/public-source-link.md",
+            visibility="public",
+        ),
+        *users,
+        *[
+            UserMembership(
+                user_id=user.id,
+                entity_id=entity_id,
+                role=user.role,
+                status="active",
+            )
+            for user in users
+        ],
+        ResourceGrant(
+            entity_id=entity_id,
+            resource_type=ResourceType.DOCUMENT,
+            resource_id=group_only_document_id,
+            subject_type="user",
+            subject_id=grantee_id,
+            capabilities=["view"],
+            granted_at=datetime.now(timezone.utc),
+        ),
+    ])
+    await db_session.flush()
+    db_session.add_all([
+        DocumentGroupMember(document_id=group_only_document_id, group_id=source_group_id),
+        DocumentGroupMember(document_id=foreign_link_document_id, group_id=source_group_id),
+        DocumentGroupMember(document_id=foreign_link_document_id, group_id=foreign_group_id),
+        DocumentGroupMember(document_id=public_document_id, group_id=source_group_id),
+    ])
+    await db_session.commit()
+
+    group_document = await db_session.get(Document, group_only_document_id)
+    folder_document = await db_session.get(Document, folder_document_id)
+    assert not await user_can_read_document(
+        db_session, group_document, entity_id=entity_id, user_id=outsider_id, role="member",
+    )
+    assert not await user_can_read_document(
+        db_session, folder_document, entity_id=entity_id, user_id=outsider_id, role="member",
+    )
+    assert await user_can_read_document(
+        db_session, group_document, entity_id=entity_id, user_id=owner_id, role="owner",
+    )
+    assert await user_can_read_document(
+        db_session, group_document, entity_id=entity_id, user_id=grantee_id, role="member",
+    )
+
+    assert await purge_workspace(db_session, workspace_id)
+    await db_session.commit()
+
+    await db_session.refresh(group_document)
+    await db_session.refresh(folder_document)
+    foreign_document = await db_session.get(Document, foreign_link_document_id)
+    public_document = await db_session.get(Document, public_document_id)
+    artifact_folder = await db_session.get(DocumentFolder, artifact_folder_id)
+    assert group_document.visibility == "workspace"
+    assert folder_document.visibility == "workspace"
+    assert artifact_folder.visibility == (
+        "workspace" if artifact_root_visibility == "entity" else "public"
+    )
+    assert foreign_document.visibility == "entity"
+    assert public_document.visibility == "public"
+    assert await db_session.get(DocumentGroup, source_group_id) is None
+    assert await db_session.get(DocumentGroup, foreign_group_id) is not None
+    assert (await db_session.execute(
+        select(DocumentGroupMember).where(
+            DocumentGroupMember.document_id == foreign_link_document_id,
+        )
+    )).scalar_one().group_id == foreign_group_id
+    assert not await user_can_read_document(
+        db_session, group_document, entity_id=entity_id, user_id=outsider_id, role="member",
+    )
+    assert not await user_can_read_document(
+        db_session, folder_document, entity_id=entity_id, user_id=outsider_id, role="member",
+    )
+    assert await user_can_read_document(
+        db_session, group_document, entity_id=entity_id, user_id=owner_id, role="owner",
+    )
+    assert await user_can_read_document(
+        db_session, group_document, entity_id=entity_id, user_id=grantee_id, role="member",
+    )
+    assert await user_can_read_document(
+        db_session, public_document, entity_id=entity_id, user_id=outsider_id, role="member",
+    )
 
 
 @pytest.mark.asyncio

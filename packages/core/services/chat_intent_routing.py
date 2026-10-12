@@ -3,17 +3,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
-import re
+import logging
+import time
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.ai.runtime.auto_route_classifier import (
-    AutoRouteDecision,
-    AutoRouteMode,
-    classify_auto_route,
-)
 from packages.core.ai.runtime.general_chat_intent import (
     GeneralChatIntentDecision,
     WorkspaceIntentCandidate,
@@ -29,6 +25,7 @@ from packages.core.ai.runtime.workspace_creation_authorization import (
     WorkspaceCreationAuthorizationStatus,
     classify_workspace_creation_authorization,
 )
+from packages.core.models.base import generate_ulid
 from packages.core.models.task import Message
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
@@ -39,20 +36,30 @@ from packages.core.services.workspace_access import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 _RECENT_CONTEXT_ROWS = 16
+_DEFERRED_INTENT_CACHE_PREFIX = "chat_intent:"
+_DEFERRED_INTENT_TTL_SECONDS = 3_600
+_DEFERRED_INTENT_POLL_SECONDS = 0.2
+_DEFERRED_INTENT_TASKS: set[asyncio.Task] = set()
+
+# The model always sees the same neutral guidance; whether a draft may start is
+# decided when it actually calls the draft tool (see workspace_drafts.py).
+_NEUTRAL_GENERAL_INTENT_PROMPT = (
+    "Answer the user's request normally and helpfully as a standalone response. "
+    "Start a new Workspace draft only when the user explicitly asks to create a "
+    "new Workspace; then save a guided Workspace draft in the current Chat, keep "
+    "configuration changes in that draft, and do not create the final Workspace "
+    "until the user uses the explicit Create Workspace action. An existing active "
+    "Workspace draft may still be updated when the user asks for a configuration "
+    "change. You may explain why a Workspace would fit the work, but never mention "
+    "or allude to internal classification, recommendation delivery, routing, "
+    "handoffs, cards, or hidden system behavior, and do not predict or announce "
+    "that any interface element will appear."
+)
 _MAX_WORKSPACE_CANDIDATES = 24
 WORKSPACE_RECOMMENDATIONS_ENABLED_PREFERENCE = "workspace_recommendations_enabled"
-_VOICE_SOCIAL_UTTERANCE = re.compile(
-    r"(?:"
-    r"(?:hi|hello|hey|thanks?|thank\s+you|good\s+(?:morning|afternoon|evening)|"
-    r"bye|goodbye|are\s+you\s+there|can\s+you\s+hear\s+me)|"
-    r"(?:你好|您好|嗨|哈喽|谢谢|感谢|早上好|下午好|晚上好|再见|你在吗|"
-    r"听得到吗|能听到吗)"
-    r")[\s.!！?？,，。]*",
-    re.IGNORECASE,
-)
-
-
 def workspace_recommendations_enabled(user: User) -> bool:
     preferences = getattr(user, "preferences", None)
     if not isinstance(preferences, dict):
@@ -61,60 +68,56 @@ def workspace_recommendations_enabled(user: User) -> bool:
 
 
 @dataclass(frozen=True)
-class ChatIntentRoutingDecision:
-    auto_route: AutoRouteDecision
-    general_intent: GeneralChatIntentDecision
-    workspace_creation_authorization: WorkspaceCreationAuthorizationDecision
-    execution_plan: TurnExecutionPlan
+class DeferredChatIntentRequest:
+    """Inputs for the classifiers that run beside the turn, not before it."""
 
-    def runtime_metadata(self, *, request: str) -> dict[str, Any]:
-        metadata: dict[str, Any] = {
-            "auto_route": {
-                "mode": self.auto_route.mode.value,
-                "confidence": self.auto_route.confidence,
-            },
+    key: str
+    message: str
+    recent_context: str
+    entity_id: str
+    user_id: str
+    conversation_id: str | None
+    recommendations_enabled: bool
+
+
+@dataclass(frozen=True)
+class DeferredChatIntent:
+    workspace_creation_authorization: WorkspaceCreationAuthorizationDecision
+    general_intent: GeneralChatIntentDecision
+
+    def to_metadata(self, *, request: str) -> dict[str, Any]:
+        recommendation = self.general_intent.recommendation
+        return {
+            "workspace_creation_authorization": (
+                self.workspace_creation_authorization.to_metadata()
+            ),
             "general_chat_intent": {
                 "kind": self.general_intent.kind.value,
                 "confidence": self.general_intent.confidence,
             },
-            "workspace_creation_authorization": (
-                self.workspace_creation_authorization.to_metadata()
+            "workspace_recommendation": (
+                recommendation.to_metadata(request=request)
+                if recommendation is not None
+                else None
             ),
-            "turn_execution_plan": self.execution_plan.to_metadata(),
         }
-        recommendation = self.general_intent.recommendation
-        if (
-            self.workspace_creation_authorization.status
-            is WorkspaceCreationAuthorizationStatus.AUTHORIZED
-        ):
-            metadata["general_intent_prompt"] = (
-                "The user explicitly authorized starting a new Workspace draft. Start and "
-                "save a guided Workspace draft in the current Chat, then keep configuration "
-                "changes in that draft. Do not create the final Workspace until the user uses "
-                "the explicit Create Workspace action."
-            )
-        elif recommendation is not None:
-            metadata["workspace_recommendation"] = recommendation.to_metadata(
-                request=request,
-            )
-            metadata["general_intent_prompt"] = (
-                "Answer the user's request normally and helpfully as a standalone "
-                "response. You may explain why a Workspace fits the work, but never "
-                "mention or allude to internal classification, recommendation delivery, "
-                "routing, handoffs, interface controls, cards, buttons, navigation, or "
-                "hidden system behavior. Do not predict or announce that any interface "
-                "element will appear. Do not tell the user to click, choose, accept, or "
-                "wait for another action. Do not start or modify a Workspace, create a "
-                "Workspace draft, navigate, or write into a Workspace in this turn."
-            )
-        else:
-            metadata["general_intent_prompt"] = (
-                "Answer the user's request normally. Do not start a new Workspace or a new "
-                "Workspace draft in this turn because the user has not explicitly asked to "
-                "create one. An existing active Workspace draft may still be updated when the "
-                "user asks for a configuration change."
-            )
-        return metadata
+
+
+@dataclass(frozen=True)
+class ChatIntentRoutingDecision:
+    execution_plan: TurnExecutionPlan
+    deferred: DeferredChatIntentRequest
+
+    def runtime_metadata(self, *, request: str) -> dict[str, Any]:
+        return {
+            "turn_execution_plan": self.execution_plan.to_metadata(),
+            "workspace_creation_authorization": {
+                "status": WorkspaceCreationAuthorizationStatus.DEFERRED.value,
+                "key": self.deferred.key,
+            },
+            "deferred_chat_intent_key": self.deferred.key,
+            "general_intent_prompt": _NEUTRAL_GENERAL_INTENT_PROMPT,
+        }
 
 
 def auto_chat_intent_routing_allowed(
@@ -276,104 +279,143 @@ async def classify_chat_intent_routing(
     user: User,
     message: str,
     conversation_id: str | None,
+    agent_subscription_id: str | None = None,
     runtime_metadata: dict[str, Any] | None = None,
 ) -> ChatIntentRoutingDecision:
-    """Classify one ordinary Auto Chat turn without creating or mutating a Workspace."""
+    """Plan one ordinary Auto Chat turn without waiting on any model.
+
+    Workspace-creation authorization and Workspace recommendation are model
+    classifiers. Neither changes how the turn starts, so they run beside it
+    (``start_deferred_chat_intent``) and are read only where they are used:
+    the draft tool and the end of the reply.
+    """
 
     metadata = dict(runtime_metadata or {})
-    if (
-        metadata.get("voice_session_mode") == "chat_gateway"
-        and _VOICE_SOCIAL_UTTERANCE.fullmatch(str(message or "").strip())
-    ):
-        local_plan = build_turn_execution_plan(
-            enabled=True,
-            surface=ChatSurface.GLOBAL_OWNER_CHAT,
-            message=message,
-            message_text=message,
-            disable_tools=True,
-            runtime_metadata=metadata,
-        )
-        # Pure call-control and social utterances do not need three remote
-        # routing classifiers before the actual reply. Anything that could be
-        # a contextual follow-up or action stays on the governed route below.
-        return ChatIntentRoutingDecision(
-            auto_route=AutoRouteDecision(
-                mode=AutoRouteMode.DIRECT_CHAT,
-                confidence=1.0,
-            ),
-            general_intent=GeneralChatIntentDecision.agent_chat(1.0),
-            workspace_creation_authorization=(
-                WorkspaceCreationAuthorizationDecision.not_authorized(1.0)
-            ),
-            execution_plan=local_plan,
-        )
-
     recent_context, _active_workspace_draft = await _recent_chat_context(
         db,
         conversation_id,
     )
-    recommendations_enabled = workspace_recommendations_enabled(user)
-    candidates = (
-        await list_workspace_intent_candidates(db, user=user)
-        if recommendations_enabled
-        else []
-    )
-    auto_route_call = classify_auto_route(
-        message_text=message,
-        recent_context_text=recent_context,
-        surface=ChatSurface.GLOBAL_OWNER_CHAT.value,
-        entity_id=user.entity_id,
-        user_id=user.id,
-        conversation_id=conversation_id,
-    )
-    creation_authorization_call = classify_workspace_creation_authorization(
-        message_text=message,
-        recent_context_text=recent_context,
-        entity_id=user.entity_id,
-        user_id=user.id,
-        conversation_id=conversation_id,
-    )
-    if recommendations_enabled:
-        general_intent_call = classify_general_chat_intent(
-            message_text=message,
-            recent_context_text=recent_context,
-            candidates=candidates,
-            entity_id=user.entity_id,
-            user_id=user.id,
-            conversation_id=conversation_id,
-        )
-        auto_route, creation_authorization, general_intent = await asyncio.gather(
-            auto_route_call,
-            creation_authorization_call,
-            general_intent_call,
-        )
-    else:
-        auto_route, creation_authorization = await asyncio.gather(
-            auto_route_call,
-            creation_authorization_call,
-        )
-        general_intent = GeneralChatIntentDecision.agent_chat(1.0)
-    if (
-        creation_authorization.status
-        is WorkspaceCreationAuthorizationStatus.AUTHORIZED
-    ):
-        auto_route = AutoRouteDecision(
-            mode=AutoRouteMode.GENERAL_CHAT,
-            confidence=1.0,
-        )
-        general_intent = GeneralChatIntentDecision.agent_chat(1.0)
-
     plan = build_turn_execution_plan(
         enabled=True,
         surface=ChatSurface.GLOBAL_OWNER_CHAT,
         message=message,
         message_text=message,
+        agent_subscription_id=agent_subscription_id,
         runtime_metadata=metadata,
-        auto_route_decision=auto_route,
     )
     return ChatIntentRoutingDecision(
-        auto_route=auto_route,
-        general_intent=general_intent,
-        workspace_creation_authorization=creation_authorization,
         execution_plan=plan,
+        deferred=DeferredChatIntentRequest(
+            key=generate_ulid(),
+            message=message,
+            recent_context=recent_context,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            conversation_id=conversation_id,
+            recommendations_enabled=workspace_recommendations_enabled(user),
+        ),
     )
+
+
+async def classify_deferred_chat_intent(
+    request: DeferredChatIntentRequest,
+    *,
+    candidates: list[WorkspaceIntentCandidate],
+) -> DeferredChatIntent:
+    """Run the creation-authorization and recommendation classifiers."""
+
+    creation_authorization_call = classify_workspace_creation_authorization(
+        message_text=request.message,
+        recent_context_text=request.recent_context,
+        entity_id=request.entity_id,
+        user_id=request.user_id,
+        conversation_id=request.conversation_id,
+    )
+    if request.recommendations_enabled:
+        creation_authorization, general_intent = await asyncio.gather(
+            creation_authorization_call,
+            classify_general_chat_intent(
+                message_text=request.message,
+                recent_context_text=request.recent_context,
+                candidates=candidates,
+                entity_id=request.entity_id,
+                user_id=request.user_id,
+                conversation_id=request.conversation_id,
+            ),
+        )
+    else:
+        creation_authorization = await creation_authorization_call
+        general_intent = GeneralChatIntentDecision.agent_chat(1.0)
+    if (
+        creation_authorization.status
+        is WorkspaceCreationAuthorizationStatus.AUTHORIZED
+    ):
+        # An explicit create request is answered by the draft, not a card.
+        general_intent = GeneralChatIntentDecision.agent_chat(1.0)
+    return DeferredChatIntent(
+        workspace_creation_authorization=creation_authorization,
+        general_intent=general_intent,
+    )
+
+
+def _deferred_intent_cache_key(key: str) -> str:
+    return f"{_DEFERRED_INTENT_CACHE_PREFIX}{key}"
+
+
+async def publish_deferred_chat_intent(request: DeferredChatIntentRequest) -> None:
+    """Classify and publish the result for the turn's consumers (Redis)."""
+
+    from packages.core.cache import cache
+    from packages.core.database import async_session
+
+    try:
+        candidates: list[WorkspaceIntentCandidate] = []
+        if request.recommendations_enabled:
+            async with async_session() as db:
+                user = await db.get(User, request.user_id)
+                if user is not None and user.entity_id == request.entity_id:
+                    candidates = await list_workspace_intent_candidates(db, user=user)
+        result = await classify_deferred_chat_intent(request, candidates=candidates)
+        payload = result.to_metadata(request=request.message)
+    except Exception:
+        logger.warning("Deferred chat intent classification failed key=%s", request.key, exc_info=True)
+        payload = {
+            "workspace_creation_authorization": (
+                WorkspaceCreationAuthorizationDecision.not_authorized(0.0).to_metadata()
+            ),
+            "workspace_recommendation": None,
+        }
+    await cache.set(
+        _deferred_intent_cache_key(request.key),
+        payload,
+        ttl=_DEFERRED_INTENT_TTL_SECONDS,
+    )
+
+
+def start_deferred_chat_intent(request: DeferredChatIntentRequest) -> None:
+    """Run the deferred classifiers beside the turn in this process."""
+
+    task = asyncio.get_running_loop().create_task(publish_deferred_chat_intent(request))
+    _DEFERRED_INTENT_TASKS.add(task)
+    task.add_done_callback(_DEFERRED_INTENT_TASKS.discard)
+
+
+async def wait_for_deferred_chat_intent(
+    key: str | None,
+    *,
+    timeout: float,
+) -> dict[str, Any] | None:
+    """Return the published classification, waiting at most ``timeout``."""
+
+    if not isinstance(key, str) or not key:
+        return None
+    from packages.core.cache import cache
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        value = await cache.get(_deferred_intent_cache_key(key))
+        if isinstance(value, dict):
+            return value
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_DEFERRED_INTENT_POLL_SECONDS)

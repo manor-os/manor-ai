@@ -1,13 +1,17 @@
+import { removeZipFolderEntries } from "./ooxmlPackage";
+import { ObjectUrlReadError, readObjectUrlBlob } from "./retainedObjectUrls";
 import {
   presentationTextEditSpans,
   presentationTextEditSpansFromSourceMap,
   presentationTextEditSpansForSource,
+  reconcilePresentationTextSourceMap,
   type PresentationTextSourceMap,
 } from "./presentationTextEdits";
 import {
   presentationObjectGroups,
   type PresentationGroupTransform,
 } from "./presentationOoxml";
+import { normalizeOfficeSoftBreaks, stripInvalidXmlCharacters } from "./xmlText";
 
 const PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
 
@@ -37,6 +41,8 @@ interface PresentationText {
   fontFamily?: string;
   bullet?: string;
   indent?: number;
+  indentRight?: number;
+  hanging?: number;
   lineSpacing?: number;
   spaceBefore?: number;
   spaceAfter?: number;
@@ -60,6 +66,9 @@ interface PresentationTableCell {
   text: string;
   sourceMap?: PresentationTextSourceMap;
   bold?: boolean;
+  italic?: boolean;
+  fontSize?: number;
+  fontFamily?: string;
   color?: string;
   fill?: string;
   gridSpan?: number;
@@ -81,15 +90,18 @@ export interface PreservePresentationShape {
   opacity?: number;
   stroke?: string;
   strokeWidth?: number;
+  strokeDash?: string;
   presetGeom?: string;
   borderRadius?: number;
   shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
   vAlign?: "top" | "middle" | "bottom";
+  wordWrap?: boolean;
   padding?: { l: number; t: number; r: number; b: number };
   imgCrop?: { l: number; t: number; r: number; b: number };
   texts: PresentationText[];
   tableRows?: PresentationTableCell[][];
   tableColWidths?: number[];
+  tableRowHeights?: number[];
   imgUrl?: string;
   hyperlink?: string;
   imageFit?: "cover" | "contain" | "fill";
@@ -121,7 +133,7 @@ export class PresentationPreservationError extends Error {
 }
 
 function escapeXml(value: string): string {
-  return value
+  return stripInvalidXmlCharacters(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -150,7 +162,7 @@ function slideUnsupportedProperties(slide: PreservePresentationSlide): Record<st
 }
 
 function setXmlAttribute(openTag: string, name: string, value: string | undefined): string {
-  const attribute = new RegExp(`\\s${name}\\s*=\\s*(?:"[^"]*"|'[^']*')`, "i");
+  const attribute = new RegExp(`\\s${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*=\\s*(?:"[^"]*"|'[^']*')`);
   if (value == null) return openTag.replace(attribute, "");
   if (attribute.test(openTag)) return openTag.replace(attribute, ` ${name}="${value}"`);
   return openTag.replace(/\s*\/?\s*>$/, (ending) => ` ${name}="${value}"${ending}`);
@@ -242,62 +254,113 @@ function presentationFillXml(shape: PreservePresentationShape): string {
 
 function presentationLineXml(shape: PreservePresentationShape): string {
   if (!shape.stroke || (shape.strokeWidth ?? 0) <= 0) return "<a:ln><a:noFill/></a:ln>";
-  return `<a:ln w="${Math.max(1, Math.round((shape.strokeWidth || 1) * 12_700))}"><a:solidFill>${presentationColorXml(shape.stroke)}</a:solidFill><a:prstDash val="solid"/></a:ln>`;
+  return `<a:ln w="${Math.max(1, Math.round((shape.strokeWidth || 1) * 12_700))}"><a:solidFill>${presentationColorXml(shape.stroke)}</a:solidFill><a:prstDash val="${escapeXml(shape.strokeDash || "solid")}"/></a:ln>`;
+}
+
+/** Direct child spans keep nested texture/extension markup out of style edits. */
+function shapePropertyChildren(xml: string): Array<{ start: number; end: number; xml: string }> {
+  const children: Array<{ start: number; end: number; xml: string }> = [];
+  let depth = 0;
+  let start = 0;
+  for (const match of xml.matchAll(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/?[\w:.-]+(?:[^>"']|"[^"]*"|'[^']*')*>/g)) {
+    const token = match[0];
+    if (token.startsWith("<!")) continue;
+    const end = match.index! + token.length;
+    if (token.startsWith("</")) {
+      depth -= 1;
+      if (depth === 1) children.push({ start, end, xml: xml.slice(start, end) });
+    } else {
+      if (depth === 1) {
+        start = match.index!;
+        if (token.endsWith("/>")) children.push({ start, end, xml: token });
+      }
+      if (!token.endsWith("/>")) depth += 1;
+    }
+  }
+  return children;
+}
+
+function patchDirectXmlChild(
+  parentXml: string,
+  pattern: RegExp,
+  replacement: string,
+  following: RegExp,
+): string {
+  const children = shapePropertyChildren(parentXml);
+  const existing = children.find((child) => child.xml.search(pattern) === 0);
+  if (existing) {
+    return `${parentXml.slice(0, existing.start)}${replacement}${parentXml.slice(existing.end)}`;
+  }
+  if (!replacement) return parentXml;
+  const next = children.find((child) => child.xml.search(following) === 0);
+  if (next) return `${parentXml.slice(0, next.start)}${replacement}${parentXml.slice(next.start)}`;
+  const tagName = parentXml.match(/^<([A-Za-z_][\w:.-]*)\b/)?.[1];
+  if (!tagName) return parentXml;
+  return parentXml.replace(new RegExp(`</${tagName}>\\s*$`, "i"), `${replacement}</${tagName}>`);
 }
 
 function patchDirectShapeProperty(
   shapeProperties: string,
   pattern: RegExp,
   replacement: string,
+  following: RegExp,
 ): string {
-  if (pattern.test(shapeProperties)) return shapeProperties.replace(pattern, replacement);
-  return shapeProperties.replace(/<\/p:spPr>\s*$/i, `${replacement}</p:spPr>`);
+  return patchDirectXmlChild(shapeProperties, pattern, replacement, following);
 }
 
 function patchDirectShapeFill(shapeProperties: string, replacement: string): string {
-  const fillPattern = /<a:(?:noFill|solidFill|gradFill|pattFill)\b[^>]*(?:\/>|>[\s\S]*?<\/a:(?:solidFill|gradFill|pattFill)>)/ig;
-  const lineIndex = shapeProperties.search(/<a:ln\b/i);
-  for (const match of shapeProperties.matchAll(fillPattern)) {
-    if (lineIndex < 0 || match.index! < lineIndex) {
-      return `${shapeProperties.slice(0, match.index)}${replacement}${shapeProperties.slice(match.index! + match[0].length)}`;
-    }
-  }
-  if (lineIndex >= 0) return `${shapeProperties.slice(0, lineIndex)}${replacement}${shapeProperties.slice(lineIndex)}`;
-  return shapeProperties.replace(/<\/p:spPr>\s*$/i, `${replacement}</p:spPr>`);
+  return patchDirectShapeProperty(shapeProperties, /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill)\b/i, replacement, /<a:(?:ln|effectLst|effectDag|scene3d|sp3d|extLst)\b/i);
 }
 
-function patchShapeFormatting(element: string, shape: PreservePresentationShape): string {
+function patchShapeFormatting(element: string, shape: PreservePresentationShape, original: PreservePresentationShape): string {
   const shapeProperties = element.match(/<p:spPr\b[^>]*(?:\/>|>[\s\S]*?<\/p:spPr>)/i)?.[0];
   if (!shapeProperties) return element;
-  let patched = shapeProperties;
-  patched = patchDirectShapeFill(patched, presentationFillXml(shape));
-  patched = patchDirectShapeProperty(
-    patched,
-    /<a:ln\b[^>]*(?:\/>|>[\s\S]*?<\/a:ln>)/i,
-    presentationLineXml(shape),
-  );
-  const geometry = presentationGeometryXml(shape);
-  patched = patchDirectShapeProperty(
-    patched,
-    /<a:prstGeom\b[^>]*(?:\/>|>[\s\S]*?<\/a:prstGeom>)/i,
-    geometry,
-  );
-  if (shape.shadow) {
-    const shadow = `<a:effectLst><a:outerShdw blurRad="${Math.round(Math.max(0, shape.shadow.blur) * 12_700)}" dist="${Math.round(Math.max(0, shape.shadow.dist) * 12_700)}" dir="${Math.round((((shape.shadow.angle || 0) % 360) + 360) % 360 * 60_000)}">${presentationColorXml(shape.shadow.color, shape.shadow.alpha)}</a:outerShdw></a:effectLst>`;
+  let patched = shapeProperties.replace(/\/>$/, "></p:spPr>");
+  const changed = (...keys: Array<keyof PreservePresentationShape>) => !sameValue(keys.map((key) => original[key]), keys.map((key) => shape[key]));
+  if (changed("fill", "gradFill")) patched = patchDirectShapeFill(patched, presentationFillXml(shape));
+  if (changed("stroke", "strokeWidth", "strokeDash")) {
+    const pattern = /<a:ln\b[^>]*?(?:\/>|>[\s\S]*?<\/a:ln>)/i;
+    let line = shapePropertyChildren(patched).find((child) => child.xml.search(pattern) === 0)?.xml;
+    if (!line) line = presentationLineXml(shape);
+    else {
+      line = line.replace(/\/>$/, "></a:ln>");
+      if (changed("strokeWidth")) line = line.replace(/^<a:ln\b[^>]*>/, (opening) => setXmlAttribute(opening, "w", String(Math.round((shape.strokeWidth ?? 1) * 12700))));
+      if (changed("stroke")) {
+        const fill = shape.stroke ? `<a:solidFill>${presentationColorXml(shape.stroke)}</a:solidFill>` : "<a:noFill/>";
+        const fillPattern = /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:(?:noFill|solidFill|gradFill|blipFill|pattFill)>)/i;
+        line = fillPattern.test(line) ? line.replace(fillPattern, fill) : line.replace(/^<a:ln\b[^>]*>/, `$&${fill}`);
+      }
+      if (changed("strokeDash")) {
+        line = line.replace(/<a:(?:prstDash|custDash)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:(?:prstDash|custDash)>)/ig, "");
+        line = line.replace(/<a:(?:round|bevel|miter|headEnd|tailEnd|extLst)\b|<\/a:ln>/i, `<a:prstDash val="${escapeXml(shape.strokeDash || "solid")}"/>$&`);
+      }
+    }
+    patched = patchDirectShapeProperty(patched, pattern, line, /<a:(?:effectLst|effectDag|scene3d|sp3d|extLst)\b/i);
+  }
+  if (changed("presetGeom", "borderRadius")) {
+    patched = patchDirectShapeProperty(patched, /<a:(?:prstGeom|custGeom)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:(?:prstGeom|custGeom)>)/i, presentationGeometryXml(shape), /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill|ln|effectLst|effectDag|scene3d|sp3d|extLst)\b/i);
+  }
+  if (changed("shadow")) {
+    if (/<a:effectDag\b/i.test(patched)) throw new PresentationPreservationError("Editing a complex shape effect graph is not supported.");
+    const pattern = /<a:effectLst\b[^>]*?(?:\/>|>[\s\S]*?<\/a:effectLst>)/i;
+    let effects = (shapePropertyChildren(patched).find((child) => child.xml.search(pattern) === 0)?.xml || "<a:effectLst/>").replace(/\/>$/, "></a:effectLst>");
+    effects = effects.replace(/<a:outerShdw\b[^>]*?(?:\/>|>[\s\S]*?<\/a:outerShdw>)/i, "");
+    if (shape.shadow) {
+      const shadow = `<a:outerShdw blurRad="${Math.round(Math.max(0, shape.shadow.blur) * 12_700)}" dist="${Math.round(Math.max(0, shape.shadow.dist) * 12_700)}" dir="${Math.round((((shape.shadow.angle || 0) % 360) + 360) % 360 * 60_000)}">${presentationColorXml(shape.shadow.color, shape.shadow.alpha)}</a:outerShdw>`;
+      effects = effects.replace(/<a:(?:prstShdw|reflection|softEdge)\b|<\/a:effectLst>/i, `${shadow}$&`);
+    }
     patched = patchDirectShapeProperty(
-      patched,
-      /<a:effectLst\b[^>]*(?:\/>|>[\s\S]*?<\/a:effectLst>)/i,
-      shadow,
+      patched, pattern, effects, /<a:(?:scene3d|sp3d|extLst)\b/i,
     );
-  } else {
-    patched = patched.replace(/<a:effectLst\b[^>]*(?:\/>|>[\s\S]*?<\/a:effectLst>)/i, "");
   }
   let output = element.replace(shapeProperties, patched);
+  if (!changed("vAlign", "padding", "wordWrap")) return output;
   output = output.replace(/<a:bodyPr\b[^>]*\/?\s*>/i, (bodyPr) => {
     const anchor = shape.vAlign === "middle" ? "ctr" : shape.vAlign === "bottom" ? "b" : "t";
-    let next = setXmlAttribute(bodyPr, "anchor", anchor);
+    let next = changed("vAlign") ? setXmlAttribute(bodyPr, "anchor", anchor) : bodyPr;
+    if (changed("wordWrap")) next = setXmlAttribute(next, "wrap", shape.wordWrap === false ? "none" : "square");
     const padding = shape.padding;
-    if (padding) {
+    if (padding && changed("padding")) {
       next = setXmlAttribute(next, "lIns", String(Math.round(padding.l * 12_700)));
       next = setXmlAttribute(next, "tIns", String(Math.round(padding.t * 12_700)));
       next = setXmlAttribute(next, "rIns", String(Math.round(padding.r * 12_700)));
@@ -327,34 +390,288 @@ function presentationRunProperties(text: PresentationText, run: NonNullable<Pres
   return `<a:rPr ${attributes}>${children}</a:rPr>`;
 }
 
+const PRESENTATION_INLINE_FORMAT_KEYS = [
+  "bold",
+  "italic",
+  "underline",
+  "strikethrough",
+  "fontSize",
+  "color",
+  "fontFamily",
+  "baseline",
+  "spacing",
+] as const;
+
+type PresentationInlineFormatting = Pick<PresentationText, typeof PRESENTATION_INLINE_FORMAT_KEYS[number]>;
+
+function presentationInlineFormattingAt(
+  text: PresentationText,
+  position: number,
+): PresentationInlineFormatting {
+  const paragraphFormatting = Object.fromEntries(
+    PRESENTATION_INLINE_FORMAT_KEYS.map((key) => [key, text[key]]),
+  ) as PresentationInlineFormatting;
+  if (!text.runs?.length) return paragraphFormatting;
+  let offset = 0;
+  for (const run of text.runs) {
+    const end = offset + presentationTextLength(run.text);
+    if (position < end || (position === end && end === presentationTextLength(text.text))) {
+      return { ...paragraphFormatting, ...run };
+    }
+    offset = end;
+  }
+  return paragraphFormatting;
+}
+
+function patchPresentationRunProperties(
+  propertiesXml: string,
+  baseline: PresentationInlineFormatting,
+  edited: PresentationInlineFormatting,
+): string {
+  const tagName = propertiesXml.match(/^<([A-Za-z_][\w:.-]*)\b/)?.[1];
+  if (!tagName) return propertiesXml;
+  let patched = propertiesXml.replace(/\/>\s*$/, `></${tagName}>`);
+  const changed = (key: keyof PresentationInlineFormatting) => !sameValue(baseline[key], edited[key]);
+  patched = patched.replace(new RegExp(`^<${tagName}\\b[^>]*>`, "i"), (opening) => {
+    let next = opening;
+    if (changed("fontSize")) {
+      next = setXmlAttribute(next, "sz", edited.fontSize == null
+        ? undefined
+        : String(Math.max(100, Math.round(edited.fontSize * 100))));
+    }
+    if (changed("bold")) next = setXmlAttribute(next, "b", edited.bold == null ? undefined : edited.bold ? "1" : "0");
+    if (changed("italic")) next = setXmlAttribute(next, "i", edited.italic == null ? undefined : edited.italic ? "1" : "0");
+    if (changed("underline")) next = setXmlAttribute(next, "u", edited.underline == null ? undefined : edited.underline ? "sng" : "none");
+    if (changed("strikethrough")) {
+      next = setXmlAttribute(
+        next,
+        "strike",
+        edited.strikethrough == null ? undefined : edited.strikethrough ? "sngStrike" : "noStrike",
+      );
+    }
+    if (changed("baseline")) {
+      next = setXmlAttribute(next, "baseline", edited.baseline == null
+        ? undefined
+        : String(Math.round(edited.baseline * 1000)));
+    }
+    if (changed("spacing")) {
+      next = setXmlAttribute(next, "spc", edited.spacing == null
+        ? undefined
+        : String(Math.round(edited.spacing * 100)));
+    }
+    return next;
+  });
+  if (changed("color")) {
+    patched = patchDirectXmlChild(
+      patched,
+      /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill)\b/i,
+      edited.color ? `<a:solidFill>${presentationColorXml(edited.color)}</a:solidFill>` : "",
+      /<a:(?:latin|ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
+    );
+  }
+  if (changed("fontFamily")) {
+    patched = patchDirectXmlChild(
+      patched,
+      /<a:latin\b/i,
+      edited.fontFamily ? `<a:latin typeface="${escapeXml(edited.fontFamily)}"/>` : "",
+      /<a:(?:ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
+    );
+  }
+  return patched;
+}
+
+function patchPresentationRunFormatting(
+  tokenXml: string,
+  baseline: PresentationInlineFormatting,
+  edited: PresentationInlineFormatting,
+): string {
+  if (sameValue(baseline, edited)) return tokenXml;
+  const properties = tokenXml.match(/<a:rPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:rPr>)/i)?.[0];
+  const patched = patchPresentationRunProperties(properties || "<a:rPr/>", baseline, edited);
+  if (properties) return tokenXml.replace(properties, patched);
+  return tokenXml.replace(/^<a:(?:r|fld)\b[^>]*>/i, (opening) => `${opening}${patched}`);
+}
+
+function presentationBulletXml(bullet: string | undefined): string {
+  if (!bullet) return "<a:buNone/>";
+  if (bullet === "#." || bullet === "a." || bullet === "i.") {
+    const type = bullet === "a." ? "alphaLcPeriod" : bullet === "i." ? "romanLcPeriod" : "arabicPeriod";
+    return `<a:buAutoNum type="${type}"/>`;
+  }
+  return `<a:buChar char="${escapeXml(bullet)}"/>`;
+}
+
+function presentationAlignmentValue(align: string | undefined): string | undefined {
+  if (!align) return undefined;
+  if (align === "center" || align === "ctr") return "ctr";
+  if (align === "right" || align === "r") return "r";
+  if (align === "justify" || align === "just") return "just";
+  return "l";
+}
+
+function patchPresentationParagraphProperties(
+  paragraphXml: string,
+  baseline: PresentationText,
+  edited: PresentationText,
+): string {
+  const changed = (key: keyof PresentationText) => !sameValue(baseline[key], edited[key]);
+  const changedKeys: Array<keyof PresentationText> = [
+    "align",
+    "bullet",
+    "indent",
+    "indentRight",
+    "hanging",
+    "lineSpacing",
+    "spaceBefore",
+    "spaceAfter",
+  ];
+  if (!changedKeys.some(changed)) return paragraphXml;
+  const originalProperties = paragraphXml.match(/<a:pPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:pPr>)/i)?.[0] || "";
+  let properties = (originalProperties || "<a:pPr/>").replace(/\/>\s*$/, "></a:pPr>");
+  properties = properties.replace(/^<a:pPr\b[^>]*>/i, (opening) => {
+    let next = opening;
+    if (changed("align")) next = setXmlAttribute(next, "algn", presentationAlignmentValue(edited.align));
+    if (changed("indent")) {
+      next = setXmlAttribute(next, "marL", edited.indent == null
+        ? undefined
+        : String(Math.round(Math.max(0, edited.indent) * 12_700)));
+    }
+    if (changed("indentRight")) {
+      next = setXmlAttribute(next, "marR", edited.indentRight == null
+        ? undefined
+        : String(Math.round(Math.max(0, edited.indentRight) * 12_700)));
+    }
+    if (changed("hanging")) {
+      next = setXmlAttribute(next, "indent", edited.hanging == null
+        ? undefined
+        : String(Math.round(edited.hanging * 12_700)));
+    }
+    return next;
+  });
+  if (changed("lineSpacing")) {
+    properties = patchDirectXmlChild(
+      properties,
+      /<a:lnSpc\b/i,
+      edited.lineSpacing == null
+        ? ""
+        : `<a:lnSpc><a:spcPct val="${Math.round(Math.max(0.1, edited.lineSpacing) * 100_000)}"/></a:lnSpc>`,
+      /<a:(?:spcBef|spcAft|buClr|buSzPct|buSzPts|buSzTx|buFont|buNone|buChar|buAutoNum|tabLst|defRPr|extLst)\b/i,
+    );
+  }
+  if (changed("spaceBefore")) {
+    properties = patchDirectXmlChild(
+      properties,
+      /<a:spcBef\b/i,
+      edited.spaceBefore == null
+        ? ""
+        : `<a:spcBef><a:spcPts val="${Math.round(Math.max(0, edited.spaceBefore) * 100)}"/></a:spcBef>`,
+      /<a:(?:spcAft|buClr|buSzPct|buSzPts|buSzTx|buFont|buNone|buChar|buAutoNum|tabLst|defRPr|extLst)\b/i,
+    );
+  }
+  if (changed("spaceAfter")) {
+    properties = patchDirectXmlChild(
+      properties,
+      /<a:spcAft\b/i,
+      edited.spaceAfter == null
+        ? ""
+        : `<a:spcAft><a:spcPts val="${Math.round(Math.max(0, edited.spaceAfter) * 100)}"/></a:spcAft>`,
+      /<a:(?:buClr|buSzPct|buSzPts|buSzTx|buFont|buNone|buChar|buAutoNum|tabLst|defRPr|extLst)\b/i,
+    );
+  }
+  if (changed("bullet")) {
+    properties = patchDirectXmlChild(
+      properties,
+      /<a:(?:buNone|buChar|buAutoNum)\b/i,
+      presentationBulletXml(edited.bullet),
+      /<a:(?:tabLst|defRPr|extLst)\b/i,
+    );
+  }
+  if (originalProperties) return paragraphXml.replace(originalProperties, properties);
+  return paragraphXml.replace(/^<a:p\b[^>]*>/i, (opening) => `${opening}${properties}`);
+}
+
+function patchPresentationParagraphFormatting(
+  paragraphXml: string,
+  baseline: PresentationText,
+  edited: PresentationText,
+): string {
+  let patched = patchPresentationParagraphProperties(paragraphXml, baseline, edited);
+  const editedCharacters = Array.from(edited.text);
+  const sourceMap = edited.sourceMap?.length === editedCharacters.length
+    ? edited.sourceMap
+    : reconcilePresentationTextSourceMap(baseline.text, edited.text);
+  const tokens = presentationTextTokens(patched);
+  let tokenIndex = 0;
+  patched = patched.replace(
+    /<a:fld[\s>][\s\S]*?<\/a:fld>|<a:r[\s>][\s\S]*?<\/a:r>|<a:br\b[^>]*(?:\/>|>[\s\S]*?<\/a:br>)|<a:t(?:\s[^>]*)?>[\s\S]*?<\/a:t>/g,
+    (raw) => {
+      const token = tokens[tokenIndex++];
+      if (!token || (token.kind !== "run" && token.kind !== "field")) return raw;
+      const sourceIndex = sourceMap
+        .slice(token.start, token.end)
+        .find((position): position is number => position != null);
+      if (sourceIndex == null) return raw;
+      return patchPresentationRunFormatting(
+        raw,
+        presentationInlineFormattingAt(baseline, sourceIndex),
+        presentationInlineFormattingAt(edited, token.start),
+      );
+    },
+  );
+  if (!tokens.some((token) => token.kind === "run" || token.kind === "field")) {
+    const endProperties = patched.match(/<a:endParaRPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:endParaRPr>)/i)?.[0];
+    if (endProperties) {
+      patched = patched.replace(
+        endProperties,
+        patchPresentationRunProperties(
+          endProperties,
+          presentationInlineFormattingAt(baseline, 0),
+          presentationInlineFormattingAt(edited, 0),
+        ),
+      );
+    }
+  }
+  return patched;
+}
+
 function presentationParagraphXml(text: PresentationText): string {
-  const alignment = text.align === "center" ? "ctr" : text.align === "right" ? "r" : text.align === "justify" ? "just" : "l";
+  const alignment = presentationAlignmentValue(text.align) || "l";
   const paragraphAttributes = [
     `algn="${alignment}"`,
     text.indent != null ? `marL="${Math.round(Math.max(0, text.indent) * 12_700)}"` : "",
+    text.indentRight != null ? `marR="${Math.round(Math.max(0, text.indentRight) * 12_700)}"` : "",
+    text.hanging != null ? `indent="${Math.round(text.hanging * 12_700)}"` : "",
   ].filter(Boolean).join(" ");
-  const bullet = text.bullet
-    ? text.bullet === "#." || text.bullet === "a." || text.bullet === "i."
-      ? `<a:buAutoNum type="${text.bullet === "a." ? "alphaLcPeriod" : text.bullet === "i." ? "romanLcPeriod" : "arabicPeriod"}"/>`
-      : `<a:buChar char="${escapeXml(text.bullet)}"/>`
-    : "<a:buNone/>";
+  const bullet = presentationBulletXml(text.bullet);
   const spacing = [
     text.lineSpacing != null ? `<a:lnSpc><a:spcPct val="${Math.round(Math.max(0.1, text.lineSpacing) * 100_000)}"/></a:lnSpc>` : "",
     text.spaceBefore != null ? `<a:spcBef><a:spcPts val="${Math.round(Math.max(0, text.spaceBefore) * 100)}"/></a:spcBef>` : "",
     text.spaceAfter != null ? `<a:spcAft><a:spcPts val="${Math.round(Math.max(0, text.spaceAfter) * 100)}"/></a:spcAft>` : "",
   ].join("");
   const runs = text.runs?.length ? text.runs : [{ text: text.text }];
-  const runXml = runs.map((run) => run.text.replace(/\r\n?/g, "\n").split("\n").map((segment, index) => (
+  const runXml = runs.map((run) => normalizeOfficeSoftBreaks(run.text).replace(/\r\n?/g, "\n").split("\n").map((segment, index) => (
     `${index > 0 ? "<a:br/>" : ""}<a:r>${presentationRunProperties(text, run)}<a:t${/^\s|\s$/.test(segment) ? ' xml:space="preserve"' : ""}>${escapeXml(segment)}</a:t></a:r>`
   )).join("")).join("");
   return `<a:p><a:pPr ${paragraphAttributes}>${spacing}${bullet}</a:pPr>${runXml}<a:endParaRPr lang="en-US"/></a:p>`;
 }
 
+/**
+ * The parser leaves rotation/flips undefined when the source omits them while
+ * editors and the AI merge write explicit 0/false — both mean "no transform".
+ */
+function presentationTransformChanged(original: PreservePresentationShape, edited: PreservePresentationShape): boolean {
+  return !sameValue(
+    [original.x, original.y, original.w, original.h, original.rotation || 0, Boolean(original.flipH), Boolean(original.flipV)],
+    [edited.x, edited.y, edited.w, edited.h, edited.rotation || 0, Boolean(edited.flipH), Boolean(edited.flipV)],
+  );
+}
+
 function patchTransform(element: string, shape: PreservePresentationShape, slideWidth: number, slideHeight: number): string {
   const x = Math.round((shape.x / 100) * slideWidth);
   const y = Math.round((shape.y / 100) * slideHeight);
-  const cx = Math.max(1, Math.round((shape.w / 100) * slideWidth));
-  const cy = Math.max(1, Math.round((shape.h / 100) * slideHeight));
+  // Zero extents are valid DrawingML (horizontal/vertical connectors); never inflate them.
+  const cx = Math.max(0, Math.round((shape.w / 100) * slideWidth));
+  const cy = Math.max(0, Math.round((shape.h / 100) * slideHeight));
   const rotation = shape.rotation ? String(Math.round(shape.rotation * 60000)) : undefined;
 
   const patchXfrm = (xfrm: string, prefix: string, coordinatePrefix = prefix) => {
@@ -423,7 +740,7 @@ function decodePresentationText(value: string): string {
 }
 
 function presentationTextXml(templateTag: string, value: string): string {
-  return value.split(/(\n)/).map((token) => {
+  return normalizeOfficeSoftBreaks(value).split(/(\n)/).map((token) => {
     if (token === "\n") return "<a:br/>";
     let opening = templateTag.match(/^<a:t(?:\s[^>]*)?>/)?.[0] || "<a:t>";
     if (/^\s|\s$/.test(token) && !/xml:space=/i.test(opening)) {
@@ -486,7 +803,7 @@ function presentationRunTemplate(token: PresentationTextToken): string {
 }
 
 function presentationRunFragments(template: string, value: string): string {
-  return value.split("\n").map((segment, index) => {
+  return normalizeOfficeSoftBreaks(value).split("\n").map((segment, index) => {
     const lineBreak = index > 0 ? "<a:br/>" : "";
     if (!segment) return lineBreak;
     const textTag = template.match(/<a:t(?:\s[^>]*)?>[\s\S]*?<\/a:t>/i)?.[0];
@@ -604,55 +921,6 @@ function patchPresentationParagraphText(
   ), paragraphXml);
 }
 
-function presentationTextFormatting(text: PresentationText): unknown {
-  const { text: _text, runs: _runs, sourceMap: _sourceMap, ...paragraphFormatting } = text;
-  return paragraphFormatting;
-}
-
-function presentationRunsFollowTextEdit(baseline: PresentationText, edited: PresentationText): boolean {
-  if (!baseline.runs?.length && !edited.runs?.length) return true;
-  if (!baseline.runs?.length || (!edited.runs?.length && edited.text.length > 0)) return false;
-  if (!edited.runs?.length) return edited.text.length === 0;
-  const baselineCharacters = baseline.runs.flatMap((run) => {
-    const { text, ...formatting } = run;
-    return Array.from(text, (character) => ({ character, formatting }));
-  });
-  const editedCharacters = edited.runs.flatMap((run) => {
-    const { text, ...formatting } = run;
-    return Array.from(text, (character) => ({ character, formatting }));
-  });
-  const baselineText = baselineCharacters.map(({ character }) => character).join("");
-  const editedText = editedCharacters.map(({ character }) => character).join("");
-  if (baselineText !== baseline.text || editedText !== edited.text) return false;
-
-  let baselineCursor = 0;
-  let editedCursor = 0;
-  for (const span of presentationTextEditSpansForSource(baseline.text, edited.text, edited.sourceMap)) {
-    const unchangedLength = span.originalStart - baselineCursor;
-    for (let offset = 0; offset < unchangedLength; offset += 1) {
-      if (!sameValue(
-        editedCharacters[editedCursor + offset]?.formatting,
-        baselineCharacters[baselineCursor + offset]?.formatting,
-      )) return false;
-    }
-    const insertedFormatting = baselineCharacters[Math.max(0, span.originalStart - 1)]?.formatting
-      || baselineCharacters[span.originalStart]?.formatting
-      || {};
-    for (let index = span.editedStart; index < span.editedEnd; index += 1) {
-      if (!sameValue(editedCharacters[index]?.formatting, insertedFormatting)) return false;
-    }
-    baselineCursor = span.originalEnd;
-    editedCursor = span.editedEnd;
-  }
-  for (let offset = 0; baselineCursor + offset < baselineCharacters.length; offset += 1) {
-    if (!sameValue(
-      editedCharacters[editedCursor + offset]?.formatting,
-      baselineCharacters[baselineCursor + offset]?.formatting,
-    )) return false;
-  }
-  return true;
-}
-
 function patchTextParagraphs(
   element: string,
   baselineTexts: PresentationText[],
@@ -671,21 +939,210 @@ function patchTextParagraphs(
   const bodyPr = textBody.match(/<a:bodyPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:bodyPr>)/i)?.[0] || "<a:bodyPr/>";
   const listStyle = textBody.match(/<a:lstStyle\b[^>]*(?:\/>|>[\s\S]*?<\/a:lstStyle>)/i)?.[0] || "<a:lstStyle/>";
   const sourceParagraphs = textBody.match(/<a:p[\s>][\s\S]*?<\/a:p>/g) || [];
-  const paragraphs = sourceParagraphs.length === baselineTexts.length && texts.length === baselineTexts.length
-    ? sourceParagraphs.map((paragraph, index) => {
-        const baseline = baselineTexts[index];
-        const edited = texts[index];
-        if (sameValue(baseline, edited)) return paragraph;
-        if (
-          sameValue(presentationTextFormatting(baseline), presentationTextFormatting(edited))
-          && presentationRunsFollowTextEdit(baseline, edited)
-        ) {
-          return patchPresentationParagraphText(paragraph, edited.text, edited);
-        }
-        return presentationParagraphXml(edited);
-      }).join("")
-    : (texts.length ? texts : [{ text: "" }]).map(presentationParagraphXml).join("");
-  return element.replace(textBody, `${openTag}${bodyPr}${listStyle}${paragraphs}</p:txBody>`);
+  let paragraphs: string;
+  if (sourceParagraphs.length === baselineTexts.length && texts.length === baselineTexts.length) {
+    paragraphs = sourceParagraphs.map((paragraph, index) => (
+      patchPresentationSourceParagraph(paragraph, baselineTexts[index], texts[index])
+    )).join("");
+  } else if (sourceParagraphs.length === baselineTexts.length && sourceParagraphs.length > 0) {
+    paragraphs = remapPresentationParagraphs(sourceParagraphs, baselineTexts, texts).join("");
+  } else if (baselineTexts.length === 0 && sourceParagraphs.length > 0) {
+    // An empty text body still carries the placeholder's paragraph and end-run properties.
+    paragraphs = (texts.length ? texts : [{ text: "" }])
+      .map((text) => clonedPresentationParagraphXml(sourceParagraphs[0]!, { text: "" }, text))
+      .join("");
+  } else {
+    paragraphs = (texts.length ? texts : [{ text: "" }]).map(presentationParagraphXml).join("");
+  }
+  const nextTextBody = `${openTag}${bodyPr}${listStyle}${paragraphs}</p:txBody>`;
+  return element.replace(textBody, () => nextTextBody);
+}
+
+function patchPresentationSourceParagraph(
+  paragraphXml: string,
+  baseline: PresentationText,
+  edited: PresentationText,
+): string {
+  if (sameValue(baseline, edited)) return paragraphXml;
+  const textPatched = patchPresentationParagraphText(paragraphXml, edited.text, edited);
+  return patchPresentationParagraphFormatting(textPatched, baseline, edited);
+}
+
+function presentationParagraphIdentity(text: PresentationText): string {
+  const { sourceMap: _sourceMap, ...rest } = text;
+  return JSON.stringify(stableValue(rest));
+}
+
+function presentationParagraphSimilarity(left: string, right: string): number {
+  const a = Array.from(left);
+  const b = Array.from(right);
+  const longest = Math.max(a.length, b.length);
+  if (!longest) return 1;
+  let prefix = 0;
+  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix += 1;
+  let suffix = 0;
+  while (
+    suffix < a.length - prefix
+    && suffix < b.length - prefix
+    && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+  ) suffix += 1;
+  return (prefix + suffix) / longest;
+}
+
+/** Order-preserving pairing of `left` into `right` (left.length <= right.length) maximizing similarity. */
+function alignPresentationParagraphGap(
+  left: number[],
+  right: number[],
+  score: (leftIndex: number, rightIndex: number) => number,
+): Map<number, number> {
+  const rows = left.length;
+  const columns = right.length;
+  const best: number[][] = Array.from({ length: rows + 1 }, () => new Array<number>(columns + 1).fill(-Infinity));
+  for (let column = 0; column <= columns; column += 1) best[0][column] = 0;
+  for (let row = 1; row <= rows; row += 1) {
+    for (let column = row; column <= columns; column += 1) {
+      best[row][column] = Math.max(
+        best[row][column - 1],
+        best[row - 1][column - 1] + score(left[row - 1], right[column - 1]),
+      );
+    }
+  }
+  const pairs = new Map<number, number>();
+  let row = rows;
+  let column = columns;
+  while (row > 0 && column > 0) {
+    if (column > row && best[row][column] === best[row][column - 1]) {
+      column -= 1;
+      continue;
+    }
+    pairs.set(left[row - 1], right[column - 1]);
+    row -= 1;
+    column -= 1;
+  }
+  return pairs;
+}
+
+/** First-run style of a source paragraph, without hyperlinks: new text must not inherit a link target. */
+function presentationParagraphRunTemplate(paragraphXml: string): string {
+  const firstRun = presentationTextTokens(paragraphXml).find((token) => token.kind === "run" || token.kind === "field");
+  let runProperties = firstRun?.raw.match(/<a:rPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:rPr>)/i)?.[0];
+  if (!runProperties) {
+    const endProperties = paragraphXml.match(/<a:endParaRPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:endParaRPr>)/i)?.[0];
+    runProperties = endProperties?.replace(/^<a:endParaRPr\b/i, "<a:rPr").replace(/<\/a:endParaRPr>$/i, "</a:rPr>");
+  }
+  runProperties = (runProperties || "")
+    .replace(/<a:(hlinkClick|hlinkMouseOver)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:\1>)/gi, "")
+    .replace(/<a:rPr\b([^>]*)><\/a:rPr>$/i, "<a:rPr$1/>");
+  return `<a:r>${runProperties}<a:t></a:t></a:r>`;
+}
+
+/**
+ * A new paragraph cloned from a neighbouring source paragraph: it keeps that
+ * paragraph's pPr (level, bullets, alignment, spacing), end-paragraph run
+ * properties and first-run character style, then applies only the model's
+ * explicit differences from the template paragraph.
+ */
+function clonedPresentationParagraphXml(
+  templateXml: string,
+  templateText: PresentationText,
+  edited: PresentationText,
+): string {
+  const parts = presentationParagraphXmlParts(templateXml);
+  const runTemplate = presentationParagraphRunTemplate(templateXml);
+  const runs = edited.runs?.length ? edited.runs : [{ text: edited.text }];
+  const content = runs.map((run) => presentationRunFragments(runTemplate, run.text)).join("");
+  const endProperties = parts.endProperties.replace(
+    /<a:(hlinkClick|hlinkMouseOver)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:\1>)/gi,
+    "",
+  );
+  const skeleton = `${parts.open}${parts.properties}${content}${endProperties}</a:p>`;
+  const firstRun = templateText.runs?.[0];
+  const { runs: _templateRuns, sourceMap: _templateSourceMap, ...templateParagraph } = templateText;
+  const templateBaseline: PresentationText = {
+    ...templateParagraph,
+    ...(firstRun ? Object.fromEntries(PRESENTATION_INLINE_FORMAT_KEYS.map((key) => [key, firstRun[key]])) : {}),
+    text: edited.text,
+  };
+  const { sourceMap: _editedSourceMap, ...editedParagraph } = edited;
+  return patchPresentationParagraphFormatting(skeleton, templateBaseline, editedParagraph);
+}
+
+/**
+ * Paragraph count changed: keep untouched source paragraphs verbatim (fields,
+ * hyperlinks, East-Asian fonts, highlight, language all survive), patch the
+ * paragraphs that were edited in place, and clone new paragraphs from their
+ * nearest source neighbour instead of regenerating the whole text body.
+ */
+function remapPresentationParagraphs(
+  sourceParagraphs: string[],
+  baselineTexts: PresentationText[],
+  texts: PresentationText[],
+): string[] {
+  const edited = texts.length ? texts : [{ ...baselineTexts[0], text: "", runs: undefined, sourceMap: undefined }];
+  const baselineKeys = baselineTexts.map(presentationParagraphIdentity);
+  const editedKeys = edited.map(presentationParagraphIdentity);
+  const lcs: number[][] = Array.from({ length: baselineKeys.length + 1 }, () => new Array<number>(editedKeys.length + 1).fill(0));
+  for (let row = baselineKeys.length - 1; row >= 0; row -= 1) {
+    for (let column = editedKeys.length - 1; column >= 0; column -= 1) {
+      lcs[row][column] = baselineKeys[row] === editedKeys[column]
+        ? lcs[row + 1][column + 1] + 1
+        : Math.max(lcs[row + 1][column], lcs[row][column + 1]);
+    }
+  }
+  const sourceForEdited = new Map<number, number>();
+  const verbatim = new Set<number>();
+  const anchors: Array<[number, number]> = [];
+  for (let row = 0, column = 0; row < baselineKeys.length && column < editedKeys.length;) {
+    if (baselineKeys[row] === editedKeys[column]) {
+      anchors.push([row, column]);
+      row += 1;
+      column += 1;
+    } else if (lcs[row + 1][column] >= lcs[row][column + 1]) row += 1;
+    else column += 1;
+  }
+  for (const [row, column] of anchors) {
+    sourceForEdited.set(column, row);
+    verbatim.add(column);
+  }
+  const bounds: Array<[number, number]> = [[-1, -1], ...anchors, [baselineKeys.length, editedKeys.length]];
+  for (let index = 0; index + 1 < bounds.length; index += 1) {
+    const baselineGap: number[] = [];
+    const editedGap: number[] = [];
+    for (let row = bounds[index][0] + 1; row < bounds[index + 1][0]; row += 1) baselineGap.push(row);
+    for (let column = bounds[index][1] + 1; column < bounds[index + 1][1]; column += 1) editedGap.push(column);
+    if (!baselineGap.length || !editedGap.length) continue;
+    const similarity = (row: number, column: number) => presentationParagraphSimilarity(baselineTexts[row].text, edited[column].text);
+    if (baselineGap.length <= editedGap.length) {
+      for (const [row, column] of alignPresentationParagraphGap(baselineGap, editedGap, similarity)) {
+        sourceForEdited.set(column, row);
+      }
+    } else {
+      for (const [column, row] of alignPresentationParagraphGap(editedGap, baselineGap, (left, right) => similarity(right, left))) {
+        sourceForEdited.set(column, row);
+      }
+    }
+  }
+  const templateFor = (column: number): number => {
+    for (let previous = column - 1; previous >= 0; previous -= 1) {
+      const row = sourceForEdited.get(previous);
+      if (row != null) return row;
+    }
+    for (let next = column + 1; next < edited.length; next += 1) {
+      const row = sourceForEdited.get(next);
+      if (row != null) return row;
+    }
+    return 0;
+  };
+  return edited.map((paragraph, column) => {
+    const row = sourceForEdited.get(column);
+    if (row != null) {
+      if (verbatim.has(column)) return sourceParagraphs[row];
+      const { sourceMap: _sourceMap, ...unmapped } = paragraph;
+      return patchPresentationSourceParagraph(sourceParagraphs[row], baselineTexts[row], unmapped);
+    }
+    const templateRow = templateFor(column);
+    return clonedPresentationParagraphXml(sourceParagraphs[templateRow], baselineTexts[templateRow], paragraph);
+  });
 }
 
 interface PresentationParagraphRecord {
@@ -823,7 +1280,10 @@ function patchTableCellTextBody(
 
     const replacement = [
       { xml: firstXml, text: firstText },
-      ...insertedParagraphs.slice(1, -1).map((text) => ({ xml: presentationParagraphXml({ text }), text })),
+      ...insertedParagraphs.slice(1, -1).map((text) => ({
+        xml: clonedPresentationParagraphXml(first.xml, { text: first.text }, { text }),
+        text,
+      })),
       { xml: lastXml, text: lastText },
     ];
     paragraphs.splice(start.index, end.index - start.index + 1, ...replacement);
@@ -854,10 +1314,15 @@ function patchTableCells(
     const textBody = cellXml.match(/<a:txBody\b[^>]*>[\s\S]*?<\/a:txBody>/i)?.[0];
     if (!textBody) throw new PresentationPreservationError("This table cell has no editable OOXML text body.");
     const baselineCell = baselineCells[index];
-    let patched = cellXml.replace(
-      textBody,
-      patchTableCellTextBody(textBody, baselineCell.text, cell.text, cell.sourceMap),
+    const textFormattingChanged = !sameValue(
+      [baselineCell.bold, baselineCell.italic, baselineCell.fontSize, baselineCell.fontFamily, baselineCell.color],
+      [cell.bold, cell.italic, cell.fontSize, cell.fontFamily, cell.color],
     );
+    let patchedTextBody = patchTableCellTextBody(textBody, baselineCell.text, cell.text, cell.sourceMap);
+    if (textFormattingChanged) {
+      patchedTextBody = patchTableCellTextFormatting(patchedTextBody, baselineCell, cell);
+    }
+    let patched = cellXml.replace(textBody, patchedTextBody);
     if (baselineCell.fill !== cell.fill) {
       const tcPr = patched.match(/<a:tcPr\b[^>]*(?:\/>|>[\s\S]*?<\/a:tcPr>)/i)?.[0];
       if (tcPr) {
@@ -869,11 +1334,100 @@ function patchTableCells(
   });
 }
 
+function patchDirectRunProperty(
+  properties: string,
+  pattern: RegExp,
+  replacement: string,
+  following: RegExp,
+): string {
+  const children = shapePropertyChildren(properties);
+  const existing = children.find((child) => child.xml.search(pattern) === 0);
+  if (existing) {
+    return `${properties.slice(0, existing.start)}${replacement}${properties.slice(existing.end)}`;
+  }
+  if (!replacement) return properties;
+  const next = children.find((child) => child.xml.search(following) === 0);
+  if (next) return `${properties.slice(0, next.start)}${replacement}${properties.slice(next.start)}`;
+  return properties.replace(/<\/a:(?:rPr|endParaRPr)>\s*$/i, `${replacement}$&`);
+}
+
+function patchTableCellRunProperties(
+  properties: string,
+  baseline: PresentationTableCell,
+  cell: PresentationTableCell,
+): string {
+  const tag = properties.match(/^<a:(rPr|endParaRPr)\b/i)?.[1];
+  if (!tag) return properties;
+  let patched = properties.replace(/\/>\s*$/, `></a:${tag}>`);
+  let opening = patched.match(/^<a:(?:rPr|endParaRPr)\b[^>]*>/i)?.[0];
+  if (!opening) return properties;
+  for (const [key, attribute] of [["bold", "b"], ["italic", "i"]] as const) {
+    if (baseline[key] === cell[key]) continue;
+    opening = setXmlAttribute(opening, attribute, cell[key] == null ? undefined : cell[key] ? "1" : "0");
+  }
+  if (baseline.fontSize !== cell.fontSize) {
+    opening = setXmlAttribute(
+      opening,
+      "sz",
+      cell.fontSize == null ? undefined : String(Math.round(Math.max(1, cell.fontSize) * 100)),
+    );
+  }
+  patched = patched.replace(/^<a:(?:rPr|endParaRPr)\b[^>]*>/i, opening);
+  if (baseline.color !== cell.color) {
+    const fill = cell.color ? `<a:solidFill>${presentationColorXml(cell.color)}</a:solidFill>` : "";
+    patched = patchDirectRunProperty(
+      patched,
+      /<a:(?:noFill|solidFill|gradFill|pattFill|grpFill)\b/i,
+      fill,
+      /<a:(?:effectLst|effectDag|highlight|uLnTx|uLn|uFillTx|uFill|latin|ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
+    );
+  }
+  if (baseline.fontFamily !== cell.fontFamily) {
+    const latin = cell.fontFamily ? `<a:latin typeface="${escapeXml(cell.fontFamily)}"/>` : "";
+    patched = patchDirectRunProperty(
+      patched,
+      /<a:latin\b/i,
+      latin,
+      /<a:(?:ea|cs|sym|hlinkClick|hlinkMouseOver|rtl|extLst)\b/i,
+    );
+  }
+  return patched;
+}
+
+function patchTableCellTextFormatting(
+  textBody: string,
+  baseline: PresentationTableCell,
+  cell: PresentationTableCell,
+): string {
+  let patched = textBody.replace(
+    /<a:(rPr|endParaRPr)\b[^>]*(?:\/>|>[\s\S]*?<\/a:\1>)/gi,
+    (properties) => patchTableCellRunProperties(properties, baseline, cell),
+  );
+  patched = patched.replace(/<a:(r|fld)\b[^>]*>[\s\S]*?<\/a:\1>/gi, (run) => {
+    if (/<a:rPr\b/i.test(run)) return run;
+    const properties = patchTableCellRunProperties("<a:rPr/>", baseline, cell);
+    return run.replace(/^<a:(?:r|fld)\b[^>]*>/i, `$&${properties}`);
+  });
+  return patched.replace(/<a:p\b[^>]*>[\s\S]*?<\/a:p>/gi, (paragraph) => {
+    if (/<a:endParaRPr\b/i.test(paragraph)) return paragraph;
+    const properties = patchTableCellRunProperties("<a:endParaRPr/>", baseline, cell);
+    return paragraph.replace(/<\/a:p>\s*$/i, `${properties}</a:p>`);
+  });
+}
+
 function patchDirectTableCellFill(tableCellProperties: string, replacement: string): string {
-  const pattern = /<a:(?:noFill|solidFill|gradFill|pattFill)\b[^>]*(?:\/>|>[\s\S]*?<\/a:(?:solidFill|gradFill|pattFill)>)/i;
-  if (pattern.test(tableCellProperties)) return tableCellProperties.replace(pattern, replacement);
+  const pattern = /<a:(?:noFill|solidFill|gradFill|blipFill|pattFill|grpFill)\b/i;
+  const children = shapePropertyChildren(tableCellProperties);
+  const existing = children.find((child) => child.xml.search(pattern) === 0);
+  if (existing) {
+    return `${tableCellProperties.slice(0, existing.start)}${replacement}${tableCellProperties.slice(existing.end)}`;
+  }
   if (/\/>\s*$/i.test(tableCellProperties)) {
     return tableCellProperties.replace(/\/>\s*$/i, `>${replacement}</a:tcPr>`);
+  }
+  const extension = children.find((child) => child.xml.search(/<a:extLst\b/i) === 0);
+  if (extension) {
+    return `${tableCellProperties.slice(0, extension.start)}${replacement}${tableCellProperties.slice(extension.start)}`;
   }
   return tableCellProperties.replace(/<\/a:tcPr>\s*$/i, `${replacement}</a:tcPr>`);
 }
@@ -887,7 +1441,7 @@ function replaceSourceObject(
   let found = false;
   const patched = slideXml.replace(pattern, (element) => {
     const cNvPr = element.match(/<p:cNvPr\b[^>]*\/?\s*>/)?.[0];
-    const objectId = cNvPr?.match(/\bid="([^"]+)"/i)?.[1];
+    const objectId = cNvPr?.match(/\sid="([^"]+)"/i)?.[1];
     if (objectId !== source.objectId) return element;
     found = true;
     return update(element);
@@ -916,9 +1470,14 @@ async function newImagePayload(url: string): Promise<{ bytes: Uint8Array; mime: 
     for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
     return { bytes, mime, extension: imageExtensionForMime(mime) };
   }
-  const response = await fetch(url);
-  if (!response.ok) throw new PresentationPreservationError(`Unable to read the inserted image (${response.status}).`);
-  blob = await response.blob();
+  try {
+    blob = await readObjectUrlBlob(url);
+  } catch (error) {
+    if (error instanceof ObjectUrlReadError) {
+      throw new PresentationPreservationError(`Unable to read the inserted image (${error.status}).`);
+    }
+    throw error;
+  }
   const mime = blob.type.toLowerCase();
   if (!mime.startsWith("image/")) throw new PresentationPreservationError("The inserted object is not an image.");
   return {
@@ -936,7 +1495,7 @@ function relationshipPartForSlide(slidePart: string): string {
 }
 
 function nextRelationshipId(relationshipsXml: string): string {
-  const ids = Array.from(relationshipsXml.matchAll(/\bId="rId(\d+)"/g), (match) => Number(match[1]));
+  const ids = Array.from(relationshipsXml.matchAll(/\sId="rId(\d+)"/g), (match) => Number(match[1]));
   return `rId${Math.max(0, ...ids) + 1}`;
 }
 
@@ -999,7 +1558,7 @@ function pictureObjectXml(
 }
 
 function nextObjectId(slideXml: string): number {
-  const ids = Array.from(slideXml.matchAll(/<p:cNvPr\b[^>]*\bid="(\d+)"/g), (match) => Number(match[1]));
+  const ids = Array.from(slideXml.matchAll(/<p:cNvPr\b[^>]*\sid="(\d+)"/g), (match) => Number(match[1]));
   return Math.max(1, ...ids) + 1;
 }
 
@@ -1015,7 +1574,7 @@ function transformXml(shape: PreservePresentationShape, slideWidth: number, slid
 function bodyPropertiesXml(shape: PreservePresentationShape): string {
   const anchor = shape.vAlign === "middle" ? "ctr" : shape.vAlign === "bottom" ? "b" : "t";
   const padding = shape.padding;
-  return `<a:bodyPr wrap="square" anchor="${anchor}"${padding ? ` lIns="${Math.round(padding.l * 12_700)}" tIns="${Math.round(padding.t * 12_700)}" rIns="${Math.round(padding.r * 12_700)}" bIns="${Math.round(padding.b * 12_700)}"` : ""}/>`;
+  return `<a:bodyPr wrap="${shape.wordWrap === false ? "none" : "square"}" anchor="${anchor}"${padding ? ` lIns="${Math.round(padding.l * 12_700)}" tIns="${Math.round(padding.t * 12_700)}" rIns="${Math.round(padding.r * 12_700)}" bIns="${Math.round(padding.b * 12_700)}"` : ""}/>`;
 }
 
 function shapeObjectXml(
@@ -1032,7 +1591,7 @@ function shapeObjectXml(
   const paragraphs = (shape.texts.length ? shape.texts : [{ text: "" }]).map(presentationParagraphXml).join("");
   return [
     "<p:sp>",
-    `<p:nvSpPr><p:cNvPr id="${objectId}" name="Manor object ${objectId}">${hyperlinkRelationshipId ? `<a:hlinkClick r:id="${hyperlinkRelationshipId}"/>` : ""}</p:cNvPr><p:cNvSpPr/><p:nvPr/></p:nvSpPr>`,
+    `<p:nvSpPr><p:cNvPr id="${objectId}" name="Manor object ${objectId}">${hyperlinkRelationshipId ? `<a:hlinkClick r:id="${hyperlinkRelationshipId}"/>` : ""}</p:cNvPr><p:cNvSpPr${shape.type === "textbox" ? ' txBox="1"' : ""}/><p:nvPr/></p:nvSpPr>`,
     `<p:spPr>${transformXml(shape, slideWidth, slideHeight)}${geometry}${presentationFillXml(shape)}${presentationLineXml(shape)}${effect}</p:spPr>`,
     `<p:txBody>${bodyPropertiesXml(shape)}<a:lstStyle/>${paragraphs}</p:txBody>`,
     "</p:sp>",
@@ -1042,7 +1601,7 @@ function shapeObjectXml(
 function tableCellXml(cell: PresentationTableCell): string {
   const attributes = `${cell.gridSpan && cell.gridSpan > 1 ? ` gridSpan="${cell.gridSpan}"` : ""}${cell.vMerge ? ' vMerge="1"' : ""}`;
   const fill = cell.fill ? `<a:solidFill>${presentationColorXml(cell.fill)}</a:solidFill>` : "<a:noFill/>";
-  return `<a:tc${attributes}><a:txBody><a:bodyPr/><a:lstStyle/>${presentationParagraphXml({ text: cell.text, bold: cell.bold, color: cell.color })}</a:txBody><a:tcPr>${fill}</a:tcPr></a:tc>`;
+  return `<a:tc${attributes}><a:txBody><a:bodyPr/><a:lstStyle/>${presentationParagraphXml({ text: cell.text, bold: cell.bold, italic: cell.italic, fontSize: cell.fontSize, fontFamily: cell.fontFamily, color: cell.color })}</a:txBody><a:tcPr>${fill}</a:tcPr></a:tc>`;
 }
 
 function tableObjectXml(
@@ -1062,9 +1621,14 @@ function tableObjectXml(
   const gridWidths = sourceColumnWidths.length === columnCount && totalSourceColumnWidth > 0
     ? sourceColumnWidths.map((value) => Math.max(1, Math.round((Math.max(0, Number(value) || 0) / totalSourceColumnWidth) * width)))
     : Array.from({ length: columnCount }, () => columnWidth);
+  const sourceRowHeights = shape.tableRowHeights || [];
+  const totalSourceRowHeight = sourceRowHeights.reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0);
+  const rowHeights = sourceRowHeights.length === rows.length && totalSourceRowHeight > 0
+    ? sourceRowHeights.map((value) => Math.max(1, Math.round((Math.max(0, Number(value) || 0) / totalSourceRowHeight) * height)))
+    : Array.from({ length: Math.max(1, rows.length) }, () => rowHeight);
   const grid = gridWidths.map((gridWidth) => `<a:gridCol w="${gridWidth}"/>`).join("");
   const rowXml = (rows.length ? rows : [[{ text: "" }]])
-    .map((row) => `<a:tr h="${rowHeight}">${row.map(tableCellXml).join("")}</a:tr>`)
+    .map((row, rowIndex) => `<a:tr h="${rowHeights[rowIndex] || rowHeight}">${row.map(tableCellXml).join("")}</a:tr>`)
     .join("");
   return [
     "<p:graphicFrame>",
@@ -1083,7 +1647,7 @@ function sourceObjectPattern(source: PresentationShapeSource): RegExp {
 function takeSourceObject(slideXml: string, source: PresentationShapeSource): { xml: string; object?: string } {
   let object: string | undefined;
   const xml = slideXml.replace(sourceObjectPattern(source), (element) => {
-    const id = element.match(/<p:cNvPr\b[^>]*\bid="([^"]+)"/i)?.[1];
+    const id = element.match(/<p:cNvPr\b[^>]*\sid="([^"]+)"/i)?.[1];
     if (id !== source.objectId || object) return element;
     object = element;
     return "";
@@ -1141,7 +1705,7 @@ function materializeInheritedSlideObjects(
 function presentationGroupContainerObjectIds(groupXml: string): Set<string> {
   return new Set(Array.from(
     groupXml.matchAll(/<p:nvGrpSpPr\b[^>]*>[\s\S]*?<\/p:nvGrpSpPr>/gi),
-    (properties) => properties[0].match(/<p:cNvPr\b[^>]*\bid="([^"]+)"/i)?.[1],
+    (properties) => properties[0].match(/<p:cNvPr\b[^>]*\sid="([^"]+)"/i)?.[1],
   ).filter((id): id is string => Boolean(id)));
 }
 
@@ -1177,7 +1741,7 @@ function reorderPresentationGroupMembers(groupXml: string, orderByObjectId: Map<
     (match) => {
       const start = match.index || 0;
       const xml = content.slice(start, start + match[0].length);
-      const objectId = xml.match(/<p:cNvPr\b[^>]*\bid="([^"]+)"/i)?.[1];
+      const objectId = xml.match(/<p:cNvPr\b[^>]*\sid="([^"]+)"/i)?.[1];
       return {
         start,
         end: start + match[0].length,
@@ -1211,6 +1775,25 @@ function reorderPresentationGroupMembers(groupXml: string, orderByObjectId: Map<
   return `${groupXml.slice(0, openingEnd + 1)}${output}${groupXml.slice(closingStart)}`;
 }
 
+/**
+ * CT_Presentation orders its children sldMasterIdLst, notesMasterIdLst,
+ * handoutMasterIdLst, sldIdLst, sldSz, ... — insert right after the slide
+ * master list, or before the first later sibling when there is none.
+ */
+function insertPresentationNotesMasterIdList(presentationXml: string, notesMasterIdList: string): string {
+  if (/<p:notesMasterIdLst\b/.test(presentationXml)) return presentationXml;
+  const masterList = presentationXml.match(/<p:sldMasterIdLst\b[^>]*(?:\/>|>[\s\S]*?<\/p:sldMasterIdLst>)/);
+  if (masterList?.index != null) {
+    const end = masterList.index + masterList[0].length;
+    return `${presentationXml.slice(0, end)}${notesMasterIdList}${presentationXml.slice(end)}`;
+  }
+  const following = presentationXml.search(
+    /<p:(?:handoutMasterIdLst|sldIdLst|sldSz|notesSz|smartTags|embeddedFontLst|custShowLst|photoAlbum|custDataLst|kinsoku|defaultTextStyle|modifyVerifier|extLst)\b/,
+  );
+  if (following >= 0) return `${presentationXml.slice(0, following)}${notesMasterIdList}${presentationXml.slice(following)}`;
+  return presentationXml.replace(/<\/p:presentation>\s*$/i, `${notesMasterIdList}</p:presentation>`);
+}
+
 function parseSlideSize(presentationXml: string): { width: number; height: number } {
   const match = presentationXml.match(/<p:sldSz\b[^>]*\bcx="(\d+)"[^>]*\bcy="(\d+)"/i);
   return match
@@ -1226,7 +1809,7 @@ function patchSpeakerNotes(notesXml: string, notes: string): string {
   if (!textBody) throw new PresentationPreservationError("This slide has no editable speaker-notes text body.");
   const bodyPr = textBody.match(/<a:bodyPr\b[^>]*\/?\s*>/i)?.[0] || "<a:bodyPr/>";
   const listStyle = textBody.match(/<a:lstStyle\b[^>]*>[\s\S]*?<\/a:lstStyle>|<a:lstStyle\b[^>]*\/>/i)?.[0] || "<a:lstStyle/>";
-  const paragraphs = (notes.split(/\r?\n/) || [""])
+  const paragraphs = (normalizeOfficeSoftBreaks(notes).split(/\r?\n/) || [""])
     .map((line) => `<a:p><a:r><a:rPr lang="en-US"/><a:t>${escapeXml(line)}</a:t></a:r><a:endParaRPr lang="en-US"/></a:p>`)
     .join("");
   const nextTextBody = `<p:txBody>${bodyPr}${listStyle}${paragraphs}</p:txBody>`;
@@ -1249,8 +1832,20 @@ function relationships(relationshipsXml: string): string[] {
   return relationshipsXml.match(/<Relationship\b[^>]*\/>/g) || [];
 }
 
+/**
+ * Reads one attribute by its exact qualified name. The name must be preceded
+ * by whitespace so `id` never matches the tail of `r:id` (a word boundary sits
+ * right after the colon), and XML attribute names are case-sensitive.
+ */
+function xmlAttribute(tagXml: string, name: string): string | undefined {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = tagXml.match(new RegExp(`\\s${escapedName}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`));
+  const value = match ? (match[1] ?? match[2]) : undefined;
+  return value ? decodePresentationText(value) : undefined;
+}
+
 function relationshipAttribute(relationshipXml: string, name: string): string | undefined {
-  return relationshipXml.match(new RegExp(`\\b${name}="([^"]+)"`, "i"))?.[1];
+  return xmlAttribute(relationshipXml, name);
 }
 
 function pruneUnusedSlideObjectRelationships(
@@ -1372,6 +1967,34 @@ function removePartOverride(contentTypesXml: string, part: string): string {
 }
 
 function ensureCompatibleShapeChange(baseline: PreservePresentationShape, edited: PreservePresentationShape) {
+  if (baseline.source?.kind !== "pic" && baseline.opacity !== edited.opacity) {
+    throw new PresentationPreservationError(
+      "Opacity can only be edited on native presentation pictures.",
+    );
+  }
+  if (baseline.source?.kind === "graphicFrame") {
+    const formattingKeys: Array<keyof PreservePresentationShape> = [
+      "fill",
+      "gradFill",
+      "stroke",
+      "strokeWidth",
+      "strokeDash",
+      "presetGeom",
+      "borderRadius",
+      "shadow",
+      "vAlign",
+      "padding",
+      "wordWrap",
+    ];
+    if (!sameValue(
+      formattingKeys.map((key) => baseline[key]),
+      formattingKeys.map((key) => edited[key]),
+    )) {
+      throw new PresentationPreservationError(
+        "Table and chart frames must use their dedicated native formatting operations.",
+      );
+    }
+  }
   const baselineCells = baseline.tableRows?.flat() || [];
   const editedCells = edited.tableRows?.flat() || [];
   if (baselineCells.length !== editedCells.length) {
@@ -1384,6 +2007,184 @@ function ensureCompatibleShapeChange(baseline: PreservePresentationShape, edited
       throw new PresentationPreservationError("Changing this presentation table structure is not supported yet.");
     }
   }
+}
+
+/** Relationship types whose targets are owned by (and edited with) a single object. */
+function isPerObjectRelationship(relationshipXml: string): boolean {
+  if (/\sTargetMode\s*=\s*"External"/.test(relationshipXml)) return false;
+  const type = relationshipAttribute(relationshipXml, "Type") || "";
+  return !/\/(?:image|audio|video|media|hyperlink|slide|slideLayout|slideMaster|notesSlide|notesMaster|handoutMaster|theme|font|customXml|tags|vmlDrawing)$/i.test(type);
+}
+
+function nextSiblingPartName(existingParts: string[], part: string): string {
+  const match = part.match(/^(.*\/)?(.*?)(\d*)(\.[^./]+)?$/);
+  const directory = match?.[1] || "";
+  const stem = match?.[2] || "part";
+  const extension = match?.[4] || "";
+  const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`^${escape(directory)}${escape(stem)}(\\d*)${escape(extension)}$`, "i");
+  const used = new Set(existingParts.map((path) => path.toLowerCase()));
+  let index = Math.max(0, ...existingParts.map((path) => Number(path.match(pattern)?.[1] || 0))) + 1;
+  while (used.has(`${directory}${stem}${index}${extension}`.toLowerCase())) index += 1;
+  return `${directory}${stem}${index}${extension}`;
+}
+
+function retargetedPartName(target: string, copiedPart: string): string {
+  const fileName = copiedPart.split("/").pop() || copiedPart;
+  const separator = target.lastIndexOf("/");
+  return separator >= 0 ? `${target.slice(0, separator + 1)}${fileName}` : fileName;
+}
+
+function partOverrideContentType(contentTypesXml: string, part: string): string | undefined {
+  const escapedPart = `/${part}`.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const override = contentTypesXml.match(new RegExp(`<Override\\b[^>]*\\sPartName="${escapedPart}"[^>]*\\/>`, "i"))?.[0];
+  return override ? relationshipAttribute(override, "ContentType") : undefined;
+}
+
+const PRECOMPRESSED_MEDIA_MIME = /^(?:image\/(?:png|jpeg|gif|webp)|video\/|audio\/(?:mpeg|mp4|aac|ogg))/i;
+
+/** Already-compressed media gains nothing from DEFLATE; store it to keep saves cheap. */
+function presentationMediaCompression(mime: string): { compression: "STORE" | "DEFLATE" } {
+  return { compression: PRECOMPRESSED_MEDIA_MIME.test(mime) ? "STORE" : "DEFLATE" };
+}
+
+/**
+ * p14:sectionLst lists slide ids per section, and the concatenation of the
+ * sections must equal sldIdLst. Deleted ids are dropped (empty sections are
+ * kept — PowerPoint allows them), a new slide joins its preceding slide's
+ * section, and a reorder that would split a section keeps the longest
+ * in-order run of memberships and moves the stragglers into the section of
+ * the slide they now follow.
+ */
+function patchPresentationSections(presentationXml: string, orderedSlideIds: string[]): string {
+  const sectionListMatch = presentationXml.match(/<([A-Za-z_][\w.-]*):sectionLst\b[^>]*>[\s\S]*?<\/\1:sectionLst>/);
+  if (!sectionListMatch) return presentationXml;
+  const sectionList = sectionListMatch[0];
+  const sections = Array.from(
+    sectionList.matchAll(/<([A-Za-z_][\w.-]*):section\b[^>]*?(?:\/>|>[\s\S]*?<\/\1:section>)/g),
+    (match) => ({
+      xml: match[0],
+      prefix: match[1],
+      slideIds: Array.from(
+        match[0].matchAll(/<[A-Za-z_][\w.-]*:sldId\b[^>]*?\sid\s*=\s*["'](\d+)["']/g),
+        (slideId) => slideId[1],
+      ),
+    }),
+  );
+  if (!sections.length) return presentationXml;
+  const sectionBySlideId = new Map<string, number>();
+  sections.forEach((section, index) => {
+    for (const slideId of section.slideIds) {
+      if (!sectionBySlideId.has(slideId)) sectionBySlideId.set(slideId, index);
+    }
+  });
+  const known = orderedSlideIds.map((slideId) => sectionBySlideId.get(slideId));
+  // Longest non-decreasing subsequence of the surviving memberships.
+  const length = known.map(() => 0);
+  const previous = known.map(() => -1);
+  let bestEnd = -1;
+  known.forEach((section, index) => {
+    if (section == null) return;
+    length[index] = 1;
+    for (let candidate = 0; candidate < index; candidate += 1) {
+      const candidateSection = known[candidate];
+      if (candidateSection == null || candidateSection > section) continue;
+      if (length[candidate] + 1 > length[index]) {
+        length[index] = length[candidate] + 1;
+        previous[index] = candidate;
+      }
+    }
+    if (bestEnd < 0 || length[index] > length[bestEnd]) bestEnd = index;
+  });
+  const stable = new Set<number>();
+  for (let index = bestEnd; index >= 0; index = previous[index]) stable.add(index);
+  const firstStable = [...stable].sort((left, right) => left - right)[0];
+  const assigned: number[] = [];
+  orderedSlideIds.forEach((_slideId, index) => {
+    if (stable.has(index)) assigned.push(known[index]!);
+    else if (index > 0) assigned.push(assigned[index - 1]);
+    else assigned.push(firstStable != null ? known[firstStable]! : 0);
+  });
+  const nextMembers = sections.map(() => [] as string[]);
+  orderedSlideIds.forEach((slideId, index) => nextMembers[assigned[index]].push(slideId));
+  if (sections.every((section, index) => sameValue(section.slideIds, nextMembers[index]))) return presentationXml;
+  let nextSectionList = sectionList;
+  sections.forEach((section, index) => {
+    const prefix = section.prefix;
+    const members = nextMembers[index].map((slideId) => `<${prefix}:sldId id="${slideId}"/>`).join("");
+    const slideIdList = members ? `<${prefix}:sldIdLst>${members}</${prefix}:sldIdLst>` : `<${prefix}:sldIdLst/>`;
+    const listPattern = /<([A-Za-z_][\w.-]*):sldIdLst\b[^>]*?(?:\/>|>[\s\S]*?<\/\1:sldIdLst>)/;
+    let nextSection: string;
+    if (listPattern.test(section.xml)) nextSection = section.xml.replace(listPattern, () => slideIdList);
+    else if (section.xml.endsWith("/>")) nextSection = section.xml.replace(/\s*\/>$/, () => `>${slideIdList}</${prefix}:section>`);
+    else nextSection = section.xml.replace(/^<[^>]*>/, (opening) => `${opening}${slideIdList}`);
+    nextSectionList = nextSectionList.replace(section.xml, () => nextSection);
+  });
+  return presentationXml.replace(sectionList, () => nextSectionList);
+}
+
+function sourcePartForRelationshipsPart(relationshipsPart: string): string | undefined {
+  const match = relationshipsPart.match(/^(.*?)(?:^|\/)_rels\/([^/]+)\.rels$/);
+  if (!match) return undefined;
+  return `${match[1] ? `${match[1]}/` : ""}${match[2]}`;
+}
+
+function removeRelationshipReferences(xml: string, relationshipIds: Set<string>): string {
+  if (!relationshipIds.size) return xml;
+  const referencesRemoved = (tag: string) => {
+    const relationshipId = xmlAttribute(tag, "r:id");
+    return relationshipId != null && relationshipIds.has(relationshipId);
+  };
+  return xml
+    .replace(/<a:(hlinkClick|hlinkMouseOver|hlinkHover)\b[^>]*?(?:\/>|>[\s\S]*?<\/a:\1>)/g, (element) => {
+      const opening = element.match(/^<[^>]*>/)?.[0] || element;
+      return referencesRemoved(opening) ? "" : element;
+    })
+    .replace(/<p:sld\b[^>]*\/>/g, (element) => (referencesRemoved(element) ? "" : element));
+}
+
+/**
+ * Other slides, notes, layouts and masters may carry hlinksldjump links to a
+ * deleted slide. Drop those relationships and the hyperlink elements using
+ * them so the deleted part is truly unreferenced (and then removed).
+ */
+async function removeSlideJumpRelationships(
+  zip: {
+    files: Record<string, { dir?: boolean }>;
+    file(path: string): { async(type: "text"): Promise<string> } | null;
+    file(path: string, data: string): unknown;
+  },
+  deletedSlideParts: Set<string>,
+): Promise<void> {
+  for (const relationshipsPart of Object.keys(zip.files)) {
+    if (zip.files[relationshipsPart]?.dir || !relationshipsPart.endsWith(".rels")) continue;
+    const sourcePart = sourcePartForRelationshipsPart(relationshipsPart);
+    if (!sourcePart || sourcePart === "ppt/presentation.xml" || deletedSlideParts.has(sourcePart)) continue;
+    const relationshipsEntry = zip.file(relationshipsPart);
+    if (!relationshipsEntry) continue;
+    const relationshipsXml = await relationshipsEntry.async("text");
+    const removedIds = new Set<string>();
+    const nextRelationshipsXml = relationshipsXml.replace(/<Relationship\b[^>]*\/>/g, (relationship) => {
+      const type = relationshipAttribute(relationship, "Type") || "";
+      const target = relationshipAttribute(relationship, "Target");
+      const id = relationshipAttribute(relationship, "Id");
+      if (!type.endsWith("/slide") || !target || !id || /\sTargetMode="External"/.test(relationship)) return relationship;
+      if (!deletedSlideParts.has(resolvePackageTarget(sourcePart, target))) return relationship;
+      removedIds.add(id);
+      return "";
+    });
+    if (!removedIds.size) continue;
+    zip.file(relationshipsPart, nextRelationshipsXml);
+    const sourceEntry = zip.file(sourcePart);
+    if (sourceEntry) zip.file(sourcePart, removeRelationshipReferences(await sourceEntry.async("text"), removedIds));
+  }
+}
+
+function removeCustomShowSlides(presentationXml: string, relationshipIds: Set<string>): string {
+  if (!relationshipIds.size) return presentationXml;
+  return presentationXml.replace(/<p:custShowLst\b[\s\S]*?<\/p:custShowLst>/, (customShows) => (
+    removeRelationshipReferences(customShows, relationshipIds)
+  ));
 }
 
 export async function preservePresentationFileWithSnapshot(
@@ -1476,11 +2277,7 @@ export async function preservePresentationFileWithSnapshot(
     const relationship = `<Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesMaster" Target="notesMasters/${notesMasterPart.split("/").pop()}"/>`;
     presentationRelationshipsXml = presentationRelationshipsXml.replace(/<\/Relationships>\s*$/i, `${relationship}</Relationships>`);
     const notesMasterId = `<p:notesMasterIdLst><p:notesMasterId r:id="${relationshipId}"/></p:notesMasterIdLst>`;
-    if (/<p:sldIdLst\b/i.test(presentationXml)) {
-      presentationXml = presentationXml.replace(/<p:sldIdLst\b/i, `${notesMasterId}<p:sldIdLst`);
-    } else {
-      presentationXml = presentationXml.replace(/<\/p:presentation>\s*$/i, `${notesMasterId}</p:presentation>`);
-    }
+    presentationXml = insertPresentationNotesMasterIdList(presentationXml, notesMasterId);
     return notesMasterPart;
   };
 
@@ -1529,6 +2326,95 @@ export async function preservePresentationFileWithSnapshot(
     const notesRelationship = `<Relationship Id="${relationshipId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/notesSlide" Target="../notesSlides/${notesPart.split("/").pop()}"/>`;
     edited.notesPart = notesPart;
     return slideRelationshipsXml.replace(/<\/Relationships>\s*$/i, `${notesRelationship}</Relationships>`);
+  };
+
+  /**
+   * Chart, SmartArt and OLE frames point at parts that belong to exactly one
+   * object. A copied frame gets its own deep copies of those parts (and of
+   * their per-object dependencies such as the embedded workbook or chart
+   * style), new slide relationships, content-type overrides and rewritten
+   * r:id references. Images, media and hyperlinks stay shared.
+   */
+  const clonePerObjectRelationships = async (
+    objectXml: string,
+    slidePart: string,
+    slideRelationshipsXml: string,
+  ): Promise<{ objectXml: string; slideRelationshipsXml: string }> => {
+    const referenced = new Set(Array.from(
+      objectXml.matchAll(/\sr:(?:id|dm|lo|qs|cs|pict)\s*=\s*"([^"]+)"/g),
+      (match) => match[1],
+    ));
+    if (!referenced.size) return { objectXml, slideRelationshipsXml };
+    const slideRelationships = relationships(slideRelationshipsXml);
+    const relationshipById = new Map(slideRelationships.map((relationship) => [relationshipAttribute(relationship, "Id") || "", relationship]));
+    const copies = new Map<string, string>();
+    const copyPart = async (part: string): Promise<string> => {
+      const existing = copies.get(part);
+      if (existing) return existing;
+      const entry = zip.file(part);
+      if (!entry) throw new PresentationPreservationError(`Missing object part ${part}.`);
+      const copy = nextSiblingPartName(Object.keys(zip.files), part);
+      copies.set(part, copy);
+      zip.file(copy, await entry.async("uint8array"));
+      const contentType = partOverrideContentType(contentTypesXml, part);
+      if (contentType) contentTypesXml = ensurePartOverride(contentTypesXml, copy, contentType);
+      const relationshipsEntry = zip.file(relationshipPartForSlide(part));
+      if (relationshipsEntry) {
+        let copiedRelationshipsXml = await relationshipsEntry.async("text");
+        for (const relationship of relationships(copiedRelationshipsXml)) {
+          const target = relationshipAttribute(relationship, "Target");
+          if (!target || !isPerObjectRelationship(relationship)) continue;
+          const childCopy = await copyPart(resolvePackageTarget(part, target));
+          copiedRelationshipsXml = copiedRelationshipsXml.replace(
+            relationship,
+            () => setXmlAttribute(relationship, "Target", escapeXml(retargetedPartName(target, childCopy))),
+          );
+        }
+        zip.file(relationshipPartForSlide(copy), copiedRelationshipsXml);
+      }
+      return copy;
+    };
+    const relationshipIdMap = new Map<string, string>();
+    const addSlideRelationshipCopy = async (relationshipId: string): Promise<string | undefined> => {
+      const mapped = relationshipIdMap.get(relationshipId);
+      if (mapped) return mapped;
+      const relationship = relationshipById.get(relationshipId);
+      const target = relationship && relationshipAttribute(relationship, "Target");
+      if (!relationship || !target || !isPerObjectRelationship(relationship)) return undefined;
+      const sourcePart = resolvePackageTarget(slidePart, target);
+      const copy = await copyPart(sourcePart);
+      const nextId = nextRelationshipId(slideRelationshipsXml);
+      const copiedRelationship = setXmlAttribute(
+        setXmlAttribute(relationship, "Id", nextId),
+        "Target",
+        escapeXml(retargetedPartName(target, copy)),
+      );
+      slideRelationshipsXml = slideRelationshipsXml.replace(/<\/Relationships>\s*$/i, () => `${copiedRelationship}</Relationships>`);
+      relationshipIdMap.set(relationshipId, nextId);
+      // SmartArt data points at its pre-rendered drawing through a slide relationship id.
+      const dataXml = /\.xml$/i.test(copy) ? await zip.file(copy)?.async("text") : undefined;
+      const drawingRelationshipId = dataXml?.match(/<[A-Za-z_][\w.-]*:dataModelExt\b[^>]*\srelId\s*=\s*"([^"]+)"/)?.[1];
+      if (dataXml && drawingRelationshipId) {
+        const drawingCopyId = await addSlideRelationshipCopy(drawingRelationshipId);
+        if (drawingCopyId) {
+          zip.file(copy, dataXml.replace(
+            /(<[A-Za-z_][\w.-]*:dataModelExt\b[^>]*\srelId\s*=\s*")[^"]+(")/,
+            (_match, before: string, after: string) => `${before}${drawingCopyId}${after}`,
+          ));
+        }
+      }
+      return nextId;
+    };
+    for (const relationshipId of referenced) await addSlideRelationshipCopy(relationshipId);
+    if (!relationshipIdMap.size) return { objectXml, slideRelationshipsXml };
+    const nextObjectXml = objectXml.replace(
+      /(\sr:(?:id|dm|lo|qs|cs|pict)\s*=\s*")([^"]+)(")/g,
+      (match, before: string, relationshipId: string, after: string) => {
+        const mapped = relationshipIdMap.get(relationshipId);
+        return mapped ? `${before}${mapped}${after}` : match;
+      },
+    );
+    return { objectXml: nextObjectXml, slideRelationshipsXml };
   };
 
   for (const edited of savedSlides) {
@@ -1586,7 +2472,7 @@ export async function preservePresentationFileWithSnapshot(
       let clonedObject = "";
       slideXml = replaceSourceObject(slideXml, templateShape.source, (element) => {
         clonedObject = element.replace(/<p:cNvPr\b[^>]*\/?\s*>/i, (openTag) => {
-          const currentName = openTag.match(/\bname="([^"]*)"/i)?.[1] || "Object";
+          const currentName = openTag.match(/\sname="([^"]*)"/i)?.[1] || "Object";
           return setXmlAttribute(setXmlAttribute(openTag, "id", assignedObjectId), "name", `${currentName} Copy`);
         });
         clonedObject = refreshClonedShapeCreationIds(clonedObject, slideXml);
@@ -1598,9 +2484,9 @@ export async function preservePresentationFileWithSnapshot(
           clonedObject = patchImageOpacity(clonedObject, clonedShape.opacity);
         }
         if (!sameValue(
-          [templateShape.fill, templateShape.gradFill, templateShape.stroke, templateShape.strokeWidth, templateShape.presetGeom, templateShape.borderRadius, templateShape.shadow, templateShape.vAlign, templateShape.padding],
-          [clonedShape.fill, clonedShape.gradFill, clonedShape.stroke, clonedShape.strokeWidth, clonedShape.presetGeom, clonedShape.borderRadius, clonedShape.shadow, clonedShape.vAlign, clonedShape.padding],
-        )) clonedObject = patchShapeFormatting(clonedObject, clonedShape);
+          [templateShape.fill, templateShape.gradFill, templateShape.stroke, templateShape.strokeWidth, templateShape.strokeDash, templateShape.presetGeom, templateShape.borderRadius, templateShape.shadow, templateShape.vAlign, templateShape.padding, templateShape.wordWrap],
+          [clonedShape.fill, clonedShape.gradFill, clonedShape.stroke, clonedShape.strokeWidth, clonedShape.strokeDash, clonedShape.presetGeom, clonedShape.borderRadius, clonedShape.shadow, clonedShape.vAlign, clonedShape.padding, clonedShape.wordWrap],
+        )) clonedObject = patchShapeFormatting(clonedObject, clonedShape, templateShape);
         if (!sameValue(templateShape.texts, clonedShape.texts)) {
           clonedObject = patchTextParagraphs(clonedObject, templateShape.texts, clonedShape.texts);
         }
@@ -1609,6 +2495,11 @@ export async function preservePresentationFileWithSnapshot(
         }
         return `${element}${clonedObject}`;
       });
+      const clonedParts = await clonePerObjectRelationships(clonedObject, slidePart, slideRelationshipsXml);
+      if (clonedParts.objectXml !== clonedObject) {
+        slideXml = slideXml.replace(clonedObject, () => clonedParts.objectXml);
+        slideRelationshipsXml = clonedParts.slideRelationshipsXml;
+      }
       if (templateShape.imgUrl !== clonedShape.imgUrl) {
         if (!clonedSource.mediaPart || !clonedShape.imgUrl) {
           throw new PresentationPreservationError("This copied object cannot be converted to or from an image in place.");
@@ -1616,7 +2507,7 @@ export async function preservePresentationFileWithSnapshot(
         const image = await newImagePayload(clonedShape.imgUrl);
         const mediaPart = nextMediaPart(zip, image.extension);
         const relationshipId = nextRelationshipId(slideRelationshipsXml);
-        zip.file(mediaPart, image.bytes);
+        zip.file(mediaPart, image.bytes, presentationMediaCompression(image.mime));
         contentTypesXml = ensureImageContentType(contentTypesXml, image.extension, image.mime);
         slideRelationshipsXml = appendImageRelationship(slideRelationshipsXml, relationshipId, mediaPart);
         slideXml = replaceSourceObject(slideXml, {
@@ -1671,15 +2562,12 @@ export async function preservePresentationFileWithSnapshot(
       if (!originalShape?.source) throw new PresentationPreservationError("This object no longer matches its source slide.");
       const source = originalShape.source;
       ensureCompatibleShapeChange(originalShape, editedShape);
-      const transformChanged = !sameValue(
-        [originalShape.x, originalShape.y, originalShape.w, originalShape.h, originalShape.rotation, originalShape.flipH, originalShape.flipV],
-        [editedShape.x, editedShape.y, editedShape.w, editedShape.h, editedShape.rotation, editedShape.flipH, editedShape.flipV],
-      );
+      const transformChanged = presentationTransformChanged(originalShape, editedShape);
       const cropChanged = !sameValue(originalShape.imgCrop, editedShape.imgCrop);
       const opacityChanged = originalShape.opacity !== editedShape.opacity;
       const formattingChanged = !sameValue(
-        [originalShape.fill, originalShape.gradFill, originalShape.stroke, originalShape.strokeWidth, originalShape.presetGeom, originalShape.borderRadius, originalShape.shadow, originalShape.vAlign, originalShape.padding],
-        [editedShape.fill, editedShape.gradFill, editedShape.stroke, editedShape.strokeWidth, editedShape.presetGeom, editedShape.borderRadius, editedShape.shadow, editedShape.vAlign, editedShape.padding],
+        [originalShape.fill, originalShape.gradFill, originalShape.stroke, originalShape.strokeWidth, originalShape.strokeDash, originalShape.presetGeom, originalShape.borderRadius, originalShape.shadow, originalShape.vAlign, originalShape.padding, originalShape.wordWrap],
+        [editedShape.fill, editedShape.gradFill, editedShape.stroke, editedShape.strokeWidth, editedShape.strokeDash, editedShape.presetGeom, editedShape.borderRadius, editedShape.shadow, editedShape.vAlign, editedShape.padding, editedShape.wordWrap],
       );
       const textChanged = !sameValue(originalShape.texts, editedShape.texts);
       const tableChanged = !sameValue(originalShape.tableRows, editedShape.tableRows);
@@ -1690,7 +2578,7 @@ export async function preservePresentationFileWithSnapshot(
             : element;
           if (cropChanged) patched = patchImageCrop(patched, editedShape.imgCrop);
           if (opacityChanged && source.kind === "pic") patched = patchImageOpacity(patched, editedShape.opacity);
-          if (formattingChanged) patched = patchShapeFormatting(patched, editedShape);
+          if (formattingChanged) patched = patchShapeFormatting(patched, editedShape, originalShape);
           if (textChanged) patched = patchTextParagraphs(patched, originalShape.texts, editedShape.texts);
           if (tableChanged && editedShape.tableRows) {
             patched = patchTableCells(patched, originalShape.tableRows || [], editedShape.tableRows);
@@ -1706,7 +2594,7 @@ export async function preservePresentationFileWithSnapshot(
         const image = await newImagePayload(editedShape.imgUrl);
         const mediaPart = nextMediaPart(zip, image.extension);
         const relationshipId = nextRelationshipId(slideRelationshipsXml);
-        zip.file(mediaPart, image.bytes);
+        zip.file(mediaPart, image.bytes, presentationMediaCompression(image.mime));
         contentTypesXml = ensureImageContentType(contentTypesXml, image.extension, image.mime);
         slideRelationshipsXml = appendImageRelationship(slideRelationshipsXml, relationshipId, mediaPart);
         slideXml = replaceSourceObject(slideXml, source, (element) => element.replace(
@@ -1723,7 +2611,7 @@ export async function preservePresentationFileWithSnapshot(
       const image = await newImagePayload(edited.bgImgUrl);
       const mediaPart = nextMediaPart(zip, image.extension);
       const relationshipId = nextRelationshipId(slideRelationshipsXml);
-      zip.file(mediaPart, image.bytes);
+      zip.file(mediaPart, image.bytes, presentationMediaCompression(image.mime));
       contentTypesXml = ensureImageContentType(contentTypesXml, image.extension, image.mime);
       slideRelationshipsXml = appendImageRelationship(slideRelationshipsXml, relationshipId, mediaPart);
       slideXml = patchSlideImageBackground(slideXml, relationshipId);
@@ -1801,7 +2689,7 @@ export async function preservePresentationFileWithSnapshot(
           const image = await newImagePayload(addedShape.imgUrl);
           const mediaPart = nextMediaPart(zip, image.extension);
           const relationshipId = nextRelationshipId(slideRelationshipsXml);
-          zip.file(mediaPart, image.bytes);
+          zip.file(mediaPart, image.bytes, presentationMediaCompression(image.mime));
           contentTypesXml = ensureImageContentType(contentTypesXml, image.extension, image.mime);
           slideRelationshipsXml = appendImageRelationship(slideRelationshipsXml, relationshipId, mediaPart);
           addedObjects.set(addedShape.id, pictureObjectXml(addedShape, objectId, relationshipId, hyperlinkRelationshipId, size.width, size.height));
@@ -1894,12 +2782,14 @@ export async function preservePresentationFileWithSnapshot(
     }
   }
 
+  const orderedPresentationSlideIds: string[] = [];
   const slideIdEntries = savedSlides.map((slide) => {
     const relationshipId = outputRelationshipBySlideId.get(slide.id);
     const part = outputPartBySlideId.get(slide.id);
     if (!relationshipId || !part) throw new PresentationPreservationError("Unable to save the slide order.");
-    const existingSlideId = slideIdByRelationship.get(relationshipId);
-    return `<p:sldId id="${existingSlideId || nextPresentationSlideId++}" r:id="${relationshipId}"/>`;
+    const presentationSlideId = slideIdByRelationship.get(relationshipId) || String(nextPresentationSlideId++);
+    orderedPresentationSlideIds.push(presentationSlideId);
+    return `<p:sldId id="${presentationSlideId}" r:id="${relationshipId}"/>`;
   }).join("");
   const keptSlideParts = new Set(outputPartBySlideId.values());
   const deletedDependencyCandidates = new Set(potentiallyOrphanedParts);
@@ -1908,18 +2798,29 @@ export async function preservePresentationFileWithSnapshot(
       slide.sourcePart && !keptSlideParts.has(slide.sourcePart) ? [slide.sourcePart] : []
     )),
   );
+  const deletedPresentationRelationshipIds = new Set<string>();
   for (const slidePart of deletedSlideParts) {
     const dependencies = await presentationDependencyClosure(zip, [slidePart]);
     dependencies.forEach((part) => deletedDependencyCandidates.add(part));
     const relationship = slideRelationshipByPart.get(slidePart);
     if (!relationship) continue;
     presentationRelationshipsXml = presentationRelationshipsXml.replace(relationship.xml, "");
+    deletedPresentationRelationshipIds.add(relationship.id);
+  }
+  if (deletedSlideParts.size) {
+    await removeSlideJumpRelationships(zip, deletedSlideParts);
+    presentationXml = removeCustomShowSlides(presentationXml, deletedPresentationRelationshipIds);
   }
   if (/<p:sldIdLst\b[^>]*>[\s\S]*?<\/p:sldIdLst>/i.test(presentationXml)) {
-    presentationXml = presentationXml.replace(/<p:sldIdLst\b[^>]*>[\s\S]*?<\/p:sldIdLst>/i, `<p:sldIdLst>${slideIdEntries}</p:sldIdLst>`);
+    presentationXml = presentationXml.replace(/<p:sldIdLst\b[^>]*>[\s\S]*?<\/p:sldIdLst>/i, () => `<p:sldIdLst>${slideIdEntries}</p:sldIdLst>`);
+  } else if (/<p:sldIdLst\b[^>]*\/>/i.test(presentationXml)) {
+    presentationXml = presentationXml.replace(/<p:sldIdLst\b[^>]*\/>/i, () => `<p:sldIdLst>${slideIdEntries}</p:sldIdLst>`);
+  } else if (/<p:sldSz\b/i.test(presentationXml)) {
+    presentationXml = presentationXml.replace(/<p:sldSz\b/i, () => `<p:sldIdLst>${slideIdEntries}</p:sldIdLst><p:sldSz`);
   } else {
     presentationXml = presentationXml.replace(/<p:presentation\b[^>]*>/i, (openTag) => `${openTag}<p:sldIdLst>${slideIdEntries}</p:sldIdLst>`);
   }
+  presentationXml = patchPresentationSections(presentationXml, orderedPresentationSlideIds);
   zip.file("ppt/presentation.xml", presentationXml);
   zip.file("ppt/_rels/presentation.xml.rels", presentationRelationshipsXml);
   const reachableParts = await reachablePresentationParts(zip);
@@ -1931,7 +2832,7 @@ export async function preservePresentationFileWithSnapshot(
   }
   zip.file("[Content_Types].xml", contentTypesXml);
 
-  const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE", mimeType: PPTX_MIME });
+  const blob = await removeZipFolderEntries(zip).generateAsync({ type: "blob", compression: "DEFLATE", mimeType: PPTX_MIME });
   const safeName = fileName.toLowerCase().endsWith(".pptx") ? fileName : `${fileName.replace(/\.ppt$/i, "")}.pptx`;
   for (const slide of savedSlides) {
     for (const shape of slide.shapes) {

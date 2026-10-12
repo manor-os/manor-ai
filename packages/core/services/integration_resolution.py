@@ -7,13 +7,9 @@ place before surfacing "connect this integration" prompts to users.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.constants.execution import (
-    WorkerStatus,
-)
 from packages.core.models.document import Integration
 from packages.core.models.mcp import MCPServer
 from packages.core.models.user import OAuthAccount
@@ -28,7 +24,6 @@ _BROWSER_PROVIDER = "chrome"
 _NON_USER_FACING_PROVIDER_KEYS = {
     "knowledge_local",
     "chrome_knowledge_local",
-    "local_browser",
     "nango",
 }
 
@@ -36,7 +31,6 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "browser",
     "browser_use",
     "chrome_browser",
-    "local_browser",
     "web_browser",
     "instagram",
     "instagram_browser",
@@ -49,11 +43,6 @@ _BROWSER_COVERAGE_PROVIDER_KEYS = {
     "boss_zhipin",
     "boss",
 }
-
-_PREFERRED_PROVIDER_BY_DUPLICATE = {
-    "local_browser": _BROWSER_PROVIDER,
-}
-
 
 @dataclass(frozen=True)
 class MissingIntegrationResolution:
@@ -83,7 +72,11 @@ async def integration_provider_readiness(
     user_id: str | None = None,
 ) -> dict[str, IntegrationProviderReadiness]:
     """Resolve runtime readiness without changing MCP capability bindings."""
-    from packages.core.services.agent_permission_service import can_use_mcp_server
+    from packages.core.services.agent_permission_service import (
+        can_use_mcp_server,
+        provider_requires_integration_account_registry,
+    )
+    from packages.core.services.integration_account_service import load_runtime_integration_registry
 
     raw_providers = [
         str(key or "").strip()
@@ -104,9 +97,22 @@ async def integration_provider_readiness(
         canonical_provider_key(provider)
         for provider in account_free_provider_rows
     }
+    account_providers = [
+        provider for provider in providers
+        if provider not in account_free_providers
+        and provider_requires_integration_account_registry(provider)
+    ]
+    # Reuse one actor-scoped snapshot within this check. Each provider still
+    # passes the runtime gate; no account state survives into another request.
+    integration_registry = await load_runtime_integration_registry(
+        db,
+        user_id=user_id or "",
+        entity_id=entity_id,
+        provider_keys=account_providers,
+    ) if account_providers else None
     out: dict[str, IntegrationProviderReadiness] = {}
     for provider in providers:
-        if provider in account_free_providers:
+        if provider in account_free_providers and provider != "chrome":
             out[provider] = IntegrationProviderReadiness(
                 provider=provider,
                 ready=True,
@@ -119,6 +125,7 @@ async def integration_provider_readiness(
             user_id=user_id or "",
             entity_id=entity_id,
             server_key=provider,
+            integration_registry=integration_registry,
             allow_env_fallback=False,
         )
         reason = decision.reason
@@ -161,6 +168,8 @@ async def connected_integration_provider_keys(
         )
     )).scalars().all()
     for integration in integration_rows:
+        if canonical_provider_key(integration.provider) == "chrome":
+            continue
         config = integration.config or {}
         if integration.credentials or integration.credential_ref or config.get("nango"):
             keys.add(canonical_provider_key(integration.provider))
@@ -247,16 +256,6 @@ def resolve_missing_integration_provider_key(
     connected_provider_keys = connected_provider_keys or set()
     if original in connected_provider_keys:
         return None
-
-    preferred = _PREFERRED_PROVIDER_BY_DUPLICATE.get(original)
-    if preferred and preferred in supported_provider_keys:
-        if preferred in connected_provider_keys:
-            return None
-        return MissingIntegrationResolution(
-            provider=preferred,
-            original_provider=original,
-            covered_provider=original,
-        )
 
     if original in supported_provider_keys:
         return MissingIntegrationResolution(provider=original, original_provider=original)

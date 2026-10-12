@@ -123,10 +123,11 @@ async def test_task_comment_routes_and_attributes_to_task_agent(monkeypatch):
         return types.SimpleNamespace(id="C1")
 
     async def _add_message(*a, **k):
-        return None
+        return types.SimpleNamespace(id="Muser")
 
     async def _run_turn(message, conversation_id, **kw):
         captured["turn_agent_id"] = kw.get("agent_id")
+        captured["origin_user_message_id"] = kw["runtime_metadata"]["origin_user_message_id"]
         return {"content": "answer", "message_id": "M1", "tool_calls_made": []}
 
     async def _add_task_log(db, task_id, log_type, content, *, actor, created_by="system", metadata=None):
@@ -160,6 +161,7 @@ async def test_task_comment_routes_and_attributes_to_task_agent(monkeypatch):
 
     # the task's agent (not the generic workspace agent) handled the turn
     assert captured["turn_agent_id"] == "01AGENTX"
+    assert captured["origin_user_message_id"] == "Muser"
     # and the reply is attributed to that specific agent
     resp = [log for log in logs if log["log_type"] == "workspace_agent_response"]
     assert resp, "expected a workspace_agent_response log"

@@ -39,6 +39,12 @@ declare namespace google {
 interface Window {
   gapi: {
     load(api: string, cb: () => void): void;
+    load(api: string, options: {
+      callback: () => void;
+      onerror?: () => void;
+      timeout?: number;
+      ontimeout?: () => void;
+    }): void;
     client: {
       load(url: string): Promise<void>;
       drive: {

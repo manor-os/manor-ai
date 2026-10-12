@@ -14,10 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user, get_db
 from packages.core.config import get_settings
+from packages.core.contracts.media_job_output import public_media_job_params
 from packages.core.models.base import generate_ulid
+from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
 from packages.core.models.media_job import MediaJob
 from packages.core.models.permission import Capability
 from packages.core.models.user import User
+from packages.core.models.workspace import Workspace
 from packages.core.services.document_metadata import merge_document_metadata
 from packages.core.services.document_service import get_document, upsert_document_by_fs_path
 from packages.core.services.entity_fs import copy_entity_file_atomic
@@ -45,6 +48,7 @@ class VideoJobResponse(BaseModel):
     model: str | None = None
     params: dict = {}
     result_url: str | None = None
+    document_id: str | None = None
     error: str | None = None
     duration_seconds: int | None = None
     credits: int | None = None
@@ -117,6 +121,91 @@ def _copy_upload_with_limit(source, target_path: str, max_bytes: int) -> int:
     return size
 
 
+async def _media_source_document(
+    db: AsyncSession, document_id: str, user: User,
+) -> Document | None:
+    document = await get_document(
+        db, document_id, user.entity_id, allow_workspace_chat_upload=True,
+    )
+    if document is not None:
+        return document
+    # Private chat attachments use hidden storage, but their uploader may
+    # still create a personal output. Do not expose another user's attachment.
+    return (await db.execute(
+        select(Document).where(
+            Document.id == document_id,
+            Document.entity_id == user.entity_id,
+            Document.owner_id == user.id,
+            Document.source == "chat_upload",
+            Document.fs_path.like("uploads/chat/%"),
+            Document.is_trashed.is_(False),
+        )
+    )).scalar_one_or_none()
+
+
+async def _workspace_output_destination(
+    db: AsyncSession, source: Document, user: User,
+) -> tuple[str | None, str | None, list[str]]:
+    """Resolve actual Workspace storage/shares, excluding context-only provenance."""
+    from apps.api.routers.documents import _workspace_storage_for_folder
+    from packages.core.services.workspace_artifacts import (
+        ensure_workspace_artifact_folder,
+        infer_workspace_id_from_storage_path,
+        workspace_artifact_storage_base,
+    )
+    from packages.core.services.workspace_access import user_can_write_workspace_artifacts
+
+    entity_id = user.entity_id
+
+    binding = await _workspace_storage_for_folder(
+        db, entity_id=entity_id, folder_id=source.folder_id,
+    )
+    physical_workspace_id = await infer_workspace_id_from_storage_path(
+        entity_id=entity_id, rel_path=source.fs_path or "",
+    )
+    if binding and physical_workspace_id and binding.workspace_id != physical_workspace_id:
+        raise HTTPException(409, "Source file has conflicting Workspace ownership")
+    group_rows = (await db.execute(
+        select(DocumentGroup.id, DocumentGroup.workspace_id)
+        .join(DocumentGroupMember, DocumentGroupMember.group_id == DocumentGroup.id)
+        .join(Workspace, Workspace.id == DocumentGroup.workspace_id)
+        .where(
+            DocumentGroupMember.document_id == source.id,
+            DocumentGroup.entity_id == entity_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        )
+        .order_by(DocumentGroup.workspace_id, DocumentGroup.id)
+    )).all() if source.visibility == "workspace" else []
+    group_ids = [str(group_id) for group_id, _ in group_rows]
+    workspace_id = (
+        binding.workspace_id if binding else physical_workspace_id
+    ) or (str(group_rows[0][1]) if group_rows else None)
+    if not workspace_id:
+        # Derived files are personal by default, even when the source sits in
+        # a non-Workspace shared folder or hidden chat-upload storage.
+        return None, None, []
+    for shared_workspace_id in {
+        workspace_id, *(str(group_workspace_id) for _, group_workspace_id in group_rows)
+    }:
+        if not await user_can_write_workspace_artifacts(
+            db, workspace_id=shared_workspace_id, user_id=user.id,
+            entity_role=user.role,
+        ):
+            raise HTTPException(403, "Workspace write access is required for derived files")
+    if binding:
+        return source.folder_id, binding.storage_dir, group_ids
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        ).limit(1)
+    )).scalar_one()
+    root = await ensure_workspace_artifact_folder(db, workspace)
+    return root.id, workspace_artifact_storage_base(root.id), group_ids
+
+
 @router.get("/free-music/search", response_model=FreeMusicSearchResponse)
 async def search_free_music(
     q: str,
@@ -139,7 +228,7 @@ async def import_free_music(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Re-verify, download, and freeze an Openverse track into Knowledge."""
+    """Re-verify and freeze an Openverse track beside an editable project document."""
     from apps.api.routers.documents import (
         _copy_document_file_atomic,
         _doc_resp_for_user,
@@ -148,19 +237,18 @@ async def import_free_music(
         _require_document_upload,
         _safe_visible_filename,
         _unique_document_rel_path,
-        _workspace_storage_for_folder,
     )
 
     await _require_document_upload(db, user)
-    source_document = await get_document(db, body.source_document_id, user.entity_id)
+    source_document = await _media_source_document(db, body.source_document_id, user)
     if not source_document:
-        raise HTTPException(404, "Source video not found")
+        raise HTTPException(404, "Source project document not found")
     await _require_document_capability(
         db,
         user,
         source_document,
         {Capability.EDIT},
-        "Edit access to the source video is required",
+        "Edit access to the source project document is required",
     )
 
     settings = get_settings()
@@ -186,15 +274,13 @@ async def import_free_music(
                 f"{raw_stem} — {track.creator}.{downloaded.extension}",
                 f"free-music.{downloaded.extension}",
             )
-            workspace_binding = await _workspace_storage_for_folder(
-                db,
-                entity_id=user.entity_id,
-                folder_id=source_document.folder_id,
+            target_folder_id, storage_dir, workspace_group_ids = await _workspace_output_destination(
+                db, source_document, user,
             )
             target_rel = _unique_document_rel_path(
                 user.entity_id,
                 filename,
-                rel_dir=workspace_binding.storage_dir if workspace_binding else None,
+                rel_dir=storage_dir,
             )
             persisted_path = await _copy_document_file_atomic(
                 user.entity_id,
@@ -203,6 +289,7 @@ async def import_free_music(
                 expected_size=downloaded.file_size,
                 allow_empty=False,
             )
+            target_visibility = "workspace" if storage_dir else "private"
             document = await upsert_document_by_fs_path(
                 db,
                 user.entity_id,
@@ -213,11 +300,17 @@ async def import_free_music(
                 mime_type=downloaded.mime_type,
                 source="openverse",
                 created_by=user.display_name or user.email or user.id,
-                folder_id=source_document.folder_id,
+                owner_id=user.id,
+                visibility=target_visibility,
+                folder_id=target_folder_id,
+            )
+            db.add_all(
+                DocumentGroupMember(document_id=document.id, group_id=group_id)
+                for group_id in workspace_group_ids
             )
             document.source = "openverse"
             document.owner_id = user.id
-            document.visibility = getattr(source_document, "visibility", "private") or "private"
+            document.visibility = target_visibility
             document.classification = getattr(source_document, "classification", "internal") or "internal"
             document.client_visible = False
             document.metadata_ = merge_document_metadata(
@@ -281,7 +374,7 @@ async def finalize_video_editor_export(
     )
 
     await _require_document_upload(db, user)
-    source_document = await get_document(db, source_document_id, user.entity_id)
+    source_document = await _media_source_document(db, source_document_id, user)
     if not source_document:
         raise HTTPException(404, "Source video not found")
     await _require_document_capability(
@@ -297,9 +390,22 @@ async def finalize_video_editor_export(
         raise HTTPException(503, "Video finalization requires the Manor entity filesystem")
     max_bytes = settings.MANOR_MAX_UPLOAD_MB * 1024 * 1024
     final_name = _safe_mp4_name(output_name)
-    source_dir = os.path.dirname(str(source_document.fs_path or "").replace("\\", "/"))
+    target_folder_id, storage_dir, workspace_group_ids = await _workspace_output_destination(
+        db, source_document, user,
+    )
+    target_visibility = "workspace" if storage_dir else "private"
+    if (
+        target_folder_id is None
+        and source_document.visibility == "private"
+        and source_document.owner_id == user.id
+        and source_document.folder_id
+    ):
+        target_folder_id = source_document.folder_id
+        storage_dir = os.path.dirname(source_document.fs_path or "") or None
+    source_dir = storage_dir or ""
     target_leaf = f"{os.path.splitext(final_name)[0]}-{generate_ulid()[:10].lower()}.mp4"
     target_rel = "/".join(part for part in (source_dir, target_leaf) if part)
+    target_visibility = "workspace" if storage_dir else "private"
     persisted_path: str | None = None
 
     with tempfile.TemporaryDirectory(prefix="manor-video-editor-finalize-") as temp_dir:
@@ -353,11 +459,17 @@ async def finalize_video_editor_export(
                 mime_type="video/mp4",
                 source="ai_generated",
                 created_by=user.id,
-                folder_id=source_document.folder_id,
+                owner_id=user.id,
+                visibility=target_visibility,
+                folder_id=target_folder_id,
+            )
+            db.add_all(
+                DocumentGroupMember(document_id=document.id, group_id=group_id)
+                for group_id in workspace_group_ids
             )
             document.source = "ai_generated"
             document.owner_id = user.id
-            document.visibility = getattr(source_document, "visibility", "private") or "private"
+            document.visibility = target_visibility
             document.classification = getattr(source_document, "classification", "internal") or "internal"
             document.client_visible = False
             document.metadata_ = merge_document_metadata(
@@ -420,8 +532,12 @@ async def link_video_editor_recipe(
         "Edit access to the video recipe is required",
     )
 
-    video_type = str(final_document.mime_type or final_document.file_type or "").lower()
-    if not (video_type.startswith("video/") or video_type in {"mp4", "webm", "mov", "mkv"}):
+    video_mime = str(final_document.mime_type or "").lower()
+    video_file_type = str(final_document.file_type or "").lower()
+    if not (
+        video_mime.startswith("video/")
+        or video_file_type in {"mp4", "webm", "mov", "mkv"}
+    ):
         raise HTTPException(422, "Target document is not a video")
     recipe_name = str(recipe_document.name or "")
     recipe_type = str(recipe_document.mime_type or recipe_document.file_type or "").lower()
@@ -493,8 +609,9 @@ async def get_job(
         kind=job.kind,
         prompt=job.prompt,
         model=job.model,
-        params=job.params or {},
+        params=public_media_job_params(job.params),
         result_url=job.result_url,
+        document_id=(job.params or {}).get("result_document_id"),
         error=job.error,
         duration_seconds=job.duration_seconds,
         credits=job.credits,
@@ -531,8 +648,9 @@ async def list_jobs(
             kind=j.kind,
             prompt=j.prompt,
             model=j.model,
-            params=j.params or {},
+            params=public_media_job_params(j.params),
             result_url=j.result_url,
+            document_id=(j.params or {}).get("result_document_id"),
             error=j.error,
             duration_seconds=j.duration_seconds,
             credits=j.credits,

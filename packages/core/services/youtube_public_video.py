@@ -1,7 +1,7 @@
 """Read-only access to metrics embedded in a public YouTube watch page."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
 import re
@@ -99,6 +99,26 @@ def _extract_assigned_json(html: str, variable_name: str) -> dict[str, Any]:
     )
 
 
+def _extract_ytcfg(html: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    config: dict[str, Any] = {}
+    marker = "ytcfg.set("
+    search_start = 0
+    while (index := html.find(marker, search_start)) >= 0:
+        object_start = html.find("{", index)
+        if object_start < 0:
+            break
+        try:
+            value, consumed = decoder.raw_decode(html[object_start:])
+        except json.JSONDecodeError:
+            search_start = index + len(marker)
+            continue
+        if isinstance(value, dict):
+            config.update(value)
+        search_start = object_start + consumed
+    return config
+
+
 def _find_first_key(value: Any, key: str) -> Any:
     if isinstance(value, dict):
         if key in value:
@@ -157,6 +177,87 @@ def _compact_public_count(value: Any) -> int | None:
     multiplier = {"": 1, "k": 1_000, "m": 1_000_000, "b": 1_000_000_000}
     number = float(match.group("number"))
     return max(0, int(round(number * multiplier[match.group("suffix") or ""])))
+
+
+def _comment_continuation_token(value: Any) -> str | None:
+    if isinstance(value, dict):
+        section = value.get("itemSectionRenderer")
+        if isinstance(section, dict) and (
+            section.get("targetId") == "comments-section"
+            or section.get("sectionIdentifier") == "comment-item-section"
+        ):
+            command = _find_first_key(section, "continuationCommand")
+            if isinstance(command, dict):
+                token = str(command.get("token") or "").strip()
+                if token:
+                    return token
+        for child in value.values():
+            token = _comment_continuation_token(child)
+            if token:
+                return token
+    elif isinstance(value, list):
+        for child in value:
+            token = _comment_continuation_token(child)
+            if token:
+                return token
+    return None
+
+
+async def _fetch_comment_count(
+    client: httpx.AsyncClient,
+    *,
+    canonical_url: str,
+    html: str,
+) -> int | None:
+    initial = _extract_assigned_json(html, "ytInitialData")
+    token = _comment_continuation_token(initial)
+    config = _extract_ytcfg(html)
+    api_key = str(config.get("INNERTUBE_API_KEY") or "").strip()
+    client_name = str(config.get("INNERTUBE_CLIENT_NAME") or "").strip()
+    client_version = str(config.get("INNERTUBE_CLIENT_VERSION") or "").strip()
+    context_client_name = str(
+        config.get("INNERTUBE_CONTEXT_CLIENT_NAME") or ""
+    ).strip()
+    if not all((token, api_key, client_name, client_version, context_client_name)):
+        return None
+
+    try:
+        response = await client.post(
+            "https://www.youtube.com/youtubei/v1/next",
+            params={"key": api_key},
+            headers={
+                **PUBLIC_YOUTUBE_HEADERS,
+                "Content-Type": "application/json",
+                "Origin": "https://www.youtube.com",
+                "Referer": canonical_url,
+                "X-Youtube-Client-Name": context_client_name,
+                "X-Youtube-Client-Version": client_version,
+            },
+            json={
+                "context": {
+                    "client": {
+                        "clientName": client_name,
+                        "clientVersion": client_version,
+                        "gl": "US",
+                        "hl": "en",
+                    }
+                },
+                "continuation": token,
+            },
+            timeout=7.0,
+        )
+    except httpx.RequestError:
+        return None
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    header = _find_first_key(payload, "commentsHeaderRenderer")
+    if not isinstance(header, dict):
+        return None
+    return _compact_public_count(header.get("countText"))
 
 
 def _required_text(value: Any, *, code: str, message: str) -> str:
@@ -276,6 +377,7 @@ async def _fetch_with_client(
     canonical_url: str,
     expected_video_id: str,
     collected_at: str | None,
+    include_comments: bool,
 ) -> YouTubePublicVideoMetrics:
     for attempt in range(2):
         try:
@@ -303,11 +405,28 @@ async def _fetch_with_client(
                 "http_error",
                 f"YouTube returned HTTP {response.status_code}",
             )
-        return parse_youtube_public_page(
+        metrics = parse_youtube_public_page(
             response.text,
             expected_video_id=expected_video_id,
             public_url=canonical_url,
             collected_at=collected_at,
+        )
+        if not include_comments or metrics.comments is not None:
+            return metrics
+        comments = await _fetch_comment_count(
+            client,
+            canonical_url=canonical_url,
+            html=response.text,
+        )
+        if comments is None:
+            return metrics
+        return replace(
+            metrics,
+            comments=comments,
+            unavailable_fields=tuple(
+                field for field in metrics.unavailable_fields
+                if field != "comments"
+            ),
         )
     raise YouTubePublicVideoError(
         "fetch_failed",
@@ -319,6 +438,7 @@ async def fetch_youtube_public_metrics(
     public_url: str,
     *,
     expected_video_id: str | None = None,
+    include_comments: bool = True,
     client: httpx.AsyncClient | None = None,
     collected_at: str | None = None,
 ) -> YouTubePublicVideoMetrics:
@@ -338,6 +458,7 @@ async def fetch_youtube_public_metrics(
             canonical_url=canonical_url,
             expected_video_id=expected,
             collected_at=collected_at,
+            include_comments=include_comments,
         )
 
     timeout = httpx.Timeout(15.0, connect=7.0)
@@ -350,4 +471,5 @@ async def fetch_youtube_public_metrics(
             canonical_url=canonical_url,
             expected_video_id=expected,
             collected_at=collected_at,
+            include_comments=include_comments,
         )

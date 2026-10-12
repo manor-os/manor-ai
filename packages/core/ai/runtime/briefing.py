@@ -46,6 +46,7 @@ async def runtime_execute_briefing_completion(
     *,
     entity_id: str | None = None,
     workspace_id: str | None = None,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute a morning briefing completion with Runtime-owned defaults."""
 
@@ -55,6 +56,7 @@ async def runtime_execute_briefing_completion(
             user_prompt=user_prompt,
         ),
         entity_id=entity_id,
+        user_id=user_id,
         workspace_id=workspace_id,
         source=RUNTIME_BRIEFING_SOURCE,
     )
@@ -82,6 +84,10 @@ Your job:
   3. For ``respond`` items, draft a reply in the workspace voice
      (concrete, brief, no fluff). Default to "yes if reasonable,
      ask one clarifying question otherwise".
+     Keep ``draft_reply`` and any recipient-facing action payload in the
+     recipient's language, as established by the source message or an
+     explicit delivery instruction. The operator's account language applies
+     to briefing headlines, titles, summaries, notes, and action labels.
   4. Headline = the one thing that matters. <=30 words. NOT a list.
   5. Skip items aggressively -- your value is reducing volume.
   6. Suggest actions the UI can render as buttons. ``send_reply``

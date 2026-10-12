@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import { t } from "../lib/i18n";
+import { workflowPath, workflowRunPath } from "../lib/workflowRoutes";
 import { useToastStore } from "../stores/toast";
 import PageHeader, {
   PageHeaderAddButton,
@@ -36,6 +37,7 @@ import {
   IconPause,
   IconPlay,
   IconPlus,
+  IconRefresh,
   IconStop,
   IconTrash,
   IconUpload,
@@ -44,11 +46,16 @@ import SmartToolbar from "../components/ui/SmartToolbar";
 import HoverMarqueeText from "../components/ui/HoverMarqueeText";
 import WorkflowImportModal from "../components/workflows/WorkflowImportModal";
 import WorkflowDeployModal from "../components/workflows/WorkflowDeployModal";
+import WorkflowRunInputModal from "../components/workflows/WorkflowRunInputModal";
+import WorkflowRunResumeControl from "../components/workflows/WorkflowRunResumeControl";
+import WorkflowRunRetryControl from "../components/workflows/WorkflowRunRetryControl";
 import WorkflowCanvas, { NodeIcon, type CanvasStep } from "../components/workflows/WorkflowCanvas";
 import WorkflowNodePalette from "../components/workflows/WorkflowNodePalette";
 import WorkflowNodeConfigPanel from "../components/workflows/WorkflowNodeConfigPanel";
 import { workflowStepOutputs } from "../lib/workflowBindings";
+import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
 import MediaPreview from "../components/workflows/MediaPreview";
+import { WorkflowValueWithJson } from "../components/workflows/WorkflowValueView";
 import WorkflowTemplates, { type WorkflowTemplate } from "../components/workflows/WorkflowTemplates";
 import {
   AiEditPreviewStatus,
@@ -60,8 +67,35 @@ import {
   openEditorLiveChat,
 } from "../lib/editorLiveChat";
 import { parseWorkflowLiveEdit, serializeWorkflowLiveEdit } from "../lib/workflowLiveEdit";
-import { extractMediaRefs, primaryMediaRef, type MediaRef } from "../lib/workflowMedia";
+import { extractMediaRefs, primaryMediaRef, workflowFinalMediaRefs, type MediaRef } from "../lib/workflowMedia";
 import { validateWorkflow, issuesByNode } from "../lib/workflowValidate";
+import { workflowRunInputs } from "../lib/workflowRunInputs";
+import { parseWorkflowFileCollection } from "../lib/workflowFileCollection";
+import WorkflowFileCollection from "../components/workflows/WorkflowFileCollection";
+import {
+  resolveWorkflowFinalResult,
+  orderWorkflowFinalArtifacts,
+  workflowArtifactLabel,
+  workflowFinalArtifactRefs,
+  workflowFinalFileListKeys,
+  workflowFinalHeadline,
+  workflowFinalOutputFields,
+  workflowEditorRunProgress,
+  workflowNodeDisplayStatus,
+  workflowRunBackgroundWait,
+  workflowRunFailure,
+  workflowStepTargets,
+  buildWorkflowSnapshotNodes,
+  buildWorkflowRunTimeline,
+  canRetryWithoutCorrection,
+  canCancelWorkflowRun,
+  workflowRunIsLegacy,
+  type WorkflowHistoryRun,
+  type WorkflowFinalResult,
+  type WorkflowRunFailure,
+} from "../components/workflows/workflowRunDisplay";
+
+const ACTIVE_RUN_STATUSES = new Set(["pending", "running", "paused"]);
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -79,6 +113,8 @@ interface Flow {
   id: string;
   name: string;
   description: string;
+  workspace_id?: string | null;
+  workspace_name?: string | null;
   icon?: string;
   trigger: "manual" | "event" | "schedule" | "webhook" | "mcp" | "internal";
   trigger_type?: "manual" | "event" | "schedule" | "webhook" | "mcp" | "internal";
@@ -348,78 +384,6 @@ function WorkflowMetadataPanel({ workflowId }: { workflowId: string }) {
   );
 }
 
-type WorkflowRunInput = {
-  key: string;
-  label: string;
-  type: "string" | "number" | "boolean" | "json";
-  required: boolean;
-  placeholder?: string;
-  defaultValue: string;
-  integer?: boolean;
-  minimum?: number;
-  maximum?: number;
-};
-
-function runInputDefault(value: unknown, variables?: Record<string, unknown>): unknown {
-  if (typeof value !== "string") return value;
-  const match = /^\s*\{\{([^{}]+)\}\}\s*$/.exec(value);
-  if (!match) return value;
-  const parts = match[1].trim().split(".");
-  let current: unknown = variables?.[parts[0]];
-  for (const part of parts.slice(1)) {
-    if (!current || typeof current !== "object") return undefined;
-    current = (current as Record<string, unknown>)[part];
-  }
-  return current;
-}
-
-function formatRunInputValue(value: unknown): string {
-  if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value;
-  if (typeof value === "object") {
-    try { return JSON.stringify(value, null, 2); } catch { return String(value); }
-  }
-  return String(value);
-}
-
-/** Inputs declared on the entry node are runtime values, not saved workflow
- * settings. Imported n8n Form Triggers use this same schema. */
-export function workflowRunInputs(flow: Pick<Flow, "steps" | "variables">): WorkflowRunInput[] {
-  const entries = (flow.steps || []).filter((step: any) => ["trigger", "webhook"].includes(step.type));
-  const seen = new Set<string>();
-  const result: WorkflowRunInput[] = [];
-  for (const step of entries) {
-    const rows = Array.isArray(step.config?.run_inputs)
-      ? step.config.run_inputs
-      : Array.isArray(step.config?.inputs) ? step.config.inputs : [];
-    for (const row of rows) {
-      const key = String(row?.key || row?.name || "").trim();
-      if (!key || row?.hidden || seen.has(key)) continue;
-      seen.add(key);
-      const rawType = String(row?.type || "string").toLowerCase();
-      const type: WorkflowRunInput["type"] = rawType === "integer"
-        ? "number"
-        : ["number", "boolean", "json"].includes(rawType)
-          ? rawType as WorkflowRunInput["type"]
-          : "string";
-      const schema = row?.schema && typeof row.schema === "object" ? row.schema : {};
-      const rawDefault = row?.defaultValue ?? row?.default ?? row?.value;
-      const formattedDefault = formatRunInputValue(runInputDefault(rawDefault, flow.variables));
-      result.push({
-        key,
-        label: String(row?.label || key),
-        type,
-        required: row?.required ?? row?.requiredField ?? true,
-        placeholder: row?.placeholder ? String(row.placeholder) : undefined,
-        defaultValue: type === "boolean" && formattedDefault === "" ? "false" : formattedDefault,
-        integer: rawType === "integer" || schema.type === "integer",
-        minimum: typeof schema.minimum === "number" ? schema.minimum : undefined,
-        maximum: typeof schema.maximum === "number" ? schema.maximum : undefined,
-      });
-    }
-  }
-  return result;
-}
 
 function workflowNodeOutputs(step: any): { name: string; type: string }[] {
   const named = workflowStepOutputs(step)
@@ -431,82 +395,100 @@ function workflowNodeOutputs(step: any): { name: string; type: string }[] {
   return named;
 }
 
-type WorkflowFinalResult = {
-  stepId: string | null;
-  stepName: string;
-  output: unknown;
-};
-
-function workflowStepTargets(step: any): string[] {
-  return [...new Set([
-    ...(step?.next || []),
-    ...(step?.true_next || []),
-    ...(step?.false_next || []),
-    ...((Array.isArray(step?.config?.cases) ? step.config.cases : [])
-      .flatMap((item: any) => item?.next || [])),
-    ...(step?.config?.default_next || []),
-  ].filter(Boolean))] as string[];
-}
-
 function hasWorkflowOutput(value: unknown): boolean {
   return value !== undefined && value !== null && value !== "";
-}
-
-/** Resolve the business output for both new runs (End passes data through) and
- * legacy runs where End only returned its own label. */
-export function resolveWorkflowFinalResult(steps: any[], run: any): WorkflowFinalResult | null {
-  const results = run?.step_results || {};
-  const terminals = steps.filter((step) => step.type === "end" || workflowStepTargets(step).length === 0);
-
-  for (const terminal of terminals) {
-    const output = results[terminal.id]?.output;
-    if (hasWorkflowOutput(output) && output !== terminal.name) {
-      return { stepId: terminal.id, stepName: terminal.name || "End", output };
-    }
-    const predecessor = [...steps].reverse().find((step) =>
-      workflowStepTargets(step).includes(terminal.id)
-      && results[step.id]?.status === "completed"
-      && !results[step.id]?.skipped
-      && hasWorkflowOutput(results[step.id]?.output),
-    );
-    if (predecessor) {
-      return {
-        stepId: predecessor.id,
-        stepName: predecessor.name || predecessor.id,
-        output: results[predecessor.id].output,
-      };
-    }
-  }
-
-  if (hasWorkflowOutput(run?.variables?.__result)) {
-    return { stepId: null, stepName: "Workflow", output: run.variables.__result };
-  }
-
-  for (const [stepId, result] of Object.entries(results).reverse()) {
-    const step = steps.find((candidate) => candidate.id === stepId);
-    const typed = result as any;
-    if (!step || ["trigger", "webhook", "end", "note"].includes(step.type)) continue;
-    if (typed?.status === "completed" && !typed?.skipped && hasWorkflowOutput(typed?.output)) {
-      return { stepId, stepName: step.name || stepId, output: typed.output };
-    }
-  }
-  return null;
 }
 
 function WorkflowFinalResultPanel({
   run,
   result,
+  workflowName,
+  processedCount,
+  outputPending,
+  failure,
+  retrying,
+  onRetry,
+  onRunAgain,
   onClose,
   onOpenNode,
+  retryControl,
 }: {
   run: any;
   result: WorkflowFinalResult | null;
+  workflowName: string;
+  processedCount: number;
+  /** The run is a compact history row whose step results are still loading. */
+  outputPending: boolean;
+  failure: WorkflowRunFailure | null;
+  retrying: boolean;
+  onRetry?: () => void;
+  onRunAgain?: () => void;
   onClose: () => void;
   onOpenNode: (stepId: string) => void;
+  retryControl?: React.ReactNode;
 }) {
   const failed = run?.status === "failed";
-  const output = failed ? run?.error : result?.output;
-  const media = failed ? [] : extractMediaRefs(output, 3);
+  // A failed run can still carry the output of the node it stopped at (for
+  // example per-platform publish results); show it under the failure.
+  const failedWithOutput = failed && !!failure && hasWorkflowOutput(result?.output);
+  const output = failed && !failedWithOutput ? run?.error : result?.output;
+  const fileCollection = failed && !failedWithOutput ? null : parseWorkflowFileCollection(output);
+  const artifacts = failed && !failedWithOutput ? [] : orderWorkflowFinalArtifacts(workflowFinalArtifactRefs(output, 50));
+  // Generic files are listed once, as file cards. Only when nothing resolves
+  // to a card do bare file URLs fall back to download rows.
+  const media = failed && !failedWithOutput ? [] : [
+    ...workflowFinalMediaRefs(output),
+    ...(artifacts.length === 0 ? extractMediaRefs(output, 3).filter((ref) => ref.type === "file") : []),
+  ];
+  // Previewed media already shows in full; list the remaining files.
+  const isPreviewed = (artifact: (typeof artifacts)[number]) => media.some((ref) => {
+    let url = ref.url;
+    try { url = decodeURIComponent(ref.url); } catch { /* keep raw */ }
+    return (!!artifact.fs_path && url.split(/[?#]/)[0].endsWith(`/${artifact.fs_path}`))
+      || (!!artifact.document_id && url.includes(artifact.document_id));
+  });
+  const listedFiles = artifacts.filter((artifact) => !isPreviewed(artifact));
+  const primaryFiles = listedFiles.slice(0, 3);
+  const otherFiles = listedFiles.slice(3);
+  const headline = failed && !failedWithOutput ? null : workflowFinalHeadline(output);
+  const showHero = !!headline || artifacts.length > 0;
+  const outputFields = workflowFinalOutputFields(output, {
+    omitKeys: [
+      ...(headline?.keys || []),
+      ...(artifacts.length > 0 ? workflowFinalFileListKeys(output) : []),
+    ],
+  });
+  const renderArtifact = (artifact: (typeof artifacts)[number], index: number) => (
+    <InlineFileReferenceCard
+      key={`${artifact.document_id || artifact.fs_path || "file"}-${index}`}
+      reference={artifact.document_id
+        ? `/viewer/${encodeURIComponent(artifact.document_id)}`
+        : artifact.fs_path || ""}
+      label={workflowArtifactLabel(artifact, `File ${index + 1}`)}
+      compact
+    />
+  );
+  const packageOutput = !failed && output && typeof output === "object" && !Array.isArray(output)
+    && Array.isArray((output as any).files) && Array.isArray((output as any).assets)
+    && typeof (output as any).bundle_path === "string"
+      ? output as Record<string, any>
+      : null;
+  const packageAssets = packageOutput?.assets as Array<Record<string, any>> || [];
+  const packageFiles = packageOutput?.files as Array<Record<string, any>> || [];
+  const essentialFiles = packageFiles.filter((file) =>
+    ["README.md", "release.json", "lyrics.txt"].includes(String(file.path || "").split("/").pop() || ""),
+  );
+  const otherPackageFiles = packageFiles.filter((file) => !essentialFiles.includes(file));
+  const renderPackageFile = (file: Record<string, any>, index: number) => (
+    <InlineFileReferenceCard
+      key={String(file.document_id || file.fs_path || file.path || index)}
+      reference={file.document_id
+        ? `/viewer/${encodeURIComponent(String(file.document_id))}`
+        : String(file.fs_path || file.path || "")}
+      label={String(file.path || file.fs_path || "File").split("/").pop() || "File"}
+      compact
+    />
+  );
   const runInputs = Object.entries(run?.trigger_data || {}).filter(
     ([key, value]) => (
       key
@@ -524,14 +506,16 @@ function WorkflowFinalResultPanel({
     >
       <div className="workflow-final-result-header">
         <div style={{ minWidth: 0 }}>
-          <div style={{ fontSize: 14, fontWeight: 750, color: "var(--text-strong)" }}>Final result</div>
+          <div className="workflow-final-result-title">
+            {failed ? "Run failed" : "Run completed"}
+          </div>
           <div className="workflow-final-result-meta">
             <span
               aria-hidden="true"
               className={`workflow-final-result-dot${failed ? " is-failed" : ""}`}
             />
-            <span style={{ textTransform: "capitalize" }}>{run?.status || "completed"}</span>
-            {result?.stepName && <span>· {result.stepName}</span>}
+            <span>{workflowName || "Workflow"}</span>
+            {processedCount > 0 && <span>· {processedCount} {processedCount === 1 ? "step" : "steps"}</span>}
             {run?.completed_at && <span>· {fmtRunTime(run.completed_at)}</span>}
           </div>
         </div>
@@ -545,38 +529,160 @@ function WorkflowFinalResultPanel({
           <IconClose size={15} />
         </button>
       </div>
-      {runInputs.length > 0 && (
-        <section className="workflow-final-result-inputs" aria-labelledby="workflow-final-result-inputs-title">
-          <div id="workflow-final-result-inputs-title" className="workflow-final-result-section-title">
-            Run inputs
+      <div className="workflow-final-result-body">
+        {failure ? (
+          <section className="workflow-final-result-failure" role="alert">
+            <strong>{failure.title}</strong>
+            <p>{failure.detail}</p>
+            {failure.hint && <p className="workflow-final-result-failure-hint">{failure.hint}</p>}
+            <div className="workflow-final-result-failure-actions">
+              {failure.stepId && onRetry && (
+                <Button size="sm" onClick={onRetry} disabled={retrying}>
+                  <IconRefresh size={13} />
+                  {retrying ? "Retrying…" : "Retry from this step"}
+                </Button>
+              )}
+              {onRunAgain && <Button variant="outline" size="sm" onClick={onRunAgain} disabled={retrying}>
+                Edit inputs and run again
+              </Button>}
+            </div>
+          </section>
+        ) : null}
+        {(!failure || failedWithOutput) && (
+        <section className="workflow-final-result-output" aria-labelledby="workflow-final-result-output-title">
+          <div id="workflow-final-result-output-title" className="workflow-final-result-section-title">
+            {failed && !failedWithOutput ? "Error" : "Output"}
           </div>
-          <dl>
-            {runInputs.map(([key, value]) => (
-              <div key={key}>
-                <dt>{key}</dt>
-                <dd title={typeof value === "string" ? value : undefined}>
-                  {typeof value === "string" ? value : JSON.stringify(value)}
-                </dd>
+          <div className={`workflow-final-result-content${failed && !failedWithOutput ? " is-failed" : ""}`}>
+            {outputPending && !hasWorkflowOutput(output) ? (
+              <span className="workflow-final-result-empty">Loading the run output…</span>
+            ) : !hasWorkflowOutput(output) ? (
+              <span className="workflow-final-result-empty">This run did not produce a final output.</span>
+            ) : packageOutput ? (
+              <div className="workflow-release-package">
+                <div className="workflow-release-package-hero">
+                  <span className="workflow-release-package-count">
+                    {packageAssets.length + packageFiles.length} files ready
+                  </span>
+                  <strong>{String(packageOutput.title || "Release package")}</strong>
+                  <p>{String(packageOutput.summary || "Your release files are ready to review.")}</p>
+                </div>
+                <div className="workflow-release-package-group">
+                  <span>Audio & cover</span>
+                  <div className="workflow-release-package-files">
+                    {packageAssets.map(renderPackageFile)}
+                  </div>
+                </div>
+                <div className="workflow-release-package-group">
+                  <span>Start here</span>
+                  <div className="workflow-release-package-files">
+                    {essentialFiles.map(renderPackageFile)}
+                  </div>
+                </div>
+                {otherPackageFiles.length > 0 && (
+                  <details className="workflow-release-package-more">
+                    <summary>All other files <span>{otherPackageFiles.length}</span></summary>
+                    <div className="workflow-release-package-files">
+                      {otherPackageFiles.map(renderPackageFile)}
+                    </div>
+                  </details>
+                )}
               </div>
-            ))}
-          </dl>
-        </section>
-      )}
-      <div className={`workflow-final-result-content${failed ? " is-failed" : ""}`}>
-        {!hasWorkflowOutput(output) ? (
-          <span style={{ color: "var(--text-faint)", fontSize: 12 }}>This run did not produce a final output.</span>
-        ) : media.length > 0 ? (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {media.map((item, index) => <MediaPreview key={`${item.type}-${index}`} refItem={item} maxHeight={360} />)}
+            ) : fileCollection ? (
+              <WorkflowFileCollection collection={fileCollection} />
+            ) : (
+              <>
+                {showHero && (
+                  <div className="workflow-final-result-hero">
+                    {artifacts.length > 0 && (
+                      <span className="workflow-final-result-hero-count">
+                        {artifacts.length} {artifacts.length === 1 ? "file" : "files"} ready
+                      </span>
+                    )}
+                    {headline?.title && <strong>{headline.title}</strong>}
+                    {headline?.summary && <p>{headline.summary}</p>}
+                  </div>
+                )}
+                {media.length > 0 && (
+                  <div className="workflow-final-result-media">
+                    {media.map((item, index) => <MediaPreview key={`${item.type}-${index}`} refItem={item} maxHeight={360} />)}
+                  </div>
+                )}
+                {listedFiles.length > 0 && (
+                  <div className="workflow-final-result-artifacts" aria-label="Output files">
+                    {primaryFiles.map((artifact, index) => renderArtifact(artifact, index))}
+                    {otherFiles.length > 0 && (
+                      <details className="workflow-final-result-more">
+                        <summary>All other files <span>{otherFiles.length}</span></summary>
+                        <div className="workflow-final-result-artifacts">
+                          {otherFiles.map((artifact, index) => renderArtifact(artifact, index + primaryFiles.length))}
+                        </div>
+                      </details>
+                    )}
+                  </div>
+                )}
+                {outputFields && outputFields.length > 0 ? (
+                  <dl className="workflow-final-result-output-fields">
+                    {outputFields.map((field) => (
+                      <div key={field.key} className={field.structured ? "is-structured" : undefined}>
+                        {field.structured ? (
+                          <section className="workflow-final-result-structured">
+                            <div className="workflow-final-result-structured-title">{field.label}</div>
+                            <WorkflowValueWithJson value={field.raw} />
+                          </section>
+                        ) : (
+                          <>
+                            <dt>{field.label}</dt>
+                            <dd>
+                              {field.reference ? (
+                                <InlineFileReferenceCard reference={field.reference} label={field.value} compact />
+                              ) : field.value}
+                            </dd>
+                          </>
+                        )}
+                      </div>
+                    ))}
+                  </dl>
+                ) : media.length === 0 && !showHero ? (
+                  <pre className={typeof output === "string" ? "is-text" : undefined}>
+                    {typeof output === "string" ? output : JSON.stringify(output, null, 2)}
+                  </pre>
+                ) : null}
+              </>
+            )}
           </div>
-        ) : (
-          <pre className={typeof output === "string" ? "is-text" : undefined}>
-            {typeof output === "string" ? output : JSON.stringify(output, null, 2)}
-          </pre>
+        </section>
+        )}
+        {runInputs.length > 0 && (
+          <details className="workflow-final-result-inputs">
+            <summary>
+              <span>Inputs</span>
+              <span>{runInputs.length}</span>
+            </summary>
+            <dl>
+              {runInputs.map(([key, value]) => (
+                <div key={key}>
+                  <dt>{key}</dt>
+                  <dd title={typeof value === "string" ? value : undefined}>
+                    {typeof value === "string" ? value : JSON.stringify(value)}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </details>
         )}
       </div>
-      {result?.stepId && (
+      {retryControl && <div className="workflow-final-result-actions">{retryControl}</div>}
+      {failure?.stepId ? (
         <div className="workflow-final-result-actions">
+          <span className="workflow-final-result-source">Stopped at {failure.stepName}</span>
+          <Button variant="outline" size="sm" onClick={() => onOpenNode(failure.stepId)}>
+            Open failed node
+          </Button>
+        </div>
+      ) : result?.stepId && (
+        <div className="workflow-final-result-actions">
+          <span className="workflow-final-result-source">Output from {result.stepName}</span>
           <Button variant="outline" size="sm" onClick={() => onOpenNode(result.stepId!)}>
             Open source node
           </Button>
@@ -591,14 +697,15 @@ function WorkflowFinalResultPanel({
 /*  Component                                                          */
 /* ------------------------------------------------------------------ */
 
-export default function Flows() {
+export default function Flows({ run, onBack }: { run?: WorkflowHistoryRun; onBack?: () => void } = {}) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
   const location = useLocation();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const requestedWorkflowId = searchParams.get("workflow");
-  const requestedRunId = searchParams.get("run") || searchParams.get("workflow_run");
+  const { workflowId: requestedWorkflowId } = useParams<{ workflowId: string }>();
+  const requestedRunId = run?.id || searchParams.get("run") || searchParams.get("workflow_run");
+  const readOnly = Boolean(run);
   const workflowReturnTo = getWorkflowReturnTo(location.state);
 
   const [search, setSearch] = useState("");
@@ -614,11 +721,13 @@ export default function Flows() {
   const [runResult, setRunResult] = useState<any>(null);
   const [showFinalResult, setShowFinalResult] = useState(false);
   const openedFinalRunRef = useRef<string | null>(null);
+  const observedActiveRunIdsRef = useRef(new Set<string>());
+  const runDetailReloadRef = useRef("");
   const [liveStatus, setLiveStatus] = useState<Record<string, string>>({});
   const [streaming, setStreaming] = useState(false);
   const [runInputFlow, setRunInputFlow] = useState<Flow | null>(null);
-  const [runInputValues, setRunInputValues] = useState<Record<string, string>>({});
-  const [runInputErrors, setRunInputErrors] = useState<Record<string, string>>({});
+  // Inputs of the run being repeated, so "run again" only asks for changes.
+  const [runInputPrefill, setRunInputPrefill] = useState<Record<string, unknown> | null>(null);
   // results from running a single node via its hover ▶ (merged onto the canvas)
   const [singleResults, setSingleResults] = useState<Record<string, any>>({});
   const recordSingleResult = (stepId: string, result: any) =>
@@ -657,6 +766,10 @@ export default function Flows() {
   const workflowAiPreviewRef = useRef<WorkflowAiPreview | null>(null);
   const workflowAiCommitCoordinator = useRef(createAiEditCommitCoordinator()).current;
   const selectedFlowRef = useRef<Flow | null>(null);
+  // Canvas edits apply at once and save in the background; only the newest
+  // save's reply may replace the local steps (an older one must not undo a
+  // later edit).
+  const canvasSaveSeqRef = useRef(0);
   selectedFlowRef.current = selectedFlow;
   const flowContextMenu = useContextMenu();
 
@@ -680,16 +793,60 @@ export default function Flows() {
     queryFn: () => api.workflows.list(),
   });
 
+  const requestedDefinition = useQuery({
+    queryKey: ["workflow-definition", requestedWorkflowId],
+    queryFn: () => api.workflows.get(requestedWorkflowId!),
+    enabled: Boolean(requestedWorkflowId),
+    retry: false,
+  });
+
+  useEffect(() => {
+    if (!run) return;
+    const definition = requestedDefinition.data as Flow | undefined;
+    const snapshot = run.definition_snapshot;
+    const currentNodes = (definition?.steps || []).map((step) => ({
+      ...step, targets: workflowStepTargets(step),
+    }));
+    const recordedNodes = buildWorkflowRunTimeline(run).map((entry) => ({
+      id: entry.nodeId, name: entry.nodeName, type: entry.nodeType,
+    }));
+    const nodes = buildWorkflowSnapshotNodes(run, currentNodes.length ? currentNodes
+      : [...new Map(recordedNodes.map((node) => [node.id, node])).values()]);
+    setSelectedFlow({
+      id: run.workflow_id || requestedWorkflowId || "",
+      name: snapshot?.name || run.workflow_name || definition?.name || "Workflow",
+      description: "",
+      status: "active",
+      trigger: "manual",
+      created_at: run.created_at || "",
+      steps: nodes.map((node) => ({
+        id: node.nodeId, name: node.nodeName, type: node.nodeType || "action", next: node.targets,
+      })),
+    });
+    setRunResult(run);
+  }, [run, requestedDefinition.data, requestedWorkflowId]);
+
+  // Closing clears selectedFlow before the route update commits, so
+  // this effect can still see the old path and reopen the editor.
+  // Remember the dismissed id until the URL actually changes.
+  const dismissedWorkflowIdRef = useRef<string | null>(null);
+
   // Workspace cards deep-link to a concrete workflow. Keep the selected
   // editor in the URL so refresh/back navigation preserves that context.
   useEffect(() => {
-    if (!requestedWorkflowId || !flows?.length) return;
+    if (readOnly) return;
+    if (requestedWorkflowId !== dismissedWorkflowIdRef.current) {
+      dismissedWorkflowIdRef.current = null;
+    }
+    if (!requestedWorkflowId) return;
+    if (dismissedWorkflowIdRef.current === requestedWorkflowId) return;
     if (
       selectedFlow?.id === requestedWorkflowId
       || selectedFlow?.name === requestedWorkflowId
     ) return;
-    const requested = (flows as Flow[]).find((flow) => flow.id === requestedWorkflowId)
-      || (flows as Flow[]).find((flow) => flow.name === requestedWorkflowId);
+    const requested = requestedDefinition.data
+      || (flows as Flow[] | undefined)?.find((flow) => flow.id === requestedWorkflowId)
+      || (flows as Flow[] | undefined)?.find((flow) => flow.name === requestedWorkflowId);
     if (requested) {
       if (
         workflowAiPreviewRef.current
@@ -699,20 +856,18 @@ export default function Flows() {
       }
       setSelectedFlow(requested);
     }
-  }, [flows, requestedWorkflowId, selectedFlow?.id]);
+  }, [readOnly, flows, requestedDefinition.data, requestedWorkflowId, selectedFlow?.id]);
 
   const closeWorkflow = () => {
+    if (readOnly && onBack) { onBack(); return; }
     closeEditorLiveChat();
+    dismissedWorkflowIdRef.current = requestedWorkflowId || null;
     setSelectedFlow(null);
     if (workflowReturnTo) {
-      navigate(workflowReturnTo);
+      navigate(workflowReturnTo, { state: location.state?.returnState });
       return;
     }
-    const next = new URLSearchParams(searchParams);
-    next.delete("workflow");
-    next.delete("run");
-    next.delete("workflow_run");
-    setSearchParams(next, { replace: true });
+    navigate("/flows");
   };
 
   const { data: runs } = useQuery({
@@ -724,7 +879,9 @@ export default function Flows() {
     // does not remain stuck on the initial "Paused" response.
     refetchInterval: (query) => {
       const latest = (query.state.data as any[] | undefined)?.[0];
-      return latest && (latest.status === "running" || latest.status === "paused") ? 2_000 : false;
+      // Poll an active run closely; otherwise check slowly for runs started
+      // elsewhere (Chat, API, schedules) so their reviews show up here.
+      return latest && ["pending", "running", "paused"].includes(latest.status) ? 2_000 : 20_000;
     },
     refetchIntervalInBackground: true,
   });
@@ -732,19 +889,39 @@ export default function Flows() {
   // Opening a flow should immediately restore its newest run onto the canvas;
   // requiring a separate History click made successful results look lost.
   useEffect(() => {
-    if (!selectedFlow || !runs?.length) return;
+    if (readOnly || !selectedFlow || !runs?.length) return;
     if (requestedRunId) {
       const requested = runs.find((run: any) => run.id === requestedRunId);
       if (requested && runResult?.id !== requested.id) setRunResult(requested);
       return;
     }
-    if (runResult?.workflow_id !== selectedFlow.id) setRunResult(runs[0]);
-  }, [requestedRunId, runs, runResult?.id, runResult?.workflow_id, selectedFlow?.id]);
+    if (runResult?.workflow_id !== selectedFlow.id) {
+      setRunResult(runs[0]);
+      return;
+    }
+    // A run started elsewhere (Chat, API, a schedule) that is still working or
+    // waiting for a decision replaces a finished one, so its review is visible.
+    const newest = runs[0];
+    if (
+      newest?.id !== runResult?.id
+      && ACTIVE_RUN_STATUSES.has(newest?.status)
+      && !ACTIVE_RUN_STATUSES.has(runResult?.status)
+    ) {
+      setRunResult(newest);
+    }
+  }, [readOnly, requestedRunId, runs, runResult?.id, runResult?.status, runResult?.workflow_id, selectedFlow?.id]);
+
+  // An explicitly opened run stays put; point at a newer run that needs you.
+  const newerActiveRun = runs?.find((run: any) => ACTIVE_RUN_STATUSES.has(run.status));
+  const showNewerActiveRun = !!newerActiveRun
+    && !!runResult
+    && newerActiveRun.id !== runResult.id
+    && !ACTIVE_RUN_STATUSES.has(runResult.status);
 
   // Chat result cards deep-link to an exact run. It may be older than the
   // compact first history page, so hydrate it directly when necessary.
   useEffect(() => {
-    if (!selectedFlow || !requestedRunId) return;
+    if (readOnly || !selectedFlow || !requestedRunId) return;
     if (runResult?.id === requestedRunId) return;
     if (runs?.some((run: any) => run.id === requestedRunId)) return;
     let active = true;
@@ -755,7 +932,7 @@ export default function Flows() {
       // Keep the workflow definition usable when an old run is unavailable.
     });
     return () => { active = false; };
-  }, [requestedRunId, runResult?.id, runs, selectedFlow?.id]);
+  }, [readOnly, requestedRunId, runResult?.id, runs, selectedFlow?.id]);
 
   // Run lists are intentionally compact and omit node-level results. Hydrate a
   // selected summary once so reopening a workflow restores its canvas state
@@ -763,7 +940,7 @@ export default function Flows() {
   const runResultHasDetail = !!runResult
     && Object.prototype.hasOwnProperty.call(runResult, "step_results");
   useEffect(() => {
-    if (!runResult?.id || runResultHasDetail) return;
+    if (readOnly || !runResult?.id || runResultHasDetail) return;
     let active = true;
     void api.workflows.getRun(runResult.id).then((detail: any) => {
       if (!active) return;
@@ -774,37 +951,78 @@ export default function Flows() {
       // Keep the compact history row usable if detail hydration is unavailable.
     });
     return () => { active = false; };
-  }, [runResult?.id, runResultHasDetail]);
+  }, [readOnly, runResult?.id, runResultHasDetail]);
 
-  // Reveal each completed/failed run once. Closing stays respected until a
-  // different run is selected or a new run completes.
+  // Reveal a result reached in this page session, or one explicitly opened
+  // from a result link. Merely opening a Flow keeps its previous run unobtrusive.
   useEffect(() => {
     if (!selectedFlow || runResult?.workflow_id !== selectedFlow.id) return;
+    if (["pending", "running", "paused"].includes(runResult?.status)) {
+      observedActiveRunIdsRef.current.add(runResult.id);
+      return;
+    }
     if (!["completed", "failed"].includes(runResult?.status)) return;
+    const explicitlyRequested = requestedRunId === runResult.id;
+    if (!explicitlyRequested && !observedActiveRunIdsRef.current.has(runResult.id)) return;
     if (openedFinalRunRef.current === runResult.id) return;
     openedFinalRunRef.current = runResult.id;
     setShowFinalResult(true);
-  }, [runResult?.id, runResult?.status, runResult?.workflow_id, selectedFlow?.id]);
+  }, [requestedRunId, runResult?.id, runResult?.status, runResult?.workflow_id, selectedFlow?.id]);
 
   useEffect(() => {
-    if (!runResult || !runs?.length) return;
+    if (readOnly || !runResult || !runs?.length) return;
     const refreshed = runs.find((run: any) => run.id === runResult.id);
     if (!refreshed) return;
     const resultCount = Object.keys(runResult.step_results || {}).length;
     const refreshedCount = Object.keys(refreshed.step_results || {}).length;
     const refreshedHasResults = Object.prototype.hasOwnProperty.call(refreshed, "step_results");
-    if (
-      refreshed.status !== runResult.status ||
-      refreshed.completed_at !== runResult.completed_at ||
-      (refreshedHasResults && refreshedCount !== resultCount)
-    ) {
+    const progressed = refreshed.status !== runResult.status
+      || refreshed.completed_at !== runResult.completed_at;
+    if (progressed || (refreshedHasResults && refreshedCount !== resultCount)) {
       // Compact polling rows must never erase the full node results received
       // from the SSE completion frame or the detail endpoint.
       setRunResult((current: any) => (
         current?.id === refreshed.id ? { ...current, ...refreshed } : current
       ));
     }
-  }, [runs, runResult]);
+    // Runs resumed or retried from this page finish in the worker, so the
+    // node results held here date from the click. Compact rows carry no node
+    // results; reload the detail whenever the run moves on.
+    if (!progressed || refreshedHasResults) return;
+    const reloadKey = `${refreshed.id}:${refreshed.status}:${refreshed.completed_at || ""}`;
+    if (runDetailReloadRef.current === reloadKey) return;
+    runDetailReloadRef.current = reloadKey;
+    void api.workflows.getRun(refreshed.id).then((detail: any) => {
+      // Full detail replaces the snapshot so canvas and final output agree.
+      setRunResult((current: any) => (
+        current?.id === detail?.id ? detail : current
+      ));
+    }).catch(() => {
+      // The compact row already updated the status; detail can load on reopen.
+    });
+  }, [readOnly, runs, runResult]);
+
+  // A run working in the worker (not streamed to this page) is followed by
+  // reloading its detail, so each node's state shows as it changes.
+  const runIsWorking = !readOnly && !!runResult && !streaming && (
+    ["running", "pending"].includes(runResult.status)
+    || (
+      runResult.status === "paused"
+      && workflowNodeDisplayStatus((runResult.step_results || {})[runResult.current_step_id] || {}) === "running"
+    )
+  );
+  useEffect(() => {
+    if (!runIsWorking || !runResult?.id) return;
+    const runId = runResult.id;
+    const timer = window.setInterval(() => {
+      void api.workflows.getRun(runId).then((detail: any) => {
+        setRunResult((current: any) => (current?.id === detail?.id ? { ...current, ...detail } : current));
+      }).catch(() => {
+        // The compact run list keeps polling; the next tick can retry.
+      });
+    }, 2_500);
+    return () => window.clearInterval(timer);
+  }, [runIsWorking, runResult?.id]);
 
   // Install by stable catalogue id; the returned workflow id is the runtime
   // identity used by bindings, Tasks, Automations, Proposals, and subflows.
@@ -816,6 +1034,7 @@ export default function Flows() {
       queryClient.invalidateQueries({ queryKey: ["workflow-templates"] });
       setShowTemplates(false);
       setSelectedFlow(result.workflow);
+      navigate(workflowPath(result.workflow.id), { state: location.state });
       toast.success(result.already_installed ? "Opened installed Flow" : "Flow installed");
     },
     onError: (error: any) => {
@@ -852,23 +1071,12 @@ export default function Flows() {
     },
   });
 
-  const resumeMutation = useMutation({
-    mutationFn: (runId: string) => api.workflows.resumeRun(runId),
-    onSuccess: (updated: any) => {
-      setRunResult(updated);
-      queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
-      toast.success(updated.status === "completed" ? "Workflow completed" : "Workflow resumed");
-    },
-    onError: (e: any) => {
-      toast.error("Couldn't resume workflow", e?.message || "Please try again.");
-    },
-  });
-
   const pauseMutation = useMutation({
     mutationFn: (runId: string) => api.workflows.pauseRun(runId),
     onSuccess: (updated: any) => {
       setRunResult(updated);
       queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
+      queryClient.invalidateQueries({ queryKey: ["workflow-run-history-detail"] });
       toast.success("Workflow paused", "The current node may finish; no next node will start.");
     },
     onError: (e: any) => {
@@ -882,6 +1090,9 @@ export default function Flows() {
       setRunResult(updated);
       setCancelRunTarget(null);
       queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
+      for (const key of ["workflow-run-history-detail", "workspace-workflow-runs", "workspace-app-recent-run", "workspace-app-run", "workspace-app-run-detail", "workspace-chat", "workflow-run"]) {
+        void queryClient.invalidateQueries({ queryKey: [key] });
+      }
       toast.success("Workflow stopped", "No additional nodes will start.");
     },
     onError: (e: any) => {
@@ -889,13 +1100,47 @@ export default function Flows() {
     },
   });
 
+  const retryMutation = useMutation({
+    // Retry keeps every completed node and re-runs from the one that failed
+    // (or the step the failing node names, such as the publishing fan-out).
+    mutationFn: (run: any) =>
+      api.workflows.retryRun(run.id, {
+        from_step_id: run.retry_from_step_id || workflowRunFailure(run)?.retryFromStepId || run.current_step_id,
+        execute: true,
+      }),
+    onSuccess: (retriedRun: any) => {
+      observedActiveRunIdsRef.current.add(retriedRun.id);
+      setShowFinalResult(false);
+      for (const key of ["workflow-runs", "workspace-workflow-runs", "workspace-app-recent-run", "workspace-app-run", "workspace-app-run-detail", "workflow-run-history-detail", "workflow-run-history-family", "workspace-chat", "workflow-run"]) {
+        void queryClient.invalidateQueries({ queryKey: [key] });
+      }
+      toast.success("Retry started", "Continuing from the failed node.");
+      if (readOnly) {
+        navigate(workflowRunPath(retriedRun.workflow_id || requestedWorkflowId || "", retriedRun.id), { state: location.state });
+        return;
+      }
+      const next = new URLSearchParams(searchParams);
+      next.delete("workflow");
+      next.set("run", retriedRun.id);
+      next.delete("workflow_run");
+      setSearchParams(next, { replace: true, state: location.state });
+      setRunResult(retriedRun);
+    },
+    onError: (e: any) => {
+      toast.error("Couldn't retry workflow", e?.message || "Please try again.");
+    },
+  });
+
   const updateMutation = useMutation({
-    mutationFn: ({ id, ...changes }: { id: string; [key: string]: any }) =>
+    mutationFn: ({ id, canvasSaveSeq: _canvasSaveSeq, ...changes }: { id: string; canvasSaveSeq?: number; [key: string]: any }) =>
       api.workflows.update(id, changes),
-    onSuccess: (updated: any) => {
+    onSuccess: (updated: any, variables) => {
       queryClient.invalidateQueries({ queryKey: ["workflows"] });
       queryClient.invalidateQueries({ queryKey: ["workflow-metadata", updated.id] });
-      if (selectedFlowRef.current?.id === updated.id) {
+      const staleCanvasSave = variables.canvasSaveSeq !== undefined
+        && variables.canvasSaveSeq !== canvasSaveSeqRef.current;
+      if (!staleCanvasSave && selectedFlowRef.current?.id === updated.id) {
+        selectedFlowRef.current = updated;
         setSelectedFlow(updated);
       }
       if (identityTarget?.id === updated.id) {
@@ -961,10 +1206,10 @@ export default function Flows() {
     closeDetail();
     setSelectedFlow(flow);
     const next = new URLSearchParams(searchParams);
-    next.set("workflow", flow.id);
+    next.delete("workflow");
     next.delete("run");
     next.delete("workflow_run");
-    setSearchParams(next, { replace: true });
+    navigate(`${workflowPath(flow.id)}${next.size ? `?${next}` : ""}`, { state: location.state });
   };
 
   const openWorkflowDetails = (flow: Flow) => {
@@ -1178,7 +1423,8 @@ export default function Flows() {
   const filtered = visibleFlows.filter(
     (f: any) =>
       f.name?.toLowerCase().includes(search.toLowerCase()) ||
-      f.description?.toLowerCase().includes(search.toLowerCase()),
+      f.description?.toLowerCase().includes(search.toLowerCase()) ||
+      f.workspace_name?.toLowerCase().includes(search.toLowerCase()),
   );
 
   const handleCreate = () => {
@@ -1224,12 +1470,35 @@ export default function Flows() {
     setStreaming(true);
     setShowFinalResult(false);
     setLiveStatus({});
+    const selectStartedRun = (run: any) => {
+      const next = new URLSearchParams(searchParams);
+      next.delete("workflow");
+      next.set("run", run.id);
+      next.delete("workflow_run");
+      navigate(`${workflowPath(flow.id)}?${next}`, { replace: true, state: location.state });
+      setRunResult(run);
+    };
     try {
+      if (flow.workspace_id) {
+        const bindings = (await api.workflows.listBindings({ workflow_id: flow.id, workspace_id: flow.workspace_id }))
+          .filter((binding: any) => binding.trigger_type === "manual" && binding.status === "active" && binding.enabled);
+        if (bindings.length !== 1) {
+          throw new Error("Open this Workspace's Flows and run the intended workflow binding.");
+        }
+        const run = await api.workflows.runBinding(bindings[0].id, {
+          execute: false, trigger_data: { ...triggerData, workspace_manual: true },
+        });
+        selectStartedRun(run);
+        setRunInputFlow(null);
+        queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
+        return;
+      }
       const finalRun = await api.workflows.runStream(
         flow.id,
         (nodeId, status) => setLiveStatus((previous) => ({ ...previous, [nodeId]: status })),
         (runId) => {
-          setRunResult({
+          setRunInputFlow(null);
+          selectStartedRun({
             id: runId,
             workflow_id: flow.id,
             status: "running",
@@ -1244,128 +1513,37 @@ export default function Flows() {
       queryClient.invalidateQueries({ queryKey: ["workflow-runs"] });
     } catch (error: any) {
       toast.error("Workflow couldn't run", error?.message || "Please check the inputs and try again.");
+      throw error;
     } finally {
       setStreaming(false);
       setLiveStatus({});
     }
   };
 
-  const requestWorkflowRun = (flow: Flow) => {
+  const requestWorkflowRun = (flow: Flow, prefill: Record<string, unknown> | null = null) => {
+    setRunInputPrefill(prefill);
     const inputs = workflowRunInputs(flow);
     if (!inputs.length) {
-      void executeWorkflow(flow);
+      void executeWorkflow(flow).catch(() => { /* Reported by executeWorkflow. */ });
       return;
     }
     closeDetail();
     setSelectedFlow(flow);
-    setRunInputValues(Object.fromEntries(inputs.map((input) => [input.key, input.defaultValue])));
-    setRunInputErrors({});
     setRunInputFlow(flow);
   };
 
-  const submitWorkflowRun = () => {
-    if (!runInputFlow || streaming) return;
-    const inputs = workflowRunInputs(runInputFlow);
-    const errors: Record<string, string> = {};
-    const triggerData: Record<string, unknown> = {};
-    for (const input of inputs) {
-      const value = runInputValues[input.key] ?? "";
-      if (!value.trim()) {
-        if (input.required) errors[input.key] = "Provide a value before running this workflow.";
-        continue;
-      }
-      if (input.type === "number") {
-        const parsed = Number(value);
-        if (!Number.isFinite(parsed)) errors[input.key] = "Enter a valid number.";
-        else if (input.integer && !Number.isInteger(parsed)) errors[input.key] = "Enter a whole number.";
-        else if (input.minimum !== undefined && parsed < input.minimum) errors[input.key] = `Enter ${input.minimum} or more.`;
-        else if (input.maximum !== undefined && parsed > input.maximum) errors[input.key] = `Enter ${input.maximum} or less.`;
-        else triggerData[input.key] = parsed;
-      } else if (input.type === "boolean") {
-        triggerData[input.key] = value === "true";
-      } else if (input.type === "json") {
-        try { triggerData[input.key] = JSON.parse(value); }
-        catch { errors[input.key] = "Enter valid JSON."; }
-      } else {
-        triggerData[input.key] = value;
-      }
-    }
-    setRunInputErrors(errors);
-    if (Object.keys(errors).length) return;
-    const flow = runInputFlow;
-    setRunInputFlow(null);
-    void executeWorkflow(flow, triggerData);
-  };
-
   const runInputModal = (
-    <Modal
-      open={!!runInputFlow}
-      onClose={() => { if (!streaming) setRunInputFlow(null); }}
-      title={runInputFlow ? `Run ${runInputFlow.name}` : "Run workflow"}
-      maxWidth="560px"
-      footer={(
-        <>
-          <Button variant="ghost" onClick={() => setRunInputFlow(null)} disabled={streaming}>Cancel</Button>
-          <Button onClick={submitWorkflowRun} loading={streaming}>Run workflow</Button>
-        </>
-      )}
-    >
-      <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-        <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 13, lineHeight: 1.55 }}>
-          Provide the entry data for this run. These test values are sent to the trigger and are not saved to the workflow.
-        </p>
-        {runInputFlow && workflowRunInputs(runInputFlow).map((input, index) => (
-          <div key={input.key} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
-              <label htmlFor={`workflow-run-input-${index}`} style={{ fontSize: 12.5, fontWeight: 700, color: "var(--text-strong)" }}>
-                {input.label}{input.required ? " *" : ""}
-              </label>
-              <span style={{ fontFamily: "var(--font-mono, monospace)", fontSize: 10.5, color: "var(--text-faint)" }}>{input.type}</span>
-            </div>
-            {input.type === "json" ? (
-              <Textarea
-                value={runInputValues[input.key] ?? ""}
-                onChange={(event) => {
-                  setRunInputValues((current) => ({ ...current, [input.key]: event.target.value }));
-                  setRunInputErrors((current) => ({ ...current, [input.key]: "" }));
-                }}
-                rows={4}
-                placeholder={input.placeholder || "Enter a JSON value"}
-                error={runInputErrors[input.key]}
-                ariaLabel={`Run value for ${input.label}`}
-              />
-            ) : input.type === "boolean" ? (
-              <select
-                id={`workflow-run-input-${index}`}
-                value={runInputValues[input.key] || "false"}
-                onChange={(event) => setRunInputValues((current) => ({ ...current, [input.key]: event.target.value }))}
-                className="manor-input"
-                aria-label={`Run value for ${input.label}`}
-              >
-                <option value="false">False</option>
-                <option value="true">True</option>
-              </select>
-            ) : (
-              <Input
-                value={runInputValues[input.key] ?? ""}
-                onChange={(event) => {
-                  setRunInputValues((current) => ({ ...current, [input.key]: event.target.value }));
-                  setRunInputErrors((current) => ({ ...current, [input.key]: "" }));
-                }}
-                type={input.type === "number" ? "number" : "text"}
-                min={input.minimum}
-                max={input.maximum}
-                step={input.integer ? 1 : undefined}
-                placeholder={input.placeholder || "Enter a value"}
-                error={runInputErrors[input.key]}
-                autoFocus={index === 0}
-                ariaLabel={`Run value for ${input.label}`}
-              />
-            )}
-          </div>
-        ))}
-      </div>
-    </Modal>
+    <WorkflowRunInputModal
+      flow={runInputFlow}
+      workspaceId={runInputFlow?.workspace_id}
+      initialValues={runInputPrefill}
+      busy={streaming}
+      onClose={() => setRunInputFlow(null)}
+      onSubmit={async (triggerData) => {
+        if (!runInputFlow) return;
+        await executeWorkflow(runInputFlow, triggerData);
+      }}
+    />
   );
 
   const workflowIdentityModal = (
@@ -1464,6 +1642,14 @@ export default function Flows() {
   /*  Flow editor view                                                 */
   /* ---------------------------------------------------------------- */
 
+  if (requestedWorkflowId && selectedFlow?.id !== requestedWorkflowId && selectedFlow?.name !== requestedWorkflowId) {
+    return requestedDefinition.isError ? <section role="alert" className="workflow-run-history-list-state is-error">
+      <p>{t("component.workspace_app_view.target_unavailable")}</p>
+      <Button variant="ghost" onClick={closeWorkflow}>{t("component.workflow_run_history.back")}</Button>
+      <Button onClick={() => void requestedDefinition.refetch()}>{t("component.workflow_run_history.try_again")}</Button>
+    </section> : <LoadingSpinner size={24} />;
+  }
+
   if (selectedFlow) {
     const flow = selectedFlow;
     const steps: FlowStep[] = flow.steps || [];
@@ -1479,7 +1665,7 @@ export default function Flows() {
     for (const [id, r] of Object.entries(stepResults)) {
       if (r && typeof r === "object" && (r as any).status) {
         const rr = r as any;
-        runStatusById[id] = rr.skipped ? "skipped" : rr.status;
+        runStatusById[id] = rr.skipped ? "skipped" : workflowNodeDisplayStatus(rr);
         // a one-line preview of what this node produced, shown on the card after
         // a run — so you can see each node's result without opening it.
         let out = "";
@@ -1491,6 +1677,15 @@ export default function Flows() {
       }
       const ref = r && typeof r === "object" ? primaryMediaRef((r as any).output) : undefined;
       if (ref) previewById[id] = ref;
+    }
+    // The node a working run is on shows as running before it has a result.
+    const currentStepId = String(lastRun?.current_step_id || "");
+    if (
+      currentStepId
+      && ["running", "pending"].includes(lastRun?.status)
+      && !["completed", "failed", "skipped"].includes(runStatusById[currentStepId])
+    ) {
+      runStatusById[currentStepId] = "running";
     }
     // While a streaming run is in flight, live per-node events drive the canvas.
     const statusById = streaming ? liveStatus : runStatusById;
@@ -1511,28 +1706,56 @@ export default function Flows() {
       }
       requestWorkflowRun(flow);
     };
-    // Notes are canvas annotations, not runtime steps. Keep them out of both
-    // sides of the progress fraction so a completed five-node flow reads 5/5
-    // even when it also contains sticky notes.
-    const executableSteps = steps.filter((step: any) => step.type !== "note");
-    const doneCount = executableSteps.filter((step: any) => statusById[step.id] === "completed").length;
+    const runProgress = workflowEditorRunProgress(
+      steps,
+      streaming ? liveStatus : runStatusById,
+      streaming ? { status: "running" } : lastRun,
+    );
     const showBanner = streaming || !!lastRun;
-    const bannerStatus = lastRun?.status || (streaming ? "starting" : undefined);
+    const bannerStatus = (workflowRunBackgroundWait(lastRun) ? "running" : lastRun?.status) || (streaming ? "starting" : undefined);
     const runBannerColor = lastRun
         ? lastRun.status === "completed" ? "#4f9c84" : lastRun.status === "failed" ? "#d65f59" : "#cf9b44"
         : streaming ? "#0f766e" : null;
-    const runCanPause = !!lastRun && ["pending", "running"].includes(lastRun.status);
-    const runCanResume = !!lastRun && lastRun.status === "paused";
-    const runCanStop = !!lastRun && ["pending", "running", "paused"].includes(lastRun.status);
+    const runCanControl = !readOnly || lastRun?.capabilities?.can_control === true;
+    const runCanPause = runCanControl && !!lastRun && ["pending", "running"].includes(lastRun.status);
+    // A run paused on background work (a rendering video) needs nobody.
+    const runBackgroundWait = workflowRunBackgroundWait(lastRun);
+    const runCanResume = runCanControl && !!lastRun && lastRun.status === "paused" && !runBackgroundWait;
+    const runCanStop = !!lastRun && (readOnly ? canCancelWorkflowRun(lastRun) : ["pending", "running", "paused"].includes(lastRun.status));
+    const runCanRetry = !streaming
+      && !!lastRun
+      && lastRun.status === "failed"
+      && (!readOnly || canRetryWithoutCorrection(lastRun))
+      && !(readOnly && lastRun.intervention?.kind === "workflow_retry")
+      && Boolean(lastRun.retry_from_step_id || lastRun.current_step_id);
+    const retryControl = readOnly && runCanControl && lastRun?.intervention?.kind === "workflow_retry"
+      ? <WorkflowRunRetryControl
+          runId={lastRun.id} workflowId={flow.id} workspaceId={lastRun.workspace_id || ""}
+          bindingId={lastRun.binding_id} businessOutcome={lastRun.business_outcome} size="sm"
+          onRetried={(next) => navigate(workflowRunPath(flow.id, next.id), { state: location.state })}
+        />
+      : undefined;
+    const openNode = (id: string) => {
+      if (!readOnly) { setConfigStepId(id); return; }
+      const node = steps.find((step) => step.id === id);
+      openDetail({
+        title: node?.name || id,
+        icon: <IconTile size={40}><NodeIcon type={node?.type || "action"} size={20} /></IconTile>,
+        body: <WorkflowValueWithJson value={{
+          result: stepResults[id] || null,
+          execution_trace: buildWorkflowRunTimeline(lastRun, steps).filter((entry) => entry.nodeId === id),
+        }} />,
+      });
+    };
     return (
-      <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "1rem", overflow: "hidden", position: "relative", zIndex: 10 }}>
+      <div className={readOnly ? "workflow-run-view" : undefined} style={{ height: "100%", display: readOnly ? "grid" : "flex", flexDirection: "column", padding: readOnly ? 0 : "1rem", overflow: readOnly ? "auto" : "hidden", position: "relative", zIndex: 10 }}>
         {/* Back + editor identity + a consistent metadata/action toolbar. */}
         <div className="workflow-editor-header">
           <button
             type="button"
             className="workflow-editor-back"
-            aria-label={workflowReturnTo ? "Back to chat" : "Back to flows"}
-            title={workflowReturnTo ? "Back to chat" : "Back to flows"}
+            aria-label={readOnly ? t("component.workflow_run_history.back") : workflowReturnTo ? "Back to chat" : "Back to flows"}
+            title={readOnly ? t("component.workflow_run_history.back") : workflowReturnTo ? "Back to chat" : "Back to flows"}
             onClick={() => {
               closeWorkflow();
             }}
@@ -1545,7 +1768,7 @@ export default function Flows() {
             </IconTile>
             <div className="workflow-editor-heading">
               <PageHeaderTitle variant="editor">
-                <button
+                {readOnly ? flow.name : <button
                   type="button"
                   className="workflow-editor-identity-edit"
                   onClick={() => openWorkflowIdentityEditor()}
@@ -1555,14 +1778,25 @@ export default function Flows() {
                 >
                   <span>{flow.name}</span>
                   <IconEdit size={15} />
-                </button>
+                </button>}
               </PageHeaderTitle>
-              <p>{flow.description || "Add a description"}</p>
+              <p>{readOnly ? fmtRunTime(lastRun?.started_at || lastRun?.created_at) : flow.description || "Add a description"}</p>
             </div>
           </div>
           <div className="workflow-editor-controls">
             <div className="workflow-editor-meta" aria-label="Workflow status">
-              {(() => {
+              {readOnly ? <>
+                <StatusBadge type={lastRun?.status === "failed" ? "error" : "gray"} dot>
+                  {t(`component.workflow_run.status.${lastRun?.status || "pending"}`)}
+                </StatusBadge>
+                <StatusBadge type="gray">{t("component.workflow_run_history.attempts", { count: lastRun?.attempt_number || 1 })}</StatusBadge>
+                {lastRun && workflowRunIsLegacy(lastRun) && <span title={t("component.workflow_run_history.legacy")}>
+                  <StatusBadge type="warning" dot>{t("component.workflow_run_history.legacy_list_metadata")}</StatusBadge>
+                </span>}
+                {lastRun?.lineage_status === "legacy_untrusted_incomplete" && <span title={t("component.workflow_run_history.legacy_lineage_untrusted")}>
+                  <StatusBadge type="warning" dot>{t("component.workflow_run_history.legacy_lineage_label")}</StatusBadge>
+                </span>}
+              </> : <>{(() => {
                 const ok = issues.length === 0;
                 const state = ok ? "valid" : errorCount > 0 ? "error" : "warning";
                 return (
@@ -1574,7 +1808,7 @@ export default function Flows() {
                     disabled={ok}
                   >
                     <span className="workflow-editor-validation-icon" aria-hidden="true">{ok ? "✓" : "!"}</span>
-                    {ok ? "Valid" : <span className="mono">{issues.length} issues</span>}
+                    {ok ? "Valid" : <span className="mono">{issues.length} issue{issues.length === 1 ? "" : "s"}</span>}
                   </button>
                 );
               })()}
@@ -1584,9 +1818,10 @@ export default function Flows() {
               <StatusBadge type="gray">
                 {t(TRIGGER_LABELS[triggerKind] || triggerKind)}
               </StatusBadge>
+              </>}
             </div>
             <div className="workflow-editor-actions" role="toolbar" aria-label="Workflow actions">
-              <AiEditButton
+              {!readOnly && <><AiEditButton
                 className="workflow-editor-action workflow-editor-action-ai"
                 onClick={openWorkflowAiEdit}
                 disabled={updateMutation.isPending}
@@ -1601,7 +1836,8 @@ export default function Flows() {
               >
                 <IconPlus size={17} />
               </Button>
-              <Button
+              </>}
+              {!readOnly && <Button
                 className="workflow-editor-action"
                 variant="outline"
                 title="Deploy workflow"
@@ -1617,8 +1853,8 @@ export default function Flows() {
                 }}
               >
                 <IconUpload size={16} />
-              </Button>
-              <Button
+              </Button>}
+              {!readOnly && <Button
                 className="workflow-editor-action"
                 variant="primary"
                 onClick={() => runStep()}
@@ -1627,7 +1863,7 @@ export default function Flows() {
                 ariaLabel={streaming ? t("page.flows.starting") : t("page.flows.run")}
               >
                 {streaming ? <LoadingSpinner size={15} /> : <IconPlay size={16} />}
-              </Button>
+              </Button>}
               <Button
                 className="workflow-editor-action"
                 variant="outline"
@@ -1641,7 +1877,7 @@ export default function Flows() {
               >
                 <IconClock size={16} />
               </Button>
-              <Button
+              {!readOnly && <Button
                 className="workflow-editor-action"
                 variant="danger"
                 onClick={() => setDeleteTarget(flow.id)}
@@ -1651,7 +1887,7 @@ export default function Flows() {
                 ariaLabel={t("page.flows.delete_flow")}
               >
                 {!(deleteMutation.isPending && deleteTarget === flow.id) && <IconTrash size={16} />}
-              </Button>
+              </Button>}
             </div>
           </div>
         </div>
@@ -1695,16 +1931,19 @@ export default function Flows() {
           </button>
           {showBanner && (
             <div
+              className="workflow-run-banner"
               style={{
                 position: "absolute", top: 16, left: "50%", transform: "translateX(-50%)", zIndex: 6,
                 display: "flex", alignItems: "center", gap: 8, padding: "5px 12px", borderRadius: 999,
                 background: "var(--surface-panel)", boxShadow: "0 1px 3px rgba(28,25,23,0.12)",
                 fontSize: 12, fontWeight: 600, color: "var(--text-muted)",
+                ...(readOnly ? { left: 16, right: 60, transform: "none", flexWrap: "wrap", borderRadius: 8 } : {}),
               }}
             >
               <span style={{ width: 8, height: 8, borderRadius: "50%", background: runBannerColor || "#a8a29e", animation: streaming ? "pulse 1.2s ease-in-out infinite" : "none" }} />
               <span style={{ color: "var(--text-strong)", textTransform: "capitalize" }}>{bannerStatus}</span>
-              <span className="mono" style={{ color: "var(--text-faint)" }}>{doneCount}/{executableSteps.length}</span>
+              {lastRun?.status !== "completed" && <span className="mono" style={{ color: "var(--text-faint)" }}>{runProgress.processed}/{runProgress.total}</span>}
+              {runBackgroundWait && <span style={{ color: "var(--text-faint)" }}>· {runBackgroundWait}</span>}
               {!streaming && lastRun?.error && <span style={{ color: "#d65f59", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>· {lastRun.error}</span>}
               {runCanPause && (
                 <button
@@ -1720,15 +1959,11 @@ export default function Flows() {
                 </button>
               )}
               {runCanResume && (
-                <button
-                  type="button"
-                  className="workflow-run-banner-action"
-                  onClick={() => resumeMutation.mutate(lastRun.id)}
-                  disabled={resumeMutation.isPending || cancelRunMutation.isPending}
-                >
-                  <IconPlay size={12} />
-                  {resumeMutation.isPending ? "Resuming…" : "Resume"}
-                </button>
+                <WorkflowRunResumeControl
+                  runId={lastRun.id}
+                  disabled={cancelRunMutation.isPending}
+                  onResumed={(updated) => { setRunResult(updated); void queryClient.invalidateQueries({ queryKey: ["workflow-run-history-detail"] }); }}
+                />
               )}
               {runCanStop && (
                 <button
@@ -1743,35 +1978,88 @@ export default function Flows() {
                   Stop
                 </button>
               )}
+              {runCanRetry && (
+                <button
+                  type="button"
+                  className="workflow-run-banner-action"
+                  onClick={() => retryMutation.mutate(lastRun)}
+                  disabled={retryMutation.isPending}
+                  aria-label="Retry workflow from the failed node"
+                  title="Continue from the failed node"
+                >
+                  <IconRefresh size={12} />
+                  {retryMutation.isPending ? "Retrying…" : "Retry"}
+                </button>
+              )}
+              {retryControl}
               {!streaming && lastRun && ["completed", "failed"].includes(lastRun.status) && (
                 <Button
                   variant="ghost"
                   size="sm"
                   onClick={() => setShowFinalResult(true)}
-                  style={{ height: 24, padding: "0 7px", fontSize: 11 }}
+                  style={{ height: 24, padding: "0 7px", fontSize: 11, whiteSpace: "nowrap", flexShrink: 0 }}
                 >
                   View result
                 </Button>
+              )}
+              {!streaming && showNewerActiveRun && (
+                <button
+                  type="button"
+                  className="workflow-run-banner-action"
+                  onClick={() => {
+                    if (readOnly) {
+                      navigate(workflowRunPath(flow.id, newerActiveRun.id), { state: location.state });
+                      return;
+                    }
+                    const next = new URLSearchParams(searchParams);
+                    next.set("run", newerActiveRun.id);
+                    next.delete("workflow_run");
+                    setSearchParams(next, { replace: true, state: location.state });
+                    setRunResult(newerActiveRun);
+                  }}
+                  title="A newer run of this Flow is still working or waiting for your decision"
+                >
+                  {newerActiveRun.status === "paused" ? "Newer run needs you" : "Open running run"}
+                </button>
               )}
             </div>
           )}
           <WorkflowCanvas
             steps={steps as unknown as CanvasStep[]}
+            fitOnResize={readOnly}
             statusById={statusById}
             previewById={previewById}
             outputById={outputById}
-            onRunNode={workflowAiPreview ? undefined : runSingleNode}
-            issueById={issueById}
-            onStepsChange={workflowAiPreview ? undefined : (next) =>
-              flow.id && updateMutation.mutate({ id: flow.id, steps: next })
-            }
-            onNodeOpen={workflowAiPreview ? undefined : (id) => setConfigStepId(id)}
-            onAddFrom={workflowAiPreview ? undefined : (id) => { setAddFromId(id); setShowAddStep(true); }}
+            onRunNode={readOnly || workflowAiPreview ? undefined : runSingleNode}
+            issueById={readOnly ? undefined : issueById}
+            onStepsChange={readOnly || workflowAiPreview ? undefined : (next) => {
+              if (!flow.id) return;
+              const previous = flow;
+              const canvasSaveSeq = canvasSaveSeqRef.current + 1;
+              canvasSaveSeqRef.current = canvasSaveSeq;
+              const optimistic = { ...flow, steps: next as any };
+              selectedFlowRef.current = optimistic;
+              setSelectedFlow(optimistic);
+              updateMutation.mutate(
+                { id: flow.id, steps: next, canvasSaveSeq },
+                {
+                  onError: () => {
+                    // Roll back only if no newer edit replaced this one.
+                    if (canvasSaveSeqRef.current !== canvasSaveSeq) return;
+                    selectedFlowRef.current = previous;
+                    setSelectedFlow(previous);
+                  },
+                },
+              );
+            }}
+            onNodeOpen={workflowAiPreview ? undefined : openNode}
+            onAddFrom={readOnly || workflowAiPreview ? undefined : (id) => { setAddFromId(id); setShowAddStep(true); }}
           />
         </div>
         );
         const editorBody = (
           <div
+            className="workflow-editor-body"
             style={
               canvasFull
                 ? { position: "fixed", inset: 0, zIndex: 1000, background: "var(--surface-app)", padding: 8, display: "flex", gap: 8 }
@@ -1786,11 +2074,23 @@ export default function Flows() {
 
         {showFinalResult && lastRun && (
           <WorkflowFinalResultPanel
+            key={lastRun.id}
             run={lastRun}
             result={finalResult}
+            workflowName={selectedFlow.name}
+            processedCount={runProgress.processed}
+            outputPending={!runResultHasDetail}
+            failure={workflowRunFailure(lastRun, steps)}
+            retrying={retryMutation.isPending}
+            onRetry={runCanRetry ? () => retryMutation.mutate(lastRun) : undefined}
+            retryControl={retryControl}
+            onRunAgain={readOnly ? undefined : () => {
+              setShowFinalResult(false);
+              requestWorkflowRun(flow, lastRun.trigger_data || null);
+            }}
             onClose={() => setShowFinalResult(false)}
             onOpenNode={(stepId) => {
-              setConfigStepId(stepId);
+              openNode(stepId);
               setShowFinalResult(false);
             }}
           />
@@ -1921,12 +2221,9 @@ export default function Flows() {
                     <button
                       key={run.id}
                       onClick={() => {
-                        setRunResult(run);
-                        const next = new URLSearchParams(searchParams);
-                        next.set("workflow", flow.id);
-                        next.set("run", run.id);
-                        next.delete("workflow_run");
-                        setSearchParams(next, { replace: true });
+                        navigate(workflowRunPath(flow.id, run.id, run.workspace_id), {
+                          state: { returnTo: `${location.pathname}${location.search}`, returnState: location.state },
+                        });
                       }}
                       style={{
                         display: "flex", alignItems: "center", gap: 10, padding: "9px 11px", borderRadius: 10,
@@ -2029,7 +2326,7 @@ export default function Flows() {
           onClose={() => setDeployFlow(null)}
         />
 
-        <WorkflowNodeConfigPanel
+        {!readOnly && <WorkflowNodeConfigPanel
           step={(flow.steps || []).find((s: any) => s.id === configStepId) || null}
           lastResult={configStepId ? stepResults[configStepId] : undefined}
           runVariables={lastRun?.variables}
@@ -2038,25 +2335,23 @@ export default function Flows() {
             id: s.id,
             name: s.name,
             type: s.type,
-            targets: [...new Set([
-              ...(s.next || []),
-              ...(s.true_next || []),
-              ...(s.false_next || []),
-              ...((Array.isArray(s.config?.cases) ? s.config.cases : []).flatMap((item: any) => item?.next || [])),
-              ...(s.config?.default_next || []),
-            ].filter(Boolean))] as string[],
+            targets: workflowStepTargets(s),
             outputs: workflowNodeOutputs(s),
           }))}
-          onSave={(updated) => {
-            if (workflowAiPreviewRef.current) return;
-            updateMutation.mutate({
-              id: flow.id,
-              steps: (flow.steps || []).map((s: any) => (s.id === updated.id ? updated : s)),
+          onSave={async (updated) => {
+            if (workflowAiPreviewRef.current || updateMutation.isPending) {
+              throw new Error("Finish the current Workflow edit before saving this node.");
+            }
+            const current = selectedFlowRef.current;
+            if (!current || current.id !== flow.id) throw new Error("Reopen this Workflow before saving.");
+            await updateMutation.mutateAsync({
+              id: current.id,
+              steps: (current.steps || []).map((s: any) => (s.id === updated.id ? updated : s)),
             });
           }}
           onRunResult={recordSingleResult}
           onClose={() => setConfigStepId(null)}
-        />
+        />}
         {runInputModal}
       </div>
     );
@@ -2125,7 +2420,7 @@ export default function Flows() {
         ) : (
           <div style={{
             display: "grid",
-            gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 260px), 1fr))",
+            gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 340px), 1fr))",
             gap: 24,
           }}>
             {filtered.map((flow: any) => {
@@ -2146,7 +2441,9 @@ export default function Flows() {
                       text={flow.name}
                     />
                   }
-                  subtitle={flow.description || t(TRIGGER_LABELS[flow.trigger] || flow.trigger)}
+                  subtitle={flow.workspace_name && flow.workspace_id
+                    ? <span title={flow.description || undefined}>{flow.workspace_id.slice(-6)} · {flow.workspace_name}</span>
+                    : flow.description || t(TRIGGER_LABELS[flow.trigger] || flow.trigger)}
                   meta={
                     <>
                       <span className="mono" style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 600 }}>

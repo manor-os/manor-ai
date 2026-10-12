@@ -38,7 +38,10 @@ export function useLiveChatCall({ scope, disabled, onConversation }: {
   const [open, setOpen] = useState(false);
   const [muted, setMuted] = useState(false);
   const [caption, setCaption] = useState("");
-  const [transcript, setTranscript] = useState<{ id: number; turn: number; role: "user" | "assistant"; text: string }[]>([]);
+  const [transcript, setTranscript] = useState<{
+    id: number; turn: number; role: "user" | "assistant"; text: string;
+    itemId?: string; partial?: boolean;
+  }[]>([]);
   const [error, setError] = useState<CallErrorCode | "">("");
   const [inputLevel, setInputLevel] = useState(0);
   const [duplexMode, setDuplexMode] = useState<"full" | "push_to_interrupt">("full");
@@ -103,6 +106,41 @@ export function useLiveChatCall({ scope, disabled, onConversation }: {
       const turn = Number.isSafeInteger(generation) ? generation! : active.transcriptTurn || 0;
       setTranscript(items => [...items, { id, turn, role, text }]
         .sort((a, b) => a.turn - b.turn || (a.role === b.role ? a.id - b.id : a.role === "user" ? -1 : 1)).slice(-80));
+    };
+    const upsertTranscript = (
+      role: "user" | "assistant",
+      itemId: string | undefined,
+      text: string,
+      generation: number | undefined,
+      final: boolean,
+      replacePartial = false,
+    ) => {
+      if (!itemId) {
+        if (final && text) appendTranscript(role, text, generation);
+        return;
+      }
+      setTranscript(items => {
+        const index = items.findIndex(item => item.role === role && item.itemId === itemId);
+        if (index >= 0) {
+          if (final && !text) return items.filter((_, itemIndex) => itemIndex !== index);
+          const currentItem = items[index];
+          if (!final && currentItem.partial === false) return items;
+          const next = [...items];
+          next[index] = {
+            ...currentItem,
+            text: final || replacePartial ? text : currentItem.text + text,
+            partial: !final,
+          };
+          return next;
+        }
+        if (!text) return items;
+        const id = active.transcriptId = (active.transcriptId || 0) + 1;
+        if (role === "user") active.transcriptTurn = (active.transcriptTurn || 0) + 1;
+        const turn = Number.isSafeInteger(generation) ? generation! : active.transcriptTurn || 0;
+        return [...items, {
+          id, turn, role, text, itemId, partial: !final,
+        }].sort((a, b) => a.turn - b.turn || (a.role === b.role ? a.id - b.id : a.role === "user" ? -1 : 1)).slice(-80);
+      });
     };
     active.release = claimChatAudio(() => { stop(); setOpen(false); });
     active.timer = setTimeout(() => fail("timeout"), 30000);
@@ -201,7 +239,7 @@ export function useLiveChatCall({ scope, disabled, onConversation }: {
               }
               break;
             case "work":
-              setBackgroundWorking(event.status === "running");
+              setBackgroundWorking(event.status === "running" || event.status === "queued");
               break;
             case "interrupt": {
               if (Number.isSafeInteger(event.generation)) {
@@ -229,11 +267,47 @@ export function useLiveChatCall({ scope, disabled, onConversation }: {
               break;
             case "caption":
               if (active.generation !== undefined && event.generation !== active.generation) break;
-              if (active.captionItem !== event.item_id) { active.captionItem = event.item_id; setCaption(event.delta); }
-              else setCaption(text => text + event.delta);
+              if (active.captionItem !== event.item_id) {
+                active.captionItem = event.item_id;
+                setCaption(event.delta);
+              } else {
+                setCaption(text => text + event.delta);
+              }
+              upsertTranscript(
+                "assistant",
+                typeof event.item_id === "string" ? event.item_id : undefined,
+                typeof event.delta === "string" ? event.delta : "",
+                Number.isSafeInteger(event.generation) ? event.generation : undefined,
+                false,
+              );
+              break;
+            case "transcript_delta":
+              upsertTranscript(
+                "user",
+                typeof event.item_id === "string" ? event.item_id : undefined,
+                typeof event.delta === "string" ? event.delta : "",
+                Number.isSafeInteger(event.generation) ? event.generation : undefined,
+                false,
+              );
+              break;
+            case "transcript_preview":
+              upsertTranscript(
+                "user",
+                typeof event.item_id === "string" ? event.item_id : undefined,
+                typeof event.text === "string" ? event.text : "",
+                undefined,
+                false,
+                true,
+              );
               break;
             case "transcript": {
-              appendTranscript("user", event.text, event.generation);
+              upsertTranscript(
+                "user",
+                typeof event.item_id === "string" ? event.item_id : undefined,
+                typeof event.text === "string" ? event.text : "",
+                Number.isSafeInteger(event.generation) ? event.generation : undefined,
+                true,
+              );
               setCaption("");
               break;
             }
@@ -247,7 +321,13 @@ export function useLiveChatCall({ scope, disabled, onConversation }: {
               if (event.text) {
                 // A completed Chat reply remains readable even if speaking
                 // again cancelled its audio. It belongs to this call's log.
-                appendTranscript("assistant", event.text, event.generation);
+                upsertTranscript(
+                  "assistant",
+                  typeof event.item_id === "string" ? event.item_id : active.captionItem,
+                  event.text,
+                  Number.isSafeInteger(event.generation) ? event.generation : undefined,
+                  true,
+                );
               }
               if (event.generation === undefined || active.generation === undefined || event.generation === active.generation) {
                 active.captionItem = undefined; setCaption("");

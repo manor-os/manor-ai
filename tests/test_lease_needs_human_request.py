@@ -4,15 +4,21 @@
 无法 join 回 task/step，也无法复用去重。这些测试钉住接线后的行为。
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
 
+from packages.core.ai.runtime.control import RuntimeAgentCheckpoint
+from packages.core.ai.runtime.workspace_delegation_actions import _tool_arguments_hash
 from packages.core.constants.approvals import ApprovalStatus
-from packages.core.constants.execution import WorkLeaseStatus
+from packages.core.constants.execution import (
+    COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY,
+    WorkLeaseStatus,
+)
+from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.dispatcher.service import Dispatcher
-from packages.core.governance import WorkspacePolicy, get_policy, update_policy
 from packages.core.governance.approvals import (
     ApprovalOrigin,
     ApprovalSubject,
@@ -25,7 +31,7 @@ from packages.core.governance.approvals import (
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
-from packages.core.models.task import Conversation, Message
+from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.worker import Worker, WorkLease
 from packages.core.models.workspace import Workspace
 from packages.core.services.runtime_authorization import AuthorizationRule
@@ -144,6 +150,59 @@ def test_tool_call_dedup_key_includes_resource_scope():
     assert exact.startswith(f"tool:{conversation_id}:workspace.file.modify#resource:docs/status.xlsx:")
 
 
+def test_tool_call_dedup_key_bounds_long_workspace_file_paths():
+    entity_id = generate_ulid()
+    conversation_id = generate_ulid()
+    resource_id = (
+        "Workspaces/_by_id/01M1Y03Z6ZYDV7FN6TXA7G1QC8/runs/"
+        "01M280X5QM3KXZPYQXH4H76SG4/technical/stickman-workspace-assets.md"
+    )
+    origin = ApprovalOrigin(
+        kind="tool_call",
+        conversation_id=conversation_id,
+        args_hash="a" * 64,
+    )
+
+    key = dedup_key_for(
+        ApprovalSubject(
+            entity_id=entity_id,
+            action_key="workspace.file.modify",
+            resource_id=resource_id,
+            capability_id="file.write",
+            risk_level="medium",
+            kind="action",
+        ),
+        origin,
+    )
+    same_key = dedup_key_for(
+        ApprovalSubject(
+            entity_id=entity_id,
+            action_key="workspace.file.modify",
+            resource_id=resource_id,
+            capability_id="file.write",
+            risk_level="medium",
+            kind="action",
+        ),
+        origin,
+    )
+    other_key = dedup_key_for(
+        ApprovalSubject(
+            entity_id=entity_id,
+            action_key="workspace.file.modify",
+            resource_id=f"{resource_id}.other",
+            capability_id="file.write",
+            risk_level="medium",
+            kind="action",
+        ),
+        origin,
+    )
+
+    assert len(key) <= 200
+    assert key == same_key
+    assert key != other_key
+    assert key.startswith(f"tool:{conversation_id}:workspace.file.modify#resource:")
+
+
 async def _lease_fixture(db, *, entity_id=None, workspace_id=None):
     """A workspace + running plan + leased step, ready to pause.
 
@@ -192,6 +251,7 @@ async def _lease_fixture(db, *, entity_id=None, workspace_id=None):
     )
 
     step_id = generate_ulid()
+    lease_id = generate_ulid()
     db.add(
         ExecutionStep(
             id=step_id,
@@ -206,10 +266,12 @@ async def _lease_fixture(db, *, entity_id=None, workspace_id=None):
             max_attempts=3,
             risk_level="medium",
             capability_id="browser.control",
+            # A granted lease always owns its running step; a report through
+            # a lease the step no longer points at is refused as superseded.
+            current_lease_id=lease_id,
         )
     )
 
-    lease_id = generate_ulid()
     db.add(
         WorkLease(
             id=lease_id,
@@ -474,6 +536,69 @@ async def test_fallback_card_without_pending_action_carries_request_id(
     assert card["approval_request_id"] == req.id
 
 
+@pytest.mark.asyncio
+async def test_expired_lease_with_unsettled_effect_persists_reconciliation_request_and_card(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.workspace_chat import notifiers as chat_notify
+
+    posted: list[dict] = []
+
+    async def _capture(**kwargs):
+        posted.append(kwargs)
+
+    monkeypatch.setattr(chat_notify, "_safe_post", _capture)
+    fx = await _lease_fixture(db_session)
+    lease = await db_session.get(WorkLease, fx["lease_id"])
+    step = await db_session.get(ExecutionStep, fx["step_id"])
+    lease.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    step.evidence_refs = [{
+        "kind": "tool_effect",
+        "effect": "pending",
+        "fields": {
+            "tool": "mcp__example__publish",
+            "tool_call_id": "call-1",
+            "arguments_hash": "a" * 64,
+            "intent_state": "started",
+        },
+    }]
+    await db_session.commit()
+
+    assert await Dispatcher().expire_leases(db_session) >= 1
+    await db_session.commit()
+    db_session.expire_all()
+
+    lease = await db_session.get(WorkLease, fx["lease_id"])
+    step = await db_session.get(ExecutionStep, fx["step_id"])
+    request = (
+        await db_session.execute(
+            select(HitlRequest).where(HitlRequest.origin_step_id == fx["step_id"])
+        )
+    ).scalar_one()
+    assert lease.status == WorkLeaseStatus.EXPIRED.value
+    assert step.step_status == "waiting_human"
+    assert request.status == ApprovalStatus.PENDING.value
+    assert request.origin_kind == "lease"
+    assert request.dedup_key == f"lease:{fx['lease_id']}:effect_reconciliation"
+    assert request.hitl_type == "error"
+    assert "external action" in request.reason.lower()
+    assert "verify it with the provider" in request.reason.lower()
+
+    target_posts = [
+        item
+        for item in posted
+        if (item.get("pending_action") or {}).get("approval_request_id") == request.id
+    ]
+    assert len(target_posts) == 1
+    card = target_posts[0]["pending_action"]
+    assert card["kind"] == "effect_reconciliation"
+    assert card["approval_request_id"] == request.id
+    assert "confirm_effect_not_applied" in card["options"]
+    assert card["payload"]["reconciliation"]["not_applied_allowed"] is True
+    assert "external action" in target_posts[0]["body"].lower()
+
+
 async def _register(client, username: str) -> dict:
     resp = await client.post(
         "/api/v1/auth/register",
@@ -486,6 +611,106 @@ async def _register(client, username: str) -> dict:
     )
     assert resp.status_code == 200
     return {"Authorization": f"Bearer {resp.json()['access_token']}"}
+
+
+async def _seed_direct_effect_reconciliation_card(
+    client,
+    db_session,
+    username: str,
+) -> tuple[dict, dict, str]:
+    headers = await _register(client, username)
+    workspace_response = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Concurrent effect reconciliation WS"},
+    )
+    assert workspace_response.status_code in (200, 201), workspace_response.text
+    workspace = workspace_response.json()
+    fixture = await _lease_fixture(
+        db_session,
+        entity_id=workspace["entity_id"],
+        workspace_id=workspace["id"],
+    )
+    db_session.add(Task(
+        id=fixture["task_id"],
+        entity_id=fixture["entity_id"],
+        workspace_id=fixture["workspace_id"],
+        title="Publish exactly once",
+        status="in_progress",
+        priority=3,
+        task_type="general",
+        details={},
+    ))
+    await db_session.flush()
+
+    tool_name = "mcp__example__publish"
+    tool_call_id = "call-concurrent-publish"
+    arguments = {"title": "Launch", "body": "Ready"}
+    checkpoint = RuntimeAgentCheckpoint(
+        messages=[
+            {"role": "user", "content": "Publish it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": '{"title":"Launch","body":"Ready"}',
+                    },
+                }],
+            },
+        ],
+        usage={},
+        rounds=1,
+        tool_calls_made=[],
+        pending_tool_call={
+            "id": tool_call_id,
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    ).to_dict()
+    effect = {
+        "kind": "tool_effect",
+        "effect": "pending",
+        "fields": {
+            "tool": tool_name,
+            "tool_call_id": tool_call_id,
+            "arguments_hash": _tool_arguments_hash(arguments),
+            "effect_generation": 0,
+            "owner_step_id": fixture["step_id"],
+            "owner_plan_id": fixture["plan_id"],
+            "intent_state": "started",
+        },
+    }
+    await Dispatcher().lease_needs_human(
+        db_session,
+        fixture["lease_id"],
+        prompt="Verify whether the publish happened",
+        evidence_refs=[effect],
+        runtime_checkpoint=checkpoint,
+    )
+    await db_session.commit()
+
+    request = (await db_session.execute(
+        select(HitlRequest).where(
+            HitlRequest.origin_step_id == fixture["step_id"],
+            HitlRequest.context["pending_kind"].as_string()
+            == PendingActionKind.EFFECT_RECONCILIATION.value,
+        )
+    )).scalar_one()
+    card = (await db_session.execute(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.entity_id == fixture["entity_id"],
+            Conversation.workspace_id == fixture["workspace_id"],
+            Message.pending_action["approval_request_id"].as_string()
+            == request.id,
+        )
+    )).scalar_one()
+    return headers, fixture, card.id
 
 
 async def _seed_lease_card(client, db_session, username: str, *, kind: str):
@@ -577,14 +802,411 @@ async def _seed_lease_card(client, db_session, username: str, *, kind: str):
     return headers, workspace_id, message_id, request_id
 
 
-async def _resolve_card(client, headers, workspace_id, message_id, choice: str):
+async def _resolve_card(client, headers, workspace_id, message_id, choice: str, *, note: str | None = None):
     resp = await client.post(
         f"/api/v1/workspaces/{workspace_id}/chat/messages/{message_id}/resolve",
         headers=headers,
-        json={"choice": choice},
+        json={"choice": choice, **({"note": note} if note is not None else {})},
     )
     assert resp.status_code == 200, resp.text
     return resp
+
+
+@pytest.mark.asyncio
+async def test_cancelling_direct_effect_reconciliation_terminalizes_without_dispatch(
+    client,
+    db_session,
+    monkeypatch,
+):
+    """The service-owned CANCEL terminal state must not trip the route's wakeup guard."""
+
+    headers = await _register(client, "direct_effect_cancel")
+    workspace_response = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Direct effect cancel WS"},
+    )
+    assert workspace_response.status_code in (200, 201), workspace_response.text
+    workspace = workspace_response.json()
+    fixture = await _lease_fixture(
+        db_session,
+        entity_id=workspace["entity_id"],
+        workspace_id=workspace["id"],
+    )
+    db_session.add(Task(
+        id=fixture["task_id"],
+        entity_id=fixture["entity_id"],
+        workspace_id=fixture["workspace_id"],
+        title="Publish launch update",
+        status="in_progress",
+        priority=3,
+        task_type="general",
+        details={},
+    ))
+    await db_session.flush()
+
+    tool_name = "mcp__example__publish"
+    tool_call_id = "call-publish-1"
+    arguments = {"title": "Launch", "body": "Ready"}
+    checkpoint = RuntimeAgentCheckpoint(
+        messages=[
+            {"role": "user", "content": "Publish it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": '{"title":"Launch","body":"Ready"}',
+                    },
+                }],
+            },
+        ],
+        usage={},
+        rounds=1,
+        tool_calls_made=[],
+        pending_tool_call={
+            "id": tool_call_id,
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    ).to_dict()
+    effect = {
+        "kind": "tool_effect",
+        "effect": "pending",
+        "fields": {
+            "tool": tool_name,
+            "tool_call_id": tool_call_id,
+            "arguments_hash": _tool_arguments_hash(arguments),
+            "effect_generation": 0,
+            "owner_step_id": fixture["step_id"],
+            "owner_plan_id": fixture["plan_id"],
+            "intent_state": "started",
+        },
+    }
+    await Dispatcher().lease_needs_human(
+        db_session,
+        fixture["lease_id"],
+        prompt="Verify whether the publish happened",
+        evidence_refs=[effect],
+        runtime_checkpoint=checkpoint,
+    )
+    await db_session.commit()
+
+    request = (await db_session.execute(
+        select(HitlRequest).where(
+            HitlRequest.origin_step_id == fixture["step_id"],
+            HitlRequest.context["pending_kind"].as_string()
+            == PendingActionKind.EFFECT_RECONCILIATION.value,
+        )
+    )).scalar_one()
+    messages = list((await db_session.execute(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.entity_id == fixture["entity_id"],
+            Conversation.workspace_id == fixture["workspace_id"],
+        )
+    )).scalars().all())
+    card = next(
+        message
+        for message in messages
+        if isinstance(message.pending_action, dict)
+        and message.pending_action.get("approval_request_id") == request.id
+    )
+    request_id = request.id
+    card_id = card.id
+
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.plans.wakeup import (
+        PLAN_CYCLE_OUTBOX_EVENT,
+        plan_cycle_outbox_dedupe_key,
+    )
+    from tests.test_plan_retries import _capture_plan_cycle_hints
+
+    plan_hints = _capture_plan_cycle_hints(monkeypatch)
+    response = await client.post(
+        f"/api/v1/workspaces/{fixture['workspace_id']}/chat/messages/{card_id}/resolve",
+        headers=headers,
+        json={"choice": "cancel"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert plan_hints == []
+    db_session.expire_all()
+    plan = await db_session.get(ExecutionPlan, fixture["plan_id"])
+    task = await db_session.get(Task, fixture["task_id"])
+    step = await db_session.get(ExecutionStep, fixture["step_id"])
+    request = await db_session.get(HitlRequest, request_id)
+    card = await db_session.get(Message, card_id)
+    pending_wake = (await db_session.execute(
+        select(RuntimeOutboxEvent.id).where(
+            RuntimeOutboxEvent.event_type == PLAN_CYCLE_OUTBOX_EVENT,
+            RuntimeOutboxEvent.aggregate_id == fixture["plan_id"],
+            RuntimeOutboxEvent.dedupe_key
+            == plan_cycle_outbox_dedupe_key(fixture["plan_id"]),
+            RuntimeOutboxEvent.delivered_at.is_(None),
+        )
+    )).scalar_one_or_none()
+    assert pending_wake is None
+    assert plan.status == "cancelled"
+    assert task.status == "cancelled"
+    assert step.step_status == "failed"
+    assert request.status == ApprovalStatus.DENIED.value
+    assert card.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_identical_effect_reconciliation_projects_and_dispatches_once(
+    client,
+    db_session,
+    monkeypatch,
+):
+    """Two request sessions may replay the decision; one Message CAS owns output."""
+
+    headers, fixture, card_id = await _seed_direct_effect_reconciliation_card(
+        client,
+        db_session,
+        "concurrent_effect_reconciliation",
+    )
+    evidence_calls: list[str] = []
+    activity_calls: list[str] = []
+    from tests.test_plan_retries import (
+        _assert_exact_pending_plan_cycle_wake,
+        _capture_plan_cycle_hints,
+    )
+
+    plan_hints = _capture_plan_cycle_hints(monkeypatch)
+
+    async def _capture_evidence(*_args, **kwargs):
+        evidence_calls.append(str(kwargs["message_id"]))
+        return []
+
+    async def _capture_activity(*_args, **kwargs):
+        activity_calls.append(str(kwargs["message_id"]))
+
+    monkeypatch.setattr(
+        "apps.api.routers.workspace_chat._record_pending_action_resolution_evidence",
+        _capture_evidence,
+    )
+    monkeypatch.setattr(
+        "apps.api.routers.workspace_chat._record_pending_action_activity",
+        _capture_activity,
+    )
+
+    path = (
+        f"/api/v1/workspaces/{fixture['workspace_id']}"
+        f"/chat/messages/{card_id}/resolve"
+    )
+    first, second = await asyncio.gather(
+        client.post(
+            path,
+            headers=headers,
+            json={"choice": "confirm_effect_not_applied"},
+        ),
+        client.post(
+            path,
+            headers=headers,
+            json={"choice": "confirm_effect_not_applied"},
+        ),
+    )
+
+    assert [first.status_code, second.status_code] == [200, 200], [
+        first.text, second.text,
+    ]
+    assert [hint["plan_id"] for hint in plan_hints] == [fixture["plan_id"]]
+    await _assert_exact_pending_plan_cycle_wake(
+        db_session,
+        fixture["plan_id"],
+        plan_hints[0],
+    )
+    assert evidence_calls == [card_id]
+    assert activity_calls == [card_id]
+
+    db_session.expire_all()
+    card = await db_session.get(Message, card_id)
+    messages = list((await db_session.execute(
+        select(Message).where(Message.conversation_id == card.conversation_id)
+    )).scalars().all())
+    followups = [
+        message
+        for message in messages
+        if any(
+            isinstance(ref, dict)
+            and ref.get("type") == "message"
+            and ref.get("id") == card_id
+            for ref in (message.refs or [])
+        )
+    ]
+    assert card.resolved_at is not None
+    assert card.resolution["choice"] == "confirm_effect_not_applied"
+    assert len(followups) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_claim_rejects_not_applied_until_claim_is_released(
+    client,
+    db_session,
+    monkeypatch,
+):
+    """An expired lease with a live claim cannot honestly authorize a retry."""
+
+    headers = await _register(client, "expired_effect_claim")
+    workspace_response = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Expired effect claim WS"},
+    )
+    assert workspace_response.status_code in (200, 201), workspace_response.text
+    workspace = workspace_response.json()
+    fixture = await _lease_fixture(
+        db_session,
+        entity_id=workspace["entity_id"],
+        workspace_id=workspace["id"],
+    )
+    db_session.add(Task(
+        id=fixture["task_id"],
+        entity_id=fixture["entity_id"],
+        workspace_id=fixture["workspace_id"],
+        title="Publish from an expired worker",
+        status="in_progress",
+        priority=3,
+        task_type="general",
+        details={},
+    ))
+    lease = await db_session.get(WorkLease, fixture["lease_id"])
+    step = await db_session.get(ExecutionStep, fixture["step_id"])
+    claim_id = generate_ulid()
+    lease.execution_claim_id = claim_id
+    lease.execution_claimed_at = datetime.now(timezone.utc)
+    lease.lease_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    effect_arguments = {"title": "Launch", "body": "Ready"}
+    step.runtime_checkpoint = RuntimeAgentCheckpoint(
+        messages=[
+            {"role": "user", "content": "Publish it"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-expired-1",
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__example__publish",
+                        "arguments": '{"title":"Launch","body":"Ready"}',
+                    },
+                }],
+            },
+        ],
+        usage={},
+        rounds=1,
+        tool_calls_made=[],
+        pending_tool_call={
+            "id": "call-expired-1",
+            "name": "mcp__example__publish",
+            "arguments": effect_arguments,
+        },
+    ).to_dict()
+    step.evidence_refs = [{
+        "kind": "tool_effect",
+        "effect": "pending",
+        "fields": {
+            "tool": "mcp__example__publish",
+            "tool_call_id": "call-expired-1",
+            "arguments_hash": _tool_arguments_hash(effect_arguments),
+            "intent_state": "started",
+        },
+    }]
+    await db_session.commit()
+
+    from tests.test_plan_retries import (
+        _assert_exact_pending_plan_cycle_wake,
+        _capture_plan_cycle_hints,
+    )
+
+    plan_hints = _capture_plan_cycle_hints(monkeypatch)
+    assert await Dispatcher().expire_leases(db_session) >= 1
+    await db_session.commit()
+    expiry_wake = await _assert_exact_pending_plan_cycle_wake(
+        db_session,
+        fixture["plan_id"],
+    )
+    assert expiry_wake.payload["reason"] == "lease_expired"
+    expiry_generation = str(expiry_wake.payload["wake_generation"])
+    db_session.expire_all()
+
+    lease = await db_session.get(WorkLease, fixture["lease_id"])
+    request = (await db_session.execute(
+        select(HitlRequest).where(
+            HitlRequest.origin_step_id == fixture["step_id"],
+            HitlRequest.context["pending_kind"].as_string()
+            == PendingActionKind.EFFECT_RECONCILIATION.value,
+        )
+    )).scalar_one()
+    card = (await db_session.execute(
+        select(Message)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .where(
+            Conversation.entity_id == fixture["entity_id"],
+            Conversation.workspace_id == fixture["workspace_id"],
+            Message.pending_action["approval_request_id"].as_string()
+            == request.id,
+        )
+    )).scalar_one()
+    request_id = request.id
+    card_id = card.id
+    assert lease.status == WorkLeaseStatus.EXPIRED.value
+    assert lease.execution_claim_id == claim_id
+    assert "confirm_effect_not_applied" in card.pending_action["options"]
+    assert (
+        card.pending_action["payload"]["reconciliation"]["not_applied_allowed"]
+        is False
+    )
+
+    rejected = await client.post(
+        f"/api/v1/workspaces/{fixture['workspace_id']}/chat/messages/{card_id}/resolve",
+        headers=headers,
+        json={"choice": "confirm_effect_not_applied"},
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert "not known to be quiescent" in rejected.json()["detail"]
+    db_session.expire_all()
+    lease = await db_session.get(WorkLease, fixture["lease_id"])
+    request = await db_session.get(HitlRequest, request_id)
+    card = await db_session.get(Message, card_id)
+    assert request.status == ApprovalStatus.PENDING.value
+    assert card.resolved_at is None
+    assert lease.execution_claim_id == claim_id
+
+    from packages.core.workers.execution_claim import release_execution_claim
+
+    assert await release_execution_claim(
+        db_session,
+        fixture["lease_id"],
+        claim_id=claim_id,
+    )
+    await db_session.commit()
+
+    resumed = await client.post(
+        f"/api/v1/workspaces/{fixture['workspace_id']}/chat/messages/{card_id}/resolve",
+        headers=headers,
+        json={"choice": "confirm_effect_not_applied"},
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert [hint["plan_id"] for hint in plan_hints] == [fixture["plan_id"]]
+    resumed_wake = await _assert_exact_pending_plan_cycle_wake(
+        db_session,
+        fixture["plan_id"],
+        plan_hints[0],
+    )
+    assert resumed_wake.payload["reason"] == "effect_reconciliation_resolved"
+    assert resumed_wake.payload["wake_generation"] != expiry_generation
+    db_session.expire_all()
+    plan = await db_session.get(ExecutionPlan, fixture["plan_id"])
+    task = await db_session.get(Task, fixture["task_id"])
+    assert plan.status == "running"
+    assert task.status == "in_progress"
 
 
 async def _reload_request(db_session, request_id: str) -> HitlRequest:
@@ -696,6 +1318,81 @@ async def test_cancelling_lease_card_denies_request(client, db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("choice", "expected_decision", "expected_step_status"),
+    [
+        ("confirm", "grant", "pending"),
+        ("cancel", "deny", "failed"),
+    ],
+)
+async def test_coordinator_card_decides_exact_approval_before_parent_step_mutation(
+    client,
+    db_session,
+    monkeypatch,
+    choice,
+    expected_decision,
+    expected_step_status,
+):
+    """The bridge validator needs the parent to still be parked when it mirrors."""
+
+    headers, ws_id, msg_id, req_id = await _seed_lease_card(
+        client,
+        db_session,
+        f"coordinator_card_order_{choice}",
+        kind="needs_confirmation",
+    )
+    request = await db_session.get(HitlRequest, req_id)
+    request.context = {
+        **(request.context or {}),
+        COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY: {},
+    }
+    step_id = request.origin_step_id
+    await db_session.commit()
+
+    events = []
+
+    async def fake_grant(db, approval, **_kwargs):
+        step = await db.get(ExecutionStep, approval.origin_step_id)
+        assert step.step_status == "waiting_human"
+        events.append("grant")
+        approval.status = ApprovalStatus.GRANTED.value
+        return approval
+
+    async def fake_consume(_db, approval, **_kwargs):
+        assert events == ["grant"]
+        events.append("consume")
+        approval.status = ApprovalStatus.CONSUMED.value
+        return approval
+
+    async def fake_deny(db, approval, **_kwargs):
+        step = await db.get(ExecutionStep, approval.origin_step_id)
+        assert step.step_status == "waiting_human"
+        events.append("deny")
+        approval.status = ApprovalStatus.DENIED.value
+        return approval
+
+    monkeypatch.setattr(
+        "packages.core.governance.approvals.grant_approval",
+        fake_grant,
+    )
+    monkeypatch.setattr(
+        "packages.core.governance.approvals.consume_approval",
+        fake_consume,
+    )
+    monkeypatch.setattr(
+        "packages.core.governance.approvals.deny_approval",
+        fake_deny,
+    )
+
+    await _resolve_card(client, headers, ws_id, msg_id, choice)
+
+    assert events[0] == expected_decision
+    step = await db_session.get(ExecutionStep, step_id)
+    await db_session.refresh(step)
+    assert step.step_status == expected_step_status
+
+
+@pytest.mark.asyncio
 async def test_skipping_needs_input_card_denies_request(client, db_session):
     """needs_input 的 skip 走 else 分支取消步骤 —— 请求同样应当 denied。"""
     headers, ws_id, msg_id, req_id = await _seed_lease_card(
@@ -803,6 +1500,7 @@ async def test_lease_needs_human_survives_step_without_workspace(db_session):
             max_attempts=3,
             risk_level="medium",
             capability_id="browser.control",
+            current_lease_id=lease_id,
         )
     )
     db_session.add(
@@ -960,7 +1658,7 @@ async def test_lease_card_roundtrip_human_input_card_closes_request(
     assert "input_schema" in card
     assert card["approval_request_id"] == req_id
 
-    await _resolve_card(client, headers, ws_id, msg_id, "ok")
+    await _resolve_card(client, headers, ws_id, msg_id, "ok", note="Ready to continue.")
     req = await _reload_request(db_session, req_id)
     assert req.status == ApprovalStatus.CONSUMED.value
 
@@ -980,166 +1678,86 @@ async def test_skipping_needs_login_card_denies_request(client, db_session):
     assert req.status == ApprovalStatus.DENIED.value
 
 
-# ── "Always" 跨路径守卫 ────────────────────────────────────────────
-#
-# 步骤门禁 (governance/approvals.resolve_approval) 与聊天工具调用
-# (ai/runtime/approval_service.guard_runtime_tool_action) 共用 workspace
-# policy 的 auto_approve 集合作为唯一 standing 存储。这只是代码注释里的
-# 约定，没有任何结构强制 —— PR #289 正是死在某条分支自己读了另一份偏好
-# 存储上，用户于是永远批不完同一个动作。下面两条测试把该性质钉死。
+# Both approval planes consume one versioned policy; a mode change never
+# resolves an already pending human decision.
+
+
+async def _approval_policy_scope(db):
+    from packages.core.models.user import User, UserMembership
+    from tests.approval_settings_test_utils import initialize_test_approval_owners
+    entity_id, actor_id = generate_ulid(), generate_ulid()
+    workspace = Workspace(id=generate_ulid(), entity_id=entity_id,
+        name="Policy parity", operating_model={})
+    actor = User(id=actor_id, entity_id=entity_id, email=f"{actor_id}@example.test",
+        password_hash="test-only", role="owner", status="active")
+    db.add_all([workspace, actor, UserMembership(user_id=actor_id,
+        entity_id=entity_id, role="owner", status="active", is_primary=True)])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=actor_id)
+    return workspace, actor
 
 
 @pytest.mark.asyncio
-async def test_always_grant_is_honored_by_both_step_and_tool_planes(db_session):
-    """工作区内点 "Always" 后，步骤门禁与聊天工具调用两条路径都不再要求审批。
-
-    这两条路径共用 workspace policy 作为唯一 standing 存储（PR #326/#328）。
-    该性质是约定而非结构强制，故用测试钉死 —— PR #289 正是死在某条分支
-    不读 Always 上。
-    """
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    db_session.add(
-        Workspace(
-            id=workspace_id,
-            entity_id=entity_id,
-            name="Always WS",
-            operating_model={},
-        )
-    )
-    await db_session.flush()
-
-    def _subj():
-        return ApprovalSubject(
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            action_key="social_post.publish",
-            capability_id="external.social",
-            risk_level="high",
-            kind="action",
-        )
-
-    # 前置：工作区把该动作设为 HITL。这一步是为了让「工具调用」路径的
-    # 授予前断言真的有意义 —— 工作区内的工具调用不吃 high_risk 内在触发
-    # （那是 step-origin 专属），只有策略 HITL 规则会拦它。少了这条规则，
-    # tool_before 会因为「本来就不需要审批」而假通过。
-    await update_policy(
-        db_session,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=WorkspacePolicy(hitl_required_actions=["social_post.publish"]),
-        changed_by=generate_ulid(),
-        change_summary="require approval",
-    )
-    await db_session.flush()
-
-    # 授予前：两条路径都要求人工介入
-    step_before = await resolve_approval(
-        db_session,
-        subject=_subj(),
-        origin=ApprovalOrigin(kind="step", step_id=generate_ulid()),
-    )
-    assert step_before.outcome == "needs_human"
-
-    tool_before = await resolve_approval(
-        db_session,
-        subject=_subj(),
-        origin=ApprovalOrigin(
-            kind="tool_call",
-            conversation_id=generate_ulid(),
-            args_hash="abc123",
-        ),
-    )
-    assert tool_before.outcome == "needs_human"
+async def test_saved_rule_is_honored_by_both_step_and_tool_planes(db_session):
+    from tests.approval_settings_test_utils import action_rule, set_workspace_test_approval
+    workspace, actor = await _approval_policy_scope(db_session)
+    subject = ApprovalSubject(entity_id=workspace.entity_id, workspace_id=workspace.id,
+        user_id=actor.id, action_key="social_post.publish", capability_id="external.social",
+        risk_level="high", kind="action")
+    step_origin = ApprovalOrigin(kind="step", step_id=generate_ulid())
+    tool_origin = ApprovalOrigin(kind="tool_call", conversation_id=generate_ulid(),
+        args_hash="abc123", operation_id="runtime:parity:call:original")
+    step_before = await resolve_approval(db_session, subject=subject, origin=step_origin)
+    tool_before = await resolve_approval(db_session, subject=subject, origin=tool_origin)
+    assert step_before.outcome == tool_before.outcome == "needs_human"
     assert tool_before.request is not None
+    with pytest.raises(ValueError, match="versioned approval-settings"):
+        await grant_approval(db_session, tool_before.request, by_user_id=actor.id,
+            via="always", standing=True)
+    assert tool_before.request.status == ApprovalStatus.PENDING.value
 
-    # 用户在聊天卡片上点 "Always" —— standing=True 把同意写进 standing 存储
-    await grant_approval(
-        db_session,
-        tool_before.request,
-        by_user_id=generate_ulid(),
-        via="always",
-        standing=True,
-        authority_prechecked=True,
-    )
-    await db_session.flush()
+    await set_workspace_test_approval(db_session, workspace_id=workspace.id,
+        entity_id=workspace.entity_id, actor_id=actor.id, mode="automatic")
+    for origin, original in ((step_origin, step_before), (tool_origin, tool_before)):
+        pending = await resolve_approval(db_session, subject=subject, origin=origin)
+        assert pending.outcome == "needs_human"
+        assert pending.request.id == original.request.id
 
-    # 唯一 standing 存储 = workspace policy 的 auto_approve 集合
-    policy = await get_policy(db_session, workspace_id)
-    assert "social_post.publish" in policy.auto_approve_actions
-
-    # 授予后：步骤门禁放行。用新的 step_id / 新的 conversation+args，
-    # 这样放行只可能来自 standing 存储，不可能是上面那条一次性 grant 记录。
-    step_after = await resolve_approval(
-        db_session,
-        subject=_subj(),
-        origin=ApprovalOrigin(kind="step", step_id=generate_ulid()),
-    )
-    assert step_after.outcome == "allow"
-
-    # 授予后：聊天工具调用路径同样放行（同一 standing 存储）
-    tool_after = await resolve_approval(
-        db_session,
-        subject=_subj(),
-        origin=ApprovalOrigin(
-            kind="tool_call",
-            conversation_id=generate_ulid(),
-            args_hash="def456",
-        ),
-    )
-    assert tool_after.outcome == "allow"
-
-    # 放行来自 standing 存储本身，两次 resolve 都没有再挂卡片。
-    assert step_after.request is None
-    assert tool_after.request is None
-    # 仍开着的只有授予前 step 那一张（"Always" 点在聊天卡片上，不会回头
-    # 关闭别的 origin 已经挂出的卡；那张由 resolve_origin_requests 在
-    # step 终态时清理）。数值锁死在 1 ⇒ 授予后的两次 resolve 一张没新增。
-    assert await count_open_requests(db_session, workspace_id=workspace_id) == 1
+    await set_workspace_test_approval(db_session, workspace_id=workspace.id,
+        entity_id=workspace.entity_id, actor_id=actor.id, mode="confirm_changes",
+        user_rules=[action_rule("social_post.publish")])
+    # New operations see the saved rule, while the old requests remain pending.
+    for origin in (ApprovalOrigin(kind="step", step_id=generate_ulid()),
+        ApprovalOrigin(kind="tool_call", conversation_id=generate_ulid(),
+            args_hash="def456", operation_id="runtime:parity:call:new")):
+        result = await resolve_approval(db_session, subject=subject, origin=origin)
+        assert result.outcome == "allow" and result.request is None
+    assert await count_open_requests(db_session, workspace_id=workspace.id) == 2
+    await grant_approval(db_session, tool_before.request, by_user_id=actor.id, via="chat_card")
+    assert tool_before.request.status == ApprovalStatus.GRANTED.value
+    assert await count_open_requests(db_session, workspace_id=workspace.id) == 1
 
 
 @pytest.mark.asyncio
-async def test_always_grant_never_overrides_hard_block(db_session):
-    """never_allow 是硬阻断：任何 standing grant 都不得放行。"""
-    entity_id = generate_ulid()
-    workspace_id = generate_ulid()
-    db_session.add(
-        Workspace(
-            id=workspace_id,
-            entity_id=entity_id,
-            name="Block WS",
-            operating_model={},
-        )
-    )
-    await db_session.flush()
-
-    await update_policy(
-        db_session,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=WorkspacePolicy(
-            never_allow_actions=["billing.*"],
-            auto_approve_actions=["billing.*"],  # 同时 always：硬阻断仍须获胜
-        ),
-        changed_by=generate_ulid(),
-        change_summary="conflicting rules",
-    )
-    await db_session.flush()
-
-    decision = await resolve_approval(
-        db_session,
-        subject=ApprovalSubject(
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            action_key="billing.charge",
-            risk_level="high",
-            kind="action",
-        ),
-        origin=ApprovalOrigin(kind="step", step_id=generate_ulid()),
-    )
-    assert decision.outcome == "deny"
-    assert decision.request is None  # 硬阻断不 mint 记录
-    assert await count_open_requests(db_session, workspace_id=workspace_id) == 0
+async def test_saved_allow_never_overrides_root_deny(db_session):
+    from tests.approval_settings_test_utils import action_rule, set_workspace_test_approval
+    from packages.core.governance.approval_policy import ApprovalScope, PolicyDraft
+    from packages.core.governance.approval_policy_service import read_approval_settings, update_approval_policy
+    workspace, actor = await _approval_policy_scope(db_session)
+    scope = ApprovalScope(kind="account", id=workspace.entity_id, entity_id=workspace.entity_id)
+    before = await read_approval_settings(db_session, scope, actor)
+    await update_approval_policy(db_session, scope,
+        PolicyDraft(mode="automatic", user_rules=[action_rule("billing.charge", effect="deny")]),
+        before["version"], actor)
+    await set_workspace_test_approval(db_session, entity_id=workspace.entity_id,
+        workspace_id=workspace.id, actor_id=actor.id,
+        user_rules=[action_rule("billing.charge")])
+    decision = await resolve_approval(db_session, subject=ApprovalSubject(
+        entity_id=workspace.entity_id, workspace_id=workspace.id, user_id=actor.id,
+        action_key="billing.charge", risk_level="high", kind="action"),
+        origin=ApprovalOrigin(kind="step", step_id=generate_ulid()))
+    assert decision.outcome == "deny" and decision.request is None
+    assert await count_open_requests(db_session, workspace_id=workspace.id) == 0
 
 
 @pytest.mark.asyncio
@@ -1197,9 +1815,10 @@ def test_mint_and_close_kind_sets_are_the_same_object():
 
     assert dispatcher_service.LEASE_HITL_CLOSEABLE_KINDS is LEASE_HITL_CLOSEABLE_KINDS
     assert chat_router.LEASE_HITL_CLOSEABLE_KINDS is LEASE_HITL_CLOSEABLE_KINDS
-    # 集合内容就是四种 path C kind。
+    # 集合内容就是所有 path C kind，包括外部副作用核对。
     assert LEASE_HITL_CLOSEABLE_KINDS == frozenset(
         {
+            "effect_reconciliation",
             "human_input",
             "needs_input",
             "needs_confirmation",

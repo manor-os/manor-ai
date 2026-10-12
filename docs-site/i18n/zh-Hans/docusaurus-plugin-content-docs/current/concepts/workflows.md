@@ -48,6 +48,10 @@ title: 工作流
 
 `agent` 节点运行与聊天相同的 Agent 循环：为它提供提示词、可选的系统提示词、工具列表、模型和轮次上限——或将其指向某个工作区服务，由该工作区分配的 Agent 处理这一步。
 
+节点的 wall-clock 超时需要显式配置：省略 `config.timeout` 或设为 `null`
+不会增加 Workflow 节点外层截止时间；有限正数按秒设置超时。HTTP 请求、
+集成和 sandbox 仍遵守各自的执行时限。
+
 ## 最小示例 {#a-minimal-example}
 
 内置的"Daily digest"模板只有三个工作步骤：
@@ -82,14 +86,25 @@ title: 工作流
 
 后续的 `workflow_action_grant` 节点可以将一次已批准的等待转换为持久的、有时限的授权，这样同一工作流的重复运行就不会为已在该范围内批准过的操作再次发起提示。
 
+原生 `tool`、`connector` 操作，以及 `agent` 节点或嵌套 Skill 发起的工具
+调用，都会遵守当前[审批策略](hitl-governance.md)。`runtime_approval_required`
+会在精确保存的运行、节点和调用处暂停；运行详情和工作区聊天会展示待决
+请求。审批只恢复该调用，不重放此前副作用，并先重新检查当前策略和生命
+周期。普通 resume、retry 或修改定义都不等于审批。嵌套调用必须有精确保存
+且仍匹配的 continuation；缺失或不匹配时，运行会失败，不会重放父步骤。
+聊天消息投影为 best-effort；投影失败不会丢弃已暂停的 run 或其审批 continuation。
+
 ## 运行、重试与可观测性 {#runs-retries-and-observability}
 
 每次运行都会存储其定义快照、每步输出和脱敏后的执行追踪（密钥已清除、大输出已摘要、产物和子运行已关联）。运行详情视图通过 SSE 实时流式展示节点状态。
 
 - **取消 / 恢复**：`POST /api/v1/workflows/runs/{run_id}/cancel` 和 `/resume`。
-- **重试**：`/retry` 重启失败的运行；`from_step_id` 从检查点重试，复用未改变的先前步骤的结果。如果定义在原始运行之后发生了变化，检查点重试会被拒绝（HTTP 409）。
-- **血缘**：`GET /runs/{run_id}/family` 返回重试链。
-- 对可缓存的节点类型，未改变步骤的结果可以在运行之间复用（类似 ComfyUI），因此对图尾部的迭代非常快。
+- **重试**：`/retry` 从失败回执或显式 `from_step_id` 检查点创建新的尝试。
+  它保留恢复边界之外的已完成并行分支回执，使所选节点及受影响的下游工作
+  失效并重新执行，并在 merge 继续前等待所有必需分支完成。恢复使用该运行
+  不可变的执行快照；快照缺失或不兼容时会被拒绝。外部副作用不确定的步骤
+  必须先完成核对，不能直接重试。
+- **血缘**：`GET /runs/{run_id}/family` 返回重试链及其持久化恢复证据。
 
 ## API 摘要 {#api-summary}
 
@@ -109,4 +124,7 @@ title: 工作流
 
 ## 可用性 {#availability}
 
-Flows 在本地和开发环境中默认启用。在生产环境中，导航项显示为 **Soon**，直到部署设置 `FLOWS_AVAILABLE=true`——参见[配置](../configuration#feature-rollout)。
+自托管部署的稳定 Flows 默认启用，包括 `prod` 和 `production` 环境；
+可设置 `FLOWS_AVAILABLE=false` 显式关闭。Cloud 生产环境的 rollout 单独管理。
+这不会启用实验性的 `task_agent_loop`，该引擎仍默认关闭。
+参见[配置](../configuration#feature-rollout)。

@@ -69,8 +69,8 @@ export function useWorkspaceSimulationRuntime({
     queryKey: ["workspace-simulation-run", workspaceId],
     queryFn: () => api.workspaces.chat.simulationRun(workspaceId),
     enabled: Boolean(enabled && workspaceId),
-    refetchInterval: (result) => result.state.data?.status === "running" ? 700 : false,
-    retry: 1,
+    refetchInterval: (result) => result.state.data?.status === "running" ? 5_000 : false,
+    refetchIntervalInBackground: false,
   });
 
   const startMutation = useMutation({

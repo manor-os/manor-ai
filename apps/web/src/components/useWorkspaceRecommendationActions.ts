@@ -97,7 +97,11 @@ export default function useWorkspaceRecommendationActions({
   );
 
   const handleWorkspaceRecommendationAdd = useCallback(
-    async (recommendation: WorkspaceRecommendation, key: string) => {
+    async (
+      recommendation: WorkspaceRecommendation,
+      key: string,
+      assistantResponse: string,
+    ) => {
       if (!recommendation.workspace_id) return;
       setWorkspaceRecommendationBusyKey(key);
       try {
@@ -105,6 +109,7 @@ export default function useWorkspaceRecommendationActions({
           recommendation.workspace_id,
           t("component.workspace_recommendation.add_prompt", {
             request: recommendation.request,
+            response: assistantResponse,
           }),
         );
         await queryClient.invalidateQueries({

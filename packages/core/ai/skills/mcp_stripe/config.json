@@ -32,5 +32,9 @@
     "mcp__stripe__search_stripe_resources",
     "mcp__stripe__fetch_stripe_resources",
     "mcp__stripe__search_stripe_documentation"
-  ]
+  ],
+  "search": {
+    "terms": ["payments", "charges", "customers", "subscriptions", "payouts", "checkout", "billing", "api docs", "balance"],
+    "examples": ["refund stripe charge for customer", "list recent stripe payments", "search stripe documentation webhook", "check stripe account balance"]
+  }
 }

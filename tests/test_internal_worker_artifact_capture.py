@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from packages.core.plans import executor as plan_executor
 from packages.core.workers import internal
 
 
@@ -50,6 +51,68 @@ def test_collect_artifact_refs_ignores_knowledge_sources() -> None:
     ]
 
     assert internal._collect_artifact_refs_from_agent_messages(messages) == []
+
+
+def test_collect_artifact_refs_skips_schema_error_path_but_keeps_later_file() -> None:
+    messages = [
+        {
+            "role": "tool",
+            "content": json.dumps(
+                {
+                    "error": "tool_input_validation_failed",
+                    "path": "$.params.purpose",
+                    "message": "$.params.purpose: not in enum",
+                }
+            ),
+        },
+        {
+            "role": "tool",
+            "content": json.dumps(
+                {
+                    "ok": True,
+                    "generated": True,
+                    "fs_path": "tasks/01TASK/documents/tonight_operator_handoff.md",
+                    "path": "tasks/01TASK/documents/tonight_operator_handoff.md",
+                }
+            ),
+        },
+    ]
+
+    refs = internal._collect_artifact_refs_from_agent_messages(messages)
+    paths = {ref.get("fs_path") for ref in refs}
+
+    assert "$.params.purpose" not in paths
+    assert "tasks/01TASK/documents/tonight_operator_handoff.md" in paths
+    assert internal._artifact_refs_from_tool_payload(
+        {"error": "tool_input_validation_failed", "path": "$.params.purpose"}
+    ) == []
+    assert internal._looks_like_relative_artifact_path("$.params.purpose") is False
+    assert internal._artifact_value_is_path("path", "$.params.purpose") is False
+
+
+def test_artifact_refs_from_result_skip_json_pointer_file_entry() -> None:
+    refs = plan_executor._artifact_refs_from_result(
+        {
+            "generated": True,
+            "files": [
+                {
+                    "name": "$.params.purpose",
+                    "type": "path",
+                    "source": "path",
+                    "fs_path": "$.params.purpose",
+                },
+                {
+                    "name": "tonight_operator_handoff.md",
+                    "type": "path",
+                    "source": "fs_path",
+                    "fs_path": "tasks/01TASK/documents/tonight_operator_handoff.md",
+                },
+            ],
+        }
+    )
+    paths = {ref.get("fs_path") for ref in refs}
+    assert "$.params.purpose" not in paths
+    assert "tasks/01TASK/documents/tonight_operator_handoff.md" in paths
 
 
 def test_pending_action_from_subagent_workspace_operation_tool_message() -> None:
@@ -120,6 +183,17 @@ def test_agentic_loop_max_rounds_with_content_is_usable() -> None:
         error=None,
         error_detail=None,
         content='{"memo_text": "Internal memo ready."}',
+    )
+
+    internal._raise_if_agentic_loop_failed(result)
+
+
+def test_agentic_loop_max_rounds_without_content_does_not_raise() -> None:
+    result = SimpleNamespace(
+        stop_reason="max_rounds",
+        error=None,
+        error_detail=None,
+        content="",
     )
 
     internal._raise_if_agentic_loop_failed(result)

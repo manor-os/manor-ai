@@ -13,10 +13,12 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 
 from packages.core.ai import workflow_runner as workflow_runner_module
-from packages.core.ai.workflow_runner import WorkflowRunner
-from packages.core.models.workflow import WorkflowRun
+from packages.core.ai.workflow_runner import WorkflowRunner, workflow_input_wait_value
+from packages.core.models.base import generate_ulid
+from packages.core.models.workflow import WorkflowDefinition, WorkflowRun
 
 
 def _run(variables: dict | None = None) -> WorkflowRun:
@@ -376,6 +378,53 @@ async def test_run_loop_appends_trace_before_best_effort_chat_projection(
 
 
 @pytest.mark.asyncio
+async def test_run_loop_persists_current_step_before_long_running_execution(
+    runner,
+    monkeypatch,
+):
+    run = _run()
+    run.status = "running"
+    run.current_step_id = "validate"
+    run.step_results = {"validate": {"status": "completed", "output": True}}
+    run.definition_snapshot = {
+        "nodes": [
+            {"id": "validate", "name": "Validate", "type": "condition"},
+            {"id": "generate", "name": "Generate video", "type": "tool"},
+        ]
+    }
+    run.execution_trace = []
+    workflow = SimpleNamespace(steps=[
+        {
+            "id": "validate",
+            "name": "Validate",
+            "type": "condition",
+            "depends_on": [],
+        },
+        {
+            "id": "generate",
+            "name": "Generate video",
+            "type": "tool",
+            "depends_on": ["validate"],
+        },
+    ])
+    committed_current_step_ids: list[str | None] = []
+
+    class Db(_RunLoopDb):
+        async def commit(self):
+            committed_current_step_ids.append(run.current_step_id)
+
+    async def execute_step(step, _run, _db):
+        assert committed_current_step_ids == ["generate"]
+        return {"status": "completed", "output": step["id"]}
+
+    monkeypatch.setattr(runner, "_execute_step_safe", execute_step)
+
+    await runner._run_loop(workflow, run, Db())
+
+    assert committed_current_step_ids[0] == "generate"
+
+
+@pytest.mark.asyncio
 async def test_run_loop_fences_and_closes_its_terminal_commit(runner):
     run = _run()
     run.status = "running"
@@ -564,6 +613,7 @@ async def test_workflow_tool_cancel_returns_state_when_effects_are_deferred(
 ):
     from packages.core.ai.tools import workflow_tools
     from packages.core.services import workflow_chat_projection
+    from packages.core.services import workflow_run_control
     from packages.core.services import workflow_service
 
     run = _run()
@@ -577,6 +627,9 @@ async def test_workflow_tool_cancel_returns_state_when_effects_are_deferred(
     run.completed_at = None
     run.trigger_data = {}
     rollbacks: list[bool] = []
+    cascade_calls: list[tuple[str, str]] = []
+    discovery_calls: list[str] = []
+    revoked_claims: list[list[str]] = []
 
     class FakeDB:
         async def __aenter__(self):
@@ -600,6 +653,19 @@ async def test_workflow_tool_cancel_returns_state_when_effects_are_deferred(
     async def no_project(*_args, **_kwargs):
         return None
 
+    async def discover(_db, parent):
+        discovery_calls.append(parent.id)
+        return []
+
+    async def cascade(_db, parent, *, actor_id, descendant_run_ids=None):
+        cascade_calls.append((parent.id, actor_id))
+        assert descendant_run_ids == []
+        return []
+
+    async def revoke(_db, run_ids):
+        revoked_claims.append(list(run_ids))
+        return len(run_ids)
+
     async def fail_effects(_runner, _run, _db):
         raise RuntimeError("projection unavailable")
 
@@ -615,6 +681,23 @@ async def test_workflow_tool_cancel_returns_state_when_effects_are_deferred(
         "project_workflow_run_status",
         no_project,
     )
+    monkeypatch.setattr(
+        workflow_run_control,
+        "active_subworkflow_descendant_ids",
+        discover,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        workflow_run_control,
+        "cancel_active_subworkflow_descendants",
+        cascade,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.workflow_run_execution_claim."
+        "revoke_workflow_run_execution_claims",
+        revoke,
+        raising=False,
+    )
     monkeypatch.setattr(WorkflowRunner, "_finalize_run_effects", fail_effects)
 
     response = json.loads(await workflow_tools._cancel_workflow_run(
@@ -627,6 +710,9 @@ async def test_workflow_tool_cancel_returns_state_when_effects_are_deferred(
     assert response["run"]["status"] == "cancelled"
     assert run.status == "cancelled"
     assert run.terminal_effects_next_attempt_at is not None
+    assert cascade_calls == [(run.id, "user1")]
+    assert discovery_calls == [run.id]
+    assert revoked_claims == [[run.id]]
     assert rollbacks == [True]
 
 
@@ -1501,6 +1587,155 @@ async def test_agent_provider_failure_is_not_reparsed_as_invalid_json(runner, mo
     assert "valid JSON" not in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_agent_step_releases_read_transaction_before_workflow_agent_loop(
+    runner,
+    monkeypatch,
+):
+    order = []
+
+    async def fake_appendix(*args, **kwargs):
+        order.append("appendix")
+        return SimpleNamespace(
+            prompt_appendix="",
+            tool_schemas=[],
+            allowed_tool_names=set(),
+            envelope=None,
+        )
+
+    async def fake_release(_db):
+        order.append("release")
+        return True
+
+    async def fake_loop(**kwargs):
+        order.append("loop")
+        return SimpleNamespace(
+            content="ok",
+            usage={},
+            tool_calls_made=[],
+            rounds=1,
+            stop_reason="completed",
+            error=None,
+            error_detail=None,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_prepare_prompt_appendix_for_turn",
+        fake_appendix,
+    )
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "release_read_transaction",
+        fake_release,
+    )
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_execute_workflow_agent_loop",
+        fake_loop,
+    )
+
+    result = await runner._execute_agent_step(
+        {
+            "id": "prepare",
+            "type": "agent",
+            "config": {"prompt": "Collect release materials."},
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+        object(),
+    )
+
+    assert order == ["appendix", "release", "loop"]
+    assert result["status"] == "completed"
+    assert result["output"] == "ok"
+
+
+
+
+_UNCONFIRMED_CONTROL = {
+    "kind": "tool_error",
+    "error_reason": "tool_outcome_unconfirmed",
+    "terminal_failure": True,
+    "retryable": False,
+    "do_not_replay": True,
+    "effect_state": "unconfirmed",
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "control", "tool_evidence"),
+    [
+        # The unconfirmed tool error carries the replay fields on its control.
+        ("tool_error", _UNCONFIRMED_CONTROL, {}),
+        # A stop with no outcome control: only the receipt ledger knows.
+        ("error", None, {"effect_state": "unconfirmed", "unconfirmed_calls": [{"call_id": "c1"}]}),
+    ],
+)
+async def test_agent_step_failure_carries_replay_fields(
+    runner,
+    monkeypatch,
+    stop_reason,
+    control,
+    tool_evidence,
+):
+    async def fake_appendix(*args, **kwargs):
+        return SimpleNamespace(
+            prompt_appendix="",
+            tool_schemas=[],
+            allowed_tool_names=set(),
+            envelope=None,
+        )
+
+    async def fake_loop(**kwargs):
+        return SimpleNamespace(
+            content="The publish request timed out; its outcome is unknown.",
+            usage={},
+            tool_calls_made=["publish_post"],
+            rounds=1,
+            stop_reason=stop_reason,
+            error="publish timed out" if control is None else None,
+            error_detail=None,
+            control=control,
+            tool_evidence=tool_evidence,
+        )
+
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_prepare_prompt_appendix_for_turn",
+        fake_appendix,
+    )
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "runtime_execute_workflow_agent_loop",
+        fake_loop,
+    )
+
+    result = await runner._execute_agent_step(
+        {
+            "id": "publish",
+            "type": "agent",
+            "config": {
+                "prompt": "Publish the post.",
+                "output_format": "json",
+                "output_schema": {"type": "object"},
+            },
+        },
+        {},
+        "entity-1",
+        "user-1",
+        {},
+        None,
+    )
+
+    assert result["status"] == "failed"
+    assert result["do_not_replay"] is True
+    if control is not None:
+        assert result["retryable"] is False
+    assert result["effect_state"] == "unconfirmed"
 
 
 @pytest.mark.asyncio
@@ -1672,7 +1907,8 @@ async def test_cache_miss_on_changed_inputs():
 
 
 @pytest.mark.asyncio
-async def test_code_node_executes_in_ephemeral_sandbox(runner, monkeypatch):
+@pytest.mark.parametrize("allow_network", [False, True])
+async def test_code_node_executes_in_ephemeral_sandbox(runner, monkeypatch, allow_network):
     captured = {}
 
     class FakeSandboxClient:
@@ -1699,16 +1935,56 @@ async def test_code_node_executes_in_ephemeral_sandbox(runner, monkeypatch):
     monkeypatch.setattr(workflow_runner_module, "_workflow_sandbox_url", lambda: "http://sandbox")
     monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", FakeSandboxClient)
     step = {"id": "c", "type": "code",
-            "config": {"code": "print(inputs['value'])", "language": "python", "output_var": "r"}}
+            "config": {"code": "print(inputs['value'])", "language": "python", "output_var": "r", "allow_network": allow_network}}
     res = await runner._execute_step(step, _run({"value": 42}), None)
     assert res["status"] == "completed"
     assert res["output"] == {"answer": 42}
     assert res["output_var"] == "r"
     assert res["sandboxed"] is True
     assert json.loads(captured["create"]["files"]["inputs.json"]) == {"value": 42}
-    assert captured["create"]["config"]["network"] == "none"
+    if allow_network:
+        assert "network" not in captured["create"]["config"]
+    else:
+        assert captured["create"]["config"]["network"] == "none"
     assert captured["exec"]["command"] == "python run.py"
     assert captured["destroy"] == ["sbx-1"]
+
+
+@pytest.mark.asyncio
+async def test_code_node_with_network_uses_the_runner_default_network(runner, monkeypatch):
+    """External runners only allow their dedicated bridge (``manor-sandbox``);
+    a hardcoded ``"bridge"`` override was rejected there. Opting into network
+    access must leave the network to the runner instead of naming one."""
+
+    captured = {}
+
+    class FakeSandboxClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return None
+
+        async def create_from_files(self, **kwargs):
+            captured["create"] = kwargs
+            return SimpleNamespace(sandbox_id="sbx-net", workdir="/skill")
+
+        async def exec(self, **kwargs):
+            return SimpleNamespace(stdout='{"ok": true}', stderr="", exit_code=0)
+
+        async def destroy(self, sandbox_id):
+            return None
+
+    monkeypatch.setattr(workflow_runner_module, "_workflow_sandbox_url", lambda: "http://sandbox")
+    monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", FakeSandboxClient)
+    step = {"id": "c", "type": "code",
+            "config": {"code": "print('{}')", "language": "python", "allow_network": True}}
+    res = await runner._execute_step(step, _run({}), None)
+    assert res["status"] == "completed"
+    assert "network" not in captured["create"]["config"]
 
 
 @pytest.mark.asyncio
@@ -1826,6 +2102,73 @@ async def test_retry_on_fail_retries_until_success(runner, monkeypatch):
     assert res["status"] == "completed"
     assert calls["n"] == 3
     assert res["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_retry_on_fail_never_replays_an_unsafe_attempt(runner, monkeypatch):
+    calls = {"n": 0}
+
+    async def unsafe(step, run, db):
+        calls["n"] += 1
+        return {"status": "failed", "error": "outcome unknown", "do_not_replay": True, "retryable": False}
+
+    monkeypatch.setattr(runner, "_execute_step", unsafe)
+    step = {"id": "s", "type": "agent", "config": {"retry_on_fail": True, "max_tries": 3, "retry_wait_ms": 0}}
+    res = await runner._execute_step_safe(step, _run(), None)
+
+    assert res["status"] == "failed"
+    assert calls["n"] == 1
+    assert res["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_on_fail_still_retries_an_exhausted_in_loop_budget(runner, monkeypatch):
+    """retryable=False alone means "the loop's own budget is spent", not "effect unknown"."""
+    calls = {"n": 0}
+
+    async def transient(step, run, db):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return {"status": "failed", "error": "provider kept failing", "retryable": False}
+        return {"status": "completed", "output": "ok"}
+
+    monkeypatch.setattr(runner, "_execute_step", transient)
+    step = {"id": "s", "type": "agent", "config": {"retry_on_fail": True, "max_tries": 3, "retry_wait_ms": 0}}
+    res = await runner._execute_step_safe(step, _run(), None)
+
+    assert res["status"] == "completed"
+    assert calls["n"] == 3
+    assert res["attempts"] == 3
+
+
+@pytest.mark.asyncio
+async def test_imported_failure_with_spent_loop_budget_is_still_skipped(runner, monkeypatch):
+    from packages.core.ai import workflow_runner as wr
+
+    async def spent(step, run, db):
+        return {"status": "failed", "error": "provider kept failing", "retryable": False}
+
+    monkeypatch.setattr(runner, "_execute_step", spent)
+    monkeypatch.setattr(wr, "_is_trusted_imported_workflow_step", lambda run, step: True)
+    res = await runner._execute_step_safe({"id": "s", "type": "agent", "config": {}}, _run(), None)
+
+    assert res["status"] == "completed"
+    assert res["skipped"] is True
+
+
+@pytest.mark.asyncio
+async def test_imported_failure_with_unconfirmed_effect_is_not_skipped(runner, monkeypatch):
+    from packages.core.ai import workflow_runner as wr
+
+    async def unsafe(step, run, db):
+        return {"status": "failed", "error": "outcome unknown", "do_not_replay": True}
+
+    monkeypatch.setattr(runner, "_execute_step", unsafe)
+    monkeypatch.setattr(wr, "_is_trusted_imported_workflow_step", lambda run, step: True)
+    res = await runner._execute_step_safe({"id": "s", "type": "agent", "config": {}}, _run(), None)
+
+    assert res["status"] == "failed"
+    assert res.get("skipped") is not True
 
 
 @pytest.mark.asyncio
@@ -2586,19 +2929,203 @@ def test_sort_dedupe_stop_extract(runner):
     stop = runner._execute_stop_step(
         {
             "id": "x",
-            "config": {"message": "halt {{why}}", "retry_from_step_id": "producer"},
+            "config": {
+                "message": "halt {{why}}",
+                "retry_from_step_id": "producer",
+                "retry_state": {
+                    "required_change": "Replace {{field}}",
+                    "editable_input_schema": {
+                        "type": "object",
+                        "properties": {"source_id": {"type": "string"}},
+                        "required": ["source_id"],
+                    },
+                },
+            },
         },
-        {"why": "now"},
+        {"why": "now", "field": "the source"},
     )
     assert stop == {
         "status": "failed",
         "error": "halt now",
         "retry_from_step_id": "producer",
+        "retry_state": {
+            "retry_from_step_id": "producer",
+            "required_change": "Replace the source",
+            "editable_input_schema": {
+                "type": "object",
+                "properties": {"source_id": {"type": "string"}},
+                "required": ["source_id"],
+            },
+        },
+    }
+    blocked_stop = runner._execute_stop_step(
+        {
+            "id": "blocked",
+            "config": {
+                "message": "reconcile before retry",
+                "retryable": False,
+            },
+        },
+        {},
+    )
+    assert blocked_stop == {
+        "status": "failed",
+        "error": "reconcile before retry",
+        "retryable": False,
+        "retry_blocked": True,
     }
     j = runner._execute_extractfromfile_step({"id": "e", "config": {"input": '{{body}}'}}, {"body": '{"a": 1}'})
     assert j["output"] == {"a": 1}
     csv = runner._execute_extractfromfile_step({"id": "e", "config": {"input": "{{c}}", "format": "csv"}}, {"c": "a,b\n1,2\n3,4"})
     assert csv["output"] == [{"a": "1", "b": "2"}, {"a": "3", "b": "4"}]
+
+
+def test_failed_stop_retry_state_drives_editable_chat_retry():
+    from packages.core.services.workflow_chat_projection import (
+        _workflow_business_state,
+        _workflow_retry_input_schema,
+    )
+
+    editable_schema = {
+        "type": "object",
+        "properties": {"workflow_project_id": {"type": "string"}},
+        "required": ["workflow_project_id"],
+    }
+    run = SimpleNamespace(
+        variables={"workflow_project_id": "published-project"},
+        current_step_id="video_project_not_ready",
+        step_results={
+            "video_project_not_ready": {
+                "status": "failed",
+                "retry_state": {
+                    "retry_from_step_id": "load_video_project",
+                    "editable_input_schema": editable_schema,
+                },
+            }
+        },
+    )
+
+    outcome, retry_state = _workflow_business_state(run)
+
+    assert outcome == "in_progress"
+    assert retry_state["retry_from_step_id"] == "load_video_project"
+    assert _workflow_retry_input_schema(run, retry_state) == editable_schema
+
+
+def test_failed_retry_blocked_step_has_no_chat_retry_checkpoint():
+    from packages.core.services.workflow_chat_projection import (
+        workflow_retry_from_step_id,
+    )
+
+    run = SimpleNamespace(
+        status="failed",
+        current_step_id="upload_youtube_video",
+        execution_snapshot={
+            "steps": [{
+                "id": "upload_youtube_video",
+                "type": "agent",
+                "config": {"skill": "chrome"},
+            }],
+        },
+        step_results={
+            "upload_youtube_video": {
+                "status": "failed",
+                "retry_blocked": True,
+            }
+        },
+        retry_from_step_id=None,
+        retry_of_run_id=None,
+    )
+
+    assert workflow_retry_from_step_id(run, {}) == ""
+
+
+@pytest.mark.parametrize("skill", ["chrome", "another-skill", None])
+def test_failed_chrome_retry_blocked_step_keeps_retry_checkpoint(skill):
+    from packages.core.services.workflow_chat_projection import (
+        workflow_retry_from_step_id,
+    )
+
+    run = SimpleNamespace(
+        status="failed",
+        current_step_id="upload_youtube_video",
+        execution_snapshot={
+            "steps": [{
+                "id": "upload_youtube_video",
+                "type": "agent",
+                "config": {"skill": skill} if skill else {},
+            }],
+        },
+        step_results={
+            "upload_youtube_video": {
+                "status": "failed",
+                "retry_blocked": True,
+                "chrome_outcome": {"status": "failed", "do_not_replay": True},
+            }
+        },
+        retry_from_step_id=None,
+        retry_of_run_id=None,
+    )
+
+    assert workflow_retry_from_step_id(run, {}) == "upload_youtube_video"
+
+
+def test_chrome_retry_prompt_retains_bounded_prior_agent_evidence():
+    from packages.core.ai.workflow_runner import _workflow_agent_resume_prompt
+
+    prompt = _workflow_agent_resume_prompt(
+        {
+            "status": "failed",
+            "resume_strategy": "reexecute",
+            "output": {
+                "video_id": "video-1",
+                "watch_url": "https://www.youtube.com/watch?v=video-1",
+                "upload_occurred": True,
+                "final_action_state": "uncertain",
+                "draft_tab_id": 17,
+                "unrelated": "discarded",
+            },
+            "chrome_outcome": {
+                "status": "failed",
+                "action_executed": "unknown",
+                "do_not_replay": True,
+                "receipts": [{"operation_id": "operation-1"}],
+                "chrome_connection": {"id": "connection-old"},
+                "unbounded": "discarded",
+            },
+        },
+        runtime_context={"workflow_run_id": "retry-run"},
+        step_id="upload_youtube_video",
+    )
+
+    assert '"same_workflow_run": false' in prompt
+    assert '"operation_id": "operation-1"' in prompt
+    assert '"video_id": "video-1"' in prompt
+    assert "Historical tab, browser-group, and node-handle references" in prompt
+    assert '"unbounded": "discarded"' in prompt
+    assert '"unrelated": "discarded"' in prompt
+
+
+def test_chrome_retry_prompt_retains_completed_agent_output():
+    from packages.core.ai.workflow_runner import _workflow_agent_resume_prompt
+
+    prompt = _workflow_agent_resume_prompt(
+        {
+            "status": "completed",
+            "resume_strategy": "reexecute",
+            "chrome_retry_recovery": True,
+            "output": {
+                "video_id": "video-1",
+                "upload_occurred": True,
+                "draft_tab_id": 17,
+            },
+        },
+        runtime_context={"workflow_run_id": "retry-run"},
+        step_id="upload_youtube_video",
+    )
+
+    assert '"same_workflow_run": false' in prompt
+    assert '"upload_occurred": true' in prompt
 
 
 def test_extract_from_file_reads_downloaded_xlsx_and_can_limit_rows(runner):
@@ -2834,8 +3361,12 @@ async def test_subworkflow_safe_execution_has_no_default_wall_clock_timeout(
         await asyncio.sleep(0.02)
         return {"status": "completed", "output": "child completed"}
 
-    monkeypatch.setattr(workflow_runner_module, "_STEP_TIMEOUT_SECS", 0.001)
     monkeypatch.setattr(runner, "_execute_step", delayed_step)
+
+    async def unexpected_wait_for(*_args, **_kwargs):
+        raise AssertionError("unbounded node must not call asyncio.wait_for")
+
+    monkeypatch.setattr(workflow_runner_module.asyncio, "wait_for", unexpected_wait_for)
 
     result = await runner._execute_step_safe(
         {"id": "child", "type": "subworkflow", "config": {}},
@@ -2929,6 +3460,534 @@ async def test_completed_subworkflow_preserves_configured_output_alias(
     assert result["output_var"] == "planning"
     assert db.child.lineage_root_run_id == db.child.id
     assert db.child.lineage_is_legacy is False
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_child_inherits_nested_chat_origin_without_reusing_root_activity(
+    runner,
+    monkeypatch,
+):
+    target = SimpleNamespace(
+        id="wf-child",
+        variables={},
+        steps=[{
+            "id": "start",
+            "type": "trigger",
+            "config": {"trigger_type": "internal"},
+            "next": [],
+        }],
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return target
+
+    class Db:
+        child = None
+
+        async def execute(self, _query):
+            return Result()
+
+        def add(self, child):
+            self.child = child
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _child):
+            return None
+
+    db = Db()
+    parent = _run()
+    parent.id = "root-run"
+    parent.trigger_data = {
+        "_workflow_chat_origin": {
+            "enabled": True,
+            "conversation_id": "conversation-1",
+            "activity_message_id": "activity-1",
+            "projection": {"progress": True},
+            "wait_bridge": True,
+        }
+    }
+
+    async def leave_child_running(_runner, _run_id):
+        return None
+
+    monkeypatch.setattr(WorkflowRunner, "run", leave_child_running)
+    result = await runner._execute_subworkflow_step(
+        {
+            "id": "child",
+            "type": "subworkflow",
+            "config": {"workflow_id": target.id},
+        },
+        {},
+        parent,
+        db,
+    )
+
+    assert result["status"] == "paused"
+    assert db.child.trigger_data["_workflow_chat_origin"] == {
+        "enabled": True,
+        "conversation_id": "conversation-1",
+        "activity_message_id": "activity-1",
+        "projection": {"progress": True},
+        "wait_bridge": True,
+        "host_run_id": parent.id,
+        "nested": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_nested_chat_cancel_cascades_cancel_to_parent_subworkflow_barrier(
+    runner,
+    db_session,
+):
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    step = {
+        "id": "child",
+        "type": "subworkflow",
+        "config": {"workflow_id": generate_ulid()},
+        "next": [],
+    }
+    parent_workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        created_by=user_id,
+        name="Nested approval parent",
+        trigger_type="manual",
+        steps=[step],
+        variables={},
+        tags=[],
+    )
+    child = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=step["config"]["workflow_id"],
+        entity_id=entity_id,
+        status="cancelled",
+        variables={},
+        step_results={},
+        trigger_data={
+            "parent_run_id": "pending-parent-id",
+            "parent_step_id": step["id"],
+            "_workflow_chat_cancel_ancestors": {
+                "host_run_id": "pending-parent-id",
+                "cancelled_by": user_id,
+            },
+        },
+        execution_trace=[],
+        started_by=user_id,
+    )
+    parent = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=parent_workflow.id,
+        entity_id=entity_id,
+        status="paused",
+        current_step_id=step["id"],
+        variables={},
+        step_results={
+            step["id"]: {
+                "status": "paused",
+                "subrun_id": child.id,
+            }
+        },
+        trigger_data={},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    child.trigger_data["parent_run_id"] = parent.id
+    child.trigger_data["_workflow_chat_cancel_ancestors"]["host_run_id"] = parent.id
+    db_session.add_all([parent_workflow, parent, child])
+    await db_session.commit()
+
+    await runner._propagate_subworkflow_result(child, db_session)
+    await db_session.refresh(parent)
+
+    assert parent.status == "cancelled"
+    assert parent.error is None
+    assert parent.trigger_data["_workflow_run_control"]["cancelled_by"] == user_id
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_uncertain_effect_blocks_parent_retry(
+    runner,
+    db_session,
+):
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    step = {
+        "id": "publish_video",
+        "type": "subworkflow",
+        "config": {"workflow_id": generate_ulid()},
+        "next": [],
+    }
+    parent_workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        created_by=user_id,
+        name="Publication parent",
+        trigger_type="manual",
+        steps=[step],
+        variables={},
+        tags=[],
+    )
+    child = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=step["config"]["workflow_id"],
+        entity_id=entity_id,
+        status="failed",
+        current_step_id="upload_youtube_video",
+        error="Upload outcome is uncertain",
+        variables={},
+        step_results={
+            "upload_youtube_video": {
+                "status": "failed",
+                "retry_blocked": True,
+                "do_not_replay": True,
+            }
+        },
+        trigger_data={
+            "parent_run_id": "pending-parent-id",
+            "parent_step_id": step["id"],
+        },
+        execution_trace=[],
+        started_by=user_id,
+    )
+    parent = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=parent_workflow.id,
+        entity_id=entity_id,
+        status="paused",
+        current_step_id=step["id"],
+        variables={},
+        step_results={
+            step["id"]: {
+                "status": "paused",
+                "subrun_id": child.id,
+            }
+        },
+        trigger_data={},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    child.trigger_data["parent_run_id"] = parent.id
+    db_session.add_all([parent_workflow, parent, child])
+    await db_session.commit()
+
+    await runner._propagate_subworkflow_result(child, db_session)
+    await db_session.refresh(parent)
+
+    assert parent.status == "failed"
+    assert parent.step_results[step["id"]]["retry_blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_recovery_reuses_child_committed_before_parent_result(
+    runner,
+    monkeypatch,
+    db_session,
+):
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    child_workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        created_by=user_id,
+        name="Crash-safe child",
+        trigger_type="manual",
+        steps=[
+            {"id": "start", "type": "trigger", "next": ["end"]},
+            {"id": "end", "type": "end", "next": []},
+        ],
+        variables={},
+        tags=[],
+    )
+    parent_workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        created_by=user_id,
+        name="Crash-safe parent",
+        trigger_type="manual",
+        steps=[],
+        variables={},
+        tags=[],
+    )
+    parent_run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=parent_workflow.id,
+        entity_id=entity_id,
+        status="running",
+        current_step_id="child",
+        variables={},
+        step_results={},
+        trigger_data={},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    db_session.add_all([child_workflow, parent_workflow, parent_run])
+    await db_session.commit()
+
+    class SimulatedProcessExit(RuntimeError):
+        pass
+
+    async def crash_after_child_commit(_runner, _run_id):
+        raise SimulatedProcessExit("process exited after child commit")
+
+    monkeypatch.setattr(WorkflowRunner, "run", crash_after_child_commit)
+    step = {
+        "id": "child",
+        "type": "subworkflow",
+        "config": {"workflow_id": child_workflow.id},
+        "next": [],
+    }
+    with pytest.raises(SimulatedProcessExit):
+        await runner._execute_subworkflow_step(
+            step,
+            parent_run.variables,
+            parent_run,
+            db_session,
+        )
+
+    await db_session.refresh(parent_run)
+    checkpoint = parent_run.step_results[step["id"]]
+    child_run_id = checkpoint["subrun_id"]
+    assert checkpoint["resume_strategy"] == "reexecute"
+
+    resumed_child_ids: list[str] = []
+
+    async def child_still_running(_runner, run_id):
+        resumed_child_ids.append(run_id)
+
+    monkeypatch.setattr(WorkflowRunner, "run", child_still_running)
+    result = await runner._execute_subworkflow_step(
+        step,
+        parent_run.variables,
+        parent_run,
+        db_session,
+    )
+
+    child_runs = (await db_session.execute(
+        select(WorkflowRun).where(WorkflowRun.workflow_id == child_workflow.id)
+    )).scalars().all()
+    assert [child.id for child in child_runs] == [child_run_id]
+    assert resumed_child_ids == [child_run_id]
+    assert result["status"] == "paused"
+    assert result["subrun_id"] == child_run_id
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_grant_failure_does_not_commit_uncheckpointed_child(
+    runner,
+    monkeypatch,
+    db_session,
+):
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    user_id = generate_ulid()
+    child_workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        created_by=user_id,
+        name="Grant-protected child",
+        trigger_type="manual",
+        steps=[
+            {"id": "start", "type": "trigger", "next": ["end"]},
+            {"id": "end", "type": "end", "next": []},
+        ],
+        variables={},
+        tags=[],
+    )
+    parent_workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        created_by=user_id,
+        name="Grant-protected parent",
+        trigger_type="manual",
+        steps=[],
+        variables={},
+        tags=[],
+    )
+    parent_run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=parent_workflow.id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        status="running",
+        current_step_id="publish",
+        variables={},
+        step_results={},
+        trigger_data={},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    db_session.add_all([child_workflow, parent_workflow, parent_run])
+    await db_session.commit()
+
+    async def deny_grant(*_args, **_kwargs):
+        raise PermissionError("grant denied")
+
+    monkeypatch.setattr(
+        "packages.core.services.workflow_action_grant_service."
+        "create_workflow_wait_youtube_publication_grant",
+        deny_grant,
+    )
+    with pytest.raises(PermissionError, match="grant denied"):
+        await runner._execute_subworkflow_step(
+            {
+                "id": "publish",
+                "type": "subworkflow",
+                "config": {
+                    "workflow_id": child_workflow.id,
+                    "workflow_wait_authorization": {},
+                },
+                "next": [],
+            },
+            parent_run.variables,
+            parent_run,
+            db_session,
+        )
+
+    # The run loop records the failed parent step and commits afterward.
+    await db_session.commit()
+    child_runs = (await db_session.execute(
+        select(WorkflowRun).where(WorkflowRun.workflow_id == child_workflow.id)
+    )).scalars().all()
+    assert child_runs == []
+    assert "publish" not in (parent_run.step_results or {})
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_creates_workflow_wait_grant_before_executor_starts(
+    runner,
+    monkeypatch,
+):
+    target = SimpleNamespace(
+        id="wf-youtube-executor",
+        variables={},
+        steps=[
+            {"id": "start", "type": "trigger", "next": ["upload"]},
+            {"id": "upload", "type": "agent", "next": ["publish"]},
+            {"id": "publish", "type": "agent", "next": []},
+        ],
+    )
+
+    class Result:
+        def scalar_one_or_none(self):
+            return target
+
+    class Db:
+        child = None
+
+        class NestedTransaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        async def execute(self, _query):
+            return Result()
+
+        def add(self, child):
+            self.child = child
+
+        def begin_nested(self):
+            return self.NestedTransaction()
+
+        async def flush(self):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def refresh(self, _child):
+            return None
+
+    db = Db()
+    parent = _run({"youtube_title": "Approved Stickman title"})
+    parent.workspace_id = "workspace-1"
+    parent.started_by = "user-1"
+    parent.step_results = {
+        "approve_video": {
+            "status": "completed",
+            "approved": True,
+            "approved_by": "user-1",
+        }
+    }
+    calls = []
+
+    async def create_grant(_db, **kwargs):
+        calls.append(kwargs)
+        trigger_data = dict(kwargs["executor_run"].trigger_data or {})
+        trusted = dict(trigger_data.get("_workflow_runtime_context") or {})
+        trusted["workflow_action_grant_id"] = "grant-1"
+        trigger_data["_workflow_runtime_context"] = trusted
+        kwargs["executor_run"].trigger_data = trigger_data
+        return SimpleNamespace(id="grant-1")
+
+    async def complete_child(_runner, _run_id):
+        assert (
+            db.child.trigger_data["_workflow_runtime_context"]
+            ["workflow_action_grant_id"]
+            == "grant-1"
+        )
+        db.child.status = "completed"
+
+    monkeypatch.setattr(
+        "packages.core.services.workflow_action_grant_service."
+        "create_workflow_wait_youtube_publication_grant",
+        create_grant,
+    )
+    monkeypatch.setattr(WorkflowRunner, "run", complete_child)
+    result = await runner._execute_subworkflow_step(
+        {
+            "id": "publish",
+            "type": "subworkflow",
+            "config": {
+                "workflow_id": target.id,
+                "workflow_wait_authorization": {
+                    "kind": "youtube_publication_v1",
+                    "source": "workflow_wait",
+                    "approved_wait_step_id": "approve_video",
+                    "destination": "studio.youtube.com",
+                    "upload_step_id": "upload",
+                    "publish_step_id": "publish",
+                    "artifact": {
+                        "workflow_project_id": "project-1",
+                        "document_id": "document-1",
+                        "fs_path": "Knowledge/video.mp4",
+                        "upload_path": "/workspace/Knowledge/video.mp4",
+                        "sha256": "a" * 64,
+                    },
+                    "publication": {
+                        "title": "{{youtube_title}}",
+                        "description": "Approved description",
+                        "audience": "not_made_for_kids",
+                        "visibility": "public",
+                    },
+                    "ttl_seconds": 3600,
+                },
+            },
+        },
+        parent.variables,
+        parent,
+        db,
+    )
+
+    assert result["status"] == "completed"
+    assert len(calls) == 1
+    assert calls[0]["root_run"] is parent
+    assert calls[0]["executor_run"] is db.child
+    assert calls[0]["executor_workflow"] is target
+    assert (
+        calls[0]["declaration"]["publication"]["title"]
+        == "Approved Stickman title"
+    )
 
 
 def test_continues_on_error_flag():
@@ -3084,6 +4143,127 @@ async def test_wait_approval_pauses(runner):
     res = await runner._execute_step(step, run, None)
     assert res["status"] == "paused"
     assert run.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_wait_input_auto_completes_from_existing_declared_values(runner):
+    run = _run({"cover_art": [{"document_id": "cover-doc"}]})
+    step = {
+        "id": "cover_input",
+        "type": "wait",
+        "config": {
+            "wait_type": "input",
+            "response_variable": "release_inputs",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "cover_art": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                            "type": "object",
+                            "required": ["document_id"],
+                            "properties": {"document_id": {"type": "string"}},
+                        },
+                    },
+                },
+                "required": ["cover_art"],
+            },
+        },
+    }
+
+    result = await runner._execute_step(step, run, None)
+
+    assert result["status"] == "completed"
+    assert result["output"] == {"cover_art": [{"document_id": "cover-doc"}]}
+    assert result["output_var"] == "release_inputs"
+
+
+@pytest.mark.asyncio
+async def test_wait_input_pauses_with_schema_when_required_value_is_missing(runner):
+    run = _run()
+    schema = {"type": "object", "properties": {"cover_art": {"type": "array", "minItems": 1}}, "required": ["cover_art"]}
+    step = {"id": "cover_input", "type": "wait", "config": {"wait_type": "input", "input_schema": schema}}
+
+    result = await runner._execute_step(step, run, None)
+
+    assert result == {
+        "status": "paused",
+        "output": "Waiting for input",
+        "wait_type": "input",
+        "response_variable": "inputs",
+        "input_schema": schema,
+    }
+
+
+@pytest.mark.asyncio
+async def test_wait_input_safe_dispatch_pauses_before_required_submission(runner):
+    schema = {"type": "object", "properties": {"cover_art": {"type": "array", "minItems": 1}}, "required": ["cover_art"]}
+    step = {"id": "cover_input", "type": "wait", "config": {"wait_type": "input", "input_schema": schema}}
+
+    result = await runner._execute_step_safe(step, _run(), None)
+
+    assert result["status"] == "paused"
+    assert result["input_schema"] == schema
+
+
+def test_input_wait_rejects_refresh_invalid_submission():
+    config = {
+        "wait_type": "input",
+        "response_variable": "release_inputs",
+        "input_schema": {
+            "type": "object",
+            "properties": {"cover_art": {"type": "array", "minItems": 1}},
+            "required": ["cover_art"],
+        },
+    }
+
+    with pytest.raises(ValueError, match="cover_art"):
+        workflow_input_wait_value(config, {"release_inputs": {}})
+
+
+def test_input_wait_normalizes_flat_values_without_unrelated_submission_data():
+    config = {
+        "response_variable": "release_inputs",
+        "input_schema": {
+            "type": "object",
+            "properties": {"cover_art": {"type": "array", "minItems": 1}},
+            "required": ["cover_art"],
+        },
+    }
+
+    response_variable, value, _schema = workflow_input_wait_value(config, {
+        "cover_art": [{"document_id": "cover-doc"}],
+        "unrelated_override": "must not persist",
+    })
+
+    assert response_variable == "release_inputs"
+    assert value == {"cover_art": [{"document_id": "cover-doc"}]}
+
+
+def test_input_wait_drops_undeclared_nested_values_before_persisting():
+    config = {
+        "response_variable": "release_inputs",
+        "input_schema": {
+            "type": "object",
+            "properties": {"cover_art": {"type": "array", "minItems": 1}},
+            "required": ["cover_art"],
+        },
+    }
+
+    _response_variable, value, _schema = workflow_input_wait_value(config, {
+        "release_inputs": {
+            "cover_art": [{"document_id": "cover-doc"}],
+            "unrelated_override": "must not persist",
+        },
+    })
+
+    assert value == {"cover_art": [{"document_id": "cover-doc"}]}
+
+
+def test_input_wait_rejects_non_object_schema():
+    with pytest.raises(ValueError, match="object input_schema"):
+        workflow_input_wait_value({"input_schema": {"type": "array"}}, {})
 
 
 def test_paused_tool_continuation_becomes_runnable_without_false_completion(runner):
@@ -3789,3 +4969,182 @@ def test_template_resolves_imported_array_paths():
     assert workflow_runner_module._render_template(
         "News: {{input.data.0.title}}", variables,
     ) == "News: Top story"
+
+
+@pytest.mark.asyncio
+async def test_media_node_keeps_referenced_parameter_types(monkeypatch):
+    # generate_file validates `duration` as an integer enum; rendering every
+    # template to a string made "{{duration_seconds}}" fail as "5".
+    captured: dict = {}
+
+    async def fake_tool_step(self, step, variables, entity_id, user_id="", runtime_context=None):
+        captured.update(step["config"]["args"])
+        return {"status": "completed", "output": {"video_url": "/api/v1/fs/e/v.mp4"}}
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_tool_step", fake_tool_step)
+    runner = WorkflowRunner.__new__(WorkflowRunner)
+    step = {
+        "id": "video",
+        "type": "video",
+        "config": {
+            "prompt": "A {{style}} clip",
+            "duration": "{{duration_seconds}}",
+            "aspect_ratio": "{{ratio}}",
+            "reference_urls": "{{refs}}",
+            "save_to_knowledge": "{{save}}",
+            "output_var": "video_asset",
+        },
+    }
+    variables = {"style": "calm", "duration_seconds": 5, "ratio": "9:16", "refs": ["/a.png", "/b.png"], "save": True}
+    await runner._execute_media_step(step, variables, "entity-1")
+    assert captured["duration"] == 5
+    assert captured["aspect_ratio"] == "9:16"
+    assert captured["reference_urls"] == ["/a.png", "/b.png"]
+    assert captured["save_to_knowledge"] is True
+    assert captured["prompt"] == "A calm clip"
+
+    captured.clear()
+    await runner._execute_media_step(step, {**variables, "duration_seconds": "7"}, "entity-1")
+    assert captured["duration"] == 7
+
+
+@pytest.mark.asyncio
+async def test_video_node_waits_for_its_async_job_without_regenerating(monkeypatch):
+    # generate_file starts video as an async job ("pending" + job_id). The
+    # node must not complete with no video, and a re-check must never start a
+    # second (paid) generation.
+    calls = {"tool": 0}
+
+    async def fake_tool_step(self, step, variables, entity_id, user_id="", runtime_context=None):
+        calls["tool"] += 1
+        return {
+            "status": "completed",
+            "output": {"kind": "video", "status": "pending", "job_id": "job-1", "name": "clip.mp4", "duration": 5},
+            "output_var": "video_asset",
+        }
+
+    job_state = {"status": "processing", "result_url": None, "error": None}
+
+    async def fake_load_job(job_id, entity_id):
+        assert (job_id, entity_id) == ("job-1", "entity-1")
+        return dict(job_state)
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_tool_step", fake_tool_step)
+    monkeypatch.setattr(workflow_runner_module, "_load_media_job_state", fake_load_job)
+    runner = WorkflowRunner.__new__(WorkflowRunner)
+    step = {"id": "video", "type": "video", "config": {"prompt": "clip", "output_var": "video_asset"}}
+    run = SimpleNamespace(step_results={}, status="running", continuation_token=None,
+                          continuation_due_at=None, continuation_next_attempt_at=None)
+
+    first = await runner._execute_media_step(step, {}, "entity-1", run=run)
+    assert first["status"] == "paused"
+    assert first["resume_strategy"] == "reexecute"
+    assert first["media_job_id"] == "job-1"
+    assert run.continuation_token and run.continuation_due_at is not None
+    assert calls["tool"] == 1
+
+    run.step_results = {"video": first}
+    still = await runner._execute_media_step(step, {}, "entity-1", run=run)
+    assert still["status"] == "paused" and still["media_job_id"] == "job-1"
+    assert calls["tool"] == 1  # re-check only, no second generation
+
+    job_state.update(status="completed", result_url="/api/v1/fs/entity-1/clip.mp4")
+    run.step_results = {"video": still}
+    done = await runner._execute_media_step(step, {}, "entity-1", run=run)
+    assert done["status"] == "completed"
+    assert done["output"]["video_url"] == "/api/v1/fs/entity-1/clip.mp4"
+    assert done["output"]["status"] == "completed"
+    assert done["output_var"] == "video_asset"
+    assert calls["tool"] == 1
+
+    job_state.update(status="failed", result_url=None, error="provider rejected the prompt")
+    failed = await runner._execute_media_step(step, {}, "entity-1", run=SimpleNamespace(
+        step_results={"video": still}, status="running", continuation_token=None,
+        continuation_due_at=None, continuation_next_attempt_at=None,
+    ))
+    assert failed["status"] == "failed"
+    assert "provider rejected the prompt" in failed["error"]
+
+
+@pytest.mark.asyncio
+async def test_media_job_state_loader_reads_the_entity_scoped_job(db_session):
+    from packages.core.models.media_job import MediaJob
+
+    entity_id = generate_ulid()
+    job = MediaJob(entity_id=entity_id, kind="video", status="completed", result_url="/api/v1/fs/e/clip.mp4", model="m", prompt="clip")
+    db_session.add(job)
+    await db_session.commit()
+
+    state = await workflow_runner_module._load_media_job_state(job.id, entity_id)
+    assert state == {"status": "completed", "result_url": "/api/v1/fs/e/clip.mp4", "error": None}
+    assert await workflow_runner_module._load_media_job_state(job.id, generate_ulid()) is None
+
+
+@pytest.mark.asyncio
+async def test_media_node_output_is_structured_so_fields_can_be_referenced(monkeypatch):
+    # generate_file returns its JSON as a string; downstream nodes read
+    # {{image_asset.image_url}}, which cannot walk into a string.
+    async def fake_tool_step(self, step, variables, entity_id, user_id="", runtime_context=None):
+        return {
+            "status": "completed",
+            "output": json.dumps({"kind": "image", "image_url": "/api/v1/fs/e/post.png", "model": "m"}),
+            "output_var": "image_asset",
+        }
+
+    monkeypatch.setattr(WorkflowRunner, "_execute_tool_step", fake_tool_step)
+    runner = WorkflowRunner.__new__(WorkflowRunner)
+    step = {"id": "image", "type": "image", "config": {"prompt": "p", "output_var": "image_asset"}}
+    result = await runner._execute_media_step(step, {}, "entity-1", run=SimpleNamespace(step_results={}))
+    assert result["output"] == {"kind": "image", "image_url": "/api/v1/fs/e/post.png", "model": "m"}
+    assert workflow_runner_module._lookup_reference("image_asset.image_url", {"image_asset": result["output"]}) == "/api/v1/fs/e/post.png"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "expected_tools", "expected_system"),
+    [
+        (
+            {"standalone_tools": ["mcp__chrome__open_or_reuse", "mcp__chrome__upload"],
+             "standalone_system_prompt": "You publish through Chrome."},
+            ["mcp__chrome__open_or_reuse", "mcp__chrome__upload"],
+            "You publish through Chrome.",
+        ),
+        ({}, [], "You are a helpful assistant completing a workflow step."),
+    ],
+)
+async def test_agent_step_without_an_agent_uses_only_its_declared_standalone_tools(
+    runner,
+    monkeypatch,
+    config,
+    expected_tools,
+    expected_system,
+):
+    """A service step run with no Workspace has no agent; it gets the tools and
+    instructions the node declares for that case, and nothing otherwise."""
+    seen: dict = {}
+
+    async def fake_appendix(*args, **kwargs):
+        seen["tools"] = kwargs.get("configured_tool_names")
+        return SimpleNamespace(prompt_appendix="", tool_schemas=[], allowed_tool_names=set(), envelope=None)
+
+    async def fake_loop(**kwargs):
+        seen["system"] = kwargs.get("system_prompt")
+        return SimpleNamespace(
+            content="done", usage={}, tool_calls_made=[], rounds=1,
+            stop_reason=None, error=None, error_detail=None, control=None,
+        )
+
+    monkeypatch.setattr(workflow_runner_module, "runtime_prepare_prompt_appendix_for_turn", fake_appendix)
+    monkeypatch.setattr(workflow_runner_module, "runtime_execute_workflow_agent_loop", fake_loop)
+
+    await runner._execute_agent_step(
+        {"id": "publish", "type": "agent", "config": {"prompt": "Publish.", "service_key": "distribution.x.chrome", **config}},
+        {},
+        "entity-1",
+        "user-1",
+        {},
+        None,
+    )
+
+    assert seen["tools"] == expected_tools
+    assert seen["system"].startswith(expected_system)

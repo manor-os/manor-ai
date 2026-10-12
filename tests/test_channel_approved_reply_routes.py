@@ -2078,7 +2078,7 @@ async def test_interrupted_at_least_once_attempt_is_not_sent_again(
     assert updates == ["unknown"]
 
 
-async def test_channel_always_approve_sends_and_creates_standing_grant(
+async def test_channel_approve_once_sends_without_saving_a_rule(
     monkeypatch,
 ) -> None:
     from packages.core.constants.pending_actions import PendingActionKind
@@ -2200,7 +2200,7 @@ async def test_channel_always_approve_sends_and_creates_standing_grant(
             "entity_id": "entity-1",
             "workspace_id": "workspace-1",
         },
-        "always_approve",
+        "approve",
         {
             "entity_id": "entity-1",
             "responder": {"user_id": "owner-1"},
@@ -2208,18 +2208,9 @@ async def test_channel_always_approve_sends_and_creates_standing_grant(
     )
 
     assert result["ok"] is True
-    assert grants == [{
-        "entity_id": "entity-1",
-        "workspace_id": "workspace-1",
-        "action_key": "external_message.send",
-        "resource_id": "config-1",
-        "changed_by": "owner-1",
-    }]
-    assert permission_checks == [
-        "approve_external_publish",
-        "manage_standing_grants",
-    ]
-    assert resolutions == [{"choice": "always_approve"}]
+    assert grants == []
+    assert permission_checks == ["approve_external_publish"]
+    assert resolutions == [{"choice": "approve"}]
 
 
 async def test_channel_approval_consumes_owner_quarantine_fallback(
@@ -2360,7 +2351,7 @@ async def test_channel_approval_consumes_owner_quarantine_fallback(
     }]
 
 
-async def test_channel_always_approve_requires_standing_grant_authority(
+async def test_channel_retired_always_choice_cannot_save_a_rule(
     monkeypatch,
 ) -> None:
     from packages.core.constants.pending_actions import PendingActionKind
@@ -2423,7 +2414,7 @@ async def test_channel_always_approve_requires_standing_grant_authority(
         return permission_key == "approve_external_publish"
 
     async def unexpected_claim(*_args, **_kwargs):
-        raise AssertionError("standing authority must be checked before provider I/O")
+        raise AssertionError("retired consent must be rejected before provider I/O")
 
     monkeypatch.setattr(callbacks, "async_session", SessionContext)
     monkeypatch.setattr(
@@ -2450,14 +2441,12 @@ async def test_channel_always_approve_requires_standing_grant_authority(
         },
     )
 
-    assert result == {
-        "ok": False,
-        "error": "standing_grant_authority_required",
-    }
-    assert permission_checks == [
-        "approve_external_publish",
-        "manage_standing_grants",
-    ]
+    assert result["ok"] is False
+    assert result["error"] == "approval_command_retired"
+    assert "versioned approval settings" in result["message"]
+    assert permission_checks == ["approve_external_publish"]
+    assert msg.resolved_at is None
+    assert msg.resolution is None
 
 
 async def test_channel_approval_callback_cannot_consume_successor_claim(
@@ -2581,7 +2570,7 @@ async def test_channel_approval_callback_cannot_consume_successor_claim(
             "entity_id": "entity-1",
             "workspace_id": "workspace-1",
         },
-        "always_approve",
+        "approve",
         {
             "entity_id": "entity-1",
             "responder": {"user_id": "owner-1"},

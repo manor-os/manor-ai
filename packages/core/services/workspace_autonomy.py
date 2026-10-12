@@ -21,6 +21,15 @@ class WorkspaceAutonomyFields(Protocol):
     deleted_at: datetime | None
 
 
+def workspace_allows_manual_work(workspace: WorkspaceAutonomyFields | None) -> bool:
+    """Pausing autonomy does not disable user-directed Workspace work."""
+    return bool(
+        workspace is not None
+        and workspace.deleted_at is None
+        and workspace.status in {"active", "paused"}
+    )
+
+
 def resolve_workspace_autonomy_state(
     *,
     status: str,

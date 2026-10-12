@@ -133,12 +133,16 @@ async def _web_search(entity_id: str, **kwargs: Any) -> str:
     try:
         if api_key:
             if search_engine == "tavily":
-                return await _tavily_search(api_key, query, num_results)
+                result = await _tavily_search(api_key, query, num_results)
             else:
-                return await _serper_search(api_key, query, num_results)
+                result = await _serper_search(api_key, query, num_results)
         else:
             # Free fallback: DuckDuckGo (no API key required)
-            return await _duckduckgo_search(query, num_results)
+            result = await _duckduckgo_search(query, num_results)
+        from packages.core.ai.runtime.artifacts import runtime_record_web_search_result
+
+        runtime_record_web_search_result(query, result)
+        return result
     except Exception as e:
         logger.error("Web search failed: %s", e)
         return json.dumps({"error": f"Search failed: {e}"})
@@ -546,12 +550,12 @@ async def _tavily_search(api_key: str, query: str, num_results: int) -> str:
     return json.dumps({"query": query, "results": results})
 
 
-async def _duckduckgo_search(query: str, num_results: int) -> str:
+async def _duckduckgo_search(query: str, num_results: int, *, backend: str = "auto") -> str:
     """Free DuckDuckGo search — real web search via ddgs, or Instant Answer API fallback."""
     # 1. Real search via ddgs package (pip install ddgs)
     if _DDGS_AVAILABLE and DDGS is not None:
         try:
-            return await _ddgs_text_search(query, num_results)
+            return await _ddgs_text_search(query, num_results, backend=backend)
         except Exception as e:
             logger.warning("DuckDuckGo ddgs search failed, trying Instant Answer API: %s", e)
 
@@ -559,7 +563,7 @@ async def _duckduckgo_search(query: str, num_results: int) -> str:
     return await _ddg_instant_answer(query, num_results)
 
 
-async def _ddgs_text_search(query: str, num_results: int) -> str:
+async def _ddgs_text_search(query: str, num_results: int, *, backend: str = "auto") -> str:
     """Real web search using ddgs package (run in thread since it's sync)."""
     def _search():
         with warnings.catch_warnings():
@@ -570,7 +574,7 @@ async def _ddgs_text_search(query: str, num_results: int) -> str:
                     region="wt-wt",
                     safesearch="moderate",
                     max_results=num_results,
-                    backend="auto",
+                    backend=backend,
                 )
             )
 

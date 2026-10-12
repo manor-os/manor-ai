@@ -22,12 +22,15 @@ import zipfile
 import xml.etree.ElementTree as ET
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Callable, TypeVar
+from typing import AsyncIterator, Awaitable, BinaryIO, Callable, TypeVar
 
 from defusedxml import ElementTree as DefusedET
 from PIL import Image
 
-from packages.core.services.office_process import office_conversion_file_limit
+from packages.core.services.office_process import (
+    office_conversion_file_limit,
+    run_in_process_group,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +73,23 @@ _CURRENT_PREVIEW_VERSION_FILE = ".current"
 _PRESENTATION_OBJECT_CACHE_DIR_RE = re.compile(r"^slide-[0-9]+-object-[0-9]+$")
 _DOCUMENT_PAGE_RENDER_LOCK_RETRY_SECONDS = 0.02
 _DOCUMENT_PAGE_RENDER_LOCK_BUCKETS = 64
+
+
+def _env_seconds(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, ""))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Interactive preview requests stop waiting for a render slot after this long
+# and surface a retryable "busy" error instead of holding the request open
+# behind every queued conversion. Background callers keep waiting (None).
+INTERACTIVE_RENDER_ADMISSION_TIMEOUT_SECONDS = _env_seconds(
+    "MANOR_OFFICE_RENDER_ADMISSION_TIMEOUT_SECONDS",
+    20.0,
+)
 _ThreadResult = TypeVar("_ThreadResult")
 
 
@@ -81,18 +101,37 @@ class OfficeRenderLimitError(ValueError):
     """Raised when an Office preview would exceed its rendering budget."""
 
 
+class OfficeRenderBusyError(RuntimeError):
+    """Raised when every render slot stayed busy for the admission timeout.
+
+    The request did not start rendering; callers should retry shortly.
+    """
+
+
+class OfficeRenderAbandonedError(RuntimeError):
+    """Raised when the requester went away before an expensive render started."""
+
+
 async def render_slides(
     pptx_path: str,
     cache_dir: str,
     *,
     dpi: int = 150,
     source_ext: str | None = ".pptx",
+    admission_timeout: float | None = None,
+    should_abandon: Callable[[], Awaitable[bool]] | None = None,
 ) -> list[str]:
     """Convert PPTX to per-slide lossless PNG images.
 
     Returns a list of absolute paths to the rendered slide images,
     ordered by slide number. Uses a content-hash based cache so
     unchanged files aren't re-rendered.
+
+    ``admission_timeout`` bounds the wait for the per-deck lock and a shared
+    render slot (``OfficeRenderBusyError`` when exceeded). ``should_abandon``
+    is consulted once admission is granted and the cache missed; when it
+    reports that the requester is gone, the render is skipped with
+    ``OfficeRenderAbandonedError`` so the slot is not spent on nobody.
     """
     if not os.path.isfile(pptx_path):
         raise FileNotFoundError(f"PPTX not found: {pptx_path}")
@@ -102,10 +141,14 @@ async def render_slides(
         _document_page_render_lock_dir,
         cache_dir,
     )
+    admission_deadline = (
+        time.monotonic() + admission_timeout if admission_timeout is not None else None
+    )
     async with _document_page_named_lock(
         _document_page_render_lock_path(lock_dir, "slides", os.path.abspath(cache_dir)),
+        deadline=admission_deadline,
     ):
-        async with _document_page_render_slot(lock_dir):
+        async with _document_page_render_slot(lock_dir, deadline=admission_deadline):
             with tempfile.TemporaryDirectory(prefix="manor-slide-snapshot-") as snapshot_dir:
                 snapshot_path = os.path.join(snapshot_dir, f"presentation{ext}")
                 cache_key = await _run_document_page_thread(
@@ -125,6 +168,10 @@ async def render_slides(
                         max_versions=SLIDE_CACHE_MAX_VERSIONS,
                     )
                     return existing
+                if should_abandon is not None and await _requester_abandoned(should_abandon):
+                    raise OfficeRenderAbandonedError(
+                        "Slide render skipped because the requester disconnected",
+                    )
                 try:
                     rendered = await _run_document_page_thread(
                         _render_sync,
@@ -526,17 +573,33 @@ def _release_document_page_file_lock(handle: BinaryIO) -> None:
         handle.close()
 
 
-async def _acquire_document_page_file_lock(path: Path) -> BinaryIO:
+def _raise_if_admission_expired(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise OfficeRenderBusyError(
+            "Office rendering is busy; retry the preview shortly",
+        )
+
+
+async def _acquire_document_page_file_lock(
+    path: Path,
+    *,
+    deadline: float | None = None,
+) -> BinaryIO:
     while True:
         handle = _try_document_page_file_lock(path)
         if handle is not None:
             return handle
+        _raise_if_admission_expired(deadline)
         await asyncio.sleep(_DOCUMENT_PAGE_RENDER_LOCK_RETRY_SECONDS)
 
 
 @asynccontextmanager
-async def _document_page_named_lock(path: Path) -> AsyncIterator[None]:
-    handle = await _acquire_document_page_file_lock(path)
+async def _document_page_named_lock(
+    path: Path,
+    *,
+    deadline: float | None = None,
+) -> AsyncIterator[None]:
+    handle = await _acquire_document_page_file_lock(path, deadline=deadline)
     try:
         yield
     finally:
@@ -544,7 +607,16 @@ async def _document_page_named_lock(path: Path) -> AsyncIterator[None]:
 
 
 @asynccontextmanager
-async def _document_page_render_slot(lock_dir: Path) -> AsyncIterator[None]:
+async def _document_page_render_slot(
+    lock_dir: Path,
+    *,
+    deadline: float | None = None,
+) -> AsyncIterator[None]:
+    """Hold one of the global render slots (shared by every Office render).
+
+    Without a ``deadline`` the wait is unbounded (background work). With one,
+    ``OfficeRenderBusyError`` is raised once it passes without a free slot.
+    """
     handle: BinaryIO | None = None
     while handle is None:
         for index in range(DOCUMENT_PAGE_RENDER_MAX_CONCURRENCY):
@@ -552,11 +624,36 @@ async def _document_page_render_slot(lock_dir: Path) -> AsyncIterator[None]:
             if handle is not None:
                 break
         if handle is None:
+            _raise_if_admission_expired(deadline)
             await asyncio.sleep(_DOCUMENT_PAGE_RENDER_LOCK_RETRY_SECONDS)
     try:
         yield
     finally:
         _release_document_page_file_lock(handle)
+
+
+async def _requester_abandoned(should_abandon: Callable[[], Awaitable[bool]]) -> bool:
+    try:
+        return bool(await should_abandon())
+    except Exception:
+        logger.debug("Render requester liveness check failed", exc_info=True)
+        return False
+
+
+def read_png_dimensions(path: str) -> tuple[int, int] | None:
+    """Return (width, height) from a PNG IHDR header without decoding pixels."""
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(24)
+    except OSError:
+        return None
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n" or header[12:16] != b"IHDR":
+        return None
+    width = int.from_bytes(header[16:20], "big")
+    height = int.from_bytes(header[20:24], "big")
+    if width < 1 or height < 1:
+        return None
+    return width, height
 
 
 async def open_first_page(
@@ -685,7 +782,7 @@ def _render_first_page_sync(
         else:
             soffice_input = _prepare_soffice_input(file_path, tmp, ext)
             pdf_path = os.path.join(tmp, Path(soffice_input).stem + ".pdf")
-            result = subprocess.run(
+            result = run_in_process_group(
                 [
                     "soffice", _soffice_user_installation_arg(tmp),
                     "--headless", "--convert-to", "pdf",
@@ -1500,7 +1597,7 @@ def _render_sync(pptx_path: str, slide_dir: str, dpi: int) -> list[str]:
     with tempfile.TemporaryDirectory() as tmp:
         # Step 1: PPTX → PDF via LibreOffice
         pdf_path = os.path.join(tmp, Path(pptx_path).stem + ".pdf")
-        result = subprocess.run(
+        result = run_in_process_group(
             [
                 "soffice", _soffice_user_installation_arg(tmp),
                 "--headless", "--convert-to", "pdf",
@@ -1575,7 +1672,7 @@ def _render_document_pages_sync(
             ext = _normalize_source_ext(source_ext) or os.path.splitext(file_path)[1].lower()
             soffice_input = _prepare_soffice_input(file_path, tmp, ext)
             pdf_path = os.path.join(tmp, Path(soffice_input).stem + ".pdf")
-            result = subprocess.run(
+            result = run_in_process_group(
                 [
                     "soffice", _soffice_user_installation_arg(tmp),
                     "--headless", "--convert-to", "pdf",

@@ -1,3 +1,4 @@
+import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
 import {
   lazy,
   Suspense,
@@ -11,6 +12,8 @@ import {
   type MouseEvent as ReactMouseEvent,
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { agentListQueryOptions, skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
+import { chatFlowEntrypointsQueryOptions, chatMentionUsersQueryOptions } from "../lib/chatCatalogQueries";
 import { useLocation, useNavigate } from "react-router-dom";
 import {
   ApiError,
@@ -24,6 +27,7 @@ import {
 } from "../lib/api";
 import { getAuthToken } from "../lib/authToken";
 import { isMasterAgent } from "../lib/constants";
+import { workflowPath } from "../lib/workflowRoutes";
 import {
   type ChatMessage,
   type ChatStreamSnapshot,
@@ -57,8 +61,9 @@ import {
 } from "../lib/responseSurface";
 import { chatMessageAnchorId } from "../lib/chatMessageAnchor";
 import { createdChatResourceReferences } from "../lib/chatResourceReferences";
+import { invalidateAgentInitiativeQueries } from "../lib/agentInitiativeInvalidation";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
-import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
+import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
 import {
   paginateManorDocument,
   renderManorDocument,
@@ -69,16 +74,25 @@ import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
   ChatStreamCompletionStatus,
   hasLocallyStreamedConversation,
+  captureChatHistoryStreamFence,
+  chatHistoryStreamFenceIsCurrent,
+  recoverRuntimeChatSession,
   shouldIgnoreLocallyStoppedStreamUpdate,
   useChatStreamStore,
 } from "../stores/chatStream";
+import { answerRuntimeHumanInput } from "../stores/chatStream";
+import { RuntimeHumanInputCard } from "./ui/RuntimeHumanInputCard";
 import { useAuthStore } from "../stores/auth";
+import { useDisplayPreferences } from "../stores/displayPreferences";
+import { chatComposerDraftKey, useChatComposerDraft } from "../lib/useChatComposerDraft";
 import { useToastStore } from "../stores/toast";
 import type { Agent, Document, UserSummary, Workspace } from "../lib/types";
 import ChatMarkdown from "./ChatMarkdown";
 import WorkflowResultCard from "./WorkflowResultCard";
 import CreatedResourceCard from "./CreatedResourceCard";
-import AssistantMessageBlocks from "./AssistantMessageBlocks";
+import AssistantMessageBlocks, {
+  assistantPendingActionKindForMessage,
+} from "./AssistantMessageBlocks";
 import ChatMessageActions, {
   chatMessageActionText,
   type ChatMessageFeedbackRating,
@@ -87,6 +101,8 @@ import ChatMessageActions, {
 } from "./chat/ChatMessageActions";
 import useChatMessageFeedback from "./chat/useChatMessageFeedback";
 import ChatTimestamp from "./chat/ChatTimestamp";
+import MessageBubble from "./chat/MessageBubble";
+import ConversationInitiativesButton from "./agents/ConversationInitiativesButton";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ChatScrollRail, {
   type ChatScrollRailMarker,
@@ -102,6 +118,7 @@ import WorkspaceIntroDialog from "./workspaces/WorkspaceIntroDialog";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
 import ApprovalActionBar from "./ui/ApprovalActionBar";
+import { isTikTokPublishApproval } from "./workflows/TikTokPublishReview";
 import InlineTips from "./ui/InlineTips";
 import WorkspaceRailVisual from "./ui/WorkspaceRailVisual";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
@@ -167,6 +184,10 @@ import {
   savePendingChatRetry,
   type PendingChatRetry,
 } from "../lib/chatRetry";
+import { latestMessageByRole, priorMatchingEntries } from "../lib/chatHistoryScan";
+import { isAbortError, loadServerSlidePreview, slidePriorityPicker } from "../lib/pptxServerPreview";
+import { createFilePreviewSource, filePreviewMediaBlob, withFilePreviewTimeout } from "../lib/filePreviewSource";
+import { getFilePreviewKind } from "../lib/filePreviewKind";
 import {
   manualSkillReferences,
   resolveManualSkillReferenceIds,
@@ -179,6 +200,7 @@ import {
   fileReferenceKind,
   generatedFileFsPath,
   generatedFileOpenReference,
+  normalizeFileRef,
 } from "../lib/fileReferences";
 import {
   assertDiagramPreviewFileSize,
@@ -191,6 +213,7 @@ import {
 } from "../lib/selectionActions";
 
 const LazyDiagramArtifactViewer = lazy(() => import("./diagram/DiagramArtifactViewer"));
+const LazyPdfJsViewer = lazy(() => import("../pages/FileViewer").then(({ PdfJsViewer }) => ({ default: PdfJsViewer })));
 
 function maybeLocalCodingRunNoticeForTools(_tools: ToolCall[]): string | null {
   return null;
@@ -208,15 +231,15 @@ import {
 import type { WorkflowTemplate } from "./workflows/WorkflowTemplates";
 import { t } from "../lib/i18n";
 import { useChatAutoFollow } from "../lib/useChatAutoFollow";
-import { isCodeLikeFile } from "../lib/codeFiles";
 import { parseDelimitedText } from "../lib/delimitedText";
 import {
-  spreadsheetChartsFromFile,
+  spreadsheetCellVisualStyle,
   spreadsheetMergeAt,
-  spreadsheetSheetsFromWorkbook,
+  spreadsheetSheetsFromFile,
   type SpreadsheetSheetModel,
 } from "../lib/spreadsheetOoxml";
 import SpreadsheetChartPreview from "./SpreadsheetChartPreview";
+import SpreadsheetImageLayer from "./SpreadsheetImageLayer";
 import {
   pickRandomSoloBusinessIdeas,
   soloBusinessIdeaExecutionKey,
@@ -229,7 +252,7 @@ import {
 } from "../services/blueprintCoverTemplate";
 
 
-interface AgentInfo {
+interface AgentInfo extends Pick<Agent, "entity_id" | "workspace_id" | "workspace_name" | "visibility" | "description"> {
   id: string;
   name: string;
   color?: string;
@@ -1096,26 +1119,6 @@ const SIDE_HUSTLE_SAMPLE_DEFINITIONS: Record<
   SideHustleSampleDefinition[]
 > = {
   workspace: [
-    {
-      id: "productized_service_os",
-      preview: "workspace",
-      coverTemplate: {
-        motif: "service",
-      palette: "stone",
-      variant: 1,
-      seed: 2061640672,
-      },
-    },
-    {
-      id: "digital_product_store_os",
-      preview: "workspace",
-      coverTemplate: {
-        motif: "commerce",
-      palette: "blue",
-      variant: 0,
-      seed: 2495511228,
-      },
-    },
   ],
   slides: [
     {
@@ -3179,6 +3182,8 @@ export interface OutputArtifact {
   status: ExecutionStatus;
   body?: string;
   href?: string;
+  /** Ephemeral preview bytes, never persisted in the artifact record. */
+  blob?: Blob;
   meta?: string;
   language?: string;
   data?: Record<string, any>;
@@ -3227,12 +3232,14 @@ function artifactFromMessageReference(
     open_url: refItem.openUrl,
     result_url: refItem.url || refItem.previewUrl,
     fs_path: refItem.fsPath,
-  }) || undefined;
+  }) || (refItem.kind === "image" && /^(?:data:image\/|blob:)/i.test(refItem.previewUrl || "")
+    ? refItem.previewUrl : undefined);
   return {
     id: `chat-reference-${documentId || refItem.key}`,
     kind: referenceArtifactKind(refItem, doc),
     title,
     status: "done",
+    blob: refItem.file,
     href: directUrl,
     body: directUrl,
     meta: doc?.mime_type || refItem.mimeType || doc?.file_type || refItem.fileType,
@@ -3344,7 +3351,8 @@ function UserMessageContent({
   onOpenReference?: (refItem: ChatMessageDisplayReference) => void;
 }) {
   const parsed = parseUserMessageDisplay(
-    typeof content === "string" ? { ...msg, content } : msg,
+    msg,
+    { content },
   );
   const contentText = parsed.cleanContent;
   const parts = buildMessageInlineParts(msg, contentText);
@@ -4609,7 +4617,7 @@ function FlowTemplateSamples() {
   const openFlow = useCallback(
     (workflowId: string) => {
       const returnTo = `${location.pathname}${location.search}${location.hash}`;
-      navigate(`/flows?workflow=${encodeURIComponent(workflowId)}`, {
+      navigate(workflowPath(workflowId), {
         state: { returnTo },
       });
     },
@@ -4772,6 +4780,7 @@ function WorkspaceWelcome({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const flowsAccess = usePreviewFeatureAccess("flows");
   const selected =
     WORKSPACE_CAPABILITIES.find((item) => item.key === activeCapability) ||
@@ -5401,7 +5410,9 @@ function WorkspaceWelcome({
         }
         onInstall={(blueprint) => {
         }}
-        onOpenInstalled={(workspace) => navigate(`/workspaces/${workspace.id}`)}
+        onOpenInstalled={(workspace) => navigate(isSimple
+          ? `/chat?workspace=${encodeURIComponent(workspace.id)}`
+          : `/workspaces/${workspace.id}`)}
       />
     </div>
   );
@@ -5599,68 +5610,8 @@ function looksLikeCodeDraftContent(content: string) {
 function detectArtifactFileCategory(
   doc: Pick<Document, "name" | "mime_type" | "file_type">,
 ): ArtifactFileCategory {
-  const fileType = String(doc.file_type || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^\./, "");
-  const persistedKind = fileType ? fileReferenceKind("", undefined, fileType) : "file";
-  const ext = persistedKind !== "file" ? fileType : (
-    (doc.name || "").split(".").pop()?.toLowerCase() || ""
-  );
-  const mime = persistedKind !== "file" ? "" : doc.mime_type || "";
-
-  if (fileReferenceKind(doc.name || "", doc.mime_type, doc.file_type) === "diagram") {
-    return "diagram";
-  }
-  if (["md", "markdown"].includes(ext)) return "markdown";
-  if (["html", "htm"].includes(ext) || mime === "text/html") return "html";
-  if (["json"].includes(ext) || mime === "application/json") return "json";
-  if (["csv"].includes(ext) || mime === "text/csv") return "csv";
-  if (["mmd", "mermaid", "drawio", "diagram"].includes(ext)) return "diagram";
-  if (persistedKind === "page") return "html";
-  if (persistedKind === "image") return "image";
-  if (persistedKind === "video") return "video";
-  if (persistedKind === "audio") return "audio";
-  if (persistedKind === "pdf") return "pdf";
-  if (
-    ["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"].includes(ext) ||
-    mime.startsWith("image/")
-  )
-    return "image";
-  if (
-    ["mp4", "webm", "mov", "avi", "mkv", "m4v"].includes(ext) ||
-    mime.startsWith("video/")
-  )
-    return "video";
-  if (
-    ["mp3", "wav", "ogg", "aac", "flac", "m4a"].includes(ext) ||
-    mime.startsWith("audio/")
-  )
-    return "audio";
-  if (ext === "pdf" || mime === "application/pdf") return "pdf";
-  if (
-    ["docx", "doc", "wps"].includes(ext) ||
-    mime ===
-      "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-  )
-    return "docx";
-  if (
-    ["xlsx", "xls", "et"].includes(ext) ||
-    mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  )
-    return "xlsx";
-  if (persistedKind === "code") return "code";
-  if (isCodeLikeFile(doc))
-    return "code";
-  if (
-    ["txt", "log", "env", "gitignore", "dockerignore", "editorconfig"].includes(
-      ext,
-    ) ||
-    mime.startsWith("text/")
-  )
-    return "text";
-
-  return "unsupported";
+  const kind = getFilePreviewKind(doc);
+  return kind === "pptx" ? "unsupported" : kind;
 }
 
 const EDITABLE_ARTIFACT_CATEGORIES = new Set<ArtifactFileCategory>([
@@ -6787,10 +6738,8 @@ function deriveOutputState(
 ): OutputState {
   const artifacts: OutputArtifact[] = [];
   const progress: ProgressItem[] = [];
-  const latestAssistant = [...messages]
-    .reverse()
-    .find((msg) => msg.role === "assistant");
-  const latestUser = [...messages].reverse().find((msg) => msg.role === "user");
+  const latestAssistant = latestMessageByRole(messages, "assistant");
+  const latestUser = latestMessageByRole(messages, "user");
 
   if (latestUser) {
     progress.push({
@@ -6907,25 +6856,27 @@ export function deriveMessageArtifacts(
   });
 
   msg.attachments?.forEach((attachment, attachmentIndex) => {
-    const documentId = String(attachment.document_id || "").trim();
-    const previewUrl = String(attachment.previewUrl || "").trim();
-    const openUrl = String(attachment.openUrl || "").trim();
-    const fsPath = String(attachment.fsPath || "").trim();
+    // Persisted rows carry the snake_case FileRef; older rows camelCase.
+    const ref = normalizeFileRef(attachment);
+    const documentId = ref.document_id || "";
+    const previewUrl = ref.preview_url || "";
+    const openUrl = ref.open_url || "";
+    const fsPath = ref.fs_path || "";
     const reference = generatedFileOpenReference({
       document_id: documentId,
       open_url: openUrl,
       result_url: previewUrl,
       fs_path: fsPath,
     });
-    const name = String(attachment.name || "").trim();
+    const name = ref.name;
     if (!name || !reference) return;
     artifacts.push({
       id: `message-attachment-${attachmentIndex}-${documentId || name}`,
       kind: artifactKindFromRecord({
         name,
-        file_type: attachment.fileType,
+        file_type: ref.file_type,
         type: attachment.type,
-        mime_type: attachment.mimeType,
+        mime_type: ref.mime,
       }, name),
       title: friendlyGeneratedAssetTitle(name),
       status: "done",
@@ -6937,8 +6888,8 @@ export function deriveMessageArtifacts(
         file_url: previewUrl || undefined,
         open_url: openUrl || undefined,
         fs_path: fsPath || undefined,
-        file_type: attachment.fileType || attachment.type,
-        mime_type: attachment.mimeType,
+        file_type: ref.file_type || attachment.type,
+        mime_type: ref.mime,
         name,
       },
     });
@@ -7289,7 +7240,8 @@ function canDownloadArtifact(artifact: OutputArtifact) {
   if (["approval", "task", "workspace"].includes(artifact.kind)) return false;
   const data = artifact.data || {};
   return Boolean(
-    artifactDocumentId(artifact) ||
+    artifact.blob || artifactDocumentId(artifact) ||
+      (data.room_id && data.room_file_id) ||
       artifact.href ||
       looksLikeFileReference(artifact.body) ||
       looksLikeFileReference(artifact.meta) ||
@@ -7361,6 +7313,20 @@ async function findDocumentForArtifact(
 }
 
 async function downloadArtifact(artifact: OutputArtifact) {
+  if (artifact.blob) {
+    const url = URL.createObjectURL(artifact.blob);
+    const filename = artifact.blob instanceof File ? artifact.blob.name : artifact.title;
+    triggerBrowserDownload(url, filename, () => URL.revokeObjectURL(url));
+    return;
+  }
+  if (artifact.data?.room_id && artifact.data?.room_file_id) {
+    const blob = await api.chatRooms.downloadFile(
+      String(artifact.data.room_id), String(artifact.data.room_file_id),
+    );
+    const url = URL.createObjectURL(blob);
+    triggerBrowserDownload(url, artifact.title, () => URL.revokeObjectURL(url));
+    return;
+  }
   const doc = await findDocumentForArtifact(artifact);
   if (doc) {
     const url = await api.documents.download(doc.id);
@@ -7416,20 +7382,16 @@ function withArtifactPreviewTimeout<T>(
   ms: number,
   message: string,
 ): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => {
-    if (timer) clearTimeout(timer);
-  });
+  return withFilePreviewTimeout(promise, ms, message);
 }
 
 function PresentationArtifactCanvas({
   url,
+  blob,
   title,
 }: {
-  url: string;
+  url?: string;
+  blob?: Blob;
   title: string;
 }) {
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -7531,11 +7493,7 @@ function PresentationArtifactCanvas({
       setRendering(false);
       activeSlideRef.current = 0;
       try {
-        const response = await fetch(url, {
-          signal: fetchAbortController.signal,
-        });
-        if (!response.ok) throw new Error("Presentation fetch failed");
-        const buffer = await response.arrayBuffer();
+        const buffer = await createFilePreviewSource({ blob, url }).getArrayBuffer(fetchAbortController.signal);
         if (cancelled || !canvasRef.current) return;
         const { PPTXViewer } = await import("pptxviewjs");
         if (cancelled || !canvasRef.current) return;
@@ -7597,7 +7555,7 @@ function PresentationArtifactCanvas({
       viewerRef.current = null;
       viewer?.destroy();
     };
-  }, [renderSlide, url]);
+  }, [renderSlide, url, blob]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -7620,7 +7578,7 @@ function PresentationArtifactCanvas({
     return (
       <div className="chat-output-file-missing">
         <p>{t("component.embedded_chat.presentation_content_is_not_available_yet")}</p>
-        <span>{title}</span>
+        <span>{error}</span>
       </div>
     );
   }
@@ -7668,20 +7626,31 @@ function PresentationArtifactCanvas({
   );
 }
 
+/** Show the client-side canvas as an interim view if the server is still rendering after this long. */
+const CHAT_PRESENTATION_INTERIM_DELAY_MS = 3000;
+
 function PresentationArtifactViewer({
   artifact,
 }: {
   artifact: OutputArtifact;
 }) {
-  const [slideUrls, setSlideUrls] = useState<string[]>([]);
+  const [slideUrls, setSlideUrls] = useState<Array<string | null>>([]);
+  const [failedSlides, setFailedSlides] = useState<ReadonlySet<number>>(() => new Set());
   const [canvasUrl, setCanvasUrl] = useState<string | null>(null);
+  const [canvasBlob, setCanvasBlob] = useState<Blob | null>(null);
   const [activeSlide, setActiveSlide] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const activeSlideRef = useRef(0);
+  activeSlideRef.current = activeSlide;
 
   useEffect(() => {
     let cancelled = false;
     const previewAbortController = new AbortController();
     let objectUrls: string[] = [];
+    let interimTimer: number | undefined;
+    let clientFallbackTask: Promise<void> | null = null;
+    let serverSlidesReady = false;
     const trackObjectUrl = (url: string) => {
       if (cancelled) URL.revokeObjectURL(url);
       else objectUrls.push(url);
@@ -7696,61 +7665,119 @@ function PresentationArtifactViewer({
       });
     };
 
+    // The client canvas is the interim view during a slow (cold) server
+    // render, and the fallback when server rendering fails outright.
+    function loadClientFallback(documentId: string): Promise<void> {
+      if (cancelled) return Promise.resolve();
+      clientFallbackTask ??= (async () => {
+        try {
+          const blob = await createFilePreviewSource({
+            fetchBinary: (signal) => api.documents.previewBlob(documentId, { signal }),
+          }).getBlob(previewAbortController.signal);
+          if (cancelled) return;
+          if (serverSlidesReady) {
+            // The server render won while the interim file was downloading.
+            return;
+          }
+          setCanvasBlob(blob);
+          setLoading(false);
+        } catch (cause) {
+          // The server render may still succeed; if it fails too, the final
+          // fallback must be able to try the download again.
+          clientFallbackTask = null;
+          if (!cancelled) setError(cause instanceof Error ? cause.message : "Presentation preview failed");
+        }
+      })();
+      return clientFallbackTask;
+    }
+
     async function loadPresentation() {
       setLoading(true);
       setSlideUrls([]);
       setCanvasUrl(null);
+      setCanvasBlob(null);
+      setError("");
+      setFailedSlides(new Set());
       setActiveSlide(0);
       try {
+        if (artifact.blob || (artifact.data?.room_id && artifact.data?.room_file_id)) {
+          const blob = await createFilePreviewSource({
+            blob: artifact.blob,
+            fetchBinary: (signal) => api.chatRooms.downloadFile(
+              String(artifact.data?.room_id), String(artifact.data?.room_file_id), { signal },
+            ),
+          }).getBlob(previewAbortController.signal);
+          if (!cancelled) setCanvasBlob(blob);
+          return;
+        }
         const doc = await findDocumentForArtifact(artifact);
-        if (!doc || cancelled) return;
+        if (!doc) {
+          if (artifact.href && !cancelled) {
+            setCanvasUrl(artifact.href);
+          } else if (!cancelled) {
+            setError("Presentation preview source is unavailable");
+          }
+          return;
+        }
+        if (cancelled) return;
 
+        interimTimer = window.setTimeout(() => {
+          void loadClientFallback(doc.id);
+        }, CHAT_PRESENTATION_INTERIM_DELAY_MS);
+        let urls: Array<string | null> = [];
+        let slidesShowing = false;
+        const listingUrls: string[] = [];
         try {
-          const slideData = await withArtifactPreviewTimeout(
-            api.documents.getSlides(doc.id),
-            8000,
-            "Presentation preview timed out",
-          );
           const token = getAuthToken();
           const headers: Record<string, string> = {};
           if (token) headers.Authorization = `Bearer ${token}`;
-          const slideResults = await Promise.allSettled(
-            (slideData.slides || []).map(async (slide) => {
-              const res = await withArtifactPreviewTimeout(
-                fetch(`/api/v1${slide.url}`, {
-                  headers,
-                  signal: previewAbortController.signal,
-                }),
-                8000,
-                "Presentation preview timed out",
-              );
-              if (!res.ok) throw new Error("Slide fetch failed");
-              const blob = await res.blob();
-              return trackObjectUrl(URL.createObjectURL(blob));
-            }),
-          );
-          const urls = slideResults.flatMap((result) =>
-            result.status === "fulfilled" ? [result.value] : [],
-          );
-          const failedSlide = slideResults.find(
-            (result) => result.status === "rejected",
-          );
-          if (failedSlide?.status === "rejected") {
-            revokeTrackedObjectUrls(urls);
-            throw failedSlide.reason;
-          }
-          if (urls.length === 0) throw new Error("No rendered slides");
-          if (!cancelled) setSlideUrls(urls);
-        } catch {
-          previewAbortController.abort();
-          revokeTrackedObjectUrls([...objectUrls]);
-          if (cancelled) return;
-          const url = trackObjectUrl(await api.documents.download(doc.id));
-          if (cancelled) return;
-          setCanvasUrl(url);
+          await loadServerSlidePreview({
+            docId: doc.id,
+            headers,
+            signal: previewAbortController.signal,
+            pickNext: slidePriorityPicker(() => activeSlideRef.current),
+            onSlideList: (slideData) => {
+              revokeTrackedObjectUrls(listingUrls.splice(0));
+              urls = Array<string | null>(slideData.slides.length).fill(null);
+              if (cancelled) return;
+              setFailedSlides(new Set());
+              if (slidesShowing) setSlideUrls([...urls]);
+            },
+            onSlideImage: (index, blob) => {
+              if (cancelled) return;
+              // Server slides are showing; the interim client download is no
+              // longer needed.
+              window.clearTimeout(interimTimer);
+              const url = trackObjectUrl(URL.createObjectURL(blob));
+              listingUrls.push(url);
+              urls[index] = url;
+              slidesShowing = true;
+              setSlideUrls([...urls]);
+              setLoading(false);
+            },
+            onSlideFailed: (index) => {
+              if (!cancelled) setFailedSlides((current) => new Set(current).add(index));
+            },
+          });
+          if (!urls.some(Boolean)) throw new Error("No rendered slides");
+          serverSlidesReady = true;
+          setCanvasBlob(null);
+          window.clearTimeout(interimTimer);
+          // Server slides replace the interim canvas; release its file.
+          if (!cancelled) setCanvasUrl(null);
+        } catch (error) {
+          window.clearTimeout(interimTimer);
+          if (cancelled || isAbortError(error)) return;
+          revokeTrackedObjectUrls(listingUrls.splice(0));
+          setSlideUrls([]);
+          setFailedSlides(new Set());
+          await loadClientFallback(doc.id);
         }
-      } catch {
-        if (!cancelled) setCanvasUrl(null);
+      } catch (cause: any) {
+        if (!cancelled) {
+          setCanvasUrl(null);
+          setError(cause?.message || "Presentation preview failed");
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -7760,11 +7787,14 @@ function PresentationArtifactViewer({
     return () => {
       cancelled = true;
       previewAbortController.abort();
+      window.clearTimeout(interimTimer);
       objectUrls.forEach((url) => URL.revokeObjectURL(url));
       objectUrls = [];
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     artifact.body,
+    artifact.blob,
     artifact.data,
     artifact.href,
     artifact.id,
@@ -7772,7 +7802,9 @@ function PresentationArtifactViewer({
     artifact.title,
   ]);
 
-  if (loading) {
+  const hasServerSlides = slideUrls.some(Boolean);
+
+  if (loading && !hasServerSlides && !canvasUrl) {
     return (
       <div className="chat-output-file-loading">
         <span className="chat-tool-spinner" />
@@ -7781,24 +7813,26 @@ function PresentationArtifactViewer({
     );
   }
 
-  if (slideUrls.length > 0) {
+  if (hasServerSlides) {
     return (
       <div className="chat-output-ppt-viewer">
         <div className="chat-output-ppt-stage">
-          <img
+          {slideUrls[activeSlide] ? <img
             src={slideUrls[activeSlide]}
             alt={`${artifact.title} slide ${activeSlide + 1}`}
-          />
+          /> : failedSlides.has(activeSlide)
+            ? <p role="status">{t("page.file_viewer.pptx_slide_render_failed")}</p>
+            : <span className="chat-tool-spinner" role="status" aria-label={t("component.embedded_chat.loading_presentation_preview")} />}
         </div>
         <div className="chat-output-ppt-strip">
           {slideUrls.map((url, index) => (
             <button
-              key={url}
+              key={index}
               className={index === activeSlide ? "active" : ""}
               onClick={() => setActiveSlide(index)}
               type="button"
             >
-              <img src={url} alt={`Slide ${index + 1}`} />
+              {url ? <img src={url} alt={`Slide ${index + 1}`} loading="lazy" decoding="async" /> : failedSlides.has(index) ? null : <span className="chat-tool-spinner" />}
               <span>{index + 1}</span>
             </button>
           ))}
@@ -7807,14 +7841,14 @@ function PresentationArtifactViewer({
     );
   }
 
-  if (canvasUrl) {
-    return <PresentationArtifactCanvas url={canvasUrl} title={artifact.title} />;
+  if (canvasUrl || canvasBlob) {
+    return <PresentationArtifactCanvas url={canvasUrl || undefined} blob={canvasBlob || undefined} title={artifact.title} />;
   }
 
   return (
     <div className="chat-output-file-missing">
       <p>{t("component.embedded_chat.presentation_content_is_not_available_yet")}</p>
-      <span>{artifact.body || artifact.title}</span>
+      <span>{error || artifact.body || artifact.title}</span>
     </div>
   );
 }
@@ -7833,24 +7867,15 @@ async function loadDocxFallbackRender(
   documentId: string,
   signal?: AbortSignal,
 ): Promise<ManorDocumentRender> {
-  const response = await api.documents.downloadResponse(documentId, { signal });
-  const blob = await response.blob();
-  const buf = await blob.arrayBuffer();
-  const rendered = await renderManorDocument(buf);
+  const buf = await createFilePreviewSource({
+    fetchBinary: (loadSignal) => api.documents.previewBlob(documentId, { signal: loadSignal }),
+  }).getArrayBuffer(signal);
+  const rendered = await withArtifactPreviewTimeout(renderManorDocument(buf), 30_000, "Word preview timed out. Please retry.");
   const sanitizeOptions = {
     allowDocxEditorAttributes: true,
     allowDocxLayoutStyles: true,
   };
-  return {
-    ...rendered,
-    html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
-    headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
-    footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
-    firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
-    firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
-    evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
-    evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
-  };
+  return sanitizeManorDocumentRender(rendered, sanitizeOptions);
 }
 
 function DocxFallbackArtifactViewer({
@@ -8105,6 +8130,7 @@ function DocumentPageArtifactViewer({
 function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
   const [category, setCategory] = useState<ArtifactFileCategory | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [previewBlob, setPreviewBlob] = useState<Blob | null>(null);
   const [content, setContent] = useState("");
   const [docxRender, setDocxRender] = useState<ManorDocumentRender | null>(null);
   const [docxPages, setDocxPages] = useState<ArtifactDocumentPage[]>([]);
@@ -8113,6 +8139,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
   const [activeSheet, setActiveSheet] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [retryVersion, setRetryVersion] = useState(0);
   const directUrl = artifact.href || artifact.body || "";
   const htmlPreview = useIsolatedHtmlPreview(
     content,
@@ -8129,6 +8156,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
       setLoading(true);
       setCategory(null);
       setObjectUrl(null);
+      setPreviewBlob(null);
       setContent("");
       setDocxRender(null);
       setDocxPages([]);
@@ -8139,9 +8167,23 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
       try {
         const doc = await findDocumentForArtifact(artifact);
         if (!doc) {
-          const fallbackCategory = artifact.kind === "diagram"
-            ? "diagram"
-            : inferArtifactKindFromPath(directUrl || artifact.title);
+          let fallbackCategory = artifact.kind === "diagram" ? "diagram" : detectArtifactFileCategory({
+            name: artifact.title || fileNameFromPath(directUrl),
+            mime_type: String(artifact.data?.mime_type || ""), file_type: String(artifact.data?.file_type || ""),
+          });
+          if (fallbackCategory === "unsupported") fallbackCategory = detectArtifactFileCategory({ name: fileNameFromPath(directUrl), mime_type: "", file_type: "" });
+          if (fallbackCategory === "unsupported" && ["pdf", "image", "video", "audio"].includes(artifact.kind)) fallbackCategory = artifact.kind as ArtifactFileCategory;
+          if (!cancelled) setCategory(fallbackCategory);
+          if (fallbackCategory === "unsupported") return;
+          const source = createFilePreviewSource({
+            blob: artifact.blob,
+            url: directUrl,
+            fetchBinary: artifact.data?.room_id && artifact.data?.room_file_id
+              ? (signal) => api.chatRooms.downloadFile(String(artifact.data!.room_id), String(artifact.data!.room_file_id), { signal })
+              : isLocalFsUrl(directUrl)
+                ? async (signal) => (await fetchProtectedFsResponse(directUrl, { signal })).blob()
+                : undefined,
+          });
           if (fallbackCategory === "diagram") {
             let diagramSourceLoaded = false;
             const fsPath = generatedFileFsPath(artifact.data)
@@ -8160,6 +8202,12 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               const rawContent = diagramPreviewTextFromFsRead(result);
               diagramSourceLoaded = true;
               if (!cancelled) setContent(rawContent);
+            } else if (artifact.blob || artifact.data?.room_file_id || directUrl) {
+              const blob = await source.getBlob(abortController.signal);
+              assertDiagramPreviewFileSize(blob.size);
+              const rawContent = await blob.text();
+              diagramSourceLoaded = true;
+              if (!cancelled) setContent(rawContent);
             }
             if (!diagramSourceLoaded) {
               throw new Error("Artifact preview source is unavailable");
@@ -8167,31 +8215,47 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             if (!cancelled) setCategory("diagram");
             return;
           }
-          if (isLocalFsUrl(directUrl)) {
-            const resolved = await resolveDisplayMediaUrl(directUrl);
-            if (cancelled) {
-              resolved.revoke();
-              return;
+          {
+            const blob = await source.getBlob(abortController.signal);
+            if (cancelled) return;
+            if (["text", "markdown", "code", "html", "csv", "json", "diagram"].includes(fallbackCategory)) {
+              const raw = await blob.text();
+              if (!cancelled) setContent(raw);
+            } else if (fallbackCategory === "xlsx") {
+              const buf = await blob.arrayBuffer();
+              const XLSX = await import("xlsx");
+              const wb = XLSX.read(buf, { type: "array", cellFormula: true, cellNF: true, cellStyles: true, cellText: true });
+              const parsed = await spreadsheetSheetsFromFile(XLSX, wb, buf);
+              if (!cancelled) setSheets(parsed.filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts"));
+            } else if (fallbackCategory === "docx") {
+              const buf = await blob.arrayBuffer();
+              const rendered = await withArtifactPreviewTimeout(renderManorDocument(buf), 30_000, "Word preview timed out. Please retry.");
+              if (!cancelled) setDocxRender(sanitizeManorDocumentRender(rendered, {
+                allowDocxEditorAttributes: true,
+                allowDocxLayoutStyles: true,
+              }));
+            } else if (fallbackCategory === "pdf") {
+              setPreviewBlob(blob);
+            } else if (["image", "video", "audio"].includes(fallbackCategory)) {
+              createdObjectUrl = URL.createObjectURL(filePreviewMediaBlob(blob, {
+                name: artifact.title, mime_type: String(artifact.data?.mime_type || ""),
+              }));
+              setObjectUrl(createdObjectUrl);
             }
-            createdObjectUrl = resolved.url;
-            setObjectUrl(resolved.url);
           }
-          if (!cancelled)
-            setCategory(
-              fallbackCategory === "presentation"
-                ? "unsupported"
-                : (fallbackCategory as ArtifactFileCategory),
-            );
           return;
         }
         if (cancelled) return;
 
         const nextCategory = detectArtifactFileCategory(doc);
         if (!cancelled) setCategory(nextCategory);
+        const source = createFilePreviewSource({
+          fetchBinary: (signal) => api.documents.previewBlob(doc.id, { signal }),
+        });
 
         if (nextCategory === "diagram") {
           assertDiagramPreviewFileSize(doc.file_size);
-          const response = await api.documents.downloadResponse(doc.id, {
+          const response = await api.documents.previewResponse(doc.id, {
             signal: abortController.signal,
           });
           const rawContent = await readDiagramPreviewText(response);
@@ -8209,8 +8273,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             "json",
           ].includes(nextCategory)
         ) {
-          const res = await api.documents.getContent(doc.id);
-          const rawContent = typeof res === "string" ? res : res.content;
+          const rawContent = await source.getText(abortController.signal);
           const previewContent = nextCategory === "html"
             ? await inlineHtmlPreviewStylesAndScripts(rawContent, doc.fs_path)
             : rawContent;
@@ -8225,7 +8288,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
           )
         ) {
           if (nextCategory === "xlsx") {
-            const blob = await api.documents.downloadBlob(doc.id);
+            const blob = await source.getBlob(abortController.signal);
             if (cancelled) return;
             const buf = await blob.arrayBuffer();
             if (cancelled) return;
@@ -8238,10 +8301,9 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               cellStyles: true,
               cellText: true,
             });
-            const chartsBySheet = await spreadsheetChartsFromFile(buf, XLSX, wb);
+            const parsed = await spreadsheetSheetsFromFile(XLSX, wb, buf);
             if (cancelled) return;
-            const parsedSheets = spreadsheetSheetsFromWorkbook(XLSX, wb)
-              .map((sheet) => ({ ...sheet, charts: chartsBySheet.get(sheet.name) || [] }))
+            const parsedSheets = parsed
               .filter((sheet) => !sheet.hidden && sheet.name !== "_manor_charts");
             setSheets(parsedSheets);
             return;
@@ -8249,9 +8311,10 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
 
           if (nextCategory === "docx") {
             try {
-              const pageData = await api.documents.getPages(
-                doc.id,
-                docxPageAbortController.signal,
+              const pageData = await withArtifactPreviewTimeout(
+                api.documents.getPages(doc.id, docxPageAbortController.signal),
+                30_000,
+                "Word page rendering timed out",
               );
               const pages = pageData.pages || [];
               if (pages.length === 0) throw new Error("No rendered Word pages");
@@ -8262,6 +8325,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               return;
             } catch {
               if (cancelled) return;
+              docxPageAbortController.abort();
             }
 
             const render = await loadDocxFallbackRender(
@@ -8272,13 +8336,13 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
             return;
           }
 
-          const downloadedUrl = await api.documents.download(doc.id);
-          if (cancelled) {
-            if (downloadedUrl.startsWith("blob:")) URL.revokeObjectURL(downloadedUrl);
-            return;
+          const blob = await source.getBlob(abortController.signal);
+          if (cancelled) return;
+          if (nextCategory === "pdf") setPreviewBlob(blob);
+          else {
+            createdObjectUrl = URL.createObjectURL(filePreviewMediaBlob(blob, doc));
+            setObjectUrl(createdObjectUrl);
           }
-          createdObjectUrl = downloadedUrl;
-          setObjectUrl(downloadedUrl);
         }
       } catch (err: any) {
         if (createdObjectUrl?.startsWith("blob:")) {
@@ -8300,12 +8364,14 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     };
   }, [
     artifact.body,
+    artifact.blob,
     artifact.data,
     artifact.href,
     artifact.id,
     artifact.kind,
     artifact.meta,
     artifact.title,
+    retryVersion,
   ]);
 
   if (loading) {
@@ -8319,21 +8385,23 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
 
   if (error) {
     return (
-      <div className="chat-output-file-missing">
+      <div className="chat-output-file-missing" role="alert">
         <p>{t("component.embedded_chat.file_preview_failed")}</p>
         <span>{error}</span>
+        <Button variant="outline" onClick={() => setRetryVersion((value) => value + 1)}>{t("component.workflow_run.action.retry")}</Button>
+        {canDownloadArtifact(artifact) && <Button variant="outline" onClick={() => void downloadArtifact(artifact).catch((cause) => setError(cause?.message || t("download.failed")))}>{t("page.file_viewer.download_file")}</Button>}
       </div>
     );
   }
 
   if (
     (category === "pdf" || artifact.kind === "pdf") &&
-    (objectUrl || artifact.href)
+    previewBlob
   ) {
     return (
-      <div className="chat-output-file-frame chat-output-file-frame--raw">
-        <iframe title={artifact.title} src={objectUrl || artifact.href} />
-      </div>
+      <Suspense fallback={<div className="chat-output-file-loading" role="status">{t("component.embedded_chat.loading_file_preview")}</div>}>
+        <LazyPdfJsViewer url="" blob={previewBlob} docName={artifact.title} canEdit={false} onDownload={() => void downloadArtifact(artifact).catch((cause) => setError(cause?.message || t("download.failed")))} />
+      </Suspense>
     );
   }
 
@@ -8347,7 +8415,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
         className={`chat-output-plain-media${isSlideImage ? " chat-output-plain-media--slide" : ""}`}
       >
         <div className="chat-output-plain-media-frame">
-          <img src={objectUrl || artifact.href} alt={artifact.title} />
+          <img src={objectUrl || artifact.href} alt={artifact.title} onError={() => setError(t("page.shared_doc.preview_unavailable"))} />
         </div>
       </div>
     );
@@ -8362,6 +8430,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
         className="chat-output-video"
         src={objectUrl || artifact.href}
         controls
+        onError={(event) => setError(event.currentTarget.error?.message || t("page.shared_doc.preview_unavailable"))}
       />
     );
   }
@@ -8375,6 +8444,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
         className="chat-output-audio"
         src={objectUrl || artifact.href}
         controls
+        onError={(event) => setError(event.currentTarget.error?.message || t("page.shared_doc.preview_unavailable"))}
       />
     );
   }
@@ -8390,7 +8460,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     );
   }
 
-  if (category === "markdown" && content) {
+  if (category === "markdown") {
     return (
       <div className="chat-output-artifact-body chat-output-artifact-body--document">
         <ChatMarkdown
@@ -8424,8 +8494,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
   if (
     (category === "text" ||
       category === "code" ||
-      category === "json") &&
-    content
+      category === "json")
   ) {
     return (
       <pre className="chat-output-code-block chat-output-code-block--light">
@@ -8436,7 +8505,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
     );
   }
 
-  if (category === "csv" && content) {
+  if (category === "csv") {
     const rows = parseDelimitedText(content).rows;
     return (
       <div className="chat-output-table-frame">
@@ -8492,6 +8561,7 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
           </div>
         )}
         <div className="chat-output-table-frame">
+          <div style={{ position: "relative", width: "max-content", minWidth: "100%" }}>
           <table style={{ width: "max-content", minWidth: "100%", tableLayout: "fixed" }}>
             <colgroup>
               <col style={{ width: 44 }} />
@@ -8524,14 +8594,10 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
                         colSpan={merge.columnSpan}
                         title={typeof raw === "string" && raw.startsWith("=") ? raw : undefined}
                         style={{
+                          ...(sheet.showGridlines === false ? { borderTop: "1px solid transparent", borderBottom: "1px solid transparent", borderLeft: "1px solid transparent", borderRight: "1px solid transparent" } : {}),
+                          ...spreadsheetCellVisualStyle(style),
                           color: style.color || "var(--text-default)",
                           background: style.fill || "var(--surface-panel)",
-                          fontWeight: style.bold ? 700 : 400,
-                          fontStyle: style.italic ? "italic" : "normal",
-                          fontFamily: style.fontFamily,
-                          fontSize: style.fontSize,
-                          textAlign: style.align,
-                          whiteSpace: "pre-wrap",
                           overflowWrap: "anywhere",
                         }}
                       >
@@ -8543,6 +8609,14 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
               ))}
             </tbody>
           </table>
+          <SpreadsheetImageLayer
+            images={sheet.images}
+            columnWidths={sheet.columnWidths}
+            rowHeights={sheet.rowHeights}
+            rowHeaderWidth={44}
+            columnHeaderHeight={35}
+          />
+          </div>
         </div>
         {sheet.charts.length > 0 && (
           <div style={{ marginTop: 12 }}>
@@ -8571,8 +8645,9 @@ function FileArtifactViewer({ artifact }: { artifact: OutputArtifact }) {
 
   return (
     <div className="chat-output-file-missing">
-      <p>{t("component.embedded_chat.file_preview_is_not_available_yet")}</p>
+      <p>{t(canDownloadArtifact(artifact) ? "page.shared_doc.preview_unsupported_downloadable" : "page.shared_doc.preview_unsupported")}</p>
       <span>{fileNameFromPath(directUrl) || artifact.title}</span>
+      {canDownloadArtifact(artifact) && <Button variant="outline" onClick={() => void downloadArtifact(artifact).catch((cause) => setError(cause?.message || t("download.failed")))}>{t("page.file_viewer.download_file")}</Button>}
     </div>
   );
 }
@@ -8646,7 +8721,7 @@ export function ArtifactViewer({
   const task = artifact.kind === "task" ? artifact.data || {} : null;
   const htmlSource = artifact.kind === "page" ? artifact.body || "" : "";
   const isFileBackedArtifact =
-    [
+    Boolean(artifact.blob || artifact.data?.room_file_id) || [
       "document",
       "pdf",
       "spreadsheet",
@@ -8794,6 +8869,7 @@ export function ArtifactViewer({
       )}
 
       {artifact.href &&
+        !artifact.data?.room_file_id &&
         !isFileBackedArtifact &&
         artifact.kind !== "image" &&
         artifact.kind !== "video" && (
@@ -8919,18 +8995,16 @@ export function ArtifactSummaryCards({
             <button
               className="chat-artifact-summary-open"
               onClick={() => onOpen(artifact)}
+              title={artifact.title}
+              aria-label={`${t("component.embedded_chat.open_artifact")}: ${artifact.title}`}
               type="button"
             >
               <ArtifactThumb artifact={artifact} />
               <span className="chat-artifact-summary-text">
                 <strong>{artifact.title}</strong>
-                <small>
-                  {isGenerating ||
-                  artifact.kind === "approval" ||
-                  artifact.kind === "task"
-                    ? statusLabel(artifact.status)
-                    : t("component.embedded_chat.open_artifact")}
-                </small>
+                {(artifact.status !== "done" || artifact.kind === "approval" || artifact.kind === "task") && (
+                  <small>{statusLabel(artifact.status)}</small>
+                )}
               </span>
             </button>
             {isGenerating && (
@@ -8973,7 +9047,9 @@ export default function EmbeddedChat({
   onNewConversation,
   showWorkspaceIntro = false,
 }: EmbeddedChatProps) {
+  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const queryClient = useQueryClient();
+  const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const location = useLocation();
   const navigate = useNavigate();
@@ -8986,7 +9062,6 @@ export default function EmbeddedChat({
   const currentUserAvatar = currentUser?.avatar_url;
   const isAgentConversation = Boolean(agentId && !isMasterAgent(agentId));
 
-  const [input, setInput] = useState("");
   const [composerSeed, setComposerSeed] = useState<{
     key: string;
     attachments: AttachedItem[];
@@ -9028,27 +9103,20 @@ export default function EmbeddedChat({
     getDefaultChatModePayload("auto"),
   );
 
-  const { data: workspaceUsers = [] } = useQuery({
-    queryKey: ["chat-mention-users"],
-    queryFn: () => api.users.directory(),
-  });
+  const { data: workspaceUsers = [] } = useQuery(chatMentionUsersQueryOptions(catalogScope));
   const { data: allAgents = [] } = useQuery({
-    queryKey: ["chat-mention-agents"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
-  const { data: globalFlowEntrypoints = [] } = useQuery({
-    queryKey: ["global-chat-flow-entrypoints"],
-    queryFn: () => api.chat.listFlowEntrypoints(),
-  });
+  const { data: globalFlowEntrypoints = [] } = useQuery(chatFlowEntrypointsQueryOptions(catalogScope));
   const workflowInvokeOptions = useMemo<WorkflowInvokeItem[]>(
     () =>
       globalFlowEntrypoints.map((entrypoint: GlobalChatFlowEntrypoint) => ({
         bindingId: entrypoint.binding_id,
         workflowId: entrypoint.workflow_id,
         title: entrypoint.title,
-        description: [entrypoint.workspace_name, entrypoint.description]
-          .filter(Boolean)
-          .join(" · "),
+        description: entrypoint.description,
+        workspace_id: entrypoint.workspace_id,
+        workspace_name: entrypoint.workspace_name,
         placeholder: entrypoint.placeholder,
       })),
     [globalFlowEntrypoints],
@@ -9077,6 +9145,15 @@ export default function EmbeddedChat({
   const [currentConvId, setCurrentConvId] = useState<string | undefined>(
     initialPropConvId || initialSession?.convId,
   );
+  const draftConversationId = initialPropConvId || (isNewManorConversationId(conversationId)
+    ? conversationId
+    : currentConvId || conversationId);
+  const composerDraftKey = chatComposerDraftKey(
+    currentUser?.entity_id, currentUser?.id, draftConversationId,
+  );
+  const composerDraftKeyRef = useRef(composerDraftKey);
+  composerDraftKeyRef.current = composerDraftKey;
+  const [input, setInput] = useChatComposerDraft(composerDraftKey);
   const [draftSessionKey, setDraftSessionKey] = useState<string | undefined>(
     initialSession && !initialSession.convId ? initialSession.key : undefined,
   );
@@ -9124,7 +9201,27 @@ export default function EmbeddedChat({
   const streamingConvId = currentSession?.convId;
   const runtimeQueueStatus = currentSession?.runtimeQueue
     ? formatRuntimeQueueStatus(currentSession.runtimeQueue)
-    : null;
+    : currentSession?.runtimeStatus === "queued"
+      ? t("component.chat_runtime_queue.waiting")
+      : undefined;
+  const runtimeHumanInput =
+    currentSession?.runtimeHumanInput && !currentSession.runtimeHumanInput.answered
+      ? currentSession.runtimeHumanInput
+      : undefined;
+  const [runtimeInputBusy, setRuntimeInputBusy] = useState(false);
+  const submitRuntimeHumanInput = useCallback(
+    async (answer: string, fields?: Record<string, string>, choice?: string) => {
+      const sessionKey = currentSessionKeyRef.current;
+      if (!sessionKey) return;
+      setRuntimeInputBusy(true);
+      try {
+        await answerRuntimeHumanInput(sessionKey, answer, fields, choice);
+      } finally {
+        setRuntimeInputBusy(false);
+      }
+    },
+    [],
+  );
   const {
     hydrateConversation: hydrateMessageFeedback,
     submit: submitMessageFeedback,
@@ -9139,6 +9236,11 @@ export default function EmbeddedChat({
     Record<string, { hasMore: boolean; nextCursor: string | null }>
   >({});
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const olderPageRequestRef = useRef<symbol | null>(null);
+  useLayoutEffect(() => {
+    setLoadingOlderMessages(false);
+    return () => { olderPageRequestRef.current = null; };
+  }, [currentSessionKey]);
   const [conversationLoading, setConversationLoading] = useState(shouldLoadInitialConversation);
   const setSessionMessages = useChatStreamStore((s) => s.setSessionMessages);
   const createDraftSession = useChatStreamStore((s) => s.createDraftSession);
@@ -9154,18 +9256,6 @@ export default function EmbeddedChat({
     currentSessionKeyRef.current = currentSessionKey;
   }, [currentSessionKey]);
   const showConversationSkeleton = conversationLoading && messages.length === 0;
-  const didInitialScrollRef = useRef(false);
-  const suppressNextAutoScrollRef = useRef(false);
-  const streamScrollFrameRef = useRef<number | null>(null);
-  const lastStreamScrollAtRef = useRef(0);
-  useEffect(() => {
-    didInitialScrollRef.current = false;
-    lastStreamScrollAtRef.current = 0;
-    if (streamScrollFrameRef.current != null) {
-      window.cancelAnimationFrame(streamScrollFrameRef.current);
-      streamScrollFrameRef.current = null;
-    }
-  }, [currentSessionKey]);
   const setMessages = useCallback(
     (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
       const key = currentSessionKeyRef.current;
@@ -9200,6 +9290,10 @@ export default function EmbeddedChat({
   const visibleWorkflowMessages = useMemo(
     () => visibleWorkflowMessageEntries.map(({ message }) => message),
     [visibleWorkflowMessageEntries],
+  );
+  const priorUserMessages = useMemo(
+    () => priorMatchingEntries(messages, hasVisibleUserContent),
+    [messages],
   );
   const workflowMessageResolveMutation = useMutation({
     mutationFn: ({
@@ -9288,18 +9382,24 @@ export default function EmbeddedChat({
   const mentionOptions = useMemo<MentionOption[]>(() => {
     const agentMap = new Map<string, AgentInfo>();
     (allAgents as Agent[]).forEach((agent) => {
+      if (agent.status !== "active") return;
       agentMap.set(agent.id, {
+        ...agent,
         id: agent.id,
         name: agent.name,
         avatar_url: agent.avatar_url,
       });
     });
-    (agents || []).forEach((agent) => agentMap.set(agent.id, agent));
+    (agents || []).forEach((agent) => agentMap.set(agent.id, { ...agentMap.get(agent.id), ...agent }));
     const agentOptions = Array.from(agentMap.values()).map((agent) => ({
       id: agent.id,
       type: "agent" as const,
       name: agent.name,
-      subtitle: t("component.embedded_chat.assign_this_message_to_an_agent"),
+      entity_id: agent.entity_id,
+      workspace_id: agent.workspace_id,
+      workspace_name: agent.workspace_name,
+      visibility: agent.visibility,
+      subtitle: agent.description || t("component.embedded_chat.assign_this_message_to_an_agent"),
       avatarUrl: agent.avatar_url,
     }));
     const userOptions = (workspaceUsers as UserSummary[]).map((user) => {
@@ -9357,7 +9457,7 @@ export default function EmbeddedChat({
     setMentionedAgent((prev) =>
       prev && !nextValue.includes(`@${prev.name}`) ? null : prev,
     );
-  }, []);
+  }, [setInput]);
 
   useEffect(() => {
     const handleInsertChatPrompt = (event: Event) => {
@@ -9381,7 +9481,7 @@ export default function EmbeddedChat({
         INSERT_CHAT_COMPOSER_EVENT,
         handleInsertChatPrompt as EventListener,
       );
-  }, []);
+  }, [setInput]);
 
   const handleMentionRemove = useCallback((mention: MentionOption) => {
     setSelectedMentions((prev) =>
@@ -9400,7 +9500,7 @@ export default function EmbeddedChat({
       WORKSPACE_CAPABILITIES[0],
     [activeCapability],
   );
-  const requestChatMode = chatMode === "auto" ? undefined : chatMode;
+  const requestChatMode = isSimple || chatMode === "auto" ? undefined : chatMode;
 
   const handleChatModeChange = useCallback((mode: ChatBoxMode) => {
     setIdeaComposer(null);
@@ -9437,6 +9537,7 @@ export default function EmbeddedChat({
     sample: WorkspaceSample | ChatModeTemplateSample,
     templateAttachment?: AttachedItem,
   ) => {
+    if (composerDraftKeyRef.current !== composerDraftKey) return;
     setIdeaComposer(null);
     const remixPrompt = buildTemplateRemixPrompt(
       sample,
@@ -9459,7 +9560,7 @@ export default function EmbeddedChat({
       }));
     }
     window.setTimeout(() => composerEditorRef.current?.focus(), 0);
-  }, []);
+  }, [composerDraftKey, setInput]);
 
   const handleChatModeTemplateSelect = useCallback(
     async (sample: ChatModeTemplateSample): Promise<void> => {
@@ -9495,11 +9596,12 @@ export default function EmbeddedChat({
   );
 
   // Resolved agent ID for stream calls (DM prop takes priority over @mention selection)
-  const resolvedAgentId = agentId || mentionedAgent?.id || selectedAgent?.id;
+  const resolvedAgentId = agentId || (isSimple ? undefined : mentionedAgent?.id || selectedAgent?.id);
 
-  const chatBodyRef = useRef<HTMLDivElement>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const { autoFollowRef, handleAutoFollowScroll } = useChatAutoFollow();
+  const {
+    chatBodyRef, chatContentRef, pauseAutoFollow, resumeAutoFollow,
+    scrollToPosition, scrollToMessage, preserveHistoryAnchor,
+  } = useChatAutoFollow(currentSessionKey);
   const resumedRef = useRef(false);
   const selectedArtifactReturnTo = useMemo(() => {
     const base = `${location.pathname}${location.search}`;
@@ -9518,13 +9620,11 @@ export default function EmbeddedChat({
     if (!location.hash.startsWith("#chat-message-")) return undefined;
     const anchor = decodeURIComponent(location.hash.slice(1));
     const timer = window.setTimeout(() => {
-      document.getElementById(anchor)?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      });
+      const target = document.getElementById(anchor);
+      if (target) scrollToMessage(target);
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [location.hash, messages.length]);
+  }, [location.hash, messages.length, scrollToMessage]);
 
   const chatScrollRailMarkers = useMemo<ChatScrollRailMarker[]>(
     () => {
@@ -9658,9 +9758,16 @@ export default function EmbeddedChat({
         messageId?: string;
       } = {},
     ) => {
+      const historyStreamFence = captureChatHistoryStreamFence(convId);
       const staleForCurrentView = () =>
         options.onlyIfStillCurrent && currentSessionKeyRef.current !== convId;
       if (shouldIgnoreLocallyStoppedStreamUpdate(convId, options.messageId)) {
+        return;
+      }
+      if (
+        !options.allowSettledStreamRefresh
+        && !chatHistoryStreamFenceIsCurrent(historyStreamFence)
+      ) {
         return;
       }
       if (!options.backgroundRefresh) setConversationLoading(true);
@@ -9674,11 +9781,13 @@ export default function EmbeddedChat({
         const targetTransportStreaming = Boolean(
           targetSessionKey && streamState.sessions[targetSessionKey]?.streaming,
         );
+        if (!chatHistoryStreamFenceIsCurrent(historyStreamFence)) return;
         if (targetTransportStreaming && !options.allowSettledStreamRefresh) return;
         if (staleForCurrentView()) return;
         if (shouldIgnoreLocallyStoppedStreamUpdate(convId, options.messageId)) return;
         const mappedMessages = mapMessages(page.items || []);
         setSessionMessages(convId, mappedMessages);
+        void recoverRuntimeChatSession(convId, mappedMessages).catch(() => {});
         setMessageHistoryState((prev) => ({
           ...prev,
           [convId]: {
@@ -9698,6 +9807,9 @@ export default function EmbeddedChat({
           );
           if (fallbackConvId && fallbackConvId !== convId) {
             try {
+              const fallbackHistoryStreamFence = captureChatHistoryStreamFence(
+                fallbackConvId,
+              );
               const page = await api.chat.getMessagesPage(fallbackConvId, {
                 silent: true,
                 limit: CHAT_MESSAGE_PAGE_SIZE,
@@ -9708,10 +9820,12 @@ export default function EmbeddedChat({
               const targetTransportStreaming = Boolean(
                 targetSessionKey && streamState.sessions[targetSessionKey]?.streaming,
               );
+              if (!chatHistoryStreamFenceIsCurrent(fallbackHistoryStreamFence)) return;
               if (targetTransportStreaming && !options.allowSettledStreamRefresh) return;
               if (staleForCurrentView()) return;
               const mappedMessages = mapMessages(page.items || []);
               setSessionMessages(fallbackConvId, mappedMessages);
+              void recoverRuntimeChatSession(fallbackConvId, mappedMessages).catch(() => {});
               setMessageHistoryState((prev) => ({
                 ...prev,
                 [fallbackConvId]: {
@@ -9932,13 +10046,14 @@ export default function EmbeddedChat({
       !currentHistoryState?.hasMore ||
       !currentHistoryState.nextCursor ||
       loadingOlderMessages ||
+      olderPageRequestRef.current ||
       streamingRef.current
     ) {
       return;
     }
-    const container = chatBodyRef.current;
-    const previousHeight = container?.scrollHeight || 0;
-    const previousTop = container?.scrollTop || 0;
+    pauseAutoFollow();
+    const request = Symbol();
+    olderPageRequestRef.current = request;
     setLoadingOlderMessages(true);
     try {
       const page = await api.chat.getMessagesPage(currentConvId, {
@@ -9946,8 +10061,9 @@ export default function EmbeddedChat({
         limit: CHAT_MESSAGE_PAGE_SIZE,
         before: currentHistoryState.nextCursor,
       });
+      if (olderPageRequestRef.current !== request) return;
       const olderMessages = mapMessages(page.items || []);
-      suppressNextAutoScrollRef.current = true;
+      preserveHistoryAnchor();
       setSessionMessages(currentConvId, (prev) =>
         mergeOlderMessages(olderMessages, prev),
       );
@@ -9958,24 +10074,21 @@ export default function EmbeddedChat({
           nextCursor: page.next_cursor || null,
         },
       }));
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => {
-          const nextContainer = chatBodyRef.current;
-          if (!nextContainer) return;
-          const heightDelta = nextContainer.scrollHeight - previousHeight;
-          nextContainer.scrollTop = previousTop + heightDelta;
-        });
-      });
     } catch {
       // Existing request() handling surfaces API errors; keep the chat usable.
     } finally {
-      setLoadingOlderMessages(false);
+      if (olderPageRequestRef.current === request) {
+        olderPageRequestRef.current = null;
+        setLoadingOlderMessages(false);
+      }
     }
   }, [
     currentConvId,
     currentHistoryState?.hasMore,
     currentHistoryState?.nextCursor,
     loadingOlderMessages,
+    pauseAutoFollow,
+    preserveHistoryAnchor,
     mapMessages,
     mergeOlderMessages,
     setSessionMessages,
@@ -10092,46 +10205,6 @@ export default function EmbeddedChat({
     };
   }, [conversationId, currentConvId, loadConversationMessages]);
 
-  /* Auto-scroll: land at the latest message immediately, then avoid smooth-scroll churn while streaming. */
-  useLayoutEffect(() => {
-    if (messages.length === 0) return;
-    const scrollToBottom = () => {
-      messagesEndRef.current?.scrollIntoView({
-        behavior: "auto",
-        block: "end",
-      });
-    };
-
-    if (suppressNextAutoScrollRef.current) {
-      suppressNextAutoScrollRef.current = false;
-      return;
-    }
-
-    if (!didInitialScrollRef.current) {
-      didInitialScrollRef.current = true;
-      scrollToBottom();
-      return;
-    }
-
-    // Respect the user's scroll position: only follow new content while they
-    // are at the bottom (they resume following by scrolling back down).
-    if (!autoFollowRef.current) return;
-
-    if (!assistantWorking) {
-      scrollToBottom();
-      return;
-    }
-
-    const now = Date.now();
-    if (now - lastStreamScrollAtRef.current < 240) return;
-    lastStreamScrollAtRef.current = now;
-    if (streamScrollFrameRef.current != null) return;
-    streamScrollFrameRef.current = window.requestAnimationFrame(() => {
-      streamScrollFrameRef.current = null;
-      scrollToBottom();
-    });
-  }, [messages, assistantWorking, autoFollowRef]);
-
   /* ---- Send message (SSE streaming) ---- */
   const handleSend = useCallback(
     async (
@@ -10161,12 +10234,12 @@ export default function EmbeddedChat({
        * server, not a hint.
        */
       const armedIdeaSkill =
-        !isResponseSurfaceSubmission && messages.length === 0 && ideaComposer?.origin === "user"
+        !isSimple && !isResponseSurfaceSubmission && messages.length === 0 && ideaComposer?.origin === "user"
           ? IDEA_BUILT_IN_SKILLS[ideaComposer.mode]
           : undefined;
-      const selectedWorkflow = isResponseSurfaceSubmission ? null : options.workflow || null;
+      const selectedWorkflow = isSimple || isResponseSurfaceSubmission ? null : options.workflow || null;
       const effectiveManualSkills =
-        !isResponseSurfaceSubmission && !selectedWorkflow && manualSkills.length > 0
+        !isSimple && !isResponseSurfaceSubmission && !selectedWorkflow && manualSkills.length > 0
           ? manualSkills
           : !selectedWorkflow && armedIdeaSkill
             ? [armedIdeaSkill]
@@ -10178,11 +10251,9 @@ export default function EmbeddedChat({
       let manualSkillRefs = requestedManualSkillRefs;
       if (requestedManualSkillRefs?.some((reference) => reference.kind === "slug")) {
         try {
-          const availableSkills = await queryClient.fetchQuery({
-            queryKey: ["skills", "chat-manual-skill-resolution", "platform"],
-            queryFn: () => api.skills.list({ include_platform: true }),
-            staleTime: 60_000,
-          });
+          const availableSkills = await queryClient.fetchQuery(
+            skillListQueryOptions(catalogScope, { include_platform: true }),
+          );
           manualSkillRefs = resolveManualSkillReferenceIds(
             requestedManualSkillRefs,
             availableSkills,
@@ -10196,6 +10267,10 @@ export default function EmbeddedChat({
           return false;
         }
       }
+      if (composerDraftKeyRef.current !== composerDraftKey) {
+        releaseSendPreflight();
+        return false;
+      }
       const text = stripWorkflowInvokeToken(
         stripManualSkillTokens(rawText, manualSkills),
         selectedWorkflow,
@@ -10208,6 +10283,30 @@ export default function EmbeddedChat({
       ) {
         releaseSendPreflight();
         return false;
+      }
+      // The run is parked on a request_input question: the next message IS
+      // the answer. It resumes the same run instead of starting a new turn.
+      const parkedSessionKey = currentSessionKeyRef.current;
+      const parkedSession = parkedSessionKey
+        ? useChatStreamStore.getState().sessions[parkedSessionKey]
+        : undefined;
+      if (parkedSession?.runtimeHumanInput && !parkedSession.runtimeHumanInput.answered && text) {
+        try {
+          setRuntimeInputBusy(true);
+          await answerRuntimeHumanInput(parkedSessionKey as string, text);
+          // The composer only clears through its parent (see ChatInputFooter).
+          handleComposerChange("");
+          return true;
+        } catch (error) {
+          toast.error(
+            t("lib.api.chat_failed"),
+            error instanceof Error ? error.message : undefined,
+          );
+          return false;
+        } finally {
+          setRuntimeInputBusy(false);
+          releaseSendPreflight();
+        }
       }
       let sessionKey = currentSessionKeyRef.current;
       if (!sessionKey) {
@@ -10224,10 +10323,10 @@ export default function EmbeddedChat({
       }
 
       // Sending is an explicit jump back to the newest message.
-      autoFollowRef.current = true;
+      resumeAutoFollow();
 
       const now = new Date().toISOString();
-      const mentionsSnapshot = selectedMentions.filter((mention) =>
+      const mentionsSnapshot = isSimple ? [] : selectedMentions.filter((mention) =>
         rawText.includes(`@${mention.name}`),
       );
       const peopleMentions = mentionsSnapshot.filter(
@@ -10249,13 +10348,6 @@ export default function EmbeddedChat({
         (selectedWorkflow
           ? workflowInvokeMessage(selectedWorkflow)
           : "Use the manually selected skill with the current conversation context.");
-      if (!isResponseSurfaceSubmission) {
-        setInput("");
-        setSelectedMentions([]);
-        setMentionedAgent(null);
-        setIdeaComposer(null);
-      }
-
       const displayContent = [
         text,
         selectedWorkflow ? `[${t("nav.flows")}: ${selectedWorkflow.title}]` : "",
@@ -10293,8 +10385,6 @@ export default function EmbeddedChat({
         manualSkillRefs,
         responseSurfaceSubmission: options.responseSurfaceSubmission,
       };
-      if (retryRequest) savePendingChatRetry(retryRequest);
-
       let attachmentSnapshots: Awaited<
         ReturnType<typeof createChatMessageAttachmentSnapshot>
       >[];
@@ -10304,7 +10394,15 @@ export default function EmbeddedChat({
         );
       } catch (error) {
         releaseSendPreflight();
-        throw error;
+        toast.error(t("lib.api.chat_failed"), t("component.chat_input_footer.file_prepare_failed"));
+        return false;
+      }
+      if (retryRequest) savePendingChatRetry(retryRequest);
+      if (!isResponseSurfaceSubmission) {
+        setInput("");
+        setSelectedMentions([]);
+        setMentionedAgent(null);
+        setIdeaComposer(null);
       }
 
       const msgsBeforeSend = [
@@ -10396,6 +10494,7 @@ export default function EmbeddedChat({
           };
         },
       );
+      await invalidateAgentInitiativeQueries(queryClient);
       if (!sendSucceeded) {
         return options.responseSurfaceSubmission ? responseSurfaceResult : false;
       }
@@ -10425,7 +10524,12 @@ export default function EmbeddedChat({
     },
     [
       selectedMentions,
+      composerDraftKey,
+      resumeAutoFollow,
+      setInput,
+      isSimple,
       currentConvId,
+      catalogScope,
       queryClient,
       resolvedAgentId,
       messages,
@@ -10546,6 +10650,9 @@ export default function EmbeddedChat({
   /* ---- HITL actions ---- */
   const handleHITLAction = useCallback(
     async (hitlId: string, action: string, review?: unknown) => {
+      const targetHitl = messages.flatMap((message) => message.hitl_requests || [])
+        .find((hitl) => hitl.id === hitlId);
+      const requiresTikTokValidation = Boolean(targetHitl && isTikTokPublishApproval(targetHitl));
       const markResolved = (items: ChatMessage[]) =>
         items.map((msg) => ({
           ...msg,
@@ -10553,7 +10660,7 @@ export default function EmbeddedChat({
             h.id === hitlId ? { ...h, resolved: true, resolution: action } : h,
           ),
         }));
-      const updatedMessages = markResolved(messages);
+      const updatedMessages = requiresTikTokValidation ? messages : markResolved(messages);
       setMessages(updatedMessages);
 
       const hitlMessage = JSON.stringify({
@@ -10566,7 +10673,9 @@ export default function EmbeddedChat({
         ...updatedMessages,
         {
           role: "user" as const,
-          content: hitlActionTranscriptText(action),
+          content: requiresTikTokValidation && action === "approve"
+            ? "Submitted TikTok publishing confirmation."
+            : hitlActionTranscriptText(action),
           timestamp: now,
         },
         { role: "assistant" as const, content: "", timestamp: now },
@@ -10593,7 +10702,14 @@ export default function EmbeddedChat({
           }
         },
         sessionKey,
-      );
+      ).finally(async () => {
+        if (requiresTikTokValidation && currentConvId) {
+          await loadConversationMessages(currentConvId, {
+            allowSettledStreamRefresh: true, backgroundRefresh: true, onlyIfStillCurrent: true,
+          });
+        }
+      });
+      await invalidateAgentInitiativeQueries(queryClient);
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
     [
@@ -10605,6 +10721,7 @@ export default function EmbeddedChat({
       createDraftSession,
       setMessages,
       onConversationResolved,
+      loadConversationMessages,
     ],
   );
 
@@ -10668,7 +10785,9 @@ export default function EmbeddedChat({
             retryRequest.message,
             retryRequest.conversationId || currentConvId,
             {
+              files: fallbackUserMessage?.attachments?.flatMap((attachment) => attachment.file instanceof File ? [attachment.file] : []),
               documentIds: retryRequest.documentIds,
+              localWorkerId: retryRequest.localWorkerId,
               agentId: retryRequest.agentId || resolvedAgentId,
               workspaceId: retryRequest.workspaceId,
               chatMode: retryRequest.chatMode,
@@ -10822,9 +10941,9 @@ export default function EmbeddedChat({
             )}
           </div>
         </div>
-        {(showWorkspaceIntro || onNewConversation) && (
+        {(currentConvId || streamingConvId || showWorkspaceIntro || onNewConversation) && (
           <div className="embedded-chat-header-actions">
-            {showWorkspaceIntro && <WorkspaceIntroDialog />}
+            {!isSimple && showWorkspaceIntro && <WorkspaceIntroDialog />}
             {onNewConversation && (
               <Button
                 variant="ghost"
@@ -10836,12 +10955,16 @@ export default function EmbeddedChat({
                 <IconPlus size={22} />
               </Button>
             )}
+            {!isSimple && <ConversationInitiativesButton
+              conversationId={currentConvId || streamingConvId}
+              fallbackTitle={title}
+            />}
           </div>
         )}
       </div>
 
       {/* ---- Agent Chip Selector (for operations) ---- */}
-      {agents && agents.length > 0 && (
+      {!isSimple && agents && agents.length > 0 && (
         <div className="embedded-agents-row">
           <span
             className={`agent-chip ${!selectedAgent ? "agent-chip--selected" : ""}`}
@@ -10908,14 +11031,20 @@ export default function EmbeddedChat({
           <div className="embedded-chat-body-wrap">
             <div
               ref={chatBodyRef}
-              onScroll={handleAutoFollowScroll}
+              tabIndex={0}
               className={`embedded-chat-body ${
                 messages.length === 0 ? "embedded-chat-body--empty" : ""
               }`}
             >
+              <div ref={chatContentRef} className="chat-scroll-content">
               {showConversationSkeleton ? (
                 <ChatMessagesSkeleton rows={5} />
-              ) : messages.length === 0 && (
+              ) : messages.length === 0 && (isSimple ? (
+                <div className="workspace-welcome">
+                  <h1>{t("component.chat_input_footer.simple_placeholder")}</h1>
+                  <p>{t("component.floating_chat.ask_anything_attach_files_or_use_voice_input")}</p>
+                </div>
+              ) : (
                 <WorkspaceWelcome
                   activeCapability={activeCapability}
                   activeIdeaMode={ideaComposerMode}
@@ -10931,7 +11060,7 @@ export default function EmbeddedChat({
                   onIdeaModeChange={handleIdeaModeChange}
                   onValidationStart={handleValidationStart}
                 />
-              )}
+              ))}
 
               {messages.length > 0 && currentHistoryState?.hasMore && (
                 <div className="chat-history-load-more">
@@ -10950,10 +11079,13 @@ export default function EmbeddedChat({
             {!showConversationSkeleton && visibleWorkflowMessageEntries.map(({ message: msg, index: i }) => {
               const content = toDisplayText(msg.content) || "";
               const visibleTools = visibleToolCallsForApprovalMessage(msg);
+              const isLatestStreaming = assistantWorking && i === messages.length - 1;
+              const messageQueueStatus = msg.role === "assistant" && isLatestStreaming && !runtimeHumanInput
+                ? runtimeQueueStatus : undefined;
               const hasAssistantBlocks =
                 msg.role === "assistant" &&
-                Array.isArray(msg.assistant_blocks) &&
-                msg.assistant_blocks.length > 0;
+                (Boolean(messageQueueStatus) || (Boolean(content) && visibleTools.length === 0 && !isRetryableAssistantMessage(msg, content) && !isApprovalBoilerplateContent(msg)) || (isLatestStreaming && !runtimeHumanInput && visibleTools.length === 0) || (Array.isArray(msg.assistant_blocks) &&
+                msg.assistant_blocks.length > 0));
               const localCodingNotice =
                 msg.role === "assistant"
                   ? maybeLocalCodingRunNoticeForTools(visibleTools)
@@ -10964,10 +11096,9 @@ export default function EmbeddedChat({
                 msg.role === "assistant"
                   ? displayContentForAssistantMessage(msg, rawBubbleContent)
                   : rawBubbleContent;
-              const isLatestStreaming = assistantWorking && i === messages.length - 1;
               const renderedBubbleDisplay = parseUserMessageDisplay(
-                { ...msg, content: bubbleContent },
-                { streaming: isLatestStreaming },
+                msg,
+                { content: bubbleContent, streaming: isLatestStreaming },
               );
               const renderedBubbleContent = renderedBubbleDisplay.cleanContent;
               const messageDisplay = localCodingNotice
@@ -10986,7 +11117,7 @@ export default function EmbeddedChat({
                 assistantMessageRendersInlineFileSurfaces(msg, isLatestStreaming);
               const actionCopyText = msg.role === "user"
                 ? content
-                : chatMessageActionText(msg, rawBubbleContent);
+                : chatMessageActionText(msg, rawBubbleContent, isLatestStreaming);
               const showMessageActions = Boolean(
                 !suppressApprovalBubble &&
                   !showCreditLimitNotice &&
@@ -10994,9 +11125,7 @@ export default function EmbeddedChat({
               );
               const hasRetryTarget =
                 Boolean(msg.retryRequest) ||
-                messages
-                  .slice(0, i)
-                  .some(hasVisibleUserContent);
+                priorUserMessages[i];
               const canRetryMessage =
                 canRetryFromContent && hasRetryTarget;
               const messageAnchorId = chatMessageAnchorId(msg.id, i);
@@ -11053,23 +11182,17 @@ export default function EmbeddedChat({
 
                     {/* Tool Calls */}
                     {!hasAssistantBlocks && visibleTools.length > 0 && (
-                      <ToolCallList tools={visibleTools} keyPrefix={i} />
+                      <ToolCallList tools={visibleTools} keyPrefix={i} hideDetails={isSimple} streaming={isLatestStreaming} />
                     )}
 
                     {isLatestStreaming &&
                       msg.role === "assistant" &&
-                      runtimeQueueStatus && (
-                        <div
-                          className="chat-runtime-queue-status"
-                          role="status"
-                          aria-live="polite"
-                        >
-                          <span
-                            className="chat-runtime-queue-status-dot"
-                            aria-hidden="true"
-                          />
-                          <span>{runtimeQueueStatus}</span>
-                        </div>
+                      runtimeHumanInput && (
+                        <RuntimeHumanInputCard
+                          input={runtimeHumanInput}
+                          onSubmit={submitRuntimeHumanInput}
+                          busy={runtimeInputBusy}
+                        />
                       )}
 
                     {msg.role === "assistant" &&
@@ -11086,6 +11209,9 @@ export default function EmbeddedChat({
                       msg.sub_agent_events.length > 0 && (
                         <div className="chat-sub-agents">
                           {msg.sub_agent_events.map((ev, j) => (
+                            isSimple ? (
+                              <ChatMarkdown key={j} content={ev.content || ""} isUser={false} returnTo={messageReturnTo} />
+                            ) : (
                             <div key={j} className="chat-sub-agent-card">
                               <div className="flex items-center gap-3 mb-3">
                                 <div className="chat-sub-agent-avatar">
@@ -11159,7 +11285,7 @@ export default function EmbeddedChat({
                                 )}
                               </div>
                             </div>
-                          ))}
+                          )))}
                         </div>
                       )}
 
@@ -11261,17 +11387,20 @@ export default function EmbeddedChat({
 
                     {/* Message Bubble */}
                     {hasAssistantBlocks &&
-                      !canRetryFromContent &&
                       renderAssistantBubble && (
-                      <div className="chat-bubble chat-bubble--bot">
+                      <MessageBubble role="other" className="chat-bubble chat-bubble--bot">
                         <AssistantMessageBlocks
                           blocks={msg.assistant_blocks}
                           content={renderedBubbleContent}
                           keyPrefix={i}
                           streaming={assistantWorking && i === messages.length - 1}
+                          hideProcess={isSimple}
+                          queueStatus={messageQueueStatus}
                           returnTo={messageReturnTo}
                           onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                           sourceMessageId={msg.id || ""}
+                          pendingActionKind={assistantPendingActionKindForMessage(msg)}
+                          hitlRequests={msg.hitl_requests}
                           responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                         />
                         {createdResources.map((resource) => (
@@ -11292,10 +11421,10 @@ export default function EmbeddedChat({
                           inlineFileCards
                           returnTo={messageReturnTo}
                         />
-                      </div>
+                      </MessageBubble>
                     )}
 
-                    {(!hasAssistantBlocks || canRetryFromContent) &&
+                    {!hasAssistantBlocks &&
                       (bubbleContent ||
                         createdResources.length > 0 ||
                         Boolean(msg.workflow_result) ||
@@ -11303,7 +11432,8 @@ export default function EmbeddedChat({
                         // file card is the message's only visible trace.
                         (msg.attachments?.length ?? 0) > 0) &&
                       renderAssistantBubble && (
-                        <div
+                        <MessageBubble
+                          role={msg.role === "user" ? "user" : "other"}
                           className={`chat-bubble ${msg.role === "user" ? "chat-bubble--user" : "chat-bubble--bot"}`}
                         >
                           {msg.role === "user" ? (
@@ -11351,7 +11481,7 @@ export default function EmbeddedChat({
                             !runtimeQueueStatus && (
                               <span className="chat-streaming-cursor" />
                             )}
-                        </div>
+                        </MessageBubble>
                       )}
 
                     {/* Compact first-token activity. Tool-only turns already render
@@ -11363,15 +11493,15 @@ export default function EmbeddedChat({
                       i === messages.length - 1 &&
                       msg.role === "assistant" &&
                       !runtimeQueueStatus && (
-                        <div className="chat-bubble chat-bubble--bot chat-bubble--activity">
+                        <MessageBubble role="other" className="chat-bubble chat-bubble--bot chat-bubble--activity">
                           <AgentActivityOrb
                             activity={inferAgentActivity(msg)}
                             className="agent-activity-orb--message"
                           />
-                        </div>
+                        </MessageBubble>
                       )}
 
-                    {workspaceRecommendation &&
+                    {!isSimple && workspaceRecommendation &&
                       workspaceRecommendationPreferencesReady &&
                       !workspaceRecommendationsSuppressed &&
                       !dismissedWorkspaceRecommendations.has(workspaceRecommendationKey) && (
@@ -11391,6 +11521,7 @@ export default function EmbeddedChat({
                           onAdd={() => void handleWorkspaceRecommendationAdd(
                             workspaceRecommendation,
                             workspaceRecommendationKey,
+                            content,
                           )}
                           onContinue={() => dismissWorkspaceRecommendation(
                             workspaceRecommendationKey,
@@ -11462,11 +11593,12 @@ export default function EmbeddedChat({
               );
             })}
 
-              <div ref={messagesEndRef} />
+              </div>
             </div>
             <ChatScrollRail
               containerRef={chatBodyRef}
               markers={chatScrollRailMarkers}
+              onNavigate={scrollToPosition}
             />
           </div>
 
@@ -11483,9 +11615,9 @@ export default function EmbeddedChat({
             variant={outputOpen ? "embedded-output-open" : "embedded"}
           />
 
-          <div className="chat-tip-bar">
+          {!isSimple && <div className="chat-tip-bar">
             <InlineTips surface="general_chat" placement="composer" />
-          </div>
+          </div>}
 
           <WorkflowRunHost
             conversationId={currentConvId || streamingConvId}
@@ -11499,6 +11631,7 @@ export default function EmbeddedChat({
           />
 
           <ChatInputFooter
+            attachments="documents"
             voiceScope={{ conversationId: currentConvId || streamingConvId, agentId: resolvedAgentId }}
             onVoiceConversation={(id) => {
               setCurrentConvId(id);
@@ -11508,7 +11641,7 @@ export default function EmbeddedChat({
             }}
             value={input}
             onChange={handleComposerChange}
-            streaming={assistantWorking}
+            streaming={assistantWorking && !runtimeHumanInput}
             onSend={(text, attachments, manualSkills, context) => {
               void handleSend(text, attachments, manualSkills, { sendContext: context });
             }}
@@ -11517,7 +11650,7 @@ export default function EmbeddedChat({
             }}
             onStop={handleStopRequest}
             topSlot={
-              messages.length > 0 ? (
+              !isSimple && messages.length > 0 ? (
                 <ChatModeTemplateGallery
                   mode={chatMode}
                   disabled={assistantWorking || Boolean(remixingChatModeSampleTitle)}
@@ -11535,8 +11668,9 @@ export default function EmbeddedChat({
                   ? t("component.embedded_chat.idea_generation.placeholder")
                 : messages.length === 0
                 ? activeCapabilityConfig.placeholder
-                : `Message ${title}... @ mention, # attach, / skill, % flow`
+                : t("component.chat_input_footer.message_agent_placeholder", { agent: title })
             }
+            approvalSlot={<ApprovalModeTrigger scope={{ kind: "personal" }} />}
             modeSlot={
               <ChatModeToolbar
                 mode={chatMode}

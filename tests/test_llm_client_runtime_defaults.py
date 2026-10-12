@@ -16,11 +16,27 @@ def test_llm_client_defaults_are_safe_for_user_facing_chat() -> None:
     assert llm_client._DEFAULT_TOOL_CALL_MAX_TOKENS <= 16384
 
 
-def test_gpt56_chat_completion_tools_disable_reasoning() -> None:
+def test_worker_stream_idle_timeout_is_longer_than_chat(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    monkeypatch.delenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("LLM_STREAM_IDLE_TIMEOUT", raising=False)
+    monkeypatch.setenv("MANOR_SERVICE_ROLE", "chat")
+    assert llm_client.get_llm_stream_idle_timeout() == llm_client.DEFAULT_LLM_STREAM_IDLE_TIMEOUT
+
+    monkeypatch.setenv("MANOR_SERVICE_ROLE", "worker-heavy")
+    assert llm_client.get_llm_stream_idle_timeout() == llm_client.DEFAULT_WORKER_LLM_STREAM_IDLE_TIMEOUT
+    assert llm_client.get_llm_stream_idle_timeout() >= 120
+
+    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "12")
+    assert llm_client.get_llm_stream_idle_timeout() == 12.0
+
+
+def test_model_chat_completion_compatibility_defaults() -> None:
     from packages.core.ai import llm_client
 
     payload: dict = {}
-    llm_client._apply_chat_completion_tool_compatibility(
+    llm_client._apply_chat_completion_compatibility(
         payload,
         model="openai/gpt-5.6-sol",
         tools=[{"type": "function"}],
@@ -28,7 +44,7 @@ def test_gpt56_chat_completion_tools_disable_reasoning() -> None:
     assert payload["reasoning_effort"] == "none"
 
     text_only_payload: dict = {}
-    llm_client._apply_chat_completion_tool_compatibility(
+    llm_client._apply_chat_completion_compatibility(
         text_only_payload,
         model="openai/gpt-5.6-sol",
         tools=[],
@@ -36,12 +52,21 @@ def test_gpt56_chat_completion_tools_disable_reasoning() -> None:
     assert "reasoning_effort" not in text_only_payload
 
     older_model_payload: dict = {}
-    llm_client._apply_chat_completion_tool_compatibility(
+    llm_client._apply_chat_completion_compatibility(
         older_model_payload,
         model="openai/gpt-5.5",
         tools=[{"type": "function"}],
     )
     assert "reasoning_effort" not in older_model_payload
+
+    astra_payload = {"temperature": 0.7, "reasoning_effort": "none"}
+    llm_client._apply_chat_completion_compatibility(
+        astra_payload,
+        model="openai/gpt-6-astra",
+        tools=[{"type": "function"}],
+    )
+    assert "temperature" not in astra_payload
+    assert astra_payload["reasoning_effort"] == "low"
 
 
 @pytest.mark.asyncio
@@ -219,6 +244,65 @@ async def test_llm_stream_iterator_fails_fast_when_provider_stalls(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_llm_stream_iterator_ignores_transport_heartbeats(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    class HeartbeatOnlyResponse:
+        async def aiter_lines(self):
+            for _ in range(20):
+                await asyncio.sleep(0.003)
+                yield ": keep-alive"
+                yield ""
+
+    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
+            HeartbeatOnlyResponse()
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_iterator_ignores_data_heartbeats(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    class HeartbeatOnlyResponse:
+        async def aiter_lines(self):
+            for index in range(20):
+                await asyncio.sleep(0.003)
+                event_type = "ping" if index % 2 == 0 else "heartbeat"
+                yield f'data: {{"type": "{event_type}"}}'
+
+    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
+            HeartbeatOnlyResponse()
+        ):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_llm_stream_iterator_ignores_empty_openai_delta_chunks(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    class EmptyDeltaResponse:
+        async def aiter_lines(self):
+            for _ in range(20):
+                await asyncio.sleep(0.003)
+                yield 'data: {"choices":[{"delta":{}}]}'
+
+    monkeypatch.setenv("LLM_STREAM_IDLE_TIMEOUT_SECONDS", "0.01")
+
+    with pytest.raises(TimeoutError, match="stalled"):
+        async for _line in llm_client._iter_stream_lines_with_idle_timeout(
+            EmptyDeltaResponse()
+        ):
+            pass
+
+
+@pytest.mark.asyncio
 async def test_llm_post_retries_cloudflare_524(monkeypatch) -> None:
     from packages.core.ai import llm_client
 
@@ -251,6 +335,163 @@ async def test_llm_post_retries_cloudflare_524(monkeypatch) -> None:
     assert response.status_code == 200
     assert len(calls) == 2
     assert sleeps == [llm_client._BASE_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_llm_post_ignores_retry_after_on_cloudflare_524(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    class FakeClient:
+        async def post(self, url, **_kwargs):
+            calls.append(url)
+            request = httpx.Request("POST", url)
+            if len(calls) == 1:
+                return httpx.Response(
+                    524,
+                    headers={"Retry-After": "120"},
+                    text="<html>A timeout occurred</html>",
+                    request=request,
+                )
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    async def fake_sleep(delay: float):
+        sleeps.append(delay)
+
+    async def fake_get_llm_client():
+        return FakeClient()
+
+    monkeypatch.setattr(llm_client, "get_llm_client", fake_get_llm_client)
+    monkeypatch.setattr(llm_client.asyncio, "sleep", fake_sleep)
+
+    response = await llm_client._post_with_retry(
+        "https://apitokengate.com/v1/chat/completions",
+        headers={"Authorization": "Bearer sk-test"},
+        payload={"model": "gpt-5.5", "messages": []},
+    )
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+    assert sleeps == [llm_client._BASE_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_llm_post_retries_cloudflare_524_only_once(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    calls: list[str] = []
+    sleeps: list[float] = []
+
+    class FakeClient:
+        async def post(self, url, **_kwargs):
+            calls.append(url)
+            request = httpx.Request("POST", url)
+            return httpx.Response(
+                524,
+                headers={"Retry-After": "120"},
+                text="<html>A timeout occurred</html>",
+                request=request,
+            )
+
+    async def fake_sleep(delay: float):
+        sleeps.append(delay)
+
+    async def fake_get_llm_client():
+        return FakeClient()
+
+    monkeypatch.setattr(llm_client, "get_llm_client", fake_get_llm_client)
+    monkeypatch.setattr(llm_client.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await llm_client._post_with_retry(
+            "https://apitokengate.com/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-test"},
+            payload={"model": "gpt-5.5", "messages": []},
+        )
+
+    assert exc_info.value.response.status_code == 524
+    assert len(calls) == 2
+    assert sleeps == [llm_client._BASE_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_skips_buffered_fallback_after_stream_provider_error(monkeypatch) -> None:
+    from packages.core.ai import llm_client
+
+    buffered_calls: list[str] = []
+    error_chunk = {
+        "error": {
+            "message": "Service temporarily unavailable. The model's availability is currently degraded.",
+        }
+    }
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield f"data: {json.dumps(error_chunk)}"
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeResponse()
+
+        async def __aexit__(self, *_exc):
+            return None
+
+    class FakeClient:
+        def stream(self, *_args, **_kwargs):
+            return FakeStream()
+
+        async def post(self, *_args, **_kwargs):
+            raise AssertionError("buffered POST must not run after a stream provider error")
+
+    async def fake_resolve_llm_routing_for_model(*_args, **_kwargs):
+        return SimpleNamespace(
+            api_key="sk-test-key-1234567890",
+            base_url="https://apitokengate.com/v1",
+            provider="openai",
+            source="byok",
+        )
+
+    async def fake_preflight_credit_check():
+        return None
+
+    async def fake_get_llm_client():
+        return FakeClient()
+
+    async def fake_buffered(*_args, **_kwargs):
+        buffered_calls.append("buffered")
+        raise AssertionError("buffered fallback must not run after a stream provider error")
+
+    async def fake_official_retry(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        llm_client,
+        "resolve_llm_routing_for_model",
+        fake_resolve_llm_routing_for_model,
+    )
+    monkeypatch.setattr(llm_client, "_preflight_credit_check", fake_preflight_credit_check)
+    monkeypatch.setattr(llm_client, "get_llm_client", fake_get_llm_client)
+    monkeypatch.setattr(llm_client, "_post_chat_with_reasoning_retry", fake_buffered)
+    monkeypatch.setattr(llm_client, "_retry_manor_official_call_via_openrouter", fake_official_retry)
+    monkeypatch.setattr(llm_client, "_record_llm_call", lambda **_kwargs: None)
+
+    async def fake_stream_handler(_event_name: str, _payload: dict):
+        return None
+
+    content, usage = await llm_client.chat_completion(
+        [{"role": "user", "content": "hello"}],
+        model="grok-4.6",
+        stream_handler=fake_stream_handler,
+    )
+
+    assert content == ""
+    assert buffered_calls == []
+    assert usage.get("error")
 
 
 @pytest.mark.asyncio
@@ -509,7 +750,11 @@ async def test_openai_tool_stream_emits_text_delta_when_chunk_also_contains_tool
         }
     ]
     assert usage["total"] == 15
-    assert events == [("text_delta", {"content": "我先生成简历页面。"})]
+    assert [event for event in events if event[0] == "text_delta"] == [
+        ("text_delta", {"content": "我先生成简历页面。"}),
+    ]
+    # The tool call being written is announced as a display-only draft.
+    assert [payload["name"] for kind, payload in events if kind == "tool_call_draft"] == ["generate_file"]
 
 
 @pytest.mark.asyncio

@@ -42,8 +42,34 @@ def test_sandbox_runner_rejects_unapproved_network_override(monkeypatch):
     runner = SkillRunner()
 
     assert runner._resolve_config().network == "manor-sandbox"
-    with pytest.raises(SecurityError, match="Docker network 'host' is not allowed"):
-        runner._resolve_config(ContainerConfig(network="host"))
+    assert runner._resolve_config(ContainerConfig(network="none")).network == "none"
+    for network in ("host", "bridge", "unapproved-network"):
+        with pytest.raises(SecurityError, match=f"Docker network '{network}' is not allowed"):
+            runner._resolve_config(ContainerConfig(network=network))
+
+
+def test_networkless_override_is_always_allowed_on_a_dedicated_bridge_runner(monkeypatch):
+    """External runners allow only their dedicated bridge (install.sh enforces
+    that), yet the bash tool, workflow code nodes, and video_edit ask for
+    ``network="none"``. Staging rejected every such call ("Docker network 'none'
+    is not allowed; expected one of ['manor-sandbox']"). No network is strictly
+    more isolated than any allowed bridge, so it never needs allowlisting."""
+
+    import sandbox.skill_runner as skill_runner_module
+
+    monkeypatch.setattr(skill_runner_module.app_config, "SANDBOX_NETWORK", "manor-sandbox")
+    monkeypatch.setattr(
+        skill_runner_module.app_config,
+        "SANDBOX_ALLOWED_NETWORKS",
+        ["manor-sandbox"],
+        raising=False,
+    )
+    runner = SkillRunner()
+
+    assert runner._resolve_config(ContainerConfig(network="none")).network == "none"
+    for widened in ("bridge", "host"):
+        with pytest.raises(SecurityError, match=f"Docker network '{widened}' is not allowed"):
+            runner._resolve_config(ContainerConfig(network=widened))
 
 
 class FakeRedis:

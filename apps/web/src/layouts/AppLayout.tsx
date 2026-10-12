@@ -4,32 +4,45 @@ import {
   useCallback,
   useRef,
   useMemo,
+  lazy,
+  Suspense,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import { Link, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useAuthStore } from "../stores/auth";
-import { usePageViewTracking, useWebSocket } from "../lib/websocket";
+import { useDisplayPreferences } from "../stores/displayPreferences";
+import { usePageViewTracking, useWebSocket, type ChatRoomChangeEvent } from "../lib/websocket";
 import { useConfigStore } from "../stores/config";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import {
   t,
   getLocale,
-  setLocale,
   SUPPORTED_LOCALES,
   type Locale,
 } from "../lib/i18n";
-import { api } from "../lib/api";
+import { ApiError, api } from "../lib/api";
+import { useAfterStartup } from "../lib/useAfterStartup";
+import { installAutoHideScrollbars } from "../lib/autoHideScrollbars";
+import { scheduleQueryInvalidation } from "../lib/coalescedInvalidation";
+import { PEOPLE_HOME_PATH } from "../lib/peopleNavigation";
+import { agentListQueryOptions, catalogScope as catalogScopeForToken, useCatalogScope } from "../lib/catalogQueries";
+import { getAuthToken } from "../lib/authToken";
+import { createTaskUpdateInvalidationBatcher, type TaskUpdateInvalidationBatcher } from "../lib/taskUpdateInvalidation";
+import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
+import { CATALOG_REVALIDATE_EVENT } from "../components/CatalogCacheBoundary";
 import type { Workspace, Agent, Conversation } from "../lib/types";
-import EmbeddedChat from "../components/EmbeddedChat";
+import type { ChatRoom } from "../lib/chatRoomTypes";
 import FloatingChat from "../components/FloatingChat";
 import TextSelectionToolbar from "../components/TextSelectionToolbar";
-import WorkspaceChat from "../components/WorkspaceChat";
-import AgentEditModal from "../components/AgentEditModal";
 import SupportPanel, {
   useSupportUnreadCount,
 } from "../components/SupportPanel";
 import UserAvatar from "../components/ui/UserAvatar";
+import GroupChatAvatar from "../components/ui/GroupChatAvatar";
+import FeatureDiscoveryHint, { FeatureDiscoveryBadge } from "../components/ui/FeatureDiscoveryHint";
+import useFeatureDiscovery from "../components/useFeatureDiscovery";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import WorkspaceIconTile from "../components/ui/WorkspaceIcon";
 import HoverMarqueeText from "../components/ui/HoverMarqueeText";
@@ -37,25 +50,133 @@ import AgentActivityOrb, {
   inferAgentActivity,
   type AgentActivity,
 } from "../components/ui/AgentActivityOrb";
-import { IconMoreHorizontal } from "../components/icons";
+import { IconChevronRight, IconMoreHorizontal } from "../components/icons";
 import Button from "../components/ui/Button";
+import EmptyState from "../components/ui/EmptyState";
+import WorkspaceAttentionBadge from "../components/WorkspaceAttentionBadge";
 import ConfirmDialog from "../components/ui/ConfirmDialog";
 import Dropdown from "../components/ui/Dropdown";
 import Input from "../components/ui/Input";
 import { InlineRowsSkeleton } from "../components/ui/Skeleton";
 import { PageHeaderBoundary } from "../components/ui/PageHeader";
 import { useWorkspaceFilter } from "../stores/workspace";
-import OnboardingTour, { isTourSuppressedPath } from "../components/OnboardingTour";
+import { useAgentEditModalStore } from "../stores/agentEditModal";
+import OnboardingTour, { isTourSuppressedPath, MAIN_TOUR_STORAGE_KEY } from "../components/OnboardingTour";
+import { FEATURE_DISCOVERIES } from "../lib/featureDiscovery";
 import { getAgentDescription } from "../lib/localizedContent";
 import { parseAppLayoutChatTarget } from "./appLayoutChatQuery";
 import { relativeTime } from "../lib/format";
 import { isChatRunActive } from "../lib/chatStream";
+import { latestMessageByRole } from "../lib/chatHistoryScan";
 import { useChatStreamStore } from "../stores/chatStream";
+import {
+  compactSidebarWorkspaces,
+  orderSidebarWorkspaces,
+  WORKSPACE_SIDEBAR_LIMIT,
+} from "../lib/workspaceChatSidebar";
+import { useSidebarReorder } from "../lib/useSidebarReorder";
 
 type AppMode = "workspace" | "chat";
+type ChatSidebarSection = "ai" | "workspaces" | "group" | "dm";
+type DirectSidebarItem = { id: string; kind: "room"; room: ChatRoom } | { id: string; kind: "agent"; agent: Agent };
+const CHAT_SIDEBAR_SECTIONS_KEY = "manor-chat-sidebar-sections";
+const DEFAULT_CHAT_SIDEBAR_SECTIONS: Record<ChatSidebarSection, boolean> = {
+  ai: true,
+  workspaces: false,
+  group: true,
+  dm: true,
+};
+
+function ChatSidebarSectionHeader({
+  id,
+  label,
+  expanded,
+  onToggle,
+  badge,
+  action,
+  searching,
+  attentionCount = 0,
+}: {
+  id: string;
+  label: string;
+  expanded: boolean;
+  onToggle: () => void;
+  badge?: ReactNode;
+  action: ReactNode;
+  searching: boolean;
+  attentionCount?: number;
+}) {
+  return (
+    <div className="conv-section-label conv-section-label--with-action" data-tour={id}>
+      <button
+        type="button"
+        className="conv-section-toggle"
+        aria-expanded={expanded}
+        aria-controls={expanded ? id : undefined}
+        onClick={onToggle}
+        disabled={searching}
+      >
+        <IconChevronRight size={12} className={expanded ? "conv-section-chevron conv-section-chevron--open" : "conv-section-chevron"} />
+        <span>{label}</span>
+        {!expanded && attentionCount > 0 && (
+          <span className="conv-section-attention">{attentionCount > 99 ? "99+" : attentionCount}</span>
+        )}
+      </button>
+      {badge}
+      {action}
+    </div>
+  );
+}
+
+const WorkspaceDraftChat = lazy(() => import("../pages/WorkspaceDraftChat"));
+const EmbeddedChat = lazy(() => import("../components/EmbeddedChat"));
+const loadWorkspaceChat = () => import("../components/WorkspaceChat");
+const WorkspaceChat = lazy(loadWorkspaceChat);
+const AgentEditModal = lazy(() => import("../components/AgentEditModal"));
+const InterfaceModeDialog = lazy(() => import("../components/UserGuide"));
+const ChatRoomNewConversation = lazy(() =>
+  import("../components/ChatRooms").then((module) => ({
+    default: module.ChatRoomNewConversation,
+  })),
+);
+const ChatRoomConversation = lazy(() =>
+  import("../components/ChatRooms").then((module) => ({
+    default: module.ChatRoomConversation,
+  })),
+);
+const ChatInviteAcceptance = lazy(() =>
+  import("../components/ChatRooms").then((module) => ({
+    default: module.ChatInviteAcceptance,
+  })),
+);
+
+function ChatSurfaceLoading() {
+  return (
+    <div className="flex flex-1 min-h-0 p-4" aria-busy="true">
+      <InlineRowsSkeleton rows={3} dense />
+    </div>
+  );
+}
 
 const EMPTY_WORKSPACES: Workspace[] = [];
 const EMPTY_CONVERSATIONS: Conversation[] = [];
+const EMPTY_AGENTS: Agent[] = [];
+
+function isPersonalAgentConversation(conversation: Conversation, userId?: string): boolean {
+  return Boolean(
+    userId
+    && conversation.agent_id
+    && conversation.user_id === userId
+    && !conversation.workspace_id
+    && conversation.channel.toLowerCase() === "web",
+  );
+}
+
+function groupChatSummary(room: ChatRoom): string {
+  const members = getLocale() === "zh" ? `${room.member_count} 位成员` : `${room.member_count} ${room.member_count === 1 ? "member" : "members"}`;
+  if (room.member_count < 2 || !room.online_user_ids) return members;
+  return `${members} · ${room.online_user_ids.length} ${getLocale() === "zh" ? "人在线" : "online"}`;
+}
 
 function positiveStat(value: unknown) {
   const count = Number(value || 0);
@@ -74,6 +195,7 @@ function workspaceLegacyActionCount(ws: Pick<Workspace, "stats">) {
 
 function workspaceChatActionCount(ws: Pick<Workspace, "stats">) {
   const stats = ws.stats || {};
+  if (stats.unseen_actions !== undefined && stats.unseen_actions !== null) return positiveStat(stats.unseen_actions);
   const hasVisibleChatStats = [
     stats.chat_pending_actions,
     stats.proposal_actions,
@@ -109,6 +231,7 @@ function formatAgentCount(count: number) {
 
 function workspaceStatusLabel(status?: string | null) {
   if (status === "active") return t("component.status.active");
+  if (status === "paused") return t("component.status.paused");
   return status || t("page.app_layout.workspace");
 }
 
@@ -219,21 +342,6 @@ const IconGoal = () => (
   </svg>
 );
 
-const IconChatBubble = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth={1.8}
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" />
-  </svg>
-);
-
 const IconPlus = () => (
   <svg
     width="14"
@@ -249,6 +357,91 @@ const IconPlus = () => (
   </svg>
 );
 
+function WorkspaceAddAction({
+  cloud,
+  ready,
+  className,
+  style,
+  tourId,
+  onCreate,
+  onMarketplace,
+}: {
+  cloud: boolean;
+  ready: boolean;
+  className: string;
+  style?: CSSProperties;
+  tourId?: string;
+  onCreate: () => void;
+  onMarketplace: () => void;
+}) {
+  const label = t(ready && !cloud ? "page.workspaces.create_workspace" : "page.workspaces.add_workspace");
+  const trigger = (
+    <button
+      type="button"
+      disabled={!ready}
+      className={className}
+      style={style}
+      data-tour={tourId}
+      aria-label={label}
+      title={label}
+      onClick={cloud ? undefined : onCreate}
+    >
+      <IconPlus />
+    </button>
+  );
+
+  if (!cloud) return trigger;
+  return (
+    <Dropdown
+      align="right"
+      constrainTo=".app-shell-sidebar"
+      menuStyle={{ border: "none" }}
+      trigger={trigger}
+      items={[
+        { key: "marketplace", label: t("page.workspaces.choose_from_marketplace"), icon: <IconGrid4 /> },
+        { key: "create", label: t("page.workspaces.create_your_own"), icon: <IconPlus /> },
+      ]}
+      onSelect={(key) => {
+        if (key === "marketplace") onMarketplace();
+        if (key === "create") onCreate();
+      }}
+    />
+  );
+}
+
+function SidebarRowMenu({
+  name,
+  items,
+  onSelect,
+}: {
+  name: string;
+  items: { key: string; label: string; danger?: boolean }[];
+  onSelect: (key: string) => void;
+}) {
+  return (
+    <Dropdown
+      align="right"
+      constrainTo=".app-shell-sidebar"
+      menuStyle={{ border: "none" }}
+      trigger={
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="conv-row-more sidebar-row-more"
+          style={{ padding: 0, justifyContent: "center" }}
+          title={`${t("action.more")}: ${name}`}
+          ariaLabel={`${t("action.more")}: ${name}`}
+        >
+          <IconMoreHorizontal size={18} />
+        </Button>
+      }
+      items={items}
+      onSelect={onSelect}
+    />
+  );
+}
+
 const IconBuilding = () => (
   <svg
     width="16"
@@ -262,26 +455,6 @@ const IconBuilding = () => (
   >
     <path d="M3 21h18M5 21V7l8-4v18M19 21V11l-6-4" />
     <path d="M9 9v.01M9 12v.01M9 15v.01M9 18v.01" />
-  </svg>
-);
-
-const IconWorkspaceGraph = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth={1.8}
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <circle cx="12" cy="12" r="3.5" />
-    <circle cx="5" cy="6" r="2.5" />
-    <circle cx="19" cy="6" r="2.5" />
-    <circle cx="6" cy="19" r="2.5" />
-    <circle cx="18" cy="18" r="2.5" />
-    <path d="M7.1 7.7l2.7 2.1M16.9 7.7l-2.7 2.1M8.1 17.2l2.2-2.5M15.8 15l1.5 1.5" />
   </svg>
 );
 
@@ -465,7 +638,6 @@ const IconBell = () => (
   </svg>
 );
 
-
 const IconMoreDots = () => (
   <svg
     width="14"
@@ -483,53 +655,6 @@ const IconMoreDots = () => (
   </svg>
 );
 
-const IconAppsGrid = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth={1.8}
-  >
-    <rect
-      x="3"
-      y="3"
-      width="7"
-      height="7"
-      rx="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    />
-    <rect
-      x="14"
-      y="3"
-      width="7"
-      height="7"
-      rx="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    />
-    <rect
-      x="3"
-      y="14"
-      width="7"
-      height="7"
-      rx="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    />
-    <rect
-      x="14"
-      y="14"
-      width="7"
-      height="7"
-      rx="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    />
-  </svg>
-);
 
 const IconAgent = () => (
   <svg
@@ -615,25 +740,6 @@ const IconMemory = () => (
   </svg>
 );
 
-const IconReport = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth={1.8}
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-    <polyline points="14 2 14 8 20 8" />
-    <line x1="16" y1="13" x2="8" y2="13" />
-    <line x1="16" y1="17" x2="8" y2="17" />
-    <polyline points="10 9 9 9 8 9" />
-  </svg>
-);
-
 /* ─── Section definitions ─── */
 
 interface NavItem {
@@ -670,6 +776,14 @@ const workspaceItems: NavItem[] = [
   },
 ];
 
+const peopleNavItem: NavItem = {
+  path: PEOPLE_HOME_PATH,
+  label: "Team & Clients",
+  i18nKey: "nav.people",
+  icon: <IconPeople />,
+  tourKey: "nav-team",
+};
+
 const managementItems: NavItem[] = [
   {
     path: "/workspaces",
@@ -685,6 +799,7 @@ const managementItems: NavItem[] = [
     icon: <IconLibraryStack />,
     tourKey: "nav-knowledge",
   },
+  peopleNavItem,
 ];
 
 const IconWorkflow = () => (
@@ -932,747 +1047,18 @@ const ManorLogo = ({
   </svg>
 );
 
-type HelpCopy = {
-  ariaLabel: string;
-  closeLabel: string;
-  kicker: string;
-  title: string;
-  intro: string;
-  workspaceMode: string;
-  workspaceModeDescription: string;
-  chatMode: string;
-  chatModeDescription: string;
-  tip: string;
-  close: string;
-  startTour: string;
-  sections: Array<{
-    label: string;
-    eyebrow: string;
-    description: string;
-    items: Array<{ title: string; description: string; use: string }>;
-  }>;
-};
-
-const helpSectionIcons: ReactNode[][] = [
-  [<IconGrid4 />, <IconChecklist />, <IconChatBubble />],
-  [<IconWorkspaceGraph />, <IconLibraryStack />, <IconPeople />],
-  [<IconAgent />, <IconConnection />, <IconLayers />, <IconAppsGrid />],
-];
-
-// Partial<Record<Locale, ...>> so newly added locales (e.g. `de`) don't
-// force a 300-line translation drop just to satisfy the type checker —
-// the consumer below falls back to `helpCopy.en` for any missing locale.
-const helpCopy: Partial<Record<Locale, HelpCopy>> = {
-  en: {
-    ariaLabel: "Manor help",
-    closeLabel: "Close help",
-    kicker: "Manor Help",
-    title: "Understand the workspace in one minute",
-    intro:
-      "Use quick chat for one-off asks. Create a workspace when the goal needs memory, files, tasks, agents, integrations, or follow-up.",
-    workspaceMode: "Workspace Mode",
-    workspaceModeDescription:
-      "The operating layer: Manor plans the work, reads context, creates artifacts, coordinates agents, and keeps progress visible.",
-    chatMode: "Manor AI Chat",
-    chatModeDescription:
-      "The fast lane: ask, reference people with @, attach files with #, and open artifacts when Manor generates work.",
-    tip: "Tip: keep the main menu focused on daily work; put configuration deeper unless the user is setting up Manor.",
-    close: "Close",
-    startTour: "Start guided tour",
-    sections: [
-      {
-        label: "Operate",
-        eyebrow: "Daily work",
-        description:
-          "Where you check status, open tasks, and continue conversations.",
-        items: [
-          {
-            title: "Dashboard",
-            description:
-              "Shows workspace progress, alerts, metrics, and items that need attention.",
-            use: "Use it daily to see what Manor finished and what is blocked.",
-          },
-          {
-            title: "Tasks",
-            description:
-              "Tracks tasks, owners, approvals, deadlines, and execution status.",
-            use: "Use it when a goal needs clear action items and follow-through.",
-          },
-          {
-            title: "Chat",
-            description:
-              "Keeps conversations with Manor AI, workspaces, and agents.",
-            use: "Use it to continue context or start a fast new request.",
-          },
-        ],
-      },
-      {
-        label: "Library",
-        eyebrow: "Long-term memory",
-        description:
-          "Where Manor keeps people, files, and workspace memory it can reuse.",
-        items: [
-          {
-            title: "Workspaces",
-            description:
-              "Goal-based operating rooms with files, tasks, agents, and artifacts.",
-            use: "Use it for launches, fundraising, hiring, content growth, or customer operations.",
-          },
-          {
-            title: "Knowledge",
-            description:
-              "Stores documents, images, sheets, decks, pages, and other reference material.",
-            use: "Use it when Manor should write, analyze, or generate from existing files.",
-          },
-          {
-            title: "Team",
-            description:
-              "Manages members, roles, permissions, and collaboration.",
-            use: "Use it when multiple people need access or approvals.",
-          },
-        ],
-      },
-      {
-        label: "Configure",
-        eyebrow: "Capabilities",
-        description:
-          "Advanced setup that can sit one level deeper so the main menu stays clean.",
-        items: [
-          {
-            title: "Agents",
-            description:
-              "Configures specialist agents for sales, research, content, design, operations, and more.",
-            use: "Use it when fixed roles should participate in a workspace over time.",
-          },
-          {
-            title: "Integrations",
-            description:
-              "Connects tools like Gmail, Slack, Drive, Calendar, and Twilio.",
-            use: "Use it when Manor needs real context or needs to send results back into your workflow.",
-          },
-          {
-            title: "Skills",
-            description:
-              "Manages reusable procedures, tools, and execution methods.",
-            use: "Use it to turn repeated work into SOPs, like weekly reports or competitor scans.",
-          },
-          {
-            title: "Apps",
-            description:
-              "A future home for installable or richer work surfaces.",
-            use: "Use it as a second-level entry for vertical app experiences.",
-          },
-        ],
-      },
-    ],
-  },
-  zh: {
-    ariaLabel: "Manor 帮助",
-    closeLabel: "关闭帮助",
-    kicker: "Manor 帮助",
-    title: "一分钟理解 Workspace 怎么用",
-    intro:
-      "一次性的事情可以直接聊天；如果目标需要记忆、文件、任务、智能体、集成或持续跟进，就创建 workspace。",
-    workspaceMode: "Workspace 模式",
-    workspaceModeDescription:
-      "这是操作层：Manor 会理解上下文、规划工作、生成产物、协调智能体，并让进展保持可见。",
-    chatMode: "Manor AI 对话",
-    chatModeDescription:
-      "这是快速通道：直接提问，用 @ 引用人或 agent，用 # 附加文件，生成后打开 artifacts 查看结果。",
-    tip: "建议：主菜单保持日常工作优先；配置类能力放到第二层，用户需要设置 Manor 时再进入。",
-    close: "关闭",
-    startTour: "开始引导",
-    sections: [
-      {
-        label: "Operate",
-        eyebrow: "日常推进",
-        description: "这里是每天看状态、开任务、继续对话的地方。",
-        items: [
-          {
-            title: "Dashboard",
-            description:
-              "查看 workspace 的进度、提醒、指标和需要你处理的事项。",
-            use: "适合每天打开，快速知道 Manor 已经做了什么、哪里卡住了。",
-          },
-          {
-            title: "Tasks",
-            description: "管理任务、owner、审批、截止时间和执行状态。",
-            use: "适合把一个目标拆成行动项，并持续跟踪推进。",
-          },
-          {
-            title: "Chat",
-            description: "查看和 Manor AI、workspace、agent 的对话历史。",
-            use: "适合继续之前的上下文，或者快速发起一次新请求。",
-          },
-        ],
-      },
-      {
-        label: "Library",
-        eyebrow: "长期记忆",
-        description: "这里保存 Manor 可以持续引用的人、文件、workspace 记忆。",
-        items: [
-          {
-            title: "Workspaces",
-            description:
-              "围绕一个长期目标建立操作空间，里面有文件、任务、agent 和产出。",
-            use: "适合 launch、融资、招聘、内容增长、客户运营这类需要 follow-up 的目标。",
-          },
-          {
-            title: "Knowledge",
-            description:
-              "上传和管理文档、图片、表格、deck、网页等可被 AI 引用的材料。",
-            use: "适合让 Manor 根据已有资料写报告、做 PPT、分析文件或生成新内容。",
-          },
-          {
-            title: "Team",
-            description: "管理成员、角色、权限和协作关系。",
-            use: "适合多人协作，或者明确谁负责批准、查看、执行某些任务。",
-          },
-        ],
-      },
-      {
-        label: "Configure",
-        eyebrow: "能力配置",
-        description:
-          "这里放更高级的能力开关，默认可以隐藏到第二层，避免主菜单太重。",
-        items: [
-          {
-            title: "Agents",
-            description:
-              "配置专业 agent，例如销售、研究、内容、设计、运营等角色。",
-            use: "适合需要固定角色长期参与 workspace，而不是一次性聊天。",
-          },
-          {
-            title: "Integrations",
-            description:
-              "连接 Gmail、Slack、Drive、Calendar、Twilio 等外部工具。",
-            use: "适合让 Manor 读取真实上下文，或者把结果发送回你的工作流。",
-          },
-          {
-            title: "Skills",
-            description: "管理可复用的流程、工具和执行方法。",
-            use: "适合把常做的事情沉淀为 SOP，例如周报、竞品分析、邮件外呼。",
-          },
-          {
-            title: "Apps",
-            description: "未来可安装或打开的工作应用入口。",
-            use: "适合承载更完整的垂直工具体验，目前可以作为第二层入口。",
-          },
-        ],
-      },
-    ],
-  },
-  es: {
-    ariaLabel: "Ayuda de Manor",
-    closeLabel: "Cerrar ayuda",
-    kicker: "Ayuda de Manor",
-    title: "Entiende el workspace en un minuto",
-    intro:
-      "Usa el chat para preguntas puntuales. Crea un workspace cuando el objetivo necesite memoria, archivos, tareas, agentes, integraciones o seguimiento.",
-    workspaceMode: "Modo Workspace",
-    workspaceModeDescription:
-      "La capa operativa: Manor planifica el trabajo, lee contexto, crea artefactos, coordina agentes y muestra el progreso.",
-    chatMode: "Chat de Manor AI",
-    chatModeDescription:
-      "La vía rápida: pregunta, referencia personas con @, adjunta archivos con # y abre artefactos cuando Manor genera trabajo.",
-    tip: "Consejo: mantén el menú principal centrado en el trabajo diario; deja la configuración un nivel más profundo.",
-    close: "Cerrar",
-    startTour: "Iniciar guía",
-    sections: [
-      {
-        label: "Operar",
-        eyebrow: "Trabajo diario",
-        description:
-          "Donde revisas estado, abres tareas y continúas conversaciones.",
-        items: [
-          {
-            title: "Panel",
-            description:
-              "Muestra progreso, alertas, métricas y elementos que requieren atención.",
-            use: "Úsalo cada día para ver qué terminó Manor y qué está bloqueado.",
-          },
-          {
-            title: "Tareas",
-            description:
-              "Sigue tareas, responsables, aprobaciones, fechas y estado de ejecución.",
-            use: "Úsalo cuando un objetivo necesite acciones claras.",
-          },
-          {
-            title: "Chat",
-            description:
-              "Guarda conversaciones con Manor AI, workspaces y agentes.",
-            use: "Úsalo para continuar contexto o iniciar una solicitud rápida.",
-          },
-        ],
-      },
-      {
-        label: "Biblioteca",
-        eyebrow: "Memoria",
-        description:
-          "Donde Manor conserva personas, archivos y memoria de workspace.",
-        items: [
-          {
-            title: "Workspaces",
-            description:
-              "Espacios por objetivo con archivos, tareas, agentes y artefactos.",
-            use: "Úsalo para lanzamientos, fundraising, contratación, contenido u operaciones.",
-          },
-          {
-            title: "Conocimiento",
-            description:
-              "Guarda documentos, imágenes, hojas, decks, páginas y referencias.",
-            use: "Úsalo cuando Manor deba analizar o generar a partir de archivos.",
-          },
-          {
-            title: "Equipo",
-            description: "Gestiona miembros, roles, permisos y colaboración.",
-            use: "Úsalo cuando varias personas necesiten acceso o aprobaciones.",
-          },
-        ],
-      },
-      {
-        label: "Configurar",
-        eyebrow: "Capacidades",
-        description:
-          "Configuración avanzada que puede vivir un nivel más profundo.",
-        items: [
-          {
-            title: "Agentes",
-            description:
-              "Configura agentes especialistas para ventas, investigación, contenido, diseño y operaciones.",
-            use: "Úsalo cuando roles fijos deban participar en un workspace.",
-          },
-          {
-            title: "Integraciones",
-            description:
-              "Conecta herramientas como Gmail, Slack, Drive, Calendar y Twilio.",
-            use: "Úsalo cuando Manor necesite contexto real o enviar resultados.",
-          },
-          {
-            title: "Skills",
-            description:
-              "Gestiona procedimientos, herramientas y métodos reutilizables.",
-            use: "Úsalo para convertir trabajo repetido en SOPs.",
-          },
-          {
-            title: "Apps",
-            description: "Futuro hogar para experiencias y apps instalables.",
-            use: "Úsalo como entrada secundaria para apps verticales.",
-          },
-        ],
-      },
-    ],
-  },
-};
-
-function ManorHelpModal({
-  locale,
-  onClose,
-  onStartTour,
-}: {
-  locale: Locale;
-  onClose: () => void;
-  onStartTour: () => void;
-}) {
-  // `en` is always populated; non-null assertion lets TS see through the
-  // Partial<Record<Locale,...>> declared above.
-  const copy = (helpCopy[locale] || helpCopy.en)!;
-  return (
-    <div
-      className="manor-help-overlay"
-      onClick={onClose}
-      style={{
-        position: "fixed",
-        inset: 0,
-        zIndex: 10020,
-        background: "var(--modal-overlay-bg)",
-        backdropFilter: "blur(10px)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        padding: 24,
-      }}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={copy.ariaLabel}
-        className="manor-dialog manor-help-dialog"
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          width: "min(920px, calc(100vw - 32px))",
-          maxHeight: "min(780px, calc(100vh - 48px))",
-          overflow: "auto",
-          borderRadius: 28,
-          background: "var(--modal-bg)",
-          border: "1px solid var(--modal-border)",
-          boxShadow: "var(--modal-shadow)",
-          color: "var(--text-default)",
-        }}
-      >
-        <div
-          style={{
-            padding: "26px 28px 18px",
-            borderBottom: "1px solid var(--modal-border)",
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              alignItems: "flex-start",
-              justifyContent: "space-between",
-              gap: 16,
-            }}
-          >
-            <div>
-              <div
-                style={{
-                  fontSize: 11,
-                  fontWeight: 800,
-                  letterSpacing: "0.12em",
-                  textTransform: "uppercase",
-                  color: "var(--accent)",
-                  marginBottom: 8,
-                }}
-              >
-                {copy.kicker}
-              </div>
-              <h2
-                style={{
-                  margin: 0,
-                  fontSize: 26,
-                  lineHeight: 1.15,
-                  color: "var(--text-strong)",
-                  letterSpacing: "-0.03em",
-                }}
-              >
-                {copy.title}
-              </h2>
-              <p
-                style={{
-                  margin: "10px 0 0",
-                  maxWidth: 680,
-                  fontSize: 14,
-                  lineHeight: 1.6,
-                  color: "var(--text-muted)",
-                }}
-              >
-                {copy.intro}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={onClose}
-              aria-label={copy.closeLabel}
-              style={{
-                width: 34,
-                height: 34,
-                borderRadius: 12,
-                border: "1px solid var(--modal-border)",
-                background: "var(--modal-control-bg)",
-                color: "var(--text-muted)",
-                cursor: "pointer",
-                display: "grid",
-                placeItems: "center",
-                flexShrink: 0,
-              }}
-            >
-              <svg
-                width="16"
-                height="16"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth={2}
-                strokeLinecap="round"
-              >
-                <path d="M18 6L6 18M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-              gap: 12,
-              marginTop: 20,
-            }}
-          >
-            <div
-              style={{
-                border: "1px solid var(--accent-soft-border)",
-                background: "var(--accent-soft)",
-                borderRadius: 18,
-                padding: 16,
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  color: "var(--accent)",
-                  fontWeight: 800,
-                  fontSize: 14,
-                }}
-              >
-                <span
-                  style={{
-                    width: 32,
-                    height: 32,
-                    borderRadius: 12,
-                    background: "var(--accent)",
-                    color: "var(--surface-app)",
-                    display: "grid",
-                    placeItems: "center",
-                  }}
-                >
-                  <IconWorkspaceGraph />
-                </span>
-                {copy.workspaceMode}
-              </div>
-              <p
-                style={{
-                  margin: "10px 0 0",
-                  color: "var(--text-muted)",
-                  fontSize: 13,
-                  lineHeight: 1.55,
-                }}
-              >
-                {copy.workspaceModeDescription}
-              </p>
-            </div>
-            <div
-              style={{
-                border: "1px solid var(--modal-border)",
-                background: "var(--modal-muted-bg)",
-                borderRadius: 18,
-                padding: 16,
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  color: "var(--text-strong)",
-                  fontWeight: 800,
-                  fontSize: 14,
-                }}
-              >
-                <span
-                  style={{
-                    width: 32,
-                    height: 32,
-                    borderRadius: 12,
-                    background: "var(--modal-sunken-bg)",
-                    color: "var(--text-muted)",
-                    display: "grid",
-                    placeItems: "center",
-                  }}
-                >
-                  <IconChatBubble />
-                </span>
-                {copy.chatMode}
-              </div>
-              <p
-                style={{
-                  margin: "10px 0 0",
-                  color: "var(--text-muted)",
-                  fontSize: 13,
-                  lineHeight: 1.55,
-                }}
-              >
-                {copy.chatModeDescription}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        <div style={{ padding: 28, display: "grid", gap: 18 }}>
-          {copy.sections.map((section, sectionIndex) => (
-            <section
-              key={section.label}
-              style={{
-                border: "1px solid var(--modal-border)",
-                background: "var(--modal-muted-bg)",
-                borderRadius: 22,
-                padding: 18,
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "baseline",
-                  justifyContent: "space-between",
-                  gap: 12,
-                  marginBottom: 14,
-                }}
-              >
-                <div>
-                  <div
-                    style={{
-                      fontSize: 11,
-                      fontWeight: 800,
-                      color: "var(--accent)",
-                      letterSpacing: "0.1em",
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    {section.eyebrow}
-                  </div>
-                  <h3
-                    style={{
-                      margin: "4px 0 0",
-                      fontSize: 18,
-                      color: "var(--text-strong)",
-                    }}
-                  >
-                    {section.label}
-                  </h3>
-                </div>
-                <p
-                  style={{
-                    margin: 0,
-                    maxWidth: 420,
-                    color: "var(--text-muted)",
-                    fontSize: 13,
-                    lineHeight: 1.5,
-                    textAlign: "right",
-                  }}
-                >
-                  {section.description}
-                </p>
-              </div>
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
-                  gap: 10,
-                }}
-              >
-                {section.items.map((item, itemIndex) => (
-                  <article
-                    key={item.title}
-                    style={{
-                      border: "1px solid #edf2f7",
-                      borderColor: "var(--modal-border)",
-                      borderRadius: 16,
-                      padding: 14,
-                      background: "var(--modal-sunken-bg)",
-                    }}
-                  >
-                    <div
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 9,
-                        marginBottom: 8,
-                      }}
-                    >
-                      <span
-                        style={{
-                          width: 28,
-                          height: 28,
-                          borderRadius: 10,
-                          display: "grid",
-                          placeItems: "center",
-                          background: "var(--sidebar-nav-active-bg)",
-                          color: "var(--accent)",
-                        }}
-                      >
-                        {helpSectionIcons[sectionIndex]?.[itemIndex]}
-                      </span>
-                      <strong style={{ color: "var(--text-strong)", fontSize: 14 }}>
-                        {item.title}
-                      </strong>
-                    </div>
-                    <p
-                      style={{
-                        margin: "0 0 8px",
-                        color: "var(--text-muted)",
-                        fontSize: 12.5,
-                        lineHeight: 1.5,
-                      }}
-                    >
-                      {item.description}
-                    </p>
-                    <p
-                      style={{
-                        margin: 0,
-                        color: "var(--text-faint)",
-                        fontSize: 12,
-                        lineHeight: 1.45,
-                      }}
-                    >
-                      {item.use}
-                    </p>
-                  </article>
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
-
-        <div
-          style={{
-            padding: "0 28px 26px",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 12,
-            flexWrap: "wrap",
-          }}
-        >
-          <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 13 }}>
-            {copy.tip}
-          </p>
-          <div style={{ display: "flex", gap: 10 }}>
-            <button
-              type="button"
-              onClick={onClose}
-              style={{
-                height: 38,
-                padding: "0 16px",
-                borderRadius: 999,
-                border: "1px solid var(--modal-border)",
-                background: "var(--modal-control-bg)",
-                color: "var(--text-default)",
-                fontWeight: 700,
-                cursor: "pointer",
-              }}
-            >
-              {copy.close}
-            </button>
-            <button
-              type="button"
-              onClick={onStartTour}
-              style={{
-                height: 38,
-                padding: "0 18px",
-                borderRadius: 999,
-                border: "1px solid var(--accent)",
-                background: "var(--accent)",
-                color: "var(--surface-app)",
-                fontWeight: 800,
-                cursor: "pointer",
-                boxShadow: "0 12px 26px var(--accent-ring)",
-              }}
-            >
-              {copy.startTour}
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function AppLayout() {
+  useEffect(installAutoHideScrollbars, []);
   const location = useLocation();
   const navigate = useNavigate();
+  const agentEditModalOpen = useAgentEditModalStore(
+    (state) => state.agentId !== undefined,
+  );
+  const simpleMode = useDisplayPreferences((s) => s.interfaceMode === "simple");
+  const hasSelectedInterfaceMode = useDisplayPreferences((s) => s.hasSelectedInterfaceMode);
   const queryClient = useQueryClient();
+  const startupSettled = useAfterStartup();
+  const catalogScope = useCatalogScope();
   const storeUser = useAuthStore((s) => s.user);
   const token = useAuthStore((s) => s.token);
   // Use react-query for live user data (syncs with Account page updates)
@@ -1690,6 +1076,13 @@ export default function AppLayout() {
     refetchOnWindowFocus: false,
   });
   const user = queryUser || storeUser;
+  const userRoleLabel = user?.role === "owner"
+    ? t("page.users.role_owner")
+    : user?.role === "admin"
+      ? t("page.users.role_admin")
+      : user?.role === "member" || !user?.role
+        ? t("page.users.role_member")
+        : user.role;
   const [toast, setToast] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(() => {
     if (typeof window === "undefined") return false;
@@ -1701,19 +1094,42 @@ export default function AppLayout() {
   const [mode, setMode] = useState<AppMode>(() =>
     shouldDefaultToChat(location.pathname) ? "chat" : "workspace",
   );
+  const sidebarMode = simpleMode ? "chat" : mode;
   const [searchOpen, setSearchOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [configureOpen, setConfigureOpen] = useState(false);
-  const [helpOpen, setHelpOpen] = useState(false);
+  const [tourRequested, setTourRequested] = useState(false);
+  const interfaceModeDialogOpen = Boolean(user && !hasSelectedInterfaceMode && !isTourSuppressedPath(location.pathname));
+
+  useEffect(() => {
+    if (!tourRequested || !user || interfaceModeDialogOpen || !hasSelectedInterfaceMode || isTourSuppressedPath(location.pathname)) return;
+    window.dispatchEvent(new Event("manor:start-tour"));
+    setTourRequested(false);
+  }, [tourRequested, user, interfaceModeDialogOpen, hasSelectedInterfaceMode, simpleMode, location.pathname]);
   const [supportOpen, setSupportOpen] = useState(false);
   const supportRestoreFocusRef = useRef<HTMLButtonElement>(null);
   const [searchQuery, setSearchQuery] = useState("");
 
   /* ── Chat Mode state ── */
-  const [activeConvId, setActiveConvId] = useState<string>("manor-ai");
+  const initialWorkspaceId = location.pathname === "/chat"
+    ? new URLSearchParams(location.search).get("workspace") : null;
+  const [activeConvId, setActiveConvId] = useState<string>(initialWorkspaceId || "manor-ai");
   const [activeConvType, setActiveConvType] = useState<
-    "manor" | "operation" | "dm"
-  >("manor");
+    "manor" | "operation" | "dm" | "room" | "compose" | "workspace-draft"
+  >(initialWorkspaceId ? "operation" : "manor");
+  const { data: humanChatRooms = [], isSuccess: humanChatRoomsLoaded } = useQuery({
+    queryKey: ["chat-rooms", user?.id],
+    queryFn: api.chatRooms.list,
+    enabled: sidebarMode === "chat" && !!user,
+    // WebSocket events provide freshness; this is a safety resync.
+    refetchInterval: 60_000,
+  });
+  const { data: groupUsage, isSuccess: groupUsageLoaded } = useQuery({
+    queryKey: ["group-chat-usage", user?.id],
+    queryFn: api.chatRooms.groupUsage,
+    enabled: sidebarMode === "chat" && !!user,
+    staleTime: 5 * 60_000,
+  });
   const [unavailableWorkspaceId, setUnavailableWorkspaceId] = useState<string | null>(null);
   const [activeDmAgentId, setActiveDmAgentId] = useState<string | null>(null);
   const [chatWorkspaces, setChatWorkspaces] = useState<Workspace[]>([]);
@@ -1721,29 +1137,64 @@ export default function AppLayout() {
   const setActiveWorkspaceId = useWorkspaceFilter(
     (s) => s.setActiveWorkspaceId,
   );
-  const [chatAgentsList, setChatAgentsList] = useState<Agent[]>([]);
+  const { data: chatAgentsList = EMPTY_AGENTS, isLoading: chatAgentsLoading } = useQuery({
+    ...agentListQueryOptions(catalogScope),
+    enabled: !!catalogScope && mode === "chat",
+  });
   const [hiredAgents, setHiredAgents] = useState<Agent[]>([]);
   const [dmConversationByAgentId, setDmConversationByAgentId] = useState<
     Record<string, string>
   >({});
   const [convSearchQuery, setConvSearchQuery] = useState("");
+  const workspaceOrderKey = user ? `manor-workspace-sidebar:${user.entity_id}:${user.id}` : null;
+  const [allSidebarWorkspaces, setAllSidebarWorkspaces] = useState(false);
+  useEffect(() => {
+    setAllSidebarWorkspaces(false);
+  }, [workspaceOrderKey]);
+  const [chatSidebarSections, setChatSidebarSections] = useState(() => {
+    if (typeof window === "undefined") return DEFAULT_CHAT_SIDEBAR_SECTIONS;
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(CHAT_SIDEBAR_SECTIONS_KEY) || "null");
+      if (!saved || typeof saved !== "object") return DEFAULT_CHAT_SIDEBAR_SECTIONS;
+      return Object.fromEntries(
+        (Object.keys(DEFAULT_CHAT_SIDEBAR_SECTIONS) as ChatSidebarSection[]).map((section) => [
+          section,
+          typeof saved[section] === "boolean" ? saved[section] : DEFAULT_CHAT_SIDEBAR_SECTIONS[section],
+        ]),
+      ) as Record<ChatSidebarSection, boolean>;
+    } catch {
+      return DEFAULT_CHAT_SIDEBAR_SECTIONS;
+    }
+  });
+  const toggleChatSidebarSection = (section: ChatSidebarSection) => {
+    setChatSidebarSections((current) => ({ ...current, [section]: !current[section] }));
+  };
   const [manorSessionsOpen, setManorSessionsOpen] = useState(false);
-  const [renamingManorSessionId, setRenamingManorSessionId] = useState<
+  const [renamingConversationId, setRenamingConversationId] = useState<
     string | null
   >(null);
-  const [manorSessionTitleDraft, setManorSessionTitleDraft] = useState("");
-  const [manorSessionRenameError, setManorSessionRenameError] = useState("");
-  const [deleteManorSessionTarget, setDeleteManorSessionTarget] =
+  const [renamingAgentDraftId, setRenamingAgentDraftId] = useState<string | null>(null);
+  const [conversationTitleDraft, setConversationTitleDraft] = useState("");
+  const [conversationRenameError, setConversationRenameError] = useState("");
+  const [deleteConversationTarget, setDeleteConversationTarget] =
     useState<Conversation | null>(null);
-  const [deleteManorSessionError, setDeleteManorSessionError] = useState("");
+  const [deleteConversationError, setDeleteConversationError] = useState("");
+  const [roomSidebarAction, setRoomSidebarAction] = useState<{
+    roomId: string;
+    id: number;
+    action: "details" | "rename" | "close";
+  } | null>(null);
+  const [renamingWorkspace, setRenamingWorkspace] = useState<Workspace | null>(null);
+  const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
+  const [workspaceRenameError, setWorkspaceRenameError] = useState("");
+  const [deleteWorkspaceTarget, setDeleteWorkspaceTarget] = useState<Workspace | null>(null);
+  const [deleteWorkspaceError, setDeleteWorkspaceError] = useState("");
   const runningManorSessionActivitiesKey = useChatStreamStore((state) =>
     JSON.stringify(
       Object.values(state.sessions)
         .flatMap((session) => {
           if (!session.streaming || !session.convId) return [];
-          const latestAssistantMessage = [...session.messages]
-            .reverse()
-            .find((message) => message.role === "assistant");
+          const latestAssistantMessage = latestMessageByRole(session.messages, "assistant");
           return [
             [
               session.convId,
@@ -1765,9 +1216,7 @@ export default function AppLayout() {
   );
   const activeManorSessionActivity = useChatStreamStore((state) => {
     if (!isChatRunActive(state.messages, state.streaming)) return null;
-    const latestAssistantMessage = [...state.messages]
-      .reverse()
-      .find((message) => message.role === "assistant");
+    const latestAssistantMessage = latestMessageByRole(state.messages, "assistant");
     return inferAgentActivity(latestAssistantMessage);
   });
   // Counts shown in chat rows: unresolved chat actions (proposal cards + HITL).
@@ -1779,29 +1228,51 @@ export default function AppLayout() {
   }, []);
   const deploymentMode = useConfigStore((s) => s.deployment_mode);
   const configLoaded = useConfigStore((s) => s.loaded);
+  const configLoadError = useConfigStore((s) => s.load_error);
+  const workspaceAddReady = configLoaded || configLoadError;
   const { enabled: flowsAvailable } = usePreviewFeatureAccess("flows");
   const supportTicketsEnabled = useConfigStore(
     (s) => s.support_tickets_enabled,
   );
   const supportUnread =
-    useSupportUnreadCount(supportTicketsEnabled).data?.count || 0;
+    useSupportUnreadCount(supportTicketsEnabled && startupSettled).data?.count || 0;
   const configurationItems = useMemo(() => {
     const items = [...baseConfigurationItems];
-    // Flows follows Skills and mirrors Apps: only unavailable accounts see
-    // the disabled "Soon" state.
+    // Only unavailable accounts see the disabled "Soon" state for Workflows.
     items.push(flowsConfigurationItem(flowsAvailable));
     return items;
-  }, [
-    flowsAvailable,
-  ]);
+  }, [flowsAvailable]);
   const {
     data: workspaceList = EMPTY_WORKSPACES,
     isSuccess: workspaceListReady,
+    dataUpdatedAt: workspaceListUpdatedAt,
   } = useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.workspaces.list(),
     staleTime: 60_000,
   });
+  // Deep links load the selected Workspace independently of the sidebar's
+  // full list and aggregated stats. Sidebar clicks reuse that list's cache.
+  const activeChatWorkspaceQuery = useQuery({
+    queryKey: ["workspace", activeConvId],
+    queryFn: ({ signal }) => api.workspaces.get(activeConvId, signal),
+    enabled: mode === "chat" && activeConvType === "operation",
+    initialData: () => queryClient.getQueryData<Workspace[]>(["workspaces"])
+      ?.find((workspace) => workspace.id === activeConvId),
+    initialDataUpdatedAt: () => queryClient.getQueryState(["workspaces"])?.dataUpdatedAt,
+    staleTime: 60_000,
+  });
+  const activeChatWorkspaceUnavailable = (
+    activeChatWorkspaceQuery.error instanceof ApiError
+    && (activeChatWorkspaceQuery.error.status === 404 || activeChatWorkspaceQuery.error.status === 403)
+  ) || (
+    workspaceListReady && !activeChatWorkspaceQuery.isPending
+    && workspaceListUpdatedAt > activeChatWorkspaceQuery.dataUpdatedAt
+    && !workspaceList.some((workspace) => workspace.id === activeConvId)
+  );
+  useEffect(() => {
+    if (mode === "chat" && activeConvType === "operation") void loadWorkspaceChat().catch(() => {});
+  }, [mode, activeConvType]);
   const {
     data: chatConversations = EMPTY_CONVERSATIONS,
     isLoading: chatConversationsLoading,
@@ -1809,7 +1280,7 @@ export default function AppLayout() {
   } = useQuery({
     queryKey: ["conversations"],
     queryFn: () => api.chat.listConversations(),
-    enabled: mode === "chat",
+    enabled: sidebarMode === "chat",
     staleTime: 30_000,
   });
   const manorChatSessions = useMemo(
@@ -1820,16 +1291,42 @@ export default function AppLayout() {
       ),
     [chatConversations],
   );
+  const dmConversationRecordByAgentId = useMemo(() => {
+    const byAgent = new Map<string, Conversation>();
+    for (const conversation of chatConversations) {
+      if (isPersonalAgentConversation(conversation, user?.id) && conversation.agent_id && !byAgent.has(conversation.agent_id)) {
+        byAgent.set(conversation.agent_id, conversation);
+      }
+    }
+    return byAgent;
+  }, [chatConversations, user?.id]);
   const conversationSearch = convSearchQuery.trim().toLocaleLowerCase();
   const isSearchingConversations = conversationSearch.length > 0;
+  const sidebarOrderKey = (section: "ai" | "group" | "dm") => user ? `manor-chat-sidebar-${section}:${user.entity_id}:${user.id}` : null;
+  const aiSidebar = useSidebarReorder(sidebarOrderKey("ai"), manorChatSessions, isSearchingConversations);
+  const isChatSidebarSectionOpen = (section: ChatSidebarSection) =>
+    isSearchingConversations || chatSidebarSections[section];
+  const groupDiscovery = useFeatureDiscovery({
+    feature: FEATURE_DISCOVERIES.groupChat,
+    userId: user?.id,
+    enabled: sidebarMode === "chat" && humanChatRoomsLoaded && groupUsageLoaded,
+    active: sidebarMode === "chat" && location.pathname.startsWith("/chat") && !collapsed && !isSearchingConversations &&
+      (window.innerWidth >= 1024 || mobileOpen),
+    alreadyUsed: groupUsage?.used === true || humanChatRooms.some((room) => room.kind === "group"),
+    autoShow: sidebarMode === "chat" && location.pathname.startsWith("/chat") &&
+      humanChatRoomsLoaded && groupUsageLoaded && !collapsed &&
+      chatSidebarSections.group && !isSearchingConversations && hasSelectedInterfaceMode && !interfaceModeDialogOpen &&
+      Boolean(window.localStorage.getItem(MAIN_TOUR_STORAGE_KEY)) &&
+      (window.innerWidth >= 1024 || mobileOpen),
+  });
   const filteredManorChatSessions = useMemo(() => {
-    if (!conversationSearch) return manorChatSessions;
-    return manorChatSessions.filter((conversation) =>
+    if (!conversationSearch) return aiSidebar.items;
+    return aiSidebar.items.filter((conversation) =>
       (conversation.title || t("page.chat_history.untitled"))
         .toLocaleLowerCase()
         .includes(conversationSearch),
     );
-  }, [conversationSearch, manorChatSessions]);
+  }, [conversationSearch, aiSidebar.items]);
   const manorIdentityMatchesSearch = !conversationSearch || [
     "manor ai",
     t("page.app_layout.your_ai_chief_of_staff").toLocaleLowerCase(),
@@ -1840,47 +1337,125 @@ export default function AppLayout() {
   useEffect(() => {
     if (conversationSearch) setManorSessionsOpen(true);
   }, [conversationSearch]);
-  const renameManorSession = useMutation({
+  const renameChatConversation = useMutation({
     mutationFn: ({ id, title }: { id: string; title: string }) =>
       api.chat.renameConversation(id, title),
     onSuccess: () => {
-      setRenamingManorSessionId(null);
-      setManorSessionTitleDraft("");
-      setManorSessionRenameError("");
+      setRenamingConversationId(null);
+      setConversationTitleDraft("");
+      setConversationRenameError("");
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
     onError: () => {
-      setManorSessionRenameError(
+      setConversationRenameError(
         t("page.app_layout.rename_manor_session_failed"),
       );
     },
   });
-  const deleteManorSession = useMutation({
+  const startAgentConversation = useMutation({
+    mutationFn: ({ agentId, title }: { agentId: string; title: string }) =>
+      api.chat.startAgentConversation(agentId, title),
+    onSuccess: (conversation) => {
+      setRenamingAgentDraftId(null);
+      setConversationTitleDraft("");
+      setConversationRenameError("");
+      queryClient.setQueryData<Conversation[]>(["conversations"], (previous = []) => [
+        conversation,
+        ...previous.filter((item) => item.id !== conversation.id),
+      ]);
+      if (conversation.agent_id) {
+        setDmConversationByAgentId((previous) => ({ ...previous, [conversation.agent_id!]: conversation.id }));
+        if (activeConvType === "dm" && activeDmAgentId === conversation.agent_id) {
+          setActiveConvId(conversation.id);
+        }
+      }
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+    },
+    onError: () => setConversationRenameError(t("page.app_layout.rename_manor_session_failed")),
+  });
+  const deleteChatConversation = useMutation({
     mutationFn: (id: string) => api.chat.deleteConversation(id),
     onSuccess: (_data, deletedId) => {
-      setDeleteManorSessionTarget(null);
-      setDeleteManorSessionError("");
+      setDeleteConversationTarget(null);
+      setDeleteConversationError("");
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      const agentId = deleteConversationTarget?.id === deletedId ? deleteConversationTarget.agent_id : null;
+      const nextConversation = agentId ? chatConversations.find((conversation) =>
+        conversation.id !== deletedId && conversation.agent_id === agentId && isPersonalAgentConversation(conversation, user?.id),
+      ) : undefined;
+      if (agentId) {
+        setDmConversationByAgentId((previous) => {
+          const next = { ...previous };
+          if (nextConversation) next[agentId] = nextConversation.id;
+          else delete next[agentId];
+          return next;
+        });
+        if (!nextConversation) setHiredAgents((previous) => previous.filter((agent) => agent.id !== agentId));
+      }
       if (activeConvType === "manor" && activeConvId === deletedId) {
-        setActiveConvId(`manor-new:${Date.now()}`);
+        const draftId = `manor-new:${Date.now()}`;
+        setActiveConvId(draftId);
         setActiveDmAgentId(null);
-        navigate("/chat", { replace: true });
+        navigate(`/chat?new=chat&draft=${encodeURIComponent(draftId)}`, { replace: true });
+      } else if (activeConvType === "dm" && activeConvId === deletedId) {
+        if (nextConversation) {
+          setActiveConvId(nextConversation.id);
+        } else {
+          setActiveConvId("manor-ai");
+          setActiveConvType("manor");
+          setActiveDmAgentId(null);
+          navigate("/chat", { replace: true });
+        }
       }
     },
     onError: () => {
-      setDeleteManorSessionError(
+      setDeleteConversationError(
         t("page.app_layout.delete_manor_session_failed"),
       );
     },
   });
+  const renameWorkspaceFromSidebar = useMutation({
+    mutationFn: ({ id, name }: { id: string; name: string }) =>
+      api.workspaces.update(id, { name }),
+    onSuccess: (_data, { id }) => {
+      setRenamingWorkspace(null);
+      setWorkspaceRenameError("");
+      void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      void queryClient.invalidateQueries({ queryKey: ["workspace", id] });
+    },
+    onError: (error: Error) => setWorkspaceRenameError(error.message),
+  });
+  const deleteWorkspaceFromSidebar = useMutation({
+    mutationFn: (id: string) => api.workspaces.delete(id),
+    onSuccess: (_data, deletedId) => {
+      setDeleteWorkspaceTarget(null);
+      setDeleteWorkspaceError("");
+      void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      void queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
+      if (activeWorkspaceId === deletedId) setActiveWorkspaceId("all");
+      if (location.pathname === `/workspaces/${deletedId}`) {
+        navigate("/workspaces", { replace: true });
+      } else if (location.pathname === "/chat" && activeConvType === "operation" && activeConvId === deletedId) {
+        setActiveConvType("manor");
+        setActiveConvId("manor-ai");
+        navigate("/chat", { replace: true });
+      }
+      setToast(t("page.workspace_detail.workspace_deleted"));
+    },
+    onError: (error: Error) => setDeleteWorkspaceError(error.message),
+  });
 
   /* Load workspaces for sidebar context switcher (both modes) */
+  // Coalesced: install, chat-mode entry, task updates and every realtime
+  // workspace chat event all ask for this list within a few seconds.
   const refreshWorkspaces = useCallback(() => {
-    void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+    scheduleQueryInvalidation(queryClient, ["workspaces"]);
   }, [queryClient]);
   useEffect(() => {
     setChatWorkspaces(workspaceList);
-    // Seed counts from backend unresolved state. Chat rows include proposal
+    // Seed counts from personal unread reminder state. Chat rows include proposal
     // cards because these actions are handled in workspace chat.
     const chatCounts: Record<string, number> = {};
     const workspaceIds = new Set<string>();
@@ -1899,13 +1474,12 @@ export default function AppLayout() {
   }, [workspaceList]);
   useEffect(() => {
     if (
-      !workspaceListReady
-      || mode !== "chat"
+      mode !== "chat"
       || activeConvType !== "operation"
     ) {
       return;
     }
-    if (workspaceList.some((workspace) => workspace.id === activeConvId)) {
+    if (!activeChatWorkspaceUnavailable) {
       setUnavailableWorkspaceId((current) =>
         current === activeConvId ? null : current,
       );
@@ -1922,8 +1496,7 @@ export default function AppLayout() {
     location.search,
     mode,
     navigate,
-    workspaceList,
-    workspaceListReady,
+    activeChatWorkspaceUnavailable,
   ]);
   useEffect(() => {
     const onRefresh = () => refreshWorkspaces();
@@ -1936,15 +1509,6 @@ export default function AppLayout() {
     if (mode === "chat") refreshWorkspaces();
   }, [mode, refreshWorkspaces]);
 
-  /* Load chat-specific data when entering chat mode */
-  useEffect(() => {
-    if (mode !== "chat") return;
-    api.agents
-      .list()
-      .then(setChatAgentsList)
-      .catch(() => {});
-  }, [mode]);
-
   // DM agents are the agents that already own at least one personal
   // conversation. The same canonical conversation query also powers the
   // expandable Manor AI session list below.
@@ -1953,7 +1517,7 @@ export default function AppLayout() {
     const dmAgentIds = new Set<string>();
     const dmConversations: Record<string, string> = {};
     chatConversations
-      .filter((conversation) => conversation.agent_id && !conversation.workspace_id)
+      .filter((conversation) => isPersonalAgentConversation(conversation, user?.id))
       .forEach((conversation) => {
         const agentId = conversation.agent_id;
         if (!agentId) return;
@@ -1975,7 +1539,7 @@ export default function AppLayout() {
       persistedDmAgents.forEach((agent) => merged.set(agent.id, agent));
       return Array.from(merged.values());
     });
-  }, [mode, chatConversations, chatAgentsList]);
+  }, [mode, chatConversations, chatAgentsList, user?.id]);
 
   // During development/HMR or from older state, activeConvId may still be an
   // agent id. Normalize it to the new DM shape so EmbeddedChat never requests
@@ -2044,7 +1608,7 @@ export default function AppLayout() {
       (a) => a.id === activeDmAgentId,
     );
     return {
-      title: agent?.name || t("page.app_layout.agent"),
+      title: (activeDmAgentId ? dmConversationRecordByAgentId.get(activeDmAgentId)?.title : null) || agent?.name || t("page.app_layout.agent"),
       subtitle: agent
         ? agentPreview(agent, "page.app_layout.direct_message")
         : t("page.app_layout.direct_message"),
@@ -2057,6 +1621,7 @@ export default function AppLayout() {
     chatWorkspaces,
     chatAgentsList,
     hiredAgents,
+    dmConversationRecordByAgentId,
   ]);
 
   /* Chat sidebar filtering:
@@ -2083,6 +1648,7 @@ export default function AppLayout() {
     setActiveConvType("manor");
     setActiveDmAgentId(null);
     setConvSearchQuery("");
+    setMobileOpen(false);
     if (location.pathname !== "/chat" || location.search) {
       navigate("/chat");
     }
@@ -2092,15 +1658,18 @@ export default function AppLayout() {
     setActiveConvType("manor");
     setActiveDmAgentId(null);
     setConvSearchQuery("");
+    setMobileOpen(false);
     navigate(`/chat?conversation=${encodeURIComponent(conversationId)}`);
   };
   const startNewManorSession = () => {
-    setActiveConvId(`manor-new:${Date.now()}`);
+    const draftId = `manor-new:${Date.now()}`;
+    setActiveConvId(draftId);
     setActiveConvType("manor");
     setActiveDmAgentId(null);
     setConvSearchQuery("");
     setManorSessionsOpen(true);
-    navigate("/chat");
+    setMobileOpen(false);
+    navigate(`/chat?new=chat&draft=${encodeURIComponent(draftId)}`);
   };
   const handleManorConversationResolved = (conversationId: string) => {
     setActiveConvId(conversationId);
@@ -2109,25 +1678,37 @@ export default function AppLayout() {
       replace: true,
     });
   };
-  const beginRenameManorSession = (conversation: Conversation) => {
-    setRenamingManorSessionId(conversation.id);
-    setManorSessionTitleDraft(
+  const beginRenameConversation = (conversation: Conversation) => {
+    setRenamingConversationId(conversation.id);
+    setRenamingAgentDraftId(null);
+    setConversationTitleDraft(
       conversation.title || t("page.chat_history.untitled"),
     );
-    setManorSessionRenameError("");
+    setConversationRenameError("");
   };
-  const cancelRenameManorSession = () => {
-    setRenamingManorSessionId(null);
-    setManorSessionTitleDraft("");
-    setManorSessionRenameError("");
+  const beginRenameAgentDraft = (agent: Agent) => {
+    setRenamingConversationId(null);
+    setRenamingAgentDraftId(agent.id);
+    setConversationTitleDraft(agent.name);
+    setConversationRenameError("");
   };
-  const submitRenameManorSession = () => {
-    if (!renamingManorSessionId) return;
-    const title = manorSessionTitleDraft.trim();
+  const cancelRenameConversation = () => {
+    setRenamingConversationId(null);
+    setRenamingAgentDraftId(null);
+    setConversationTitleDraft("");
+    setConversationRenameError("");
+  };
+  const submitRenameConversation = () => {
+    const title = conversationTitleDraft.trim();
     if (!title) return;
-    renameManorSession.mutate({ id: renamingManorSessionId, title });
+    if (renamingAgentDraftId) {
+      startAgentConversation.mutate({ agentId: renamingAgentDraftId, title });
+      return;
+    }
+    if (!renamingConversationId) return;
+    renameChatConversation.mutate({ id: renamingConversationId, title });
   };
-  const openAgentDm = (agent: Agent) => {
+  const openAgentDm = (agent: Agent, replace = false) => {
     const convId = dmConversationByAgentId[agent.id] || `agent:${agent.id}`;
     setHiredAgents((prev) => {
       if (prev.some((item) => item.id === agent.id)) return prev;
@@ -2137,10 +1718,84 @@ export default function AppLayout() {
     setActiveDmAgentId(agent.id);
     setActiveConvType("dm");
     setConvSearchQuery("");
+    setMobileOpen(false);
+    navigate(`/chat?agent=${encodeURIComponent(agent.id)}`, { replace });
   };
-  const filteredWorkspaces = chatWorkspaces;
-  const filteredDmAgents = hiredAgents.filter(
-    (a) => a && a.name && matchesConversationSearch(a),
+  const openAgentDmFromCompose = (agent: Agent) => {
+    openAgentDm(agent, true);
+  };
+  const openWorkspaceChat = (workspaceId: string) => {
+    setActiveConvId(workspaceId);
+    setActiveConvType("operation");
+    setActiveDmAgentId(null);
+    setConvSearchQuery("");
+    setMobileOpen(false);
+    navigate(`/chat?workspace=${encodeURIComponent(workspaceId)}`);
+  };
+  const openHumanRoom = (roomId: string) => {
+    setActiveConvId(roomId);
+    setActiveConvType("room");
+    setActiveDmAgentId(null);
+    setConvSearchQuery("");
+    setMobileOpen(false);
+    navigate(`/chat?room=${encodeURIComponent(roomId)}`);
+  };
+  const openHumanRoomAction = (
+    roomId: string,
+    action: "details" | "rename" | "close",
+  ) => {
+    setRoomSidebarAction((current) => ({
+      roomId,
+      id: (current?.id || 0) + 1,
+      action,
+    }));
+    openHumanRoom(roomId);
+  };
+  const openNewConversation = () => {
+    setActiveConvType("compose");
+    setActiveConvId("new-conversation");
+    setMobileOpen(false);
+    navigate("/chat?new=message");
+  };
+  const openNewGroup = () => {
+    groupDiscovery.dismiss();
+    setActiveConvType("compose");
+    setActiveConvId("new-conversation");
+    setMobileOpen(false);
+    navigate("/chat?new=message&kind=group");
+  };
+  const openNewWorkspaceDraft = () => {
+    setActiveConvType("workspace-draft");
+    setActiveConvId("new-workspace");
+    setMobileOpen(false);
+    navigate("/chat?new=workspace");
+  };
+  const openWorkspaceMarketplace = () => {
+    setMobileOpen(false);
+    navigate("/workspaces?view=marketplace");
+  };
+  const openStandaloneWorkspaceDraft = () => {
+    setMobileOpen(false);
+    navigate("/workspaces/new");
+  };
+  const recentWorkspaces = useMemo(() => orderSidebarWorkspaces(chatWorkspaces, { mode: "recent", order: [] }), [chatWorkspaces]);
+  const workspaceSidebar = useSidebarReorder(workspaceOrderKey, recentWorkspaces, isSearchingConversations);
+  const orderedWorkspaces = workspaceSidebar.items;
+  const matchingWorkspaces = isSearchingConversations
+    ? orderedWorkspaces.filter((ws) => {
+        const name = String(ws?.name || "").toLowerCase();
+        if (conversationSearch.length === 1) return name.startsWith(conversationSearch);
+        return name.includes(conversationSearch);
+      })
+    : orderedWorkspaces;
+  const filteredWorkspaces = isSearchingConversations || allSidebarWorkspaces
+    ? matchingWorkspaces
+    : compactSidebarWorkspaces(matchingWorkspaces, activeConvType === "operation" ? activeConvId : null);
+  const filteredDmAgents = hiredAgents.filter((agent) =>
+    agent && agent.name && (
+      matchesConversationSearch(agent)
+      || dmConversationRecordByAgentId.get(agent.id)?.title?.toLocaleLowerCase().includes(conversationSearch)
+    ),
   );
   const filteredSearchAgents = isSearchingConversations
     ? chatAgentsList
@@ -2151,6 +1806,19 @@ export default function AppLayout() {
         })
         .slice(0, 10)
     : [];
+  const visibleSearchAgents = simpleMode ? [] : filteredSearchAgents;
+  const filteredHumanChatRooms = isSearchingConversations
+    ? humanChatRooms.filter((room) => room.title.toLocaleLowerCase().includes(conversationSearch))
+    : humanChatRooms;
+  const groupSidebar = useSidebarReorder(sidebarOrderKey("group"), humanChatRooms.filter((room) => room.kind === "group"), isSearchingConversations);
+  const dmSidebar = useSidebarReorder<DirectSidebarItem>(sidebarOrderKey("dm"), [
+    ...humanChatRooms.filter((room) => room.kind === "dm").map((room) => ({ id: `room:${room.id}`, kind: "room" as const, room })),
+    ...hiredAgents.map((agent) => ({ id: `agent:${agent.id}`, kind: "agent" as const, agent })),
+  ], isSearchingConversations);
+  const collapsedDmItems = useMemo(() => {
+    const count = { room: 0, agent: 0 };
+    return dmSidebar.items.filter((item) => ++count[item.kind] <= 8);
+  }, [dmSidebar.items]);
 
   const videoRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
@@ -2161,8 +1829,8 @@ export default function AppLayout() {
       const title = (data.title as string) || "New notification";
       setToast(title);
       setTimeout(() => setToast(null), 4000);
-      // Refresh notification list + unread count
-      queryClient.invalidateQueries({ queryKey: ["notifications"] });
+      // Refresh notification list + unread count (coalesced across a burst)
+      scheduleQueryInvalidation(queryClient, ["notifications"]);
       // If it's a proposal, also refresh workspace data + tasks
       if (data.type === "proposal") {
         queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
@@ -2176,23 +1844,24 @@ export default function AppLayout() {
     },
     [queryClient],
   );
+  const taskUpdateInvalidationRef = useRef<TaskUpdateInvalidationBatcher>();
+  useEffect(() => {
+    const batcher = createTaskUpdateInvalidationBatcher(queryClient, {
+      isCurrentScope: () => Boolean(catalogScope && catalogScopeForToken(getAuthToken()) === catalogScope),
+    });
+    taskUpdateInvalidationRef.current = batcher;
+    return () => {
+      if (taskUpdateInvalidationRef.current === batcher) taskUpdateInvalidationRef.current = undefined;
+      batcher.dispose();
+    };
+  }, [queryClient, catalogScope]);
   const onTaskUpdate = useCallback(
     (data: Record<string, any>) => {
       const taskId = data.task_id || data.id;
       const planId = data.plan_id;
-      if (taskId) {
-        queryClient.invalidateQueries({ queryKey: ["task", taskId] });
-        queryClient.invalidateQueries({ queryKey: ["task-logs", taskId] });
-        queryClient.invalidateQueries({ queryKey: ["task-plans", taskId] });
-      }
-      if (planId) {
-        queryClient.invalidateQueries({ queryKey: ["plan-steps", planId] });
-      }
-      queryClient.invalidateQueries({ queryKey: ["taskBoard"] });
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      refreshWorkspaces();
+      taskUpdateInvalidationRef.current?.enqueue({ taskId, planId });
     },
-    [queryClient, refreshWorkspaces],
+    [],
   );
   const onJobUpdate = useCallback(
     (_data: Record<string, any>) => {
@@ -2240,15 +1909,16 @@ export default function AppLayout() {
         refreshWorkspaces();
         return;
       }
-      // If this workspace isn't in our list yet, refetch
-      if (!chatWorkspaces.find((w) => w.id === wsId)) {
-        refreshWorkspaces();
-      }
-      if (data.action_resolved) {
+      if (
+        data.author_kind === "user"
+        // If this workspace isn't in our list yet, refetch
+        || !chatWorkspaces.find((w) => w.id === wsId)
+        || data.action_resolved
+        || data.has_pending_action
+      ) {
         refreshWorkspaces();
       }
       if (data.has_pending_action) {
-        refreshWorkspaces();
         const wsName =
           chatWorkspaces.find((w) => w.id === wsId)?.name ||
           t("page.app_layout.workspace");
@@ -2283,7 +1953,7 @@ export default function AppLayout() {
   );
   const onConversationMessage = useCallback(
     (data: Record<string, any>) => {
-      queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      scheduleQueryInvalidation(queryClient, ["conversations"]);
       window.dispatchEvent(
         new CustomEvent("manor:conversation-message", { detail: data }),
       );
@@ -2299,13 +1969,56 @@ export default function AppLayout() {
       new CustomEvent("manor:chat-stream-snapshot", { detail: data }),
     );
   }, []);
+  const hasConnectedRef = useRef(false);
+  const onConnect = useCallback(() => {
+    void queryClient.invalidateQueries({ queryKey: ["chat-rooms"] });
+    if (hasConnectedRef.current) {
+      window.dispatchEvent(new Event(CATALOG_REVALIDATE_EVENT));
+    }
+    hasConnectedRef.current = true;
+  }, [queryClient]);
+  const roomListRefreshTimerRef = useRef<number | null>(null);
+  const seenRoomMessageIdsRef = useRef(new Set<string>());
+  const onChatRoomChanged = useCallback(({ room_id, kind, message }: ChatRoomChangeEvent) => {
+    if (kind === "message" && message?.room_id === room_id) {
+      if (seenRoomMessageIdsRef.current.has(message.id)) return;
+      seenRoomMessageIdsRef.current.add(message.id);
+      if (seenRoomMessageIdsRef.current.size > 1000) {
+        seenRoomMessageIdsRef.current.delete(seenRoomMessageIdsRef.current.values().next().value!);
+      }
+      const readingRoom = activeConvType === "room" && activeConvId === room_id
+        && document.visibilityState === "visible" && document.hasFocus();
+      queryClient.setQueriesData<ChatRoom[]>({ queryKey: ["chat-rooms"] }, (rooms) => {
+        if (!rooms?.some((room) => room.id === room_id)) return rooms;
+        return rooms.map((room) => room.id === room_id ? {
+          ...room,
+          last_message_at: Date.parse(message.created_at) > Date.parse(room.last_message_at || room.created_at)
+            ? message.created_at : room.last_message_at,
+          unread_count: (room.unread_count || 0) + (message.sender_user_id !== user?.id && !readingRoom ? 1 : 0),
+        } : room).sort((left, right) =>
+          Date.parse(right.last_message_at || right.created_at) - Date.parse(left.last_message_at || left.created_at));
+      });
+      return;
+    }
+    if (kind === "reaction") return;
+    if (roomListRefreshTimerRef.current !== null) return;
+    roomListRefreshTimerRef.current = window.setTimeout(() => {
+      roomListRefreshTimerRef.current = null;
+      void queryClient.invalidateQueries({ queryKey: ["chat-rooms"] });
+    }, 250);
+  }, [activeConvId, activeConvType, queryClient, user?.id]);
+  useEffect(() => () => {
+    if (roomListRefreshTimerRef.current !== null) window.clearTimeout(roomListRefreshTimerRef.current);
+  }, []);
   const { connectedRef: _connectedRef, unreadCount: wsUnread } = useWebSocket({
+    onConnect,
     onNotification,
     onTaskUpdate,
     onJobUpdate,
     onVideoReady,
     onWorkspaceChatMessage,
     onConversationMessage,
+    onChatRoomChanged,
     onChatStreamSnapshot,
   });
   usePageViewTracking();
@@ -2320,17 +2033,28 @@ export default function AppLayout() {
   );
   // Also poll unread count so it updates after mark-read on Notifications page
   const { data: notifData } = useQuery({
-    queryKey: ["notifications", "all"],
-    queryFn: () => api.notifications.list(),
+    queryKey: ["notifications", "badge"],
+    queryFn: () => api.notifications.list({ limit: 1 }),
+    enabled: startupSettled,
     refetchInterval: 60_000,
   });
-  const unreadCount = notifData?.unread_count ?? wsUnread;
+  let unreadCount = notifData?.unread_count ?? wsUnread;
   const [locale, setLocaleState] = useState<Locale>(getLocale());
+  const [localeSaving, setLocaleSaving] = useState(false);
 
-  const handleLocaleChange = (newLocale: Locale) => {
-    setLocale(newLocale);
-    setLocaleState(newLocale);
-    window.location.reload();
+  const handleLocaleChange = async (newLocale: Locale) => {
+    if (localeSaving || (newLocale === locale && user?.locale === newLocale)) return;
+    setLocaleSaving(true);
+    try {
+      const updatedUser = await useAuthStore.getState().updateLocale(newLocale);
+      queryClient.setQueryData(["auth-me"], updatedUser);
+      setLocaleState(getLocale());
+      window.location.reload();
+    } catch {
+      setToast(t("page.account.save_failed"));
+    } finally {
+      setLocaleSaving(false);
+    }
   };
 
   const isActive = (path: string) => {
@@ -2349,7 +2073,6 @@ export default function AppLayout() {
     }
     return location.pathname.startsWith(path);
   };
-
   /* Close mobile sidebar on route change */
   useEffect(() => {
     setMobileOpen(false);
@@ -2362,6 +2085,10 @@ export default function AppLayout() {
     );
   }, [collapsed]);
 
+  useEffect(() => {
+    window.localStorage.setItem(CHAT_SIDEBAR_SECTIONS_KEY, JSON.stringify(chatSidebarSections));
+  }, [chatSidebarSections]);
+
   /* Keep the top-level switcher aligned with concrete routes. Chat owns /chat;
    * every other route renders the workspace surface. */
   useEffect(() => {
@@ -2370,21 +2097,89 @@ export default function AppLayout() {
 
   useEffect(() => {
     if (location.pathname !== "/chat") return;
+    const params = new URLSearchParams(location.search);
+    const newTarget = params.get("new");
+    if (newTarget === "chat") {
+      const draftId = params.get("draft");
+      setMode("chat");
+      setActiveConvId(draftId?.startsWith("manor-new:") ? draftId : "manor-new:chat");
+      setActiveConvType("manor");
+      setActiveDmAgentId(null);
+      setManorSessionsOpen(true);
+      return;
+    }
+    if (newTarget === "message" || newTarget === "workspace") {
+      setMode("chat");
+      setActiveConvId(newTarget === "message" ? "new-conversation" : "new-workspace");
+      setActiveConvType(newTarget === "message" ? "compose" : "workspace-draft");
+      setActiveDmAgentId(null);
+      return;
+    }
+    const humanRoomId = params.get("room");
+    if (humanRoomId) {
+      setMode("chat");
+      setActiveConvId(humanRoomId);
+      setActiveConvType("room");
+      setActiveDmAgentId(null);
+      return;
+    }
     const target = parseAppLayoutChatTarget(location.search);
-    if (!target) return;
     setMode("chat");
+    if (!target) {
+      setActiveConvId("manor-ai");
+      setActiveConvType("manor");
+      setActiveDmAgentId(null);
+      return;
+    }
     if (target.type === "conversation") {
       setActiveConvId(target.conversationId);
       setActiveConvType("manor");
-    } else {
+      setManorSessionsOpen(true);
+    } else if (target.type === "workspace") {
       setActiveConvId(target.workspaceId);
       setActiveConvType("operation");
+    } else {
+      setActiveConvId(dmConversationByAgentId[target.agentId] || `agent:${target.agentId}`);
+      setActiveConvType("dm");
+      setActiveDmAgentId(target.agentId);
+      const agent = chatAgentsList.find((item) => item.id === target.agentId);
+      if (agent) {
+        setHiredAgents((prev) => prev.some((item) => item.id === agent.id) ? prev : [...prev, agent]);
+      }
+      return;
     }
     setActiveDmAgentId(null);
     setConvSearchQuery("");
-  }, [location.pathname, location.search]);
+  }, [location.pathname, location.search, dmConversationByAgentId, chatAgentsList]);
 
   const isSettingsRoute = location.pathname === "/settings";
+  // A display preference only changes presentation. Account, setup, approval
+  // and artifact links retain their existing authorization and runtime paths.
+  const simpleSetupTab = new URLSearchParams(location.search).get("tab");
+  const isSimpleSetupPage = /^\/workspaces\/[^/]+$/.test(location.pathname)
+    && new URLSearchParams(location.search).get("setup") === "1"
+    && (simpleSetupTab === "channels" || simpleSetupTab === "capabilities");
+  const isSimplePage = location.pathname === "/"
+    || location.pathname === "/chat"
+    || location.pathname.startsWith("/chat/")
+    || isSettingsRoute
+    || location.pathname === "/account"
+    || location.pathname === "/company/clients"
+    || location.pathname === "/team/clients"
+    || location.pathname.startsWith("/client-delivery/")
+    || location.pathname === "/notifications"
+    || location.pathname === "/workspaces"
+    || isSimpleSetupPage
+    || location.pathname.startsWith("/viewer/")
+    || location.pathname.startsWith("/editor/")
+    || location.pathname.startsWith("/video-editor/")
+    || location.pathname.startsWith("/integrations")
+    ;
+  const simpleWorkspaceId = /^\/workspaces\/([^/]+)$/.exec(location.pathname)?.[1];
+  const simpleChatPath = simpleWorkspaceId && simpleWorkspaceId !== "new"
+    ? `/chat?workspace=${simpleWorkspaceId}`
+    : "/chat";
+  const showProfessionalPageNotice = simpleMode && !isSimplePage;
   const isTasksRoute =
     location.pathname === "/tasks" ||
     (location.pathname.startsWith("/tasks/") &&
@@ -2397,31 +2192,47 @@ export default function AppLayout() {
 
   const switchMode = useCallback(
     (nextMode: AppMode) => {
+      if (simpleMode && nextMode === "workspace") return;
       setMode(nextMode);
       if (nextMode === "chat") {
-        if (location.pathname !== "/chat") navigate("/chat");
+        if (location.pathname !== "/chat") {
+          // Match the destination before Chat mounts and starts scoped reads.
+          setActiveConvId("manor-ai");
+          setActiveConvType("manor");
+          setActiveDmAgentId(null);
+          navigate("/chat");
+        }
         return;
       }
       if (location.pathname === "/chat") navigate("/dashboard");
     },
-    [location.pathname, navigate],
+    [location.pathname, navigate, simpleMode],
   );
+
+  useEffect(() => {
+    if (hasSelectedInterfaceMode && simpleMode && location.pathname === "/dashboard") navigate("/chat", { replace: true });
+  }, [hasSelectedInterfaceMode, simpleMode, location.pathname, navigate]);
 
   // The onboarding tour highlights targets that only exist in one sidebar
   // mode; let it switch the app there (see OnboardingTour's "manor:tour-mode").
   useEffect(() => {
     const handleTourMode = (event: Event) => {
-      const nextMode = (event as CustomEvent<{ mode?: AppMode }>).detail?.mode;
+      const detail = (event as CustomEvent<{ mode?: AppMode; openSidebar?: boolean }>).detail;
+      const nextMode = detail?.mode;
       if (nextMode === "chat" || nextMode === "workspace") switchMode(nextMode);
+      if (typeof detail?.openSidebar === "boolean") setMobileOpen(detail.openSidebar);
     };
     // Agents/Skills/Integrations only mount while the Configure menu is open
     // in the expanded sidebar; the tour asks for it before highlighting them.
     const handleTourConfigure = () => setConfigureOpen(true);
+    const handleTourFinish = () => setMobileOpen(false);
     window.addEventListener("manor:tour-mode", handleTourMode);
     window.addEventListener("manor:tour-configure", handleTourConfigure);
+    window.addEventListener("manor:tour-finish", handleTourFinish);
     return () => {
       window.removeEventListener("manor:tour-mode", handleTourMode);
       window.removeEventListener("manor:tour-configure", handleTourConfigure);
+      window.removeEventListener("manor:tour-finish", handleTourFinish);
     };
   }, [switchMode]);
 
@@ -2442,6 +2253,8 @@ export default function AppLayout() {
         key={item.path}
         {...(linkProps as any)}
         data-tour={item.tourKey || undefined}
+        aria-label={t(item.i18nKey)}
+        aria-current={active ? "page" : undefined}
         title={sidebarCollapsed ? t(item.i18nKey) : undefined}
         style={{
           position: "relative",
@@ -2545,29 +2358,32 @@ export default function AppLayout() {
 
   const renderCollapsedChatButton = (item: {
     id: string;
-    type: "manor" | "operation" | "dm";
+    type: "manor" | "operation" | "dm" | "room";
     label: string;
     subtitle?: string;
-    avatarUrl?: string | null;
-    customAvatar?: ReactNode;
-    icon?: ReactNode;
-    initials?: string;
-    color?: string;
+    customAvatar: ReactNode;
     count?: number;
     agentId?: string;
+    sidebarId?: string;
   }) => {
-    const active = activeConvId === item.id;
+    const active = item.type === "manor"
+      ? activeConvType === "manor"
+      : activeConvType === item.type && activeConvId === item.id;
     return (
+      <span key={item.sidebarId || item.id} className="workspace-collapsed-chat-item">
       <button
-        key={item.id}
         type="button"
         title={item.subtitle ? `${item.label} · ${item.subtitle}` : item.label}
         aria-label={`Open ${item.label}`}
         aria-pressed={active}
         onClick={() => {
-          setActiveConvId(item.id);
-          setActiveConvType(item.type);
-          setActiveDmAgentId(item.type === "dm" ? item.agentId || null : null);
+          if (item.type === "manor") openManorChat();
+          else if (item.type === "operation") openWorkspaceChat(item.id);
+          else if (item.type === "room") openHumanRoom(item.id);
+          else {
+            const agent = hiredAgents.find((entry) => entry.id === item.agentId);
+            if (agent) openAgentDm(agent);
+          }
         }}
         style={{
           position: "relative",
@@ -2584,7 +2400,7 @@ export default function AppLayout() {
           display: "flex",
           alignItems: "center",
           justifyContent: "center",
-          cursor: "pointer",
+          cursor: "default",
           transition: "all 0.18s ease",
         }}
         onMouseEnter={(e) => {
@@ -2598,69 +2414,8 @@ export default function AppLayout() {
           }
         }}
       >
-        {active && (
-          <span
-            style={{
-              position: "absolute",
-              left: -6,
-              top: "50%",
-              width: 3,
-              height: 22,
-              borderRadius: "0 4px 4px 0",
-              background: "var(--sidebar-nav-active-indicator, var(--accent))",
-              transform: "translateY(-50%)",
-            }}
-          />
-        )}
-        {item.customAvatar ? (
-          item.customAvatar
-        ) : item.avatarUrl ? (
-          <img
-            src={item.avatarUrl}
-            alt=""
-            style={{
-              width: 30,
-              height: 30,
-              borderRadius: "50%",
-              objectFit: "cover",
-            }}
-          />
-        ) : item.icon ? (
-          <span
-            style={{
-              width: 30,
-              height: 30,
-              borderRadius: item.type === "manor" ? "50%" : 10,
-              background:
-                item.type === "manor" ? "#1c1917" : "var(--accent-soft)",
-              color: item.type === "manor" ? "#fff" : "var(--accent)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
-            {item.icon}
-          </span>
-        ) : (
-          <span
-            style={{
-              width: 30,
-              height: 30,
-              borderRadius: item.type === "dm" ? "50%" : 10,
-              background: item.color || "#5f928a",
-              color: "#fff",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              fontSize: 11,
-              fontWeight: 800,
-              letterSpacing: "-0.02em",
-            }}
-          >
-            {item.initials || item.label.charAt(0).toUpperCase()}
-          </span>
-        )}
-        {!!item.count && item.count > 0 && (
+        {item.customAvatar}
+        {item.type !== "operation" && !!item.count && item.count > 0 && (
           <span
             style={{
               position: "absolute",
@@ -2682,8 +2437,108 @@ export default function AppLayout() {
           </span>
         )}
       </button>
+      {item.type === "operation" && !!item.count && item.count > 0 && (
+        <WorkspaceAttentionBadge workspaceId={item.id} name={item.label} count={item.count} compact />
+      )}
+      </span>
     );
   };
+
+  const newConversationKind = new URLSearchParams(location.search).get("kind") === "group" ? "group" : "dm";
+  const manorMainActive = activeConvType === "manor" &&
+    (activeConvId === "manor-ai" || activeConvId.startsWith("manor-new:") || !manorSessionsOpen);
+  const chatWorkspaceSection = (!isSearchingConversations || filteredWorkspaces.length > 0) && (
+    <section aria-label={t("page.app_layout.workspaces")}>
+      <ChatSidebarSectionHeader
+        id="chat-sidebar-workspaces"
+        label={t("page.app_layout.workspaces")}
+        expanded={isChatSidebarSectionOpen("workspaces")}
+        onToggle={() => toggleChatSidebarSection("workspaces")}
+        searching={isSearchingConversations}
+        attentionCount={matchingWorkspaces.reduce((count, ws) => count + positiveStat(actionCounts[ws.id]), 0)}
+        action={<WorkspaceAddAction
+          cloud={deploymentMode === "cloud"}
+          ready={workspaceAddReady}
+          className="conv-section-add"
+          tourId="create-workspace"
+          onCreate={openNewWorkspaceDraft}
+          onMarketplace={openWorkspaceMarketplace}
+        />}
+      />
+      {isChatSidebarSectionOpen("workspaces") && <div id="chat-sidebar-workspaces">
+      <div data-sidebar-reorder-list="workspaces" className={`workspace-sidebar-list${allSidebarWorkspaces && !isSearchingConversations ? " workspace-sidebar-list--expanded" : ""}`}>
+      {filteredWorkspaces.map((ws) => {
+        const isActive = activeConvType === "operation" && activeConvId === ws.id;
+        if (renamingWorkspace?.id === ws.id) {
+          return <form key={ws.id} className="conv-row conv-row-rename" onSubmit={(event) => {
+            event.preventDefault();
+            const name = workspaceNameDraft.trim();
+            if (name && name !== ws.name) renameWorkspaceFromSidebar.mutate({ id: ws.id, name });
+            else if (name === ws.name) setRenamingWorkspace(null);
+          }}>
+            <Input
+              value={workspaceNameDraft}
+              onChange={(event) => setWorkspaceNameDraft(event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Escape") setRenamingWorkspace(null); }}
+              maxLength={255}
+              ariaLabel={getLocale() === "zh" ? `重命名 ${ws.name}` : `Rename ${ws.name}`}
+              className="conv-row-rename-field"
+              error={workspaceRenameError || undefined}
+              autoFocus
+              disabled={renameWorkspaceFromSidebar.isPending}
+            />
+            <Button type="submit" size="sm" variant="ghost" disabled={!workspaceNameDraft.trim() || renameWorkspaceFromSidebar.isPending} ariaLabel={t("action.save")}>{t("action.save")}</Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setRenamingWorkspace(null)} disabled={renameWorkspaceFromSidebar.isPending} ariaLabel={t("action.cancel")}>×</Button>
+          </form>;
+        }
+        return <div key={ws.id} data-workspace-id={ws.id} {...workspaceSidebar.rowAttributes(ws.id)}
+          className={`conv-row conv-row--with-menu workspace-sidebar-row ${isActive ? "conv-row--active" : ""}`}
+        >
+          <button type="button" className="conv-row-main sidebar-reorder-button"
+          aria-current={isActive ? "page" : undefined}
+          aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: ws.name })}
+          title={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_hint")}
+          {...workspaceSidebar.buttonAttributes(ws.id, () => openWorkspaceChat(ws.id))}
+          >
+            <WorkspaceIconTile workspace={ws} size={30} iconSize={15} style={{ borderRadius: 9, flexShrink: 0 }} />
+            <span className="min-w-0 flex-1">
+              <HoverMarqueeText className="conv-name" text={ws.name} style={(actionCounts[ws.id] || 0) > 0 ? { fontWeight: 800, color: "var(--text-strong)" } : undefined} />
+              {(!simpleMode || (ws.status && ws.status !== "active")) && <span className="conv-preview block">{workspaceStatusLabel(ws.status)}</span>}
+            </span>
+          </button>
+          {(actionCounts[ws.id] || 0) > 0 && <WorkspaceAttentionBadge workspaceId={ws.id} name={ws.name} count={actionCounts[ws.id]} />}
+          <SidebarRowMenu
+            name={ws.name}
+            items={[
+              { key: "details", label: getLocale() === "zh" ? "Workspace 设置" : "Workspace settings" },
+              ...(ws.can_manage ? [{ key: "rename", label: getLocale() === "zh" ? "重命名 Workspace" : "Rename Workspace" }] : []),
+              ...(ws.can_delete ? [{ key: "delete", label: t("page.workspaces.delete_workspace"), danger: true }] : []),
+            ]}
+            onSelect={(key) => {
+              if (key === "details") navigate(`/workspaces/${encodeURIComponent(ws.id)}?tab=settings`);
+              if (key === "rename") {
+                setRenamingWorkspace(ws);
+                setWorkspaceNameDraft(ws.name);
+                setWorkspaceRenameError("");
+              }
+              if (key === "delete" && ws.can_delete) {
+                setDeleteWorkspaceTarget(ws);
+                setDeleteWorkspaceError("");
+              }
+            }}
+          />
+        </div>;
+      })}
+      </div>
+      {!isSearchingConversations && matchingWorkspaces.length > WORKSPACE_SIDEBAR_LIMIT && <button
+        type="button"
+        className="workspace-sidebar-expand"
+        aria-expanded={allSidebarWorkspaces}
+        onClick={() => setAllSidebarWorkspaces((value) => !value)}
+      >{allSidebarWorkspaces ? t("page.app_layout.workspace_show_less") : t("page.app_layout.workspace_show_all", { count: String(matchingWorkspaces.length) })}</button>}
+      </div>}
+    </section>
+  );
 
   return (
     <div className="flex flex-col h-screen relative">
@@ -2750,7 +2605,7 @@ export default function AppLayout() {
                   height: 32,
                   minWidth: 32,
                   borderRadius: 8,
-                  background: "#1c1917",
+                  background: "#000000",
                   display: "flex",
                   alignItems: "center",
                   justifyContent: "center",
@@ -2758,7 +2613,7 @@ export default function AppLayout() {
                   boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
                 }}
               >
-                <ManorLogo size={16} color="white" className="manor-brand-logo" />
+                <ManorLogo size={24} color="white" className="manor-brand-logo" />
               </div>
               {!sidebarCollapsed && (
                 <span
@@ -2775,8 +2630,8 @@ export default function AppLayout() {
               )}
               {!sidebarCollapsed && (
                 <button
-                  aria-label="Collapse sidebar"
-                  title="Collapse sidebar"
+                  aria-label={t("page.app_layout.collapse_sidebar")}
+                  title={t("page.app_layout.collapse_sidebar")}
                   onClick={() => {
                     if (mobileOpen) {
                       setMobileOpen(false);
@@ -2823,8 +2678,8 @@ export default function AppLayout() {
             {sidebarCollapsed && (
               <button
                 className="app-sidebar-edge-toggle"
-                aria-label="Expand sidebar"
-                title="Expand sidebar"
+                aria-label={t("page.app_layout.expand_sidebar")}
+                title={t("page.app_layout.expand_sidebar")}
                 onClick={() => {
                   if (mobileOpen) {
                     setMobileOpen(false);
@@ -2850,15 +2705,24 @@ export default function AppLayout() {
             )}
 
             {/* ── MODE SWITCHER ── */}
+            {(!simpleMode || sidebarCollapsed) && (
             <div
               style={{
                 padding: sidebarCollapsed ? "0 0 12px" : "0 16px 12px",
                 display: sidebarCollapsed ? "flex" : undefined,
                 justifyContent: sidebarCollapsed ? "center" : undefined,
               }}
-              data-tour="mode-switcher"
+              data-tour={simpleMode ? "create-workspace" : "mode-switcher"}
             >
-              {sidebarCollapsed ? (
+              {simpleMode ? (
+                <WorkspaceAddAction
+                  cloud={deploymentMode === "cloud"}
+                  ready={workspaceAddReady}
+                  className="conv-section-add conv-section-add--collapsed"
+                  onCreate={openNewWorkspaceDraft}
+                  onMarketplace={openWorkspaceMarketplace}
+                />
+              ) : sidebarCollapsed ? (
                 <div
                   style={{
                     display: "grid",
@@ -3014,9 +2878,11 @@ export default function AppLayout() {
                 </div>
               )}
             </div>
+            )}
 
             {/* ── SCROLLABLE NAV ── */}
             <div
+              data-sidebar-scroll-area
               style={{
                 flex: 1,
                 overflowY: "auto",
@@ -3026,13 +2892,13 @@ export default function AppLayout() {
               {/* ══════════════════════════════════════════════ */}
               {/* CHAT MODE: Conversation list                   */}
               {/* ══════════════════════════════════════════════ */}
-              {mode === "chat" && !sidebarCollapsed && (
+              {sidebarMode === "chat" && !sidebarCollapsed && (
                 <div
                   style={{ display: "flex", flexDirection: "column", gap: 0 }}
                 >
                   {/* Search input */}
-                  <div style={{ padding: "0 8px 8px" }}>
-                    <div style={{ position: "relative" }}>
+                  <div className="chat-sidebar-global-search-wrap">
+                    <div className="chat-sidebar-global-search-field">
                       <svg
                         width="13"
                         height="13"
@@ -3040,12 +2906,7 @@ export default function AppLayout() {
                         fill="none"
                         stroke="#a8a29e"
                         strokeWidth={2}
-                        style={{
-                          position: "absolute",
-                          left: 10,
-                          top: "50%",
-                          transform: "translateY(-50%)",
-                        }}
+                        className="chat-sidebar-global-search-icon"
                       >
                         <circle cx="11" cy="11" r="8" />
                         <line x1="21" y1="21" x2="16.65" y2="16.65" />
@@ -3069,55 +2930,64 @@ export default function AppLayout() {
                             openManorChat();
                             return;
                           }
+                          const firstWorkspace = filteredWorkspaces[0];
+                          if (firstWorkspace) {
+                            e.preventDefault();
+                            openWorkspaceChat(firstWorkspace.id);
+                            return;
+                          }
+                          const firstGroup = filteredHumanChatRooms.find((room) => room.kind === "group");
+                          if (firstGroup) {
+                            e.preventDefault();
+                            openHumanRoom(firstGroup.id);
+                            return;
+                          }
+                          const firstDirect = filteredHumanChatRooms.find((room) => room.kind === "dm");
+                          if (firstDirect) {
+                            e.preventDefault();
+                            openHumanRoom(firstDirect.id);
+                            return;
+                          }
                           const firstMatch =
-                            filteredDmAgents[0] || filteredSearchAgents[0];
+                            filteredDmAgents[0] || visibleSearchAgents[0];
                           if (!firstMatch) return;
                           e.preventDefault();
                           openAgentDm(firstMatch);
                         }}
-                        placeholder={t("page.app_layout.search_chats_and_agents")}
-                        aria-label={t("page.app_layout.search_chats_and_agents")}
+                        placeholder={t(simpleMode ? "page.app_layout.search_conversations" : "page.app_layout.search_chats_and_agents")}
+                        aria-label={t(simpleMode ? "page.app_layout.search_conversations" : "page.app_layout.search_chats_and_agents")}
                       />
                     </div>
                   </div>
 
-                  {/* PINNED section */}
-                  {!isSearchingConversations && (
-                    <div className="conv-section-label">
-                      {t("page.app_layout.pinned")}
-                    </div>
-                  )}
 
-                  {/* Manor AI conversation and its sessions share the global search. */}
+                  {/* Manor AI and its sessions lead the chat list. */}
                   {(!isSearchingConversations || manorSearchHasResults) && (
-                    <div className="manor-session-group">
+                    <section className="manor-session-group" aria-label={t("page.app_layout.ai_chats")}>
+                      <ChatSidebarSectionHeader
+                        id="chat-sidebar-ai-chats"
+                        label={t("page.app_layout.ai_chats")}
+                        expanded={isChatSidebarSectionOpen("ai")}
+                        onToggle={() => toggleChatSidebarSection("ai")}
+                        searching={isSearchingConversations}
+                        attentionCount={positiveStat(actionCounts["manor-ai"])}
+                        action={<button type="button" className="conv-section-add" aria-label={t("component.session_switcher.new_chat_2")} title={t("component.session_switcher.new_chat_2")} onClick={startNewManorSession}>
+                          <IconPlus />
+                        </button>}
+                      />
+                      {isChatSidebarSectionOpen("ai") && <div id="chat-sidebar-ai-chats">
                       <div
-                        className={`conv-row conv-row--manor ${activeConvType === "manor" ? "conv-row--active" : ""}`}
+                        className={`conv-row conv-row--manor ${manorMainActive ? "conv-row--active" : ""}`}
                       >
-                        {activeConvType === "manor" && (
-                          <span className="conv-active-bar" />
-                        )}
                         <button
                           type="button"
                           className="conv-row-main"
+                          aria-current={manorMainActive ? "page" : undefined}
                           onClick={openManorChat}
                         >
-                          <span
-                            className="conv-avatar"
-                            style={{ background: "#1c1917", borderRadius: "50%" }}
-                          >
-                            <ManorLogo />
-                          </span>
+                          <UserAvatar type="manor" size={30} />
                           <span className="conv-row-copy">
-                            <span className="conv-name">
-                              Manor AI
-                              <span
-                                style={{ marginLeft: 4, fontSize: 10 }}
-                                title={t("page.app_layout.pinned")}
-                              >
-                                {"\uD83D\uDCCC"}
-                              </span>
-                            </span>
+                            <span className="conv-name">Manor AI</span>
                             <span className="conv-preview">
                               {t("page.app_layout.your_ai_chief_of_staff")}
                             </span>
@@ -3169,13 +3039,13 @@ export default function AppLayout() {
                           {!chatConversationsLoading &&
                             !chatConversationsError &&
                             filteredManorChatSessions.length > 0 && (
-                              <div className="manor-session-list">
+                              <div className="manor-session-list" data-sidebar-reorder-list="ai">
                                 {filteredManorChatSessions.map((conversation) => {
                                   const isActive =
                                     activeConvType === "manor" &&
                                     activeConvId === conversation.id;
                                   const isRenaming =
-                                    renamingManorSessionId === conversation.id;
+                                    renamingConversationId === conversation.id;
                                   const runningActivity =
                                     runningManorSessionActivities.get(
                                       conversation.id,
@@ -3191,13 +3061,13 @@ export default function AppLayout() {
                                         className="manor-session-rename"
                                         onSubmit={(event) => {
                                           event.preventDefault();
-                                          submitRenameManorSession();
+                                          submitRenameConversation();
                                         }}
                                       >
                                         <Input
-                                          value={manorSessionTitleDraft}
+                                          value={conversationTitleDraft}
                                           onChange={(event) =>
-                                            setManorSessionTitleDraft(
+                                            setConversationTitleDraft(
                                               event.target.value,
                                             )
                                           }
@@ -3210,9 +3080,9 @@ export default function AppLayout() {
                                             },
                                           )}
                                           className="manor-session-rename-input"
-                                          error={manorSessionRenameError || undefined}
+                                          error={conversationRenameError || undefined}
                                           autoFocus
-                                          disabled={renameManorSession.isPending}
+                                          disabled={renameChatConversation.isPending}
                                         />
                                         <div className="manor-session-rename-actions">
                                           <Button
@@ -3222,8 +3092,8 @@ export default function AppLayout() {
                                             className="manor-session-icon-action"
                                             title={t("action.save")}
                                             ariaLabel={t("action.save")}
-                                            loading={renameManorSession.isPending}
-                                            disabled={!manorSessionTitleDraft.trim()}
+                                            loading={renameChatConversation.isPending}
+                                            disabled={!conversationTitleDraft.trim()}
                                           >
                                             <svg
                                               width="14"
@@ -3243,10 +3113,10 @@ export default function AppLayout() {
                                             variant="ghost"
                                             size="sm"
                                             className="manor-session-icon-action"
-                                            onClick={cancelRenameManorSession}
+                                            onClick={cancelRenameConversation}
                                             title={t("action.cancel")}
                                             ariaLabel={t("action.cancel")}
-                                            disabled={renameManorSession.isPending}
+                                            disabled={renameChatConversation.isPending}
                                           >
                                             <svg
                                               width="14"
@@ -3270,37 +3140,44 @@ export default function AppLayout() {
                                   return (
                                     <div
                                       key={conversation.id}
-                                      className={`manor-session-row ${isActive ? "manor-session-row--active" : ""}`}
+                                      {...aiSidebar.rowAttributes(conversation.id)}
+                                      className={`conv-row manor-session-row ${isActive ? "conv-row--active manor-session-row--active" : ""}`}
                                     >
                                       <button
                                         type="button"
-                                        className="manor-session-row-main"
+                                        className="manor-session-row-main sidebar-reorder-button"
                                         aria-current={isActive ? "page" : undefined}
-                                        onClick={() =>
-                                          openManorSession(conversation.id)
-                                        }
+                                        aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: conversation.title || t("page.chat_history.untitled") })}
+                                        {...aiSidebar.buttonAttributes(conversation.id, () => openManorSession(conversation.id))}
                                       >
-                                        <HoverMarqueeText
-                                          className="manor-session-title"
-                                          text={
-                                            conversation.title ||
-                                            t("page.chat_history.untitled")
-                                          }
-                                        />
-                                        <span className="manor-session-time">
-                                          {relativeTime(
-                                            conversation.updated_at ||
-                                              conversation.created_at,
-                                          )}
+                                        <span className="manor-session-avatar" aria-hidden="true">
+                                          <IconChatSmall />
+                                        </span>
+                                        <span className="manor-session-copy">
+                                          <HoverMarqueeText
+                                            className="manor-session-title"
+                                            text={
+                                              conversation.title ||
+                                              t("page.chat_history.untitled")
+                                            }
+                                          />
+                                          <span className="manor-session-time">
+                                            {relativeTime(
+                                              conversation.updated_at ||
+                                                conversation.created_at,
+                                            )}
+                                          </span>
                                         </span>
                                       </button>
                                       <Dropdown
                                         align="right"
+                                        constrainTo=".app-shell-sidebar"
+                                        menuStyle={{ border: "none" }}
                                         trigger={
                                           <Button
                                             variant="ghost"
                                             size="sm"
-                                            className={`manor-session-more ${isRunning ? "manor-session-more--running" : ""}`}
+                                            className={`manor-session-more sidebar-row-more ${isRunning ? "manor-session-more--running" : ""}`}
                                             title={t(
                                               isRunning
                                                 ? "page.app_layout.running_manor_session_menu"
@@ -3350,11 +3227,11 @@ export default function AppLayout() {
                                         ]}
                                         onSelect={(key) => {
                                           if (key === "rename") {
-                                            beginRenameManorSession(conversation);
+                                            beginRenameConversation(conversation);
                                             return;
                                           }
-                                          setDeleteManorSessionError("");
-                                          setDeleteManorSessionTarget(conversation);
+                                          setDeleteConversationError("");
+                                          setDeleteConversationTarget(conversation);
                                         }}
                                       />
                                     </div>
@@ -3385,98 +3262,137 @@ export default function AppLayout() {
                           )}
                         </div>
                       )}
-                    </div>
+                      </div>}
+                    </section>
                   )}
 
-                  {/* WORKSPACES section */}
-                  {!isSearchingConversations &&
-                    filteredWorkspaces.length > 0 && (
-                      <>
-                        <div className="conv-section-label">
-                          {t("page.app_layout.workspaces")}
-                        </div>
-                        {filteredWorkspaces.map((ws) => {
-                          const isActive = activeConvId === ws.id;
-                          const openWorkspace = () => {
-                            setActiveConvId(ws.id);
-                            setActiveConvType("operation");
-                            setActiveDmAgentId(null);
-                            navigate(`/chat?workspace=${encodeURIComponent(ws.id)}`);
-                          };
-                          return (
-                            <div
-                              role="button"
-                              tabIndex={0}
-                              key={ws.id}
-                              className={`conv-row conv-row--button ${isActive ? "conv-row--active" : ""}`}
-                              onClick={openWorkspace}
-                              onKeyDown={(event) => {
-                                if (
-                                  event.key === "Enter" ||
-                                  event.key === " "
-                                ) {
-                                  event.preventDefault();
-                                  openWorkspace();
-                                }
-                              }}
-                            >
-                              {isActive && <span className="conv-active-bar" />}
-                              <WorkspaceIconTile
-                                workspace={ws}
-                                size={30}
-                                iconSize={15}
-                                style={{ borderRadius: 9, flexShrink: 0 }}
-                              />
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <HoverMarqueeText
-                                  className="conv-name"
-                                  text={ws.name}
-                                  style={
-                                    (actionCounts[ws.id] || 0) > 0
-                                      ? {
-                                          fontWeight: 800,
-                                          color: "var(--text-strong)",
-                                        }
-                                      : undefined
-                                  }
-                                />
-                                <div className="conv-preview">
-                                  {workspaceStatusLabel(ws.status)}
-                                </div>
-                              </div>
-                              {(actionCounts[ws.id] || 0) > 0 && (
-                                <span className="conv-badge">
-                                  {actionCounts[ws.id]}
-                                </span>
-                              )}
-                            </div>
-                          );
-                        })}
-                      </>
-                    )}
+                  {chatWorkspaceSection}
 
-                  {/* DIRECT MESSAGES section */}
-                  {filteredDmAgents.length > 0 && (
+                  {(["group", "dm"] as const).map((kind) => {
+                    const sidebar = kind === "group" ? groupSidebar : dmSidebar;
+                    const rank = new Map(sidebar.items.map((item, index) => [item.id, index]));
+                    const matchingRooms = filteredHumanChatRooms.filter((room) => room.kind === kind);
+                    if (isSearchingConversations && !matchingRooms.length && (kind === "group" || (filteredDmAgents.length === 0 && visibleSearchAgents.length === 0))) return null;
+                    const sectionLabel = kind === "group" ? (getLocale() === "zh" ? "群聊" : "Group chats") : (getLocale() === "zh" ? "私聊" : "Direct chats");
+                    return <section key={kind} aria-label={sectionLabel}>
+                      <ChatSidebarSectionHeader
+                        id={`chat-sidebar-${kind}`}
+                        label={sectionLabel}
+                        expanded={isChatSidebarSectionOpen(kind)}
+                        onToggle={() => toggleChatSidebarSection(kind)}
+                        searching={isSearchingConversations}
+                        attentionCount={kind === "group" ? matchingRooms.reduce((count, room) => count + positiveStat(room.unread_count), 0) : filteredDmAgents.reduce((count, agent) => count + positiveStat(actionCounts[agent.id]), 0)}
+                        badge={kind === "group" && groupUsageLoaded && humanChatRoomsLoaded && groupDiscovery.badgeVisible && !isSearchingConversations ? <FeatureDiscoveryBadge label={t("component.feature_discovery.new")} onClick={groupDiscovery.reveal} expanded={groupDiscovery.open} controls="group-chat-feature-discovery" /> : undefined}
+                        action={<button type="button" className="conv-section-add" aria-label={kind === "group" ? (getLocale() === "zh" ? "新建群聊" : "New group chat") : (getLocale() === "zh" ? "新建私聊" : "New direct chat")} title={kind === "group" ? (getLocale() === "zh" ? "新建群聊" : "New group chat") : (getLocale() === "zh" ? "新建私聊" : "New direct chat")} onClick={kind === "group" ? openNewGroup : openNewConversation}><IconPlus /></button>}
+                      />
+                      {kind === "group" && groupDiscovery.open && !isSearchingConversations && <FeatureDiscoveryHint id="group-chat-feature-discovery" title={t("component.feature_discovery.group_chat_title")} description={t("component.feature_discovery.group_chat_description")} actionLabel={t("component.feature_discovery.create_group")} laterLabel={t("component.feature_discovery.later")} onAction={openNewGroup} onDismiss={groupDiscovery.dismiss} />}
+                      {isChatSidebarSectionOpen(kind) && <div id={`chat-sidebar-${kind}`} data-sidebar-reorder-list={kind}>
+                      {!matchingRooms.length && kind === "group" && <div className="px-4 py-1 text-xs text-[var(--text-faint)]">{getLocale() === "zh" ? "还没有群聊" : "No group chats yet"}</div>}
+                      {[...matchingRooms.map((room) => {
+                        const sidebarId = kind === "dm" ? `room:${room.id}` : room.id;
+                        const isActive = activeConvType === "room" && activeConvId === room.id;
+                        const memberRole = room.members.find((member) => member.user_id === user?.id)?.role;
+                        const otherMember = room.kind === "dm" ? room.members.find((member) => member.user_id !== user?.id) : undefined;
+                        return <div key={sidebarId} {...sidebar.rowAttributes(sidebarId)} className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}>
+                          <button type="button" className="conv-row-main sidebar-reorder-button" aria-current={isActive ? "page" : undefined} aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: room.title })} {...sidebar.buttonAttributes(sidebarId, () => openHumanRoom(room.id))}>
+                            {room.kind === "group" ? <GroupChatAvatar title={room.title} members={room.members} currentUserId={user?.id} /> : <UserAvatar name={room.title} avatarUrl={otherMember?.avatar_url} size={30} />}
+                            <span className="min-w-0 flex-1"><HoverMarqueeText className="conv-name" text={room.title} style={room.kind === "group" && (room.unread_count || 0) > 0 ? { fontWeight: 800, color: "var(--text-strong)" } : undefined} /><span className="conv-preview block">{room.kind === "group" ? groupChatSummary(room) : room.member_count < 2 ? (getLocale() === "zh" ? "私聊 · 等待加入" : "Direct message · Awaiting acceptance") : room.online_user_ids ? <span className="inline-flex items-center gap-1.5"><span aria-hidden="true" className={room.online_user_ids.some((id) => id !== user?.id) ? "chat-status-dot chat-status-dot--online" : "chat-status-dot bg-[var(--text-faint)]"} />{getLocale() === "zh" ? "私聊 · " : "Direct message · "}{room.online_user_ids.some((id) => id !== user?.id) ? (getLocale() === "zh" ? "在线" : "Online") : (getLocale() === "zh" ? "离线" : "Offline")}</span> : (getLocale() === "zh" ? "私聊" : "Direct message")}</span></span>
+                          </button>
+                          {room.kind === "group" && (room.unread_count || 0) > 0 && <span className="conv-badge" aria-label={getLocale() === "zh" ? `${room.unread_count} 条未读消息` : `${room.unread_count} unread messages`}>{(room.unread_count || 0) > 99 ? "99+" : room.unread_count}</span>}
+                          <SidebarRowMenu
+                            name={room.title}
+                            items={[
+                              { key: "details", label: room.kind === "group" ? (getLocale() === "zh" ? "群聊详情" : "Group details") : (getLocale() === "zh" ? "私聊详情" : "Direct message details") },
+                              ...(room.kind === "group" && (memberRole === "owner" || memberRole === "admin") ? [{ key: "rename", label: getLocale() === "zh" ? "重命名群聊" : "Rename group" }] : []),
+                              ...(room.kind === "group" && memberRole === "owner" ? [{ key: "close", label: getLocale() === "zh" ? "解散群聊" : "Close group", danger: true }] : []),
+                            ]}
+                            onSelect={(key) => {
+                              if (key === "details" || key === "rename" || key === "close") openHumanRoomAction(room.id, key);
+                            }}
+                          />
+                        </div>;
+                      }), ...(kind === "dm" ? filteredDmAgents
+                    .filter((agent) => agent && agent.name)
+                    .map((agent) => {
+                      const sidebarId = `agent:${agent.id}`;
+                      const dmConversation = dmConversationRecordByAgentId.get(agent.id);
+                      const isDraft = !dmConversation && !chatConversationsLoading && !chatConversationsError;
+                      const isActive = activeConvType === "dm" && activeDmAgentId === agent.id;
+                      if ((dmConversation && renamingConversationId === dmConversation.id) || (isDraft && renamingAgentDraftId === agent.id)) {
+                        return <form key={sidebarId} className="conv-row conv-row-rename" onSubmit={(event) => {
+                          event.preventDefault();
+                          submitRenameConversation();
+                        }}>
+                          <Input
+                            value={conversationTitleDraft}
+                            onChange={(event) => setConversationTitleDraft(event.target.value)}
+                            onKeyDown={(event) => { if (event.key === "Escape") cancelRenameConversation(); }}
+                            maxLength={500}
+                            ariaLabel={t("component.session_switcher.rename_chat_label", { title: dmConversation?.title || agent.name })}
+                            className="conv-row-rename-field"
+                            error={conversationRenameError || undefined}
+                            autoFocus
+                            disabled={renameChatConversation.isPending || startAgentConversation.isPending}
+                          />
+                          <Button type="submit" size="sm" variant="ghost" loading={renameChatConversation.isPending || startAgentConversation.isPending} disabled={!conversationTitleDraft.trim()} ariaLabel={t("action.save")}>{t("action.save")}</Button>
+                          <Button type="button" size="sm" variant="ghost" onClick={cancelRenameConversation} disabled={renameChatConversation.isPending || startAgentConversation.isPending} ariaLabel={t("action.cancel")}>×</Button>
+                        </form>;
+                      }
+                      return (
+                        <div
+                          key={sidebarId}
+                          {...dmSidebar.rowAttributes(sidebarId)}
+                          className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}
+                        >
+                          <button type="button" className="conv-row-main sidebar-reorder-button" aria-current={isActive ? "page" : undefined} aria-description={isSearchingConversations ? undefined : t("page.app_layout.workspace_drag_name", { name: dmConversation?.title || agent.name })} {...dmSidebar.buttonAttributes(sidebarId, () => openAgentDm(agent))}>
+                            <AgentAvatar name={agent.name} avatarUrl={agent.avatar_url} seed={agent.id} size={30} className="conv-avatar" />
+                            <span className="min-w-0 flex-1">
+                              <HoverMarqueeText className="conv-name" text={dmConversation?.title || agent.name} />
+                              <span className="conv-preview block">{dmConversation?.title ? agent.name : agentPreview(agent, "page.app_layout.agent")}</span>
+                            </span>
+                          </button>
+                          {(actionCounts[agent.id] || 0) > 0 && <span className="conv-badge">{actionCounts[agent.id]}</span>}
+                          <SidebarRowMenu
+                            name={agent.name}
+                            items={[
+                              { key: "profile", label: getLocale() === "zh" ? "查看 Agent" : "View Agent" },
+                              ...(dmConversation || isDraft ? [
+                                { key: "rename", label: t("component.session_switcher.rename_chat") },
+                                { key: "delete", label: t("component.session_switcher.delete_chat"), danger: true },
+                              ] : []),
+                            ]}
+                            onSelect={(key) => {
+                              if (key === "profile") navigate(`/agents/${encodeURIComponent(agent.id)}`);
+                              if (key === "rename") {
+                                if (dmConversation) beginRenameConversation(dmConversation);
+                                else if (isDraft) beginRenameAgentDraft(agent);
+                              }
+                              if (key === "delete" && dmConversation) {
+                                setDeleteConversationError("");
+                                setDeleteConversationTarget(dmConversation);
+                              } else if (key === "delete" && isDraft) {
+                                setHiredAgents((previous) => previous.filter((item) => item.id !== agent.id));
+                                if (isActive) openManorChat();
+                              }
+                            }}
+                          />
+                        </div>
+                      );
+                    }) : [])].sort((a, b) => (rank.get(String(a.key)) ?? Infinity) - (rank.get(String(b.key)) ?? Infinity))}
+
+                      {/* Search can offer new AI direct chats below existing ones. */}
+                      {kind === "dm" && visibleSearchAgents.length > 0 && (
                     <>
-                      <div className="conv-section-label">
-                        {t("page.app_layout.direct_messages")}
-                      </div>
-                      {filteredDmAgents
-                        .filter((a) => a && a.name)
-                        .map((agent) => {
-                          const convId =
-                            dmConversationByAgentId[agent.id] ||
-                            `agent:${agent.id}`;
-                          const isActive =
-                            activeConvType === "dm" &&
-                            activeDmAgentId === agent.id;
-                          return (
-                            <div
-                              key={agent.id}
-                              className={`conv-row ${isActive ? "conv-row--active" : ""}`}
-                              onClick={() => openAgentDm(agent)}
-                            >
-                              {isActive && <span className="conv-active-bar" />}
+                      {visibleSearchAgents.map((agent) => {
+                        const isActive =
+                          activeConvType === "dm" &&
+                          activeDmAgentId === agent.id;
+                        return (
+                          <div
+                            key={agent.id}
+                            className={`conv-row conv-row--with-menu ${isActive ? "conv-row--active" : ""}`}
+                          >
+                            <button type="button" className="conv-row-main" aria-current={isActive ? "page" : undefined} onClick={() => openAgentDm(agent)}>
                               <AgentAvatar
                                 name={agent.name}
                                 avatarUrl={agent.avatar_url}
@@ -3485,68 +3401,31 @@ export default function AppLayout() {
                                 className="conv-avatar"
                               />
                               <div style={{ flex: 1, minWidth: 0 }}>
-                                <div className="conv-name">{agent.name}</div>
+                                <HoverMarqueeText className="conv-name" text={agent.name} />
                                 <div className="conv-preview">
-                                  {agentPreview(agent, "page.app_layout.agent")}
+                                  {agentPreview(
+                                    agent,
+                                    "page.app_layout.start_a_chat",
+                                  )}
                                 </div>
                               </div>
-                              {(actionCounts[agent.id] || 0) > 0 && (
-                                <span className="conv-badge">
-                                  {actionCounts[agent.id]}
-                                </span>
-                              )}
-                            </div>
-                          );
-                        })}
-                    </>
-                  )}
-
-                  {/* AGENT SEARCH RESULTS section */}
-                  {filteredSearchAgents.length > 0 && (
-                    <>
-                      <div className="conv-section-label">
-                        {t("page.app_layout.start_direct_chat")}
-                      </div>
-                      {filteredSearchAgents.map((agent) => {
-                        const convId =
-                          dmConversationByAgentId[agent.id] ||
-                          `agent:${agent.id}`;
-                        const isActive =
-                          activeConvType === "dm" &&
-                          activeDmAgentId === agent.id;
-                        return (
-                          <div
-                            key={agent.id}
-                            className={`conv-row ${isActive ? "conv-row--active" : ""}`}
-                            onClick={() => openAgentDm(agent)}
-                          >
-                            {isActive && <span className="conv-active-bar" />}
-                            <AgentAvatar
-                              name={agent.name}
-                              avatarUrl={agent.avatar_url}
-                              seed={agent.id}
-                              size={30}
-                              className="conv-avatar"
-                            />
-                            <div style={{ flex: 1, minWidth: 0 }}>
-                              <div className="conv-name">{agent.name}</div>
-                              <div className="conv-preview">
-                                {agentPreview(
-                                  agent,
-                                  "page.app_layout.start_a_chat",
-                                )}
-                              </div>
-                            </div>
+                            </button>
+                            <SidebarRowMenu name={agent.name} items={[{ key: "profile", label: getLocale() === "zh" ? "查看 Agent" : "View Agent" }]} onSelect={() => navigate(`/agents/${encodeURIComponent(agent.id)}`)} />
                           </div>
                         );
                       })}
                     </>
                   )}
+                      </div>}
+                    </section>;
+                  })}
 
                   {convSearchQuery.trim() &&
                     !manorSearchHasResults &&
+                    filteredWorkspaces.length === 0 &&
+                    filteredHumanChatRooms.length === 0 &&
                     filteredDmAgents.length === 0 &&
-                    filteredSearchAgents.length === 0 && (
+                    visibleSearchAgents.length === 0 && (
                       <div
                         style={{
                           padding: "14px 12px",
@@ -3555,13 +3434,13 @@ export default function AppLayout() {
                           textAlign: "center",
                         }}
                       >
-                        {t("page.app_layout.no_matching_chats_or_agents")}
+                        {t(simpleMode ? "page.app_layout.no_matching_conversations" : "page.app_layout.no_matching_chats_or_agents")}
                       </div>
                     )}
                 </div>
               )}
 
-              {mode === "chat" && sidebarCollapsed && (
+              {sidebarMode === "chat" && sidebarCollapsed && (
                 <div
                   style={{
                     display: "flex",
@@ -3571,22 +3450,25 @@ export default function AppLayout() {
                     padding: "4px 0 10px",
                   }}
                 >
+                  <button type="button" title={getLocale() === "zh" ? "新建对话" : "New conversation"} aria-label={getLocale() === "zh" ? "新建对话" : "New conversation"} onClick={openNewConversation} className="flex h-9 w-9 items-center justify-center rounded-xl bg-[var(--surface-muted)] text-[var(--text-strong)]"><IconPlus /></button>
                   {renderCollapsedChatButton({
                     id: "manor-ai",
                     type: "manor",
                     label: "Manor AI",
                     subtitle: t("page.app_layout.your_ai_chief_of_staff"),
-                    icon: <ManorLogo size={15} color="white" />,
+                    customAvatar: <UserAvatar type="manor" size={30} />,
                     count: actionCounts["manor-ai"] || 0,
                   })}
 
-                  {chatWorkspaces.slice(0, 8).map((ws) => {
+                  {orderedWorkspaces.slice(0, 8).map((ws) => {
                     return renderCollapsedChatButton({
                       id: ws.id,
                       type: "operation",
                       label: ws.name,
                       subtitle:
-                        ws.status === "active"
+                        simpleMode && (!ws.status || ws.status === "active")
+                          ? undefined
+                          : ws.status === "active"
                           ? t("page.app_layout.active_workspace")
                           : workspaceStatusLabel(ws.status),
                       customAvatar: (
@@ -3601,49 +3483,25 @@ export default function AppLayout() {
                     });
                   })}
 
-                  {hiredAgents.length > 0 && (
-                    <div
-                      style={{
-                        width: 28,
-                        height: 1,
-                        background: "rgba(231,229,228,0.88)",
-                        margin: "2px 0",
-                      }}
-                    />
-                  )}
-
-                  {hiredAgents
-                    .filter((agent) => agent && agent.id && agent.name)
-                    .slice(0, 8)
-                    .map((agent) => {
-                      const colors = [
-                        "#534AB7",
-                        "#6d6fb2",
-                        "#5a8ea6",
-                        "#cf9b44",
-                        "#4f9c84",
-                        "#d65f59",
-                      ];
-                      const colorIdx =
-                        agent.name
-                          .split("")
-                          .reduce((sum, char) => sum + char.charCodeAt(0), 0) %
-                        colors.length;
-                      const convId =
-                        dmConversationByAgentId[agent.id] ||
-                        `agent:${agent.id}`;
-                      return renderCollapsedChatButton({
-                        id: convId,
-                        type: "dm",
-                        label: agent.name,
-                        subtitle: agentPreview(agent, "page.app_layout.agent"),
-                        avatarUrl: agent.avatar_url,
-                        initials: agent.name.charAt(0).toUpperCase(),
-                        color: colors[colorIdx],
-                        count: actionCounts[agent.id] || 0,
-                        agentId: agent.id,
-                      });
-                    })}
+                  {groupSidebar.items.slice(0, 8).map((room) => renderCollapsedChatButton({ id: room.id, type: "room", label: room.title, subtitle: groupChatSummary(room), customAvatar: <GroupChatAvatar title={room.title} members={room.members} currentUserId={user?.id} />, count: room.unread_count || 0 }))}
+                  {collapsedDmItems.map((item) => {
+                    if (item.kind === "room") {
+                      const room = item.room;
+                      return renderCollapsedChatButton({ id: room.id, sidebarId: item.id, type: "room", label: room.title, subtitle: getLocale() === "zh" ? "私聊" : "Direct chat", customAvatar: <UserAvatar name={room.title} avatarUrl={room.members.find((member) => member.user_id !== user?.id)?.avatar_url} size={30} /> });
+                    }
+                    const agent = item.agent;
+                    const convId = dmConversationByAgentId[agent.id] || item.id;
+                    return renderCollapsedChatButton({
+                      id: convId,
+                      sidebarId: item.id,
+                      type: "dm",
+                      label: agent.name,
+                      subtitle: agentPreview(agent, "page.app_layout.agent"),
+                      customAvatar: <AgentAvatar name={agent.name} avatarUrl={agent.avatar_url} seed={agent.id} size={30} />,
+                      count: actionCounts[agent.id] || 0,
+                      agentId: agent.id,
+                    });
+                  })}
                 </div>
               )}
 
@@ -3652,7 +3510,7 @@ export default function AppLayout() {
               {/* ══════════════════════════════════════════════ */}
 
               {/* WORKSPACE SECTION */}
-              {mode === "workspace" && (
+              {sidebarMode === "workspace" && (
                 <div
                   style={{
                     background: "var(--sidebar-group-bg)",
@@ -3674,7 +3532,7 @@ export default function AppLayout() {
                           letterSpacing: "0.16em",
                         }}
                       >
-                        OPERATE
+                        {t("page.app_layout.operate")}
                       </span>
                       <span
                         className="sidebar-pulse-dot"
@@ -3707,11 +3565,10 @@ export default function AppLayout() {
                           }}
                         />
                       </div>
-                      <Link
-                        to="/workspaces/new"
+                      <WorkspaceAddAction
+                        cloud={deploymentMode === "cloud"}
+                        ready={workspaceAddReady}
                         className="sidebar-workspace-create"
-                        title={t("page.workspaces.create_workspace")}
-                        aria-label={t("page.workspaces.create_workspace")}
                         style={{
                           width: 36,
                           height: 36,
@@ -3720,12 +3577,11 @@ export default function AppLayout() {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          textDecoration: "none",
                           flexShrink: 0,
                         }}
-                      >
-                        <IconPlus />
-                      </Link>
+                        onCreate={openStandaloneWorkspaceDraft}
+                        onMarketplace={openWorkspaceMarketplace}
+                      />
                     </div>
                   )}
 
@@ -3740,11 +3596,10 @@ export default function AppLayout() {
                   >
                     {workspaceItems.map((item) => renderNavItem(item))}
                     {sidebarCollapsed && (
-                      <Link
-                        to="/workspaces/new"
+                      <WorkspaceAddAction
+                        cloud={deploymentMode === "cloud"}
+                        ready={workspaceAddReady}
                         className="sidebar-workspace-create sidebar-workspace-create--collapsed"
-                        title={t("page.workspaces.create_workspace")}
-                        aria-label={t("page.workspaces.create_workspace")}
                         style={{
                           width: 36,
                           height: 36,
@@ -3753,18 +3608,17 @@ export default function AppLayout() {
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          textDecoration: "none",
                         }}
-                      >
-                        <IconPlus />
-                      </Link>
+                        onCreate={openStandaloneWorkspaceDraft}
+                        onMarketplace={openWorkspaceMarketplace}
+                      />
                     )}
                   </div>
                 </div>
               )}
 
               {/* MANAGEMENT SECTION (workspace mode only) */}
-              {mode === "workspace" && (
+              {sidebarMode === "workspace" && (
                 <div
                   style={{
                     paddingTop: sidebarCollapsed ? 2 : 8,
@@ -3782,7 +3636,7 @@ export default function AppLayout() {
                           letterSpacing: "0.16em",
                         }}
                       >
-                        LIBRARY
+                        {t("page.app_layout.library")}
                       </span>
                     </div>
                   )}
@@ -4001,7 +3855,7 @@ export default function AppLayout() {
                               marginTop: 0,
                             }}
                           >
-                            {user.role || "Member"}
+                            {userRoleLabel}
                           </div>
                         </div>
                       )}
@@ -4012,6 +3866,7 @@ export default function AppLayout() {
                   <div style={{ position: "relative", order: 4 }}>
                   <button
                     ref={supportRestoreFocusRef}
+                    data-tour="sidebar-more"
                     type="button"
                     onClick={() => {
                       setMoreOpen(!moreOpen);
@@ -4096,7 +3951,10 @@ export default function AppLayout() {
                           type="button"
                           onClick={() => {
                             setMoreOpen(false);
-                            setHelpOpen(true);
+                            setTourRequested(true);
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter") event.stopPropagation();
                           }}
                           style={{
                             display: "flex",
@@ -4120,24 +3978,12 @@ export default function AppLayout() {
                             e.currentTarget.style.background = "transparent";
                           }}
                         >
-                          <svg
-                            width="14"
-                            height="14"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            strokeWidth={2}
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                          >
-                            <circle cx="12" cy="12" r="10" />
-                            <path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3" />
-                            <line x1="12" y1="17" x2="12.01" y2="17" />
-                          </svg>
-                          <span>{t("nav.support")}</span>
+                          <IconHelp />
+                          <span>{t("component.user_guide.title")}</span>
                         </button>
                         <Link
                           to="/settings"
+                          state={{ returnTo: `${location.pathname}${location.search}` }}
                           onClick={() => {
                             setMode("workspace");
                             setMoreOpen(false);
@@ -4313,8 +4159,11 @@ export default function AppLayout() {
                           return (
                             <button
                               key={l.code}
+                              disabled={localeSaving}
+                              aria-pressed={active}
+                              aria-busy={localeSaving}
                               onClick={() => {
-                                handleLocaleChange(l.code as Locale);
+                                void handleLocaleChange(l.code);
                                 setMoreOpen(false);
                               }}
                               style={{
@@ -4328,7 +4177,8 @@ export default function AppLayout() {
                                 background: active
                                   ? "var(--accent-soft)"
                                   : "transparent",
-                                cursor: "pointer",
+                                cursor: localeSaving ? "wait" : "pointer",
+                                opacity: localeSaving ? 0.6 : 1,
                                 fontSize: 13,
                                 transition: "background 0.1s",
                                 fontWeight: active ? 600 : 400,
@@ -4372,7 +4222,6 @@ export default function AppLayout() {
                 )}
                   </div>
                 )}
-
 
                 {/* Notifications bell */}
                 {!sidebarCollapsed && (
@@ -4443,6 +4292,7 @@ export default function AppLayout() {
         >
           {/* Mobile hamburger */}
           {!isSettingsRoute && (
+          <div className="mobile-chat-actions">
           <button
             className="mobile-hamburger"
             onClick={() => setMobileOpen(true)}
@@ -4457,7 +4307,6 @@ export default function AppLayout() {
               justifyContent: "center",
               color: "var(--text-muted)",
               cursor: "pointer",
-              marginBottom: 8,
               flexShrink: 0,
             }}
           >
@@ -4476,9 +4325,38 @@ export default function AppLayout() {
               <line x1="3" y1="18" x2="21" y2="18" />
             </svg>
           </button>
+          {sidebarMode === "chat" && (
+            <button
+              type="button"
+              className="mobile-chat-new"
+              onClick={openNewConversation}
+              aria-label={getLocale() === "zh" ? "新建对话" : "New conversation"}
+              title={getLocale() === "zh" ? "新建对话" : "New conversation"}
+            >
+              <IconPlus />
+            </button>
+          )}
+          </div>
           )}
 
-          {mode === "chat" ? (
+          {showProfessionalPageNotice ? (
+            <div className="app-content-panel glass-panel flex h-full min-w-0 items-center justify-center p-6">
+              <EmptyState
+                title={t("page.app_layout.professional_page")}
+                description={t("page.app_layout.professional_page_description")}
+                action={(
+                  <div className="flex flex-wrap justify-center gap-2">
+                    <Button onClick={() => navigate(simpleChatPath)}>{t("nav.chat")}</Button>
+                    <Button variant="outline" onClick={() => navigate("/settings?tab=appearance", {
+                      state: { returnTo: `${location.pathname}${location.search}` },
+                    })}>
+                      {t("page.app_layout.open_display_settings")}
+                    </Button>
+                  </div>
+                )}
+              />
+            </div>
+          ) : mode === "chat" ? (
             <div
               className="app-chat-shell"
               style={{
@@ -4491,12 +4369,29 @@ export default function AppLayout() {
                 overflow: "hidden",
               }}
             >
-              {activeConvType === "operation" ? (
+              {activeConvType === "compose" ? (
+                <Suspense fallback={<ChatSurfaceLoading />}>
+                  <ChatRoomNewConversation key={newConversationKind} initialKind={newConversationKind} rooms={humanChatRooms} agents={chatAgentsList} agentsLoading={chatAgentsLoading} currentUserId={user?.id || ""} onClose={openManorChat} onCreated={(room) => openHumanRoom(room.id)} onSelectAgent={openAgentDmFromCompose} />
+                </Suspense>
+              ) : activeConvType === "workspace-draft" ? (
+                <Suspense fallback={<div className="flex-1 min-h-0 p-4" aria-busy="true"><InlineRowsSkeleton rows={3} dense /></div>}>
+                  <WorkspaceDraftChat embeddedInChat />
+                </Suspense>
+              ) : activeConvType === "room" ? (
+                <Suspense fallback={<ChatSurfaceLoading />}>
+                  <ChatRoomConversation
+                    key={activeConvId}
+                    roomId={activeConvId}
+                    currentUserId={user?.id || ""}
+                    requestedAction={roomSidebarAction?.roomId === activeConvId ? roomSidebarAction : undefined}
+                  />
+                </Suspense>
+              ) : activeConvType === "operation" ? (
                 (() => {
-                  const activeWorkspace = workspaceList.find(
+                  const activeWorkspace = activeChatWorkspaceQuery.data || workspaceList.find(
                     (w) => w.id === activeConvId,
                   );
-                  if (unavailableWorkspaceId === activeConvId) {
+                  if (activeChatWorkspaceUnavailable || unavailableWorkspaceId === activeConvId) {
                     return (
                       <div className="flex flex-1 items-center justify-center p-6" role="alert">
                         <div className="text-center">
@@ -4520,6 +4415,14 @@ export default function AppLayout() {
                     );
                   }
                   if (!activeWorkspace) {
+                    if (activeChatWorkspaceQuery.isError) return (
+                      <div className="flex flex-1 flex-col items-center justify-center gap-3 p-6" role="alert">
+                        <p>{t("component.workspace_app_view.error")}</p>
+                        <Button variant="outline" onClick={() => void activeChatWorkspaceQuery.refetch()}>
+                          {t("component.workspace_app_view.retry")}
+                        </Button>
+                      </div>
+                    );
                     return (
                       <div className="flex-1 min-h-0 p-4" aria-busy="true">
                         <InlineRowsSkeleton rows={3} dense />
@@ -4527,12 +4430,14 @@ export default function AppLayout() {
                     );
                   }
                   return (
-                    <WorkspaceChat
-                      key={activeConvId}
-                      workspaceId={activeConvId}
-                      workspace={activeWorkspace}
-                      workspaceName={activeWorkspace?.name}
-                    />
+                    <Suspense fallback={<ChatSurfaceLoading />}>
+                      <WorkspaceChat
+                        key={activeConvId}
+                        workspaceId={activeConvId}
+                        workspace={activeWorkspace}
+                        workspaceName={activeWorkspace?.name}
+                      />
+                    </Suspense>
                   );
                 })()
               ) : (
@@ -4544,26 +4449,37 @@ export default function AppLayout() {
                           (a) => a.id === activeDmAgentId,
                         )
                       : null;
+                  if (activeConvType === "dm" && !dmAgent) {
+                    return <div className="flex min-h-0 flex-1 items-center justify-center p-6">
+                      {!catalogScope || chatAgentsLoading ? <InlineRowsSkeleton rows={3} dense /> : <EmptyState
+                        title={t("page.app_layout.agent_unavailable")}
+                        description={t("page.app_layout.agent_unavailable_desc")}
+                        action={<Button variant="outline" onClick={openManorChat}>{t("nav.chat")}</Button>}
+                      />}
+                    </div>;
+                  }
                   return (
-                    <EmbeddedChat
-                      conversationId={activeConvId}
-                      title={info.title}
-                      subtitle={info.subtitle}
-                      agents={info.agents}
-                      avatarUrl={dmAgent?.avatar_url}
-                      agentId={dmAgent?.id}
-                      onConversationResolved={
-                        activeConvType === "manor"
-                          ? handleManorConversationResolved
-                          : undefined
-                      }
-                      onNewConversation={
-                        activeConvType === "manor"
-                          ? startNewManorSession
-                          : undefined
-                      }
-                      showWorkspaceIntro={activeConvType === "manor"}
-                    />
+                    <Suspense fallback={<ChatSurfaceLoading />}>
+                      <EmbeddedChat
+                        conversationId={activeConvId}
+                        title={info.title}
+                        subtitle={info.subtitle}
+                        agents={info.agents}
+                        avatarUrl={dmAgent?.avatar_url}
+                        agentId={dmAgent?.id}
+                        onConversationResolved={
+                          activeConvType === "manor"
+                            ? handleManorConversationResolved
+                            : undefined
+                        }
+                        onNewConversation={
+                          activeConvType === "manor"
+                            ? startNewManorSession
+                            : undefined
+                        }
+                        showWorkspaceIntro={activeConvType === "manor"}
+                      />
+                    </Suspense>
                   );
                 })()
               )}
@@ -4586,6 +4502,15 @@ export default function AppLayout() {
         </main>
 
         {/* Toast notification */}
+        {location.pathname === "/chat" && new URLSearchParams(location.search).get("invite") && (
+          <Suspense fallback={null}>
+            <ChatInviteAcceptance
+              token={new URLSearchParams(location.search).get("invite") || ""}
+              onClose={() => navigate("/chat", { replace: true })}
+              onAccepted={(room) => openHumanRoom(room.id)}
+            />
+          </Suspense>
+        )}
         {toast && (
           <div className="fixed left-3 right-3 top-4 z-50 glass-panel px-4 py-3 text-sm text-stone-700 animate-fade-in sm:left-auto sm:right-4 sm:max-w-sm">
             <div className="flex items-center gap-2">
@@ -4602,7 +4527,7 @@ export default function AppLayout() {
         )}
 
         {/* Floating chat — visible in workspace mode, hidden on /chat */}
-        {mode === "workspace" &&
+        {!simpleMode && mode === "workspace" &&
           !location.pathname.startsWith("/chat")
           && (
           <FloatingChat />
@@ -4614,48 +4539,69 @@ export default function AppLayout() {
             from any page (Agents.tsx, WorkspaceDetail.tsx, WorkspaceChat).
             Mounted here (inside the Router tree, under AppLayout) rather
             than in main.tsx because it calls useNavigate(). */}
-        <AgentEditModal />
+        {agentEditModalOpen && (
+          <Suspense fallback={null}>
+            <AgentEditModal />
+          </Suspense>
+        )}
 
         <ConfirmDialog
-          open={Boolean(deleteManorSessionTarget)}
+          open={Boolean(deleteWorkspaceTarget)}
           onClose={() => {
-            if (deleteManorSession.isPending) return;
-            setDeleteManorSessionTarget(null);
-            setDeleteManorSessionError("");
+            if (deleteWorkspaceFromSidebar.isPending) return;
+            setDeleteWorkspaceTarget(null);
+            setDeleteWorkspaceError("");
           }}
           onConfirm={() => {
-            if (deleteManorSessionTarget) {
-              deleteManorSession.mutate(deleteManorSessionTarget.id);
+            if (deleteWorkspaceTarget?.can_delete) {
+              deleteWorkspaceFromSidebar.mutate(deleteWorkspaceTarget.id);
+            }
+          }}
+          title={t("page.workspaces.delete_workspace")}
+          message={t("page.workspaces.delete_workspace_msg", { days: "30" })}
+          confirmLabel={t("page.workspaces.move_to_trash")}
+          cancelLabel={t("action.cancel")}
+          danger
+          loading={deleteWorkspaceFromSidebar.isPending}
+          closeOnConfirm={false}
+          error={deleteWorkspaceError || undefined}
+        />
+
+        <ConfirmDialog
+          open={Boolean(deleteConversationTarget)}
+          onClose={() => {
+            if (deleteChatConversation.isPending) return;
+            setDeleteConversationTarget(null);
+            setDeleteConversationError("");
+          }}
+          onConfirm={() => {
+            if (deleteConversationTarget) {
+              deleteChatConversation.mutate(deleteConversationTarget.id);
             }
           }}
           title={t("page.chat_history.delete_title")}
           message={t("page.app_layout.delete_manor_session_message", {
             title:
-              deleteManorSessionTarget?.title ||
+              deleteConversationTarget?.title ||
               t("page.chat_history.untitled"),
           })}
           confirmLabel={t("action.delete")}
           cancelLabel={t("action.cancel")}
           danger
-          loading={deleteManorSession.isPending}
+          loading={deleteChatConversation.isPending}
           closeOnConfirm={false}
-          error={deleteManorSessionError || undefined}
+          error={deleteConversationError || undefined}
         />
 
 
-        {helpOpen && (
-          <ManorHelpModal
-            locale={locale}
-            onClose={() => setHelpOpen(false)}
-            onStartTour={() => {
-              setHelpOpen(false);
-              window.dispatchEvent(new Event("manor:start-tour"));
-            }}
-          />
+        {interfaceModeDialogOpen && (
+          <Suspense fallback={null}>
+            <InterfaceModeDialog />
+          </Suspense>
         )}
-
-        {/* Onboarding tour for new users */}
-        {!isTourSuppressedPath(location.pathname) && <OnboardingTour />}
+        {user && !isTourSuppressedPath(location.pathname) && (
+          <OnboardingTour enabled={false} />
+        )}
 
         {/* Support drawer — talks to the platform team */}
         {supportTicketsEnabled && (

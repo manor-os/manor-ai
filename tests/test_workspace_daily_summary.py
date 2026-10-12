@@ -159,10 +159,12 @@ async def test_workspace_daily_summary_uses_real_workspace_data(client):
 
 @pytest.mark.asyncio
 async def test_manor_action_exposes_workspace_daily_summary(client):
+    from sqlalchemy import select
     import packages.core.database as db_module
-    from packages.core.ai.tools.manor_tool import _dispatch_action, _manor_handler
+    from packages.core.ai.tools.manor_tool import _dispatch_action, manor_action_manifests
     from packages.core.models.base import generate_ulid
     from packages.core.models.task import Task
+    from packages.core.models.user import User
 
     headers, entity_id = await _auth(client, "daily_summary_tool")
     ws_resp = await client.post(
@@ -173,6 +175,9 @@ async def test_manor_action_exposes_workspace_daily_summary(client):
     workspace_id = ws_resp.json()["id"]
 
     async with db_module.async_session() as db:
+        actor_id = (await db.execute(select(User.id).where(
+            User.entity_id == entity_id, User.email == "daily_summary_tool@test.com",
+        ))).scalar_one()
         db.add(
             Task(
                 id=generate_ulid(),
@@ -188,25 +193,31 @@ async def test_manor_action_exposes_workspace_daily_summary(client):
         )
         await db.commit()
 
+    params = {"workspace_id": workspace_id, "date": "2026-02-01", "timezone": "UTC"}
+    # A business target is not a principal or a trusted Workspace scope.
+    assert json.loads(await _dispatch_action(
+        "get_workspace_daily_summary", params, entity_id,
+    )) == {"error": "Workspace not found"}
+    assert json.loads(await _dispatch_action(
+        "get_workspace_daily_summary", params, generate_ulid(),
+        user_id=actor_id, workspace_id=workspace_id,
+    )) == {"error": "Workspace not found"}
     result = json.loads(
         await _dispatch_action(
             "get_workspace_daily_summary",
-            {"workspace_id": workspace_id, "date": "2026-02-01", "timezone": "UTC"},
+            params,
             entity_id,
+            user_id=actor_id, workspace_id=workspace_id,
         )
     )
     assert result["kind"] == "workspace_daily_summary"
     assert result["workspace"]["id"] == workspace_id
     assert result["yesterday_outcomes"]["completed_count"] == 1
 
-    search = json.loads(
-        await _manor_handler(
-            entity_id=entity_id,
-            action="search",
-            query="workspace daily summary handoff health",
-        )
-    )
-    assert "get_workspace_daily_summary" in {item["action"] for item in search["matches"]}
+    assert "get_workspace_daily_summary" in {
+        item["invoke_with"]["arguments"]["action"]
+        for item in manor_action_manifests()
+    }
 
 
 @pytest.mark.asyncio
@@ -372,6 +383,7 @@ async def test_briefing_dispatch_passes_scheduled_job_timezone(client):
     from packages.core.constants.execution import ScheduledDispatchKind
     from packages.core.models.base import generate_ulid
     from packages.core.models.scheduler import ScheduledJob
+    from packages.core.models.user import User
     from packages.core.tasks.scheduler_tasks import _dispatch_job
     from sqlalchemy import select
 
@@ -385,11 +397,13 @@ async def test_briefing_dispatch_passes_scheduled_job_timezone(client):
 
     job_id = generate_ulid()
     async with db_module.async_session() as db:
+        owner_id = (await db.execute(select(User.id).where(User.entity_id == entity_id))).scalar_one()
         db.add(
             ScheduledJob(
                 id=job_id,
                 job_id="br:dispatch-timezone",
                 entity_id=entity_id,
+                user_id=owner_id,
                 workspace_id=workspace_id,
                 name="Morning briefing",
                 job_type="cron",
@@ -416,6 +430,7 @@ async def test_briefing_dispatch_passes_scheduled_job_timezone(client):
     assert dispatch["kind"] == ScheduledDispatchKind.MORNING_BRIEFING.value
     assert dispatch["args"] == [workspace_id]
     assert dispatch["kwargs"]["timezone_name"] == "Asia/Tokyo"
+    assert dispatch["kwargs"]["user_id"] == owner_id
 
 
 @pytest.mark.asyncio

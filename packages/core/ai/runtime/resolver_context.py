@@ -197,6 +197,12 @@ class ToolResolverStage:
             # generate_file(kind="image"). This stage only keeps that one
             # turn-scoped schema visible to the editor model.
             profile_extra_allowed_tool_names.add("generate_file")
+        from packages.core.ai.runtime.surfaces import ChatSurface
+
+        if context.request.surface == ChatSurface.PUBLIC_CUSTOMER_CHAT:
+            from packages.core.ai.runtime.tool_surface import runtime_turn_armed_public_tools
+
+            profile_extra_allowed_tool_names |= runtime_turn_armed_public_tools()
         filtered_tools, filtered_allowed, runtime_blocked = filter_runtime_tools(
             surface=context.request.surface,
             profile=profile,
@@ -204,6 +210,27 @@ class ToolResolverStage:
             allowed_tool_names=incoming_allowed,
             profile_extra_allowed_tool_names=profile_extra_allowed_tool_names,
         )
+        editor_context = context.request.editor_context or {}
+        native_editor_patch_enabled = bool(
+            editor_context.get("supportsNativeFilePatch")
+            or editor_context.get("supports_native_file_patch")
+        )
+        patch_file_requested = "patch_file" in incoming_allowed or any(
+            tool_name_from_schema(schema) == "patch_file"
+            for schema in context.tool_schemas
+        )
+        if (
+            profile == RuntimeProfile.FILE_EDITOR_PATCH
+            and patch_file_requested
+            and not native_editor_patch_enabled
+        ):
+            runtime_blocked.add("patch_file")
+            filtered_tools = [
+                schema
+                for schema in filtered_tools
+                if tool_name_from_schema(schema) != "patch_file"
+            ]
+            filtered_allowed.discard("patch_file")
         blocked = set(context.incoming_blocked_tool_names)
         blocked.update(runtime_blocked)
         if blocked:

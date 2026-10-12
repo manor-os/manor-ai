@@ -32,6 +32,10 @@ POST /api/v1/backup/export/download  # download an export archive
 This is a data-level export (suitable for migrations and offsite copies), not
 a substitute for volume-level backups of a whole deployment.
 
+Blueprint JSON is only sanitized configuration and selected starter knowledge;
+it excludes histories, secrets and grants. It is not a backup of users, tasks,
+transcripts, provider credentials or in-progress runs.
+
 ## PostgreSQL
 
 Dump:

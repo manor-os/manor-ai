@@ -27,15 +27,19 @@ import pytest
 from sqlalchemy import select
 
 from packages.core.dispatcher.service import Dispatcher
-from packages.core.governance import WorkspacePolicy, update_policy
 from packages.core.governance.approvals import grant_approval
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
+from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
 from packages.core.models.worker import SubscriptionWorker, Worker, WorkerActivityLog
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.task import Task
 from packages.core.models.user import User, UserMembership
+from packages.core.plans.step_reset import step_approval_operation_id
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
 
 
 async def _scenario(
@@ -43,11 +47,15 @@ async def _scenario(
     *,
     requires_approval=True,
     risk_level="medium",
-    policy=None,
+    mode=None,
+    policy_rules=(),
     proposal_authorized=False,
+    automated_origin=False,
     authorization_overrides=None,
     capability_id="external.social",
     task_runtime_rules=None,
+    attempt_count=0,
+    last_execution_error=None,
 ):
     """A workspace step parked in front of the gate, plus a worker to claim it."""
     entity_id = generate_ulid()
@@ -121,6 +129,40 @@ async def _scenario(
                 },
             ),
         ]
+    elif automated_origin:
+        plan_task_id = generate_ulid()
+        scheduled_job = ScheduledJob(
+            job_id=f"scheduled-{generate_ulid()}",
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            execution_type="agent",
+            enabled=True,
+        )
+        scheduled_run = ScheduledJobRun(
+            id=generate_ulid(),
+            job_id=scheduled_job.job_id,
+            status="running",
+            trigger_type="cron",
+            result={
+                "scheduled_child_kind": "agent_task",
+                "scheduled_child_id": plan_task_id,
+            },
+        )
+        task_rows = [
+            scheduled_job,
+            scheduled_run,
+            Task(
+                id=plan_task_id,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                title="Scheduled publication task",
+                status="pending",
+                details={
+                    "scheduled_job_id": scheduled_job.job_id,
+                    "scheduled_run_id": scheduled_run.id,
+                },
+            ),
+        ]
     db.add_all(task_rows + [
         User(
             id=approval_actor_id,
@@ -163,16 +205,20 @@ async def _scenario(
             kind="subagent",
             service_key="content",
             capability_id=capability_id,
+            action_key="social_post.publish",
             params={"prompt": "Publish the approved post."},
             depends_on=[], step_status="pending",
             risk_level=risk_level,
             requires_approval=requires_approval,
-            attempt_count=0, max_attempts=1,
+            attempt_count=attempt_count, max_attempts=max(attempt_count + 1, 1),
+            last_execution_error=last_execution_error,
         ),
     ])
-    if policy is not None:
-        await update_policy(db, entity_id=entity_id, workspace_id=workspace_id,
-                            policy=policy, changed_by="test")
+    await db.flush()
+    workspace = await db.get(Workspace, workspace_id)
+    await initialize_test_approval_owners(db, workspace, user_id=approval_actor_id)
+    await set_workspace_test_approval(db, workspace_id=workspace_id, entity_id=entity_id,
+        actor_id=approval_actor_id, mode=mode, user_rules=policy_rules)
     await db.flush()
     return {
         "entity_id": entity_id, "workspace_id": workspace_id,
@@ -198,6 +244,7 @@ async def test_setup_regression_blocks_existing_pending_step_before_lease(
         db_session,
         requires_approval=False,
         risk_level="low",
+        mode="automatic",
     )
     workspace = await db_session.get(Workspace, s["workspace_id"])
     workspace.settings = {
@@ -282,6 +329,7 @@ async def test_gate_pauses_and_links_one_request_to_the_card(db_session, monkeyp
     assert step.error["approval_request_id"] == requests[0].id
     assert cards[0]["approval_request_id"] == requests[0].id
     assert requests[0].origin_step_id == s["step_id"]
+    assert requests[0].context["operation_id"] == step_approval_operation_id(step)
 
 
 @pytest.mark.asyncio
@@ -314,6 +362,7 @@ async def test_grant_lets_the_step_through_next_checkout__289_317(db_session, mo
     assert step.step_status == "running"
     await db_session.refresh(request)
     assert request.status == "consumed"        # one-time grant was spent
+    assert request.context["operation_id"] == step_approval_operation_id(step)
     assert await _open_requests(db_session, s["entity_id"]) == []
 
 
@@ -357,7 +406,7 @@ async def test_hard_block_fails_step_and_mints_no_request(db_session, monkeypatc
     monkeypatch.setattr("packages.core.governance.service.post_hitl_card", fake_card)
     s = await _scenario(
         db_session,
-        policy=WorkspacePolicy(never_allow_capabilities=["external.social"]),
+        policy_rules=[action_rule("social_post.publish", effect="deny")],
     )
 
     leases = await Dispatcher().checkout_steps_for_worker(db_session, s["worker"], max_n=1)
@@ -368,6 +417,133 @@ async def test_hard_block_fails_step_and_mints_no_request(db_session, monkeypatc
     assert step.error["type"] == "GovernancePolicy"
     assert cards == []
     assert await _open_requests(db_session, s["entity_id"]) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("requires_approval", "policy_rules", "expected_pause"), [
+    (False, [], False),
+    (True, [], True),
+    (False, [action_rule("social_post.publish", effect="ask")], True),
+])
+async def test_verified_automated_task_uses_mode_but_preserves_explicit_review(
+    db_session,
+    monkeypatch,
+    requires_approval,
+    policy_rules,
+    expected_pause,
+):
+    cards: list[dict] = []
+
+    async def fake_card(**kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr("packages.core.governance.service.post_hitl_card", fake_card)
+    s = await _scenario(
+        db_session,
+        requires_approval=requires_approval,
+        risk_level="high",
+        automated_origin=True,
+        mode="automatic",
+        policy_rules=policy_rules,
+    )
+
+    leases = await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        s["worker"],
+        max_n=1,
+    )
+    step = await db_session.get(ExecutionStep, s["step_id"])
+
+    if expected_pause:
+        assert leases == []
+        assert step.step_status == "waiting_human"
+        assert len(cards) == 1
+        assert len(await _open_requests(db_session, s["entity_id"])) == 1
+    else:
+        assert len(leases) == 1
+        assert step.step_status == "running"
+        assert cards == []
+        assert await _open_requests(db_session, s["entity_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_automated_task_automatic_mode_does_not_override_hard_block(
+    db_session,
+    monkeypatch,
+):
+    cards: list[dict] = []
+
+    async def fake_card(**kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr("packages.core.governance.service.post_hitl_card", fake_card)
+    s = await _scenario(
+        db_session,
+        requires_approval=True,
+        risk_level="high",
+        automated_origin=True,
+        mode="automatic",
+        policy_rules=[action_rule("social_post.publish", effect="deny")],
+    )
+
+    leases = await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        s["worker"],
+        max_n=1,
+    )
+    step = await db_session.get(ExecutionStep, s["step_id"])
+
+    assert leases == []
+    assert step.step_status == "failed"
+    assert step.current_lease_id is None
+    assert step.error["type"] == "GovernancePolicy"
+    assert cards == []
+    assert await _open_requests(db_session, s["entity_id"]) == []
+
+
+@pytest.mark.asyncio
+async def test_automated_task_automatic_mode_preserves_error_recovery_hitl(
+    db_session,
+    monkeypatch,
+):
+    cards: list[dict] = []
+
+    async def fake_card(**kwargs):
+        cards.append(kwargs)
+
+    monkeypatch.setattr("packages.core.governance.service.post_hitl_card", fake_card)
+    s = await _scenario(
+        db_session,
+        requires_approval=True,
+        risk_level="high",
+        automated_origin=True,
+        attempt_count=1,
+        last_execution_error={
+            "type": "worker_error",
+            "message": "The browser worker disconnected during upload.",
+        },
+        mode="automatic",
+    )
+    step = await db_session.get(ExecutionStep, s["step_id"])
+    # Recovery reviews describe the current failed attempt, not only its audit history.
+    step.error = dict(step.last_execution_error)
+    await db_session.flush()
+
+    leases = await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        s["worker"],
+        max_n=1,
+    )
+    step = await db_session.get(ExecutionStep, s["step_id"])
+    requests = await _open_requests(db_session, s["entity_id"])
+
+    assert leases == []
+    assert step.step_status == "waiting_human"
+    assert step.current_lease_id is None
+    assert len(requests) == 1
+    assert requests[0].hitl_type == "error"
+    assert len(cards) == 1
+    assert cards[0]["hitl_type"] == "error"
 
 
 @pytest.mark.asyncio
@@ -404,11 +580,11 @@ async def test_proposal_authorization_skips_duplicate_high_risk_step_prompt(
 
 
 @pytest.mark.asyncio
-async def test_proposal_authorization_skips_matching_runtime_approval_rule(
+async def test_proposal_authorization_preserves_explicit_task_approval_rule(
     db_session,
     monkeypatch,
 ):
-    """Proposal approval also satisfies approval-only policy for that action."""
+    """A prior Proposal grant cannot satisfy a newly explicit Task review rule."""
     cards: list[dict] = []
 
     async def fake_card(**kwargs):
@@ -425,7 +601,7 @@ async def test_proposal_authorization_skips_matching_runtime_approval_rule(
             {
                 "rule_key": "proposal_publish_requires_approval",
                 "rule_type": "approval_required",
-                "capability_patterns": ["external.social"],
+                "approval_selectors": [{"kind": "action", "action_key": "social_post.publish"}],
             }
         ],
     )
@@ -437,10 +613,12 @@ async def test_proposal_authorization_skips_matching_runtime_approval_rule(
     )
     step = await db_session.get(ExecutionStep, s["step_id"])
 
-    assert len(leases) == 1
-    assert step.step_status == "running"
-    assert cards == []
-    assert await _open_requests(db_session, s["entity_id"]) == []
+    assert leases == []
+    assert step.step_status == "waiting_human"
+    assert len(cards) == 1
+    requests = await _open_requests(db_session, s["entity_id"])
+    assert len(requests) == 1
+    assert requests[0].matched_rule == "proposal_publish_requires_approval"
 
 
 @pytest.mark.asyncio
@@ -459,7 +637,7 @@ async def test_proposal_authorization_does_not_override_policy_hard_block(
         requires_approval=False,
         risk_level="high",
         proposal_authorized=True,
-        policy=WorkspacePolicy(never_allow_capabilities=["external.social"]),
+        policy_rules=[action_rule("social_post.publish", effect="deny")],
         capability_id=None,
     )
 
@@ -521,8 +699,7 @@ async def test_proposal_scope_must_be_active_and_cannot_waive_explicit_approval(
 
 @pytest.mark.asyncio
 async def test_terminal_plan_expires_the_open_request(db_session, monkeypatch):
-    """A plan that ends while a step is still waiting must not leave an
-    orphaned card behind."""
+    """Terminal cleanup closes the request after releasing execution locks."""
     monkeypatch.setattr(
         "packages.core.governance.service.post_hitl_card",
         lambda **kw: _noop(),
@@ -535,6 +712,20 @@ async def test_terminal_plan_expires_the_open_request(db_session, monkeypatch):
 
     plan = await db_session.get(ExecutionPlan, s["plan_id"])
     await PlanExecutor._finalize(db_session, plan, "failed")
+
+    # Finalization owns Task/Plan locks; approval decisions own HitlRequest
+    # first. Cleaning here would reverse that order and reintroduce a deadlock.
+    assert len(await _open_requests(db_session, s["entity_id"])) == 1
+    await db_session.commit()
+    await PlanExecutor._cleanup_terminal_approvals_after_commit(
+        db_session, plan_id=plan.id, task_id=plan.task_id, reason="plan_failed",
+    )
+
+    assert await _open_requests(db_session, s["entity_id"]) == []
+    # A redelivered terminal cycle uses the same idempotent cleanup path.
+    await PlanExecutor._cleanup_terminal_approvals_after_commit(
+        db_session, plan_id=plan.id, task_id=plan.task_id, reason="plan_failed",
+    )
 
     assert await _open_requests(db_session, s["entity_id"]) == []
 

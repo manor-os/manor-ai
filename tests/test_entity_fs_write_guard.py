@@ -26,6 +26,7 @@ from packages.core.services.entity_fs import (
     mark_entity_editor_write_intent_committed,
     mark_entity_editor_write_intent_digest_committed,
     resolve_path,
+    unlink_entity_file_entry,
     write_entity_file_atomic,
 )
 
@@ -47,6 +48,34 @@ def fs_settings(tmp_path):
         settings.DEPLOYMENT_MODE = old_mode
 
 
+@pytest.fixture(autouse=True)
+def isolated_file_journal(monkeypatch):
+    """These are filesystem unit tests; real journal recovery has DB tests."""
+    from packages.core.services import runtime_file_journal
+
+    class Journal:
+        def __init__(self, _entity):
+            self.entries = {}
+
+        async def prepare(self, snapshot, _digest):
+            self.entries[snapshot.rel_path] = snapshot.rel_path
+
+        async def installed(self, *_args):
+            pass
+
+        async def mark_committed(self, *_args):
+            pass
+
+        async def committed(self):
+            return False
+
+        async def settled(self, **_kwargs):
+            pass
+
+    monkeypatch.setattr(runtime_file_journal, "RuntimeFileJournal", Journal)
+    monkeypatch.setattr(runtime_file_journal, "recover_runtime_file_commits", AsyncMock(return_value={}))
+
+
 def test_write_entity_file_atomic_persists_verified_bytes(fs_settings):
     path = write_entity_file_atomic(
         "entity_1",
@@ -57,6 +86,26 @@ def test_write_entity_file_atomic_persists_verified_bytes(fs_settings):
 
     assert path.endswith(os.path.join("entity_1", "videos", "out.mp4"))
     assert open(path, "rb").read() == b"video-bytes"
+
+
+def test_unlink_entity_file_entry_removes_final_symlink_not_destination(fs_settings, tmp_path):
+    entity_root = tmp_path / "entity_1"
+    source_dir = entity_root / "uploads"
+    source_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"must survive")
+    link = source_dir / "stale-upload.txt"
+    link.symlink_to(outside)
+
+    removed = unlink_entity_file_entry(
+        "entity_1",
+        "uploads/stale-upload.txt",
+        allow_symlink=True,
+    )
+
+    assert removed is True
+    assert not link.exists()
+    assert outside.read_bytes() == b"must survive"
 
 
 def test_editor_write_fence_allows_only_identical_same_sequence_retries(tmp_path):
@@ -313,7 +362,7 @@ async def test_runtime_projection_commit_finishes_after_request_cancellation(
         async with RuntimeFileProjectionTransactionFactory.create(
             "entity_1",
         ) as transaction:
-            written = transaction.write_bytes(
+            written = await transaction.write_bytes(
                 "report.md",
                 content,
                 expected_content_sha256=digest,
@@ -423,7 +472,7 @@ async def test_runtime_projection_ignores_session_teardown_error_after_commit(
     async with RuntimeFileProjectionTransactionFactory.create(
         "entity_1",
     ) as transaction:
-        written = transaction.write_bytes(
+        written = await transaction.write_bytes(
             "report.md",
             content,
             expected_content_sha256=digest,
@@ -502,7 +551,7 @@ async def test_runtime_projection_retries_a_failed_staged_write_rollback(
             "entity_1",
         ) as transaction:
             content = b"new"
-            transaction.write_bytes(
+            await transaction.write_bytes(
                 "report.md",
                 content,
                 expected_content_sha256=hashlib.sha256(content).hexdigest(),
@@ -559,7 +608,7 @@ async def test_runtime_projection_restores_existing_file_when_written_target_dis
             "entity_1",
         ) as transaction:
             content = b"new"
-            transaction.write_bytes(
+            await transaction.write_bytes(
                 "report.md",
                 content,
                 expected_content_sha256=hashlib.sha256(content).hexdigest(),
@@ -836,11 +885,12 @@ def test_document_creation_keeps_bytes_and_acl_inside_entity_boundary():
         assert "_rollback_database_best_effort" in source
         assert "_remove_or_quarantine_document_file" in source
 
-    for handler in (
+    assert "_commit_document_upload_with_reconciliation" in inspect.getsource(
         documents.upload_document,
+    )
+    assert "_commit_document_and_dispatch_embeddings" in inspect.getsource(
         documents.upload_from_google_drive,
-    ):
-        assert "_commit_document_and_dispatch_embeddings" in inspect.getsource(handler)
+    )
 
     for handler in (
         documents.create_blank_document,
@@ -1295,11 +1345,46 @@ def test_raw_filesystem_readers_use_shared_entity_read_boundary():
         filesystem.file_info,
         filesystem.search_files,
         filesystem.resolve_wiki_links,
-        filesystem.wiki_index,
         filesystem.lint_knowledge_base,
         filesystem.serve_entity_file,
     ):
         assert "_entity_filesystem_read_boundary" in inspect.getsource(handler)
+
+
+@pytest.mark.asyncio
+async def test_filesystem_lint_requires_explicit_global_knowledge_read(monkeypatch):
+    from apps.api.routers import filesystem
+    from packages.core.permissions import Permission
+
+    checked: list[object] = []
+
+    async def deny_global_read(_db, _user, permission):
+        checked.append(permission)
+        return False
+
+    monkeypatch.setattr(filesystem, "_require_fs", lambda: None)
+    monkeypatch.setattr(
+        filesystem,
+        "effective_user_has_permission",
+        deny_global_read,
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        await filesystem.lint_knowledge_base(
+            user=SimpleNamespace(id="admin-1", entity_id="entity-1", role="admin"),
+            db=SimpleNamespace(),
+        )
+
+    assert getattr(exc_info.value, "status_code", None) == 403
+    assert checked == [Permission.DOCS_READ_ALL]
+
+
+def test_filesystem_cross_directory_move_uses_global_knowledge_manage_permission():
+    from apps.api.routers import filesystem
+
+    source = inspect.getsource(filesystem.move_file)
+    assert "Permission.DOCS_MANAGE_ALL" in source
+    assert "user_is_effective_entity_admin" not in source
 
 
 @pytest.mark.asyncio
@@ -2079,6 +2164,7 @@ async def test_metadata_document_editor_fences_replays_and_stale_sequences(
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document
     from packages.core.models.document_version import DocumentVersion
+    from packages.core.models.user import Entity
     from packages.core.services import document_service
     from packages.core.services.entity_fs import EntityFilesystemStaleWriteError
 
@@ -2099,7 +2185,7 @@ async def test_metadata_document_editor_fences_replays_and_stale_sequences(
         source="generated",
         metadata_={},
     )
-    db_session.add(document)
+    db_session.add_all([Entity(id=entity_id, name="Metadata editor"), document])
     await db_session.commit()
 
     for _attempt in range(2):
@@ -2447,6 +2533,7 @@ async def test_runtime_generate_document_file_restores_prior_bytes_when_sync_fai
         name="report.md",
         content="# New report\n",
         file_type="md",
+        expected_sha256=hashlib.sha256(b"old report").hexdigest(),
     ))
 
     assert "rolled back" in result["error"]
@@ -2597,6 +2684,7 @@ async def test_runtime_generate_document_file_rolls_back_when_response_metadata_
         name="report.md",
         content="# New report\n",
         file_type="md",
+        expected_sha256=hashlib.sha256(b"old report").hexdigest(),
     ))
 
     assert result["error"] == "Document was not committed: metadata extraction failed"
@@ -2640,6 +2728,7 @@ async def test_generate_file_restores_prior_bytes_when_projection_fails(
             name="report.md",
             content="new report",
             user_id="user_1",
+            expected_sha256=hashlib.sha256(b"old report").hexdigest(),
         )
     )
 
@@ -2682,10 +2771,11 @@ async def test_patch_file_restores_prior_bytes_when_projection_fails(
             path="report.md",
             user_id="user_1",
             operations=[{"op": "text.replace", "old_text": "old", "new_text": "new"}],
+            expected_sha256=hashlib.sha256(b"old report").hexdigest(),
         )
     )
 
-    assert result["edited"] is False
+    assert result["patched"] is False
     assert result["knowledge_sync_reason"] == "storage_limit"
     with open(target, "rb") as file:
         assert file.read() == b"old report"
@@ -2904,6 +2994,7 @@ async def test_generate_file_retains_durable_cleanup_intent_when_backup_cleanup_
             name="report.md",
             content="new",
             _user_id_from_context="trusted_user",
+            expected_sha256=hashlib.sha256(b"old").hexdigest(),
         )
     )
 
@@ -3290,6 +3381,9 @@ async def test_sandbox_save_result_rolls_back_failed_knowledge_projection(
     async def allow_file_mutation(**_kwargs):
         return None
 
+    async def allow_sandbox_access(**_kwargs):
+        return None
+
     async def fail_sync(**_kwargs):
         return SimpleNamespace(
             synced=False,
@@ -3306,6 +3400,11 @@ async def test_sandbox_save_result_rolls_back_failed_knowledge_projection(
         sandbox_tools,
         "runtime_guard_file_mutation",
         allow_file_mutation,
+    )
+    monkeypatch.setattr(
+        sandbox_tools,
+        "_sandbox_instance_access_error",
+        allow_sandbox_access,
     )
     monkeypatch.setattr(knowledge_sync, "sync_file_to_knowledge", fail_sync)
 
@@ -3579,10 +3678,28 @@ async def test_filesystem_write_requires_document_edit_access(
 
 
 @pytest.mark.asyncio
-async def test_filesystem_mutations_reject_deleted_workspace_even_for_admin(
+async def test_deleted_workspace_retains_projected_knowledge_but_stops_scope(
     client,
+    db_session,
     fs_settings,
 ):
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select, update as sa_update
+
+    from packages.core.models.document import Document, DocumentFolder
+    from packages.core.models.permission import (
+        Capability,
+        ResourceGrant,
+        ResourceType,
+        SubjectType,
+    )
+    from packages.core.models.user import User
+    from packages.core.services.auth_service import create_access_token, hash_password
+    from packages.core.services.filesystem_access import (
+        FilesystemAccessDenied,
+        require_path_write_access,
+    )
     registered = await client.post(
         "/api/v1/auth/register",
         json={
@@ -3605,13 +3722,46 @@ async def test_filesystem_mutations_reject_deleted_workspace_even_for_admin(
     artifact_folder_id = workspace["artifact_folder_id"]
 
     physical_path = f"Workspaces/_by_id/{artifact_folder_id}/report.md"
-    logical_dir = f"Workspaces/{workspace['name']}"
     created = await client.post(
         "/api/v1/fs/write",
         headers=headers,
         json={"path": physical_path, "content": "before deletion"},
     )
     assert created.status_code == 200, created.text
+    document = await db_session.scalar(select(Document).where(
+        Document.entity_id == entity_id,
+        Document.fs_path == physical_path,
+    ))
+    assert document is not None
+    artifact_folder = await db_session.get(DocumentFolder, artifact_folder_id)
+    assert artifact_folder is not None
+    owner = await db_session.scalar(select(User).where(User.id == document.owner_id))
+    assert owner is not None
+    member = User(
+        entity_id=entity_id,
+        email="fsdeletedworkspacegrant@test.com",
+        display_name="Workspace knowledge editor",
+        password_hash=hash_password("pass123"),
+        role="member",
+        status="active",
+    )
+    db_session.add(member)
+    await db_session.flush()
+    db_session.add(ResourceGrant(
+        entity_id=entity_id,
+        resource_type=ResourceType.DOCUMENT,
+        resource_id=document.id,
+        subject_type=SubjectType.USER,
+        subject_id=member.id,
+        capabilities=[Capability.EDIT],
+        granted_by=owner.id,
+        granted_at=datetime.now(timezone.utc),
+        status="active",
+    ))
+    await db_session.commit()
+    member_headers = {
+        "Authorization": f"Bearer {create_access_token(member.id, entity_id, member.role)}",
+    }
     source = await client.post(
         "/api/v1/fs/write",
         headers=headers,
@@ -3625,33 +3775,68 @@ async def test_filesystem_mutations_reject_deleted_workspace_even_for_admin(
     )
     assert deleted.status_code == 204, deleted.text
 
-    denied_write = await client.post(
+    retained_document = await db_session.get(Document, document.id)
+    retained_folder = await db_session.get(DocumentFolder, artifact_folder_id)
+    assert retained_document is not None
+    assert retained_folder is not None
+    assert (await db_session.execute(select(ResourceGrant).where(
+        ResourceGrant.resource_id == document.id,
+        ResourceGrant.subject_id == member.id,
+    ))).scalar_one().status == "active"
+
+    owner_write = await client.post(
         "/api/v1/fs/write",
         headers=headers,
-        json={"path": physical_path, "content": "must not replace"},
+        json={"path": physical_path, "content": "owner can edit retained Knowledge"},
     )
-    denied_mkdir = await client.post(
-        "/api/v1/fs/mkdir",
-        headers=headers,
-        json={"path": f"{logical_dir}/new-directory"},
+    member_write = await client.post(
+        "/api/v1/fs/write",
+        headers=member_headers,
+        json={"path": physical_path, "content": "grantee can edit retained Knowledge"},
     )
-    denied_delete = await client.post(
-        "/api/v1/fs/delete",
+    assert owner_write.status_code == 200, owner_write.text
+    assert member_write.status_code == 200, member_write.text
+
+    await db_session.execute(sa_update(ResourceGrant).where(
+        ResourceGrant.resource_id == document.id,
+        ResourceGrant.subject_id == member.id,
+    ).values(status="revoked"))
+    await db_session.commit()
+    revoked_grantee = await client.post(
+        "/api/v1/fs/write",
+        headers=member_headers,
+        json={"path": physical_path, "content": "revoked grant must not edit"},
+    )
+    assert revoked_grantee.status_code == 403, revoked_grantee.text
+
+    with pytest.raises(FilesystemAccessDenied, match="artifact scope is unavailable"):
+        await require_path_write_access(
+            db_session,
+            user=owner,
+            rel_path=physical_path,
+            exists=True,
+            workspace_id=workspace["id"],
+        )
+    await db_session.rollback()
+
+    denied_unprojected_write = await client.post(
+        "/api/v1/fs/write",
         headers=headers,
-        json={"path": physical_path},
+        json={
+            "path": f"Workspaces/_by_id/{artifact_folder_id}/unprojected.txt",
+            "content": "must not create",
+        },
     )
     denied_move = await client.post(
         "/api/v1/fs/move",
         headers=headers,
         json={
             "src": "move-source.txt",
-            "dest": f"{logical_dir}/moved.txt",
+            "dest": f"Workspaces/_by_id/{artifact_folder_id}/moved.txt",
         },
     )
 
-    assert denied_write.status_code == 403, denied_write.text
-    assert denied_mkdir.status_code == 403, denied_mkdir.text
-    assert denied_delete.status_code == 403, denied_delete.text
+    assert denied_unprojected_write.status_code == 403, denied_unprojected_write.text
     assert denied_move.status_code == 403, denied_move.text
     absolute_report = os.path.join(
         fs_settings.MANOR_FS_ROOT,
@@ -3659,25 +3844,12 @@ async def test_filesystem_mutations_reject_deleted_workspace_even_for_admin(
         *physical_path.split("/"),
     )
     with open(absolute_report, encoding="utf-8") as file:
-        assert file.read() == "before deletion"
+        assert file.read() == "grantee can edit retained Knowledge"
     assert os.path.isfile(os.path.join(
         fs_settings.MANOR_FS_ROOT,
         entity_id,
         "move-source.txt",
     ))
-
-    restored = await client.post(
-        f"/api/v1/workspaces/{workspace['id']}/restore",
-        headers=headers,
-    )
-    assert restored.status_code == 200, restored.text
-    allowed_write = await client.post(
-        "/api/v1/fs/write",
-        headers=headers,
-        json={"path": physical_path, "content": "after restore"},
-    )
-    assert allowed_write.status_code == 200, allowed_write.text
-
 
 @pytest.mark.asyncio
 async def test_filesystem_write_serializes_with_workspace_delete(
@@ -3725,21 +3897,21 @@ async def test_filesystem_write_serializes_with_workspace_delete(
         request_task = asyncio.create_task(client.post(
             "/api/v1/fs/write",
             headers=headers,
-            json={"path": rel_path, "content": "must not cross deletion"},
+            json={"path": rel_path, "content": "retained Knowledge write"},
         ))
         await asyncio.sleep(0.1)
         assert request_task.done() is False
         await deleting_db.commit()
 
     response = await asyncio.wait_for(request_task, timeout=5)
-    assert response.status_code == 403, response.text
+    assert response.status_code == 200, response.text
     absolute_path = os.path.join(
         fs_settings.MANOR_FS_ROOT,
         entity_id,
         *rel_path.split("/"),
     )
     with open(absolute_path, encoding="utf-8") as file:
-        assert file.read() == "before deletion"
+        assert file.read() == "retained Knowledge write"
 
 
 @pytest.mark.asyncio
@@ -3762,7 +3934,7 @@ async def test_mutable_display_name_never_grants_document_ownership(monkeypatch)
         created_by=owner.display_name,
         owner_id=owner.id,
     )
-    db = SimpleNamespace()
+    db = SimpleNamespace(scalar=AsyncMock(return_value="entity"))
     monkeypatch.setattr(
         document_access,
         "_resolve_current_actor_for_entity",
@@ -3775,7 +3947,7 @@ async def test_mutable_display_name_never_grants_document_ownership(monkeypatch)
     )
     monkeypatch.setattr(
         filesystem_access,
-        "user_is_effective_entity_admin",
+        "effective_user_has_permission",
         AsyncMock(return_value=False),
     )
     monkeypatch.setattr(
@@ -3785,7 +3957,12 @@ async def test_mutable_display_name_never_grants_document_ownership(monkeypatch)
     )
     monkeypatch.setattr(
         documents,
-        "user_is_effective_entity_admin",
+        "effective_user_has_permission",
+        AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(
+        documents,
+        "user_owns_workspace_document",
         AsyncMock(return_value=False),
     )
 
@@ -6867,3 +7044,40 @@ def test_copy_entity_file_atomic_rejects_source_alias(fs_settings, tmp_path):
             "documents/copied.txt",
             str(alias),
         )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_budget_waits_briefly_for_a_free_slot_instead_of_failing():
+    # A result panel or Knowledge list fetches several files at once; with an
+    # immediate 503 the third concurrent download failed and never retried.
+    from apps.api import file_responses
+
+    budget = file_responses._SnapshotBudget(max_files=1, max_bytes=100)
+    assert budget.try_reserve(10) is True
+
+    async def release_soon():
+        await asyncio.sleep(0.1)
+        budget.release(10)
+
+    releaser = asyncio.create_task(release_soon())
+    assert await budget.reserve(10, timeout=2.0) is True
+    await releaser
+    budget.release(10)
+
+    # A request that can never fit is rejected at once, not after the timeout.
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    assert await budget.reserve(101, timeout=2.0) is False
+    assert await file_responses._SnapshotBudget(max_files=0, max_bytes=0).reserve(1, timeout=2.0) is False
+    assert loop.time() - started < 0.5
+
+    # Sustained contention still ends in a bounded rejection.
+    assert budget.try_reserve(10) is True
+    assert await budget.reserve(10, timeout=0.2) is False
+    budget.release(10)
+
+
+def test_snapshot_download_concurrency_allows_a_page_of_files():
+    from apps.api import file_responses
+
+    assert file_responses._MAX_SNAPSHOT_FILES >= 8

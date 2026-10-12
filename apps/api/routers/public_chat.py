@@ -27,6 +27,9 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
+from fastapi.routing import APIRoute
+from fastapi.exceptions import RequestValidationError
+from fastapi.exception_handlers import request_validation_exception_handler
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,6 +69,7 @@ from packages.core.services.runtime_file_context import (
     runtime_message_with_file_attachments,
     runtime_saved_message_with_file_references,
 )
+from packages.core.services.workspace_audio_defaults import normalize_workspace_audio_language
 from apps.api.deps import get_current_user, security
 from apps.api.middleware.rate_limit import RateLimiter, client_ip
 from apps.api.chat_audio import (
@@ -85,7 +89,25 @@ _BLOCKED_VISITOR_DETAIL = {
     "message": "This chat visitor is blocked.",
 }
 
-router = APIRouter(prefix="/api/v1/public/chat", tags=["public-chat"])
+class PrivateChatResponseRoute(APIRoute):
+    """Chat results and denial responses must never enter a shared/browser cache."""
+    def get_route_handler(self):
+        handler = super().get_route_handler()
+        async def no_store(request):
+            try:
+                response = await handler(request)
+            except HTTPException as exc:
+                exc.headers = {**(exc.headers or {}), "Cache-Control": "private, no-store", "Pragma": "no-cache"}
+                raise
+            except RequestValidationError as exc:
+                response = await request_validation_exception_handler(request, exc)
+            response.headers["Cache-Control"] = "private, no-store"
+            response.headers["Pragma"] = "no-cache"
+            return response
+        return no_store
+
+
+router = APIRouter(prefix="/api/v1/public/chat", tags=["public-chat"], route_class=PrivateChatResponseRoute)
 _CLOUD_EMAIL_VERIFICATION_ENABLED = False
 _SSE_HEADERS = {
     "Cache-Control": "no-cache",
@@ -530,6 +552,8 @@ async def _ensure_session_contact_for_user(
     user: User | None,
     conversation: Conversation | None = None,
     sender_name: str | None = None,
+    request: Request | None = None,
+    resident_check: bool = True,
 ) -> ChannelContact:
     """Find/create the session contact and claim it when login is required."""
     contact = await find_channel_session_contact(
@@ -561,6 +585,12 @@ async def _ensure_session_contact_for_user(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"code": "session_mismatch", "message": "This chat session belongs to a signed-in visitor."},
         )
+    from packages.core.services import webchat_resident
+    private, was_private = await webchat_resident.private_contact_binding(db, contact)
+    if was_private:
+        if not private or private.manor_user_id != (user.id if user else None):
+            exc = webchat_resident.authentication_required()
+            raise HTTPException(exc.status, {"code": exc.code, "message": exc.message})
     if sender_name and not contact.display_name:
         contact.display_name = sender_name
     if user:
@@ -570,6 +600,15 @@ async def _ensure_session_contact_for_user(
             cc,
             display_name=_display_name_for_user(user),
         )
+    if resident_check:
+        from packages.core.services import webchat_resident
+        try:
+            await webchat_resident.require_private_access(
+                db, contact=contact, cc=cc, session_id=session_id, request=request,
+                manor_user_id=user.id if user else None,
+            )
+        except webchat_resident.ResidentAccessError as exc:
+            raise HTTPException(exc.status, {"code": exc.code, "message": exc.message}) from exc
     if conversation is not None:
         meta = dict(conversation.meta or {})
         meta.update({
@@ -643,6 +682,7 @@ class ChatInfoResponse(BaseModel):
     signup_url: str | None = None
     auth_hint: str | None = None
     public_page: WebchatPage | None = None
+    resident_pms: dict[str, Any] | None = None
 
 
 class ChatEmbedResponse(BaseModel):
@@ -712,6 +752,8 @@ async def get_chat_info(
         login_url=login_url,
         signup_url=signup_url,
         auth_hint=config.get("auth_hint"),
+        resident_pms={"enabled": bool((config.get("resident_pms") or {}).get("enabled")),
+                      "display_name": "PMS resident services" if (config.get("resident_pms") or {}).get("enabled") else None},
         public_page=await _resolve_public_page(
             db,
             value=config.get("public_page"),
@@ -734,6 +776,12 @@ async def create_or_resume_session(
     claimed_contact = await find_claimed_webchat_contact_for_user(
         db, cc=cc, user=user,
     ) if not req.session_id else None
+    # A fresh public chat must not silently resume private resident history.
+    if claimed_contact:
+        from packages.core.services.webchat_resident import private_contact_binding
+        _, was_private = await private_contact_binding(db, claimed_contact)
+        if was_private:
+            claimed_contact = None
     session_id = req.session_id or (claimed_contact.source_id if claimed_contact else None) or secrets.token_urlsafe(16)
     visitor_name = req.visitor_name or (_display_name_for_user(user) if user else None)
     visitor_email = req.visitor_email or (user.email if user else None)
@@ -748,6 +796,7 @@ async def create_or_resume_session(
     if existing:
         await _ensure_session_contact_for_user(
             db,
+            request=request,
             cc=cc,
             session_id=session_id,
             user=user,
@@ -771,6 +820,7 @@ async def create_or_resume_session(
 
     contact = await _ensure_session_contact_for_user(
         db,
+        request=request,
         cc=cc,
         session_id=session_id,
         user=user,
@@ -856,6 +906,7 @@ async def run_public_page_action(
         raise HTTPException(404, "Chat session not found")
     await _ensure_session_contact_for_user(
         db,
+        request=request,
         cc=cc,
         session_id=body.session_id,
         user=user,
@@ -977,6 +1028,7 @@ async def run_public_page_action(
 async def register_customer_for_chat(
     token: str,
     req: CustomerRegisterRequest,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     """Create a customer account from a public chat without Manor invite gates."""
@@ -990,6 +1042,7 @@ async def register_customer_for_chat(
         mark_user_login,
         register_user,
     )
+
 
     try:
         user, entity = await register_user(
@@ -1041,6 +1094,14 @@ async def register_customer_for_chat(
     }
 
 
+async def _resident_publish_check(db, request):
+    from packages.core.services import webchat_resident
+    try:
+        await webchat_resident.authorize_publication(db, getattr(request.state, "resident_scope", None))
+    except webchat_resident.ResidentAccessError as exc:
+        raise HTTPException(exc.status, {"code": exc.code, "message": exc.message}) from exc
+
+
 @router.post("/{token}/message")
 async def send_message(
     token: str,
@@ -1057,6 +1118,7 @@ async def send_message(
     # its own DB session and resolves the same ChannelContact.
     await _ensure_session_contact_for_user(
         db,
+        request=request,
         cc=cc,
         session_id=req.session_id,
         user=user,
@@ -1068,7 +1130,16 @@ async def send_message(
     # tools fire, conversation history persists, and usage is recorded.
     from packages.core.services.channel_gateway import dispatch_inbound
 
-    result = await dispatch_inbound(
+    from packages.core.services import site_content, webchat_resident
+
+    site_scope = await site_content.site_chat_scope_for(
+        db,
+        entity_id=cc.entity_id,
+        workspace_id=getattr(cc, "workspace_id", None),
+        channel_config_id=cc.id,
+    )
+    result = await site_content.run_with_scope(site_scope, webchat_resident.run_with_scope(
+        getattr(request.state, "resident_scope", None), dispatch_inbound(
         entity_id=cc.entity_id,
         channel_config_id=cc.id,
         channel_type="webchat",
@@ -1078,12 +1149,27 @@ async def send_message(
         content=req.text,
         attachments=req.attachments,
         runtime_metadata=(
-            {"voice_session_mode": "chat_gateway"}
+            {
+                "voice_session_mode": "chat_gateway",
+                **(
+                    {
+                        "voice_origin_message_id": str(
+                            request.state.voice_origin_message_id
+                        ),
+                        "origin_user_message_id": str(
+                            request.state.voice_origin_message_id
+                        ),
+                    }
+                    if getattr(request.state, "voice_origin_message_id", None)
+                    else {}
+                ),
+            }
             if getattr(request.state, "voice_session_mode", None) == "chat_gateway"
             else None
         ),
-    )
+    )))
 
+    await _resident_publish_check(db, request)
     response = {
         "status": result.get("status", "ok"),
         "reply": result.get("reply"),
@@ -1124,6 +1210,7 @@ async def stream_message(
 
         contact = await _ensure_session_contact_for_user(
             db,
+            request=request,
             cc=cc,
             session_id=session_id,
             user=user,
@@ -1135,6 +1222,7 @@ async def stream_message(
         from packages.core.services.conversation_messages import add_message
         from packages.core.services.conversation_messages import create_assistant_stream_placeholder
         from packages.core.ai.runtime import runtime_stream_chat_turn
+        from packages.core.services import webchat_resident
 
         sub = await resolve_subscription(db, binding=binding, contact=contact)
         if sub.source == "invalid":
@@ -1159,7 +1247,16 @@ async def stream_message(
                     f"{dispatch_text}\n\n"
                     f"[Attached files: {', '.join(attachment_names)}]"
                 ).strip()
-            result = await dispatch_inbound(
+            from packages.core.services import site_content
+
+            site_scope = await site_content.site_chat_scope_for(
+                db,
+                entity_id=cc.entity_id,
+                workspace_id=getattr(cc, "workspace_id", None),
+                channel_config_id=cc.id,
+            )
+            result = await site_content.run_with_scope(site_scope, webchat_resident.run_with_scope(
+                getattr(request.state, "resident_scope", None), dispatch_inbound(
                 entity_id=cc.entity_id,
                 channel_config_id=cc.id,
                 channel_type="webchat",
@@ -1174,7 +1271,8 @@ async def stream_message(
                     }
                     for f in files
                 ] or None,
-            )
+            )))
+            await _resident_publish_check(db, request)
             status_value = str(result.get("status") or "ok")
             if status_value == "approval_required":
                 notice = "Thanks, your message was sent. The reply is waiting for team approval and will appear here once approved."
@@ -1254,7 +1352,7 @@ async def stream_message(
         )
         # Correlation survives losing the first SSE event; it grants no access.
         turn_meta = {"client_turn_id": client_turn_id} if client_turn_id else {}
-        await add_message(
+        visitor_message = await add_message(
             db,
             conv.id,
             role="user",
@@ -1284,8 +1382,18 @@ async def stream_message(
         )
         await db.commit()
 
+        from packages.core.services import site_content
+
+        site_scope = await site_content.site_chat_scope_for(
+            db,
+            entity_id=cc.entity_id,
+            workspace_id=sub.workspace_id,
+            channel_config_id=cc.id,
+            conversation_id=conv.id,
+        )
         return StreamingResponse(
-            lease.wrap(runtime_stream_chat_turn(
+            lease.wrap(site_content.guard_stream(site_scope, webchat_resident.guard_stream(
+                getattr(request.state, "resident_scope", None), runtime_stream_chat_turn(
                 llm_message,
                 conv.id,
                 surface=ChatSurface.PUBLIC_CUSTOMER_CHAT,
@@ -1308,11 +1416,14 @@ async def stream_message(
                 runtime_metadata={
                     "channel_label": cc.name or binding.name or "public webchat",
                     "channel_language": channel_runtime_config(cc, binding).get("language"),
+                    "webchat_channel_config_id": cc.id,
                     "visitor_entity_id": getattr(user, "entity_id", None),
                     "visitor_verified": bool(user),
+                    # The run writes this turn to the transcript itself.
+                    "origin_user_message_id": visitor_message.id,
                     **file_context_turn.runtime_metadata,
                 },
-            )),
+            )))),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
@@ -1326,6 +1437,7 @@ class PublicSpeechRequest(BaseModel):
     message_id: str = Field(min_length=1, max_length=128)
     offset: int = Field(default=0, ge=0)
     length: int = Field(default=SPEECH_CHUNK_LENGTH, ge=1, le=SPEECH_CHUNK_LENGTH)
+    language: str | None = Field(default=None, max_length=35)
 
 
 async def _public_audio_scope(db, token, request, session_id):
@@ -1338,6 +1450,7 @@ async def _public_audio_scope(db, token, request, session_id):
         raise HTTPException(404, "Chat session not found")
     contact = await _ensure_session_contact_for_user(
         db, cc=cc, session_id=session_id, user=user, conversation=conv,
+        request=request,
     )
     from packages.core.services.agent_subscription_service import resolve_subscription
 
@@ -1367,7 +1480,9 @@ async def transcribe_public_chat_audio(
     scope = await _public_audio_scope(db, token, request, session_id)
     lease = await acquire_audio_lease()
     try:
-        return await transcribe_chat_upload(db, scope, file, language)
+        result = await transcribe_chat_upload(db, scope, file, language)
+        await _resident_publish_check(db, request)
+        return result
     finally:
         await lease.release()
 
@@ -1391,6 +1506,11 @@ async def public_chat_speech(
         raise HTTPException(409, "Reply is not complete")
     # Never accept arbitrary public TTS text or read internal/unpublished replies.
     text = message["content"][body.offset:body.offset + body.length]
+    speech_language = (
+        normalize_workspace_audio_language(body.language)
+        if str(body.language or "").strip()
+        else None
+    )
     cache_identity = hashlib.sha256(
         "\0".join(
             (
@@ -1400,6 +1520,7 @@ async def public_chat_speech(
                 str(body.offset),
                 str(body.length),
                 text,
+                speech_language or "",
             )
         ).encode("utf-8")
     ).hexdigest()
@@ -1414,6 +1535,7 @@ async def public_chat_speech(
             except ValueError:
                 audio = b""
             if audio:
+                await _resident_publish_check(db, request)
                 return Response(
                     audio,
                     media_type=media_type,
@@ -1421,7 +1543,8 @@ async def public_chat_speech(
                 )
     lease = await acquire_audio_lease()
     try:
-        response = await chat_speech_response(db, scope, text)
+        response = await chat_speech_response(db, scope, text, language=speech_language)
+        await _resident_publish_check(db, request)
         await cache.set(
             cache_key,
             {
@@ -1460,6 +1583,7 @@ async def poll_messages(
 
     await _ensure_session_contact_for_user(
         db,
+        request=request,
         cc=cc,
         session_id=session_id,
         user=user,
@@ -1478,6 +1602,7 @@ async def poll_messages(
         response["updates"] = await list_public_webchat_messages(
             db, conv.id, session_id=session_id, message_ids=refresh,
         )
+    await _resident_publish_check(db, request)
     return response
 
 

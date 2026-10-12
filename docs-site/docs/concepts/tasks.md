@@ -57,6 +57,21 @@ If an agent is assigned at creation, the run starts immediately. `POST
 its plan); approval steps waiting on you are decided right from the task —
 see [HITL Governance](hitl-governance.md).
 
+### Delivery checks and recovery
+
+For coordinator-managed tasks, completion checks use the submitted files and
+their Knowledge records. A file must be accessible and tied to the relevant
+step; its existence alone does not prove that its content meets the request.
+Correctable review errors are returned to the same agent loop. A review error
+does not by itself authorize repeating an already completed file-writing step.
+
+An older run incorrectly paused during delivery review can be resumed through
+`POST /api/v1/tasks/{id}/resume-delivery-review` with its exact `expected_plan_id` and
+`expected_state_version`. The server checks the original run, completed steps,
+files, pending decisions and action outcomes before resuming review. Conflicts
+are rejected; this endpoint neither approves pending actions nor marks the task
+complete. Ordinary task retry and approval controls remain separate.
+
 ## Sharing Work Outside Manor
 
 Unauthenticated, code-scoped task endpoints let external collaborators

@@ -14,21 +14,46 @@ This guide covers essential PDF processing operations using Python libraries and
 
 1. Preserve the source PDF. Treat chat uploads, Knowledge files, and `/workspace/` files as read-only inputs. Never overwrite a mounted source; create a descriptively named output copy.
 2. Inspect structure with `pypdf` or `pdfplumber`, but render every relevant page to PNG for layout review. Text extraction alone is not a visual correctness check.
+   Identify the physical page numbers by enumerating the PDF pages; printed page labels may differ. For optional text searches, prefer Python and return an empty match list when nothing is found. A grep exit code of 1 means no matches and must not abort the inspection; retain errors for invalid commands or unreadable files.
 3. Put temporary work under `tmp/pdfs/` and final files under `output/pdf/` inside the skill workspace.
-4. After each meaningful edit, run `python scripts/verify_pdf.py <output.pdf> <render_dir/>`, then inspect every rendered page for alignment, spacing, clipping, glyphs, tables, images, headers, footers, and page transitions. Add `--expect-interactive --require-form-appearances` for an editable form or `--expect-flattened` for a static form copy.
-5. Before returning, save the verified file with `sandbox_save_result`. That creates a new managed artifact through Manor's file-action boundary; do not use `write_file` or `edit_file` to replace a read-only attachment.
+4. After each meaningful edit, run `python scripts/verify_pdf.py <output.pdf> <render_dir/> --report-only` to receive validation findings, correct every finding, and repeat. After the report passes, run the same command without `--report-only` as the final delivery gate. For party or member removal, this command MUST include `--source <original.pdf>`, repeated `--remove-text` values for all target names and aliases, and repeated `--preserve-text` values for every retained party, original signature label, and percentage. Require both `machine_checks_passed` and `edit_scope_passed` before saving. Then use sandbox action `read_file` on the rendered PNG files for visual observations, then inspect every rendered page for alignment, spacing, clipping, glyphs, tables, images, headers, footers, and page transitions. Add `--expect-interactive --require-form-appearances` for an editable form or `--expect-flattened` for a static form copy.
+5. Complete all required corrections and verification in the current run. If a visual review finds table remnants or damaged borders, correct the PDF and repeat review; a progress reply promising a later PDF is not a completed edit. Before returning, save the verified file with `sandbox(action="save_result", params={...})`. That creates a new managed artifact through Manor's file-action boundary; do not use `generate_file` or `patch_file` to replace a read-only attachment.
 
 For signed PDFs, preserve the signed original. Editing invalidates its signature. Refuse by default and continue only when the user explicitly accepts signature invalidation. Never flatten a signed PDF without that explicit decision.
 
 ### Final Delivery Contract
 
-- Deliver one canonical PDF from the absolute path `/skill/output/pdf/<descriptive-name>.pdf`. The `filename` passed to `sandbox_save_result` must match that basename.
-- Call `sandbox_save_result` only after structural verification and page-by-page visual review. Save the final PDF exactly once in the successful path.
+- Deliver one canonical PDF from the absolute path `/skill/output/pdf/<descriptive-name>.pdf`. The `filename` passed to sandbox action `save_result` must match that basename.
+- Call sandbox action `save_result` only after structural verification and page-by-page visual review. Save the final PDF exactly once in the successful path.
 - Never save helper scripts, render PNGs, temporary copies, intermediate PDFs, or a fallback DOCX as final artifacts. Keep all of those under `/skill/tmp/pdfs/`.
-- If `sandbox_save_result` fails, use its exact returned error to correct the path or artifact once. Do not guess alternate directories or repeat an unchanged save call. The runtime stops the same failed file delivery after three attempts.
+- If sandbox action `save_result` fails, use its exact returned error to correct the path or artifact once. Do not guess alternate directories or repeat an unchanged save call. The runtime stops the same failed file delivery after three attempts.
 - Do not generate a DOCX substitute unless the user explicitly asked for a Word version. A missing PDF dependency is a readiness error, not permission to change the requested file type.
 
+## Editing Existing Pages with PyMuPDF
+
+When removing a named party or member, remove all target-name aliases from the entire output, including notes and explanations. Do not reintroduce the removed name in a note about the deletion. Explain any unallocated interest in the chat response; do not invent a replacement allocation or add a new contract clause. Preserve every other party's names, signature labels, percentages, addresses, and contributions on each modified page. Keep retained names explicit in rewritten paragraphs; a generic reference to a member list does not preserve a named party. A PyMuPDF text block may contain the entire multi-party paragraph. Build its replacement from the complete original block, remove only the target party clauses, and keep every unrelated name and clause from that block. Do not replace a whole block with only the short fragment around the target match. Collect the retained names from the original member list and all original signature labels, including their different source spellings. In a member table, remove the target's entire row across all columns and all wrapped lines, including its address, postcode, interest, and contribution text. Name search rectangles cover only matched glyphs; they cannot remove a full row. Determine the row boundaries from the original rendered page or table extraction, remove the full row, then rebuild or compact the table with the retained rows and intact borders. Check every former cell for leftover wrapped words and numbers before saving. A redaction rectangle must end before the next unrelated signature heading. When rewriting a paragraph that names several parties, reinsert the retained parties rather than removing the entire list.
+
+Before delivery, compare retained names and signature labels on every modified page against the original. Normalize whitespace and case for this comparison; document-wide counts can hide one lost label behind a new occurrence elsewhere. Report any decreased count, correct the edit, and repeat verification before saving. Do not treat a successful render or an empty target-name search as proof that unrelated text survived. Use the bundled verifier rather than an ad hoc count script, for example:
+
+```bash
+python scripts/verify_pdf.py output/pdf/revised.pdf tmp/pdfs/verified \
+  --report-only --source tmp/pdfs/original.pdf \
+  --remove-text "Removed Party" --remove-text "Removed Party Full Legal Name" \
+  --preserve-text "Retained Party" --preserve-text "Retained Signature Heading" \
+  --preserve-text "60%" --preserve-text "30%"
+```
+
+Replace the example labels with the actual source text. Include each different spelling in the original signature headings. The verifier rejects absent source labels, remaining target aliases, decreased per-page retained-label counts, changed page counts, and new question marks or replacement characters in a removal-only edit. Such new characters usually indicate a font substitution; resolve the font and reinsert the text before repeating verification. In report mode, read `edit_scope_passed` and `machine_checks_passed`; exit code 0 only means the report was produced. Correct all findings, then rerun without `--report-only`. The final command must exit 0 and both check fields must be true. A report containing errors never permits delivery.
+
+An unsuccessful scope report is a request to correct the edited copy; never deliver that copy. Keep the original source unchanged throughout these checks.
+
+The sandbox installs `PyMuPDF`, which provides `import pymupdf` and the legacy `import fitz` alias. Use its redaction APIs when removing existing text while preserving the surrounding page layout. Apply redactions before saving a new output copy; a white rectangle alone does not remove the underlying text. Never install the unrelated package named `fitz`.
+
+When reinserting paragraphs, preserve Unicode punctuation and choose an installed font file that covers every character. Pass `fontfile` with a custom, non-reserved `fontname` such as `DocSerif`; names such as `tiro` or `Times-Roman` select a built-in font and ignore the font file. Resolve the actual serif font with `fc-match -f '%{file}' serif` rather than guessing a font path. Check the return value from `insert_textbox`: a negative value means the text did not fit. Re-extract and render the replaced paragraphs to detect lost characters, question marks substituted for quotes, and clipping before delivery. See the [PyMuPDF font API](https://pymupdf.readthedocs.io/en/latest/page.html#Page.insert_font).
+
 ## Rendering and Validation
+
+For a long existing PDF, execute the editing script once, then render and verify in a separate command. Start full-document rendering with sandbox action `exec`, `background: true`, and `timeout: 600`; poll sandbox action `status` using the returned `sandbox_id` and `execution_id` until it finishes with exit code 0. This avoids the short synchronous command limit. A timeout does not prove that no output was written: inspect the output and execution status before considering any repeat of an editing command. Never combine a source-changing edit and a slow full-document verification into one synchronous command.
 
 Prefer Poppler for deterministic rendering and metadata checks:
 
@@ -90,9 +115,9 @@ The generator validates required data, resolves fonts across sandbox/Linux/macOS
 
 Created PDFs may use photographs, illustrations, diagrams, textures, logos, and other raster images when they improve the document. Do not default to text-only pages when the user's brief calls for visual storytelling. Use one or more of these source routes:
 
-1. **User-provided or Knowledge image** - import the returned `fs_path` or upload path into `/skill/tmp/pdfs/assets/` with `sandbox_write_file`. Preserve the original as a read-only input.
+1. **User-provided or Knowledge image** - import the returned `fs_path` or upload path into `/skill/tmp/pdfs/assets/` with sandbox action `write_file`. Preserve the original as a read-only input.
 2. **Downloaded image** - use `web_search` or `web_fetch` to identify the source page and confirm the usage rights, then download the direct HTTPS image URL into `/skill/tmp/pdfs/assets/source/`. Record the source page, direct asset URL, license, and required credit. If the license or permission is unknown, do not embed the image.
-3. **Generated image** - call the system `generate_file(kind="image")` tool with the subject, visual style, composition, and aspect ratio. Use text-free imagery; keep all titles, labels, charts, and factual data as native PDF content. Import the returned workspace `fs_path` into `/skill/tmp/pdfs/assets/source/` with `sandbox_write_file` before continuing.
+3. **Generated image** - call the system `generate_file(kind="image")` tool with the subject, visual style, composition, and aspect ratio. Use text-free imagery; keep all titles, labels, charts, and factual data as native PDF content. Import the returned workspace `fs_path` into `/skill/tmp/pdfs/assets/source/` with sandbox action `write_file` before continuing.
 
 Never point ReportLab, fpdf2, or another renderer at a remote URL. Every image must exist as a local sandbox file before layout begins. If a download is unavailable in the sandbox, use a user-provided or generated image instead and report the limitation; do not leave a broken placeholder.
 

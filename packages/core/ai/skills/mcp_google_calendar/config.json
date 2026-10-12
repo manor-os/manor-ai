@@ -19,5 +19,9 @@
     "mcp__google_calendar__respond_to_invite",
     "mcp__google_calendar__quick_add_event",
     "mcp__google_calendar__move_event"
-  ]
+  ],
+  "search": {
+    "terms": ["gcal", "meeting", "appointment", "reschedule", "availability", "agenda", "rsvp", "invite"],
+    "examples": ["what is on my schedule tomorrow", "find free slot next week", "move meeting to friday afternoon", "accept calendar invite from client"]
+  }
 }

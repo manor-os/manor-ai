@@ -189,6 +189,26 @@ async def test_failed_envelope_marked_non_retryable_stops_immediately(client) ->
 
 
 @pytest.mark.asyncio
+async def test_failed_envelope_with_unconfirmed_effect_is_not_retried(client) -> None:
+    """do_not_replay alone (no retryable=False) still stops the attempt budget."""
+    import packages.core.database as dbmod
+
+    envelope = {
+        "status": "failed",
+        "summary": "the publish call timed out; its outcome is unknown",
+        "failure": {"reason": "publish outcome unconfirmed", "do_not_replay": True},
+    }
+    async with dbmod.async_session() as db:
+        step_id, lease_id = await _setup_step(db, attempt_count=1, max_attempts=3)
+        await Dispatcher().complete_lease(db, lease_id, result=envelope)
+        await db.flush()
+
+        step = await db.get(ExecutionStep, step_id)
+        assert step.step_status in ("failed", "waiting_human")
+        assert step.step_status != "pending"
+
+
+@pytest.mark.asyncio
 async def test_partial_envelope_is_a_success(client) -> None:
     """Partial output is usable output — the step stays done."""
     import packages.core.database as dbmod
@@ -216,6 +236,32 @@ async def test_succeeded_envelope_is_a_success(client) -> None:
         step = await db.get(ExecutionStep, step_id)
         assert step.step_status == "done"
         assert step.result == _SUCCEEDED_ENVELOPE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidenced", [False, True])
+async def test_publishing_receipt_is_persisted_for_supervisor_verification(client, evidenced):
+    import packages.core.database as dbmod
+
+    async with dbmod.async_session() as db:
+        step_id, lease_id = await _setup_step(db, kind="subagent")
+        step = await db.get(ExecutionStep, step_id)
+        plan = await db.get(ExecutionPlan, step.plan_id)
+        plan.plan_dag = {"steps": [{"key": step.step_key, "expects": ["publish"]}]}
+        # A URL claimed by the model is deliberately present in both cases.
+        result = {"status": "succeeded", "summary": "Draft ready", "outputs": {"post_url": "https://x.com/u/status/123"}}
+        evidence = [{
+            "kind": "tool_effect",
+            "effect": "publish",
+            "fields": {"tweet_id": "123", "delivery_confirmed": True},
+        }] if evidenced else []
+        lease = await Dispatcher().complete_lease(db, lease_id, result=result, evidence_refs=evidence)
+        assert step.result == result
+        assert step.step_status == "done"
+        assert lease.status == "completed"
+        from packages.core.plans.executor import _unmet_expects_issue
+
+        assert bool(_unmet_expects_issue(plan, [step])) is not evidenced
 
 
 @pytest.mark.asyncio
@@ -358,6 +404,10 @@ async def test_empty_envelope_step_does_not_release_its_dependent(client) -> Non
     step1_id, step2_id = generate_ulid(), generate_ulid()
 
     async with dbmod.async_session() as db:
+        from tests.approval_settings_test_utils import action_rule, initialize_test_account_approval
+
+        await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("unclassified.action")])
         db.add(
             Worker(
                 id=worker_id,
@@ -445,3 +495,24 @@ async def test_llm_step_without_envelope_schema_is_unaffected(client) -> None:
 
         step = await db.get(ExecutionStep, step_id)
         assert step.step_status == "done"
+
+
+@pytest.mark.asyncio
+async def test_real_action_receipt_survives_schema_failure_without_automatic_reexecution(client):
+    import packages.core.database as dbmod
+
+    async with dbmod.async_session() as db:
+        step_id, lease_id = await _setup_step(db, kind="action", schema=_ACTION_SCHEMA)
+        evidence = [{"kind": "tool_effect", "effect": "action", "fields": {
+            "provider": "twitter_x", "action_key": "create_tweet",
+        }}]
+        native_receipt = {"tweet_id": "already-published"}  # missing required status
+        lease = await Dispatcher().complete_lease(db, lease_id, result=native_receipt, evidence_refs=evidence)
+        step = await db.get(ExecutionStep, step_id)
+        assert step.step_status == "failed"
+        assert lease.evidence_refs == step.evidence_refs == evidence
+        assert step.result == native_receipt
+        assert step.error["type"] == "OutputSchemaError"
+        assert step.error["failure"]["requires_human"] is True
+        assert step.error["failure"]["retryable"] is False
+        assert step.attempt_count == 1

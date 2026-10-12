@@ -26,6 +26,8 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import Workspace
+from packages.core.models.user import Entity
+from packages.core.governance.approval_policy_service import account_defaults, initialize_workspace_approval
 
 
 async def resolve_approval(*args, **kwargs):
@@ -35,6 +37,17 @@ async def resolve_approval(*args, **kwargs):
         PermissionDecision.allow(AuthorizationRule.DISPATCHER_WORKER),
     )
     return await _resolve_approval(*args, **kwargs)
+
+
+async def _create_workspace(db, entity_id, workspace_id):
+    if await db.get(Entity, entity_id) is None:
+        db.add(Entity(id=entity_id, name="Approval lifecycle account",
+                      settings={"approval_defaults": account_defaults()}))
+    workspace = Workspace(id=workspace_id, entity_id=entity_id, name="Cards WS", operating_model={})
+    db.add(workspace)
+    await db.flush()
+    await initialize_workspace_approval(db, workspace)
+    return workspace
 
 
 async def _ws_with_card(
@@ -48,7 +61,7 @@ async def _ws_with_card(
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
     conversation_id = generate_ulid()
-    db.add(Workspace(id=workspace_id, entity_id=entity_id, name="Cards WS", operating_model={}))
+    await _create_workspace(db, entity_id, workspace_id)
     db.add(Conversation(
         id=conversation_id, entity_id=entity_id, user_id=generate_ulid(),
         workspace_id=workspace_id, title="ws chat",
@@ -172,8 +185,11 @@ async def test_task_terminal_cleanup_closes_stale_cards_and_requests(db_session)
 
 @pytest.mark.asyncio
 async def test_finalize_expires_requests_and_closes_cards(db_session):
-    """The _finalize integration: terminal plan → open request expired AND its
-    chat card resolved, in one cleanup pass."""
+    """Terminal cleanup runs after the Task/Plan transaction commits.
+
+    Approval decisions lock the request before the execution graph; keeping
+    this cleanup post-commit avoids taking those locks in the reverse order.
+    """
     from packages.core.plans.executor import PlanExecutor
 
     plan_id, step_id = generate_ulid(), generate_ulid()
@@ -196,10 +212,22 @@ async def test_finalize_expires_requests_and_closes_cards(db_session):
     )
     assert decision.outcome == "needs_human"
     await db_session.flush()
+    request_id = decision.request.id
+    card_id = card.id
+    card_model = type(card)
 
     await PlanExecutor._finalize(db_session, plan, "failed")
+    await db_session.commit()
+    await PlanExecutor._cleanup_terminal_approvals_after_commit(
+        db_session,
+        plan_id=plan.id,
+        task_id=plan.task_id,
+        reason="plan_terminal",
+    )
 
-    request = await db_session.get(HitlRequest, decision.request.id)
+    db_session.expire_all()
+    request = await db_session.get(HitlRequest, request_id)
+    card = await db_session.get(card_model, card_id)
     assert request.status == "expired"
     assert card.resolved_at is not None
     assert card.resolution == {"choice": "expired", "reason": "plan_terminal"}
@@ -243,7 +271,7 @@ async def test_count_open_requests_by_workspace_groups_pending_only(db_session):
     entity_id = generate_ulid()
     ws_a, ws_b = generate_ulid(), generate_ulid()
     for wid in (ws_a, ws_b):
-        db_session.add(Workspace(id=wid, entity_id=entity_id, name=f"WS {wid[:4]}", operating_model={}))
+        await _create_workspace(db_session, entity_id, wid)
     await db_session.flush()
 
     async def _mint(wid):

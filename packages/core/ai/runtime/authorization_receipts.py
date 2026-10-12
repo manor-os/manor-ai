@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 import hashlib
 import json
@@ -19,6 +21,9 @@ from packages.core.services.runtime_authorization.domain import (
     RuntimeAuthorizationAccess,
 )
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
+from packages.core.services.generated_media_naming import (
+    GeneratedMediaOutputPlan, workspace_artifact_default_dir,
+)
 
 if TYPE_CHECKING:
     from packages.core.ai.runtime.approvals import (
@@ -41,6 +46,75 @@ _RUNTIME_EPHEMERAL_ARGUMENT_KEYS = frozenset({
     "approval_token",
     "active_user_message",
 })
+
+
+@dataclass(frozen=True)
+class TikTokPublishConsent:
+    """Frozen operator-reviewed input, issued only after a durable grant is spent."""
+
+    approval_id: str
+    evidence_json: str
+    fields_json: str
+
+    @property
+    def evidence(self) -> dict:
+        return json.loads(self.evidence_json)
+
+    @property
+    def fields(self) -> dict:
+        return json.loads(self.fields_json)
+
+
+_tiktok_consent_capture: ContextVar[list[TikTokPublishConsent] | None] = ContextVar(
+    "runtime_tiktok_consent_capture", default=None,
+)
+
+
+@contextmanager
+def runtime_capture_tiktok_publish_consent():
+    """Transport gate output within one preparation, never through model arguments."""
+    captured: list[TikTokPublishConsent] = []
+    token = _tiktok_consent_capture.set(captured)
+    try:
+        yield captured
+    finally:
+        _tiktok_consent_capture.reset(token)
+
+
+def runtime_record_tiktok_publish_consent(consent: TikTokPublishConsent) -> None:
+    captured = _tiktok_consent_capture.get()
+    if captured is not None:
+        captured.append(consent)
+
+
+@dataclass(frozen=True)
+class ChromePublicationBinding:
+    connection_id: str
+    credential_revision: str
+    connection_epoch: str
+    approval_id: str | None = None
+    consumed_at: datetime | None = None
+
+
+_chrome_publication_capture: ContextVar[list[ChromePublicationBinding] | None] = ContextVar(
+    "runtime_chrome_publication_capture", default=None,
+)
+
+
+@contextmanager
+def runtime_capture_chrome_publication_binding():
+    captured: list[ChromePublicationBinding] = []
+    token = _chrome_publication_capture.set(captured)
+    try:
+        yield captured
+    finally:
+        _chrome_publication_capture.reset(token)
+
+
+def runtime_record_chrome_publication_binding(binding: ChromePublicationBinding) -> None:
+    captured = _chrome_publication_capture.get()
+    if captured is not None:
+        captured.append(binding)
 
 
 def _authorization_arguments_payload(value: object) -> object:
@@ -98,6 +172,12 @@ def _file_resource_id(value: str | None) -> str | None:
     return "/".join(parts)
 
 
+def workspace_file_resource_id(value: str | None) -> str | None:
+    """Canonical relative resource id, or None for empty/traversing paths."""
+
+    return _file_resource_id(value)
+
+
 class WorkspaceFileMutationKind(str, Enum):
     CREATE = "create"
     MODIFY = "modify"
@@ -107,6 +187,7 @@ class WorkspaceFileMutationKind(str, Enum):
 
 class WorkspaceFileResourceMatchKind(str, Enum):
     EXACT = "exact"
+    ENTITY_EXACT = "entity_exact"
     TREE = "tree"
     COLLISION_SAFE_FILE = "collision_safe_file"
 
@@ -170,6 +251,8 @@ def _file_resource_matches(
     artifact_base_dir: str | None,
 ) -> bool:
     approved = _file_resource_id(approved_resource.resource_id)
+    if approved_resource.match_kind is WorkspaceFileResourceMatchKind.ENTITY_EXACT:
+        return approved is not None and approved == _file_resource_id(actual_path)
     normalized_base = _file_resource_id(artifact_base_dir)
     if approved is not None and normalized_base is not None:
         if approved == normalized_base:
@@ -227,11 +310,24 @@ class WorkspaceFileAuthorizationResource:
 
 
 @dataclass(frozen=True)
+class GenerateFileDestination:
+    """Resolved output of one ``generate_file`` call, before Workspace scoping."""
+
+    kind: GenerateFileKind
+    name: str | None
+    directory: str | None
+    match_kind: WorkspaceFileResourceMatchKind
+
+
+@dataclass(frozen=True)
 class WorkspaceFileOutputResourceSpec:
     argument_name: str
     kind: WorkspaceFileOutputArgumentKind
     default_directory: str = ""
     fallback_path: str = ""
+    media_kind: str | None = None
+    media_extensions: tuple[str, ...] = ()
+    video_edit_recipe: bool = False
 
 
 class WorkspaceFileAuthorizationResourceFactory:
@@ -252,6 +348,7 @@ class WorkspaceFileAuthorizationResourceFactory:
     _DIRECT_GENERATION_DIRECTORIES = {
         "generate_image": WorkspaceArtifactDir.IMAGES.value,
         "generate_audio": WorkspaceArtifactDir.AUDIO.value,
+        "generate_video": WorkspaceArtifactDir.VIDEOS.value,
     }
     _MEDIA_OUTPUT_SPECS = {
         "align_subtitles": (
@@ -266,19 +363,19 @@ class WorkspaceFileAuthorizationResourceFactory:
                 "manifest_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.ARTIFACTS.value,
-                fallback_path="technical/narration-manifest.json",
+                fallback_path="narration-manifest.json",
             ),
             WorkspaceFileOutputResourceSpec(
                 "timeline_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.ARTIFACTS.value,
-                fallback_path="timeline/narration-timeline.json",
+                fallback_path="narration-timeline.json",
             ),
             WorkspaceFileOutputResourceSpec(
                 "cues_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.ARTIFACTS.value,
-                fallback_path="subtitles/subtitle-cues.json",
+                fallback_path="subtitle-cues.json",
             ),
         ),
         "compose_video_timeline": (
@@ -286,6 +383,9 @@ class WorkspaceFileAuthorizationResourceFactory:
                 "output_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.VIDEOS.value,
+                media_kind="video",
+                media_extensions=(".mp4",),
+                video_edit_recipe=True,
             ),
         ),
         "merge_videos": (
@@ -293,7 +393,27 @@ class WorkspaceFileAuthorizationResourceFactory:
                 "output_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.VIDEOS.value,
+                media_kind="video",
+                media_extensions=(".mp4",),
             ),
+        ),
+        "prepare_recording": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
+        "prepare_creative_studio": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
+        "verify_creative_studio": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
+        "compose_creative_publication": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
+        "compose_creative_dub": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
+        ),
+        "render_recording": (
+            WorkspaceFileOutputResourceSpec("output_directory", WorkspaceFileOutputArgumentKind.DIRECTORY),
         ),
         "normalize_audio_loudness": (
             WorkspaceFileOutputResourceSpec(
@@ -311,19 +431,19 @@ class WorkspaceFileAuthorizationResourceFactory:
                 "manifest_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.ARTIFACTS.value,
-                fallback_path="technical/narration-manifest.json",
+                fallback_path="narration-manifest.json",
             ),
             WorkspaceFileOutputResourceSpec(
                 "timeline_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.ARTIFACTS.value,
-                fallback_path="timeline/narration-timeline.json",
+                fallback_path="narration-timeline.json",
             ),
             WorkspaceFileOutputResourceSpec(
                 "cues_name",
                 WorkspaceFileOutputArgumentKind.FILE,
                 default_directory=WorkspaceArtifactDir.ARTIFACTS.value,
-                fallback_path="subtitles/subtitle-cues.json",
+                fallback_path="subtitle-cues.json",
             ),
         ),
         "render_frame_samples": (
@@ -349,36 +469,80 @@ class WorkspaceFileAuthorizationResourceFactory:
         action_key: str,
         resource_id: str | None,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
-        resource = _file_resource_id(resource_id)
-        direct_directory = cls._DIRECT_GENERATION_DIRECTORIES.get(request.tool_name)
-        if direct_directory is not None:
-            return cls.direct_generation_resources(
-                request.arguments,
-                default_directory=direct_directory,
-            )
-        if request.tool_name == "generate_file":
-            return cls.generate_file_resources(request.arguments, resource)
-        if request.tool_name == "generate_document_file":
-            return cls.generate_document_resources(
-                request.arguments,
-                resource,
-                workspace_scoped=bool(_scope(request.workspace_id)),
-            )
-        if request.tool_name == "sandbox_save_result":
-            return cls.sandbox_save_result_resources(request.arguments)
-        if request.tool_name == "bash":
-            return cls._bash_resources(request.arguments)
-        media_resources = cls.media_tool_resources(
+        from packages.core.ai.runtime.composite_tools import (
+            RuntimeCompositeToolCallFactory,
+        )
+
+        canonical_call = RuntimeCompositeToolCallFactory.create(
             request.tool_name,
             request.arguments,
+        )
+        tool_name = canonical_call.tool_name
+        arguments = canonical_call.arguments
+        plan = request.workspace_file_scope.media_output_plan if request.workspace_file_scope else None
+        if plan is not None:
+            return tuple(
+                WorkspaceFileAuthorizationResource(path, WorkspaceFileResourceMatchKind.EXACT)
+                for path in plan.all_paths
+            )
+        if request.workspace_file_scope and request.workspace_file_scope.file_targets:
+            return tuple(
+                WorkspaceFileAuthorizationResource(path, WorkspaceFileResourceMatchKind.EXACT)
+                for path in request.workspace_file_scope.file_targets
+            )
+        if tool_name == "code_project":
+            project_root = _file_resource_id(
+                request.workspace_file_scope.artifact_base_dir
+                if request.workspace_file_scope else None
+            )
+            if project_root is None:
+                return ()
+            from packages.core.ai.runtime.approval_classifier import (
+                code_project_target_paths,
+            )
+
+            return tuple(
+                WorkspaceFileAuthorizationResource(target, WorkspaceFileResourceMatchKind.ENTITY_EXACT)
+                for target in code_project_target_paths(project_root, arguments)
+            )
+        resource = _file_resource_id(resource_id)
+        artifact_base = request.workspace_file_scope.artifact_base_dir if request.workspace_file_scope else None
+        typed_directories = (
+            workspace_artifact_default_dir(artifact_base, "documents") != artifact_base
+            if artifact_base else bool(request.workspace_id and request.task_id)
+        )
+        direct_directory = cls._DIRECT_GENERATION_DIRECTORIES.get(tool_name)
+        if direct_directory is not None:
+            return cls.direct_generation_resources(
+                arguments,
+                default_directory=direct_directory,
+            )
+        if tool_name == "generate_file":
+            return cls.generate_file_resources(arguments, resource, typed_directories=typed_directories)
+        if tool_name == "generate_document_file":
+            return cls.generate_document_resources(
+                arguments,
+                resource,
+                workspace_scoped=typed_directories,
+            )
+        if tool_name == "sandbox_save_result":
+            return cls.sandbox_save_result_resources(arguments, typed_directories=typed_directories)
+        if tool_name == "bash":
+            return cls._bash_resources(arguments, artifact_base_dir=artifact_base, entity_id=request.entity_id)
+        media_resources = cls.media_tool_resources(
+            tool_name,
+            arguments,
+            artifact_base_dir=artifact_base or "",
+            entity_id=request.entity_id,
         )
         if media_resources:
             return media_resources
         if resource is None:
             return ()
         if (
-            request.tool_name == "write_file"
+            tool_name == "write_file"
             and action_key == "workspace.file.create"
+            and typed_directories
         ):
             return (WorkspaceFileAuthorizationResource(
                 resource_id=_default_artifact_resource_id(
@@ -388,8 +552,8 @@ class WorkspaceFileAuthorizationResourceFactory:
                 match_kind=WorkspaceFileResourceMatchKind.EXACT,
             ),)
         if (
-            request.tool_name in {"write_file", "edit_file", "patch_file", "delete_file"}
-            and request.workspace_id
+            tool_name in {"write_file", "edit_file", "patch_file", "replace_file", "delete_file"}
+            and typed_directories
             and "/" not in resource
         ):
             return (
@@ -415,19 +579,42 @@ class WorkspaceFileAuthorizationResourceFactory:
         return tool_name in {
             "delete_file",
             "edit_file",
+            "patch_file",
+            "replace_file",
             "generate_document_file",
             "generate_file",
             "sandbox_save_result",
+            "sandbox",
+            "bash",
             "write_file",
+            "archive_file_collection",
             *cls._DIRECT_GENERATION_DIRECTORIES,
             *cls._MEDIA_OUTPUT_SPECS,
         }
+
+    @classmethod
+    def frozen_media_output_spec(
+        cls, tool_name: str,
+    ) -> WorkspaceFileOutputResourceSpec | None:
+        """One registered output contract owns approval and execution naming.
+
+        Registered companions share that exact plan. Other multi-file writers
+        retain their existing declared directory contract.
+        """
+        specs = tuple(
+            spec for spec in cls._MEDIA_OUTPUT_SPECS.get(tool_name, ())
+            if spec.media_kind is not None
+        )
+        if len(specs) > 1:
+            raise ValueError("A frozen media writer must declare one output specification")
+        return specs[0] if specs else None
 
     @classmethod
     def media_tool_resources(
         cls,
         tool_name: str,
         arguments: dict[str, object],
+        *, artifact_base_dir: str | None = None, entity_id: str | None = None,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
         """Authorize only output directories declared by a media tool contract."""
 
@@ -436,8 +623,35 @@ class WorkspaceFileAuthorizationResourceFactory:
             raw_path = str(
                 arguments.get(spec.argument_name) or spec.fallback_path
             ).strip()
+            if spec.argument_name == "output_directory" and artifact_base_dir is not None:
+                from packages.core.services.generated_media_naming import execution_output_directory
+                raw_path = execution_output_directory(raw_path, artifact_base_dir)
             resource = _file_resource_id(raw_path)
             if spec.kind is WorkspaceFileOutputArgumentKind.FILE:
+                if (
+                    resource and "/" not in resource and artifact_base_dir is not None
+                    and workspace_artifact_default_dir(artifact_base_dir, "artifacts") == artifact_base_dir
+                ):
+                    from packages.core.services.entity_fs import get_entity_root
+                    from packages.core.services.generated_media_naming import build_generated_media_target
+                    extension = posixpath.splitext(resource)[1] or ".json"
+                    if tool_name in {"compose_video_timeline", "merge_videos", "still_to_video"}:
+                        extension = ".mp4"
+                    elif tool_name == "normalize_audio_loudness":
+                        fmt = str(arguments.get("output_format") or "wav").lower()
+                        extension = "." + (fmt if fmt in {"wav", "mp3", "m4a", "flac"} else "wav")
+                    elif tool_name == "align_subtitles":
+                        fmt = str(arguments.get("format") or "srt").lower()
+                        extension = "." + (fmt if fmt in {"srt", "vtt", "ass"} else "srt")
+                    target = build_generated_media_target(
+                        prompt=resource, desired_name=resource, ext=extension,
+                        default_dir=artifact_base_dir,
+                        entity_root=get_entity_root(entity_id) if entity_id else None,
+                    )
+                    resources.append(WorkspaceFileAuthorizationResource(
+                        target.rel_path, WorkspaceFileResourceMatchKind.EXACT,
+                    ))
+                    continue
                 resource = (
                     posixpath.dirname(resource)
                     if resource and "/" in resource
@@ -485,6 +699,7 @@ class WorkspaceFileAuthorizationResourceFactory:
     @staticmethod
     def sandbox_save_result_resources(
         arguments: dict[str, object],
+        *, typed_directories: bool = True,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
         """Bind a sandbox export to its requested collision-safe filename."""
         filename = str(arguments.get("filename") or "").strip().replace("\\", "/")
@@ -496,7 +711,7 @@ class WorkspaceFileAuthorizationResourceFactory:
         ):
             return ()
         return (WorkspaceFileAuthorizationResource(
-            resource_id=f"{WorkspaceArtifactDir.ARTIFACTS.value}/{filename}",
+            resource_id=f"{WorkspaceArtifactDir.ARTIFACTS.value}/{filename}" if typed_directories else filename,
             match_kind=WorkspaceFileResourceMatchKind.COLLISION_SAFE_FILE,
         ),)
 
@@ -504,10 +719,20 @@ class WorkspaceFileAuthorizationResourceFactory:
     def _bash_resources(
         cls,
         arguments: dict[str, object],
+        *, artifact_base_dir: str | None = None, entity_id: str | None = None,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
         from packages.core.ai.runtime.approval_classifier import bash_write_targets
 
         command = str(arguments.get("command") or "").strip()
+        if artifact_base_dir and entity_id:
+            from packages.core.ai.runtime.bash_output_paths import BashOutputPathError, scope_bash_output_command
+            from packages.core.services.entity_fs import get_entity_root
+            try:
+                command = scope_bash_output_command(
+                    command, artifact_base_dir=artifact_base_dir, entity_root=get_entity_root(entity_id),
+                ).command
+            except BashOutputPathError:
+                return ()
         targets = bash_write_targets(command)
         try:
             import shlex
@@ -520,38 +745,190 @@ class WorkspaceFileAuthorizationResourceFactory:
         resources = []
         for target in targets:
             resource = _file_resource_id(target)
+            if artifact_base_dir and resource and resource.startswith("Workspaces/"):
+                from packages.core.services.generated_media_naming import workspace_storage_root
+                if not resource.startswith(workspace_storage_root(artifact_base_dir) + "/"):
+                    return ()
             if resource is None or any(
                 item.resource_id == resource for item in resources
             ):
                 continue
             resources.append(WorkspaceFileAuthorizationResource(
                 resource_id=resource,
-                match_kind=WorkspaceFileResourceMatchKind.EXACT,
+                match_kind=WorkspaceFileResourceMatchKind.ENTITY_EXACT if artifact_base_dir else WorkspaceFileResourceMatchKind.EXACT,
             ))
         return tuple(resources)
+
+    @classmethod
+    def generate_file_destination(
+        cls,
+        arguments: dict[str, object],
+        name: str | None = None,
+    ) -> "GenerateFileDestination | None":
+        """The single output target of one ``generate_file`` call.
+
+        The approval receipt (via :meth:`generate_file_resources`) and the
+        ``generate_file`` handler both derive the write target from this value.
+        ``name`` is the logical path handed to the materializer; ``directory``
+        is the typed artifact bucket, which Workspace scoping applies only
+        inside an execution archive (``scope_workspace_artifact_path``). Neither
+        side may add its own prefix, suffix or bucket: any divergence makes the
+        inner write fail the receipt with ``authorization_receipt_mismatch``.
+        """
+
+        raw_kind = str(arguments.get("kind") or "").strip().lower().replace("-", "_")
+        try:
+            kind = GenerateFileKind(raw_kind)
+        except ValueError:
+            return None
+        raw_params = arguments.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        if kind is GenerateFileKind.DOCUMENT and (
+            arguments.get("files") is not None or params.get("files") is not None
+        ):
+            # The handler materializes a document with bundle files as code.
+            kind = GenerateFileKind.CODE
+        elif kind is GenerateFileKind.DOCUMENT and not any(
+            key in source
+            for source in (arguments, params)
+            for key in ("operations", "template", "source")
+        ):
+            content = arguments.get("content")
+            if content is None:
+                content = params.get("content")
+            requested_type = str(
+                arguments.get("file_type") or params.get("file_type") or ""
+            ).strip().lower().lstrip(".")
+            if not content and (
+                requested_type in {"diagram", "diagram.json"}
+                or str(name or "").strip().lower().endswith((".diagram", ".diagram.json"))
+            ):
+                # A content-less diagram document is rendered from its prompt.
+                kind = GenerateFileKind.DIAGRAM
+        resource = _file_resource_id(name)
+        # Handlers read only the top-level prompt (``params.prompt`` is dropped
+        # by the merged params); a diagram falls back to its content.
+        prompt = str(arguments.get("prompt") or "").strip()
+        if not prompt and kind is GenerateFileKind.DIAGRAM:
+            prompt = str(arguments.get("content") or params.get("content") or "").strip()
+        operation_type = cls.generate_file_operation_file_type(kind, arguments, resource or "")
+        if resource is None:
+            # Resolve deterministic leaf defaults before binding authorization.
+            # An unscoped export must never receive an entire Knowledge-root grant.
+            if operation_type is not None:
+                resource = f"generated-document.{operation_type}"
+            elif kind is GenerateFileKind.DOCUMENT:
+                resource = "generated-document.md"
+            elif kind is GenerateFileKind.CODE:
+                from packages.core.ai.tools.generate_file.code import _bundle_name
+                resource = _bundle_name("", prompt)
+            elif kind is GenerateFileKind.DIAGRAM:
+                from packages.core.ai.tools.generate_file.diagram import _diagram_filename
+                resource = _diagram_filename("", prompt)
+        elif kind is GenerateFileKind.CODE:
+            from packages.core.ai.tools.generate_file.code import _bundle_name
+            resource = _bundle_name(resource, "")
+        elif kind is GenerateFileKind.DIAGRAM:
+            from packages.core.ai.tools.generate_file.diagram import _diagram_filename
+            resource = _diagram_filename(resource, "")
+        else:
+            # The document materializer appends ``.<file_type>`` to an
+            # extensionless name; mirror it for every route that reaches it.
+            file_type = cls._generate_file_materializer_type(
+                kind, arguments, operation_type=operation_type,
+            )
+            if file_type and "." not in posixpath.basename(resource):
+                resource = f"{resource}.{file_type}"
+        return GenerateFileDestination(
+            kind=kind,
+            name=resource,
+            directory=cls._GENERATE_FILE_DIRECTORIES.get(kind),
+            match_kind=(
+                WorkspaceFileResourceMatchKind.TREE
+                if kind is GenerateFileKind.CODE
+                else WorkspaceFileResourceMatchKind.EXACT
+            ),
+        )
+
+    _GENERATE_FILE_OPERATION_TYPES = {
+        GenerateFileKind.WORD_DOCUMENT: "docx",
+        GenerateFileKind.PRESENTATION: "pptx",
+        GenerateFileKind.SPREADSHEET: "xlsx",
+    }
+
+    @classmethod
+    def generate_file_operation_file_type(
+        cls,
+        kind: GenerateFileKind,
+        arguments: dict[str, object],
+        name: str,
+    ) -> str | None:
+        """Output type of a native Office ``operations``/``template`` call, else None."""
+
+        raw_params = arguments.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        if not any(
+            key in source
+            for source in (arguments, params)
+            for key in ("operations", "template")
+        ):
+            return None
+        if kind is not GenerateFileKind.DOCUMENT and kind not in cls._GENERATE_FILE_OPERATION_TYPES:
+            return None
+        from packages.core.contracts.file_engine import file_type_from_path
+
+        requested = str(
+            arguments.get("file_type") or params.get("file_type") or ""
+        ).strip().lower().lstrip(".")
+        return (
+            requested
+            or cls._GENERATE_FILE_OPERATION_TYPES.get(kind)
+            or file_type_from_path(name)
+            or None
+        )
+
+    @classmethod
+    def _generate_file_materializer_type(
+        cls,
+        kind: GenerateFileKind,
+        arguments: dict[str, object],
+        *,
+        operation_type: str | None,
+    ) -> str | None:
+        raw_params = arguments.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        requested = str(
+            arguments.get("file_type") or params.get("file_type") or ""
+        ).strip().lower().lstrip(".")
+        if "source" in arguments or "source" in params:
+            return requested or ("pdf" if kind is GenerateFileKind.PDF else None)
+        if operation_type is not None:
+            return operation_type
+        if kind is GenerateFileKind.DOCUMENT:
+            return requested or "md"
+        return None
 
     @classmethod
     def generate_file_resources(
         cls,
         arguments: dict[str, object],
         resource: str | None,
+        *, typed_directories: bool = True,
     ) -> tuple[WorkspaceFileAuthorizationResource, ...]:
-        raw_kind = str(arguments.get("kind") or "").strip().lower().replace("-", "_")
-        try:
-            kind = GenerateFileKind(raw_kind)
-        except ValueError:
+        destination = cls.generate_file_destination(arguments, resource)
+        if destination is None:
+            resource = _file_resource_id(resource)
             if resource is None:
                 return ()
             return (WorkspaceFileAuthorizationResource(
                 resource_id=resource,
                 match_kind=WorkspaceFileResourceMatchKind.EXACT,
             ),)
-        artifact_directory = cls._GENERATE_FILE_DIRECTORIES.get(kind)
-        if resource is None:
-            if artifact_directory is None:
+        if destination.name is None:
+            if destination.directory is None or not typed_directories:
                 return ()
             return (WorkspaceFileAuthorizationResource(
-                resource_id=artifact_directory,
+                resource_id=destination.directory,
                 match_kind=WorkspaceFileResourceMatchKind.TREE,
             ),)
         raw_params = arguments.get("params")
@@ -560,44 +937,24 @@ class WorkspaceFileAuthorizationResourceFactory:
             arguments.get("purpose") or params.get("purpose") or ""
         ).strip().lower().replace("-", "_")
         if (
-            kind is GenerateFileKind.AUDIO
+            destination.kind is GenerateFileKind.AUDIO
             and purpose == AudioGenerationPurpose.NARRATION.value
         ):
             narrator_directory = (
-                posixpath.dirname(resource)
-                if resource.startswith("runs/")
+                posixpath.dirname(destination.name)
+                if "/" in destination.name
                 else WorkspaceArtifactDir.AUDIO.value
             )
             return (WorkspaceFileAuthorizationResource(
                 resource_id=narrator_directory,
                 match_kind=WorkspaceFileResourceMatchKind.TREE,
             ),)
-        if kind is GenerateFileKind.CODE:
-            resource_directory, basename = posixpath.split(resource)
-            stem, extension = posixpath.splitext(basename)
-            if extension:
-                resource = posixpath.join(resource_directory, stem)
-        elif kind is GenerateFileKind.DIAGRAM:
-            lower_resource = resource.lower()
-            if lower_resource.endswith(".diagram"):
-                resource = f"{resource}.json"
-            elif not lower_resource.endswith(".diagram.json"):
-                root, extension = posixpath.splitext(resource)
-                resource = f"{root if extension else resource}.diagram.json"
-        elif kind is GenerateFileKind.DOCUMENT and "." not in posixpath.basename(resource):
-            file_type = str(
-                arguments.get("file_type") or params.get("file_type") or "md"
-            ).strip().lower().lstrip(".")
-            resource = f"{resource}.{file_type or 'md'}"
-        if artifact_directory:
-            resource = _default_artifact_resource_id(resource, artifact_directory)
+        resource = destination.name
+        if destination.directory and typed_directories:
+            resource = _default_artifact_resource_id(resource, destination.directory)
         return (WorkspaceFileAuthorizationResource(
             resource_id=resource,
-            match_kind=(
-                WorkspaceFileResourceMatchKind.TREE
-                if kind is GenerateFileKind.CODE
-                else WorkspaceFileResourceMatchKind.EXACT
-            ),
+            match_kind=destination.match_kind,
         ),)
 
     @classmethod
@@ -645,6 +1002,14 @@ class RuntimeToolAuthorizationReceipt:
     workspace_scope_binding: WorkspaceFileScopeBinding = (
         WorkspaceFileScopeBinding.UNBOUND
     )
+    tiktok_publish_consent: TikTokPublishConsent | None = None
+    chrome_publication_binding: ChromePublicationBinding | None = None
+    media_output_plan: GeneratedMediaOutputPlan | None = None
+    workflow_run_id: str | None = None
+    # Filled only from this invocation's server-owned approval-consume capture,
+    # never from a model argument or an older same-payload grant.
+    consumed_approval_request_id: str | None = None
+    operation_id: str | None = None
 
     @property
     def resource_ids(self) -> tuple[str, ...]:
@@ -672,7 +1037,6 @@ class RuntimeToolAuthorizationReceipt:
             and self.resource_kind in {"file", "workspace_file"}
             and receipt_kind is not None
             and receipt_kind is requested_kind
-            and self.workspace_id
             and self.entity_id == str(entity_id or "").strip()
             and self.user_id == _scope(user_id)
             and self.workspace_id == _scope(workspace_id)
@@ -788,16 +1152,37 @@ class RuntimeToolAuthorizationReceiptFactory:
             WorkspaceFileScopeBinding.EXACT
             if resolved_artifact_base
             else WorkspaceFileScopeBinding.UNRESOLVED
-            if authoritative_request.workspace_file_scope is not None
+            if authoritative_request.workspace_file_scope is not None and authoritative_request.workspace_id
             else WorkspaceFileScopeBinding.UNBOUND
+        )
+
+        from packages.core.ai.runtime.sandbox import runtime_is_task_binding_key
+
+        # A conversation-less task worker authorizes sandbox-bound tools under
+        # its synthetic binding key (see runtime_authorization_conversation_id).
+        # That key identifies the sandbox binding, not a conversation: the
+        # inner file mutation is checked against the real conversation (none),
+        # so the receipt must record none too or every save would mismatch.
+        receipt_conversation_id = _scope(authoritative_request.conversation_id)
+        if receipt_conversation_id and runtime_is_task_binding_key(receipt_conversation_id):
+            receipt_conversation_id = None
+
+        from packages.core.ai.runtime.surfaces import ChatSurface
+
+        surface = getattr(authoritative_request.envelope, "surface", None)
+        workflow_run_id = (
+            _scope(authoritative_request.arguments.get("_workflow_run_id_from_context"))
+            if getattr(surface, "value", surface) == ChatSurface.WORKFLOW_AGENT_STEP.value
+            else None
         )
 
         return RuntimeToolAuthorizationReceipt(
             tool_name=str(authoritative_request.tool_name or "").strip(),
+            operation_id=authoritative_request.operation_id,
             entity_id=str(authoritative_request.entity_id or "").strip(),
             user_id=_scope(authoritative_request.user_id),
             workspace_id=_scope(authoritative_request.workspace_id),
-            conversation_id=_scope(authoritative_request.conversation_id),
+            conversation_id=receipt_conversation_id,
             task_id=_scope(authoritative_request.task_id),
             action_key=authorization.action_key,
             capability_id=authorization.capability_id,
@@ -813,8 +1198,27 @@ class RuntimeToolAuthorizationReceiptFactory:
                 resource_id=resource_id,
             ),
             workspace_artifact_base_dir=resolved_artifact_base,
+            media_output_plan=(
+                authoritative_request.workspace_file_scope.media_output_plan
+                if authoritative_request.workspace_file_scope else None
+            ),
             public_argument_keys=public_argument_keys,
             workspace_scope_binding=workspace_scope_binding,
+            workflow_run_id=workflow_run_id,
+        )
+
+
+async def runtime_workflow_receipt_is_executable(receipt: RuntimeToolAuthorizationReceipt | None) -> bool:
+    """Recheck delegated Workflow state immediately before invoking any tool handler."""
+    if receipt is None or receipt.workflow_run_id is None:
+        return True
+    from packages.core.database import async_session
+    from packages.core.governance.service import workflow_run_is_executable
+
+    async with async_session() as db:
+        return await workflow_run_is_executable(
+            db, entity_id=receipt.entity_id, workspace_id=receipt.workspace_id,
+            user_id=receipt.user_id, workflow_run_id=receipt.workflow_run_id,
         )
 
 
@@ -833,6 +1237,7 @@ class RuntimeAuthorizationScopeFailure(str, Enum):
 class RuntimeToolAuthorizationLease:
     receipt: RuntimeToolAuthorizationReceipt
     state: RuntimeAuthorizationLeaseState = RuntimeAuthorizationLeaseState.ISSUED
+    tiktok_publish_claimed: bool = False
 
     def activate(self) -> bool:
         if self.state is not RuntimeAuthorizationLeaseState.ISSUED:
@@ -920,3 +1325,17 @@ def runtime_current_tool_authorization_receipt(
 ) -> RuntimeToolAuthorizationReceipt | None:
     lease = _lease_var.get()
     return lease.current_receipt() if lease is not None else None
+
+
+def runtime_claim_tiktok_publish_consent(consent: TikTokPublishConsent) -> bool:
+    """Spend the exact consent once, inside its active execution lease only."""
+    lease = _lease_var.get()
+    if (
+        lease is None
+        or lease.current_receipt() is None
+        or lease.receipt.tiktok_publish_consent is not consent
+        or lease.tiktok_publish_claimed
+    ):
+        return False
+    lease.tiktok_publish_claimed = True
+    return True

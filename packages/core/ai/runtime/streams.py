@@ -3,19 +3,26 @@ from __future__ import annotations
 import contextvars
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from packages.core.ai.runtime.output_policy import (
     PREVIOUS_TOOL_ACTIVITY_MARKER,
+    _runtime_is_file_read_content_payload,
     runtime_public_transport_payload,
     runtime_public_tool_result,
+    runtime_is_internal_failure_detail,
+    runtime_strip_leaked_tool_activity,
 )
+from packages.core.ai.runtime.control import runtime_sequence_child_owner
 from packages.core.ai.runtime.provider_approvals import (
     normalize_provider_approval,
     normalize_provider_approval_resolution,
+    provider_tool_result_for_persistence,
 )
+from packages.core.ai.runtime.tool_results import RuntimeAlternatePathToolResult
+from packages.core.services.sensitive_data import sanitize_approval_credentials, sanitize_sensitive_payload
 from packages.core.constants.hitl_envelope import parse_hitl_envelope
 
 
@@ -63,12 +70,14 @@ class RuntimeToolStreamSink:
     format_tool_arguments: RuntimeToolArgumentFormatter | None = None
     format_tool_result: RuntimeToolResultFormatter | None = None
     resolve_tool_status: RuntimeToolStatusResolver | None = None
+    record_progress: Callable[[dict[str, Any]], None] | None = None
 
     @property
     def active(self) -> bool:
         return (
             self.record_tool_event is not None
             or self.record_sub_agent_event is not None
+            or self.record_progress is not None
             or (
                 self.event_queue is not None and self.format_event is not None
             )
@@ -133,7 +142,10 @@ class RuntimeToolStreamSink:
             # persist nested HITL payloads.  Keep it off the SSE payload so
             # large or sensitive provider responses are never exposed to the
             # browser merely to support durable server-side bookkeeping.
-            recorded_tool_call["raw_result"] = result
+            recorded_tool_call["raw_result"] = provider_tool_result_for_persistence(
+                tool_name,
+                result,
+            )
             provider_approval = normalize_provider_approval(
                 tool_name,
                 args,
@@ -171,6 +183,21 @@ class RuntimeToolStreamSink:
             self.record_sub_agent_event(dict(event))
         self._emit("sub_agent", payload)
 
+    def emit_progress(self, text: str) -> None:
+        from packages.core.ai.agentic_loop import FINAL_RESPONSE_SENTINELS
+
+        note = runtime_strip_leaked_tool_activity(text).strip()
+        if not note or any(marker in note for marker in FINAL_RESPONSE_SENTINELS) or runtime_is_internal_failure_detail(note):
+            return
+        payload = {"content": sanitize_sensitive_payload(sanitize_approval_credentials(note))}
+        if self.record_progress is not None:
+            recorded = dict(payload)
+            self.record_progress(recorded)
+            for key in ("assistant_blocks", "assistant_blocks_schema"):
+                if key in recorded:
+                    payload[key] = recorded[key]
+        self._emit("process_note", payload)
+
 runtime_tool_stream_sink_var: contextvars.ContextVar[RuntimeToolStreamSink | None] = (
     contextvars.ContextVar("runtime_tool_stream_sink", default=None)
 )
@@ -180,7 +207,7 @@ def runtime_is_media_tool_name(tool_name: str) -> bool:
     name = (tool_name or "").lower()
     return (
         name in {
-            "generate_file", "generate_image", "generate_video",
+            "generate_file", "generate_image", "generate_video", "import_free_music",
             "wait_media_jobs", "merge_videos", "align_subtitles",
             "normalize_audio_loudness",
             "compose_video_timeline",
@@ -580,12 +607,104 @@ def _compact_media_tool_result(result: str) -> str | None:
     return json.dumps(compact, ensure_ascii=False)
 
 
-def runtime_tool_result_for_chat(tool_name: str, result: str) -> str:
+def _compact_native_file_patch_result(result: str) -> str | None:
+    """Keep the editor reload receipt when a patch result has large details."""
+
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        return None
+    if (
+        not isinstance(parsed, dict)
+        or parsed.get("error")
+        or parsed.get("patched") is not True
+        or not isinstance(parsed.get("path"), str)
+        or not parsed["path"]
+    ):
+        return None
+    keep_keys = (
+        "patched",
+        "path",
+        "document_id",
+        "source_sha256",
+        "knowledge_synced",
+    )
+    return json.dumps(
+        {key: parsed[key] for key in keep_keys if key in parsed},
+        ensure_ascii=False,
+    )
+
+
+def runtime_tool_result_for_chat(tool_name: str, result: Any) -> str:
     """Return a UI-safe tool result without breaking media preview JSON."""
 
-    result = result if isinstance(result, str) else str(result)
-    public_result = runtime_public_tool_result(result)
+    if runtime_sequence_child_owner(tool_name, result) is not None:
+        return str(result)
+    result = (
+        json.dumps(result, ensure_ascii=False, default=str)
+        if isinstance(result, (dict, list))
+        else result if isinstance(result, str) else str(result)
+    )
+    if tool_name.startswith("mcp__chrome__"):
+        from packages.core.ai.runtime.chrome_action_outcomes import CONTRACT, pending_action_receipt
+
+        try:
+            chrome_result = json.loads(result)
+        except (ValueError, TypeError):
+            chrome_result = None
+        if pending_action_receipt(chrome_result):
+            return json.dumps({"status": "unverified", "message": (
+                "The action ran. Its result still needs page verification."
+                if chrome_result["action_receipt"]["execution"] in {"executed", "acknowledged"}
+                else "Execution could not be confirmed. Inspect the page before trying again."
+            )})
+        proof = chrome_result.get("action_verification") if isinstance(chrome_result, dict) else None
+        if isinstance(proof, dict) and proof.get("contract") == CONTRACT:
+            return json.dumps({"status": proof.get("status"), "message": (
+                "The expected page condition was confirmed." if proof.get("status") in {"verified", "already_verified"}
+                else "The page confirms that the action did not achieve the requested result." if proof.get("status") == "failed"
+                else "The page was read, but it does not yet confirm the action's result."
+            )})
+    provider_resolution = normalize_provider_approval_resolution(
+        tool_name,
+        None,
+        result,
+    )
+    if provider_resolution is not None:
+        return json.dumps(
+            {
+                "ok": True,
+                "status": "approved",
+                **provider_resolution,
+            },
+            ensure_ascii=False,
+        )
+    result = str(sanitize_approval_credentials(result))
+    if tool_name == "generate_file":
+        handoff = _runtime_tool_result_payload(result)
+        if isinstance(handoff, dict) and handoff.get("status") == "sandbox_ready":
+            # Preparing an Office Skill is not a generated-file receipt. Keep
+            # that state parseable even when its instructions are very long.
+            return json.dumps({key: handoff[key] for key in ("status", "skill") if key in handoff}, ensure_ascii=False)
+    if _runtime_command_exit_code(result) not in {None, 0}:
+        result = runtime_tool_call_error(result) or result
+    public_result = (
+        result
+        if tool_name == "read_file" and _runtime_is_file_read_content_payload(result)
+        else runtime_public_tool_result(result)
+    )
     if public_result != result:
+        envelope = parse_hitl_envelope(result)
+        hitl = envelope.get("hitl") if envelope is not None else None
+        if isinstance(hitl, dict) and hitl.get("type") == "approval":
+            # Preserve the gate identity when the generic redactor hides the
+            # private continuation. Dedicated public review payloads stay intact.
+            return json.dumps({
+                "__hitl__": True,
+                "status": "approval_required",
+                "hitl": {"id": hitl.get("id"), "type": "approval"},
+                "message": "Waiting for your approval. The action has not run.",
+            })
         return str(public_result)
     if runtime_is_local_coding_tool_name(tool_name):
         coding = _compact_local_coding_tool_result(result)
@@ -595,6 +714,10 @@ def runtime_tool_result_for_chat(tool_name: str, result: str) -> str:
         media = _compact_media_tool_result(result)
         if media is not None:
             return media
+    if tool_name == "patch_file":
+        native_patch = _compact_native_file_patch_result(result)
+        if native_patch is not None:
+            return native_patch
     return result[:_TOOL_RESULT_PREVIEW_CHARS] if len(result) > _TOOL_RESULT_PREVIEW_CHARS else result
 
 
@@ -610,6 +733,8 @@ def _short_arg_value(value, *, max_chars: int = 240):
         return {
             str(key): _short_arg_value(item, max_chars=max_chars)
             for key, item in value.items()
+            if str(key).strip().lower().replace("-", "_")
+            not in {"approval_token", "approvaltoken"}
             if str(key) not in {"prompt", "content", "input", "instructions", "messages"}
         }
     return str(value)[:max_chars]
@@ -627,7 +752,7 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
         keep_keys = (
             "kind", "name", "path", "output_name", "filename", "file_type",
             "aspect_ratio", "duration", "resolution", "purpose", "voice",
-            "response_format", "save_to_knowledge",
+            "response_format", "save_to_knowledge", "storage_scope",
         )
         compact = {key: args[key] for key in keep_keys if args.get(key) is not None}
         params_keep = {
@@ -635,10 +760,23 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
             for key in (
                 "name", "path", "output_name", "filename", "file_type",
                 "aspect_ratio", "duration", "resolution", "generate_audio",
-                "purpose", "voice", "response_format", "save_to_knowledge",
+                "purpose", "voice", "response_format", "save_to_knowledge", "storage_scope",
             )
             if params.get(key) is not None
         }
+        # Keep the bounded source identity needed to match conversion retries;
+        # never include document content, arbitrary source fields or credentials.
+        for source_args, destination in ((args, compact), (params, params_keep)):
+            source = source_args.get("source")
+            if not isinstance(source, dict):
+                continue
+            path, digest = source.get("path"), source.get("expected_sha256")
+            if (
+                isinstance(path, str) and 0 < len(path) <= 1000
+                and isinstance(digest, str) and len(digest) == 64
+                and all(char in "0123456789abcdefABCDEF" for char in digest)
+            ):
+                destination["source"] = {"path": path, "expected_sha256": digest.lower()}
         if params_keep:
             compact["params"] = params_keep
         return compact or None
@@ -650,31 +788,62 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
         skill = args.get("skill") or args.get("skill_id")
         return {"skill": skill} if skill else None
 
-    if name == "workspace_agent" and args.get("action") == "delegate_service":
-        params = args.get("params") if isinstance(args.get("params"), dict) else {}
+    from packages.core.ai.runtime.composite_tools import (
+        RuntimeCompositeToolCallFactory,
+    )
+
+    canonical_call = RuntimeCompositeToolCallFactory.create(name, args)
+    canonical_args = canonical_call.arguments
+    if canonical_call.tool_name == "workspace_agent":
+        workspace_action = str(canonical_args.get("action") or "").strip()
+        params = (
+            canonical_args.get("params")
+            if isinstance(canonical_args.get("params"), dict)
+            else {}
+        )
         compact_params = {
             key: _short_arg_value(params[key], max_chars=160)
             for key in (
+                "query",
+                "category",
+                "status",
+                "name",
+                "title",
+                "task_id",
+                "goal_id",
+                "document_id",
+                "document_ids",
+                "folder_id",
+                "folder_name",
+                "folder_path",
+                "path",
+                "contract_id",
                 "service_key",
                 "agent_subscription_id",
                 "agent_id",
                 "max_rounds",
+                "request_id",
+                "hitl_id",
+                "blocker_id",
             )
             if params.get(key) is not None
         }
-        objective = (
-            params.get("prompt")
-            or params.get("instructions")
-            or params.get("task")
-            or params.get("message")
-            or params.get("request")
-        )
-        if objective:
-            compact_params["objective"] = _short_arg_value(objective, max_chars=240)
-        return {
-            "action": "delegate_service",
-            "params": compact_params,
-        }
+        if workspace_action == "delegate_service":
+            objective = (
+                params.get("prompt")
+                or params.get("instructions")
+                or params.get("task")
+                or params.get("message")
+                or params.get("request")
+            )
+            if objective:
+                compact_params["objective"] = _short_arg_value(objective, max_chars=240)
+        workspace_args: dict[str, Any] = {"action": workspace_action}
+        if compact_params:
+            workspace_args["params"] = compact_params
+        if name == "manor":
+            return {"action": "workspace", "params": workspace_args}
+        return workspace_args
 
     if name == "manor":
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
@@ -691,11 +860,19 @@ def runtime_tool_arguments_for_chat(tool_name: str, args: dict | None) -> dict |
             compact["params"] = compact_params
         return {key: value for key, value in compact.items() if value} or None
 
-    redacted_keys = {"prompt", "content", "input", "instructions", "messages"}
+    redacted_keys = {
+        "prompt",
+        "content",
+        "input",
+        "instructions",
+        "messages",
+        "approval_token",
+        "approvaltoken",
+    }
     compact = {
         str(key): _short_arg_value(value)
         for key, value in args.items()
-        if str(key) not in redacted_keys
+        if str(key).strip().lower().replace("-", "_") not in redacted_keys
     }
     return compact or None
 
@@ -743,42 +920,121 @@ def runtime_tool_error_result(message: str) -> str:
     return f"{RUNTIME_TOOL_ERROR_PREFIX}{message}"
 
 
-def runtime_tool_status_for_chat(result: str) -> str:
-    """Infer UI status from a structured tool result."""
+def runtime_tool_alternate_path_error_result(result: Any) -> RuntimeAlternatePathToolResult:
+    """Carry host-only pre-I/O proof without discarding structured evidence."""
 
-    text = result if isinstance(result, str) else str(result)
-    exit_code = _runtime_command_exit_code(text)
-    if text.startswith((RUNTIME_TOOL_ERROR_PREFIX, RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX)):
-        return "error"
-    if exit_code not in {None, 0}:
-        return "error"
+    payload = result if isinstance(result, dict) else None
+    if payload is None and isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            payload = parsed
+    if payload is not None:
+        return RuntimeAlternatePathToolResult(json.dumps(
+            {**payload, "retry_policy": "read_only_alternate_path"},
+            ensure_ascii=False,
+            default=str,
+        ))
+    return RuntimeAlternatePathToolResult(json.dumps(
+        {
+            "status": "error",
+            "error": str(result),
+            "retry_policy": "read_only_alternate_path",
+        },
+        ensure_ascii=False,
+    ))
+
+
+def runtime_tool_allows_alternate_path(result: Any) -> bool:
+    """Permit read-only alternate work only from host-held pre-I/O proof."""
+
+    if not isinstance(result, RuntimeAlternatePathToolResult):
+        return False
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(result)
     except Exception:
-        return "success"
-    if not isinstance(parsed, dict):
-        return "success"
-    status = str(parsed.get("status") or "").lower()
-    if status in {
-        "error", "failed", "timeout", "waiting_human",
-        "rejected", "blocked", "cancelled", "canceled",
-    } or parsed.get("error"):
-        return "error"
-    return "success"
+        return False
+    return (
+        isinstance(parsed, dict)
+        and parsed.get("retry_policy") == "read_only_alternate_path"
+        and runtime_tool_call_error(result) is not None
+    )
 
 
-# Approval/HITL outcomes that runtime_tool_status_for_chat collapses into
-# its UI-facing "error" bucket, but that say nothing about whether the
-# TOOL/PATH itself works — a human hasn't decided yet, or declined.
+# Approval outcomes that runtime_tool_status_for_chat collapses into its
+# UI-facing "error" bucket, but that say nothing about whether the TOOL/PATH
+# itself works — a human declined or the request was otherwise blocked.
 _APPROVAL_GATE_STATUSES = frozenset({
     "waiting_human", "rejected", "blocked", "cancelled", "canceled",
+    "approval_required", "handoff_required",
 })
 # True execution outcomes (vs. an approval gate) that DO belong in
 # intent-path-memory failure recording.
-_EXECUTION_FAILURE_STATUSES = frozenset({"error", "failed", "timeout"})
+_EXECUTION_FAILURE_STATUSES = frozenset({"error", "failed", "failure", "timeout"})
+RUNTIME_UNFINISHED_TOOL_STATUSES = frozenset({
+    "unknown", "pending", "queued", "running", "submitted", "partial", "interrupted",
+})
 
 
-def runtime_tool_path_memory_outcome(result: str) -> str | None:
+def _runtime_tool_result_payload(result: Any) -> dict[str, Any] | None:
+    from packages.core.ai.runtime.tool_results import RuntimeStructuredToolResult
+
+    if isinstance(result, RuntimeStructuredToolResult):
+        result = result.structured_content
+    if isinstance(result, dict):
+        return result
+    if not isinstance(result, str):
+        return None
+    try:
+        parsed = json.loads(result)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _runtime_tool_control_status(result: Any) -> str | None:
+    """Recognize waits/decisions for classification, never for authorization."""
+    from packages.core.ai.runtime.control import RuntimeToolSuspension
+
+    if isinstance(result, RuntimeToolSuspension):
+        return "hitl_required"
+    payload = _runtime_tool_result_payload(result)
+    if parse_hitl_envelope(payload if payload is not None else result) is not None:
+        return "hitl_required"
+    if payload is None:
+        return None
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"hitl_required", "approval_required"}:
+        return "hitl_required"
+    if status in _APPROVAL_GATE_STATUSES:
+        return status
+    if payload.get("approval_required") is True:
+        return "hitl_required"
+    control = payload.get("control")
+    if (
+        isinstance(control, dict)
+        and control.get("kind") == "approval_required"
+        and "blocking_result" in control
+    ):
+        return "hitl_required"
+    return None
+
+
+def runtime_tool_status_for_chat(result: Any) -> str:
+    """Project the shared execution classification into the UI vocabulary."""
+    control_status = _runtime_tool_control_status(result)
+    if control_status is not None:
+        return "success" if control_status == "hitl_required" else "error"
+    from packages.core.ai.runtime.chrome_action_outcomes import pending_action_receipt
+
+    if pending_action_receipt(_runtime_tool_result_payload(result)):
+        return "unverified"
+    return "error" if runtime_tool_call_error(result) is not None else "success"
+
+
+def runtime_tool_path_memory_outcome(result: Any) -> str | None:
     """Classify a raw tool result for intent-path-memory recording (spec
     §A3) — distinct from runtime_tool_status_for_chat's UI-facing
     success/error split. Spec §A3 explicitly excludes approval denials,
@@ -789,29 +1045,23 @@ def runtime_tool_path_memory_outcome(result: str) -> str | None:
     actually resolves it). Returns "success", "failure", or None (skip
     recording entirely for this call).
     """
-    text = result if isinstance(result, str) else str(result)
-    if parse_hitl_envelope(result) is not None:
+    if _runtime_tool_control_status(result) is not None:
         return None
-    exit_code = _runtime_command_exit_code(text)
-    if text.startswith((RUNTIME_TOOL_ERROR_PREFIX, RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX)):
-        return "failure"
-    if exit_code not in {None, 0}:
-        return "failure"
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        return "success"
-    if not isinstance(parsed, dict):
-        return "success"
-    status = str(parsed.get("status") or "").lower()
-    if status in _APPROVAL_GATE_STATUSES:
+    from packages.core.ai.runtime.chrome_action_outcomes import pending_action_receipt
+
+    if pending_action_receipt(_runtime_tool_result_payload(result)):
         return None
-    if status in _EXECUTION_FAILURE_STATUSES or parsed.get("error"):
+    parsed = _runtime_tool_result_payload(result)
+    if runtime_tool_call_error(result) is not None:
         return "failure"
+    if isinstance(parsed, dict) and (parsed.get("success") is False or parsed.get("ok") is False):
+        return "failure"
+    if isinstance(parsed, dict) and str(parsed.get("status") or "").strip().lower() in RUNTIME_UNFINISHED_TOOL_STATUSES:
+        return None
     return "success"
 
 
-def runtime_tool_call_error(result: str) -> str | None:
+def runtime_tool_call_error(result: Any) -> str | None:
     """Return the error detail a tool result carries, or ``None``.
 
     The single decoder of the tool-result error contract for durable
@@ -823,41 +1073,76 @@ def runtime_tool_call_error(result: str) -> str | None:
     away. Callers must not re-implement this check inline; one decoder is
     what keeps every consumer of the contract in agreement.
     """
-    text = result if isinstance(result, str) else str(result)
-    if parse_hitl_envelope(result) is not None:
+    if _runtime_tool_control_status(result) is not None:
         return None
+    parsed = _runtime_tool_result_payload(result)
+    # Structured MCP data is authoritative; its display text can itself
+    # contain examples of errors or HITL JSON without changing the outcome.
+    text = result if isinstance(result, str) and parsed is None else ""
     if text.startswith(RUNTIME_TOOL_ERROR_PREFIX):
         return text[len(RUNTIME_TOOL_ERROR_PREFIX):].strip() or text
     if text.startswith(RUNTIME_TOOL_EXECUTOR_ERROR_PREFIX):
         return text
+    if text.lstrip().startswith("Error invoking skill"):
+        return text.strip()
     exit_match = _RUNTIME_COMMAND_EXIT_CODE_RE.search(text)
     exit_code = _runtime_command_exit_code(text)
     if exit_code not in {None, 0} and exit_match is not None:
         detail = text[: exit_match.start()].strip()
+        # stdout can be a whole reference document. The executor appends
+        # stderr separately; preserve the actual failure before that content.
+        stderr_marker = "\n[stderr]\n"
+        if stderr_marker in detail:
+            stderr = detail.rsplit(stderr_marker, 1)[1].strip()
+            if stderr:
+                detail = stderr
+        elif detail.startswith("[stderr]\n"):
+            detail = detail[len("[stderr]\n"):].strip()
         if detail:
             detail = " ".join(detail.split())[-900:]
             return f"Command exited with status {exit_code}: {detail}"
         return f"Command exited with status {exit_code}"
-    try:
-        parsed = json.loads(text)
-    except Exception:
+    if parsed is None:
         return None
-    if not isinstance(parsed, dict):
+    from packages.core.ai.runtime.chrome_action_outcomes import pending_action_receipt
+
+    if pending_action_receipt(parsed):
         return None
-    status = str(parsed.get("status") or "").lower()
-    if status in _APPROVAL_GATE_STATUSES:
+    status = str(parsed.get("status") or "").strip().lower()
+    json_exit_code = parsed.get("exit_code")
+    if isinstance(json_exit_code, str) and re.fullmatch(r"-?\d+", json_exit_code.strip()):
+        try:
+            json_exit_code = int(json_exit_code)
+        except ValueError:
+            return "Tool returned an invalid exit_code (integer is out of range)"
+    command_failed = isinstance(json_exit_code, int) and not isinstance(json_exit_code, bool) and json_exit_code != 0
+    if not (
+        status in _EXECUTION_FAILURE_STATUSES
+        or parsed.get("error")
+        or parsed.get("isError") is True
+        or parsed.get("ok") is False
+        or parsed.get("success") is False
+        or command_failed
+    ):
         return None
-    if status not in _EXECUTION_FAILURE_STATUSES and not parsed.get("error"):
-        return None
-    detail = parsed.get("error") or parsed.get("message") or parsed.get("detail")
+    detail = parsed.get("error") or parsed.get("message") or parsed.get("detail") or parsed.get("reason")
     if isinstance(detail, str) and detail.strip():
         return detail.strip()
     if detail is not None and not isinstance(detail, str):
         return json.dumps(detail, ensure_ascii=False, default=str)
-    return status or text
+    if command_failed:
+        command_detail = str(parsed.get("stderr") or parsed.get("stdout") or "").strip()
+        return f"Command exited with status {json_exit_code}" + (f": {command_detail}" if command_detail else "")
+    if parsed.get("isError") is True:
+        content = parsed.get("content")
+        if isinstance(content, list):
+            messages = [item["text"] for item in content if isinstance(item, dict) and isinstance(item.get("text"), str)]
+            if messages:
+                return "\n".join(messages)
+    return status if status in _EXECUTION_FAILURE_STATUSES else "Tool call failed"
 
 
-def runtime_tool_call_outcome(tool_name: str, result: str) -> str:
+def runtime_tool_call_outcome(tool_name: str, result: Any) -> str:
     """Classify a tool result into ``"success"`` | ``"error"`` | ``"empty_result"``.
 
     A real failure always wins — even for ``search_tools`` itself raising,
@@ -872,11 +1157,7 @@ def runtime_tool_call_outcome(tool_name: str, result: str) -> str:
     if runtime_tool_call_error(result) is not None:
         return "error"
     if tool_name == "search_tools":
-        text_ = result if isinstance(result, str) else str(result)
-        try:
-            parsed = json.loads(text_)
-        except Exception:
-            return "success"
+        parsed = _runtime_tool_result_payload(result)
         if isinstance(parsed, dict):
             matches = parsed.get("matches")
             if isinstance(matches, list) and not matches:
@@ -912,3 +1193,121 @@ def runtime_skill_nested_tool_callbacks(
         )
 
     return on_sub_tool_start, on_sub_tool_end
+
+
+def runtime_skill_progress_callbacks(
+    on_tool_start: RuntimeToolStartCallback | None,
+) -> tuple[RuntimeToolStartCallback | None, Callable[[str, dict[str, Any]], Awaitable[None]] | None]:
+    """Release public child commentary only once its next tool is confirmed."""
+    sink = runtime_tool_stream_sink_var.get(None)
+    if sink is None or not (sink.record_progress or (sink.event_queue is not None and sink.format_event)):
+        return on_tool_start, None
+    pending_text = ""
+    final_started = False
+
+    async def on_stream_event(event_type: str, payload: dict[str, Any]) -> None:
+        nonlocal pending_text, final_started
+        if event_type in {"text_reset", "final_response_start"}:
+            pending_text = ""
+            final_started = event_type == "final_response_start"
+        elif event_type == "text_delta" and not final_started:
+            text = payload.get("content", payload.get("text_delta", payload.get("token", "")))
+            if isinstance(text, str):
+                pending_text = (pending_text + text)[:4000]
+        elif event_type == "process_note" and not final_started:
+            text = payload.get("content")
+            if isinstance(text, str):
+                sink.emit_progress(text[:4000])
+
+    def start_tool(name: str, args: dict[str, Any]) -> None:
+        nonlocal pending_text
+        text, pending_text = pending_text, ""
+        if text:
+            sink.emit_progress(text)
+        if on_tool_start is not None:
+            on_tool_start(name, args)
+
+    return start_tool, on_stream_event
+
+
+def runtime_partial_json_object(text: Any) -> dict[str, Any]:
+    """Best-effort object from JSON that is still streaming in.
+
+    Closes an open string and any open containers, dropping a trailing key
+    that has no value yet. Display only: never used to execute a call.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return {}
+    try:
+        value = json.loads(text)
+        return value if isinstance(value, dict) else {}
+    except ValueError:
+        pass
+    stack: list[str] = []
+    in_string = escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append("}" if char == "{" else "]")
+        elif char in "}]" and stack:
+            stack.pop()
+    candidate = text
+    if in_string:
+        if escaped:
+            candidate = candidate[:-1]
+        candidate += '"'
+    closers = "".join(reversed(stack))
+    for attempt in (candidate, candidate.rstrip().rstrip(",")):
+        for tail in ("", "null"):
+            try:
+                value = json.loads(attempt + tail + closers)
+                return value if isinstance(value, dict) else {}
+            except ValueError:
+                continue
+    # A key whose value has not started: drop it and parse what came before.
+    cut = max(candidate.rfind(","), candidate.rfind("{"))
+    if cut > 0:
+        head = candidate[:cut] if candidate[cut] == "," else candidate[:cut + 1]
+        return runtime_partial_json_object(head + closers[-len(stack):] if stack else head)
+    return {}
+
+
+def runtime_tool_draft_preview(arguments: Any, *, max_chars: int = 90) -> str:
+    """The line the model is writing now: the tail of its longest text field."""
+    longest = ""
+
+    def walk(value: Any) -> None:
+        nonlocal longest
+        if isinstance(value, str):
+            if len(value) > len(longest):
+                longest = value
+        elif isinstance(value, dict):
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(arguments)
+    if len(longest) < 40:
+        return ""
+    lines = [
+        cleaned for cleaned in (line.strip().lstrip("#>*-•0123456789.) ").strip() for line in longest.splitlines())
+        if cleaned
+    ]
+    line = lines[-1] if lines else ""
+    # A line just begun ("让", "Card") says nothing yet: keep the last whole one.
+    if len(line) < 8 and len(lines) > 1:
+        line = lines[-2]
+    if len(line) > max_chars:
+        line = "…" + line[-(max_chars - 1):]
+    return line

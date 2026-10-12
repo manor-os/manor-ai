@@ -791,9 +791,23 @@ async def test_discord_prepared_reply_stops_after_binding_is_disabled(
 
 
 @pytest.mark.asyncio
-async def test_discord_prepared_reply_route_rejects_paused_workspace(
+@pytest.mark.parametrize(
+    ("workspace_status", "deleted", "routable"),
+    [
+        ("active", False, True),
+        ("paused", False, True),
+        ("archived", False, False),
+        ("draft", False, False),
+        ("active", True, False),
+        ("paused", True, False),
+    ],
+)
+async def test_discord_prepared_reply_route_respects_workspace_lifecycle(
     client,
     db_session,
+    workspace_status,
+    deleted,
+    routable,
 ) -> None:
     from packages.core.services.channel_outbound_delivery import (
         channel_reply_route_is_active,
@@ -803,8 +817,9 @@ async def test_discord_prepared_reply_route_rejects_paused_workspace(
     workspace = Workspace(
         id=generate_ulid(),
         entity_id=owner["entity_id"],
-        name="Paused Discord workspace",
-        status="paused",
+        name="Discord reply workspace",
+        status=workspace_status,
+        deleted_at=datetime.now(timezone.utc) if deleted else None,
     )
     binding = Channel(
         id=generate_ulid(),
@@ -812,7 +827,7 @@ async def test_discord_prepared_reply_route_rejects_paused_workspace(
         user_id=owner["id"],
         workspace_id=workspace.id,
         type="discord",
-        name="Paused Workspace Discord",
+        name="Workspace Discord reply",
         config={"channel_config_id": config.id},
         agent_id="manor-master",
         status="active",
@@ -823,13 +838,15 @@ async def test_discord_prepared_reply_route_rejects_paused_workspace(
         entity_id=owner["entity_id"],
         channel_config_id=config.id,
         channel_type="discord",
-        source_id="paused-discord-contact",
+        source_id="workspace-discord-contact",
         status="active",
     )
     db_session.add_all([workspace, binding, contact])
     await db_session.commit()
 
-    assert not await channel_reply_route_is_active(
+    # Pausing automation preserves human replies; inactive or deleted
+    # Workspaces must still invalidate the exact prepared route.
+    actual = await channel_reply_route_is_active(
         entity_id=owner["entity_id"],
         cc_id=config.id,
         channel_type="discord",
@@ -845,6 +862,7 @@ async def test_discord_prepared_reply_route_rejects_paused_workspace(
         },
         workspace_id=workspace.id,
     )
+    assert actual is routable
 
 
 @pytest.mark.asyncio

@@ -1,90 +1,71 @@
-"""A workspace that EXPLICITLY auto-approves a capability/action overrides a
-capability's intrinsic ``required_approval`` (e.g. file.write). This is the
-mechanism that lets a workspace stop being prompted for file writes without
-weakening the global capability default."""
+"""Approval exceptions use the inherited evaluator and canonical action facts."""
+from unittest.mock import AsyncMock
 
-from __future__ import annotations
-
-import asyncio
+import pytest
+from pydantic import ValidationError
 
 import packages.core.governance.service as gov
-from packages.core.governance.policy import WorkspacePolicy, policy_auto_approves
+from packages.core.governance.approval_facts import action_facts
+from packages.core.governance.approval_policy import ActionSelector, ApprovalScope, evaluate_policy
+from packages.core.governance.approval_policy_service import build_policy_chain
+from packages.core.governance.policy import PolicyDecision
 
 
-# ── pure: policy_auto_approves ────────────────────────────────────────
+def _evaluate(rules, *, action="workspace.file.modify", category="files", mode="confirm_changes"):
+    chain = build_policy_chain(scope=ApprovalScope(kind="account", id="entity", entity_id="entity"),
+        root={"revision": 1, "policy": {"mode": mode, "rules": rules}})
+    return evaluate_policy(chain, action_facts(action_key=action, category=category, risk_level="low"))
 
 
-def test_auto_approves_matching_capability():
-    p = WorkspacePolicy(auto_approve_capabilities=["file.write"])
-    assert policy_auto_approves(p, capability_id="file.write") is True
+def _rule(effect, *, action=None, category=None, id="rule"):
+    return {"id": id, "effect": effect, "selector":
+        {"kind": "action", "action_key": action} if action else {"kind": "category", "category": category}}
 
 
-def test_auto_approves_matching_action_and_wildcard():
-    p = WorkspacePolicy(auto_approve_actions=["x.*"])
-    assert policy_auto_approves(p, action_key="x.like") is True
+def test_category_exception_allows_matching_file_action():
+    assert _evaluate([_rule("allow", category="files")]).outcome == "allow"
 
 
-def test_default_allow_is_not_auto_approve():
-    # Empty policy: nothing denies file.write, but that is NOT an explicit
-    # auto-approval — the intrinsic approval gate must still fire.
-    assert policy_auto_approves(WorkspacePolicy(), capability_id="file.write") is False
+def test_exact_action_does_not_authorize_sibling_action():
+    rules = [_rule("allow", action="workspace.file.create")]
+    assert _evaluate(rules, action="workspace.file.create").outcome == "allow"
+    assert _evaluate(rules).outcome == "ask"
 
 
-def test_hitl_or_never_allow_only_is_not_auto_approve():
-    p = WorkspacePolicy(
-        hitl_required_capabilities=["file.write"],
-        never_allow_capabilities=["x.delete"],
-    )
-    assert policy_auto_approves(p, capability_id="file.write") is False
-    assert policy_auto_approves(p, capability_id="x.delete") is False
+def test_action_selector_rejects_unbounded_wildcard():
+    with pytest.raises(ValidationError):
+        ActionSelector(action_key="workspace.file.*")
 
 
-def test_no_subject_is_not_auto_approve():
-    p = WorkspacePolicy(auto_approve_capabilities=["*"])
-    assert policy_auto_approves(p, action_key=None, capability_id=None) is False
+def test_deny_always_wins_over_matching_allow():
+    assert _evaluate([_rule("allow", category="files"),
+        _rule("deny", action="workspace.file.modify", id="deny")]).outcome == "deny"
 
 
-# ── service: workspace_policy_auto_approves (loads policy) ────────────
+def test_unknown_effect_follows_the_chosen_mode():
+    # The user's approval mode decides; an unnamed effect is no exception.
+    assert _evaluate([], action="unknown.action", category="unknown", mode="automatic").outcome == "allow"
+    assert _evaluate([], action="unknown.action", category="unknown", mode="confirm_changes").outcome == "ask"
+    # "Confirm by risk" cannot show an unnamed effect routine; explicit rules still win.
+    assert _evaluate([], action="unknown.action", category="unknown", mode="risk_based").outcome == "ask"
+    assert _evaluate([_rule("ask", action="unknown.action")], action="unknown.action",
+                     category="unknown", mode="automatic").outcome == "ask"
+    assert _evaluate([_rule("deny", action="unknown.action")], action="unknown.action",
+                     category="unknown", mode="automatic").outcome == "deny"
 
 
-def test_workspace_policy_auto_approves_true(monkeypatch):
-    async def fake_get_policy(db, workspace_id):
-        return WorkspacePolicy(auto_approve_capabilities=["file.write"])
-
-    monkeypatch.setattr(gov, "get_policy", fake_get_policy)
-    out = asyncio.run(
-        gov.workspace_policy_auto_approves(
-            None,
-            workspace_id="ws",
-            capability_id="file.write",
-        )
-    )
-    assert out is True
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed", [True, False])
+async def test_workspace_auto_approve_adapter_delegates_current_gate(monkeypatch, allowed):
+    gate = AsyncMock(return_value=PolicyDecision(allowed))
+    monkeypatch.setattr(gov, "check_step_policy", gate)
+    assert await gov.workspace_policy_auto_approves(None, workspace_id="ws", action_key="workspace.file.modify") is allowed
+    gate.assert_awaited_once()
 
 
-def test_workspace_policy_auto_approves_false_without_rule(monkeypatch):
-    async def fake_get_policy(db, workspace_id):
-        return WorkspacePolicy()
-
-    monkeypatch.setattr(gov, "get_policy", fake_get_policy)
-    out = asyncio.run(
-        gov.workspace_policy_auto_approves(
-            None,
-            workspace_id="ws",
-            capability_id="file.write",
-        )
-    )
-    assert out is False
-
-
-def test_workspace_policy_auto_approves_false_without_workspace(monkeypatch):
-    # No workspace → nothing to opt into; must not even load a policy.
-    monkeypatch.setattr(gov, "get_policy", None)
-    out = asyncio.run(
-        gov.workspace_policy_auto_approves(
-            None,
-            workspace_id="",
-            capability_id="file.write",
-        )
-    )
-    assert out is False
+@pytest.mark.asyncio
+async def test_missing_workspace_cannot_create_an_implicit_grant(monkeypatch):
+    gate = AsyncMock()
+    monkeypatch.setattr(gov, "check_step_policy", gate)
+    assert await gov.workspace_policy_auto_approves(None, workspace_id="", action_key="workspace.file.modify") is False
+    gate.assert_not_awaited()

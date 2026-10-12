@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 
 /**
@@ -6,15 +7,15 @@ import { NavLink } from "react-router-dom";
  *
  * For an in-page segmented control (no URL change), use TabSwitcher.
  *
- * Visual language matches TabSwitcher: slate-50 track, white active tile
- * with teal text, subtle hover on inactive tiles — just backed by
- * <NavLink> so each tab is a real URL the user can deep-link to.
+ * Visual language matches TabSwitcher's neutral track and active tile.
+ * Each tab is a real URL with native link keyboard navigation.
  */
 
 interface SectionTab {
   path: string;
   label: string;
   count?: number;
+  badge?: ReactNode;
   /** Forces exact match — needed for index routes like "/team". */
   end?: boolean;
 }
@@ -22,19 +23,21 @@ interface SectionTab {
 interface SectionTabsProps {
   tabs: SectionTab[];
   size?: "sm" | "md";
+  ariaLabel?: string;
 }
 
-export default function SectionTabs({ tabs, size = "md" }: SectionTabsProps) {
+export default function SectionTabs({ tabs, size = "md", ariaLabel }: SectionTabsProps) {
   const pad = size === "sm" ? "5px 12px" : "6px 14px";
   const fs = size === "sm" ? 12 : 13;
   const r = size === "sm" ? 7 : 8;
 
   return (
     <nav
-      role="tablist"
+      aria-label={ariaLabel}
       style={{
-        display: "inline-flex", gap: 2, padding: 3,
-        background: "#f5f5f4",
+        display: "inline-flex", flexWrap: "wrap", gap: 2, padding: 3,
+        width: "fit-content", maxWidth: "100%",
+        background: "var(--surface-muted)",
         borderRadius: r + 3,
       }}
     >
@@ -49,22 +52,23 @@ export default function SectionTabs({ tabs, size = "md" }: SectionTabsProps) {
             fontSize: fs, fontWeight: isActive ? 700 : 500,
             textDecoration: "none",
             transition: "background 0.15s ease, color 0.15s ease",
-            background: isActive ? "#ffffff" : "transparent",
-            color: isActive ? "#1c1917" : "#78716c",
-            boxShadow: isActive ? "0 1px 2px rgba(28,25,23,0.06)" : "none",
+            background: isActive ? "var(--surface-panel)" : "transparent",
+            color: isActive ? "var(--text-strong)" : "var(--text-muted)",
+            boxShadow: isActive ? "var(--shadow-sm)" : "none",
           })}
         >
           {({ isActive }) => (
             <>
               <span>{tab.label}</span>
+              {tab.badge}
               {tab.count !== undefined && (
                 <span
                   style={{
                     fontSize: size === "sm" ? 10 : 11, fontWeight: 600,
                     padding: "0 6px", borderRadius: 6, minWidth: 16,
                     lineHeight: 1.5, textAlign: "center",
-                    background: isActive ? "#e7e5e4" : "#efedea",
-                    color: isActive ? "#44403c" : "#78716c",
+                    background: "var(--surface-muted)",
+                    color: isActive ? "var(--text-strong)" : "var(--text-muted)",
                   }}
                 >
                   {tab.count}

@@ -1,0 +1,23 @@
+{
+  "id": "remotion-upgrade",
+  "name": "remotion-upgrade",
+  "display_name": "Remotion Upgrade",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Upgrade Remotion and related dependencies.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "upgrade",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["update remotion", "version bump", "migration", "breaking changes", "npm upgrade", "dependency update"],
+    "examples": ["upgrade remotion to latest version", "fix remotion version mismatch", "review breaking changes after upgrade", "update all remotion packages together"]
+  }
+}

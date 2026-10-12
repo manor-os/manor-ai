@@ -35,10 +35,13 @@ def oauth_account_is_runtime_usable_clause():
 
 def oauth_account_is_runtime_usable(account: OAuthAccount) -> bool:
     """In-memory counterpart to ``oauth_account_is_runtime_usable_clause``."""
+    from packages.core.services.manor_integration_oauth import manor_oauth_account_matches
+
     return bool(
         (account.credential_ref or account.access_token)
         and _oauth_account_token_is_current(account)
         and not _oauth_account_requires_reconnect(account)
+        and manor_oauth_account_matches(account)
     )
 
 

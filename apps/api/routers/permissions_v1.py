@@ -37,6 +37,7 @@ from packages.core.permissions import (
     effective_user_has_permission,
 )
 from packages.core.services.document_access import (
+    document_entity_is_unavailable,
     effective_document_capabilities_for_user,
     lock_folder_policy_rows,
     lock_workspace_policy_rows,
@@ -147,13 +148,13 @@ async def _load_doc(db: AsyncSession, document_id: str, entity_id: str) -> Docum
                     message="Document not found",
                 )
             scope = await resolve_document_policy_lock_scope(db, doc)
-            workspaces = await lock_workspace_policy_rows(
+            await lock_workspace_policy_rows(
                 db,
                 entity_id=entity_id,
                 workspace_ids=scope.workspace_ids,
                 read=True,
             )
-            if any(workspace.deleted_at is not None for workspace in workspaces):
+            if await document_entity_is_unavailable(db, doc):
                 raise CodedError(
                     404,
                     code="permissions.error.doc.not_found",
@@ -337,6 +338,38 @@ async def change_document_visibility(
     _folder_floor, folder_ceiling = await _document_folder_constraints(db, doc)
     if _VISIBILITY_RANK[body.visibility] > folder_ceiling:
         raise HTTPException(409, "Document visibility cannot be broader than its folder")
+
+    from packages.core.models.document import DocumentGroup, DocumentGroupMember
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import (
+        artifact_folder_id_from_entity_storage_path,
+        resolve_workspace_folder_binding,
+    )
+
+    workspace_binding = await resolve_workspace_folder_binding(
+        db, entity_id=user.entity_id, folder_id=doc.folder_id,
+    )
+    physical_folder_id = artifact_folder_id_from_entity_storage_path(doc.fs_path)
+    physical_workspace = (await db.execute(
+        select(Workspace.id).where(
+            Workspace.entity_id == user.entity_id,
+            Workspace.artifact_folder_id == physical_folder_id,
+            Workspace.deleted_at.is_(None),
+        ).limit(1)
+    )).scalar_one_or_none() if physical_folder_id else None
+    workspace_group = (await db.execute(
+        select(DocumentGroupMember.document_id)
+        .join(DocumentGroup, DocumentGroupMember.group_id == DocumentGroup.id)
+        .join(Workspace, Workspace.id == DocumentGroup.workspace_id)
+        .where(
+            DocumentGroupMember.document_id == doc.id,
+            DocumentGroup.entity_id == user.entity_id,
+            Workspace.entity_id == user.entity_id,
+            Workspace.deleted_at.is_(None),
+        ).limit(1)
+    )).scalar_one_or_none()
+    if (workspace_binding or physical_workspace or workspace_group) and body.visibility != Visibility.WORKSPACE:
+        raise HTTPException(409, "Workspace files are shared with Workspace members")
 
     doc.visibility = body.visibility
     await _audit(db, doc, user, "visibility_change", request)

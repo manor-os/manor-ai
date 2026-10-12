@@ -6,6 +6,7 @@ from typing import Any
 
 from packages.core.ai.runtime.capabilities import capability_for_id, tool_names_for_capability_ids
 from packages.core.ai.runtime.profiles import RuntimeProfile
+from packages.core.ai.runtime.tool_visibility import HIDDEN_RUNTIME_TOOLS
 
 
 _CAPABILITY_KEYS = (
@@ -36,6 +37,37 @@ RUNTIME_CAPABILITY_BINDING_TYPES = {
     "tool",
 }
 
+RUNTIME_CAPABILITY_BINDING_OWNER_SCOPES = frozenset({
+    "workspace_agent",
+    "service",
+    "agent",
+    "task",
+})
+
+# Owner-scope spellings models actually emit, mapped onto the four scopes the
+# runtime understands. Only unambiguous synonyms belong here: a value that could
+# mean more than one scope must fall through to validation instead.
+_OWNER_SCOPE_ALIASES = {
+    "workspace": "workspace_agent",
+    "workspaceagent": "workspace_agent",
+    "master": "workspace_agent",
+    "master_agent": "workspace_agent",
+    "manor": "workspace_agent",
+    "global": "workspace_agent",
+    "all": "workspace_agent",
+    "shared": "workspace_agent",
+    "service_role": "service",
+    "services": "service",
+    "role": "service",
+    "department": "service",
+    "agent_subscription": "agent",
+    "subscription": "agent",
+    "custom_agent": "agent",
+    "sub_agent": "agent",
+    "subagent": "agent",
+    "tasks": "task",
+}
+
 # Known MCP integration server_keys (mirrors BUILTIN_MCP_MODULES in
 # packages/core/ai/mcp/__init__.py). Kept as static data — NOT imported — so
 # this core module doesn't pull the (partly OSS-excluded) MCP server modules at
@@ -46,8 +78,8 @@ _KNOWN_INTEGRATION_SERVER_KEYS = frozenset({
     "linkedin", "quickbooks", "stripe", "twitter_x", "email", "wechat_official",
     "wechat_personal", "telegram", "replicate", "elevenlabs", "tavily", "jimeng",
     "claude_code", "codex_cli", "gemini_cli", "cursor_cli", "aider", "continue_cli",
-    "producthunt", "facebook", "chrome", "chrome_knowledge_local", "knowledge_local",
-    "local_browser", "youtube", "tiktok", "shopify", "woocommerce", "square",
+    "producthunt", "facebook", "chrome", "knowledge_local",
+    "youtube", "tiktok", "shopify", "woocommerce", "square",
     "tiktok_shop", "amazon",
 })
 
@@ -118,10 +150,52 @@ WORKSPACE_CUSTOM_AGENT_BASE_TOOL_NAMES = (
     "manor",
     "workspace_agent",
     "workspace_operation",
-    "rag",
+    # "rag",  # temporarily hidden from LLM auto-bind
+    "read_file",
+    "list_files",
+    "glob_files",
+    "grep_files",
     "generate_file",
     "patch_file",
+    "replace_file",
+    "code_project",
 )
+
+_FILE_READ_RUNTIME_TOOLS = frozenset({
+    "read_file",
+    "list_files",
+    "glob_files",
+    "grep_files",
+})
+_FILE_WRITE_RUNTIME_TOOLS = frozenset({
+    "generate_file",
+    "patch_file",
+    "replace_file",
+    "code_project",
+})
+
+
+def expand_authorized_runtime_file_read_bindings(
+    bound_tool_names: set[str] | frozenset[str] | None,
+) -> set[str] | None:
+    """Run-local file.read replacement for hidden rag / write-only bindings.
+
+    Master/unscoped ``None`` is unchanged. Agents without file.write or rag
+    authorization do not receive ``read_file``. This does not write
+    ``AgentToolBinding`` rows.
+    """
+    if bound_tool_names is None:
+        return None
+    expanded = {
+        str(name).strip()
+        for name in bound_tool_names
+        if str(name or "").strip()
+    }
+    needs_read = bool(expanded & _FILE_WRITE_RUNTIME_TOOLS) or "rag" in expanded
+    expanded -= HIDDEN_RUNTIME_TOOLS
+    if needs_read:
+        expanded.update(_FILE_READ_RUNTIME_TOOLS)
+    return expanded
 
 
 @dataclass(frozen=True)
@@ -214,9 +288,10 @@ def runtime_binding_owner_matches(
         service_key = runtime_binding_service_key(binding)
         if not service_key:
             return False
-        if is_master and task_service_keys is not None:
-            scoped_task_services = set(task_service_keys)
-            return not scoped_task_services or service_key in scoped_task_services
+        if is_master:
+            # The Host coordinates a service but never inherits that service
+            # Agent's execution grant, even when this Task names the service.
+            return False
         return service_key in current_service_keys
 
     if owner_scope == "agent":
@@ -226,13 +301,15 @@ def runtime_binding_owner_matches(
             return owner_sub_id == current_subscription_id
         if owner_agent_id and owner_agent_id == str(agent_id or ""):
             return True
-        if owner_sub_id and owner_sub_id in subscription_agent_ids_by_id:
+        if agent_id and owner_sub_id and owner_sub_id in subscription_agent_ids_by_id:
             return subscription_agent_ids_by_id[owner_sub_id] == agent_id
         return False
 
     if owner_scope == "task":
-        owner_task_id = str(binding.get("task_id") or binding.get("owner_id") or "").strip()
-        return bool(owner_task_id and owner_task_id == str(task_id or ""))
+        # A Task expresses requirements and approvals; it cannot own an
+        # Agent's execution capabilities. Historical rows remain auditable
+        # but are never matched as runtime grants.
+        return False
 
     return False
 
@@ -261,6 +338,77 @@ def runtime_capability_binding_identity(
         binding=binding,
     )
     return f"{capability_type}:{capability}:{owner_scope}:{owner_id}"
+
+
+def resolve_runtime_binding_owner_scope(binding: dict[str, Any]) -> str | None:
+    """The owner scope a binding *means*, or ``None`` when it cannot be known.
+
+    Models write the scope under ``owner_scope``, ``scope`` or ``owner``, spell
+    it ``workspace`` / ``master`` / ``global`` for the workspace agent, and —
+    most often — omit it entirely: every prompt that tells the model to draft
+    a ``capability_binding.upsert`` names ``capability_type`` and
+    ``integration_key`` but not the owner, so the model does not write one.
+    Prod card "发布 X post": a single MCP binding with ``allowed_tools=
+    ['create_tweet']`` and no owner at all, rejected as
+    ``capability_bindings[8].owner_scope binding must be owned by …`` with
+    Approve greyed out and nothing the operator could do about it.
+
+    Resolution order:
+      1. an explicit, valid scope wins;
+      2. a known synonym is mapped;
+      3. an owner identifier implies its scope (``service_key`` → service,
+         ``agent_id`` / ``agent_subscription_id`` → agent, ``task_id`` → task);
+      4. no owner information at all means the workspace agent — the only
+         owner a binding drafted in workspace chat can sensibly default to;
+      5. an explicit value that is none of the above stays unresolved so the
+         validator rejects it rather than the runtime guessing.
+    """
+    raw = str(
+        binding.get("owner_scope")
+        or binding.get("scope")
+        or binding.get("owner")
+        or ""
+    ).strip()
+    if raw:
+        return _owner_scope_word(raw)
+    if str(binding.get("owner_service_key") or binding.get("service_key") or "").strip():
+        return "service"
+    if str(binding.get("agent_id") or binding.get("agent_subscription_id") or "").strip():
+        return "agent"
+    if str(binding.get("task_id") or "").strip():
+        return "task"
+    return "workspace_agent"
+
+
+def apply_runtime_binding_owner_scope_default(
+    raw_binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Write the resolved owner scope onto a binding being DRAFTED.
+
+    Draft-authoring only. Bindings already stored without an owner match no
+    one (see ``runtime_binding_owner_matches``); inferring a scope for them at
+    read time would silently widen what an existing workspace grants. On the
+    draft path the inferred scope lands in the diff the operator approves, so
+    nothing is granted that was not shown.
+    """
+    binding = dict(raw_binding)
+    resolved = resolve_runtime_binding_owner_scope(binding)
+    if resolved is None:
+        return binding
+    binding["owner_scope"] = resolved
+    # ``scope`` / ``owner`` were alias spellings of the scope, not identifiers;
+    # keep one canonical field so the binding key and the diff read cleanly.
+    binding.pop("scope", None)
+    if _owner_scope_word(binding.get("owner")) is not None:
+        binding.pop("owner", None)
+    return binding
+
+
+def _owner_scope_word(value: Any) -> str | None:
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in RUNTIME_CAPABILITY_BINDING_OWNER_SCOPES:
+        return text
+    return _OWNER_SCOPE_ALIASES.get(text)
 
 
 def normalize_runtime_capability_binding(
@@ -340,7 +488,7 @@ def validate_runtime_capability_binding(
 ) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     service_keys = service_keys or set()
-    valid_owner_scopes = valid_owner_scopes or {"workspace_agent", "service", "agent", "task"}
+    valid_owner_scopes = valid_owner_scopes or set(RUNTIME_CAPABILITY_BINDING_OWNER_SCOPES)
 
     if raw_binding.get("enabled") is False:
         return errors
@@ -492,9 +640,10 @@ def normalize_workspace_custom_agent_tool_bindings(
 ) -> tuple[str, ...]:
     """Normalize tool bindings for agents created from workspace setup.
 
-    This keeps legacy ``tool_bindings`` working while allowing architects to
-    specify capability ids. Baseline tools stay intentionally narrow to avoid
-    silently widening old custom-agent behavior.
+    This keeps legacy draft ``tool_bindings`` working while allowing architects
+    to specify capability ids. New file workers need protected source reads and
+    hashes before patching or replacing files. Apply these defaults only during
+    creation; saved bindings and runtime resolution must retain explicit revocations.
     """
 
     merged: list[str] = []
@@ -516,4 +665,4 @@ def normalize_workspace_custom_agent_tool_bindings(
     add_many(WORKSPACE_CUSTOM_AGENT_BASE_TOOL_NAMES)
     if has_skills:
         add_many(("invoke_skill",))
-    return tuple(merged)
+    return tuple(name for name in merged if name not in HIDDEN_RUNTIME_TOOLS)

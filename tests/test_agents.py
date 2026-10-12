@@ -54,6 +54,118 @@ async def test_list_agents(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_agent_deployment_list_handles_empty_and_large_agent_lists(client: AsyncClient, db_session):
+    headers = await _auth(client, "agent_deployments_batch")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    empty = await client.get("/api/v1/agents/deployments", headers=headers)
+    assert empty.status_code == 200
+    assert empty.json() == {}
+
+    agents = [Agent(entity_id=me["entity_id"], name=f"Agent {index}") for index in range(125)]
+    db_session.add_all(agents)
+    await db_session.flush()
+    subscription = AgentSubscription(
+        entity_id=me["entity_id"], agent_id=agents[0].id,
+        owner_user_id=me["id"], status="active",
+    )
+    db_session.add(subscription)
+    await db_session.commit()
+
+    batch = await client.get("/api/v1/agents/deployments", headers=headers)
+    assert batch.status_code == 200, batch.text
+    assert set(batch.json()) == {agent.id for agent in agents}
+    assert batch.json()[agents[-1].id] == []
+    detail = await client.get(f"/api/v1/agents/{agents[0].id}/deployments", headers=headers)
+    assert detail.status_code == 200
+    assert batch.json()[agents[0].id] == detail.json()
+    assert batch.json()[agents[0].id][0]["id"] == subscription.id
+
+
+@pytest.mark.asyncio
+async def test_agent_deployment_list_preserves_agent_and_subscription_visibility(client: AsyncClient, db_session):
+    from datetime import datetime, timezone
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import User, UserMembership
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+    from packages.core.services.auth_service import create_access_token, hash_password
+
+    owner_headers = await _auth(client, "agent_deployments_owner")
+    owner = (await client.get("/api/v1/auth/me", headers=owner_headers)).json()
+    entity_id = owner["entity_id"]
+    member = User(
+        id=generate_ulid(), entity_id=entity_id, email="deploymentmember@test.com",
+        password_hash=hash_password("pass123"), role="member", status="active",
+    )
+    db_session.add_all([member, UserMembership(
+        user_id=member.id, entity_id=entity_id, role="member", status="active", is_primary=True,
+    )])
+    visible_workspace = Workspace(entity_id=entity_id, name="Visible", settings={"access_mode": "members_only"})
+    hidden_workspace = Workspace(entity_id=entity_id, name="Hidden", settings={"access_mode": "members_only"})
+    paused_workspace = Workspace(entity_id=entity_id, name="Paused", status="paused")
+    deleted_workspace = Workspace(
+        entity_id=entity_id, name="Deleted", status="deleted", deleted_at=datetime.now(timezone.utc),
+    )
+    db_session.add_all([visible_workspace, hidden_workspace, paused_workspace, deleted_workspace])
+    await db_session.flush()
+    db_session.add_all([
+        WorkspaceStaff(workspace_id=workspace.id, user_id=member.id, role="viewer", status="active")
+        for workspace in (visible_workspace, paused_workspace)
+    ])
+    shared = Agent(entity_id=entity_id, name="Shared", visibility="entity")
+    own = Agent(entity_id=entity_id, name="Own private", visibility="private", owner_user_id=member.id)
+    hidden = [
+        Agent(entity_id=entity_id, name="Other private", visibility="private", owner_user_id=owner["id"]),
+        Agent(entity_id=entity_id, name="Hidden Workspace", visibility="workspace", workspace_id=hidden_workspace.id),
+        Agent(entity_id=generate_ulid(), name="Other Entity", visibility="public", is_public=True),
+        Agent(entity_id=entity_id, name="Deleted Agent", deleted_at=datetime.now(timezone.utc)),
+        Agent(entity_id=None, name="Platform Template", is_template=True, is_public=True),
+    ]
+    db_session.add_all([shared, own, *hidden])
+    await db_session.flush()
+    visible_subs = [
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, workspace_id=visible_workspace.id),
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, workspace_id=paused_workspace.id),
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, owner_user_id=member.id),
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id),  # Legacy entity-visible deployment.
+    ]
+    for index, subscription in enumerate(visible_subs):
+        subscription.created_at = datetime(2026, 1, index + 1, tzinfo=timezone.utc)
+    hidden_subs = [
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, workspace_id=hidden_workspace.id),
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, workspace_id=deleted_workspace.id),
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, owner_user_id=owner["id"]),
+        AgentSubscription(entity_id=entity_id, agent_id=shared.id, workspace_id=visible_workspace.id, service_key="inactive", status="inactive"),
+        AgentSubscription(entity_id=generate_ulid(), agent_id=shared.id),
+        *[AgentSubscription(entity_id=entity_id, agent_id=agent.id) for agent in hidden],
+    ]
+    db_session.add_all([*visible_subs, *hidden_subs])
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {create_access_token(member.id, entity_id, 'member')}"}
+
+    listed = await client.get("/api/v1/agents", headers=headers)
+    batch = await client.get("/api/v1/agents/deployments", headers=headers)
+    assert listed.status_code == batch.status_code == 200
+    assert set(batch.json()) == {agent["id"] for agent in listed.json()} == {shared.id, own.id}
+    assert batch.json()[own.id] == []
+    detail = await client.get(f"/api/v1/agents/{shared.id}/deployments", headers=headers)
+    assert detail.status_code == 200
+    assert batch.json()[shared.id] == detail.json()
+    assert [row["id"] for row in batch.json()[shared.id]] == [sub.id for sub in reversed(visible_subs)]
+    workspace_rows = [row for row in batch.json()[shared.id] if row["workspace_id"]]
+    assert all(row["can_manage"] is False for row in workspace_rows)
+    legacy = next(row for row in batch.json()[shared.id] if row["id"] == visible_subs[3].id)
+    assert legacy["can_manage"] is False
+
+    # Entity admins may view the Agent, but cannot see another user's personal deployment.
+    owner_batch = await client.get("/api/v1/agents/deployments", headers=owner_headers)
+    assert owner_batch.status_code == 200
+    owner_subscription_ids = {row["id"] for row in owner_batch.json()[shared.id]}
+    assert visible_subs[2].id not in owner_subscription_ids
+    assert hidden_subs[2].id in owner_subscription_ids
+
+
+@pytest.mark.asyncio
 async def test_workspace_agent_mappings_include_public_template_identity(
     client: AsyncClient,
     db_session,
@@ -641,11 +753,17 @@ async def test_python_worker_reports_runtime_capabilities_on_heartbeat() -> None
     )
 
     await worker._tick()
-    assert client.requests[-1].capabilities == {"supported_capabilities": ["external.social"]}
+    assert client.requests[-1].capabilities == {
+        "supported_capabilities": ["external.social"],
+        "lease_attempt_token_version": 1,
+    }
 
     worker.update_capabilities({"supported_capabilities": ["workspace.task"]})
     await worker._tick()
-    assert client.requests[-1].capabilities == {"supported_capabilities": ["workspace.task"]}
+    assert client.requests[-1].capabilities == {
+        "supported_capabilities": ["workspace.task"],
+        "lease_attempt_token_version": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -690,6 +808,9 @@ async def test_agent_deployments_manage_subscription_worker_bindings(client: Asy
     assert body[0]["workspace_id"] == workspace_id
     assert body[0]["service_key"] == service_key
     assert body[0]["workers"][0]["worker_id"] == worker_id
+    batch = await client.get("/api/v1/agents/deployments", headers=headers)
+    assert batch.status_code == 200
+    assert batch.json()[agent_id] == body
 
     unbind = await client.delete(
         f"/api/v1/agents/subscriptions/{sub.id}/workers/{worker_id}",
@@ -739,6 +860,9 @@ async def test_deleted_workspace_subscription_is_hidden_from_agent_projections(
     assert subscription.id not in {row["id"] for row in subscriptions.json()}
     assert deployments.status_code == 200
     assert subscription.id not in {row["id"] for row in deployments.json()}
+    batch = await client.get("/api/v1/agents/deployments", headers=headers)
+    assert batch.status_code == 200
+    assert batch.json()[agent_id] == deployments.json()
     assert workers.status_code == 404
 
 
@@ -848,6 +972,9 @@ async def test_subscription_worker_bindings_do_not_expose_another_users_cli_work
     deployments = await client.get(f"/api/v1/agents/{agent_id}/deployments", headers=owner_headers)
     assert deployments.status_code == 200
     assert deployments.json()[0]["workers"] == []
+    batch = await client.get("/api/v1/agents/deployments", headers=owner_headers)
+    assert batch.status_code == 200
+    assert batch.json()[agent_id] == deployments.json()
 
     denied_unbind = await client.delete(
         f"/api/v1/agents/subscriptions/{sub.id}/workers/{other_worker.id}",

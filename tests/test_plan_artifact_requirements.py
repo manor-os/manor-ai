@@ -7,6 +7,36 @@ import pytest
 from packages.core.plans import executor
 
 
+async def _add_workspace_plan_runtime(
+    db,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    service_key: str = "ops",
+):
+    """Install the minimal active service required by the Task runtime factory."""
+    from packages.core.models.workspace import Agent, AgentSubscription
+
+    agent = Agent(
+        entity_id=entity_id,
+        name=f"{service_key} agent",
+        status="active",
+        config={},
+    )
+    db.add(agent)
+    await db.flush()
+    subscription = AgentSubscription(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=agent.id,
+        service_key=service_key,
+        status="active",
+    )
+    db.add(subscription)
+    await db.flush()
+    return subscription
+
+
 def _task(title: str, *, description: str = "", expected_output=None, details=None):
     return SimpleNamespace(
         title=title,
@@ -410,31 +440,45 @@ async def test_missing_artifact_completed_plan_replans_before_hitl(db_session, m
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan, ExecutionStep
     from packages.core.models.task import Task
+    from packages.core.models.workspace import Workspace
     from packages.core.plans.executor import PlanExecutor
 
-    dispatched: list[str] = []
+    direct_dispatches: list[str] = []
     monkeypatch.setattr(
         "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
-        lambda task_id: dispatched.append(task_id),
+        lambda task_id: direct_dispatches.append(task_id),
     )
 
     entity_id = generate_ulid()
     task_id = generate_ulid()
     plan_id = generate_ulid()
-    db_session.add(
-        Task(
-            id=task_id,
-            entity_id=entity_id,
-            title="生成客户可下载的PDF报价单",
-            status="in_progress",
-            priority=3,
-            task_type="general",
-            details={},
-        )
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Artifact recovery",
     )
+    db_session.add(workspace)
+    subscription = await _add_workspace_plan_runtime(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+    )
+    db_session.add(Task(
+        id=task_id,
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        title="生成客户可下载的PDF报价单",
+        status="in_progress",
+        priority=3,
+        task_type="general",
+        details={},
+        owner_service_key=subscription.service_key,
+        owner_subscription_id=subscription.id,
+    ))
     plan = ExecutionPlan(
         id=plan_id,
         entity_id=entity_id,
+        workspace_id=workspace.id,
         task_id=task_id,
         status="running",
         plan_dag={},
@@ -464,25 +508,89 @@ async def test_missing_artifact_completed_plan_replans_before_hitl(db_session, m
     assert task.details["_replan_context"]["failed_steps"][0]["error"]["type"] == "MissingArtifactEvidence"
     assert task.details["_replan_context"]["artifact_recovery"]["default_action"] == "materialize_saved_workspace_file"
     assert "fs_path" in task.details["_replan_context"]["artifact_recovery"]["required_evidence"]
-    assert dispatched == []
+    assert direct_dispatches == []
 
     await PlanExecutor._commit_and_dispatch_replan(db_session, task_id, plan_id)
-    assert dispatched == [task_id]
+    assert direct_dispatches == []
+
+    from sqlalchemy import select
+
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+
+    event = (await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+            RuntimeOutboxEvent.aggregate_id == task_id,
+            RuntimeOutboxEvent.delivered_at.is_(None),
+        )
+    )).scalars().one()
+    assert event.payload["task_id"] == task_id
 
 
 @pytest.mark.asyncio
-async def test_replan_dispatch_happens_after_commit(monkeypatch) -> None:
+async def test_replan_intent_is_staged_before_commit_without_direct_broker(
+    monkeypatch,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    from packages.core.constants.task import TaskRuntimeKind
     from packages.core.plans.executor import PlanExecutor
 
     events: list[str] = []
 
     class CommitRecorder:
+        def begin_nested(self):
+            @asynccontextmanager
+            async def nested_transaction():
+                events.append("savepoint")
+                yield
+
+            return nested_transaction()
+
         async def commit(self) -> None:
             events.append("commit")
 
+        async def execute(self, _statement):
+            task = SimpleNamespace(id="task_1", status="in_progress")
+            return SimpleNamespace(scalar_one_or_none=lambda: task)
+
+    async def noop_cleanup(*_args, **_kwargs) -> None:
+        events.append("cleanup")
+
+    async def coordinated_dispatch(_db, _task):
+        events.append("resolve")
+        return SimpleNamespace(
+            runtime_kind=TaskRuntimeKind.COORDINATED_PLAN,
+            task_id="task_1",
+        )
+
+    async def stage_intent(_db, _task, _dispatch) -> None:
+        events.append("stage")
+
+    def direct_broker_forbidden(*_args, **_kwargs):
+        pytest.fail("replan admission must not publish directly to the broker")
+
+    monkeypatch.setattr(
+        PlanExecutor,
+        "_cleanup_terminal_approvals_after_commit",
+        noop_cleanup,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.task_execution.resolve_task_execution",
+        coordinated_dispatch,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.task_execution.stage_task_execution_intent",
+        stage_intent,
+    )
+    monkeypatch.setattr(
+        "packages.core.services.task_execution.dispatch_task_execution",
+        direct_broker_forbidden,
+    )
     monkeypatch.setattr(
         "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
-        lambda _task_id: events.append("dispatch"),
+        direct_broker_forbidden,
     )
 
     await PlanExecutor._commit_and_dispatch_replan(
@@ -491,18 +599,101 @@ async def test_replan_dispatch_happens_after_commit(monkeypatch) -> None:
         "plan_1",
     )
 
-    assert events == ["commit", "dispatch"]
+    assert events == ["savepoint", "resolve", "stage", "commit", "cleanup"]
 
 
 @pytest.mark.asyncio
-async def test_replan_dispatch_failure_marks_task_retryable(
+async def test_broker_unavailability_does_not_break_durable_replan_admission(
     db_session,
     monkeypatch,
+) -> None:
+    from sqlalchemy import select
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.runtime_run import RuntimeOutboxEvent
+    from packages.core.models.task import Task
+    from packages.core.models.workspace import Workspace
+    from packages.core.plans.executor import PlanExecutor
+    from packages.core.services.task_execution import TASK_EXECUTION_OUTBOX_EVENT
+
+    entity_id, workspace_id, task_id, plan_id = (generate_ulid() for _ in range(4))
+    workspace = Workspace(
+        id=workspace_id,
+        entity_id=entity_id,
+        name="Durable replan",
+    )
+    db_session.add(workspace)
+    subscription = await _add_workspace_plan_runtime(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
+    task = Task(
+        id=task_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        title="Retry through durable intent",
+        status="in_progress",
+        priority=3,
+        task_type="general",
+        details={"_replan_context": {"prior_plan_id": plan_id}},
+        owner_service_key=subscription.service_key,
+        owner_subscription_id=subscription.id,
+    )
+    plan = ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        task_id=task_id,
+        status="replanned",
+        plan_dag={},
+    )
+    db_session.add_all([task, plan])
+    await db_session.commit()
+
+    def broker_unavailable(*_args, **_kwargs):
+        raise RuntimeError("broker unavailable")
+
+    monkeypatch.setattr(
+        "packages.core.services.task_execution.dispatch_task_execution",
+        broker_unavailable,
+    )
+    monkeypatch.setattr(
+        "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
+        broker_unavailable,
+    )
+
+    assert await PlanExecutor._commit_and_dispatch_replan(
+        db_session,
+        task_id,
+        plan_id,
+    ) is True
+
+    db_session.expire_all()
+    persisted_task = await db_session.get(Task, task_id)
+    assert persisted_task is not None
+    assert persisted_task.status == "in_progress"
+    event = (await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.event_type == TASK_EXECUTION_OUTBOX_EVENT,
+            RuntimeOutboxEvent.aggregate_id == task_id,
+            RuntimeOutboxEvent.delivered_at.is_(None),
+        )
+    )).scalars().one()
+    assert event.payload["task_id"] == task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_point", ["factory", "staging"])
+async def test_replan_admission_failure_creates_recovery_card(
+    db_session,
+    monkeypatch,
+    failure_point,
 ) -> None:
     from packages.core.models.base import generate_ulid
     from sqlalchemy import select
 
-    from packages.core.constants.pending_actions import PendingActionKind
     from packages.core.models.execution import ExecutionPlan
     from packages.core.models.task import Conversation, Message, Task
     from packages.core.models.workspace import Workspace
@@ -517,6 +708,12 @@ async def test_replan_dispatch_failure_marks_task_retryable(
         entity_id=entity_id,
         name="Replan Dispatch Recovery",
     )
+    db_session.add(workspace)
+    subscription = await _add_workspace_plan_runtime(
+        db_session,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+    )
     task = Task(
         id=task_id,
         entity_id=entity_id,
@@ -526,6 +723,8 @@ async def test_replan_dispatch_failure_marks_task_retryable(
         priority=3,
         task_type="general",
         details={"_replan_context": {"prior_plan_id": plan_id}},
+        owner_service_key=subscription.service_key,
+        owner_subscription_id=subscription.id,
     )
     plan = ExecutionPlan(
         id=plan_id,
@@ -535,15 +734,17 @@ async def test_replan_dispatch_failure_marks_task_retryable(
         status="replanned",
         plan_dag={},
     )
-    db_session.add_all([workspace, task, plan])
+    db_session.add_all([task, plan])
     await db_session.commit()
 
-    def fail_dispatch(_task_id: str) -> None:
-        raise RuntimeError("broker unavailable")
+    async def fail_admission(*_args, **_kwargs) -> None:
+        raise RuntimeError(f"deterministic {failure_point} failure")
 
     monkeypatch.setattr(
-        "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
-        fail_dispatch,
+        "packages.core.services.task_execution.resolve_task_execution"
+        if failure_point == "factory"
+        else "packages.core.services.task_execution.stage_task_execution_intent",
+        fail_admission,
     )
 
     dispatched = await PlanExecutor._commit_and_dispatch_replan(
@@ -556,7 +757,7 @@ async def test_replan_dispatch_failure_marks_task_retryable(
     db_session.expire_all()
     task = await db_session.get(Task, task_id)
     plan = await db_session.get(ExecutionPlan, plan_id)
-    assert task is not None and task.status == "failed"
+    assert task is not None and task.status == "blocked"
     assert task.details["_replan_context"]["dispatch_status"] == "failed"
     assert task.details["_replan_context"]["dispatch_plan_id"] == plan_id
     assert plan is not None and plan.status == "replanned"
@@ -568,11 +769,8 @@ async def test_replan_dispatch_failure_marks_task_retryable(
             Conversation.workspace_id == workspace_id,
             Message.resolved_at.is_(None),
         )
-    )).scalars().one()
-    assert (recovery.pending_action or {}).get("kind") == (
-        PendingActionKind.TASK_RECOVERY.value
-    )
-    assert recovery.pending_action["plan_id"] == plan_id
+    )).scalars().all()
+    assert recovery == []
 
 
 @pytest.mark.asyncio
@@ -616,12 +814,12 @@ async def test_replan_dispatch_failure_does_not_regress_cached_terminal_task(
     await db_session.commit()
     assert task.status == "in_progress"
 
-    def fail_dispatch(_task_id: str) -> None:
-        raise RuntimeError("broker unavailable")
+    async def stage_forbidden(*_args, **_kwargs) -> None:
+        pytest.fail("terminal Tasks must not stage a replacement execution intent")
 
     monkeypatch.setattr(
-        "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
-        fail_dispatch,
+        "packages.core.services.task_execution.stage_task_execution_intent",
+        stage_forbidden,
     )
     dispatched = await PlanExecutor._commit_and_dispatch_replan(
         db_session,
@@ -728,11 +926,129 @@ async def test_missing_artifact_supervisor_requests_replan_not_human(db_session,
     assert decision.source is SupervisorDecisionSource.GATE
 
 
+@pytest.mark.asyncio
+async def test_partial_status_supervisor_requests_replan_not_human(db_session, monkeypatch) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.plans.executor import PlanExecutor
+
+    async def fail_supervisor_llm(*_args, **_kwargs):
+        raise AssertionError("partial status gate should not call LLM supervisor")
+
+    monkeypatch.setattr("packages.core.ai.llm_client.chat_completion", fail_supervisor_llm)
+
+    entity_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=entity_id,
+            title="Score workspace goals from current evidence",
+            status="in_progress",
+            priority=3,
+            task_type="general",
+            details={},
+        )
+    )
+    plan = ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        task_id=task_id,
+        status="completed",
+        plan_dag={},
+    )
+    db_session.add(plan)
+    db_session.add(
+        ExecutionStep(
+            id=generate_ulid(),
+            plan_id=plan_id,
+            entity_id=entity_id,
+            step_key="persist_goal_scores",
+            kind="subagent",
+            step_status="done",
+            result={"status": "partial", "summary": "persist applied=false"},
+        )
+    )
+    await db_session.commit()
+
+    decision = await PlanExecutor._supervise_outcome(db_session, plan, "completed")
+
+    from packages.core.constants.supervisor import (
+        SupervisorDecisionSource,
+        SupervisorVerdict,
+    )
+    assert decision.verdict is SupervisorVerdict.NEEDS_REPLAN
+    assert "status=partial" in (decision.evidence or "")
+    assert decision.source is SupervisorDecisionSource.GATE
+
+
+@pytest.mark.asyncio
+async def test_structured_hitl_claim_without_request_needs_repair(db_session, monkeypatch) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.plans.executor import PlanExecutor
+
+    async def fail_supervisor_llm(*_args, **_kwargs):
+        raise AssertionError("HITL gate should not call LLM supervisor")
+
+    monkeypatch.setattr("packages.core.ai.llm_client.chat_completion", fail_supervisor_llm)
+
+    entity_id = generate_ulid()
+    task_id = generate_ulid()
+    plan_id = generate_ulid()
+    db_session.add(
+        Task(
+            id=task_id,
+            entity_id=entity_id,
+            title="Score workspace goals from current evidence",
+            status="in_progress",
+            priority=3,
+            task_type="general",
+            details={},
+        )
+    )
+    plan = ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        task_id=task_id,
+        status="completed",
+        plan_dag={},
+    )
+    db_session.add(plan)
+    db_session.add(
+        ExecutionStep(
+            id=generate_ulid(),
+            plan_id=plan_id,
+            entity_id=entity_id,
+            step_key="persist_goal_scores",
+            kind="subagent",
+            step_status="done",
+            result={
+                "__hitl__": True,
+                "hitl": {"prompt": "Approve persist?", "tool": "sandbox_exec"},
+            },
+        )
+    )
+    await db_session.commit()
+
+    decision = await PlanExecutor._supervise_outcome(db_session, plan, "completed")
+
+    from packages.core.constants.supervisor import (
+        SupervisorDecisionSource,
+        SupervisorVerdict,
+    )
+    assert decision.verdict is SupervisorVerdict.NEEDS_REPLAN
+    assert decision.source is SupervisorDecisionSource.GATE
+
+
 # ── replan context: completed steps carry reusable handles ────────────
 
 
 @pytest.mark.asyncio
-async def test_human_required_failure_stops_replan_and_supervisor_holds_task(
+async def test_model_human_flag_does_not_stop_bounded_replan(
     db_session,
 ):
     from packages.core.constants.execution import ExecutionPlanStatus
@@ -785,14 +1101,14 @@ async def test_human_required_failure_stops_replan_and_supervisor_holds_task(
     db_session.add_all([plan, step])
     await db_session.commit()
 
-    assert await PlanExecutor._maybe_replan(db_session, plan, [step]) is False
+    assert await PlanExecutor._maybe_replan(db_session, plan, [step]) is True
 
     decision = await PlanExecutor._supervise_outcome(
         db_session,
         plan,
         ExecutionPlanStatus.FAILED,
     )
-    assert decision.verdict is SupervisorVerdict.NEEDS_HUMAN
+    assert decision.verdict is SupervisorVerdict.FAILED
     assert decision.source is SupervisorDecisionSource.GATE
     assert "docs.upload" in decision.evidence
 
@@ -993,3 +1309,72 @@ async def test_replan_context_carries_artifacts_of_completed_steps(db_session, m
     assert set(by_key) == {"write_script", "notify_team"}
     assert by_key["write_script"]["artifacts"][0]["fs_path"] == "workspace/artifacts/script.md"
     assert by_key["notify_team"]["no_output"] is True
+
+
+@pytest.mark.asyncio
+async def test_second_replan_preserves_earlier_completed_artifact(db_session, monkeypatch) -> None:
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.task import Task
+    from packages.core.plans.executor import PlanExecutor
+
+    monkeypatch.setattr(
+        "packages.core.tasks.ai_tasks.plan_and_run_task.delay",
+        lambda task_id: None,
+    )
+
+    entity_id = generate_ulid()
+    task_id = generate_ulid()
+    earlier_plan_id = generate_ulid()
+    current_plan_id = generate_ulid()
+    db_session.add(Task(
+        id=task_id,
+        entity_id=entity_id,
+        title="Verify a release matrix",
+        status="in_progress",
+        priority=3,
+        task_type="general",
+        details={"_replan_context": {
+            "prior_plan_id": earlier_plan_id,
+            "succeeded_steps": [{
+                "step_key": "save_matrix",
+                "kind": "subagent",
+                "artifacts": [{"type": "document", "document_id": "matrix-doc"}],
+            }],
+        }},
+    ))
+    db_session.add(ExecutionPlan(
+        id=earlier_plan_id,
+        entity_id=entity_id,
+        task_id=task_id,
+        status="replanned",
+        plan_dag={},
+    ))
+    current_plan = ExecutionPlan(
+        id=current_plan_id,
+        entity_id=entity_id,
+        task_id=task_id,
+        status="running",
+        plan_dag={},
+    )
+    failed = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=current_plan_id,
+        entity_id=entity_id,
+        step_key="return_result",
+        kind="subagent",
+        step_status="failed",
+        error={"type": "StepResultFailed", "message": "output unavailable"},
+    )
+    db_session.add_all([current_plan, failed])
+    await db_session.commit()
+
+    assert await PlanExecutor._maybe_replan(
+        db_session, current_plan, [failed], reason="step_failure",
+    ) is True
+    task = await db_session.get(Task, task_id)
+    assert task.details["_replan_context"]["succeeded_steps"] == [{
+        "step_key": "save_matrix",
+        "kind": "subagent",
+        "artifacts": [{"type": "document", "document_id": "matrix-doc"}],
+    }]

@@ -30,6 +30,7 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from auth_helpers import register_user_and_get_token
+from tests.approval_settings_test_utils import initialize_test_approval_owners
 from packages.core.consolidators import REGISTRY, SnapshotContext
 from packages.core.constants.approvals import (
     GOVERNANCE_HITL_TYPES,
@@ -44,6 +45,7 @@ from packages.core.models.hitl_request import (
 )
 from packages.core.models.base import generate_ulid
 from packages.core.models.workspace import Workspace
+from packages.core.models.user import User, UserMembership
 from packages.core.review import begin_review, events_in_window
 from packages.core.review.briefing import ReviewBriefingModel, build_briefing
 from packages.core.review.briefing_render import render_briefing_markdown
@@ -57,8 +59,15 @@ def _utcnow() -> datetime:
 
 async def _workspace(db, *, entity_id: str = ENTITY_ID) -> Workspace:
     workspace = Workspace(entity_id=entity_id, name="HITL read WS")
+    if await db.get(User, entity_id) is None:
+        db.add_all([
+            User(id=entity_id, entity_id=entity_id, email=f"{entity_id}@example.test",
+                 password_hash="fixture", role="owner", status="active"),
+            UserMembership(user_id=entity_id, entity_id=entity_id, role="owner", status="active"),
+        ])
     db.add(workspace)
     await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=entity_id)
     return workspace
 
 
@@ -166,7 +175,7 @@ async def test_human_queue_splits_approvals_from_information_requests(
     resp = await register_user_and_get_token(client, json={
         "username": "hitl_queue_owner",
         "email": "hitl_queue_owner@test.com",
-        "password": "pass123",
+        "password": "HitlQueueApprovalTest123!",
         "entity_name": "HITL Queue Corp",
     })
     data = resp.json()

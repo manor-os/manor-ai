@@ -11,6 +11,7 @@ Public surface:
 """
 from packages.core.review.service import (
     ReviewAlreadyRunning,
+    ReviewWorkspaceUnavailable,
     begin_review,
     complete_review,
     events_in_window,
@@ -23,6 +24,7 @@ from packages.core.review.service import (
 
 __all__ = [
     "ReviewAlreadyRunning",
+    "ReviewWorkspaceUnavailable",
     "begin_review",
     "complete_review",
     "events_in_window",

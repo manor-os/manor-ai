@@ -11,15 +11,19 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import posixpath
 import re
 import shlex
 import shutil
 import time
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
+
+from jsonschema import Draft202012Validator
 
 from packages.core.ai.runtime.video_edit_sessions import (
     append_video_edit_session_event,
@@ -32,6 +36,8 @@ from packages.core.ai.runtime.video_edit_sessions import (
     video_edit_session_events,
 )
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+from packages.core.services.generated_file_refs import parse_entity_fs_url
 
 
 HYPERFRAMES_VERSION = "0.7.105"
@@ -58,7 +64,28 @@ _SANDBOX_WORKDIR_SIZE = "2g"
 _SANDBOX_MEMORY = "4g"
 _SANDBOX_CPUS = 4.0
 _SANDBOX_RENDER_TIMEOUT = 1800
-_SANDBOX_UPLOAD_CONCURRENCY = 4
+_SANDBOX_UPLOAD_CONCURRENCY = 2
+
+
+def _video_sandbox_client(*, base_url: str, timeout: float):
+    """Build the Sandbox Service client with the shared API token attached.
+
+    sandbox-service rejects every ``/api/v1/*`` call that lacks the
+    ``X-Manor-Sandbox-Token`` header, and ``SandboxClient`` only sends it when
+    constructed with ``api_token=``. Every video-edit sandbox call goes
+    through here so the token can never be dropped at one call site again
+    (tests/test_sandbox_client_token_guard.py enforces it repository-wide).
+    """
+    from packages.core.config import get_settings
+    from packages.core.services.sandbox_sdk import SandboxClient
+
+    try:
+        api_token = str(getattr(get_settings(), "SANDBOX_API_TOKEN", "") or "").strip()
+    except Exception:
+        api_token = ""
+    if not api_token:
+        api_token = os.getenv("SANDBOX_API_TOKEN", "").strip()
+    return SandboxClient(base_url=base_url, timeout=timeout, api_token=api_token)
 _MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024
 _MAX_TEXT_BATCH_BYTES = 16 * 1024 * 1024
 _MAX_TEXT_FILES_PER_CALL = 64
@@ -70,11 +97,54 @@ _VIDEO_SESSION_EVENT_TYPES = {
     "question",
     "artifact",
 }
+_LOCAL_GSAP_PATH = "assets/vendor/gsap.min.js"
+_VIDEO_AUTHORING_CONTRACT_VERSION = "video-edit-authoring-v1"
+_MOTION_ASSERTION_SCHEMAS = {
+    "appearsBy": {
+        "required": ["selector", "bySec"],
+        "properties": {"selector": {"type": "string", "minLength": 1}, "bySec": {"type": "number", "minimum": 0}},
+    },
+    "before": {
+        "required": ["a", "b"],
+        "properties": {"a": {"type": "string", "minLength": 1}, "b": {"type": "string", "minLength": 1}},
+    },
+    "staysInFrame": {
+        "required": ["selector"],
+        "properties": {"selector": {"type": "string", "minLength": 1}},
+    },
+    "keepsMoving": {
+        "required": [],
+        "properties": {"withinSelector": {"type": "string", "minLength": 1, "not": {"const": "*"}}, "maxStaticSec": {"type": "number", "exclusiveMinimum": 0}},
+    },
+}
+_MOTION_METADATA_SCHEMA = {
+    "type": "object",
+    "properties": {"version": {"const": 1}, "duration": {"type": "number", "exclusiveMinimum": 0}},
+}
+_MINIMAL_MOTION_SPEC = {"duration": 4, "assertions": [{"kind": "staysInFrame", "selector": "#headline"}]}
+_MINIMAL_COMPOSITION_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;width:1280px;height:720px;overflow:hidden}
+#demo{position:relative;width:1280px;height:720px;background:#142522;color:#fff}
+.clip{position:absolute;inset:0;display:grid;place-items:center;padding:80px;box-sizing:border-box}
+#headline{margin:0;font:64px/1.2 sans-serif;max-width:1000px;text-align:center}
+</style></head><body>
+<main id="demo" data-composition-id="demo" data-start="0" data-duration="4" data-fps="30" data-width="1280" data-height="720">
+<section id="scene-1" class="clip" data-start="0" data-duration="4" data-track-index="0"><h1 id="headline">Your video content</h1></section>
+</main>
+<script src="./assets/vendor/gsap.min.js"></script>
+<script>
+window.__timelines = window.__timelines || {};
+const tl = gsap.timeline({paused:true});
+tl.to('#headline',{x:24,duration:4,ease:'none'},0);
+window.__timelines['demo'] = tl;
+</script></body></html>"""
 
 
 def _video_authoring_contract() -> dict[str, Any]:
     """Return the minimum deterministic project contract for direct tool users."""
     return {
+        "version": _VIDEO_AUTHORING_CONTRACT_VERSION,
         "required_files": sorted(_REQUIRED_PROJECT_FILES) + ["index.motion.json"],
         "composition_root": {
             "required_attributes": [
@@ -105,26 +175,41 @@ def _video_authoring_contract() -> dict[str, Any]:
             ),
         },
         "motion_assertions": {
-            "supported_kinds": ["appearsBy", "before", "staysInFrame", "keepsMoving"],
-            "forbidden_kinds": ["exists"],
-            "example": {
-                "duration": 12,
-                "assertions": [
-                    {"kind": "appearsBy", "selector": "#headline", "bySec": 0.8},
-                    {"kind": "before", "a": "#headline", "b": "#cta"},
-                    {"kind": "staysInFrame", "selector": ".product-card"},
-                    {
-                        "kind": "keepsMoving",
-                        "withinSelector": ".scene",
-                        "maxStaticSec": 2,
-                    },
-                ],
+            "purpose": (
+                "Motion sidecars contain validation assertions, not playback tracks/keyframes. "
+                "Author playback in index.html's GSAP timeline. Every existing root *.motion.json "
+                "is checked; adding a new sidecar does not fix an invalid old one."
+            ),
+            "preferred_file": "index.motion.json",
+            "supported_kinds": list(_MOTION_ASSERTION_SCHEMAS),
+            "schema": {
+                "type": "object",
+                "required": ["assertions"],
+                "properties": {**_MOTION_METADATA_SCHEMA["properties"], "assertions": {"type": "array", "minItems": 1, "items": {
+                    "oneOf": [
+                        {"type": "object", "required": ["kind", *schema["required"]],
+                         "properties": {"kind": {"const": kind}, **schema["properties"]}}
+                        for kind, schema in _MOTION_ASSERTION_SCHEMAS.items()
+                    ],
+                }}},
             },
+            "forbidden_kinds": ["exists"],
+            "example": _MINIMAL_MOTION_SPEC,
         },
         "determinism": (
             "Use composition time only: no live clocks, unseeded randomness, infinite repeats, "
             "network requests, or forward-only event callbacks."
         ),
+        "minimal_example": {
+            "purpose": "Structural example only; preserve and adapt the user's content/assets before review.",
+            "index.html": _MINIMAL_COMPOSITION_HTML,
+            "index.motion.json": _MINIMAL_MOTION_SPEC,
+        },
+        "runtime_assets": {
+            "local_gsap_path": _LOCAL_GSAP_PATH,
+            "provider": "The Sandbox supplies this library during review; add the local script import, not a download.",
+        },
+        "completion": "contract_valid is static preflight only; strict review, exact-hash approval and rendering are still required.",
     }
 
 
@@ -237,6 +322,13 @@ VIDEO_EDIT_SCHEMA = {
                     "enum": ["standard", "high"],
                     "default": "high",
                 },
+                "render_workers": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 2,
+                    "default": 2,
+                    "description": "For render: use 1 to reduce peak browser memory on a busy self-hosted server; review and output quality are unchanged.",
+                },
             },
             "required": ["operation"],
             "additionalProperties": False,
@@ -250,28 +342,24 @@ def _json(payload: dict[str, Any]) -> str:
 
 
 def _json_error(message: str, *, code: str = "invalid_request", **details: Any) -> str:
-    return _json({"status": "error", "code": code, "error": message, **details})
+    return _json(tool_error_payload(tool_name="video_edit", code=code, message=message, details=details))
 
 
 def _normalize_entity_relative_path(value: str, *, entity_id: str = "") -> str:
-    raw = unquote(str(value or "").strip()).replace("\\", "/")
-    if not raw:
+    text = str(value or "").strip()
+    if not text:
         raise ValueError("A non-empty relative path is required")
 
-    parsed = urlparse(raw)
-    if parsed.scheme or parsed.netloc:
-        raw = parsed.path
-    marker = f"/api/v1/fs/{entity_id}/" if entity_id else "/api/v1/fs/"
-    if entity_id and raw.startswith(marker):
-        raw = raw[len(marker) :]
-    elif raw.startswith("/api/v1/fs/"):
-        remainder = raw[len("/api/v1/fs/") :]
-        parts = remainder.split("/", 1)
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            raise ValueError(f"Invalid entity filesystem URL: {value!r}")
-        if entity_id and parts[0] != entity_id:
+    fs_url = parse_entity_fs_url(text)
+    if fs_url is not None:
+        if entity_id and fs_url[0] != entity_id:
             raise ValueError("A reference URL cannot target a different entity")
-        raw = parts[1]
+        raw = fs_url[1]
+    else:
+        raw = unquote(text).replace("\\", "/")
+        parsed = urlparse(raw)
+        if parsed.scheme or parsed.netloc:
+            raw = parsed.path
 
     raw = raw.lstrip("/")
     normalized = posixpath.normpath(raw)
@@ -361,17 +449,42 @@ async def _run_process(
     )
 
 
-def _validate_project_contract(project_dir: Path) -> list[str]:
-    missing = sorted(name for name in _REQUIRED_PROJECT_FILES if not (project_dir / name).is_file())
+class _LocalVideoScripts(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.has_gsap = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "script":
+            return
+        try:
+            source = urlparse(dict(attrs).get("src") or "")
+        except ValueError:
+            return
+        path = unquote(source.path).replace("\\", "/")
+        if not source.scheme and not source.netloc and not path.startswith("/"):
+            self.has_gsap |= posixpath.normpath(path) == _LOCAL_GSAP_PATH
+
+
+def _project_contract_violations(project_dir: Path) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+
+    def fail(file: str, rule: str, message: str, expected: Any, pointer: str = "") -> None:
+        violations.append({"file": file, "rule": rule, "message": message, "expected": expected,
+                           "pointer": pointer})
+
+    for name in sorted(_REQUIRED_PROJECT_FILES):
+        if not (project_dir / name).is_file():
+            fail(name, "required_file", name, "A readable project source file")
     motion_files = sorted(project_dir.glob("*.motion.json"))
     if not motion_files:
-        missing.append("*.motion.json")
+        fail("index.motion.json", "motion_sidecar", "*.motion.json", {"assertions": [{"kind": "staysInFrame", "selector": "#headline"}]})
     index = project_dir / "index.html"
     if index.is_file():
         try:
             html = index.read_text(encoding="utf-8")
         except OSError:
-            missing.append("index.html: unreadable")
+            fail("index.html", "readable_html", "index.html: unreadable", "UTF-8 HTML")
         else:
             root_match = re.search(
                 r"<[^>]+\bdata-composition-id\s*=\s*[\"'][^\"']+[\"'][^>]*>",
@@ -379,7 +492,7 @@ def _validate_project_contract(project_dir: Path) -> list[str]:
                 flags=re.IGNORECASE,
             )
             if root_match is None:
-                missing.append("index.html: missing data-composition-id root")
+                fail("index.html", "composition_root", "index.html: missing data-composition-id root", "A data-composition-id root")
             else:
                 root_tag = root_match.group(0)
                 if not re.search(
@@ -387,19 +500,22 @@ def _validate_project_contract(project_dir: Path) -> list[str]:
                     root_tag,
                     flags=re.IGNORECASE,
                 ):
-                    missing.append('index.html: root missing data-start="0"')
+                    fail("index.html", "root_start", 'index.html: root missing data-start="0"', 'data-start="0"')
                 for attr in ("data-width", "data-height", "data-duration", "data-fps"):
                     if not re.search(rf"\b{attr}\s*=", root_tag, flags=re.IGNORECASE):
-                        missing.append(f"index.html: root missing {attr}")
+                        fail("index.html", f"root_{attr}", f"index.html: root missing {attr}", attr)
             if "data-end=" in html or "data-end =" in html:
-                missing.append("index.html: data-end is forbidden; use data-duration")
-            if "./assets/vendor/gsap.min.js" not in html:
-                missing.append("index.html: missing local GSAP runtime")
+                fail("index.html", "duration_not_end", "index.html: data-end is forbidden; use data-duration", "data-duration")
+            scripts = _LocalVideoScripts()
+            scripts.feed(html)
+            if not scripts.has_gsap:
+                fail("index.html", "local_gsap_import", "index.html: missing local GSAP script import",
+                     '<script src="./assets/vendor/gsap.min.js"></script>')
             timeline_count = html.count("gsap.timeline")
             if timeline_count != 1 or "window.__timelines" not in html:
-                missing.append(
-                    "index.html: inline exactly one paused gsap.timeline and register it on window.__timelines"
-                )
+                fail("index.html", "registered_timeline",
+                     "index.html: inline exactly one paused gsap.timeline and register it on window.__timelines",
+                     _video_authoring_contract()["timeline"]["example"])
             timed_children = 0
             for tag_match in re.finditer(
                 r"<([a-zA-Z][\w:-]*)\b[^>]*\bdata-start\s*=\s*[\"'][^\"']+[\"'][^>]*>",
@@ -419,25 +535,61 @@ def _validate_project_contract(project_dir: Path) -> list[str]:
                 }
                 for requirement, pattern in required_patterns.items():
                     if not re.search(pattern, tag, flags=re.IGNORECASE):
-                        missing.append(f"index.html: timed element {label} missing {requirement}")
+                        fail("index.html", f"clip_{requirement}", f"index.html: timed element {label} missing {requirement}", requirement, label)
             if timed_children == 0:
-                missing.append("index.html: no timed clip children")
+                fail("index.html", "timed_clip_children", "index.html: no timed clip children",
+                     '<section id="scene-1" class="clip" data-start="0" data-duration="4" data-track-index="0">...</section>')
     for motion_path in motion_files:
         try:
             spec = json.loads(motion_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            missing.append(f"{motion_path.name}: invalid JSON")
+            fail(motion_path.name, "motion_json", f"{motion_path.name}: invalid JSON", "JSON object")
             continue
         assertions = spec.get("assertions") if isinstance(spec, dict) else None
         if not isinstance(assertions, list) or not assertions:
-            missing.append(f'{motion_path.name}: requires a non-empty "assertions" array')
+            fail(motion_path.name, "motion_assertions", f'{motion_path.name}: requires a non-empty "assertions" array',
+                 {"type": "array", "minItems": 1}, "/assertions")
             continue
-        supported = {"appearsBy", "before", "staysInFrame", "keepsMoving"}
+        for error in Draft202012Validator(_MOTION_METADATA_SCHEMA).iter_errors(spec):
+            fail(motion_path.name, "motion_metadata", f"{motion_path.name}: {error.message}", _MOTION_METADATA_SCHEMA,
+                 "/" + "/".join(map(str, error.absolute_path)))
+        if isinstance(spec.get("duration"), (int, float)) and not math.isfinite(spec["duration"]):
+            fail(motion_path.name, "motion_metadata", f"{motion_path.name}: duration must be finite", "finite positive duration", "/duration")
         for index, assertion in enumerate(assertions):
             kind = assertion.get("kind") if isinstance(assertion, dict) else None
-            if kind not in supported:
-                missing.append(f"{motion_path.name}: assertion {index + 1} has unsupported kind {kind!r}")
-    return missing
+            pointer = f"/assertions/{index}"
+            if not isinstance(kind, str) or kind not in _MOTION_ASSERTION_SCHEMAS:
+                fail(motion_path.name, "motion_assertion_kind", f"{motion_path.name}: assertion {index + 1} has unsupported kind {kind!r}", list(_MOTION_ASSERTION_SCHEMAS),
+                     pointer + "/kind")
+                continue
+            schema = _MOTION_ASSERTION_SCHEMAS[kind]
+            for error in Draft202012Validator(schema).iter_errors(assertion):
+                fail(motion_path.name, "motion_assertion_shape", f"{motion_path.name}: assertion {index + 1}: {error.message}", schema,
+                     pointer + "/" + "/".join(map(str, error.absolute_path)))
+            for field, field_schema in schema["properties"].items():
+                value = assertion.get(field)
+                if field_schema.get("type") == "number" and isinstance(value, (int, float)) and not math.isfinite(value):
+                    fail(motion_path.name, "motion_assertion_shape", f"{motion_path.name}: assertion {index + 1}: {field} must be finite", "finite number",
+                         pointer + "/" + field)
+    return violations
+
+
+def _validate_project_contract(project_dir: Path) -> list[str]:
+    """Compatibility view of the shared structured authoring validation."""
+    return [item["message"] for item in _project_contract_violations(project_dir)]
+
+
+def _video_project_feedback(project_dir: Path) -> dict[str, Any]:
+    violations = _project_contract_violations(project_dir)
+    violations.extend({"file": "index.html", "rule": "local_assets", "message": message,
+                       "expected": "Local frozen assets", "pointer": ""}
+                      for message in _validate_local_runtime_assets(project_dir))
+    return {
+        "authoring_contract": _video_authoring_contract(),
+        "contract_valid": not violations,
+        "contract_violations": violations,
+        "missing_project_contract": [item["message"] for item in violations],
+    }
 
 
 def _validate_local_runtime_assets(project_dir: Path) -> list[str]:
@@ -507,7 +659,6 @@ async def _create_video_session_sandbox(project_dir: Path) -> tuple[str, dict[st
     """Create one long-lived, network-isolated video Sandbox and seed its source."""
 
     from packages.core.config import get_settings
-    from packages.core.services.sandbox_sdk import SandboxClient
 
     sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
     if not sandbox_url:
@@ -517,19 +668,19 @@ async def _create_video_session_sandbox(project_dir: Path) -> tuple[str, dict[st
     if source_bytes > _MAX_SANDBOX_PROJECT_BYTES:
         raise ValueError("Video source project exceeds the 1.5 GB sandbox limit")
 
-    client = SandboxClient(base_url=sandbox_url, timeout=180.0)
+    client = _video_sandbox_client(base_url=sandbox_url, timeout=180.0)
     sandbox_id = ""
     started_at = time.perf_counter()
     try:
-        created = await client.create_from_builtin(
-            skill_name="video-edit-runtime",
-            files=_video_sandbox_bundle(),
-            env={
+        create_options = {
+            "skill_name": "video-edit-runtime",
+            "files": _video_sandbox_bundle(),
+            "env": {
                 "NO_COLOR": "1",
                 "HYPERFRAMES_BROWSER_PATH": "/usr/bin/chromium",
-                "HYPERFRAMES_GSAP_PATH": ("/usr/local/lib/node_modules/gsap/dist/gsap.min.js"),
+                "HYPERFRAMES_GSAP_PATH": "/usr/local/lib/node_modules/gsap/dist/gsap.min.js",
             },
-            config={
+            "config": {
                 "network": "none",
                 "memory": _SANDBOX_MEMORY,
                 "cpus": _SANDBOX_CPUS,
@@ -537,8 +688,21 @@ async def _create_video_session_sandbox(project_dir: Path) -> tuple[str, dict[st
                 "workdir_tmpfs_size": _SANDBOX_WORKDIR_SIZE,
                 "exec_timeout": _SANDBOX_RENDER_TIMEOUT,
             },
-            auto_install=False,
-        )
+            "auto_install": False,
+        }
+        for attempt in range(2):
+            try:
+                created = await client.create_from_builtin(**create_options)
+                break
+            except Exception as exc:
+                detail = str(exc).casefold()
+                if attempt or "file injection failed" not in detail or not any(
+                    marker in detail for marker in ("is not running", "no such container")
+                ):
+                    raise
+                # No project work ran yet. A one-time fresh container is safe
+                # when Docker stopped the container during initial injection.
+                await asyncio.sleep(0.25)
         sandbox_id = created.sandbox_id
         created_at = time.perf_counter()
         probe = await client.exec(
@@ -598,30 +762,66 @@ async def _ensure_video_session_sandbox(
     """Touch an owned session or recover it from durable Manor source."""
 
     from packages.core.config import get_settings
-    from packages.core.services.sandbox_sdk import SandboxClient
-    from packages.core.services.sandbox_sdk.exceptions import SandboxNotFoundError
+    from packages.core.services.sandbox_sdk.exceptions import (
+        SandboxNotFoundError,
+        SandboxRuntimeError,
+    )
 
     sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
     if not sandbox_url:
         raise VideoEditRuntimeUnavailable("Sandbox Service is not configured; set SANDBOX_SERVICE_URL.")
     sandbox_id = str(state.get("sandbox_id") or "")
-    client = SandboxClient(base_url=sandbox_url, timeout=180.0)
+    client = _video_sandbox_client(base_url=sandbox_url, timeout=180.0)
     try:
         try:
             info = await client.touch(sandbox_id)
-            return _sandbox_info_payload(info), False
+            status = _sandbox_info_payload(info)
+            if status["status"] != "ready":
+                return status, False
+            # The Sandbox Service can retain a ready session record after Docker
+            # has removed or killed its container. touch() only renews that
+            # record, so verify the actual workdir before reusing the session.
+            probe = await client.exec(
+                sandbox_id=sandbox_id,
+                command="test -d /skill/project",
+                timeout=15,
+            )
+            if probe.exit_code == 0:
+                return status, False
+            detail = str(probe.stderr or "").casefold()
+            if probe.exit_code != 1 and not any(
+                marker in detail
+                for marker in ("no such container", "is not running", "no such object")
+            ):
+                raise VideoEditRuntimeUnavailable(
+                    f"Video Sandbox readiness probe failed (exit {probe.exit_code})."
+                )
         except SandboxNotFoundError:
             pass
+        except SandboxRuntimeError as exc:
+            if not any(
+                marker in str(exc).casefold()
+                for marker in ("no such container", "is not running", "no such object")
+            ):
+                raise
     finally:
         await client.close()
 
+    if sandbox_id:
+        stale_client = _video_sandbox_client(base_url=sandbox_url, timeout=30.0)
+        try:
+            await stale_client.destroy(sandbox_id)
+        except Exception:
+            pass
+        finally:
+            await stale_client.close()
     replacement_id, metrics = await _create_video_session_sandbox(project_dir)
     state["sandbox_id"] = replacement_id
     append_video_edit_session_event(
         state,
         "progress",
         message="Sandbox session recovered from durable project source.",
-        data={"recovered": True, "sandbox_metrics": metrics},
+        data={"recovered": True, "sandbox_metrics": metrics, "authoring_contract_version": _VIDEO_AUTHORING_CONTRACT_VERSION},
     )
     await save_video_edit_session(state)
     return {
@@ -658,10 +858,9 @@ async def _sync_video_session_to_entity(
 
     from packages.core.config import get_settings
     from packages.core.services import entity_fs
-    from packages.core.services.sandbox_sdk import SandboxClient
 
     sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
-    client = SandboxClient(base_url=sandbox_url, timeout=180.0)
+    client = _video_sandbox_client(base_url=sandbox_url, timeout=180.0)
     sandbox_id = str(state.get("sandbox_id") or "")
     try:
         result = await client.exec(
@@ -742,9 +941,9 @@ async def _run_video_sandbox(
     snapshot_times: list[float] | None = None,
     output_rel: str = "renders/final.mp4",
     quality: str = "high",
+    render_workers: int = 2,
 ) -> tuple[int, dict[str, Any], dict[str, bytes], str]:
     from packages.core.config import get_settings
-    from packages.core.services.sandbox_sdk import SandboxClient
 
     sandbox_url = get_settings().SANDBOX_SERVICE_URL.strip()
     if not sandbox_url:
@@ -755,11 +954,17 @@ async def _run_video_sandbox(
     if total_bytes > _MAX_SANDBOX_PROJECT_BYTES:
         raise ValueError("Video source project exceeds the 1.5 GB sandbox limit")
 
-    client = SandboxClient(
+    client = _video_sandbox_client(
         base_url=sandbox_url,
         timeout=float(_SANDBOX_RENDER_TIMEOUT + 60),
     )
-    active_sandbox_id = str(sandbox_id or "").strip()
+    # Rendering consumes an already synchronized, review-hash-checked snapshot.
+    # Keep browser/encoder children out of the authoring session, and destroy
+    # the entire execution sandbox even if PID exhaustion prevents an exec to
+    # clean them up. A retry must not inherit a failed render's processes.
+    active_sandbox_id = "" if operation == "render" else str(sandbox_id or "").strip()
+    if operation == "render":
+        upload_sources = True
     created_for_call = not active_sandbox_id
     started_at = time.perf_counter()
     created_at = started_at
@@ -816,13 +1021,13 @@ async def _run_video_sandbox(
                     "--quality",
                     quality if quality in {"standard", "high"} else "high",
                     "--workers",
-                    "4",
+                    str(max(1, min(int(render_workers), 2))),
                 ]
             )
         result = await client.exec(
             sandbox_id=active_sandbox_id,
             command=" ".join(shlex.quote(value) for value in command),
-            timeout=(_SANDBOX_RENDER_TIMEOUT if operation == "render" else 600),
+            timeout=(_SANDBOX_RENDER_TIMEOUT if operation == "render" else 900),
         )
         executed_at = time.perf_counter()
         payload = _sandbox_result_payload(result.stdout)
@@ -860,20 +1065,35 @@ async def _run_video_sandbox(
         await client.close()
 
 
-async def _stage_references(
+class VideoReferenceAccessDenied(PermissionError):
+    """A reference failed Workspace scope or ACL before any Video Edit effect."""
+
+
+class VideoReferenceUnavailable(ValueError):
+    """A reference path is malformed, missing or over budget before any Video Edit effect."""
+
+
+async def _preflight_reference_paths(
     *,
     entity_id: str,
     entity_root: Path,
-    project_dir: Path,
     raw_paths: list[Any],
     user_id: str | None,
+    workspace_id: str | None,
     workspace_base_dir: str,
-) -> list[dict[str, Any]]:
-    rel_paths = [
-        _normalize_entity_relative_path(str(value), entity_id=entity_id)
-        for value in raw_paths
-        if str(value or "").strip()
-    ]
+) -> list[str]:
+    """Validate references with reads only, before the project, sandbox or session is touched.
+
+    Every rejection raised here is a host-proven no-op (see the handler).
+    """
+    rel_paths = []
+    for value in raw_paths:
+        if not str(value or "").strip():
+            continue
+        try:
+            rel_paths.append(_normalize_entity_relative_path(str(value), entity_id=entity_id))
+        except ValueError as exc:
+            raise VideoReferenceUnavailable(str(exc)) from exc
     if not rel_paths:
         return []
 
@@ -891,23 +1111,50 @@ async def _stage_references(
             entity_id=entity_id,
             rel_paths=rel_paths,
             user_id=user_id,
+            # User-less (scheduler/Strategist) runs may read only their own
+            # Workspace store; without the scope every reference is denied.
+            workspace_id=workspace_id,
             actor_type="agent",
         )
     if blocked:
-        raise PermissionError("Reference access denied: " + ", ".join(sorted(blocked)))
+        raise VideoReferenceAccessDenied("Reference access denied: " + ", ".join(sorted(blocked)))
+
+    # Existence and the staging budget are checked only after authorization,
+    # so an unreadable path cannot be probed for existence or size.
+    total_bytes = 0
+    for rel_path in rel_paths:
+        try:
+            source = _resolve_inside(entity_root, rel_path)
+        except ValueError as exc:
+            raise VideoReferenceUnavailable(str(exc)) from exc
+        if not source.is_file():
+            raise VideoReferenceUnavailable(f"Reference file not found: {rel_path}")
+        total_bytes += source.stat().st_size
+        if total_bytes > _MAX_REFERENCE_BYTES:
+            raise VideoReferenceUnavailable("Combined reference files exceed the 1 GB staging limit")
+    return rel_paths
+
+
+async def _stage_references(
+    *,
+    entity_root: Path,
+    project_dir: Path,
+    rel_paths: list[str],
+) -> list[dict[str, Any]]:
+    """Copy references that _preflight_reference_paths already validated."""
+    if not rel_paths:
+        return []
 
     destination_dir = project_dir / "assets" / "references"
     destination_dir.mkdir(parents=True, exist_ok=True)
-    total_bytes = 0
     staged: list[dict[str, Any]] = []
     for rel_path in rel_paths:
         source = _resolve_inside(entity_root, rel_path)
+        # A reference removed after preflight fails here, after effects began:
+        # a plain error, so the outcome correctly stays unconfirmed.
         if not source.is_file():
             raise FileNotFoundError(f"Reference file not found: {rel_path}")
         size = source.stat().st_size
-        total_bytes += size
-        if total_bytes > _MAX_REFERENCE_BYTES:
-            raise ValueError("Combined reference files exceed the 1 GB staging limit")
 
         clean_name = re.sub(r"[^\w.\-]+", "-", source.name, flags=re.UNICODE).strip(".-")
         clean_name = clean_name or "reference"
@@ -932,13 +1179,17 @@ def _assert_workspace_reference_scope(
     *,
     workspace_base_dir: str,
 ) -> None:
+    from packages.core.services.generated_media_naming import workspace_storage_root
+
+    # Inside a Workflow/Task the resolved base is that execution's archive, but
+    # the Workspace home (generate_file(storage_scope='workspace')) and every
+    # archive under it belong to the same active Workspace.
+    home = workspace_storage_root(workspace_base_dir) if workspace_base_dir else ""
     for rel_path in rel_paths:
         if rel_path != "Workspaces" and not rel_path.startswith("Workspaces/"):
             continue
-        if not workspace_base_dir or not (
-            rel_path == workspace_base_dir or rel_path.startswith(f"{workspace_base_dir}/")
-        ):
-            raise PermissionError("Workspace reference is outside the active Workspace: " + rel_path)
+        if not home or not rel_path.startswith(f"{home}/"):
+            raise VideoReferenceAccessDenied("Workspace reference is outside the active Workspace: " + rel_path)
 
 
 async def _start_video_session(
@@ -952,14 +1203,19 @@ async def _start_video_session(
     workspace_base_dir: str,
     legacy_external_authoring: bool,
 ) -> str:
+    reference_paths = await _preflight_reference_paths(
+        entity_id=entity_id,
+        raw_paths=raw_reference_paths,
+        entity_root=entity_root,
+        user_id=context.user_id,
+        workspace_id=context.workspace_id,
+        workspace_base_dir=workspace_base_dir,
+    )
     project_dir.mkdir(parents=True, exist_ok=True)
     staged = await _stage_references(
-        entity_id=entity_id,
         entity_root=entity_root,
         project_dir=project_dir,
-        raw_paths=raw_reference_paths,
-        user_id=context.user_id,
-        workspace_base_dir=workspace_base_dir,
+        rel_paths=reference_paths,
     )
     sandbox_id, metrics = await _create_video_session_sandbox(project_dir)
     state = new_video_edit_session(
@@ -1001,12 +1257,7 @@ async def _start_video_session(
             "staged_references": staged,
             "event_cursor": state["last_event_seq"],
             "events": video_edit_session_events(state),
-            "authoring_contract": _video_authoring_contract(),
-            "next_step": (
-                "Write the editable project inside this session with write_files, then run review."
-                if not legacy_external_authoring
-                else "Author the editable project, then call review; the same Sandbox will be reused."
-            ),
+            **_video_project_feedback(project_dir),
         }
     )
 
@@ -1044,14 +1295,19 @@ async def _push_video_session_assets(
     raw_paths: list[Any],
     workspace_base_dir: str,
 ) -> str:
+    reference_paths = await _preflight_reference_paths(
+        entity_id=entity_id,
+        raw_paths=raw_paths,
+        entity_root=entity_root,
+        user_id=context.user_id,
+        workspace_id=context.workspace_id,
+        workspace_base_dir=workspace_base_dir,
+    )
     await _ensure_video_session_sandbox(state, project_dir=project_dir)
     staged = await _stage_references(
-        entity_id=entity_id,
         entity_root=entity_root,
         project_dir=project_dir,
-        raw_paths=raw_paths,
-        user_id=context.user_id,
-        workspace_base_dir=workspace_base_dir,
+        rel_paths=reference_paths,
     )
     if not staged:
         return _json_error(
@@ -1060,9 +1316,8 @@ async def _push_video_session_assets(
         )
 
     from packages.core.config import get_settings
-    from packages.core.services.sandbox_sdk import SandboxClient
 
-    client = SandboxClient(
+    client = _video_sandbox_client(
         base_url=get_settings().SANDBOX_SERVICE_URL.strip(),
         timeout=180.0,
     )
@@ -1129,9 +1384,8 @@ async def _write_video_session_files(
 
     from packages.core.config import get_settings
     from packages.core.services import entity_fs
-    from packages.core.services.sandbox_sdk import SandboxClient
 
-    client = SandboxClient(
+    client = _video_sandbox_client(
         base_url=get_settings().SANDBOX_SERVICE_URL.strip(),
         timeout=180.0,
     )
@@ -1165,7 +1419,7 @@ async def _write_video_session_files(
         await client.close()
 
     source_hash = _project_source_sha256(project_dir)
-    missing_contract = _validate_project_contract(project_dir)
+    feedback = _video_project_feedback(project_dir)
     state["source_revision"] = int(state.get("source_revision") or 0) + 1
     state["last_synced_sha256"] = source_hash
     append_video_edit_session_event(
@@ -1182,6 +1436,7 @@ async def _write_video_session_files(
     return _json(
         {
             "status": "source_updated",
+            "source_saved": True,
             "session_id": state["session_id"],
             "project_path": state["project_path"],
             "written_files": [item[0] for item in normalized_files],
@@ -1190,12 +1445,7 @@ async def _write_video_session_files(
             "source_revision": state["source_revision"],
             "event_cursor": state["last_event_seq"],
             "events": [state["events"][-1]],
-            "missing_project_contract": missing_contract,
-            "next_step": (
-                "Write the missing required project files before review: " + ", ".join(missing_contract)
-                if missing_contract
-                else "Project file contract is complete; run review in the same session."
-            ),
+            **feedback,
         }
     )
 
@@ -1213,7 +1463,10 @@ async def _register_artifact(
         runtime_register_video_edit_artifact,
     )
 
-    return await runtime_register_video_edit_artifact(
+    from packages.core.services.file_refs import file_ref
+    from packages.core.services.generated_file_refs import entity_fs_open_url
+
+    artifact = await runtime_register_video_edit_artifact(
         abs_path=abs_path,
         entity_root=entity_root,
         entity_id=entity_id,
@@ -1221,6 +1474,51 @@ async def _register_artifact(
         artifact_role=artifact_role,
         generation=generation,
     )
+    # Legacy ``url`` stays an fs address (callers decode it), now encoded.
+    artifact["url"] = entity_fs_open_url(entity_id, artifact.get("fs_path"))
+    artifact["file"] = file_ref(
+        entity_id=entity_id,
+        fs_path=artifact.get("fs_path"),
+        document_id=artifact.get("document_id"),
+        name=artifact.get("name"),
+        mime=artifact.get("mime_type"),
+        size=artifact.get("size_bytes"),
+    )
+    return artifact
+
+
+async def _review_validation_result(
+    *,
+    project_rel: str,
+    feedback: dict[str, Any],
+    diagnostics: list[dict[str, Any]],
+    session_state: dict[str, Any] | None,
+    sandbox_metrics: dict[str, Any] | None = None,
+) -> str:
+    """Return a completed check with unmet criteria, preserving its effects."""
+    if session_state is not None:
+        session_state["last_review_sha256"] = ""
+        session_state["last_review_artifacts"] = []
+        append_video_edit_session_event(
+            session_state,
+            "warning",
+            message="Video review completed with validation findings.",
+            data={"review_passed": False, "diagnostics": diagnostics},
+        )
+        await save_video_edit_session(session_state)
+    return _json({
+        **feedback,
+        "status": "completed",
+        "operation": "review",
+        "review_passed": False,
+        "quality_gate": "failed",
+        "static_contract_valid": feedback["contract_valid"],
+        "contract_valid": False,
+        "diagnostics": diagnostics,
+        "session_id": session_state.get("session_id") if session_state is not None else None,
+        "project_path": project_rel,
+        "sandbox_metrics": sandbox_metrics or {},
+    })
 
 
 async def _review_project(
@@ -1243,13 +1541,19 @@ async def _review_project(
                 project_dir=project_dir,
                 entity_id=entity_id,
             )
-    missing = _validate_project_contract(project_dir)
-    missing.extend(_validate_local_runtime_assets(project_dir))
+    feedback = _video_project_feedback(project_dir)
+    missing = feedback["missing_project_contract"]
     if missing:
-        return _json_error(
-            "Video project contract is incomplete",
-            code="project_contract_incomplete",
-            missing=missing,
+        return await _review_validation_result(
+            project_rel=project_rel,
+            feedback=feedback,
+            diagnostics=[{
+                "code": "project_contract_incomplete",
+                "message": "Video project contract is incomplete.",
+                "missing": missing,
+                "violations": feedback["contract_violations"],
+            }],
+            session_state=session_state,
         )
 
     if snapshot_times:
@@ -1271,23 +1575,66 @@ async def _review_project(
     except VideoEditRuntimeUnavailable as exc:
         return _json_error(str(exc), code="runtime_unavailable")
     if exit_code != 0 or payload.get("status") != "ok":
+        failure_code = (
+            "sandbox_worker_killed"
+            if exit_code == 137 and not payload.get("code")
+            else str(payload.get("code") or "quality_gate_failed")
+        )
         if session_state is not None:
             append_video_edit_session_event(
                 session_state,
                 "warning",
-                message="Video review gate failed; the project needs another edit pass.",
+                message=(
+                    "Video review worker was killed; recover the Sandbox and retry."
+                    if failure_code == "sandbox_worker_killed"
+                    else "Video review gate failed; the project needs another edit pass."
+                ),
                 data={
-                    "code": str(payload.get("code") or "quality_gate_failed"),
+                    "code": failure_code,
                     "exit_code": exit_code,
                 },
             )
             await save_video_edit_session(session_state)
         return _json_error(
-            "Video sandbox review failed; fix every reported issue before asking for approval.",
-            code=str(payload.get("code") or "quality_gate_failed"),
+            (
+                "Video review worker was killed before returning quality findings."
+                if failure_code == "sandbox_worker_killed"
+                else "Video sandbox review failed; fix every reported issue before asking for approval."
+            ),
+            code=failure_code,
             exit_code=exit_code,
             runtime_result=payload,
             stderr=stderr,
+            **feedback,
+        )
+
+    if payload.get("review_passed") is False:
+        report = payload.get("check_report")
+        sections = ("lint", "runtime", "layout", "motion", "contrast")
+        if (
+            payload.get("operation") != "review"
+            or not isinstance(report, dict)
+            or report.get("ok") is not False
+            or report.get("error")
+            or not all(
+                isinstance(report.get(section), dict)
+                and isinstance(report[section].get("findings"), list)
+                for section in sections
+            )
+        ):
+            return _json_error("Video review returned an incomplete result.", code="review_result_invalid")
+        diagnostics = [
+            {"section": section, **finding}
+            for section in sections
+            for finding in report[section]["findings"]
+            if isinstance(finding, dict)
+        ]
+        return await _review_validation_result(
+            project_rel=project_rel,
+            feedback=feedback,
+            diagnostics=diagnostics,
+            session_state=session_state,
+            sandbox_metrics=payload.get("sandbox_metrics"),
         )
 
     review_rel = "snapshots/manor-review"
@@ -1308,24 +1655,47 @@ async def _review_project(
         ],
         key=lambda path: ("contact" not in path.name.lower(), path.name.lower()),
     )
+    from packages.core.services.document_service import StorageLimitExceeded
+
     artifacts: list[dict[str, Any]] = []
-    for path in review_files[:12]:
-        artifacts.append(
-            await _register_artifact(
-                abs_path=path,
-                entity_root=entity_root,
-                entity_id=entity_id,
-                context=context,
-                artifact_role="review",
-                generation={
-                    "kind": "video_review",
-                    "project_path": project_rel,
-                    "source_sha256": source_hash,
-                    "snapshot_times": times,
-                    "video_runtime_version": HYPERFRAMES_VERSION,
-                },
+    try:
+        for path in review_files[:12]:
+            artifacts.append(
+                await _register_artifact(
+                    abs_path=path,
+                    entity_root=entity_root,
+                    entity_id=entity_id,
+                    context=context,
+                    artifact_role="review",
+                    generation={
+                        "kind": "video_review",
+                        "project_path": project_rel,
+                        "source_sha256": source_hash,
+                        "snapshot_times": times,
+                        "video_runtime_version": HYPERFRAMES_VERSION,
+                    },
+                )
             )
-        )
+    except StorageLimitExceeded as exc:
+        if session_state is not None:
+            append_video_edit_session_event(
+                session_state,
+                "warning",
+                message="Review passed, but Knowledge storage is full; free space and retry review.",
+                data={"code": "knowledge_storage_limit", "source_sha256": source_hash},
+            )
+            await save_video_edit_session(session_state)
+        return _json({
+            "status": "blocked",
+            "code": "knowledge_storage_limit",
+            "error": str(exc),
+            "quality_gate": "passed",
+            "session_id": (session_state.get("session_id") if session_state is not None else None),
+            "project_path": project_rel,
+            "source_sha256": source_hash,
+            "preview_frames_written": len(review_files),
+            "next_step": "Free Knowledge storage or upgrade the plan, then retry review on this session.",
+        })
 
     if session_state is not None:
         session_state["legacy_external_authoring"] = False
@@ -1352,15 +1722,12 @@ async def _review_project(
             "quality_gate": "passed",
             "snapshot_times": times,
             "review_artifacts": artifacts,
+            "files": [artifact["file"] for artifact in artifacts if artifact.get("file")],
             "approval_required": True,
             "execution_runtime": "isolated_sandbox",
             "sandbox_metrics": payload.get("sandbox_metrics", {}),
             "event_cursor": (session_state.get("last_event_seq") if session_state is not None else None),
             "events": ([session_state["events"][-1]] if session_state is not None else []),
-            "next_step": (
-                "Show the review artifacts to the user and ask for explicit approval. "
-                "After approval, call render with this exact review_sha256."
-            ),
         }
     )
 
@@ -1401,6 +1768,7 @@ async def _render_project(
     review_sha256: str,
     output_name: str,
     quality: str,
+    render_workers: int = 2,
     session_state: dict[str, Any] | None = None,
 ) -> str:
     upload_sources = True
@@ -1450,25 +1818,35 @@ async def _render_project(
             upload_sources=upload_sources,
             output_rel=output_rel,
             quality=quality,
+            render_workers=render_workers,
         )
     except VideoEditRuntimeUnavailable as exc:
         return _json_error(str(exc), code="runtime_unavailable")
     output_bytes = outputs.get(output_rel, b"")
     if exit_code != 0 or payload.get("status") != "ok" or not output_bytes:
+        failure_code = (
+            "sandbox_worker_killed"
+            if exit_code == 137 and not payload.get("code")
+            else str(payload.get("code") or "render_failed")
+        )
         if session_state is not None:
             append_video_edit_session_event(
                 session_state,
                 "warning",
-                message="Final video render failed inside the active Sandbox.",
+                message="Final video render failed; the editable project is preserved.",
                 data={
-                    "code": str(payload.get("code") or "render_failed"),
+                    "code": failure_code,
                     "exit_code": exit_code,
                 },
             )
             await save_video_edit_session(session_state)
         return _json_error(
-            "Video sandbox render failed or produced no MP4.",
-            code=str(payload.get("code") or "render_failed"),
+            (
+                "Video render worker was killed before producing an MP4."
+                if failure_code == "sandbox_worker_killed"
+                else "Video sandbox render failed or produced no MP4."
+            ),
+            code=failure_code,
             exit_code=exit_code,
             runtime_result=payload,
             stderr=stderr,
@@ -1511,6 +1889,7 @@ async def _render_project(
             "execution_runtime": "isolated_sandbox",
             "sandbox_metrics": payload.get("sandbox_metrics", {}),
             "video": artifact,
+            "file": artifact.get("file"),
             "media_probe": probe,
             "event_cursor": (session_state.get("last_event_seq") if session_state is not None else None),
             "events": ([session_state["events"][-1]] if session_state is not None else []),
@@ -1626,7 +2005,7 @@ async def _video_edit_handler(
                 session_state,
                 "progress",
                 message="Video Sandbox restored for a legacy durable project.",
-                data={"sandbox_metrics": metrics},
+                data={"sandbox_metrics": metrics, "authoring_contract_version": _VIDEO_AUTHORING_CONTRACT_VERSION},
             )
             await save_video_edit_session(session_state)
 
@@ -1736,6 +2115,7 @@ async def _video_edit_handler(
                         after_seq=after_seq,
                     ),
                     "event_cursor": session_state["last_event_seq"],
+                    **_video_project_feedback(project_dir),
                 }
             )
         if operation == "sync":
@@ -1756,6 +2136,7 @@ async def _video_edit_handler(
                     "sync": sync,
                     "event_cursor": session_state["last_event_seq"],
                     "events": [session_state["events"][-1]],
+                    **_video_project_feedback(project_dir),
                 }
             )
         if operation == "close":
@@ -1769,9 +2150,8 @@ async def _video_edit_handler(
                 entity_id=entity_id,
             )
             from packages.core.config import get_settings
-            from packages.core.services.sandbox_sdk import SandboxClient
 
-            client = SandboxClient(
+            client = _video_sandbox_client(
                 base_url=get_settings().SANDBOX_SERVICE_URL.strip(),
                 timeout=180.0,
             )
@@ -1807,7 +2187,24 @@ async def _video_edit_handler(
             review_sha256=str(kwargs.get("review_sha256") or ""),
             output_name=str(kwargs.get("output_name") or "renders/final.mp4"),
             quality=str(kwargs.get("quality") or "high"),
+            render_workers=int(kwargs.get("render_workers") or 2),
             session_state=session_state,
+        )
+    except VideoReferenceAccessDenied as exc:
+        # Raised only by the reference preflight, before the project directory,
+        # sandbox or session record is touched: a host-proven no-op the agent
+        # may correct or report, not an unconfirmed outcome.
+        from packages.core.ai.runtime.tool_results import RuntimeNoEffectToolResult
+
+        return RuntimeNoEffectToolResult.video_reference_denied(
+            _json_error(str(exc), code="permission_denied", applied=False)
+        )
+    except VideoReferenceUnavailable as exc:
+        # Same read-only preflight: nothing was created, staged or started.
+        from packages.core.ai.runtime.tool_results import RuntimeNoEffectToolResult
+
+        return RuntimeNoEffectToolResult.video_reference_unavailable(
+            _json_error(str(exc), code="reference_unavailable", applied=False)
         )
     except PermissionError as exc:
         return _json_error(str(exc), code="permission_denied")
@@ -1817,6 +2214,9 @@ async def _video_edit_handler(
         return _json_error(str(exc))
     except Exception as exc:  # Keep tool failures actionable for the calling agent.
         return _json_error(f"Video editing operation failed: {exc}", code="operation_failed")
+
+
+TOOL_GUIDANCE = {"video_edit": "video-edit"}
 
 
 def get_tools():

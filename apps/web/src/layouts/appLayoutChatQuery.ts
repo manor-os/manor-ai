@@ -1,6 +1,7 @@
 export type AppLayoutChatTarget =
   | { type: "conversation"; conversationId: string }
   | { type: "workspace"; workspaceId: string }
+  | { type: "agent"; agentId: string }
   | null;
 
 export function parseAppLayoutChatTarget(search: string): AppLayoutChatTarget {
@@ -13,6 +14,11 @@ export function parseAppLayoutChatTarget(search: string): AppLayoutChatTarget {
   const workspaceId = (params.get("workspace") || params.get("workspaceId") || "").trim();
   if (workspaceId) {
     return { type: "workspace", workspaceId };
+  }
+
+  const agentId = (params.get("agent") || "").trim();
+  if (agentId) {
+    return { type: "agent", agentId };
   }
 
   return null;

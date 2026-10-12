@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import json
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
@@ -20,10 +21,18 @@ from packages.core.services.chat_approvals import (
 )
 from packages.core.services.workflow_chat_projection import (
     _notify_update,
+    _workflow_run_url,
     project_workflow_step,
 )
+from packages.core.services.workflow_chat_approvals import resolve_chat_workflow_wait
 from packages.core.services.workflow_run_trace import build_execution_snapshot
 from packages.core.services.workflow_service import create_workflow, start_workflow
+
+
+@pytest.mark.parametrize("workspace_id", [None, "workspace/one"])
+def test_workflow_result_url_uses_the_flow_run_route(workspace_id) -> None:
+    run = SimpleNamespace(id="run/one", workflow_id="flow/one", workspace_id=workspace_id)
+    assert _workflow_run_url(run) == "/flows/flow%2Fone/runs/run%2Fone"
 
 
 def test_chat_approval_payload_preserves_edited_review() -> None:
@@ -46,6 +55,15 @@ def test_chat_revision_payload_preserves_revision_request() -> None:
         "revise",
         {"review": {"revision_request": "Shorten the opening."}},
     )
+
+
+def test_chat_hitl_payload_preserves_safe_workflow_specific_choice() -> None:
+    assert parse_hitl_action(
+        '{"hitl_id":"approval-3","action":"leave_unpublished"}'
+    ) == ("approval-3", "leave_unpublished", None)
+    assert parse_hitl_action(
+        '{"hitl_id":"approval-3","action":"not a safe action"}'
+    ) is None
 
 
 @pytest.mark.asyncio
@@ -111,8 +129,10 @@ async def test_personal_workflow_update_notification_carries_entity_scope(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
 async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
     db_session,
+    read_only,
 ) -> None:
     entity_id = generate_ulid()
     user_id = generate_ulid()
@@ -144,6 +164,7 @@ async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
                     "response_variable": "topic_decision",
                     "review_title": "Review Topic Brief",
                     "review": "{{topic_brief}}",
+                    "review_read_only": read_only,
                 },
                 "next": [],
             },
@@ -209,7 +230,641 @@ async def test_agent_tool_runner_projects_wait_card_to_personal_chat(
     assert approval.pending_action["workflow_run_id"] == run.id
     assert approval.pending_action["step_id"] == "approve_topic"
     assert approval.pending_action["review"] == {"title": "A grounded topic"}
+    assert approval.pending_action.get("review_read_only", False) is read_only
+    assert approval.meta["hitl_requests"][0]["review_read_only"] is read_only
     assert approval.meta["hitl_requests"][0]["workflow"]["id"] == workflow.id
+
+
+@pytest.mark.parametrize(
+    ("choice", "approved"),
+    [("approve", True), ("leave_unpublished", False)],
+)
+@pytest.mark.asyncio
+async def test_variable_backed_video_review_resumes_non_cancel_decisions(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+    choice: str,
+    approved: bool,
+) -> None:
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    conversation_id = generate_ulid()
+    activity_id = generate_ulid()
+    binding_id = generate_ulid()
+    publication_review = {
+        "review_artifacts": [
+            {
+                "document_id": "document-1",
+                "fs_path": "runs/root/final.mp4",
+                "filename": "final.mp4",
+            }
+        ],
+        "title": "A verified Stickman video",
+        "description": "Publication description",
+        "visibility": "public",
+        "audience": "not_made_for_kids",
+        "selected_topic": "A concrete topic",
+        "revision_notes": "",
+    }
+    db_session.add(User(
+        id=user_id,
+        entity_id=entity_id,
+        email=f"{user_id}@example.com",
+        password_hash="test-only",
+        role="owner",
+        status="active",
+    ))
+    await db_session.flush()
+    workflow = await create_workflow(
+        db_session,
+        entity_id=entity_id,
+        created_by=user_id,
+        name="Variable-backed video approval",
+        variables={"publication_review": {}},
+        steps=[
+            {
+                "id": "start",
+                "type": "trigger",
+                "name": "Start",
+                "config": {},
+                "next": ["approve_video"],
+            },
+            {
+                "id": "approve_video",
+                "type": "wait",
+                "name": "Approve video",
+                "config": {
+                    "wait_type": "approval",
+                    "message": "Review the exact video.",
+                    "options": [
+                        "approve",
+                        "request_revision",
+                        "leave_unpublished",
+                        "cancel",
+                    ],
+                    "approval_values": ["approve"],
+                    "response_variable": "video_decision",
+                    "review": "{{publication_review}}",
+                },
+                "next": ["done"],
+            },
+            {"id": "done", "type": "end", "name": "Done"},
+        ],
+    )
+    run = await start_workflow(
+        db_session,
+        entity_id,
+        workflow.id,
+        variables={"publication_review": publication_review},
+        started_by=user_id,
+        binding_id=binding_id,
+        trigger_source="mcp",
+    )
+    db_session.add_all([
+        Conversation(
+            id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=None,
+            title="Video Workflow Chat",
+            scope="channel",
+        ),
+        Message(
+            id=activity_id,
+            conversation_id=conversation_id,
+            role="system",
+            content="Workflow is running.",
+            author_kind="system",
+            message_kind="workflow_activity",
+            meta={
+                "workflow_run_id": run.id,
+                "workflow_binding_id": binding_id,
+                "workflow_title": workflow.name,
+                "workflow_status": "queued",
+                "workflow_steps": [],
+            },
+        ),
+    ])
+    run.trigger_data = {
+        **dict(run.trigger_data or {}),
+        "_workflow_chat_origin": {
+            "enabled": True,
+            "conversation_id": conversation_id,
+            "activity_message_id": activity_id,
+            "projection": {"progress": True, "step_outputs": "explicit"},
+            "wait_bridge": True,
+        },
+    }
+    await db_session.commit()
+
+    await WorkflowRunner().run(run.id)
+    await db_session.refresh(run)
+    assert run.status == "paused", (run.status, run.error, run.step_results)
+    approval = (await db_session.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.pending_action.isnot(None),
+        )
+    )).scalar_one()
+
+    queued: list[str] = []
+    monkeypatch.setattr(
+        "packages.core.ai.workflow_runner.WorkflowRunner.enqueue",
+        staticmethod(lambda run_id, *args, **kwargs: queued.append(run_id) or True),
+    )
+    action_message = json.dumps({
+        "hitl_id": approval.id,
+        "action": choice,
+        "payload": {"review": publication_review},
+    })
+    assert await chat_hitl_action_is_pending(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=entity_id,
+        message=action_message,
+    ) is True
+    assert await chat_hitl_action_is_pending(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=entity_id,
+        message=json.dumps({
+            "hitl_id": approval.id,
+            "action": "undeclared_choice",
+        }),
+    ) is False
+    response, _, _, _ = await resolve_chat_approval_turn(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=entity_id,
+        user_id=user_id,
+        message=action_message,
+    )
+    assert response and "continuing" in response
+    await db_session.commit()
+    await db_session.refresh(run)
+
+    assert queued == [run.id]
+    assert run.status == "running"
+    assert run.variables["video_decision"]["choice"] == choice
+    assert run.step_results["approve_video"]["approved"] is approved
+
+
+@pytest.mark.asyncio
+async def test_subworkflow_pause_does_not_project_chat_approval(
+    db_session,
+) -> None:
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    conversation_id = generate_ulid()
+    activity_id = generate_ulid()
+    workflow_id = generate_ulid()
+    binding_id = generate_ulid()
+    step = {
+        "id": "create_video",
+        "type": "subworkflow",
+        "name": "Create video",
+        "config": {"workflow_id": generate_ulid()},
+        "next": [],
+    }
+    run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=workflow_id,
+        entity_id=entity_id,
+        workspace_id=generate_ulid(),
+        binding_id=binding_id,
+        trigger_source="mcp",
+        status="paused",
+        current_step_id=step["id"],
+        variables={},
+        step_results={
+            step["id"]: {
+                "status": "paused",
+                "subrun_id": generate_ulid(),
+                "output": "Waiting for child workflow",
+            }
+        },
+        trigger_data={
+            "_workflow_chat_origin": {
+                "enabled": True,
+                "conversation_id": conversation_id,
+                "activity_message_id": activity_id,
+                "projection": {"progress": True},
+                "wait_bridge": True,
+            },
+        },
+        definition_snapshot={"name": "parent", "nodes": [step]},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    db_session.add_all([
+        Conversation(
+            id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=run.workspace_id,
+            title="Workflow Chat",
+            scope="workspace",
+        ),
+        Message(
+            id=activity_id,
+            conversation_id=conversation_id,
+            role="system",
+            content="Workflow is running.",
+            author_kind="system",
+            message_kind="workflow_activity",
+            meta={
+                "workflow_run_id": run.id,
+                "workflow_binding_id": binding_id,
+                "workflow_title": "parent",
+                "workflow_status": "running",
+                "workflow_steps": [],
+            },
+        ),
+        WorkflowDefinition(
+            id=workflow_id,
+            entity_id=entity_id,
+            workspace_id=run.workspace_id,
+            created_by=user_id,
+            name="parent",
+            trigger_type="manual",
+            steps=[step],
+            variables={},
+            tags=[],
+        ),
+        run,
+    ])
+    await db_session.commit()
+
+    await project_workflow_step(
+        db_session,
+        run=run,
+        step=step,
+        status="paused",
+        result=run.step_results[step["id"]],
+    )
+    await db_session.commit()
+
+    approvals = (await db_session.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.pending_action.isnot(None),
+        )
+    )).scalars().all()
+    assert approvals == []
+
+
+@pytest.mark.asyncio
+async def test_nested_subworkflow_wait_projects_child_approval_into_root_chat_group(
+    db_session,
+) -> None:
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    workspace_id = generate_ulid()
+    conversation_id = generate_ulid()
+    activity_id = generate_ulid()
+    root_run_id = generate_ulid()
+    child_workflow_id = generate_ulid()
+    child_step = {
+        "id": "approve_video",
+        "type": "wait",
+        "name": "Approve video",
+        "config": {
+            "wait_type": "approval",
+            "message": "Review the generated video.",
+            "options": ["approve", "cancel"],
+            "response_variable": "video_decision",
+            "review": {"title": "Generated video"},
+        },
+        "next": [],
+    }
+    child_run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=child_workflow_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        binding_id=None,
+        trigger_source="manual",
+        status="paused",
+        current_step_id=child_step["id"],
+        variables={},
+        step_results={
+            child_step["id"]: {
+                "status": "paused",
+                "wait_type": "approval",
+                "output": "Review the generated video.",
+                "review": {"title": "Generated video"},
+            }
+        },
+        trigger_data={
+            "parent_run_id": root_run_id,
+            "parent_step_id": "publish_video",
+            "_workflow_chat_origin": {
+                "enabled": True,
+                "conversation_id": conversation_id,
+                "activity_message_id": activity_id,
+                "projection": {"progress": True},
+                "wait_bridge": True,
+                "host_run_id": root_run_id,
+                "nested": True,
+            },
+        },
+        definition_snapshot={"name": "Publication child", "nodes": [child_step]},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    root_activity = Message(
+        id=activity_id,
+        conversation_id=conversation_id,
+        role="system",
+        content="Root workflow is running.",
+        author_kind="system",
+        message_kind="workflow_activity",
+        meta={
+            "workflow_run_id": root_run_id,
+            "workflow_binding_id": generate_ulid(),
+            "workflow_title": "Root workflow",
+            "workflow_status": "paused",
+            "workflow_steps": [{"id": "publish_video", "status": "paused"}],
+        },
+    )
+    db_session.add_all([
+        Conversation(
+            id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            title="Nested Workflow Chat",
+            scope="workspace",
+        ),
+        root_activity,
+        WorkflowDefinition(
+            id=child_workflow_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            created_by=user_id,
+            name="Publication child",
+            trigger_type="manual",
+            steps=[child_step],
+            variables={},
+            tags=[],
+        ),
+        child_run,
+    ])
+    await db_session.commit()
+
+    await project_workflow_step(
+        db_session,
+        run=child_run,
+        step=child_step,
+        status="paused",
+        result=child_run.step_results[child_step["id"]],
+    )
+    await db_session.commit()
+    await db_session.refresh(root_activity)
+
+    approval = (await db_session.execute(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.pending_action.isnot(None),
+        )
+    )).scalar_one()
+    assert approval.pending_action["workflow_run_id"] == child_run.id
+    assert approval.pending_action["workflow_chat_host_run_id"] == root_run_id
+    assert approval.meta["workflow_run_id"] == child_run.id
+    assert root_activity.meta["workflow_run_id"] == root_run_id
+    assert root_activity.meta["workflow_steps"] == [
+        {"id": "publish_video", "status": "paused"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_nested_workflow_chat_cancel_schedules_terminal_propagation(
+    db_session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    conversation_id = generate_ulid()
+    root_run_id = generate_ulid()
+    child_workflow_id = generate_ulid()
+    approval_id = generate_ulid()
+    step = {
+        "id": "approve_video",
+        "type": "wait",
+        "config": {
+            "wait_type": "approval",
+            "options": ["approve", "cancel"],
+            "response_variable": "video_decision",
+        },
+        "next": [],
+    }
+    child_run = WorkflowRun(
+        id=generate_ulid(),
+        workflow_id=child_workflow_id,
+        entity_id=entity_id,
+        trigger_source="manual",
+        status="paused",
+        current_step_id=step["id"],
+        variables={},
+        step_results={
+            step["id"]: {"status": "paused", "wait_type": "approval"}
+        },
+        trigger_data={
+            "parent_run_id": root_run_id,
+            "parent_step_id": "publish_video",
+            "_workflow_chat_origin": {
+                "enabled": True,
+                "conversation_id": conversation_id,
+                "activity_message_id": generate_ulid(),
+                "wait_bridge": True,
+                "host_run_id": root_run_id,
+                "nested": True,
+            },
+        },
+        definition_snapshot={"name": "Publication child", "nodes": [step]},
+        execution_trace=[],
+        started_by=user_id,
+    )
+    db_session.add_all([
+        User(
+            id=user_id,
+            entity_id=entity_id,
+            email=f"{user_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        Conversation(
+            id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            title="Nested Workflow Chat",
+            scope="channel",
+        ),
+        WorkflowDefinition(
+            id=child_workflow_id,
+            entity_id=entity_id,
+            created_by=user_id,
+            name="Publication child",
+            trigger_type="manual",
+            steps=[step],
+            variables={},
+            tags=[],
+        ),
+        child_run,
+        Message(
+            id=approval_id,
+            conversation_id=conversation_id,
+            role="system",
+            content="Approve publication",
+            author_kind="system",
+            message_kind="hitl_request",
+            pending_action={
+                "kind": "workflow_approval",
+                "workflow_run_id": child_run.id,
+                "workflow_chat_host_run_id": root_run_id,
+                "step_id": step["id"],
+                "response_variable": "video_decision",
+                "options": ["approve", "cancel"],
+            },
+        ),
+    ])
+    await db_session.commit()
+    queued: list[str] = []
+    monkeypatch.setattr(
+        WorkflowRunner,
+        "enqueue",
+        staticmethod(lambda run_id, delay_seconds=0: queued.append(run_id) or True),
+    )
+
+    response = await resolve_chat_workflow_wait(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=entity_id,
+        user_id=user_id,
+        hitl_id=approval_id,
+        action="cancel",
+    )
+    await db_session.commit()
+    await db_session.refresh(child_run)
+
+    assert response == "The Workflow was cancelled from its originating Chat."
+    assert child_run.status == "cancelled"
+    assert child_run.terminal_effects_next_attempt_at is not None
+    assert child_run.trigger_data["_workflow_chat_cancel_ancestors"] == {
+        "host_run_id": root_run_id,
+        "cancelled_by": user_id,
+    }
+    assert queued == [child_run.id]
+
+
+@pytest.mark.asyncio
+async def test_chat_approval_cannot_resolve_subworkflow_barrier(
+    db_session,
+) -> None:
+    entity_id = generate_ulid()
+    user_id = generate_ulid()
+    conversation_id = generate_ulid()
+    workflow_id = generate_ulid()
+    run_id = generate_ulid()
+    approval_id = generate_ulid()
+    step = {
+        "id": "create_video",
+        "type": "subworkflow",
+        "name": "Create video",
+        "config": {"workflow_id": generate_ulid()},
+        "next": [],
+    }
+    workflow = WorkflowDefinition(
+        id=workflow_id,
+        entity_id=entity_id,
+        created_by=user_id,
+        name="parent",
+        trigger_type="manual",
+        steps=[step],
+        variables={},
+        tags=[],
+    )
+    run = WorkflowRun(
+        id=run_id,
+        workflow_id=workflow_id,
+        entity_id=entity_id,
+        trigger_source="mcp",
+        status="paused",
+        current_step_id=step["id"],
+        variables={},
+        step_results={
+            step["id"]: {
+                "status": "paused",
+                "subrun_id": generate_ulid(),
+            }
+        },
+        trigger_data={
+            "_workflow_chat_origin": {
+                "enabled": True,
+                "conversation_id": conversation_id,
+                "activity_message_id": generate_ulid(),
+                "projection": {"progress": True},
+                "wait_bridge": True,
+            },
+        },
+        definition_snapshot={"name": "parent", "nodes": [step]},
+        execution_snapshot=build_execution_snapshot(workflow),
+        execution_trace=[],
+        started_by=user_id,
+    )
+    approval = Message(
+        id=approval_id,
+        conversation_id=conversation_id,
+        role="system",
+        content="Approve child completion",
+        author_kind="system",
+        message_kind="hitl_request",
+        pending_action={
+            "kind": "workflow_approval",
+            "workflow_run_id": run_id,
+            "step_id": step["id"],
+            "response_variable": "create_video_response",
+            "options": ["approve", "cancel"],
+        },
+    )
+    db_session.add_all([
+        User(
+            id=user_id,
+            entity_id=entity_id,
+            email=f"{user_id}@example.com",
+            password_hash="test-only",
+            role="owner",
+            status="active",
+        ),
+        Conversation(
+            id=conversation_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            title="Workflow Chat",
+            scope="channel",
+        ),
+        workflow,
+        run,
+        approval,
+    ])
+    await db_session.commit()
+
+    response = await resolve_chat_workflow_wait(
+        db_session,
+        conversation_id=conversation_id,
+        entity_id=entity_id,
+        user_id=user_id,
+        hitl_id=approval_id,
+        action="approve",
+    )
+
+    assert response == "This Workflow step is not a human wait."
+    await db_session.refresh(run)
+    await db_session.refresh(approval)
+    assert run.status == "paused"
+    assert run.step_results[step["id"]]["status"] == "paused"
+    assert approval.resolved_at is None
 
 
 @pytest.mark.asyncio
@@ -343,7 +998,7 @@ async def test_personal_chat_approval_uses_execution_snapshot_after_live_config_
         "id": workflow_id,
         "name": "content-publish-workflow",
         "run_id": run_id,
-        "url": f"/flows?workflow={workflow_id}",
+        "url": f"/flows/{workflow_id}/runs/{run_id}",
     }
     assert request["node"] == {
         "id": "approve_publish",

@@ -24,7 +24,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.goals import GoalStatus
@@ -57,6 +57,8 @@ from packages.core.services.runtime_authorization import authorize_runtime_actio
 from packages.core.services.runtime_authorization.domain import RuntimeAuthorizationAccess
 from packages.core.services.task_dependencies import dependency_ids_from_details, details_with_dependency_state
 from packages.core.services.task_service import update_task
+from packages.core.services.task_execution_origin import record_manual_task_execution
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 from packages.core.services.workspace_work_reconciliation import (
     reconcile_active_work_batches,
     stale_reconciliation_results,
@@ -66,15 +68,22 @@ from packages.core.services.workspace_readiness import (
     normalize_workspace_setup_task_key,
 )
 from packages.core.strategist.context import gather_context
+from packages.core.strategist.execution_presentation import (
+    execution_review_metadata,
+    format_execution_notes,
+)
 from packages.core.strategist.prompt import generate_proposal
-from packages.core.strategist.proposal import Proposal, ProposedTask
+from packages.core.strategist.proposal import (
+    Proposal,
+    ProposedHumanRequest,
+    ProposedTask,
+)
 from packages.core.strategist.triggers import ReviewTrigger, ReviewTriggerKind
 from packages.core.workspace_chat import service as chat_service
 
 logger = logging.getLogger(__name__)
 
 _STRATEGIST_SETTINGS_KEY = "strategist"
-_AUTO_APPROVE_PROPOSALS_KEY = "auto_approve_proposals"
 _STRATEGIST_ACTIVITY_TERMINAL_STATES = frozenset({"completed", "skipped", "failed"})
 
 
@@ -112,48 +121,169 @@ def _restrict_proposal_to_setup_work(
     return True
 
 
+_DEFAULT_SETUP_INPUT_QUESTION = (
+    "Complete the remaining Workspace setup requirements before ordinary "
+    "work can start."
+)
+
+
+def _blocking_setup_input_question(setup_status) -> str:
+    details = setup_status.details if setup_status is not None else {}
+    details = details if isinstance(details, dict) else {}
+    for result in details.get("incomplete_checks") or []:
+        if not isinstance(result, dict):
+            continue
+        question = str(result.get("question") or "").strip()
+        if question:
+            return question[:1000]
+    reasons = [
+        str(result.get("reason") or "").strip()
+        for result in details.get("incomplete_checks") or []
+        if isinstance(result, dict) and str(result.get("reason") or "").strip()
+    ]
+    if reasons:
+        return (" ".join(reasons))[:1000]
+    return _DEFAULT_SETUP_INPUT_QUESTION
+
+
+async def _workspace_has_waiting_input(
+    db: AsyncSession,
+    workspace_id: str,
+) -> bool:
+    from packages.core.models.participant import HumanCommitment
+
+    existing = (await db.execute(
+        select(HumanCommitment.id).where(
+            HumanCommitment.workspace_id == workspace_id,
+            HumanCommitment.request_kind == "input",
+            HumanCommitment.status == "waiting",
+        ).limit(1)
+    )).scalar_one_or_none()
+    return existing is not None
+
+
+async def _ensure_blocking_setup_human_request(
+    db: AsyncSession,
+    workspace: Workspace,
+    proposal: Proposal,
+    setup_status,
+) -> None:
+    """Mint one setup Need Input when the Blueprint gate is still open.
+
+    Completeness lives in WS-03. This only injects a generic allowlisted
+    human_request so the operator is asked again until those checks pass.
+    Waiting input cards are reused instead of duplicated.
+    """
+
+    if setup_status is None or not setup_status.blocks_work:
+        return
+
+    allowed_keys = list(dict.fromkeys(
+        normalize_workspace_setup_task_key(value)
+        for value in setup_status.details.get("allowed_setup_task_keys") or []
+        if normalize_workspace_setup_task_key(value)
+    ))
+    allowed_key_set = set(allowed_keys)
+    if not allowed_keys:
+        return
+    if await _workspace_has_waiting_input(db, workspace.id):
+        proposal.human_requests = []
+        return
+    if any(
+        normalize_workspace_setup_task_key(request.request_key) in allowed_key_set
+        for request in proposal.human_requests
+    ):
+        return
+
+    request_key = allowed_keys[0]
+    question = _blocking_setup_input_question(setup_status)
+    if len(question) < 8:
+        question = _DEFAULT_SETUP_INPUT_QUESTION
+    proposal.human_requests = [
+        ProposedHumanRequest(
+            request_key=request_key,
+            request_kind="input",
+            question=question,
+        )
+    ]
+
+
 async def _post_strategist_activity(
     workspace: Workspace,
     *,
     stage: str,
     body: str,
     review_id: str | None = None,
+    message_id: str | None = None,
 ) -> str | None:
-    """Best-effort progress receipt for the Workspace Chat timeline.
+    """Best-effort progress receipt for one Workspace Chat review line.
 
     Strategist reviews can spend a meaningful amount of time assembling
     evidence and waiting for the model.  Use a short-lived independent
-    session so each stage is committed and visible immediately without
+    session so each stage update is committed and visible immediately without
     committing the review transaction that owns the business result.
     """
     try:
         from packages.core.database import async_session
 
         async with async_session() as activity_db:
-            activity = await chat_service.post_message(
-                activity_db,
-                entity_id=workspace.entity_id,
-                workspace_id=workspace.id,
-                body=body,
-                message_kind="strategist_activity",
-                author_kind="agent",
-                refs=[{"type": "workspace", "id": workspace.id}],
-                meta={
-                    "strategist_activity": {
-                        "stage": stage,
-                        "state": "running",
-                        "started_at": datetime.now(timezone.utc).isoformat(),
-                        **({"review_id": review_id} if review_id else {}),
+            activity = None
+            if message_id is not None:
+                activity = (await activity_db.execute(
+                    select(Message)
+                    .join(Conversation, Conversation.id == Message.conversation_id)
+                    .where(
+                        Message.id == message_id,
+                        Message.message_kind == "strategist_activity",
+                        Conversation.entity_id == workspace.entity_id,
+                        Conversation.workspace_id == workspace.id,
+                    )
+                    .with_for_update(of=Message)
+                )).scalar_one_or_none()
+                if activity is not None:
+                    current = (activity.meta or {}).get("strategist_activity")
+                    if not isinstance(current, dict) or current.get("review_id") != review_id:
+                        return None
+                    if current.get("state") != "running":
+                        return message_id
+                    activity.content = body
+                    activity.meta = {
+                        **(activity.meta or {}),
+                        "strategist_activity": {**current, "stage": stage},
+                    }
+            if activity is None:
+                activity = await chat_service.post_message(
+                    activity_db,
+                    entity_id=workspace.entity_id,
+                    workspace_id=workspace.id,
+                    body=body,
+                    message_kind="strategist_activity",
+                    author_kind="agent",
+                    refs=[{"type": "workspace", "id": workspace.id}],
+                    meta={
+                        "strategist_activity": {
+                            "stage": stage,
+                            "state": "running",
+                            "started_at": datetime.now(timezone.utc).isoformat(),
+                            **({"review_id": review_id} if review_id else {}),
+                        },
                     },
-                },
-                publish_event=False,
-            )
+                    publish_event=False,
+                )
             await activity_db.commit()
-            await chat_service.publish_workspace_chat_message_event(
-                workspace.entity_id,
-                workspace_id=workspace.id,
-                message=activity,
-            )
+            try:
+                await chat_service.publish_workspace_chat_message_event(
+                    workspace.entity_id,
+                    workspace_id=workspace.id,
+                    message=activity,
+                )
+            except Exception:  # noqa: BLE001 — persisted progress still owns the next stage
+                logger.debug(
+                    "Strategist: failed to publish activity stage=%s workspace=%s",
+                    stage,
+                    workspace.id,
+                    exc_info=True,
+                )
             return activity.id
     except Exception:  # noqa: BLE001 — status must never fail the review
         logger.debug(
@@ -296,6 +426,18 @@ class StrategistLeaseLost(StrategistError):
     """Raised when a review can no longer fence its business transaction."""
 
 
+async def _lock_proposal_workspace(db: AsyncSession, workspace: Workspace) -> Workspace:
+    """Reacquire lifecycle after a proposal item commits its dispatch receipt."""
+    from packages.core.services.workspace_access import lock_workspace_access_boundary
+
+    current = await lock_workspace_access_boundary(
+        db, workspace_id=workspace.id, entity_id=workspace.entity_id,
+    )
+    if not workspace_allows_manual_work(current):
+        raise StrategistError("Workspace is unavailable for proposal execution")
+    return current
+
+
 async def _strategist_permission_decision(
     db: AsyncSession,
     *,
@@ -335,6 +477,8 @@ async def run_review(
     review_lease_owner: str | None = None,
     activity_review_id: str | None = None,
     initial_activity_message_id: str | None = None,
+    automation_context: dict | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """Run one Strategist review cycle. Caller commits.
 
@@ -352,12 +496,11 @@ async def run_review(
     ``_post_review_skip_notice``), so a suppressed review stops being
     invisible.
 
-    ``briefing_markdown`` / ``review_run`` are only supplied on the
-    strategist_review_v2 path (M5/M6): the deterministic ReviewBriefing
-    markdown replaces the legacy context sections in the LLM user prompt,
-    and the proposal cohort is tagged with the ReviewRun's id so decisions
-    trace back to the frozen snapshot. Both default to ``None``, keeping
-    the legacy path (prompts included) byte-identical.
+    ``review_run`` supplies the durable admission, execution lease, and
+    atomic terminal receipt for either prompt path. Only
+    ``briefing_markdown`` is gated by strategist_review_v2 (M5/M6): the
+    deterministic ReviewBriefing replaces legacy context sections. Both
+    prompt paths use the same Proposal governance and approval policy.
     """
     trigger = ReviewTrigger.coerce(trigger)
     workspace = (await db.execute(
@@ -373,8 +516,10 @@ async def run_review(
             f"workspace {workspace_id} not found (or in soft-delete trash)",
         )
 
-    # Paused workspaces don't get reviews
-    if workspace.status != "active":
+    # Pausing autonomy stops unsolicited reviews, not an operator's request.
+    if not workspace_allows_manual_work(workspace) or (
+        workspace.status == "paused" and not trigger.is_human_initiated
+    ):
         logger.info("Strategist: workspace %s is %s — skipping", workspace_id, workspace.status)
         await _finish_strategist_activity(
             workspace,
@@ -391,7 +536,7 @@ async def run_review(
     review_id = (
         review_run.id
         if review_run is not None
-        else activity_review_id or "rv_" + generate_ulid()
+        else activity_review_id or generate_ulid()
     )
     activity_message_id = initial_activity_message_id
     if activity_message_id is None:
@@ -418,11 +563,9 @@ async def run_review(
         # Persist completion/stall state before any early return below.
         await db.commit()
 
-    # Cadence ticks yield to work that is already in flight. Deliberately
-    # narrower than the open-proposal gate below: event triggers fire
-    # *because* something finished, and a human trigger never waits on a
-    # batch — it waits on the operator.
-    if trigger.kind is ReviewTriggerKind.SCHEDULED:
+    # Autonomous reviews wait for the whole work batch, not one completed
+    # sibling. A human-requested review still reports to its operator.
+    if trigger.kind.suppressible:
         active_batch = await _active_work_batch_with_open_tasks(db, workspace)
         if active_batch:
             logger.info(
@@ -449,18 +592,14 @@ async def run_review(
                 **active_batch,
             }
 
-    await _finish_strategist_activity(
-        workspace,
-        message_id=activity_message_id,
-        state="completed",
-    )
     activity_message_id = await _post_strategist_activity(
         workspace,
         stage="analyzing_context",
         body="🧭 Manor AI is analyzing workspace context and deciding what matters next…",
         review_id=review_id,
+        message_id=activity_message_id,
     )
-    ctx = await gather_context(db, workspace, trigger=trigger.label)
+    ctx = await gather_context(db, workspace, trigger=trigger.label, user_id=user_id)
     ctx.work_batch_reconciliation = stale_work_batches
     starter_cleanup = await _resolve_fulfilled_starter_document_proposals(
         db,
@@ -542,21 +681,19 @@ async def run_review(
             "expression": matched,
         }
 
-    await _finish_strategist_activity(
-        workspace,
-        message_id=activity_message_id,
-        state="completed",
-    )
     activity_message_id = await _post_strategist_activity(
         workspace,
         stage="generating_plan",
         body="🧭 Manor AI is generating the next execution plan from the reviewed evidence…",
         review_id=review_id,
+        message_id=activity_message_id,
     )
 
     # Only pass briefing_markdown on the v2 path so the legacy call shape
     # (and anything monkeypatching generate_proposal) stays untouched.
     proposal_kwargs: dict = {}
+    if user_id is not None:
+        proposal_kwargs["user_id"] = user_id
     if briefing_markdown is not None:
         proposal_kwargs["briefing_markdown"] = briefing_markdown
 
@@ -574,6 +711,8 @@ async def run_review(
     _sanitize_governance_language(proposal, ctx)
     _suppress_starter_document_proposals(proposal, ctx)
     _suppress_meta_learning_proposals(proposal)
+    _suppress_duplicate_completed_work_proposals(proposal, ctx)
+    _suppress_capability_recovery_duplicates(proposal, ctx)
     _enforce_allowlists(proposal, ctx.allowed_service_keys)
     _enforce_proposal_shape(proposal, ctx)
     await _suppress_active_workflow_run_proposals(db, workspace, proposal)
@@ -633,7 +772,9 @@ async def run_review(
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if locked_workspace is None or locked_workspace.status != "active":
+    if not workspace_allows_manual_work(locked_workspace) or (
+        locked_workspace.status == "paused" and not trigger.is_human_initiated
+    ):
         workspace_status = (
             locked_workspace.status if locked_workspace is not None else "deleted"
         )
@@ -655,6 +796,55 @@ async def run_review(
         }
     workspace = locked_workspace
 
+    # A cohort can start while the model is generating. The Workspace fence
+    # makes this the final autonomous admission check before persistence.
+    if trigger.kind.suppressible:
+        active_batch = await _active_work_batch_with_open_tasks(db, workspace)
+        if active_batch:
+            await _post_review_skip_notice(
+                db,
+                workspace,
+                trigger=trigger,
+                fingerprint=_active_batch_fingerprint(active_batch),
+                body=_active_batch_skip_body(trigger, active_batch),
+            )
+            await _finish_strategist_activity(
+                workspace,
+                message_id=activity_message_id,
+                state="skipped",
+            )
+            return {
+                "workspace_id": workspace_id,
+                "skipped": True,
+                "reason": ReviewSkipReason.ACTIVE_WORK_BATCH,
+                **active_batch,
+            }
+
+    automation_origin: dict[str, str] | None = None
+    if isinstance(automation_context, dict):
+        from packages.core.governance.service import (
+            scheduled_automation_origin_is_valid,
+        )
+
+        scheduled_job_id = str(
+            automation_context.get("scheduled_job_id") or ""
+        ).strip()
+        scheduled_run_id = str(
+            automation_context.get("scheduled_run_id") or ""
+        ).strip()
+        if await scheduled_automation_origin_is_valid(
+            db,
+            entity_id=workspace.entity_id,
+            workspace_id=workspace.id,
+            scheduled_job_id=scheduled_job_id,
+            scheduled_run_id=scheduled_run_id,
+            execution_type="strategist_review",
+        ):
+            automation_origin = {
+                "scheduled_job_id": scheduled_job_id,
+                "scheduled_run_id": scheduled_run_id,
+            }
+
     # Model instructions are guidance, not an authorization boundary. Re-read
     # the live Blueprint setup state while holding the Workspace fence, then
     # deterministically discard every model-authored Task and retain only
@@ -663,11 +853,41 @@ async def run_review(
     # normal work while setup is incomplete.
     blocking_setup_status = await evaluate_workspace_blocking_setup(db, workspace)
     _restrict_proposal_to_setup_work(proposal, blocking_setup_status)
+    await _ensure_blocking_setup_human_request(
+        db,
+        workspace,
+        proposal,
+        blocking_setup_status,
+    )
 
-    auto_approve_proposals = proposal_auto_approval_enabled(workspace)
+    # The model's notes are strategy; these frozen execution facts come from
+    # the validated, Workspace-scoped observation, not from its prose. Do this
+    # after all Proposal shaping so a later note append cannot cut off facts.
+    execution_snapshot = getattr(ctx, "execution_snapshot", {}) or {}
+    execution_review = execution_review_metadata(proposal, execution_snapshot)
+    execution_note = format_execution_notes(proposal, execution_snapshot)
+    if execution_note:
+        strategy_notes = proposal.notes
+        if strategy_notes:
+            label = "\n\nStrategy notes:\n"
+            budget = max(0, 1500 - len(execution_note) - len(label))
+            visible_strategy = strategy_notes[:budget]
+            proposal.notes = execution_note + (label + visible_strategy if visible_strategy else "")
+        else:
+            proposal.notes = execution_note
+    if review_run is not None and execution_review is not None:
+        review_run.briefing = {
+            **(review_run.briefing or {}),
+            "execution_evidence": execution_review,
+        }
 
     # Write Task rows + collect their ids.
-    new_task_ids = await _persist_tasks(db, workspace, proposal)
+    new_task_ids = await _persist_tasks(
+        db,
+        workspace,
+        proposal,
+        automation_origin=automation_origin,
+    )
     # Ledger (M1): one proposal_created fact per review.
     from packages.core.ledger.adapters import record_proposal_created
     await record_proposal_created(db, workspace, review_id=review_id, task_ids=new_task_ids)
@@ -680,38 +900,30 @@ async def run_review(
         ctx=ctx,
     )
 
-    # ── M7/M8 (v2 path only): proposal_items bookkeeping + one
-    # HitlRequest resolution for the whole cohort. Legacy path
-    # (briefing_markdown is None) writes no proposal rows at all.
+    # Prompt generation never selects the authorization policy. Both prompt
+    # paths persist the same auditable Proposal/items and resolve one cohort
+    # approval before any Task can start.
     governance: dict = {}
     if (
-        briefing_markdown is not None
-        and review_run is not None
-        and (
-            new_task_ids
-            or proposal.human_requests
-            or proposal.experiments
-            or proposal.workflow_runs
-            or proposal.automation_changes
-            or proposal.workflow_changes
-            or proposal.goal_changes
-        )
+        new_task_ids
+        or proposal.human_requests
+        or proposal.experiments
+        or proposal.workflow_runs
+        or proposal.automation_changes
+        or proposal.workflow_changes
+        or proposal.goal_changes
     ):
         governance = await _wire_proposal_governance(
             db,
             workspace=workspace,
-            review_run=review_run,
+            review_id=review_id,
             proposal=proposal,
             new_task_ids=new_task_ids,
         )
+        workspace = await _lock_proposal_workspace(db, workspace)
 
     policy_denied = governance.get("outcome") == "deny"
     standing_allow = governance.get("outcome") == "allow"
-    has_external_tasks = any(
-        task.external_action is not None for task in proposal.tasks
-    )
-    legacy_auto_approve = auto_approve_proposals and not has_external_tasks
-
     approved_task_ids: list[str] = []
     if policy_denied:
         # Governance hard block: cancel the cohort (items already marked
@@ -720,17 +932,19 @@ async def run_review(
             db,
             entity_id=workspace.entity_id,
             review_id=review_id,
-            only_task_ids=new_task_ids or None,
+            only_task_ids=new_task_ids,
+            only_item_ids=[],
             reason=governance.get("reason") or "Blocked by governance policy.",
             reason_code="POLICY_BLOCKED",
             actor_kind="system",
         )
-    elif (legacy_auto_approve or standing_allow) and new_task_ids:
+    elif standing_allow and new_task_ids and workspace.status == "active":
         approved_task_ids = await approve_proposal(
             db,
             entity_id=workspace.entity_id,
             review_id=review_id,
             only_task_ids=new_task_ids,
+            only_item_ids=[],
             actor_kind="system",
         )
 
@@ -745,20 +959,17 @@ async def run_review(
         new_task_ids or pending_items or proposal.notes
     )
     auto_approved_action_key = (
-        governance.get("task_action_key") if standing_allow else None
+        governance.get("task_action_key")
+        if standing_allow else None
     )
     proposal_message: Message | None = None
     if should_post_proposal_card:
-        await _finish_strategist_activity(
-            workspace,
-            message_id=activity_message_id,
-            state="completed",
-        )
         activity_message_id = await _post_strategist_activity(
             workspace,
             stage="finalizing_plan",
             body="🧭 Manor AI is preparing the plan for your Workspace Chat…",
             review_id=review_id,
+            message_id=activity_message_id,
         )
         if review_run is not None:
             # The durable approval surface is part of the v2 business receipt.
@@ -772,6 +983,7 @@ async def run_review(
                 policy_denied=policy_denied,
                 pending_items=pending_items,
                 auto_approved_action_key=auto_approved_action_key,
+                **({"execution_review": execution_review} if execution_review is not None else {}),
             )
 
     # ReviewRun success is the durable receipt for this exact cohort. Commit
@@ -805,9 +1017,9 @@ async def run_review(
             policy_denied=policy_denied,
             pending_items=pending_items,
             # Name the exact cohort action that authorised auto-execution.
-            # External tasks use their dedicated high-risk standing grant;
-            # the legacy workspace-wide boolean covers internal tasks only.
+            # External tasks use their dedicated high-risk standing grant.
             auto_approved_action_key=auto_approved_action_key,
+            **({"execution_review": execution_review} if execution_review is not None else {}),
         )
 
     await _finish_strategist_activity(
@@ -831,6 +1043,8 @@ async def run_review(
         "summary": proposal.summary,
         "notes": proposal.notes,
     }
+    if execution_review is not None:
+        result["execution_review"] = execution_review
     if governance:
         result["proposal_id"] = governance.get("proposal_id")
         result["approval_outcome"] = governance.get("outcome")
@@ -854,13 +1068,13 @@ async def _wire_proposal_governance(
     db: AsyncSession,
     *,
     workspace: Workspace,
-    review_run,
+    review_id: str,
     proposal: Proposal,
     new_task_ids: list[str],
 ) -> dict:
     """M7/M8 v1: persist the proposal-item cohort and resolve its approval.
 
-    Runs only on the v2 (briefing) path. Creates one ProposalRecord + one
+    Shared by both Strategist prompt paths. Creates one ProposalRecord + one
     kind="task" item per persisted Task, runs the v1 validator (strips
     invalid basis report_refs), then asks the unified approval core ONCE
     for the whole cohort (subject = workspace.proposal.task, resource =
@@ -881,7 +1095,6 @@ async def _wire_proposal_governance(
         validate_items,
     )
 
-    review_id = review_run.id
     rows = (await db.execute(
         select(Task).where(Task.id.in_(new_task_ids))
     )).scalars().all()
@@ -905,7 +1118,7 @@ async def _wire_proposal_governance(
     report_rows = (await db.execute(
         select(ConsolidationReport).where(ConsolidationReport.review_id == review_id)
     )).scalars().all()
-    validated = await validate_items(db, review_run, report_rows, items)
+    validated = await validate_items(db, record, report_rows, items)
     validation_notes = [note for _, note in validated if note]
 
     external_pairs = [
@@ -929,10 +1142,11 @@ async def _wire_proposal_governance(
                 risk_level=cohort_risk_level,
                 kind="action",
                 # Proposals intrinsically need a human unless a standing grant
-                # (policy auto_approve_actions) or the legacy workspace boolean
-                # says otherwise — without this flag a policy with no opinion
+                # (an applicable approval policy rule) says otherwise — without this
+                # flag a policy with no opinion
                 # would silently auto-approve every cohort.
-                requires_approval=True,
+                requires_approval=False,
+                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -954,6 +1168,7 @@ async def _wire_proposal_governance(
             ),
             intrinsic_rule="proposal.review",
             intrinsic_reason="Strategist proposals require operator approval before execution.",
+            require_explicit_approval=workspace.status == "paused",
         )
 
     approval_request_id = (
@@ -995,7 +1210,7 @@ async def _wire_proposal_governance(
         db,
         workspace=workspace,
         record=record,
-        review_run=review_run,
+        review_run=record,
         review_id=review_id,
         proposal=proposal,
         report_rows=report_rows,
@@ -1103,10 +1318,7 @@ async def _execute_workflow_run_items(
         consume_approval,
         resolve_approval,
     )
-    from packages.core.proposals import (
-        WORKFLOW_RUN_ACTION_KEY,
-        create_workflow_run_items,
-    )
+    from packages.core.proposals import create_workflow_run_items
     from packages.core.services.proposal_workflow_runs import (
         ProposalWorkflowRunError,
         ProposalWorkflowRunConflict,
@@ -1123,6 +1335,7 @@ async def _execute_workflow_run_items(
     now = datetime.now(timezone.utc)
     digests: list[dict] = []
     for proposed_run, item in zip(proposed, items):
+        workspace = await _lock_proposal_workspace(db, workspace)
         digest = {
             "item_id": item.id,
             "kind": "workflow_run",
@@ -1153,13 +1366,14 @@ async def _execute_workflow_run_items(
             db,
             subject=ApprovalSubject(
                 entity_id=workspace.entity_id,
-                action_key=WORKFLOW_RUN_ACTION_KEY,
+                action_key=item.action_key,
                 capability_id="workflow.run",
                 resource_kind="proposal_item",
                 resource_id=item.id,
                 risk_level=item.risk_level,
                 kind="action",
-                requires_approval=True,
+                requires_approval=False,
+                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -1176,13 +1390,14 @@ async def _execute_workflow_run_items(
             permission_decision=await _strategist_permission_decision(
                 db,
                 workspace=workspace,
-                action_key=WORKFLOW_RUN_ACTION_KEY,
+                action_key=item.action_key,
                 capability_id="workflow.run",
             ),
             intrinsic_rule="proposal.workflow_run",
             intrinsic_reason=(
                 "Workspace Flow runs require approval before a new execution lineage is created."
             ),
+            require_explicit_approval=workspace.status == "paused",
         )
         digest["outcome"] = decision.outcome
         if decision.request is not None:
@@ -1267,6 +1482,7 @@ async def _execute_experiment_items(
     now = datetime.now(timezone.utc)
     digests: list[dict] = []
     for proposed_experiment, item in zip(proposed, items):
+        workspace = await _lock_proposal_workspace(db, workspace)
         decision = await resolve_approval(
             db,
             subject=ApprovalSubject(
@@ -1278,8 +1494,9 @@ async def _execute_experiment_items(
                 risk_level=item.risk_level,
                 kind="action",
                 # Experiments intrinsically need a human unless a standing
-                # grant (policy auto_approve_actions) says otherwise.
-                requires_approval=True,
+                # grant (an applicable approval policy rule) says otherwise.
+                requires_approval=False,
+                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -1309,6 +1526,7 @@ async def _execute_experiment_items(
                 "Experiments require operator approval before a config "
                 "overlay is applied."
             ),
+            require_explicit_approval=workspace.status == "paused",
         )
 
         experiment_id = None
@@ -1408,6 +1626,7 @@ async def _execute_change_items(
     now = datetime.now(timezone.utc)
     digests: list[dict] = []
     for (kind, proposed_change), item in zip(proposed, items):
+        workspace = await _lock_proposal_workspace(db, workspace)
         digest: dict = {
             "item_id": item.id,
             "kind": kind,
@@ -1440,8 +1659,9 @@ async def _execute_change_items(
                 risk_level=item.risk_level,
                 kind="action",
                 # Config changes intrinsically need a human unless a standing
-                # grant (policy auto_approve_actions) says otherwise.
-                requires_approval=True,
+                # grant (an applicable approval policy rule) says otherwise.
+                requires_approval=False,
+                category="automation", impact="external",
                 workspace_id=workspace.id,
             ),
             origin=ApprovalOrigin(
@@ -1470,6 +1690,7 @@ async def _execute_change_items(
                 "Configuration changes require operator approval before the "
                 "canonical row is edited."
             ),
+            require_explicit_approval=workspace.status == "paused",
         )
         digest["outcome"] = decision.outcome
         if decision.request is not None:
@@ -1623,13 +1844,19 @@ async def _mirror_item_decisions(
         find_requests_by_dedup,
         grant_approval,
     )
+    from packages.core.proposals.constants import EXTERNAL_TASK_ACTION_KEY, TASK_ACTION_KEY
 
     if selected_task_ids:
         open_reqs = [
             r for r in await find_requests_by_dedup(
-                db, entity_id=record.entity_id, dedup_key=f"proposal:{record.id}",
+                db, entity_id=record.entity_id, dedup_key=f"operation:proposal:{record.id}",
             )
             if r.status in APPROVAL_LIVE_STATUSES
+            and r.entity_id == record.entity_id
+            and r.workspace_id == record.workspace_id
+            and r.resource_kind == "proposal"
+            and r.resource_id == record.id
+            and r.action_key in {TASK_ACTION_KEY, EXTERNAL_TASK_ACTION_KEY}
         ]
         for req in open_reqs:
             if approved:
@@ -1709,7 +1936,7 @@ async def _mirror_workflow_run_items_on_cohort_decision(
             await dispatch_workflow_run_item(
                 db,
                 item_id=item.id,
-                actor_id=actor_id,
+                actor_id=actor_id if actor_kind == "user" else None,
             )
         except ProposalWorkflowRunConflict as exc:
             mark_workflow_run_item_conflict(item, exc)
@@ -1831,6 +2058,25 @@ async def approve_proposal(
         if only_task_ids is not None and not only_task_ids
         else _selected_rows_with_required_dependencies(all_rows, only_task_ids)
     )
+    from packages.core.proposals.approval_guard import ProposalApprovalBlocked, require_current_proposal_policy
+    from packages.core.proposals.service import get_items_for_review, get_proposal_for_review
+
+    record = await get_proposal_for_review(db, review_id)
+    if record is not None:
+        if record.entity_id != entity_id:
+            raise ProposalApprovalBlocked("Proposal belongs to another account")
+        selected_task_ids = {task.id for task in rows}
+        selected_items = [item for item in await get_items_for_review(db, review_id)
+            if item.status == ProposalItemStatus.PROPOSED and (
+                (item.kind == ProposalItemKind.TASK and (item.payload or {}).get("task_id") in selected_task_ids)
+                or (item.kind not in {ProposalItemKind.TASK, ProposalItemKind.HUMAN_REQUEST}
+                    and (only_item_ids is None or item.id in only_item_ids)))]
+        if selected_task_ids - {(item.payload or {}).get("task_id") for item in selected_items if item.kind == ProposalItemKind.TASK}:
+            raise ProposalApprovalBlocked("Proposal Task approval binding is missing")
+        await require_current_proposal_policy(db, record=record, items=selected_items,
+            actor_id=actor_id, actor_kind=actor_kind)
+    elif rows:
+        raise ProposalApprovalBlocked("Proposal approval binding is missing")
     moved: list[str] = []
     batch_id: str | None = None
     if rows:
@@ -1868,6 +2114,9 @@ async def approve_proposal(
         # Apply details first so the status-transition ledger event sees the
         # work-batch root (update_task re-applies the same dict afterwards).
         t.details = details
+        if actor_kind == "user" and actor_id:
+            record_manual_task_execution(t, user_id=actor_id, action="proposal_approval")
+            details = t.details
         await update_task(db, t.id, entity_id, status=next_status, details=details)
         moved.append(t.id)
         from packages.core.ledger.adapters import record_proposal_item_decision
@@ -1926,6 +2175,8 @@ async def reject_proposal(
         details = dict(t.details or {})
         if reason:
             details["rejection_reason"] = reason
+        if reason_code:
+            details["rejection_reason_code"] = reason_code
         await update_task(
             db, t.id, entity_id,
             status="cancelled", details=details,
@@ -2011,14 +2262,6 @@ async def supersede_open_proposals(
     }
 
 
-def proposal_auto_approval_enabled(workspace: Workspace) -> bool:
-    settings = workspace.settings if isinstance(workspace.settings, dict) else {}
-    strategist = settings.get(_STRATEGIST_SETTINGS_KEY)
-    if not isinstance(strategist, dict):
-        return False
-    return strategist.get(_AUTO_APPROVE_PROPOSALS_KEY) is True
-
-
 async def set_proposal_auto_approval(
     db: AsyncSession,
     *,
@@ -2027,15 +2270,18 @@ async def set_proposal_auto_approval(
     enabled: bool,
     changed_by: str | None = None,
 ) -> Workspace:
-    workspace = (await db.execute(
-        select(Workspace).where(
-            Workspace.id == workspace_id,
-            Workspace.entity_id == entity_id,
-            Workspace.deleted_at.is_(None),
-        ).with_for_update()
-    )).scalar_one_or_none()
-    if workspace is None:
-        raise StrategistError(f"workspace {workspace_id} not found")
+    """Compatibility setter for the canonical internal-Task standing grant."""
+    from packages.core.governance.proposal_approval import set_proposal_approval_actions
+    from packages.core.proposals.constants import TASK_ACTION_KEY
+
+    workspace = await set_proposal_approval_actions(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        action_keys=(TASK_ACTION_KEY,),
+        enabled=enabled,
+        changed_by=changed_by,
+    )
 
     settings = dict(workspace.settings or {})
     raw_strategist_settings = settings.get(_STRATEGIST_SETTINGS_KEY)
@@ -2044,11 +2290,6 @@ async def set_proposal_auto_approval(
         if isinstance(raw_strategist_settings, dict)
         else {}
     )
-    strategist_settings[_AUTO_APPROVE_PROPOSALS_KEY] = bool(enabled)
-    # An explicit operator choice owns this setting. It must not later be
-    # mistaken for the temporary auto-run permission added by a Blueprint
-    # simulation and silently cleared during promotion.
-    strategist_settings.pop("auto_approve_proposals_source", None)
     now_iso = datetime.now(timezone.utc).isoformat()
     if enabled:
         strategist_settings["auto_approve_proposals_set_at"] = now_iso
@@ -2404,7 +2645,11 @@ def _is_meta_learning_task(task: ProposedTask) -> bool:
     Learnings already flow through the automatic learning pipeline
     (runtime evidence → learning candidates → operator resolve → memory
     apply), so they must never become proposed tasks.
+    Goal scoring is a measurement gap, not LEARNINGS.md bookkeeping, even
+    when it has no single goal_id and its description mentions evidence.
     """
+    if _is_goal_scoring_work(task):
+        return False
     impact = task.estimated_impact
     if impact is not None and impact.goal_id:
         return False
@@ -2447,6 +2692,221 @@ def _suppress_meta_learning_proposals(proposal: Proposal) -> None:
         "recorded automatically by the learning pipeline, not via proposed "
         f"tasks: {titles}{suffix}.",
     )
+
+
+_DUPLICATE_COMPLETED_WORK_WINDOW = timedelta(hours=12)
+_DUPLICATE_TITLE_COVERAGE = 0.8
+_DUPLICATE_TITLE_OVERLAP = 3
+_TITLE_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "for", "of", "to", "with", "on", "in",
+    "from", "by", "at", "as", "is", "are", "be", "this", "that", "vs",
+})
+_TITLE_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _task_title_tokens(title: str | None) -> set[str]:
+    return {
+        tok for tok in _TITLE_TOKEN_RE.findall((title or "").lower())
+        if tok not in _TITLE_STOPWORDS and len(tok) > 1
+    }
+
+
+def _completed_work_title_coverage(
+    proposed: set[str],
+    completed: set[str],
+) -> tuple[float, int]:
+    if not proposed:
+        return 0.0, 0
+    overlap = proposed & completed
+    return len(overlap) / len(proposed), len(overlap)
+
+
+def _task_completion_time(task) -> datetime | None:
+    for attr in ("completed_at", "updated_at", "created_at"):
+        value = getattr(task, attr, None)
+        if value is None:
+            continue
+        if getattr(value, "tzinfo", None) is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+    return None
+
+
+def _recent_completed_tasks(ctx) -> list:
+    seen: set[object] = set()
+    out: list = []
+
+    def _add(task, *, require_completed: bool) -> None:
+        tid = getattr(task, "id", None) or id(task)
+        if tid in seen:
+            return
+        if require_completed:
+            status = getattr(task, "status", None)
+            status_value = str(getattr(status, "value", status) or "").lower()
+            if status_value != TaskStatus.COMPLETED:
+                return
+        seen.add(tid)
+        out.append(task)
+
+    for task in getattr(ctx, "recent_tasks", None) or []:
+        _add(task, require_completed=True)
+    outcomes = getattr(ctx, "recent_proposal_outcomes", None) or {}
+    for task in outcomes.get("completed") or []:
+        _add(task, require_completed=False)
+    return out
+
+
+def _suppress_capability_recovery_duplicates(proposal: Proposal, ctx) -> None:
+    """A configuration wait belongs to the original Task, not a new attempt.
+
+Only suppress tasks requiring the same unavailable capability on the same
+owner, without a capable selected delegate. Drop their dependent proposals
+too; removing dependency edges would otherwise manufacture runnable work.
+"""
+    from packages.core.services.task_capability_recovery import current_capability_blocker
+
+    waiting = []
+    execution_snapshot = getattr(ctx, "execution_snapshot", None) or {}
+    if execution_snapshot:
+        # Use the same Task-owned occurrence and current Agent scope supplied
+        # to the model, not an independent read of historical failure details.
+        for fact in execution_snapshot.get("tasks", []):
+            blocker = fact.get("current_blocker") or {}
+            if (blocker.get("source_task_id") != fact.get("task_id")
+                or blocker.get("scope_status") != "still_missing"):
+                continue
+            for agent in blocker.get("affected_agents", []):
+                if agent.get("service_key"):
+                    waiting.append((agent["service_key"], set(blocker.get("current_missing_capabilities") or ())))
+    else:
+        for task in getattr(ctx, "recent_tasks", ()) or ():
+            blocker = current_capability_blocker(task)
+            if blocker:
+                waiting.append((task.owner_service_key, set(blocker.get("missing_capabilities") or ())))
+    if not waiting:
+        return
+    snapshots = getattr(ctx, "service_capabilities", {}) or {}
+    dropped_keys = set()
+    dropped_ids = set()
+    for task in proposal.tasks:
+        requirements = set(task.required_capabilities or ())
+        selected = {task.owner_service_key, *(task.delegate_service_keys or ())}
+        available = set()
+        for key in selected:
+            snapshot = snapshots.get(key)
+            if snapshot is not None:
+                available.update(
+                    snapshot.get("capability_ids", ()) if isinstance(snapshot, dict)
+                    else snapshot.capability_ids
+                )
+        if any(
+            task.owner_service_key == blocked_owner
+            and (requirements & missing) - available
+            for blocked_owner, missing in waiting
+        ):
+            dropped_ids.add(id(task))
+            if task.task_key:
+                dropped_keys.add(task.task_key)
+    while True:
+        dependents = [task for task in proposal.tasks if id(task) not in dropped_ids
+                      and set(task.depends_on_task_keys or ()) & dropped_keys]
+        if not dependents:
+            break
+        for task in dependents:
+            dropped_ids.add(id(task))
+            if task.task_key:
+                dropped_keys.add(task.task_key)
+    if dropped_ids:
+        proposal.tasks = [task for task in proposal.tasks if id(task) not in dropped_ids]
+        proposal.notes = _append_note(
+            proposal.notes,
+            "Existing tasks are waiting for Agent configuration. Resolve their configuration requests and continue those tasks instead of creating duplicate recovery work.",
+        )
+
+
+def _recent_completed_task_titles(ctx) -> list[tuple[set[str], datetime]]:
+    window_start = datetime.now(timezone.utc) - _DUPLICATE_COMPLETED_WORK_WINDOW
+    titles: list[tuple[set[str], datetime]] = []
+    for task in _recent_completed_tasks(ctx):
+        when = _task_completion_time(task)
+        if when is None or when < window_start:
+            continue
+        tokens = _task_title_tokens(getattr(task, "title", None))
+        if len(tokens) < _DUPLICATE_TITLE_OVERLAP:
+            continue
+        titles.append((tokens, when))
+    return titles
+
+
+def _is_duplicate_of_recent_completed_work(
+    task: ProposedTask,
+    completed_titles: list[tuple[set[str], datetime]],
+) -> bool:
+    proposed = _task_title_tokens(task.title)
+    if len(proposed) < _DUPLICATE_TITLE_OVERLAP:
+        return False
+    for tokens, _when in completed_titles:
+        coverage, overlap = _completed_work_title_coverage(proposed, tokens)
+        if coverage >= _DUPLICATE_TITLE_COVERAGE and overlap >= _DUPLICATE_TITLE_OVERLAP:
+            return True
+    return False
+
+
+def _suppress_duplicate_completed_work_proposals(proposal: Proposal, ctx) -> None:
+    """Drop proposals that restate work completed in the last 12 hours.
+
+    Missing Goal ``current_value`` is a measurement gap, not missing
+    materials, so recently completed work must not be re-proposed just
+    because Goals are still unscored.
+    """
+    completed_titles = _recent_completed_task_titles(ctx)
+    if not completed_titles:
+        return
+
+    kept = []
+    dropped = []
+    for task in proposal.tasks:
+        if _is_duplicate_of_recent_completed_work(task, completed_titles):
+            dropped.append(task)
+            continue
+        kept.append(task)
+    if not dropped:
+        return
+
+    kept_keys = {task.task_key for task in kept if task.task_key}
+    for task in kept:
+        task.depends_on_task_keys = [
+            key for key in task.depends_on_task_keys
+            if key in kept_keys
+        ]
+    proposal.tasks = kept
+    titles = ", ".join(task.title for task in dropped[:3])
+    suffix = "" if len(dropped) <= 3 else f" and {len(dropped) - 3} more"
+    logger.info(
+        "Strategist: suppressed %d duplicate completed-work task proposal(s): %s%s",
+        len(dropped),
+        titles,
+        suffix,
+    )
+    proposal.notes = _append_note(
+        proposal.notes,
+        f"Suppressed {len(dropped)} duplicate completed-work task(s) — missing "
+        "Goal current_value is a measurement gap, not missing materials: "
+        f"{titles}{suffix}.",
+    )
+
+
+_GOAL_SCORING_TASK_KEY = "score_goals"
+
+
+def _is_goal_scoring_work(task) -> bool:
+    key = str(getattr(task, "task_key", None) or "").strip().lower()
+    if key == _GOAL_SCORING_TASK_KEY:
+        return True
+    title = str(getattr(task, "title", None) or "").lower()
+    return "score" in title and "goal" in title
+
+
 
 
 def _append_note(existing: str | None, note: str, *, max_chars: int = 1500) -> str:
@@ -3150,7 +3610,9 @@ def _sanitize_governance_language(proposal: Proposal, ctx) -> None:
     explicitly says so.
     """
     policy = getattr(ctx, "governance_policy", None) or {}
-    if policy.get("auto_approve_actions"):
+    approval = policy.get("approval") or {}
+    override = approval.get("policy", approval)
+    if override.get("mode") == "automatic" or any(rule.get("effect") == "allow" for rule in override.get("rules", [])):
         return
 
     proposal.summary = _sanitize_unsupported_auto_approval_text(proposal.summary)
@@ -3186,6 +3648,8 @@ async def _persist_tasks(
     db: AsyncSession,
     workspace: Workspace,
     proposal: Proposal,
+    *,
+    automation_origin: dict[str, str] | None = None,
 ) -> list[str]:
     ids: list[str] = []
     rows_by_key: dict[str, Task] = {}
@@ -3209,6 +3673,10 @@ async def _persist_tasks(
         )).scalars().all())
 
     for pt in proposal.tasks:
+        if pt.required_skills:
+            await _validate_owner_required_skills(db, workspace, pt)
+
+    for pt in proposal.tasks:
         base_key = _proposal_task_key(pt.task_key or pt.title)
         count = used_keys.get(base_key, 0)
         used_keys[base_key] = count + 1
@@ -3224,6 +3692,8 @@ async def _persist_tasks(
             "estimated_impact": pt.estimated_impact.model_dump() if pt.estimated_impact else None,
             "rationale": pt.rationale,
         }
+        if automation_origin is not None:
+            details["automation_origin"] = dict(automation_origin)
         if pt.external_action is not None:
             details["external_action"] = pt.external_action.model_dump(mode="json")
         runtime_context = merge_task_runtime_capabilities(
@@ -3246,9 +3716,15 @@ async def _persist_tasks(
             owner_service_key=pt.owner_service_key,
             owner_subscription_id=owner_sub_id,
             delegate_service_keys=list(pt.delegate_service_keys),
+            required_skills=list(pt.required_skills),
             expected_output=_task_expected_output_from_proposed(pt),
             creator_id=None,
         )
+        from packages.core.ai.runtime.task_requirements import (
+            apply_workspace_service_task_requirements,
+        )
+
+        apply_workspace_service_task_requirements(row, workspace)
         db.add(row)
         ids.append(row.id)
         rows_by_key[task_key] = row
@@ -3369,12 +3845,7 @@ async def _record_strategist_review_evidence(
                     "configured_integrations": list(getattr(ctx, "configured_integrations", []) or [])[:30],
                     "configured_channels": list(getattr(ctx, "configured_channels", []) or [])[:20],
                     "knowledge_net_count": len(getattr(ctx, "knowledge_nets", []) or []),
-                    "governance_hitl_actions": (
-                        (getattr(ctx, "governance_policy", None) or {}).get("hitl_required_actions") or []
-                    )[:20],
-                    "governance_auto_approve_actions": (
-                        (getattr(ctx, "governance_policy", None) or {}).get("auto_approve_actions") or []
-                    )[:20],
+                    "governance_approval": (getattr(ctx, "governance_policy", None) or {}).get("approval"),
                     "workspace_evaluation_score": (
                         (workspace_evaluation.get("overall") or {}).get("score")
                         if isinstance(workspace_evaluation, dict) else None
@@ -3407,6 +3878,38 @@ async def _resolve_subscription_id(
     )
     row = result.scalar_one_or_none()
     return row
+
+
+async def _validate_owner_required_skills(
+    db: AsyncSession, workspace: Workspace, task: ProposedTask,
+) -> None:
+    from packages.core.models.skill import AgentSkillBinding, Skill
+    from packages.core.models.workspace import AgentSubscription
+
+    agent_ids = select(AgentSubscription.agent_id).where(
+        AgentSubscription.workspace_id == workspace.id,
+        AgentSubscription.entity_id == workspace.entity_id,
+        AgentSubscription.service_key == task.owner_service_key,
+        AgentSubscription.status == "active",
+    )
+    bound_ids = select(AgentSkillBinding.skill_id).where(
+        AgentSkillBinding.agent_id.in_(agent_ids),
+        AgentSkillBinding.status == "active",
+    )
+    available = set((await db.execute(
+        select(Skill.slug).where(
+            Skill.slug.in_(task.required_skills),
+            Skill.status == "active",
+            or_(Skill.entity_id == workspace.entity_id, Skill.entity_id.is_(None)),
+            or_(Skill.workspace_id.is_(None), Skill.workspace_id == workspace.id),
+            or_(Skill.is_public.is_(True), Skill.id.in_(bound_ids)),
+        )
+    )).scalars().all())
+    missing = set(task.required_skills) - available
+    if missing:
+        raise StrategistError(
+            f"Task {task.title!r} requires unavailable owner Skills: {sorted(missing)}"
+        )
 
 
 # ── Non-task item digests for the cohort card ─────────────────────────
@@ -3564,29 +4067,26 @@ async def _post_human_request_chat(
     workspace: Workspace,
     human_requests: list[dict],
 ) -> None:
-    """One plain informational chat message per human request (M10).
+    """One answerable chat card per human request (M10).
 
-    Deliberately NO ``pending_action``: the frontend's ChatActionCard
-    vocabulary has no human_request kind yet, so the actioning surface
-    is the Human queue (M9 `/human-queue` + the respond endpoint); this
-    message just makes the ask visible where the operator already looks.
-    Best-effort, own session — mirrors ``_post_proposal_chat``.
+    Workspace Chat already renders ``pending_action.kind=human_input`` as
+    a text+file card. The Human queue remain a second surface; answering
+    either one fulfills the same commitment. Best-effort, own session —
+    mirrors ``_post_proposal_chat``.
     """
     try:
         from packages.core.database import async_session
         async with async_session() as db:
             for entry in human_requests:
                 kind_label = str(entry.get("request_kind") or "input").replace("_", " ")
+                question = str(entry.get("question") or "").strip()
                 lines = [
-                    f"🙋 Strategist needs a human {kind_label}: {entry.get('question')}",
+                    f"🙋 Strategist needs a human {kind_label}: {question}",
                 ]
                 if entry.get("role_required"):
                     lines.append(f"Role: {entry['role_required']}")
                 if entry.get("expected_by"):
                     lines.append(f"Needed by: {entry['expected_by']}")
-                lines.append(
-                    "Respond (or decline) from the workspace Human queue."
-                )
                 await chat_service.post_message(
                     db,
                     entity_id=workspace.entity_id,
@@ -3598,6 +4098,12 @@ async def _post_human_request_chat(
                         "type": "human_commitment",
                         "id": entry.get("commitment_id"),
                     }],
+                    pending_action={
+                        "kind": PendingActionKind.HUMAN_INPUT.value,
+                        "hitl_type": "input",
+                        "commitment_id": entry.get("commitment_id"),
+                        "prompt": question,
+                    },
                 )
             await db.commit()
     except Exception:
@@ -3849,8 +4355,7 @@ async def _notify_proposal_users(
             "Manage this in Settings → Approval automation."
             if auto_approve_label
             else (
-                "Started automatically by workspace-wide auto-approval. "
-                "Manage this in Settings → Approval automation."
+                "Started by an explicitly authorized automation."
             )
         )
         task_count = len(task_ids)
@@ -3860,13 +4365,21 @@ async def _notify_proposal_users(
             else f"{len(items)} change{'s' if len(items) != 1 else ''}"
         )
         raw_title = (
-            f"Proposal auto-approved: {proposal.summary or count_label}"
+            f"Proposal needs review: {proposal.summary or count_label}"
+            if items
+            else f"Proposal auto-approved: {proposal.summary or count_label}"
             if auto_approved
             else f"New proposal: {proposal.summary or count_label}"
         )
         notif_title = raw_title[:490] + "…" if len(raw_title) > 490 else raw_title
         notif_body = (
-            f"{workspace.name} — started {count_label}. {auto_approve_reason}"
+            (
+                f"{workspace.name} — {count_label} already approved and started; "
+                f"{len(items)} other item{'s' if len(items) != 1 else ''} still "
+                f"require{'s' if len(items) == 1 else ''} approval. Review the remaining items."
+            )
+            if auto_approved and items
+            else f"{workspace.name} — started {count_label}. {auto_approve_reason}"
             if auto_approved
             else (
                 f"{workspace.name} — Strategist proposed {count_label}. "
@@ -3937,6 +4450,7 @@ async def _post_proposal_chat(
     policy_denied: bool = False,
     pending_items: Optional[list[dict]] = None,
     auto_approved_action_key: Optional[str] = None,
+    execution_review: dict | None = None,
 ) -> Message | None:
     """Single proposal card in the workspace_main conversation.
 
@@ -3961,8 +4475,8 @@ async def _post_proposal_chat(
 
     ``auto_approved_action_key`` names the standing grant that authorised an
     auto-execution, so the card says what let it run and where to change it.
-    ``None`` with ``auto_approved=True`` means the legacy workspace-wide
-    boolean did it — worded differently on purpose.
+    ``None`` with ``auto_approved=True`` means a verified automation origin
+    was already authorized — it is not a workspace-wide blanket grant.
     """
     items = [item for item in (pending_items or []) if isinstance(item, dict)]
     goal_ids = {
@@ -3991,8 +4505,7 @@ async def _post_proposal_chat(
         "Manage this in Settings → Approval automation."
         if auto_approve_label
         else (
-            "Started automatically by workspace-wide auto-approval. "
-            "Manage this in Settings → Approval automation."
+            "Started by an explicitly authorized automation."
         )
     )
     if policy_denied:
@@ -4044,9 +4557,35 @@ async def _post_proposal_chat(
             "items": items,
             "options": list(DEFAULT_APPROVAL_OPTIONS),
         }
-        if (task_ids or items) and not auto_approved and not policy_denied
+        if items or (task_ids and not auto_approved and not policy_denied)
         else None
     )
+    if pending_action is not None and (auto_approved or policy_denied):
+        # Task approval must not hide a different, still-pending change item.
+        pending_action["task_ids"] = []
+        pending_action["task_titles"] = []
+        pending_action["tasks"] = []
+
+    if pending_action is not None:
+        approval = {
+            "status": "pending",
+            "source": "operator_review",
+            "reason": "This proposal is waiting for your approval.",
+        }
+    elif policy_denied:
+        approval = {
+            "status": "rejected",
+            "source": "governance_policy",
+            "reason": "Workspace governance policy blocked this proposal.",
+        }
+    elif auto_approved:
+        approval = {
+            "status": "auto_approved",
+            "source": "standing_approval" if auto_approved_action_key else "authorized_automation",
+            "reason": auto_approve_reason,
+        }
+    else:
+        approval = {"status": "not_required", "source": "none"}
 
     # Auto-approved and policy-denied cards carry no ``pending_action`` at
     # all, yet they render the same task list. ``meta["proposal"]`` is the
@@ -4059,6 +4598,8 @@ async def _post_proposal_chat(
             "tasks": task_entries,
             "items": items,
             "footnotes": footnotes,
+            "approval": approval,
+            **({"execution_review": execution_review} if execution_review is not None else {}),
         }
     }
 

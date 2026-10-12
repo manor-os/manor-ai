@@ -13,10 +13,10 @@ clicking Promote. Three sections:
                    spot a runaway category.
 
   Counterfactual   What would have happened under each governance
-                   preset? Re-runs every historic step through Safe
-                   and Aggressive variants; reports how many would
+                   mode? Re-runs every historic step through current
+                   approval modes; reports how many would
                    have been blocked / paused / allowed under each.
-                   Lets the operator answer "if I switch to Safe
+                   Lets the operator answer "if I confirm changes
                    before promoting, what breaks?".
 
   Goal pace        For each goal in the workspace, did the simulated
@@ -35,6 +35,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import without_rolled_up_coordinator_children
 from packages.core.constants.goals import GoalStatus
 from packages.core.governance import get_policy
 from packages.core.governance.policy import decide
@@ -252,7 +253,7 @@ def _build_cost(
 ) -> CostSection:
     total_usd = 0.0
     by_kind_usd: dict[str, float] = {}
-    for s in steps:
+    for s in without_rolled_up_coordinator_children(steps):
         usd = float((s.cost or {}).get("usd") or 0)
         if usd <= 0:
             continue
@@ -319,6 +320,14 @@ async def _build_counterfactuals(
     workspace's current policy. Reports how the verdict would have
     differed."""
     base_policy = await get_policy(db, workspace_id)
+    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_policy import evaluate_policy
+    from packages.core.governance.approval_policy_service import load_policy_chain
+    from packages.core.governance.approval_projection import policy_override
+
+    base_chain = await load_policy_chain(
+        db, entity_id=base_policy.approval.root_entity_id, workspace_id=workspace_id,
+    )
     out: list[CounterfactualOutcome] = []
 
     # Count the actual outcome (post-current-policy) so the operator
@@ -332,6 +341,9 @@ async def _build_counterfactuals(
 
     for preset in list_presets():
         variant = preset.transform(base_policy)
+        variant_chain = base_chain.model_copy(update={
+            "local": base_chain.local.model_copy(update={"policy": policy_override(variant)}),
+        })
         allowed = paused = denied = 0
         for s in steps:
             d = decide(
@@ -340,9 +352,15 @@ async def _build_counterfactuals(
                 action_key=s.action_key,
                 risk_level=s.risk_level or "low",
             )
-            if d.allowed:
+            if not d.allowed:
+                denied += 1
+                continue
+            consent = evaluate_policy(variant_chain, action_facts(
+                action_key=s.action_key, risk_level=s.risk_level or "low",
+            ))
+            if consent.outcome == "allow":
                 allowed += 1
-            elif d.pause_for_hitl:
+            elif consent.outcome == "ask":
                 paused += 1
             else:
                 denied += 1
@@ -355,7 +373,7 @@ async def _build_counterfactuals(
             denied=denied,
             delta_blocked_vs_actual=blocked_under_preset - actual_blocked,
         ))
-    return _dedupe_goal_paces(out)
+    return out
 
 
 def _dedupe_goal_paces(goals: list[GoalPace]) -> list[GoalPace]:
@@ -473,18 +491,18 @@ def _build_notes(
             f"~{cost.projected_monthly_credits} credits/month."
         )
 
-    safe = next((c for c in counterfactuals if c.preset_key == "safe"), None)
-    aggressive = next((c for c in counterfactuals if c.preset_key == "aggressive"), None)
+    safe = next((c for c in counterfactuals if c.preset_key == "confirm_changes"), None)
+    risk_based = next((c for c in counterfactuals if c.preset_key == "risk_based"), None)
     if safe and safe.delta_blocked_vs_actual > 0:
         notes.append(
-            f"Switching to 'Safe' before promote would have paused "
+            f"Switching to 'Confirm changes' before promote would have paused "
             f"{safe.delta_blocked_vs_actual} additional step(s) for HITL."
         )
-    if aggressive and aggressive.delta_blocked_vs_actual < 0:
+    if risk_based and risk_based.delta_blocked_vs_actual < 0:
         notes.append(
-            f"Switching to 'Aggressive' would have let "
-            f"{abs(aggressive.delta_blocked_vs_actual)} more step(s) "
-            "run unsupervised."
+            f"Switching to 'Confirm by risk' would have let "
+            f"{abs(risk_based.delta_blocked_vs_actual)} more step(s) "
+            "run automatically."
         )
 
     return notes

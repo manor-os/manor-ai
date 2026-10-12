@@ -244,7 +244,7 @@ async def test_transactional_external_delivery_waits_for_outer_commit(
     deliveries = []
     delivery_complete = asyncio.Event()
 
-    async def capture_webhook(entity_id, event_type, payload):
+    async def capture_webhook(entity_id, event_type, payload, **_kwargs):
         deliveries.append(("webhook", entity_id, event_type, dict(payload)))
 
     async def capture_external(entity_id, event_type, payload, **_kwargs):
@@ -441,7 +441,7 @@ async def test_interrupted_external_delivery_is_reclaimed_from_event_log(
 
     started = asyncio.Event()
 
-    async def blocked_delivery(*_args):
+    async def blocked_delivery(*_args, **_kwargs):
         started.set()
         await asyncio.Event().wait()
 
@@ -585,7 +585,7 @@ async def test_external_delivery_bounds_parallel_provider_work(
     active_deliveries = 0
     maximum_active_deliveries = 0
 
-    async def capture_webhook(*_args):
+    async def capture_webhook(*_args, **_kwargs):
         nonlocal active_deliveries, maximum_active_deliveries
         active_deliveries += 1
         maximum_active_deliveries = max(
@@ -634,7 +634,7 @@ async def test_external_delivery_provider_failure_retries_event_log(
     )
     await db_session.commit()
 
-    async def fail_webhook(*_args):
+    async def fail_webhook(*_args, **_kwargs):
         raise RuntimeError("provider refused delivery")
 
     monkeypatch.setattr(event_emitter, "deliver_webhook_event", fail_webhook)
@@ -676,7 +676,7 @@ async def test_external_delivery_retry_skips_already_completed_sink(
     calls = []
     external_attempts = 0
 
-    async def capture_webhook(entity_id, event_type, payload):
+    async def capture_webhook(entity_id, event_type, payload, **_kwargs):
         calls.append(("webhook", entity_id, event_type, dict(payload)))
 
     async def flaky_external(entity_id, event_type, payload, **_kwargs):
@@ -761,7 +761,7 @@ async def test_external_delivery_cancels_inactive_workspace_event(
     )
     await db_session.commit()
 
-    async def unexpected_delivery(*_args):
+    async def unexpected_delivery(*_args, **_kwargs):
         raise AssertionError("inactive workspace event should not deliver")
 
     monkeypatch.setattr(event_emitter, "deliver_webhook_event", unexpected_delivery)
@@ -815,7 +815,7 @@ async def test_workspace_external_delivery_holds_lifecycle_lock_until_finish(
     pause_waiting = asyncio.Event()
     pause_acquired = asyncio.Event()
 
-    async def blocked_webhook(*_args):
+    async def blocked_webhook(*_args, **_kwargs):
         provider_started.set()
         await provider_release.wait()
 
@@ -898,7 +898,7 @@ async def test_workspace_external_delivery_cancel_preserves_completed_sink(
     calls = []
     external_started = asyncio.Event()
 
-    async def capture_webhook(entity_id, event_type, payload):
+    async def capture_webhook(entity_id, event_type, payload, **_kwargs):
         calls.append(("webhook", entity_id, event_type, dict(payload)))
 
     async def blocked_external(entity_id, event_type, payload, **_kwargs):

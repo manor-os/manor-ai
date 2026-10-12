@@ -33,6 +33,14 @@ def is_platform_managed_mcp_server(server_key: object) -> bool:
     return canonical_provider_key(server_key) in platform_managed_mcp_server_keys()
 
 
+def is_accountless_platform_mcp_server(server_key: object) -> bool:
+    """Apify also accepts an explicitly selected customer-owned account."""
+    return (
+        is_platform_managed_mcp_server(server_key)
+        and canonical_provider_key(server_key) != "apify"
+    )
+
+
 def _first_env_value(names: tuple[str, ...]) -> str:
     for name in names:
         value = os.getenv(name, "").strip()
@@ -50,6 +58,15 @@ def platform_mcp_server_is_configured(server: MCPServer | None) -> bool:
     if server is None or not is_platform_managed_mcp_server(server.server_key):
         return False
     return bool(server.credential_ref or _environment_credentials(server.server_key))
+
+
+def platform_mcp_credentials_source(server: MCPServer | None) -> str:
+    """Describe credential precedence without leasing or returning secrets."""
+    if server is None or not is_platform_managed_mcp_server(server.server_key):
+        return "none"
+    if server.credential_ref:
+        return "admin"
+    return "environment" if _environment_credentials(server.server_key) else "none"
 
 
 async def platform_mcp_provider_is_configured(
@@ -116,8 +133,11 @@ async def resolve_platform_mcp_bearer_token(
             credentials = _normalized_credentials(key, leased)
         except Exception:  # noqa: BLE001
             # A deployment env secret remains a safe fallback when a stale DB
-            # credential cannot be decrypted after a key rotation.
+            # credential cannot be decrypted after a key rotation, except for
+            # Apify: its pending runs must keep the same supplier account.
             credentials = {}
+        if key == "apify" and not credentials:
+            return None
     if not credentials:
         credentials = _environment_credentials(key)
     if not credentials:

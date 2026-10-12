@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "note": "What the library holds. scripts/build_music_library.py generates each track from its prompt and records it in catalog.json. Every prompt is instrumental only.",
+  "duration_seconds": 60,
+  "crossfade_seconds": 1.5,
+  "loudness_lufs": -16,
+  "tracks": [
+    {
+      "id": "calm-piano",
+      "moods": ["calm", "warm", "minimal"],
+      "prompt": "Calm, warm instrumental background music for a product video. Soft felt piano, gentle warm pads, a light steady pulse at about 80 BPM. Even dynamics with no big build, no drops, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "upbeat-pop",
+      "moods": ["upbeat", "inspiring", "warm"],
+      "prompt": "Upbeat, bright instrumental background music for a social media video. Clean electric guitar plucks, claps, light drums and bass at about 110 BPM. Positive and friendly, even energy throughout, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "tech-pulse",
+      "moods": ["tech", "minimal", "upbeat"],
+      "prompt": "Modern technology instrumental background music for a software product demo. Crisp electronic arpeggios, soft synth bass, tight minimal beat at about 100 BPM. Focused and clean, even energy, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "cinematic-rise",
+      "moods": ["cinematic", "inspiring"],
+      "prompt": "Cinematic instrumental background music for a brand story. Warm strings, soft piano, gentle percussion, a sense of quiet ambition at about 90 BPM. Steady intensity rather than one big climax, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "warm-acoustic",
+      "moods": ["warm", "calm", "upbeat"],
+      "prompt": "Warm acoustic instrumental background music for a friendly small-business video. Fingerpicked acoustic guitar, light shaker, soft bass at about 95 BPM. Cozy and human, even dynamics, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "inspiring-build",
+      "moods": ["inspiring", "upbeat", "cinematic"],
+      "prompt": "Inspiring, uplifting instrumental background music for a launch announcement. Piano chords, bright synth layers, steady kick and claps at about 115 BPM. Hopeful and confident, consistent energy, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "minimal-ambient",
+      "moods": ["minimal", "calm", "tech"],
+      "prompt": "Minimal ambient instrumental background music for an explainer video. Airy pads, soft glassy textures, very light rhythmic ticks at about 85 BPM. Unobtrusive under a voice-over, no vocals, no lyrics. Seamless and loop-friendly."
+    },
+    {
+      "id": "energetic-drive",
+      "moods": ["energetic", "upbeat", "tech"],
+      "prompt": "Energetic, driving instrumental background music for a fast-paced promo. Punchy drums, distorted synth bass, bright stabs at about 125 BPM. Powerful and dynamic but even, no vocals, no lyrics. Seamless and loop-friendly."
+    }
+  ]
+}

@@ -1,105 +1,97 @@
 name: CI
-
-on:
-  # PRs run CI before merge. dev/main pushes already run the K8s release
-  # workflows, so do not
-  # run the full CI again for merge commits.
+'on':
   pull_request:
-    branches: [dev, main]
+    branches:
+    - dev
+    - main
   workflow_dispatch:
     inputs:
       test_level:
-        description: "Python test depth for manual runs"
+        description: Python test depth for manual runs
         required: true
         default: smoke
         type: choice
         options:
-          - smoke
-          - regression
-
+        - smoke
+        - regression
+  push:
+    branches:
+    - main
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref_name }}
   cancel-in-progress: true
-
 jobs:
+  docs-check:
+    name: Build docs site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-node@v7
+      with:
+        node-version: 22.13.0
+        cache: npm
+        cache-dependency-path: docs-site/package-lock.json
+    - name: Install and build docs
+      working-directory: docs-site
+      run: 'npm ci
+
+        npm run build
+
+        '
   lint:
     name: Lint (advisory)
-    runs-on: ubuntu-latest
-    # The current repo-wide Ruff baseline is not clean on dev. Keep this visible
-    # while the required test gate stays fast and stable; make it blocking after
-    # the lint/format debt is burned down in a dedicated cleanup.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: pip install ".[dev]"
-
-      - name: Ruff lint
-        run: |
-          if ! ruff check packages/ apps/ tests/; then
-            echo "::warning::Ruff lint reported issues; advisory job is non-blocking until the existing baseline is clean."
-          fi
-
-      - name: Ruff format check
-        run: |
-          if ! ruff format --check packages/ apps/ tests/; then
-            echo "::warning::Ruff format reported issues; advisory job is non-blocking until the existing baseline is clean."
-          fi
-
-      - name: Whitespace check
-        run: git diff --check
-
+    - uses: actions/checkout@v7
+    - uses: ./.github/actions/setup-test-python
+    - name: Ruff lint
+      run: "if ! ruff check packages/ apps/ tests/; then\n  echo \"::warning::Ruff lint reported issues; advisory job is non-blocking\
+        \ until the existing baseline is clean.\"\nfi\n"
+    - name: Ruff format check
+      run: "if ! ruff format --check packages/ apps/ tests/; then\n  echo \"::warning::Ruff format reported issues; advisory\
+        \ job is non-blocking until the existing baseline is clean.\"\nfi\n"
+    - name: Whitespace check
+      run: git diff --check
   api-versions:
     name: External API versions
-    runs-on: ubuntu-latest
-    # Fast — runs as a separate job so a stale pin doesn't block lint/test.
-    # Fails the build only when a pin is past 90% of the vendor's
-    # documented EOL window (configurable via API_VERSION_FAIL_PCT).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Check pinned vendor API versions
-        run: python scripts/check_api_versions.py
-
+    - uses: actions/checkout@v7
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - name: Check pinned vendor API versions
+      run: python scripts/check_api_versions.py
   typecheck-frontend:
     name: Frontend checks
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Set up Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22.13.0"
-          cache: "npm"
-          cache-dependency-path: apps/web/package-lock.json
-
-      - name: Install deps
-        working-directory: apps/web
-        run: npm ci
-
-      - name: Build
-        working-directory: apps/web
-        env:
-          BUILD_VERSION: ${{ github.sha }}
-        run: npm run build
-
-
-
+    - uses: actions/checkout@v7
+    - name: Set up Node
+      uses: actions/setup-node@v7
+      with:
+        node-version: 22.13.0
+        cache: npm
+        cache-dependency-path: apps/web/package-lock.json
+    - name: Install deps
+      working-directory: apps/web
+      run: npm ci
+    - name: Build
+      working-directory: apps/web
+      env:
+        BUILD_VERSION: ${{ github.sha }}
+        NODE_OPTIONS: --max-old-space-size=4096
+      run: npm run build
   python-smoke:
     name: Python smoke tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -108,55 +100,46 @@ jobs:
           POSTGRES_USER: manor
           POSTGRES_PASSWORD: manor_secret
         ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-
+        - 5432:5432
+        options: --health-cmd "pg_isready -U manor -d manor_test" --health-interval 5s --health-timeout 3s --health-retries
+          5
       redis:
         image: redis:7-alpine
         ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-
+        - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
     steps:
-      - uses: actions/checkout@v7
+    - uses: actions/checkout@v7
+    - uses: ./.github/actions/setup-test-python
+    - name: Install Redis binary for isolated email proof tests
+      run: 'sudo systemctl mask redis-server.service
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
+        sudo apt-get update
 
-      - name: Install dependencies
-        run: pip install ".[dev]"
+        sudo apt-get install --yes --no-install-recommends redis-server
 
-      - name: Run tests
-        env:
-          TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
-          MANOR_FS_ENABLED: "false"
-          PYTHONPATH: .:tests
-          REDIS_URL: redis://localhost:6379/0
-        run: >
-          python -m pytest tests/
-          -m "oss_smoke"
-          -x -q --tb=short -p no:warnings
+        redis-server --version
 
+        '
+    - name: Run tests
+      env:
+        TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
+        MANOR_FS_ENABLED: 'false'
+        PYTHONPATH: .:tests
+        TEST_REDIS_URL: redis://localhost:6379/0
+      run: python scripts/run_python_tests.py smoke --report-dir artifacts/smoke --durations=20
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: python-smoke-results
+        path: artifacts/
+        retention-days: 14
   python-regression:
     name: Python regression suite
-    runs-on: ubuntu-latest
-    # Stage gate:
-    # - dev/default PRs run the quick smoke gate above for fast feedback.
-    # - main/main-targeting PRs run the broader regression gate.
-    # - manual runs can opt into this gate with test_level=regression.
-    if: >-
-      github.event_name == 'pull_request' && github.base_ref == 'main' ||
-      github.event_name == 'workflow_dispatch' && inputs.test_level == 'regression'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request' && github.base_ref
+      == 'main' || github.event_name == 'workflow_dispatch' && inputs.test_level == 'regression'
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -165,42 +148,64 @@ jobs:
           POSTGRES_USER: manor
           POSTGRES_PASSWORD: manor_secret
         ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-
+        - 5432:5432
+        options: --health-cmd "pg_isready -U manor -d manor_test" --health-interval 5s --health-timeout 3s --health-retries
+          5
       redis:
         image: redis:7-alpine
         ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 5
-
+        - 6379:6379
+        options: --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 5
     steps:
-      - uses: actions/checkout@v7
+    - uses: actions/checkout@v7
+    - uses: ./.github/actions/setup-test-python
+    - name: Install Redis binary for isolated email proof tests
+      run: 'sudo systemctl mask redis-server.service
 
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
+        sudo apt-get update
 
-      - name: Install dependencies
-        run: pip install ".[dev]"
+        # PDF verification invokes Poppler in the regression suite.
 
-      - name: Run Python regression suite
-        env:
-          TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
-          MANOR_FS_ENABLED: "false"
-          PYTHONPATH: .:tests
-          REDIS_URL: redis://localhost:6379/0
-        run: >
-          python -m pytest tests/
-          -m "oss_smoke or oss_regression"
-          -x -q --tb=short -p no:warnings
+        sudo apt-get install --yes --no-install-recommends redis-server poppler-utils
 
+        redis-server --version
+
+        pdfinfo -v
+
+        pdftoppm -v
+
+        '
+    - name: Install public media and document regression prerequisites
+      run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends ffmpeg libreoffice-writer libreoffice-calc
+        libreoffice-impress poppler-utils fonts-liberation fonts-dejavu-core
+    - name: Run Python regression suite
+      env:
+        TEST_DATABASE_URL: postgresql+asyncpg://manor:manor_secret@localhost:5432/manor_test
+        MANOR_FS_ENABLED: 'false'
+        PYTHONPATH: .:tests
+        TEST_REDIS_URL: redis://localhost:6379/0
+      run: python scripts/run_python_tests.py regression --markers 'oss_smoke or oss_regression' --fail-on-skip=media_integration
+        --report-dir artifacts/regression --durations=20
+    - uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: python-regression-results
+        path: artifacts/
+        retention-days: 14
+  oss-regression-gate:
+    name: Python regression gate
+    runs-on: ubuntu-24.04
+    needs:
+    - api-versions
+    - typecheck-frontend
+    - docs-check
+    - python-smoke
+    - python-regression
+    if: always() && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'pull_request'
+      && github.base_ref == 'main' || github.event_name == 'workflow_dispatch' && inputs.test_level == 'regression')
+    steps:
+    - name: Require exported release checks
+      env:
+        RESULTS: ${{ toJSON(needs) }}
+      run: python3 -c 'import json, os; results=json.loads(os.environ["RESULTS"]); assert all(job["result"] == "success" for
+        job in results.values()), results'

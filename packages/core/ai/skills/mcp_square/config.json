@@ -19,5 +19,9 @@
     "mcp__square__create_customer",
     "mcp__square__update_customer",
     "mcp__square__adjust_inventory"
-  ]
+  ],
+  "search": {
+    "terms": ["point of sale", "pos", "retail", "stock count", "payments", "merchant", "shop items", "store locations"],
+    "examples": ["check square inventory counts", "add new item to square catalog", "look up recent square orders", "create customer in square"]
+  }
 }

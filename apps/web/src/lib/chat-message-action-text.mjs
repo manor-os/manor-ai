@@ -1,4 +1,4 @@
-import { visibleAssistantText } from "./assistant-visible-text.mjs";
+import { hasAppendedCanonicalFinal, hasRunningAssistantProcess, visibleAssistantText } from "./assistant-visible-text.mjs";
 
 function textValue(value) {
   return typeof value === "string" ? value.trim() : "";
@@ -11,7 +11,7 @@ function textValue(value) {
  * The longer persisted content is retained only when it is the same answer
  * with leading context, matching AssistantMessageBlocks rendering semantics.
  */
-export function chatMessageActionText(message, visibleContent) {
+export function chatMessageActionText(message, visibleContent, streaming = false) {
   const rawDirect = textValue(visibleContent) || textValue(message?.content);
   if (message?.role !== "assistant") return rawDirect;
   const direct = visibleAssistantText(rawDirect);
@@ -33,6 +33,12 @@ export function chatMessageActionText(message, visibleContent) {
   const compactFinalText = finalParts.join("").trim();
 
   if (finalText) {
+    if (hasAppendedCanonicalFinal(
+      direct,
+      finalParts,
+      streaming,
+      hasRunningAssistantProcess(message.assistant_blocks),
+    )) return direct;
     const directContainsFinal =
       direct.length > compactFinalText.length &&
       (direct.endsWith(finalText) || direct.endsWith(compactFinalText));

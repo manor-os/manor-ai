@@ -6,8 +6,8 @@
  *
  * Uses react-markdown v10 (named export: Markdown).
  */
-import { memo, useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import Markdown, { defaultUrlTransform } from "react-markdown";
+import { createContext, memo, useContext, useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import Markdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import { PrismLight as SyntaxHighlighter } from "react-syntax-highlighter";
@@ -41,7 +41,7 @@ import {
 } from "../lib/chatRouteReferences";
 import { visibleAssistantText } from "../lib/assistantTextProjection";
 import { redactInternalAssistantErrorDetails } from "../lib/assistant-visible-text.mjs";
-import { decodeFileReferenceHref, isOpenableFileReference, linkifyFileReferencesInMarkdown } from "../lib/fileReferences";
+import { decodeFileReferenceHref, isInternalFileTarget, isOpenableFileReference, linkifyFileReferencesInMarkdown } from "../lib/fileReferences";
 
 
 SyntaxHighlighter.registerLanguage("tsx", tsx);
@@ -73,6 +73,26 @@ interface ChatMarkdownProps {
   streaming?: boolean;
   enableFileCards?: boolean;
   returnTo?: string;
+}
+
+interface MarkdownRenderOptions {
+  isUser?: boolean;
+  returnTo?: string;
+  enableFileCards: boolean;
+  deferSyntaxHighlighting: boolean;
+}
+
+const MarkdownRenderContext = createContext<MarkdownRenderOptions>({
+  enableFileCards: true,
+  deferSyntaxHighlighting: false,
+});
+
+const assistantRemarkPlugins = [remarkGfm, remarkSourceCitations, remarkBreaks];
+const userRemarkPlugins = [remarkGfm, remarkBreaks];
+
+function transformChatUrl(url: string): string {
+  if (url.startsWith("manor-route:") || url.startsWith("manor-file:")) return url;
+  return defaultUrlTransform(url);
 }
 
 /* Custom theme tweaks on top of oneLight */
@@ -192,25 +212,22 @@ function toMarkdownText(value: unknown): string {
   }
 }
 
-function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, returnTo }: ChatMarkdownProps) {
-  const projectedText = visibleAssistantText(toMarkdownText(content));
-  const rawText = isUser
-    ? projectedText
-    : redactInternalAssistantErrorDetails(projectedText);
-  const routeLinkedText = enableFileCards ? linkifyChatRouteReferencesInMarkdown(rawText) : rawText;
-  const text = enableFileCards ? linkifyFileReferencesInMarkdown(routeLinkedText) : routeLinkedText;
+export function hasUnclosedFencedCodeBlock(text: string): boolean {
+  let fence: { character: string; length: number } | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (!fence) {
+      const match = /^(?: {0,3})(`{3,}|~{3,})(.*)$/.exec(line);
+      if (!match || (match[1][0] === "`" && match[2].includes("`"))) continue;
+      const marker = match[1];
+      fence = { character: marker[0], length: marker.length };
+    } else if (new RegExp(`^(?: {0,3})${fence.character}{${fence.length},}[ \\t]*$`).test(line)) {
+      fence = null;
+    }
+  }
+  return fence !== null;
+}
 
-  return (
-    <div className={isUser ? "chat-md chat-md--user" : `chat-md${streaming ? " chat-md--streaming" : ""}`}>
-      <Markdown
-        remarkPlugins={isUser ? [remarkGfm, remarkBreaks] : [remarkGfm, remarkSourceCitations, remarkBreaks]}
-        urlTransform={(url) => {
-          if (url.startsWith("manor-route:") || url.startsWith("manor-file:")) {
-            return url;
-          }
-          return defaultUrlTransform(url);
-        }}
-        components={{
+const markdownComponents: Components = {
           span({ node, children, ...props }) {
             if (node?.properties?.["data-source-citation"]) {
               return <SourceCitation
@@ -224,6 +241,7 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
           },
           /* Override pre to handle fenced code blocks */
           pre({ children }) {
+            const { deferSyntaxHighlighting, isUser } = useContext(MarkdownRenderContext);
             // children is a <code> element with className="language-xxx"
             const codeEl = children as any;
             if (!codeEl?.props) {
@@ -247,19 +265,32 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
                   </div>
                 )}
                 <CopyButton text={codeString} />
-                <SyntaxHighlighter
-                  style={isUser ? userCodeTheme : codeTheme}
-                  language={lang || "text"}
-                  PreTag="div"
-                  customStyle={{
+                {deferSyntaxHighlighting ? (
+                  <pre style={{
+                    margin: 0,
+                    padding: "12px 14px",
                     background: "var(--chat-code-bg)",
                     borderRadius: 0,
                     color: "var(--chat-code-fg)",
-                    marginTop: 0,
-                  }}
-                >
-                  {codeString}
-                </SyntaxHighlighter>
+                    fontSize: 12,
+                    lineHeight: 1.6,
+                    whiteSpace: "pre-wrap",
+                  }}><code>{codeString}</code></pre>
+                ) : (
+                  <SyntaxHighlighter
+                    style={isUser ? userCodeTheme : codeTheme}
+                    language={lang || "text"}
+                    PreTag="div"
+                    customStyle={{
+                      background: "var(--chat-code-bg)",
+                      borderRadius: 0,
+                      color: "var(--chat-code-fg)",
+                      marginTop: 0,
+                    }}
+                  >
+                    {codeString}
+                  </SyntaxHighlighter>
+                )}
               </div>
             );
 
@@ -280,6 +311,7 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
 
           /* Inline code only */
           code({ className, children }) {
+            const { isUser } = useContext(MarkdownRenderContext);
             return (
               <code
                 className={`${className || ""} chat-inline-code${isUser ? " chat-inline-code--user" : ""}`.trim()}
@@ -290,7 +322,11 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
           },
 
           a({ href, children }) {
+            const { enableFileCards, isUser, returnTo } = useContext(MarkdownRenderContext);
             const label = getTextContent(children).trim();
+            // An unsafe scheme (emptied by urlTransform) or a sandbox-internal
+            // file location is not a destination: keep the words, drop the link.
+            if (!href?.trim() || isInternalFileTarget(href)) return <>{children}</>;
             const integrationProvider = href && typeof window !== "undefined"
               ? parseIntegrationSetupLink(href, window.location.origin)
               : null;
@@ -362,6 +398,7 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
           },
 
           th({ children }) {
+            const { isUser } = useContext(MarkdownRenderContext);
             return (
               <th className={isUser ? "chat-md-table-cell--user" : undefined}>
                 {children}
@@ -370,16 +407,35 @@ function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, retu
           },
 
           td({ children }) {
+            const { isUser } = useContext(MarkdownRenderContext);
             return (
               <td className={isUser ? "chat-md-table-cell--user" : undefined}>
                 {children}
               </td>
             );
           },
-        }}
-      >
-        {text}
-      </Markdown>
+};
+
+function ChatMarkdown({ content, isUser, streaming, enableFileCards = true, returnTo }: ChatMarkdownProps) {
+  const projectedText = visibleAssistantText(toMarkdownText(content));
+  const rawText = isUser
+    ? projectedText
+    : redactInternalAssistantErrorDetails(projectedText);
+  const routeLinkedText = enableFileCards ? linkifyChatRouteReferencesInMarkdown(rawText) : rawText;
+  const text = enableFileCards ? linkifyFileReferencesInMarkdown(routeLinkedText) : routeLinkedText;
+  const deferSyntaxHighlighting = Boolean(streaming && hasUnclosedFencedCodeBlock(text));
+
+  return (
+    <div className={isUser ? "chat-md chat-md--user" : `chat-md${streaming ? " chat-md--streaming" : ""}`}>
+      <MarkdownRenderContext.Provider value={{ isUser, returnTo, enableFileCards, deferSyntaxHighlighting }}>
+        <Markdown
+          remarkPlugins={isUser ? userRemarkPlugins : assistantRemarkPlugins}
+          urlTransform={transformChatUrl}
+          components={markdownComponents}
+        >
+          {text}
+        </Markdown>
+      </MarkdownRenderContext.Provider>
     </div>
   );
 }

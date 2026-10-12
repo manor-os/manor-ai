@@ -4,6 +4,7 @@ from typing import Any
 
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.sources import (
+    RUNTIME_PLAN_AND_RUN_TASK_SOURCE,
     RUNTIME_PLAN_EXECUTOR_SOURCE,
     RUNTIME_TASK_RUNNER_SOURCE,
 )
@@ -36,6 +37,28 @@ async def runtime_record_plan_executor_task_evidence(
         db,
         **kwargs,
         source=RUNTIME_PLAN_EXECUTOR_SOURCE,
+    )
+
+
+async def runtime_record_task_agent_loop_evidence(
+    db: Any,
+    **kwargs: Any,
+) -> Any:
+    """Record a plan-free Task agent loop run's evidence.
+
+    The same task_run evidence as a Plan, without a Plan or Steps: nothing
+    is faked, so plan_id/plan_status are absent and steps are empty.
+    """
+
+    from packages.core.services.runtime_learning import record_task_execution_evidence
+
+    return await record_task_execution_evidence(
+        db,
+        **kwargs,
+        plan_id=None,
+        plan_status=None,
+        steps=None,
+        source=RUNTIME_PLAN_AND_RUN_TASK_SOURCE,
     )
 
 

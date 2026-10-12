@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import heapq
+import hashlib
 import io
 import json
 import logging
@@ -13,17 +17,20 @@ import tempfile
 import time
 import urllib.parse
 import zipfile
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.database_runtime import release_read_transaction
 from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.models.document import Document, DocumentFolder, DocumentGroup, VectorStatus
@@ -31,26 +38,31 @@ from packages.core.config import get_settings
 from packages.core.services.document_service import (
     DocumentMutationConflictError,
     create_document, delete_document,
-    rename_document,
+    rename_document, list_documents,
     list_groups, create_group, add_document_to_group, add_documents_to_group,
     create_workspace_knowledge_group, mark_workspace_knowledge_changed,
     trigger_reindex,
-    get_document_content, get_document_for_update,
+    get_document_content, get_document_for_read, get_document_for_update,
     save_document_content, save_document_file,
     upsert_document_by_fs_path,
 )
 from packages.core.services.document_access import (
     DocumentAccessContext,
     ResourcePolicyMutationConflictError,
-    document_is_owned_by_deleted_workspace,
+    document_entity_is_unavailable,
+    knowledge_entity_is_unavailable,
     effective_document_capabilities_for_user,
     folder_grant_capabilities_for_user,
     get_visible_document,
+    _filter_readable_local_documents,
     list_visible_documents,
     lock_folder_policy_boundaries,
     partition_documents_by_capability,
     user_has_document_capability,
     user_has_folder_capability,
+    user_owns_workspace_document,
+    user_owns_workspace_folder,
+    workspace_folder_capabilities_for_user,
     user_can_read_folder,
     visible_document_counts_by_folder,
     visible_storage_usage,
@@ -89,14 +101,15 @@ from packages.core.services.permission_gate import (
     ResourcePermissionGate,
 )
 from packages.core.ai.runtime import runtime_text_completion_platform_configured
-from apps.api.deps import get_current_user, require_plan
+from apps.api.deps import enforce_plan_resource, get_current_user, require_plan
+from apps.api.errors import CodedError
 from apps.api.file_responses import EntitySnapshotFileResponse, entity_filesystem_read_boundary
 from packages.core.models.permission import Capability
+from packages.core.services.resource_grant_policy import ResourceGrantPolicyFactory
 from packages.core.permissions import (
     Permission,
     check_effective_user_permission,
     effective_user_has_permission,
-    user_is_effective_entity_admin,
 )
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
@@ -184,6 +197,7 @@ class DocumentVersionResponse(BaseModel):
     name: str
     fs_path: str | None = None
     file_size: int | None = None
+    content_sha256: str | None = None
     change_summary: str | None = None
     created_by: str | None = None
     created_at: str | None = None
@@ -290,6 +304,7 @@ async def _doc_resp_for_user(
             access_ctx.is_admin
             or getattr(d, "owner_id", None) == user.id
             or getattr(d, "created_by", None) == user.id
+            or access_ctx.owns_workspace_document(d)
         )
     else:
         capabilities = await effective_document_capabilities_for_user(
@@ -331,9 +346,11 @@ async def _doc_resp_for_user(
 
 
 async def _can_manage_document(db: AsyncSession, user: User, doc) -> bool:
-    if await user_is_effective_entity_admin(db, user):
+    if await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
         return True
     if getattr(doc, "owner_id", None) == user.id:
+        return True
+    if await user_owns_workspace_document(db, document=doc, user_id=user.id):
         return True
     # Historical rows may store the immutable user id in created_by. Mutable
     # email/display-name audit labels must never grant authorization.
@@ -346,7 +363,7 @@ async def _can_use_document_capability(
     doc,
     capabilities: set[str],
 ) -> bool:
-    if await document_is_owned_by_deleted_workspace(db, doc):
+    if await document_entity_is_unavailable(db, doc):
         return False
     if await _can_manage_document(db, user, doc):
         return True
@@ -366,7 +383,7 @@ async def _can_use_document_capability_from_context(
     access_ctx: DocumentAccessContext,
 ) -> bool:
     """Batched equivalent of ``_can_use_document_capability`` for lists."""
-    if access_ctx.document_owned_by_deleted_workspace(doc):
+    if access_ctx.document_entity_is_unavailable(doc):
         return False
     if (
         access_ctx.is_admin
@@ -385,7 +402,7 @@ async def _require_document_capability(
     capabilities: set[str],
     message: str,
 ) -> None:
-    if await document_is_owned_by_deleted_workspace(db, doc, for_update=True):
+    if await document_entity_is_unavailable(db, doc, for_update=True):
         raise HTTPException(404, "Document not found")
     if not await _can_use_document_capability(db, user, doc, capabilities):
         raise HTTPException(403, message)
@@ -415,7 +432,12 @@ async def _can_delete_document(
     user: User,
     doc,
 ) -> bool:
-    if await effective_user_has_permission(db, user, Permission.DOCS_DELETE):
+    if await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
+        return True
+    if (
+        getattr(doc, "owner_id", None) == user.id
+        or getattr(doc, "created_by", None) == user.id
+    ) and await effective_user_has_permission(db, user, Permission.DOCS_DELETE):
         return True
     return await _can_use_document_capability(
         db,
@@ -431,7 +453,7 @@ async def _require_document_delete(
     doc,
     message: str,
 ) -> None:
-    if await document_is_owned_by_deleted_workspace(db, doc, for_update=True):
+    if await document_entity_is_unavailable(db, doc, for_update=True):
         raise HTTPException(404, "Document not found")
     if not await _can_delete_document(db, user, doc):
         raise HTTPException(403, message)
@@ -449,9 +471,16 @@ async def _can_manage_folder(
     user: User,
     folder,
 ) -> bool:
-    if await user_is_effective_entity_admin(db, user):
+    if await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
         return True
-    return bool(getattr(folder, "owner_id", None) == user.id)
+    if await user_owns_workspace_folder(db, folder=folder, user_id=user.id):
+        return True
+    if getattr(folder, "owner_id", None) == user.id:
+        return True
+    capabilities = await folder_grant_capabilities_for_user(
+        db, entity_id=user.entity_id, folder_id=folder.id, user_id=user.id,
+    )
+    return ResourceGrantPolicyFactory.create("document_folder").allowed_capabilities.issubset(capabilities)
 
 
 async def _require_folder_manager(
@@ -460,17 +489,20 @@ async def _require_folder_manager(
     folder,
 ) -> None:
     try:
-        locked_folders, workspaces = await lock_folder_policy_boundaries(
+        locked_folders, _workspaces = await lock_folder_policy_boundaries(
             db,
             entity_id=user.entity_id,
             folder_ids={folder.id},
         )
     except ResourcePolicyMutationConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
-    if any(workspace.deleted_at is not None for workspace in workspaces):
+    if await knowledge_entity_is_unavailable(db, user.entity_id):
         raise HTTPException(404, "Folder not found")
     if not await _can_manage_folder(db, user, locked_folders[folder.id]):
-        raise HTTPException(403, "Only an owner/admin or the folder owner can modify this folder")
+        raise HTTPException(
+            403,
+            "Only the folder owner, a Co-owner, or a user with global document management permission can modify this folder",
+        )
 
 
 async def _require_folder_managers(
@@ -479,20 +511,20 @@ async def _require_folder_managers(
     folders: list,
 ) -> dict[str, object]:
     try:
-        locked_folders, workspaces = await lock_folder_policy_boundaries(
+        locked_folders, _workspaces = await lock_folder_policy_boundaries(
             db,
             entity_id=user.entity_id,
             folder_ids={folder.id for folder in folders},
         )
     except ResourcePolicyMutationConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
-    if any(workspace.deleted_at is not None for workspace in workspaces):
+    if await knowledge_entity_is_unavailable(db, user.entity_id):
         raise HTTPException(404, "Folder not found")
     for folder in locked_folders.values():
         if not await _can_manage_folder(db, user, folder):
             raise HTTPException(
                 403,
-                "Only an owner/admin or the folder owner can modify this folder",
+                "Only the folder owner, a Co-owner, or a user with global document management permission can modify this folder",
             )
     return locked_folders
 
@@ -503,6 +535,18 @@ async def _can_use_folder_capability(
     folder,
     capabilities: set[str],
 ) -> bool:
+    workspace_binding = await _workspace_storage_for_folder(
+        db, entity_id=user.entity_id, folder_id=getattr(folder, "id", None),
+    )
+    if workspace_binding:
+        from packages.core.services.workspace_access import user_can_write_workspace_artifacts
+
+        return await user_can_write_workspace_artifacts(
+            db,
+            workspace_id=workspace_binding.workspace_id,
+            user_id=user.id,
+            entity_role=user.role,
+        )
     if await _can_manage_folder(db, user, folder):
         return True
     return await user_has_folder_capability(
@@ -522,14 +566,14 @@ async def _require_folder_capability(
     message: str,
 ) -> None:
     try:
-        locked_folders, workspaces = await lock_folder_policy_boundaries(
+        locked_folders, _workspaces = await lock_folder_policy_boundaries(
             db,
             entity_id=user.entity_id,
             folder_ids={folder.id},
         )
     except ResourcePolicyMutationConflictError as exc:
         raise HTTPException(409, str(exc)) from exc
-    if any(workspace.deleted_at is not None for workspace in workspaces):
+    if await knowledge_entity_is_unavailable(db, user.entity_id):
         raise HTTPException(404, "Folder not found")
     if not await _can_use_folder_capability(
         db,
@@ -727,6 +771,14 @@ def _capture_document_source_snapshot(source_path: str) -> _DocumentSourceSnapsh
     )
 
 
+def _document_source_sha256(source_path: str) -> str:
+    digest = hashlib.sha256()
+    with open(source_path, "rb") as source_file:
+        while chunk := source_file.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _document_source_matches(
     snapshot: _DocumentSourceSnapshot,
     current_source_path: str | None,
@@ -781,7 +833,9 @@ def _is_docx_document(doc) -> bool:
 
 
 def _entity_root(entity_id: str) -> str:
-    return os.path.realpath(os.path.join(settings.MANOR_FS_ROOT, entity_id))
+    from packages.core.services.entity_fs import get_entity_root
+
+    return os.path.realpath(get_entity_root(entity_id))
 
 
 @asynccontextmanager
@@ -1057,17 +1111,168 @@ async def _commit_document_and_dispatch_embeddings(
 ) -> None:
     """Commit a document before dispatching its embedding work."""
     await db.commit()
-    from packages.core.services.slide_renderer import invalidate_document_preview_versions
+    await _run_committed_document_side_effects(document_id, entity_id)
 
-    await asyncio.to_thread(
-        invalidate_document_preview_versions,
-        _entity_root(entity_id),
-        document_id,
-    )
-    await _dispatch_document_embeddings_and_invalidate_cache(
-        document_id,
+
+async def _run_committed_document_side_effects(
+    document_id: str,
+    entity_id: str,
+) -> None:
+    """Run post-commit work without turning a durable write into a failure."""
+    try:
+        from packages.core.services.slide_renderer import invalidate_document_preview_versions
+
+        await asyncio.to_thread(
+            invalidate_document_preview_versions,
+            _entity_root(entity_id),
+            document_id,
+        )
+    except Exception:
+        logger.warning(
+            "Committed document preview invalidation failed for %s",
+            document_id,
+            exc_info=True,
+        )
+    try:
+        await _dispatch_document_embeddings_and_invalidate_cache(
+            document_id,
+            entity_id,
+        )
+    except Exception:
+        logger.warning(
+            "Committed document post-processing failed for %s",
+            document_id,
+            exc_info=True,
+        )
+
+
+async def _load_committed_document_upload(
+    *,
+    document_id: str,
+    entity_id: str,
+    owner_id: str,
+    idempotency_key: str | None,
+    request_fingerprint: str,
+    require_source_file: bool,
+) -> Document | None:
+    """Use a fresh transaction to resolve an ambiguous upload commit."""
+    from packages.core import database as database_module
+
+    async with database_module.async_session() as receipt_db:
+        if idempotency_key is not None:
+            document = await _find_idempotent_document_upload(
+                receipt_db,
+                entity_id=entity_id,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
+            )
+        else:
+            document = await receipt_db.scalar(
+                select(Document).where(
+                    Document.id == document_id,
+                    Document.entity_id == entity_id,
+                    Document.owner_id == owner_id,
+                )
+            )
+        if document is None:
+            return None
+        if idempotency_key is not None:
+            await _validate_idempotent_document_upload(
+                receipt_db,
+                document,
+                request_fingerprint=request_fingerprint,
+            )
+        if require_source_file:
+            source_path = _document_full_path(document, entity_id)
+            if source_path is None or not await asyncio.to_thread(os.path.isfile, source_path):
+                logger.error(
+                    "Committed upload %s has no readable source file",
+                    document.id,
+                )
+                return None
+        receipt_db.expunge(document)
+        return document
+
+
+class _DocumentUploadCommitUncertain(HTTPException):
+    def __init__(self):
+        super().__init__(
+            status_code=503,
+            detail={
+                "code": "document_upload_commit_uncertain",
+                "message": "Upload completion is still being reconciled; retry with the same Idempotency-Key",
+            },
+        )
+
+
+async def _commit_document_upload_with_reconciliation(
+    db: AsyncSession,
+    document: Document,
+    *,
+    entity_id: str,
+    owner_id: str,
+    idempotency_key: str | None,
+    request_fingerprint: str,
+    require_source_file: bool,
+) -> Document:
+    """Commit once, proving durable success before any upload cleanup."""
+    committed_document = document
+    document_id = document.id
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Constraint failures are a definite database rejection. The caller
+        # owns the normal idempotency-race lookup and source-file cleanup.
+        await _rollback_database_best_effort(db)
+        raise
+    except Exception as commit_error:
+        await _rollback_database_best_effort(db)
+        reconciled = None
+        # A successful COMMIT can become visible to a fresh connection shortly
+        # after its acknowledgement is lost. A single negative read is not
+        # proof of rollback, so use a small bounded visibility window before
+        # reporting the outcome as ambiguous.
+        for delay_seconds in (0.0, 0.05, 0.1, 0.2, 0.4):
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+            try:
+                reconciled = await _load_committed_document_upload(
+                    document_id=document_id,
+                    entity_id=entity_id,
+                    owner_id=owner_id,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=request_fingerprint,
+                    require_source_file=require_source_file,
+                )
+            except Exception as reconciliation_error:
+                logger.error(
+                    "Could not reconcile document upload %s after commit failure",
+                    document_id,
+                    exc_info=True,
+                )
+                raise _DocumentUploadCommitUncertain() from ExceptionGroup(
+                    "Upload commit and reconciliation both failed",
+                    [commit_error, reconciliation_error],
+                )
+            if reconciled is not None:
+                break
+        if reconciled is None:
+            logger.warning(
+                "Document upload %s remained ambiguous after bounded commit reconciliation",
+                document_id,
+            )
+            raise _DocumentUploadCommitUncertain() from commit_error
+        committed_document = reconciled
+        logger.warning(
+            "Recovered committed document upload %s after commit acknowledgement failure",
+            committed_document.id,
+        )
+
+    await _run_committed_document_side_effects(
+        committed_document.id,
         entity_id,
     )
+    return committed_document
 
 
 async def _remove_or_quarantine_document_file(
@@ -1536,6 +1741,561 @@ async def list_my_documents(
 
 # ── Upload (fixed path — before /{doc_id}) ──
 
+_UPLOAD_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
+
+
+@dataclass(frozen=True)
+class _DocumentUploadRecoveryIntent:
+    rel_path: str
+    fs_path: str
+    owner_id: str = ""
+    idempotency_key: str | None = None
+    request_fingerprint: str = ""
+    expires_at: float = 0.0
+
+
+class _DocumentUploadRecoveryConflict(HTTPException):
+    def __init__(self, message: str):
+        super().__init__(409, message)
+
+
+def _document_upload_recovery_intent_rel_path(
+    owner_id: str,
+    recovery_token: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"document-upload-v1\0{owner_id}\0{recovery_token}".encode("utf-8"),
+    ).hexdigest()
+    return os.path.join(
+        ".ai",
+        "document-upload-intents",
+        digest[:2],
+        f"{digest}.json",
+    )
+
+
+def _document_upload_recovery_ttl_seconds() -> int:
+    raw = os.getenv("DOCUMENT_UPLOAD_RECOVERY_TTL_SECONDS", "86400")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 86400
+    return max(3600, min(value, 7 * 86400))
+
+
+def _document_upload_recovery_expiry(
+    payload: dict[str, object],
+    marker_mtime: float,
+) -> float:
+    expires_at = payload.get("expires_at")
+    if isinstance(expires_at, (int, float)) and not isinstance(expires_at, bool):
+        return float(expires_at)
+    return marker_mtime + _document_upload_recovery_ttl_seconds()
+
+
+async def _read_document_upload_recovery_payload(
+    *,
+    entity_id: str,
+    intent_rel_path: str,
+) -> tuple[dict[str, object], float] | None:
+    from packages.core.services.entity_fs import open_entity_file_snapshot, resolve_path
+
+    resolved = resolve_path(entity_id, intent_rel_path)
+    if resolved is None:
+        raise EntityFilesystemError("Upload recovery intent path is invalid")
+
+    def _read() -> tuple[dict[str, object], float] | None:
+        try:
+            with open_entity_file_snapshot(entity_id, intent_rel_path) as snapshot:
+                with open(snapshot.descriptor_path, "rb") as intent_file:
+                    payload = json.load(intent_file)
+                if not isinstance(payload, dict):
+                    raise EntityFilesystemError("Upload recovery intent is malformed")
+                return payload, float(snapshot.stat.st_mtime)
+        except EntityFilesystemError:
+            if not os.path.lexists(resolved):
+                return None
+            raise
+
+    return await asyncio.to_thread(_read)
+
+
+def _parse_document_upload_recovery_intent(
+    *,
+    entity_id: str,
+    intent_rel_path: str,
+    payload: dict[str, object],
+    marker_mtime: float,
+) -> _DocumentUploadRecoveryIntent:
+    from packages.core.services.entity_fs import resolve_path
+
+    version = payload.get("version")
+    owner_id = payload.get("owner_id")
+    idempotency_key = payload.get("idempotency_key")
+    request_fingerprint = payload.get("request_fingerprint")
+    fs_path = payload.get("fs_path")
+    recovery_token = payload.get("recovery_token")
+    if version == 1 and isinstance(idempotency_key, str):
+        recovery_token = idempotency_key
+    if (
+        version not in {1, 2}
+        or not isinstance(owner_id, str)
+        or not owner_id
+        or not (idempotency_key is None or isinstance(idempotency_key, str))
+        or not isinstance(recovery_token, str)
+        or not recovery_token
+        or not isinstance(request_fingerprint, str)
+        or not request_fingerprint
+        or not isinstance(fs_path, str)
+        or not fs_path
+        or _document_upload_recovery_intent_rel_path(owner_id, recovery_token) != intent_rel_path
+    ):
+        raise EntityFilesystemError("Upload recovery intent is malformed")
+    normalized_fs_path = fs_path.replace("\\", "/").lstrip("/")
+    resolved_source = resolve_path(entity_id, normalized_fs_path)
+    if resolved_source is None or normalized_fs_path.startswith(".ai/"):
+        raise EntityFilesystemError("Upload recovery source path is invalid")
+    return _DocumentUploadRecoveryIntent(
+        rel_path=intent_rel_path,
+        fs_path=normalized_fs_path,
+        owner_id=owner_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+        expires_at=_document_upload_recovery_expiry(payload, marker_mtime),
+    )
+
+
+async def _has_active_document_upload_recovery_intent(
+    *,
+    entity_id: str,
+    owner_id: str,
+    idempotency_key: str | None,
+) -> bool:
+    if idempotency_key is None:
+        return False
+    intent_rel_path = _document_upload_recovery_intent_rel_path(owner_id, idempotency_key)
+    try:
+        loaded = await _read_document_upload_recovery_payload(
+            entity_id=entity_id,
+            intent_rel_path=intent_rel_path,
+        )
+        if loaded is None:
+            return False
+        payload, marker_mtime = loaded
+        intent = _parse_document_upload_recovery_intent(
+            entity_id=entity_id,
+            intent_rel_path=intent_rel_path,
+            payload=payload,
+            marker_mtime=marker_mtime,
+        )
+    except (EntityFilesystemError, OSError, ValueError, json.JSONDecodeError):
+        logger.warning(
+            "Ignoring invalid document upload recovery intent %s",
+            intent_rel_path,
+            exc_info=True,
+        )
+        return False
+    return (
+        intent.owner_id == owner_id
+        and intent.idempotency_key == idempotency_key
+        and intent.expires_at > time.time()
+    )
+
+
+async def _load_document_upload_recovery_intent(
+    *,
+    entity_id: str,
+    owner_id: str,
+    idempotency_key: str | None,
+    request_fingerprint: str,
+) -> _DocumentUploadRecoveryIntent | None:
+    if idempotency_key is None:
+        return None
+    intent_rel_path = _document_upload_recovery_intent_rel_path(
+        owner_id,
+        idempotency_key,
+    )
+    loaded = await _read_document_upload_recovery_payload(
+        entity_id=entity_id,
+        intent_rel_path=intent_rel_path,
+    )
+    if loaded is None:
+        return None
+    payload, marker_mtime = loaded
+    try:
+        intent = _parse_document_upload_recovery_intent(
+            entity_id=entity_id,
+            intent_rel_path=intent_rel_path,
+            payload=payload,
+            marker_mtime=marker_mtime,
+        )
+    except EntityFilesystemError as exc:
+        raise _DocumentUploadRecoveryConflict(
+            "Idempotency-Key conflicts with an incomplete document upload",
+        ) from exc
+    if (
+        intent.owner_id != owner_id
+        or intent.idempotency_key != idempotency_key
+        or intent.request_fingerprint != request_fingerprint
+    ):
+        raise _DocumentUploadRecoveryConflict(
+            "Idempotency-Key conflicts with an incomplete document upload",
+        )
+    if intent.expires_at <= time.time():
+        raise _DocumentUploadRecoveryConflict(
+            "This incomplete document upload has expired; start a new upload",
+        )
+    return intent
+
+
+async def _create_document_upload_recovery_intent(
+    *,
+    entity_id: str,
+    owner_id: str,
+    idempotency_key: str | None,
+    request_fingerprint: str,
+    fs_path: str,
+) -> _DocumentUploadRecoveryIntent | None:
+    recovery_token = idempotency_key or (
+        f"anonymous-{time.time_ns()}-{os.urandom(16).hex()}"
+    )
+    intent_rel_path = _document_upload_recovery_intent_rel_path(
+        owner_id,
+        recovery_token,
+    )
+    created_at = time.time()
+    expires_at = created_at + _document_upload_recovery_ttl_seconds()
+    payload = json.dumps(
+        {
+            "version": 2,
+            "owner_id": owner_id,
+            "idempotency_key": idempotency_key,
+            "recovery_token": recovery_token,
+            "request_fingerprint": request_fingerprint,
+            "fs_path": fs_path,
+            "created_at": created_at,
+            "expires_at": expires_at,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    await _write_document_bytes_atomic(
+        entity_id,
+        intent_rel_path,
+        payload,
+        allow_empty=False,
+    )
+    return _DocumentUploadRecoveryIntent(
+        rel_path=intent_rel_path,
+        fs_path=fs_path,
+        owner_id=owner_id,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+        expires_at=expires_at,
+    )
+
+
+async def _document_upload_source_matches(
+    *,
+    entity_id: str,
+    fs_path: str,
+    content_sha256: str,
+    file_size: int,
+) -> bool:
+    from packages.core.services.entity_fs import open_entity_file_snapshot, resolve_path
+
+    resolved = resolve_path(entity_id, fs_path)
+    if resolved is None:
+        raise EntityFilesystemError("Upload recovery source path is invalid")
+
+    def _matches() -> bool:
+        if not os.path.lexists(resolved):
+            return False
+        try:
+            with open_entity_file_snapshot(
+                entity_id,
+                fs_path,
+                expected_content_sha256=content_sha256,
+            ) as snapshot:
+                return snapshot.stat.st_size == file_size
+        except EntityFilesystemError as exc:
+            raise _DocumentUploadRecoveryConflict(
+                "Stored bytes conflict with this incomplete document upload",
+            ) from exc
+
+    return await asyncio.to_thread(_matches)
+
+
+async def _cleanup_document_upload_recovery_intent(
+    entity_id: str,
+    intent: _DocumentUploadRecoveryIntent | None,
+) -> None:
+    if intent is None:
+        return
+    try:
+        from packages.core.services.entity_fs import unlink_entity_file_entry
+
+        await asyncio.to_thread(
+            unlink_entity_file_entry,
+            entity_id,
+            intent.rel_path,
+            allow_symlink=True,
+        )
+    except Exception:
+        logger.warning(
+            "Could not remove completed document upload recovery intent %s",
+            intent.rel_path,
+            exc_info=True,
+        )
+
+
+def _iter_stale_document_upload_recovery_markers(
+    *,
+    now: float,
+) -> Iterator[tuple[float, str, str]]:
+    root = os.path.realpath(settings.MANOR_FS_ROOT)
+    cutoff = now - _document_upload_recovery_ttl_seconds()
+
+    def _entries(path: str) -> Iterator[os.DirEntry[str]]:
+        try:
+            scanner = os.scandir(path)
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            return
+        with scanner:
+            yield from scanner
+
+    for entity_entry in _entries(root):
+        if not entity_entry.is_dir(follow_symlinks=False):
+            continue
+        intents_root = os.path.join(
+            entity_entry.path,
+            ".ai",
+            "document-upload-intents",
+        )
+        for shard_entry in _entries(intents_root):
+            if not shard_entry.is_dir(follow_symlinks=False):
+                continue
+            for marker_entry in _entries(shard_entry.path):
+                try:
+                    marker_stat = marker_entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if (
+                    not marker_entry.is_file(follow_symlinks=False)
+                    or not marker_entry.name.endswith(".json")
+                    or marker_stat.st_mtime > cutoff
+                ):
+                    continue
+                rel_path = os.path.relpath(marker_entry.path, entity_entry.path)
+                yield marker_stat.st_mtime, entity_entry.name, rel_path
+
+
+async def cleanup_expired_document_upload_recovery_intents(
+    *,
+    now: float | None = None,
+    limit: int = 200,
+) -> dict[str, int]:
+    """Remove bounded, expired upload intents and unreferenced source bytes."""
+    if not settings.MANOR_FS_ENABLED or limit <= 0:
+        return {"examined": 0, "cleaned": 0, "sources_removed": 0, "failed": 0}
+    cleanup_now = time.time() if now is None else float(now)
+    candidates = heapq.nsmallest(
+        limit,
+        _iter_stale_document_upload_recovery_markers(now=cleanup_now),
+    )
+    report = {"examined": 0, "cleaned": 0, "sources_removed": 0, "failed": 0}
+    from packages.core import database as database_module
+    from packages.core.services.entity_fs import unlink_entity_file_entry
+
+    async with database_module.async_session() as cleanup_db:
+        for _marker_mtime, entity_id, intent_rel_path in candidates:
+            report["examined"] += 1
+            try:
+                async with _document_filesystem_mutation(entity_id):
+                    try:
+                        loaded = await _read_document_upload_recovery_payload(
+                            entity_id=entity_id,
+                            intent_rel_path=intent_rel_path,
+                        )
+                    except (EntityFilesystemError, OSError, ValueError, json.JSONDecodeError):
+                        await asyncio.to_thread(
+                            unlink_entity_file_entry,
+                            entity_id,
+                            intent_rel_path,
+                            allow_symlink=True,
+                        )
+                        report["cleaned"] += 1
+                        continue
+                    if loaded is None:
+                        continue
+                    payload, current_mtime = loaded
+                    try:
+                        intent = _parse_document_upload_recovery_intent(
+                            entity_id=entity_id,
+                            intent_rel_path=intent_rel_path,
+                            payload=payload,
+                            marker_mtime=current_mtime,
+                        )
+                    except EntityFilesystemError:
+                        await asyncio.to_thread(
+                            unlink_entity_file_entry,
+                            entity_id,
+                            intent_rel_path,
+                            allow_symlink=True,
+                        )
+                        report["cleaned"] += 1
+                        continue
+                    if intent.expires_at > cleanup_now:
+                        continue
+                    document_id = await cleanup_db.scalar(
+                        select(Document.id).where(
+                            Document.entity_id == entity_id,
+                            Document.fs_path == intent.fs_path,
+                        ).limit(1)
+                    )
+                    if document_id is None:
+                        removed = await asyncio.to_thread(
+                            unlink_entity_file_entry,
+                            entity_id,
+                            intent.fs_path,
+                            allow_symlink=True,
+                        )
+                        if removed:
+                            report["sources_removed"] += 1
+                    await asyncio.to_thread(
+                        unlink_entity_file_entry,
+                        entity_id,
+                        intent.rel_path,
+                        allow_symlink=True,
+                    )
+                    report["cleaned"] += 1
+            except Exception:
+                report["failed"] += 1
+                await cleanup_db.rollback()
+                logger.warning(
+                    "Could not clean expired document upload recovery intent %s/%s",
+                    entity_id,
+                    intent_rel_path,
+                    exc_info=True,
+                )
+    return report
+
+
+def _normalize_upload_idempotency_key(raw_key: str | None) -> str | None:
+    key = (raw_key or "").strip()
+    if not key:
+        return None
+    if not _UPLOAD_IDEMPOTENCY_KEY_RE.fullmatch(key):
+        raise HTTPException(
+            400,
+            "Idempotency-Key must be 8-128 URL-safe characters",
+        )
+    return key
+
+
+def _document_upload_request_fingerprint(
+    *,
+    content_sha256: str,
+    filename: str,
+    file_size: int,
+    folder_id: str | None,
+    visibility: str | None,
+    classification: str | None,
+    client_visible: bool | None,
+) -> str:
+    payload = {
+        "classification": classification,
+        "client_visible": client_visible,
+        "content_sha256": content_sha256,
+        "file_size": file_size,
+        "filename": filename,
+        "folder_id": folder_id,
+        "visibility": visibility,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _find_idempotent_document_upload(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    owner_id: str,
+    idempotency_key: str | None,
+) -> Document | None:
+    if idempotency_key is None:
+        return None
+    return await db.scalar(
+        select(Document).where(
+            Document.entity_id == entity_id,
+            Document.owner_id == owner_id,
+            Document.upload_idempotency_key == idempotency_key,
+        )
+    )
+
+
+async def _require_idempotent_document_upload_visible(
+    db: AsyncSession,
+    document: Document,
+) -> None:
+    if await document_entity_is_unavailable(
+        db,
+        document,
+        lock_for_read=True,
+    ):
+        raise HTTPException(404, "Document not found")
+    if document.is_trashed:
+        raise HTTPException(
+            409,
+            "This upload already completed, but its document is now in trash",
+        )
+
+
+async def _validate_idempotent_document_upload(
+    db: AsyncSession,
+    document: Document,
+    *,
+    request_fingerprint: str,
+) -> Document:
+    await _require_idempotent_document_upload_visible(db, document)
+    if document.upload_request_fingerprint != request_fingerprint:
+        raise HTTPException(
+            409,
+            "Idempotency-Key was already used for a different document upload",
+        )
+    return document
+
+
+@router.get("/upload-receipts/{idempotency_key}", response_model=DocumentResponse)
+async def get_document_upload_receipt(
+    idempotency_key: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Resolve an ambiguously completed browser upload without resending bytes."""
+    normalized_key = _normalize_upload_idempotency_key(idempotency_key)
+    # This is a read-side reconciliation endpoint, not a new upload attempt.
+    # The durable receipt is scoped to the authenticated uploader and entity;
+    # requiring DOCS_UPLOAD again would make an already accepted upload
+    # impossible to reconcile if that permission changed while it processed.
+    document = await _find_idempotent_document_upload(
+        db,
+        entity_id=user.entity_id,
+        owner_id=user.id,
+        idempotency_key=normalized_key,
+    )
+    if document is None:
+        raise HTTPException(404, "Upload receipt not found")
+    await _require_idempotent_document_upload_visible(db, document)
+    return await _doc_resp_for_user(db, document, user)
+
+
 @router.post("/upload", response_model=DocumentResponse, status_code=201)
 async def upload_document(
     file: UploadFile = File(...),
@@ -1543,7 +2303,7 @@ async def upload_document(
     visibility: str | None = Query(None, description="private | workspace | entity | public"),
     classification: str | None = Query(None, description="public | internal | confidential | restricted"),
     client_visible: bool | None = Query(None, description="Show in client portal"),
-    _gate=Depends(require_plan("storage_mb")),
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1552,6 +2312,29 @@ async def upload_document(
     from packages.core.services.document_service import get_document
 
     await _require_document_upload(db, user)
+    idempotency_key = _normalize_upload_idempotency_key(idempotency_key)
+    existing_receipt = await _find_idempotent_document_upload(
+        db,
+        entity_id=user.entity_id,
+        owner_id=user.id,
+        idempotency_key=idempotency_key,
+    )
+    active_recovery_intent = (
+        existing_receipt is None
+        and settings.MANOR_FS_ENABLED
+        and await _has_active_document_upload_recovery_intent(
+            entity_id=user.entity_id,
+            owner_id=user.id,
+            idempotency_key=idempotency_key,
+        )
+    )
+    # A committed replay does not consume storage again and must remain
+    # recoverable even when the first upload brought the entity to its limit.
+    # A validated pending intent is the same already-admitted logical attempt,
+    # not a new upload. New attempts retain the route's early plan gate;
+    # create_document also rechecks at the persistence boundary to close races.
+    if existing_receipt is None and not active_recovery_intent:
+        await enforce_plan_resource("storage_mb", user=user, db=db)
 
     # Validate enum-style params; reject unknown values rather than silently
     # accept (avoids "Confidentail" typos surviving into the DB).
@@ -1567,6 +2350,9 @@ async def upload_document(
     # Cross-field: confidential+ cannot be client_visible
     if client_visible and classification in {"confidential", "restricted"}:
         raise HTTPException(400, "Confidential/Restricted documents cannot be client_visible")
+    requested_visibility = visibility
+    requested_classification = classification
+    requested_client_visible = client_visible
     if folder_id:
         _, folder_by_id = await _load_document_folders(db, user.entity_id)
         folder = folder_by_id.get(folder_id)
@@ -1577,7 +2363,7 @@ async def upload_document(
             user,
             folder,
             {Capability.UPLOAD_TO, Capability.EDIT},
-            "Only the folder owner/admin or a user with upload/edit access can upload to this folder",
+            "Only the folder owner or a user with global management or upload/edit access can upload to this folder",
         )
 
     # RFC §13.3: when uploading into a folder, the folder's classification
@@ -1610,6 +2396,7 @@ async def upload_document(
     entity_root = _entity_root(entity_id)
     fs_path = None
     file_size = 0
+    content_hasher = hashlib.sha256()
     resolved_folder_id = folder_id
     workspace_binding = await _workspace_storage_for_folder(
         db,
@@ -1628,7 +2415,13 @@ async def upload_document(
                 while chunk := await file.read(1024 * 256):  # 256KB chunks
                     file_size += len(chunk)
                     if file_size > max_bytes:
-                        raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
+                        raise CodedError(
+                            413,
+                            code="page.knowledge.file_too_large_max_mb",
+                            message=f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB",
+                            vars={"max": settings.MANOR_MAX_UPLOAD_MB},
+                        )
+                    content_hasher.update(chunk)
                     await f.write(chunk)
             from packages.core.services.upload_security import (
                 UploadSecurityError,
@@ -1643,23 +2436,86 @@ async def upload_document(
                 )
             except UploadSecurityError as exc:
                 raise HTTPException(exc.status_code, str(exc)) from exc
+            request_fingerprint = _document_upload_request_fingerprint(
+                content_sha256=content_hasher.hexdigest(),
+                filename=filename,
+                file_size=file_size,
+                folder_id=resolved_folder_id,
+                visibility=requested_visibility,
+                classification=requested_classification,
+                client_visible=requested_client_visible,
+            )
             async with _document_filesystem_mutation(entity_id):
 
                 async def persist_upload():
                     nonlocal fs_path
+                    recovery_intent: _DocumentUploadRecoveryIntent | None = None
+                    is_recovery_retry = False
                     try:
-                        rel_target = _unique_document_rel_path(
-                            entity_id,
-                            filename,
-                            rel_dir=workspace_binding.storage_dir if workspace_binding else None,
+                        existing = await _find_idempotent_document_upload(
+                            db,
+                            entity_id=entity_id,
+                            owner_id=owner_id,
+                            idempotency_key=idempotency_key,
                         )
-                        fs_path = await _copy_document_file_atomic(
-                            entity_id,
-                            rel_target,
-                            tmp_path,
-                            expected_size=file_size,
-                            allow_empty=True,
+                        if existing is not None:
+                            existing = await _validate_idempotent_document_upload(
+                                db,
+                                existing,
+                                request_fingerprint=request_fingerprint,
+                            )
+                            stale_intent = (
+                                _DocumentUploadRecoveryIntent(
+                                    rel_path=_document_upload_recovery_intent_rel_path(
+                                        owner_id,
+                                        idempotency_key,
+                                    ),
+                                    fs_path="",
+                                )
+                                if idempotency_key is not None
+                                else None
+                            )
+                            await _cleanup_document_upload_recovery_intent(
+                                entity_id,
+                                stale_intent,
+                            )
+                            return existing
+                        recovery_intent = await _load_document_upload_recovery_intent(
+                            entity_id=entity_id,
+                            owner_id=owner_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=request_fingerprint,
                         )
+                        if recovery_intent is None:
+                            rel_target = _unique_document_rel_path(
+                                entity_id,
+                                filename,
+                                rel_dir=workspace_binding.storage_dir if workspace_binding else None,
+                            )
+                            recovery_intent = await _create_document_upload_recovery_intent(
+                                entity_id=entity_id,
+                                owner_id=owner_id,
+                                idempotency_key=idempotency_key,
+                                request_fingerprint=request_fingerprint,
+                                fs_path=rel_target,
+                            )
+                        else:
+                            is_recovery_retry = True
+                            rel_target = recovery_intent.fs_path
+                        fs_path = rel_target
+                        if not await _document_upload_source_matches(
+                            entity_id=entity_id,
+                            fs_path=rel_target,
+                            content_sha256=content_hasher.hexdigest(),
+                            file_size=file_size,
+                        ):
+                            fs_path = await _copy_document_file_atomic(
+                                entity_id,
+                                rel_target,
+                                tmp_path,
+                                expected_size=file_size,
+                                allow_empty=True,
+                            )
                         sync = await sync_file_to_knowledge(
                             entity_id=entity_id,
                             abs_path=os.path.join(entity_root, fs_path),
@@ -1673,6 +2529,7 @@ async def upload_document(
                             visibility=visibility,
                             classification=classification,
                             client_visible=client_visible,
+                            storage_admission_prevalidated=is_recovery_retry,
                             db=db,
                         )
                         doc = await get_document(db, sync.document_id, entity_id) if sync.document_id else None
@@ -1683,6 +2540,10 @@ async def upload_document(
                         doc.name = filename
                         doc.file_type = ext
                         doc.mime_type = mime_type
+                        doc.upload_idempotency_key = idempotency_key
+                        doc.upload_request_fingerprint = (
+                            request_fingerprint if idempotency_key is not None else None
+                        )
                         _apply_permission_overrides(
                             doc,
                             owner_id,
@@ -1691,15 +2552,63 @@ async def upload_document(
                             client_visible,
                         )
                         await db.flush()
-                        await _commit_document_and_dispatch_embeddings(
+                        doc = await _commit_document_upload_with_reconciliation(
                             db,
-                            doc.id,
+                            doc,
+                            entity_id=entity_id,
+                            owner_id=owner_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=request_fingerprint,
+                            require_source_file=True,
+                        )
+                        await _cleanup_document_upload_recovery_intent(
                             entity_id,
+                            recovery_intent,
                         )
                         return doc
+                    except IntegrityError:
+                        await _rollback_database_best_effort(db)
+                        existing = await _find_idempotent_document_upload(
+                            db,
+                            entity_id=entity_id,
+                            owner_id=owner_id,
+                            idempotency_key=idempotency_key,
+                        )
+                        if existing is not None:
+                            existing = await _validate_idempotent_document_upload(
+                                db,
+                                existing,
+                                request_fingerprint=request_fingerprint,
+                            )
+                            await _cleanup_document_upload_recovery_intent(
+                                entity_id,
+                                recovery_intent,
+                            )
+                            return existing
+                        await _remove_or_quarantine_document_file(entity_id, fs_path)
+                        await _cleanup_document_upload_recovery_intent(
+                            entity_id,
+                            recovery_intent,
+                        )
+                        raise
+                    except _DocumentUploadCommitUncertain:
+                        # The commit outcome could not be proven. Preserve the
+                        # source path so a durable receipt can never point at
+                        # bytes this request deleted while the DB recovered.
+                        await _rollback_database_best_effort(db)
+                        raise
+                    except _DocumentUploadRecoveryConflict:
+                        # This key belongs to an earlier incomplete request.
+                        # Never delete that request's recovery bytes.
+                        await _rollback_database_best_effort(db)
+                        raise
                     except Exception:
                         await _rollback_database_best_effort(db)
                         await _remove_or_quarantine_document_file(entity_id, fs_path)
+                        await _cleanup_document_upload_recovery_intent(
+                            entity_id,
+                            recovery_intent,
+                        )
                         raise
 
                 doc = await _finish_document_filesystem_mutation(persist_upload())
@@ -1709,44 +2618,111 @@ async def upload_document(
             except OSError:
                 pass
     else:
-        # No filesystem — just read to get size for DB record
-        content = await file.read()
-        file_size = len(content)
-        if file_size > max_bytes:
-            raise HTTPException(413, f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB")
-        from packages.core.services.upload_security import UploadSecurityError, inspect_upload_content
-
+        # Metadata-only deployments still accept large files. Stream through a
+        # bounded temporary file so validation, hashing, and the size gate do
+        # not allocate the complete request body a second time.
+        fd, tmp_path = tempfile.mkstemp(prefix="manor-doc-upload-", suffix=".tmp")
+        os.close(fd)
         try:
-            mime_type = await inspect_upload_content(
-                content,
+            async with aiofiles.open(tmp_path, "wb") as target:
+                while chunk := await file.read(1024 * 256):
+                    file_size += len(chunk)
+                    if file_size > max_bytes:
+                        raise CodedError(
+                            413,
+                            code="page.knowledge.file_too_large_max_mb",
+                            message=f"File too large. Max {settings.MANOR_MAX_UPLOAD_MB}MB",
+                            vars={"max": settings.MANOR_MAX_UPLOAD_MB},
+                        )
+                    content_hasher.update(chunk)
+                    await target.write(chunk)
+            from packages.core.services.upload_security import (
+                UploadSecurityError,
+                inspect_upload_path,
+            )
+
+            try:
+                mime_type = await inspect_upload_path(
+                    tmp_path,
+                    filename=filename,
+                    declared_content_type=file.content_type,
+                )
+            except UploadSecurityError as exc:
+                raise HTTPException(exc.status_code, str(exc)) from exc
+            request_fingerprint = _document_upload_request_fingerprint(
+                content_sha256=content_hasher.hexdigest(),
                 filename=filename,
-                declared_content_type=file.content_type,
+                file_size=file_size,
+                folder_id=resolved_folder_id,
+                visibility=requested_visibility,
+                classification=requested_classification,
+                client_visible=requested_client_visible,
             )
-        except UploadSecurityError as exc:
-            raise HTTPException(exc.status_code, str(exc)) from exc
-        doc = await create_document(
-            db,
-            entity_id,
-            name=filename,
-            fs_path=fs_path,
-            file_size=file_size,
-            file_type=ext,
-            mime_type=mime_type,
-            source="upload",
-            created_by=created_by,
-            folder_id=resolved_folder_id,
-            visibility=visibility,
-            classification=classification,
-            client_visible=client_visible,
-            owner_id=owner_id,
-        )
-        await _finish_document_filesystem_mutation(
-            _commit_document_and_dispatch_embeddings(
+            existing = await _find_idempotent_document_upload(
                 db,
-                doc.id,
-                entity_id,
+                entity_id=entity_id,
+                owner_id=owner_id,
+                idempotency_key=idempotency_key,
             )
-        )
+            if existing is not None:
+                doc = await _validate_idempotent_document_upload(
+                    db,
+                    existing,
+                    request_fingerprint=request_fingerprint,
+                )
+            else:
+                try:
+                    doc = await create_document(
+                        db,
+                        entity_id,
+                        name=filename,
+                        fs_path=fs_path,
+                        file_size=file_size,
+                        file_type=ext,
+                        mime_type=mime_type,
+                        source="upload",
+                        created_by=created_by,
+                        folder_id=resolved_folder_id,
+                        visibility=visibility,
+                        classification=classification,
+                        client_visible=client_visible,
+                        owner_id=owner_id,
+                        upload_idempotency_key=idempotency_key,
+                        upload_request_fingerprint=(
+                            request_fingerprint if idempotency_key is not None else None
+                        ),
+                    )
+                    doc = await _finish_document_filesystem_mutation(
+                        _commit_document_upload_with_reconciliation(
+                            db,
+                            doc,
+                            entity_id=entity_id,
+                            owner_id=owner_id,
+                            idempotency_key=idempotency_key,
+                            request_fingerprint=request_fingerprint,
+                            require_source_file=False,
+                        )
+                    )
+                except IntegrityError:
+                    await _rollback_database_best_effort(db)
+                    existing = await _find_idempotent_document_upload(
+                        db,
+                        entity_id=entity_id,
+                        owner_id=owner_id,
+                        idempotency_key=idempotency_key,
+                    )
+                    if existing is None:
+                        raise
+                    doc = await _validate_idempotent_document_upload(
+                        db,
+                        existing,
+                        request_fingerprint=request_fingerprint,
+                    )
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
     return await _doc_resp_for_user(db, doc, user)
 
@@ -1800,8 +2776,19 @@ async def _enforce_folder_invariants(
             adjustments["classification"] = {"from": current, "to": f_class, "reason": "folder rule"}
             classification = f_class
 
-    # Ceiling: child visibility cannot exceed folder's.
-    if f_vis:
+    # Placing content in a Workspace folder is the sharing action. Its
+    # document/folder projection must be readable by that Workspace, even
+    # when the source was private or a caller requested a wider audience.
+    workspace_binding = await _workspace_storage_for_folder(
+        db, entity_id=entity_id, folder_id=folder_id,
+    )
+    if workspace_binding:
+        if visibility != "workspace":
+            adjustments["visibility"] = {
+                "from": visibility, "to": "workspace", "reason": "workspace folder",
+            }
+        visibility = "workspace"
+    elif f_vis:
         current_v = visibility or "entity"
         if _VIS_RANK.get(current_v, 2) > _VIS_RANK.get(f_vis, 2):
             adjustments["visibility"] = {"from": current_v, "to": f_vis, "reason": "folder rule"}
@@ -1831,7 +2818,7 @@ def _apply_permission_overrides(
     """
     if visibility is not None:
         doc.visibility = visibility
-    elif not getattr(doc, "folder_id", None):
+    else:
         doc.visibility = USER_ROOT_DOCUMENT_DEFAULT_VISIBILITY
     if classification is not None:
         doc.classification = classification
@@ -1983,6 +2970,16 @@ async def _generate_pptx_bytes(title: str, content: str = "") -> bytes:
             raise
         return await asyncio.to_thread(_minimal_pptx_bytes, title, content)
 
+
+def _blank_xlsx_bytes() -> bytes:
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    output = io.BytesIO()
+    workbook.save(output)
+    return output.getvalue()
+
+
 @router.post("/create-blank", response_model=DocumentResponse, status_code=201)
 async def create_blank_document(
     body: CreateBlankRequest,
@@ -2013,6 +3010,9 @@ async def create_blank_document(
     elif ext in ("pptx", "ppt", "dps"):
         content = await _generate_pptx_bytes(os.path.splitext(filename)[0] or "Untitled", "")
         mime_type = PPTX_MIME
+    elif ext == "xlsx":
+        content = _blank_xlsx_bytes()
+        mime_type = XLSX_MIME
     elif ext in ("diagram", "diagram.json"):
         diagram_title = (
             filename[: -len(".diagram.json")]
@@ -2410,7 +3410,7 @@ async def upload_from_google_drive(
             user,
             folder,
             {Capability.UPLOAD_TO, Capability.EDIT},
-            "Only the folder owner/admin or a user with upload/edit access can upload to this folder",
+            "Only the folder owner or a user with global management or upload/edit access can upload to this folder",
         )
 
     settings = get_settings()
@@ -2573,7 +3573,7 @@ async def sync_google_drive_document(
         user,
         doc,
         {Capability.EDIT},
-        "Only the document owner/admin or a user with edit access can sync this document",
+        "Only the document owner or a user with global management or edit access can sync this document",
     )
     if doc.source != "google_drive":
         raise HTTPException(400, "Not a Google Drive document")
@@ -2628,7 +3628,7 @@ async def sync_google_drive_document(
             user,
             current,
             {Capability.EDIT},
-            "Only the document owner/admin or a user with edit access can sync this document",
+            "Only the document owner or a user with global management or edit access can sync this document",
         )
         if current.source != "google_drive":
             raise HTTPException(400, "Not a Google Drive document")
@@ -2918,7 +3918,13 @@ async def batch_add_to_group(
         group.id,
         entity_id=user.entity_id,
     )
-    if workspace_id and added:
+    visibility_changed = False
+    if workspace_id:
+        for document in manageable_documents:
+            if document.visibility == "private":
+                document.visibility = "workspace"
+                visibility_changed = True
+    if workspace_id and (added or visibility_changed):
         await db.commit()
         await mark_workspace_knowledge_changed(user.entity_id, workspace_id)
     return {"added": added, "total": len(body.document_ids)}
@@ -3010,7 +4016,7 @@ async def list_trashed_documents(
     docs = [
         document
         for document in docs
-        if not access_ctx.document_owned_by_deleted_workspace(document)
+        if not access_ctx.document_entity_is_unavailable(document)
     ]
     if not await effective_user_has_permission(db, user, Permission.DOCS_DELETE):
         docs = [
@@ -3056,10 +4062,11 @@ async def empty_trash_endpoint(
         from packages.core.services.workspace_artifact_purge import (
             ARTIFACT_CLEANUP_KIND_FILE,
             DOCUMENT_DERIVED_TREE_CACHE_ROOTS,
+            DOCUMENT_VERSION_SNAPSHOT_ROOT,
             drain_workspace_artifact_purge_jobs,
         )
 
-        for cache_root in DOCUMENT_DERIVED_TREE_CACHE_ROOTS:
+        for cache_root in (*DOCUMENT_DERIVED_TREE_CACHE_ROOTS, DOCUMENT_VERSION_SNAPSHOT_ROOT):
             await drain_workspace_artifact_purge_jobs(
                 db,
                 limit=1000,
@@ -3078,13 +4085,28 @@ async def empty_trash_endpoint(
 
 # ── Slide images (server-rendered PPTX) ──
 
+SLIDE_RENDER_BUSY_RETRY_AFTER_SECONDS = 3
+
+
+def _slide_image_dimensions(paths: list[str]) -> list[tuple[int, int] | None]:
+    from packages.core.services.slide_renderer import read_png_dimensions
+
+    return [read_png_dimensions(path) for path in paths]
+
+
 @router.get("/{doc_id}/slides")
 async def get_slide_images(
     doc_id: str,
+    request: Request = None,  # type: ignore[assignment]
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return list of rendered slide image URLs for a PPTX document."""
+    """Return list of rendered slide image URLs for a PPTX document.
+
+    A render that cannot get a slot within the interactive admission window
+    answers 503 ``office_render_busy`` with ``Retry-After``; clients keep their
+    interim preview and retry instead of treating it as a hard failure.
+    """
     doc = await get_visible_document(
         db,
         doc_id,
@@ -3129,18 +4151,36 @@ async def get_slide_images(
 
     async def render_preview():
         from packages.core.services.slide_renderer import (
+            INTERACTIVE_RENDER_ADMISSION_TIMEOUT_SECONDS,
+            OfficeRenderAbandonedError,
+            OfficeRenderBusyError,
             OfficeRenderLimitError,
             render_slides,
         )
 
+        render_kwargs = {
+            "source_ext": source_ext,
+            "admission_timeout": INTERACTIVE_RENDER_ADMISSION_TIMEOUT_SECONDS,
+        }
+        if request is not None:
+            render_kwargs["should_abandon"] = request.is_disconnected
         try:
             return await render_slides(
                 pptx_path,
                 cache_dir,
-                source_ext=source_ext,
+                **render_kwargs,
             )
         except OfficeRenderLimitError as exc:
             raise HTTPException(413, str(exc)) from exc
+        except (OfficeRenderBusyError, OfficeRenderAbandonedError) as exc:
+            raise HTTPException(
+                503,
+                {
+                    "code": "office_render_busy",
+                    "message": "Slide rendering is busy; retry shortly",
+                },
+                headers={"Retry-After": str(SLIDE_RENDER_BUSY_RETRY_AFTER_SECONDS)},
+            ) from exc
         except Exception as exc:
             logging.getLogger(__name__).warning(
                 "Slide rendering failed for %s: %s",
@@ -3165,17 +4205,27 @@ async def get_slide_images(
     )
 
     version = Path(paths[0]).parent.name if paths else ""
-    return {
-        "slides": [
-            {
-                "index": i,
-                "url": f"/documents/{doc_id}/slides/{i}?version={version}",
-            }
-            for i in range(len(paths))
-        ],
+    # Rendered pixel size lets the viewer frame slides at their true aspect
+    # before (or without, e.g. legacy .ppt) parsing the deck in the browser.
+    dimensions = await asyncio.to_thread(_slide_image_dimensions, paths)
+    slides = []
+    for i, size in enumerate(dimensions):
+        slide = {
+            "index": i,
+            "url": f"/documents/{doc_id}/slides/{i}?version={version}",
+        }
+        if size is not None:
+            slide["width"], slide["height"] = size
+        slides.append(slide)
+    payload = {
+        "slides": slides,
         "total": len(paths),
         "version": version,
     }
+    first_size = next((size for size in dimensions if size is not None), None)
+    if first_size is not None:
+        payload["width"], payload["height"] = first_size
+    return payload
 
 
 @router.get("/{doc_id}/slides/{slide_index}")
@@ -3224,7 +4274,15 @@ async def get_slide_image(
     except HTTPException:
         raise
     except FileNotFoundError as exc:
-        raise HTTPException(404, "Slide preview version not found") from exc
+        # The deck changed (or its cache was pruned) after the slide list was
+        # issued; the viewer re-requests /slides for the current version.
+        raise HTTPException(
+            404,
+            {
+                "code": "slide_preview_version_not_found",
+                "message": "Slide preview version not found",
+            },
+        ) from exc
     except IndexError as exc:
         raise HTTPException(404, "Slide index out of range") from exc
     except Exception as exc:
@@ -3623,6 +4681,12 @@ async def replace_document_file_endpoint(
     file: UploadFile = File(...),
     save_session_id: str | None = Form(default=None, min_length=1, max_length=128),
     save_sequence: int | None = Form(default=None, ge=1, le=9_007_199_254_740_991),
+    expected_source_sha256: str | None = Form(
+        default=None,
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-fA-F]{64}$",
+    ),
     _gate=Depends(require_plan("storage_mb")),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -3647,7 +4711,7 @@ async def replace_document_file_endpoint(
         user,
         existing_doc,
         {Capability.EDIT},
-        "Only the document owner/admin or a user with edit access can replace this document",
+        "Only the document owner or a user with global management or edit access can replace this document",
     )
 
     max_bytes = settings.MANOR_MAX_UPLOAD_MB * 1024 * 1024
@@ -3681,10 +4745,11 @@ async def replace_document_file_endpoint(
             created_by=(user.display_name or user.email),
             save_session_id=save_session_id,
             save_sequence=save_sequence,
+            expected_source_sha256=expected_source_sha256,
             mutation_authorizer=_document_mutation_authorizer(
                 user,
                 {Capability.EDIT},
-                "Only the document owner/admin or a user with edit access can replace this document",
+                "Only the document owner or a user with global management or edit access can replace this document",
             ),
         )
     except DocumentMutationConflictError as exc:
@@ -3765,7 +4830,7 @@ async def save_document_content_endpoint(
         user,
         doc,
         {Capability.EDIT},
-        "Only the document owner/admin or a user with edit access can save this document",
+        "Only the document owner or a user with global management or edit access can save this document",
     )
     try:
         ok = await save_document_content(
@@ -3779,7 +4844,7 @@ async def save_document_content_endpoint(
             mutation_authorizer=_document_mutation_authorizer(
                 user,
                 {Capability.EDIT},
-                "Only the document owner/admin or a user with edit access can save this document",
+                "Only the document owner or a user with global management or edit access can save this document",
             ),
         )
     except DocumentMutationConflictError as exc:
@@ -3925,6 +4990,27 @@ async def _cache_thumbnail_file_response(doc, response: FileResponse) -> FileRes
     return response
 
 
+async def _revalidate_thumbnail_response(
+    db: AsyncSession,
+    *,
+    document: Document,
+    user: User,
+) -> None:
+    prepared_key = document_hot_cache_key(document, "thumbnail")
+    document_id = document.id
+    entity_id = user.entity_id
+    user_id = user.id
+    role = user.role
+    await db.rollback()
+    current_doc = await get_visible_document(
+        db, document_id, entity_id, user_id=user_id, role=role,
+    )
+    if current_doc is None:
+        raise HTTPException(404, "Document not found")
+    if document_hot_cache_key(current_doc, "thumbnail") != prepared_key:
+        raise HTTPException(409, "Document changed while thumbnail was being prepared")
+
+
 @router.get("/{doc_id}/thumbnail")
 async def document_thumbnail(
     doc_id: str,
@@ -3940,17 +5026,37 @@ async def document_thumbnail(
     )
     if not doc:
         raise HTTPException(404, "Document not found")
+    cached_key = document_hot_cache_key(doc, "thumbnail")
     cached_thumbnail = await get_cached_document_blob(doc, "thumbnail")
     if cached_thumbnail is not None:
-        return Response(
-            content=cached_thumbnail.data,
-            media_type=cached_thumbnail.media_type,
-            headers={
-                "Cache-Control": "private, max-age=300",
-                "X-Knowledge-Cache": "redis-hit",
-                "X-Thumbnail-Cache": "redis-hit",
-            },
+        # The Redis await can race a share revocation, trash, or file edit.
+        # Never let a week-long byte cache become a week-long permission cache.
+        entity_id = user.entity_id
+        user_id = user.id
+        role = user.role
+        await db.rollback()
+        current_doc = await get_visible_document(
+            db, doc_id, entity_id, user_id=user_id, role=role,
         )
+        if current_doc is None:
+            raise HTTPException(404, "Document not found")
+        if document_hot_cache_key(current_doc, "thumbnail") == cached_key:
+            return Response(
+                content=cached_thumbnail.data,
+                media_type=cached_thumbnail.media_type,
+                headers={
+                    "Cache-Control": "private, max-age=300",
+                    "X-Knowledge-Cache": "redis-hit",
+                    "X-Thumbnail-Cache": "redis-hit",
+                },
+            )
+        doc = current_doc
+
+    # A cache miss may download the source, render with PIL or run ffmpeg.
+    # Do not hold the read transaction (an admission permit and a pooled
+    # connection) across that; every generating path revalidates access in a
+    # fresh transaction before responding.
+    await release_read_transaction(db)
 
     if _is_image_document(doc):
         source_path = _document_full_path(doc, user.entity_id)
@@ -3991,7 +5097,9 @@ async def document_thumbnail(
                 "X-Thumbnail-Cache": "disk-hit" if disk_hit else "generated",
             },
         )
-        return await _cache_thumbnail_file_response(doc, image_response)
+        image_response = await _cache_thumbnail_file_response(doc, image_response)
+        await _revalidate_thumbnail_response(db, document=doc, user=user)
+        return image_response
 
     if not _is_video_document(doc):
         # PDFs and office files use the renderer's content-addressed disk cache.
@@ -4115,7 +5223,9 @@ async def document_thumbnail(
             "X-Thumbnail-Cache": "hit" if cache_hit else "miss",
         },
     )
-    return await _cache_thumbnail_file_response(doc, video_response)
+    video_response = await _cache_thumbnail_file_response(doc, video_response)
+    await _revalidate_thumbnail_response(db, document=doc, user=user)
+    return video_response
 
 
 @router.get("/{doc_id}/editable-file")
@@ -4159,6 +5269,10 @@ async def get_editable_document_file(
         source_mime = doc.mime_type
         source_snapshot = await asyncio.to_thread(
             _capture_document_source_snapshot,
+            source_path,
+        )
+        source_sha256 = await asyncio.to_thread(
+            _document_source_sha256,
             source_path,
         )
         await db.rollback()
@@ -4242,6 +5356,7 @@ async def get_editable_document_file(
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
             "Cache-Control": "private, no-store",
             "Content-Length": str(converted.size),
+            "X-Manor-Source-SHA256": source_sha256,
         },
     )
 
@@ -4345,7 +5460,9 @@ async def _document_read_response(
     transferred = False
     try:
         for _attempt in range(2):
-            doc = await get_document_for_update(db, doc_id, entity_id)
+            doc = await get_document_for_read(db, doc_id, entity_id)
+            if doc is None:
+                raise HTTPException(404, "Document not found")
             try:
                 authorized = await ResourcePermissionGate.authorize_document_read(
                     db, credential=credential, document=doc, download=download,
@@ -4386,7 +5503,11 @@ async def _document_read_response(
             cache_status = "redis-hit"
             if content is None:
                 content = await get_document_content(
-                    db, doc_id, entity_id, allow_filesystem=source_path is not None,
+                    db,
+                    doc_id,
+                    entity_id,
+                    allow_filesystem=source_path is not None,
+                    allow_workspace_chat_upload=True,
                 )
                 if content is None:
                     raise HTTPException(404, "Document not found or no content")
@@ -4484,6 +5605,7 @@ def _ver_resp(v) -> DocumentVersionResponse:
         id=v.id, document_id=v.document_id,
         version_number=v.version_number, name=v.name,
         fs_path=v.fs_path, file_size=v.file_size,
+        content_sha256=v.content_sha256,
         change_summary=v.change_summary,
         created_by=v.created_by,
         created_at=v.created_at.isoformat() if v.created_at else None,
@@ -4516,31 +5638,43 @@ async def create_document_version(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    doc = await get_visible_document(
-        db,
-        doc_id,
-        user.entity_id,
-        user_id=user.id,
-        role=user.role,
-    )
-    if not doc:
-        raise HTTPException(404, "Document not found")
-    await _require_document_capability(
-        db,
-        user,
-        doc,
-        {Capability.EDIT},
-        "Only the document owner/admin or a user with edit access can create versions",
-    )
-    try:
-        version = await create_version(
-            db, doc_id, user.entity_id,
-            change_summary=req.change_summary,
-            created_by=(user.display_name or user.email),
+    async def persist_version() -> DocumentVersionResponse:
+        locked_doc = await get_document_for_update(db, doc_id, user.entity_id)
+        if locked_doc is None:
+            raise HTTPException(404, "Document not found")
+        doc = await get_visible_document(
+            db,
+            doc_id,
+            user.entity_id,
+            user_id=user.id,
+            role=user.role,
         )
-    except ValueError:
-        raise HTTPException(404, "Document not found")
-    return _ver_resp(version)
+        if not doc:
+            raise HTTPException(404, "Document not found")
+        await _require_document_capability(
+            db,
+            user,
+            doc,
+            {Capability.EDIT},
+            "Only the document owner or a user with global management or edit access can create versions",
+        )
+        try:
+            version = await create_version(
+                db, doc_id, user.entity_id,
+                change_summary=req.change_summary,
+                created_by=(user.display_name or user.email),
+                filesystem_lock_held=settings.MANOR_FS_ENABLED,
+            )
+        except ValueError:
+            raise HTTPException(404, "Document not found")
+        await db.commit()
+        return _ver_resp(version)
+
+    if settings.MANOR_FS_ENABLED:
+        await db.commit()
+        async with _document_filesystem_mutation(user.entity_id):
+            return await _finish_document_filesystem_mutation(persist_version())
+    return await persist_version()
 
 
 # ── Trash / Restore per document ──
@@ -4580,7 +5714,7 @@ async def trash_one_document(
             db,
             user,
             locked_doc,
-            "Only the document owner/admin or a user with delete access can trash this document",
+            "Only the document owner or a user with global management or delete access can trash this document",
         )
         doc = locked_doc
 
@@ -4738,7 +5872,7 @@ async def restore_one_document(
             db,
             user,
             doc,
-            "Only the document owner/admin or a user with delete access can restore this document",
+            "Only the document owner or a user with global management or delete access can restore this document",
         )
 
         trashed_fs_path = str(doc.fs_path) if doc.fs_path else None
@@ -4815,7 +5949,7 @@ class FolderResponse(BaseModel):
     entity_id: str
     name: str
     parent_id: str | None = None
-    document_count: int = 0
+    document_count: int | None = 0
     created_at: str | None = None
     # ── Permission-v1 (RFC §13.3) ──────────────────────────────────────
     visibility: str | None = None
@@ -4832,11 +5966,21 @@ class DocumentBrowseResponse(DocumentListResponse):
     total_documents: int = 0
     direct_total_files: int = 0
     direct_total_size: int = 0
+    max_upload_mb: int
+
+
+class DocumentBrowsePageResponse(BaseModel):
+    items: list[DocumentResponse]
+    folders: list[FolderResponse]
+    next_cursor: str | None = None
+    storage_used_mb: float | None = None
+    storage_limit_mb: float | None = None
+    max_upload_mb: int
 
 
 def _folder_resp(
     f,
-    document_count: int = 0,
+    document_count: int | None = 0,
     *,
     current_user_capabilities: set[str] | None = None,
 ) -> FolderResponse:
@@ -4857,7 +6001,7 @@ async def _folder_resp_for_user(
     f,
     user: User,
     *,
-    document_count: int = 0,
+    document_count: int | None = 0,
     access_ctx: DocumentAccessContext | None = None,
 ) -> FolderResponse:
     capabilities: set[str]
@@ -4866,13 +6010,22 @@ async def _folder_resp_for_user(
         can_manage = (
             access_ctx.is_admin
             if access_ctx is not None
-            else await user_is_effective_entity_admin(db, user)
+            else await effective_user_has_permission(
+                db, user, Permission.DOCS_MANAGE_ALL
+            )
+        )
+    if not can_manage:
+        can_manage = (
+            access_ctx.owns_workspace_folder(f)
+            if access_ctx is not None
+            else await user_owns_workspace_folder(db, folder=f, user_id=user.id)
         )
     if can_manage:
         capabilities = set(_FOLDER_OWNER_CAPABILITIES)
     else:
         if access_ctx is not None:
             capabilities = access_ctx.folder_capabilities(getattr(f, "id", None))
+            capabilities.update(access_ctx.workspace_folder_capabilities(f))
         else:
             capabilities = await folder_grant_capabilities_for_user(
                 db,
@@ -4880,6 +6033,9 @@ async def _folder_resp_for_user(
                 folder_id=getattr(f, "id", None),
                 user_id=user.id,
             )
+            capabilities.update(await workspace_folder_capabilities_for_user(
+                db, folder=f, user_id=user.id,
+            ))
         capabilities.add(Capability.VIEW)
     return _folder_resp(
         f,
@@ -5051,6 +6207,52 @@ async def _user_can_read_folder_path(
     return True
 
 
+def _browse_document_position(document: Document, sort_by: str) -> tuple[object, str]:
+    if sort_by == "name":
+        return (str(document.name or ""), str(document.id))
+    if sort_by == "size":
+        return (int(document.file_size or 0), str(document.id))
+    return (document.created_at, str(document.id))
+
+
+def _encode_browse_cursor(position: tuple[object, str], sort_by: str) -> str:
+    value, document_id = position
+    encoded_value = value.isoformat() if isinstance(value, datetime) else value
+    payload = json.dumps({"sort": sort_by, "value": encoded_value, "id": document_id}, separators=(",", ":"))
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_browse_cursor(cursor: str | None, sort_by: str) -> tuple[object, str] | None:
+    if not cursor:
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+        if not isinstance(payload, dict) or payload.get("sort") != sort_by:
+            raise ValueError("Cursor sort mismatch")
+        value = payload.get("value")
+        document_id = payload.get("id")
+        if not isinstance(document_id, str) or not document_id or len(document_id) > 64:
+            raise ValueError("Invalid cursor document")
+        if sort_by == "date":
+            if not isinstance(value, str):
+                raise ValueError("Invalid cursor date")
+            value = datetime.fromisoformat(value)
+        elif sort_by == "size":
+            if type(value) is not int or value < 0:
+                raise ValueError("Invalid cursor size")
+        elif not isinstance(value, str) or len(value) > 512:
+            raise ValueError("Invalid cursor name")
+        return (value, document_id)
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error) as exc:
+        raise HTTPException(422, "Invalid browse cursor") from exc
+
+
+_BROWSE_FILE_TYPE_FILTERS = frozenset({
+    "all", "pdf", "docx", "xlsx", "txt", "csv", "md", "json", "html",
+    "png", "jpg", "mp4", "mp3", "py", "js", "sql", "yaml",
+})
+
+
 async def _visible_document_folders_for_user(
     db: AsyncSession,
     user: User,
@@ -5100,7 +6302,21 @@ def _document_matches_browse_filters(
     from packages.core.services.knowledge_visibility import is_user_visible_path
 
     fs_path = str(document.fs_path or "")
-    if fs_path and not is_user_visible_path(fs_path):
+    # ``list_visible_documents`` admits this hidden runtime path only when the
+    # Document is explicitly projected into the selected Workspace. Preserve
+    # that narrow projection after the Gate refresh; all other hidden paths
+    # remain unavailable from Knowledge browse.
+    projected_workspace_chat_upload = (
+        bool(workspace_id)
+        and document.source == "chat_upload"
+        and fs_path.startswith("uploads/chat/")
+        and workspace_id in access_context.document_group_workspace_ids(document)
+    )
+    if (
+        fs_path
+        and not is_user_visible_path(fs_path)
+        and not projected_workspace_chat_upload
+    ):
         return False
     if not include_generated_assets and document.source in _GENERATED_MEDIA_SOURCES:
         mime_type = str(document.mime_type or "").lower()
@@ -5131,6 +6347,160 @@ def _document_matches_browse_filters(
     ):
         return False
     return True
+
+
+@router.get("/browse-page", response_model=DocumentBrowsePageResponse)
+async def browse_documents_page(
+    search: str | None = Query(None),
+    folder_id: str | None = Query(None),
+    workspace_id: str | None = Query(None),
+    scope: str | None = Query(None),
+    include_generated_assets: bool = Query(True),
+    favorite_only: bool = Query(False),
+    file_type_filter: str | None = Query(None, max_length=10),
+    sort_by: str = Query("date", pattern="^(date|name|size)$"),
+    limit: int = Query(50, ge=1, le=100),
+    cursor: str | None = Query(None, max_length=1024),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fetch one authorized Knowledge page without scanning for exact totals.
+
+    The cursor records the last *raw* row scanned, including inaccessible
+    rows. Keyset ordering stays stable when another user adds a newer file.
+    """
+    from packages.core.services.plan_gate import check as _plan_check
+
+    credential = AuthenticatedUserCredential.from_user(user)
+    if file_type_filter and file_type_filter not in _BROWSE_FILE_TYPE_FILTERS:
+        raise HTTPException(422, "Invalid file type filter")
+    search_query = (search or "").strip() or None
+    browse_folder_id = None if folder_id in (None, "", "root") else folder_id
+    visible_folders, visible_folder_by_id, _ = await _visible_document_folders_for_user(
+        db, user, credential=credential,
+    )
+    if browse_folder_id and browse_folder_id not in visible_folder_by_id:
+        raise HTTPException(404, "Folder not found")
+    global_document_scope = scope == "all" or bool(workspace_id) or bool(search_query)
+    query_folder_id = None if global_document_scope else browse_folder_id or "root"
+
+    page_documents: list[Document] = []
+    position = _decode_browse_cursor(cursor, sort_by)
+    has_more = False
+    batch_size = 100
+    while True:
+        raw_candidates, _ = await list_documents(
+            db,
+            user.entity_id,
+            name_search=search_query,
+            folder_id=query_folder_id,
+            workspace_id=workspace_id,
+            include_generated_assets=include_generated_assets,
+            limit=batch_size,
+            after_key=position,
+            count_total=False,
+            sort_by=sort_by,
+            favorite_user_id=user.id if favorite_only else None,
+            file_type_filter=file_type_filter,
+        )
+        if not raw_candidates:
+            break
+        raw_positions = {
+            str(candidate.id): _browse_document_position(candidate, sort_by)
+            for candidate in raw_candidates
+        }
+        candidates = await _filter_readable_local_documents(db, raw_candidates, stat_files=False)
+        authorized = await ResourcePermissionGate.authorize_document_batch_read(
+            db,
+            credential=credential,
+            documents=candidates,
+            workspace_id=workspace_id,
+        )
+        if authorized is None:
+            raise HTTPException(404, "Document not found")
+        authorized_by_id = {str(doc.id): doc for doc in authorized.documents}
+        for candidate in raw_candidates:
+            document = authorized_by_id.get(str(candidate.id))
+            if document is not None and _document_matches_browse_filters(
+                document,
+                search_query=search_query.lower() if search_query else None,
+                workspace_id=workspace_id,
+                include_generated_assets=include_generated_assets,
+                access_context=authorized.access_context,
+            ) and (
+                workspace_id is not None
+                or document.folder_id is None
+                or str(document.folder_id) in visible_folder_by_id
+            ):
+                if len(page_documents) == limit:
+                    has_more = True
+                    break
+                page_documents.append(document)
+            position = raw_positions[str(candidate.id)]
+        if has_more or len(raw_candidates) < batch_size:
+            break
+
+    # Recheck the page after the scan: a grant, membership, or document can
+    # change while earlier batches are being read.
+    final_docs = await ResourcePermissionGate.authorize_document_batch_read(
+        db,
+        credential=credential,
+        documents=page_documents,
+        workspace_id=workspace_id,
+    )
+    if final_docs is None:
+        raise HTTPException(404, "Document not found")
+    final_folders, final_folder_by_id, final_folder_context = (
+        await _visible_document_folders_for_user(db, user, credential=credential)
+    )
+    if browse_folder_id and browse_folder_id not in final_folder_by_id:
+        raise HTTPException(404, "Folder not found")
+    final_items = [
+        await _doc_resp_for_user(db, document, user, final_docs.access_context)
+        for document in final_docs.documents
+        if _document_matches_browse_filters(
+            document,
+            search_query=search_query.lower() if search_query else None,
+            workspace_id=workspace_id,
+            include_generated_assets=include_generated_assets,
+            access_context=final_docs.access_context,
+        )
+        and (
+            workspace_id is not None
+            or document.folder_id is None
+            or str(document.folder_id) in final_folder_by_id
+        )
+        and (global_document_scope or (str(document.folder_id) if document.folder_id else None) == browse_folder_id)
+    ]
+    if cursor or workspace_id or (scope == "all" and not search_query):
+        direct_folders = []
+    elif search_query:
+        direct_folders = [
+            folder for folder in final_folders
+            if search_query.lower() in (folder.name or "").lower()
+        ]
+    else:
+        direct_folders = [
+            folder for folder in final_folders
+            if (folder.parent_id or None) == browse_folder_id
+        ]
+    direct_folders.sort(key=lambda folder: (folder.name or "").lower())
+    gate = await _plan_check(db, user.entity_id, "storage_mb") if not cursor else None
+    return DocumentBrowsePageResponse(
+        items=final_items,
+        folders=[
+            await _folder_resp_for_user(
+                db, folder, user,
+                document_count=None,
+                access_ctx=final_folder_context,
+            )
+            for folder in direct_folders
+        ],
+        next_cursor=_encode_browse_cursor(position, sort_by) if has_more and position else None,
+        storage_used_mb=gate.current if gate else None,
+        storage_limit_mb=gate.limit if gate else None,
+        max_upload_mb=settings.MANOR_MAX_UPLOAD_MB,
+    )
 
 
 @router.get("/browse", response_model=DocumentBrowseResponse)
@@ -5367,6 +6737,7 @@ async def browse_documents(
         total_size=total_size,
         storage_used_mb=gate.current,
         storage_limit_mb=gate.limit,
+        max_upload_mb=settings.MANOR_MAX_UPLOAD_MB,
     )
 
 
@@ -5412,25 +6783,29 @@ async def document_indexing_statuses(
 
 @router.get("/folder-tree", response_model=list[FolderResponse])
 async def document_folder_tree(
+    include_counts: bool = Query(True),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     credential = AuthenticatedUserCredential.from_user(user)
-    visible_folders, _, _access_ctx = await _visible_document_folders_for_user(
+    visible_folders, _, access_context = await _visible_document_folders_for_user(
         db, user, credential=credential,
     )
-    visible_folders, folder_counts, access_context = (
-        await _authorized_folder_listing_snapshot(
-            db,
-            user,
-            credential=credential,
-            folders=visible_folders,
+    if include_counts:
+        visible_folders, folder_counts, access_context = (
+            await _authorized_folder_listing_snapshot(
+                db,
+                user,
+                credential=credential,
+                folders=visible_folders,
+            )
         )
-    )
+    else:
+        folder_counts = {}
     return [
         await _folder_resp_for_user(
             db, f, user,
-            document_count=folder_counts.get(f.id, 0),
+            document_count=folder_counts.get(f.id) if include_counts else None,
             access_ctx=access_context,
         )
         for f in sorted(
@@ -5446,6 +6821,7 @@ async def _validate_folder_position(
     *,
     name: str,
     parent_id: str | None,
+    owner_id: str | None,
     folder_id: str | None = None,
 ) -> tuple[list, dict[str, object]]:
     """Validate a logical Knowledge folder name/parent pair."""
@@ -5476,10 +6852,16 @@ async def _validate_folder_position(
     if not is_user_visible_folder_path(candidate_path):
         raise HTTPException(400, "Folder path is reserved for system use")
 
+    workspace_shared = bool(parent_id and await _workspace_storage_for_folder(
+        db, entity_id=entity_id, folder_id=parent_id,
+    ))
     duplicate = next(
         (
             f for f in folders
-            if f.parent_id == parent_id and f.name == clean_name and f.id != folder_id
+            if f.parent_id == parent_id
+            and (workspace_shared or f.owner_id == owner_id)
+            and f.name == clean_name
+            and f.id != folder_id
         ),
         None,
     )
@@ -5537,27 +6919,33 @@ async def create_folder(
             user,
             parent,
             {Capability.UPLOAD_TO, Capability.EDIT},
-            "Only the folder owner/admin or a user with upload/edit access can create folders here",
+            "Only the folder owner or a user with global management or upload/edit access can create folders here",
         )
     await _validate_folder_position(
         db,
         user.entity_id,
         name=body.name,
         parent_id=body.parent_id,
+        owner_id=user.id,
     )
     folder = DocumentFolder(
         id=generate_ulid(),
         entity_id=user.entity_id,
         name=body.name.strip(),
         parent_id=body.parent_id,
+        visibility=(
+            "workspace"
+            if parent is not None and await _workspace_storage_for_folder(
+                db, entity_id=user.entity_id, folder_id=parent.id,
+            )
+            else "private"
+        ),
     )
     # Inherit owner + perm fields from parent (RFC §13.3 — child
     # classification ≥ parent, child visibility ⊆ parent). New folder
-    # gets the creating user as owner; visibility/classification default
-    # to the parent's values when present, else leave as DB defaults.
+    # gets the creating user as owner. Workspace children inherit Workspace
+    # sharing; children in other shared folders stay private by default.
     if parent is not None:
-        if getattr(parent, "visibility", None):
-            folder.visibility = parent.visibility
         if getattr(parent, "classification", None):
             folder.classification = parent.classification
         if getattr(parent, "client_visible", None) is not None:
@@ -5588,6 +6976,7 @@ async def rename_folder(
         user.entity_id,
         name=clean_name,
         parent_id=folder.parent_id,
+        owner_id=folder.owner_id,
         folder_id=folder_id,
     )
     from packages.core.services.workspace_artifacts import (
@@ -5605,6 +6994,13 @@ async def rename_folder(
         and not workspace_binding.relative_parts
     )
     if is_workspace_root:
+        if not await user_can_manage_workspace(
+            db,
+            workspace_id=workspace_binding.workspace_id,
+            user_id=user.id,
+            entity_role=user.role,
+        ):
+            raise HTTPException(403, "Only Workspace owners/admins can rename this Workspace folder")
         from packages.core.services.entity_service import update_workspace
 
         workspace = await update_workspace(
@@ -5730,6 +7126,7 @@ async def move_folder(
         user.entity_id,
         name=folder.name,
         parent_id=body.parent_id,
+        owner_id=folder.owner_id,
         folder_id=folder_id,
     )
     new_vis, new_cls, new_cv, _adjustments = await _enforce_folder_invariants(
@@ -5798,6 +7195,7 @@ async def move_folder(
 
 class MoveToFolderRequest(BaseModel):
     folder_id: str | None = None  # None = move to root
+    filing_only: bool = False  # Preserve the canonical source path and bytes
 
 
 @router.post("/{doc_id}/move", response_model=DocumentResponse)
@@ -5816,12 +7214,35 @@ async def move_document_to_folder(
     )
     if not doc:
         raise HTTPException(404, "Document not found")
+    from packages.core.services.document_access import (
+        lock_workspace_policy_rows,
+        resolve_document_policy_lock_scope,
+        resolve_folder_policy_lock_scope,
+    )
+
+    source_scope = await resolve_document_policy_lock_scope(db, doc)
+    target_scope = await resolve_folder_policy_lock_scope(
+        db, entity_id=user.entity_id, folder_id=body.folder_id,
+    )
+    await lock_workspace_policy_rows(
+        db,
+        entity_id=user.entity_id,
+        workspace_ids=tuple(sorted(
+            set(source_scope.workspace_ids) | set(target_scope.workspace_ids)
+        )),
+    )
     await _require_document_capability(
         db,
         user,
         doc,
         {Capability.MANAGE_METADATA},
-        "Only the document owner/admin or a user with metadata access can move this document",
+        "Only the document owner or a user with global management or metadata access can move this document",
+    )
+    original_visibility = doc.visibility
+    original_state = (
+        doc.folder_id, doc.fs_path, doc.visibility, doc.metadata_,
+        doc.classification, doc.client_visible, doc.owner_id, doc.created_by,
+        doc.is_trashed, doc.quarantine_status, doc.source, doc.file_url,
     )
     target_folder_path = None
     workspace_binding = None
@@ -5842,7 +7263,7 @@ async def move_document_to_folder(
             user,
             folder,
             {Capability.UPLOAD_TO, Capability.EDIT},
-            "Only the target folder owner/admin or a user with upload/edit access can move documents here",
+            "Only the target folder owner or a user with global management or upload/edit access can move documents here",
         )
         from packages.core.services.knowledge_visibility import is_user_visible_folder_path
         target_folder_path = _folder_rel_path(folder, folder_by_id)
@@ -5866,6 +7287,22 @@ async def move_document_to_folder(
         classification=getattr(doc, "classification", None),
         client_visible=getattr(doc, "client_visible", None),
     )
+    # Group insertion also locks the Document row. Serialize the move with
+    # sharing, then read the current group links before changing their scope.
+    locked_doc = (await db.execute(
+        select(Document).where(
+            Document.id == doc_id,
+            Document.entity_id == user.entity_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if locked_doc is None or (
+        locked_doc.folder_id, locked_doc.fs_path, locked_doc.visibility, locked_doc.metadata_,
+        locked_doc.classification, locked_doc.client_visible, locked_doc.owner_id,
+        locked_doc.created_by, locked_doc.is_trashed, locked_doc.quarantine_status,
+        locked_doc.source, locked_doc.file_url,
+    ) != original_state:
+        raise HTTPException(409, "Document changed during the move; please retry")
+    doc = locked_doc
     if folder_adjustments:
         if "visibility" in folder_adjustments:
             doc.visibility = new_vis
@@ -5873,27 +7310,134 @@ async def move_document_to_folder(
             doc.classification = new_cls
         if "client_visible" in folder_adjustments:
             doc.client_visible = new_cv
+    from packages.core.models.document import DocumentGroupMember
+
+    workspace_group_rows = (await db.execute(
+        select(DocumentGroupMember.group_id, DocumentGroup.workspace_id)
+        .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+        .where(
+            DocumentGroupMember.document_id == doc.id,
+            DocumentGroup.entity_id == user.entity_id,
+            DocumentGroup.workspace_id.isnot(None),
+        )
+    )).all()
+    source_workspace_binding = await _workspace_storage_for_folder(
+        db, entity_id=user.entity_id, folder_id=doc.folder_id,
+    )
+    from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+
+    source_workspace_id = (
+        source_workspace_binding.workspace_id if source_workspace_binding else None
+    ) or await infer_workspace_id_from_storage_path(
+        entity_id=user.entity_id, rel_path=doc.fs_path or "",
+    )
+    source_workspace_ids = {
+        str(workspace_id) for _, workspace_id in workspace_group_rows
+    }
+    if source_workspace_id:
+        source_workspace_ids.add(source_workspace_id)
+    metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+    origin = metadata.get("origin") if isinstance(metadata.get("origin"), dict) else {}
+    if original_visibility == "workspace":
+        source_workspace_ids.update(
+            str(value) for value in (origin.get("workspace_id"), metadata.get("workspace_id"))
+            if value
+        )
     from packages.core.services.document_file_move import move_document_file_to_folder
     from packages.core.services.document_file_state import mark_document_file_missing
 
-    fs_move = move_document_file_to_folder(
-        doc,
-        entity_id=user.entity_id,
-        target_folder_path=target_folder_path,
+    workspace_group_rows = (await db.execute(
+        select(DocumentGroupMember.group_id, DocumentGroup.workspace_id)
+        .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+        .where(
+            DocumentGroupMember.document_id == doc.id,
+            DocumentGroup.entity_id == user.entity_id,
+            DocumentGroup.workspace_id.isnot(None),
+        )
+    )).all()
+    source_workspace_binding = await _workspace_storage_for_folder(
+        db, entity_id=user.entity_id, folder_id=doc.folder_id,
     )
-    if fs_move.reason == "fs_unavailable":
-        raise HTTPException(503, "Document storage is temporarily unavailable")
-    if fs_move.reason == "missing_source":
-        mark_document_file_missing(doc, source="document_move", trash=False)
+    from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+
+    source_workspace_id = (
+        source_workspace_binding.workspace_id if source_workspace_binding else None
+    ) or await infer_workspace_id_from_storage_path(
+        entity_id=user.entity_id, rel_path=doc.fs_path or "",
+    )
+    source_workspace_ids = {
+        str(workspace_id) for _, workspace_id in workspace_group_rows
+    }
+    if source_workspace_id:
+        source_workspace_ids.add(source_workspace_id)
+    metadata = doc.metadata_ if isinstance(doc.metadata_, dict) else {}
+    origin = metadata.get("origin") if isinstance(metadata.get("origin"), dict) else {}
+    if original_visibility == "workspace":
+        source_workspace_ids.update(
+            str(value) for value in (origin.get("workspace_id"), metadata.get("workspace_id"))
+            if value
+        )
+    if body.filing_only:
+        from packages.core.services.workspace_artifacts import artifact_folder_id_from_entity_storage_path
+
+        source_workspace_folder_id = artifact_folder_id_from_entity_storage_path(doc.fs_path)
+        target_workspace_folder_id = (
+            workspace_binding.artifact_folder_id if workspace_binding else None
+        )
+        if source_workspace_folder_id != target_workspace_folder_id:
+            raise HTTPException(400, "Filing without moving bytes must stay in the same Workspace")
+    else:
+        from packages.core.services.document_file_move import move_document_file_to_folder
+        from packages.core.services.document_file_state import mark_document_file_missing
+
+        fs_move = move_document_file_to_folder(
+            doc,
+            entity_id=user.entity_id,
+            target_folder_path=target_folder_path,
+        )
+        if fs_move.reason == "fs_unavailable":
+            raise HTTPException(503, "Document storage is temporarily unavailable")
+        if fs_move.reason == "missing_source":
+            mark_document_file_missing(doc, source="document_move", trash=False)
     doc.folder_id = body.folder_id
+    target_workspace_id = workspace_binding.workspace_id if workspace_binding else None
+    stale_group_ids = [
+        group_id for group_id, group_workspace_id in workspace_group_rows
+        if str(group_workspace_id) != target_workspace_id
+    ] if source_workspace_ids else []
+    if stale_group_ids:
+        await db.execute(
+            DocumentGroupMember.__table__.delete().where(
+                DocumentGroupMember.document_id == doc.id,
+                DocumentGroupMember.group_id.in_(stale_group_ids),
+            )
+        )
     if workspace_binding:
+        metadata = dict(doc.metadata_ or {})
+        metadata.pop("workspace_id", None)
         doc.metadata_ = merge_document_metadata(
-            doc.metadata_,
+            metadata,
             origin={"workspace_id": workspace_binding.workspace_id},
         )
+    elif source_workspace_ids:
+        # Leaving a Workspace folder removes its implicit publication.
+        doc.visibility = "private"
+        metadata = dict(doc.metadata_ or {})
+        origin = dict(metadata.get("origin") or {})
+        if str(origin.get("workspace_id") or "") in source_workspace_ids:
+            origin.pop("workspace_id", None)
+            metadata["origin"] = origin
+        if str(metadata.get("workspace_id") or "") in source_workspace_ids:
+            metadata.pop("workspace_id", None)
+        doc.metadata_ = metadata
     await db.flush()
     from packages.core.services.tool_cache_version import bump_tool_cache_version
     await bump_tool_cache_version(user.entity_id, "documents")
+    if source_workspace_ids or target_workspace_id:
+        from packages.core.workspace_chat.context import invalidate
+
+        for workspace_id in source_workspace_ids | ({target_workspace_id} if target_workspace_id else set()):
+            invalidate(workspace_id)
     return await _doc_resp_for_user(db, doc, user)
 
 
@@ -5921,7 +7465,7 @@ async def rename_one_document(
         user,
         current,
         {Capability.MANAGE_METADATA},
-        "Only the document owner/admin or a user with metadata access can rename this document",
+        "Only the document owner or a user with global management or metadata access can rename this document",
     )
     doc = await rename_document(db, doc_id, user.entity_id, body.name)
     if not doc:
@@ -5977,7 +7521,7 @@ async def delete_one_document(
         user,
         doc,
         {Capability.DELETE},
-        "Only the document owner/admin or a user with delete access can delete this document",
+        "Only the document owner or a user with global management or delete access can delete this document",
     )
     source_cleanup_bases = {doc.fs_path} if doc.fs_path else set()
     try:
@@ -5995,11 +7539,15 @@ async def delete_one_document(
         ARTIFACT_CLEANUP_KIND_FILE,
         document_derived_file_cleanup_bases,
         document_derived_tree_cleanup_bases,
+        document_version_snapshot_cleanup_bases,
         drain_workspace_artifact_purge_jobs,
         enqueue_artifact_cleanup_jobs,
     )
 
-    cleanup_bases = document_derived_tree_cleanup_bases({doc_id})
+    cleanup_bases = (
+        document_derived_tree_cleanup_bases({doc_id})
+        | document_version_snapshot_cleanup_bases({doc_id})
+    )
     file_cleanup_bases = (
         source_cleanup_bases
         | document_derived_file_cleanup_bases({doc_id})
@@ -6043,7 +7591,7 @@ async def reindex_one_document(
         user,
         doc,
         {Capability.MANAGE_METADATA},
-        "Only the document owner/admin or a user with metadata access can re-index this document",
+        "Only the document owner or a user with global management or metadata access can re-index this document",
     )
     doc.vector_status = VectorStatus.PENDING
     # Clear existing embedding
@@ -6082,7 +7630,7 @@ async def cancel_index_document(
         user,
         doc,
         {Capability.MANAGE_METADATA},
-        "Only the document owner/admin or a user with metadata access can cancel indexing for this document",
+        "Only the document owner or a user with global management or metadata access can cancel indexing for this document",
     )
     doc.vector_status = VectorStatus.SKIPPED
     try:
@@ -6099,8 +7647,8 @@ async def reindex_documents(
     db: AsyncSession = Depends(get_db),
 ):
     """Reset all entity documents to pending and trigger re-indexing."""
-    if not await user_is_effective_entity_admin(db, user):
-        raise HTTPException(403, "Only owner/admin can re-index all documents")
+    if not await effective_user_has_permission(db, user, Permission.DOCS_MANAGE_ALL):
+        raise HTTPException(403, "Global Knowledge management permission is required")
     count = await trigger_reindex(db, user.entity_id)
     return {"count": count}
 
@@ -6177,10 +7725,13 @@ async def add_to_group(
         user,
         doc,
         {Capability.MANAGE_METADATA},
-        "Only the document owner/admin or a user with metadata access can add this document",
+        "Only the document owner or a user with global management or metadata access can add this document",
     )
     added = await add_document_to_group(db, doc_id, group_id, entity_id=user.entity_id)
-    if workspace_id and added:
+    visibility_changed = bool(workspace_id and doc.visibility == "private")
+    if visibility_changed:
+        doc.visibility = "workspace"
+    if workspace_id and (added or visibility_changed):
         await db.commit()
         await mark_workspace_knowledge_changed(user.entity_id, workspace_id)
     return {"added": added}

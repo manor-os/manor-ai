@@ -266,3 +266,39 @@ def test_task_status_from_event_reads_the_committed_status():
     ) == "waiting_on_customer"
     assert _task_status_from_event(None) is None
     assert _task_status_from_event({"payload": {}}) is None
+
+
+# ── A missing deliverable is a failed step, never a placeholder success ──
+
+
+def test_submit_result_contract_makes_a_missing_deliverable_a_failed_status():
+    """Prod incident (task FQ2881, 2026-09-14): a content step could not write
+    the post, filled the text field with a "暂缺 / not generated" explanation
+    and submitted a non-failed status. The step rendered Done, the dependent
+    publish step ran on that empty input and failed, and the operator was only
+    asked afterwards — with the real reason buried in the first step's text.
+
+    The words the model reads are the contract: ``failed`` must be defined as
+    "the deliverable was not produced" (blocked, missing input, no evidence),
+    a placeholder standing in for the deliverable must be named as a failed
+    outcome, and the failure block must tell the model to list what is missing
+    so the operator is asked immediately with a concrete blocker."""
+    from packages.core.contracts.task_output import task_failure_control_schema
+    from packages.core.workers.submit_result import (
+        SUBMIT_RESULT_PROMPT_SUFFIX,
+        build_submit_result_tool,
+    )
+
+    props = build_submit_result_tool(None)["function"]["parameters"]["properties"]
+    status_desc = props["status"]["description"]
+    assert "not produced" in status_desc, status_desc
+    assert "placeholder" in SUBMIT_RESULT_PROMPT_SUFFIX
+    assert "failure.blockers" in SUBMIT_RESULT_PROMPT_SUFFIX
+    assert "requires_human=true" in SUBMIT_RESULT_PROMPT_SUFFIX
+
+    # Both failure-control shapes (tolerant default and hard contract) must
+    # tell the model what a blocker entry is — one description, not two.
+    default_items = props["failure"]["properties"]["blockers"]["items"]
+    hard_items = task_failure_control_schema()["properties"]["blockers"]["items"]
+    assert default_items.get("description"), "blockers items need a description"
+    assert default_items == hard_items

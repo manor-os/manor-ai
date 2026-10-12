@@ -33,6 +33,8 @@ from packages.core.ai.runtime.tool_context import (
 from packages.core.models.media_job import MediaJobStatus
 from packages.core.models.base import generate_ulid
 from packages.core.services.audio_conversion import ffmpeg_audio_codec_args
+from packages.core.services.file_refs import file_ref
+from packages.core.services.generated_file_refs import entity_fs_open_url, parse_entity_fs_url
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
 
 logger = logging.getLogger(__name__)
@@ -43,6 +45,7 @@ class _MediaFileAccessContext:
     entity_id: str
     user_id: str | None
     workspace_id: str | None
+    conversation_id: str | None
     runtime_envelope: Any | None
     tool_name: str
     enforce_acl: bool
@@ -83,6 +86,7 @@ def _with_media_file_access(handler):
                 entity_id=entity_id,
                 user_id=runtime_context.user_id,
                 workspace_id=runtime_context.workspace_id,
+                conversation_id=runtime_context.conversation_id,
                 runtime_envelope=runtime_context.runtime_envelope,
                 tool_name=tool_name,
                 enforce_acl=runtime_injected,
@@ -96,8 +100,16 @@ def _with_media_file_access(handler):
     return wrapped
 
 
-VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".webm"}
 AUDIO_TIMELINE_TYPES = {
     "audio",
@@ -118,6 +130,57 @@ MAX_WAIT_SECONDS = 900.0
 NARRATION_MIN_TEMPO_FACTOR = 0.75
 NARRATION_MAX_TEMPO_FACTOR = 1.5
 NARRATION_MAX_BLOCK_TEMPO_RELATIVE_SPREAD = 0.03
+
+
+def _is_narration_collision_retry_path(path: str | Path, expected_stem: str) -> bool:
+    match = re.fullmatch(
+        rf"{re.escape(expected_stem)}-([0-9]+)",
+        Path(path).stem.lower(),
+    )
+    return match is not None and int(match.group(1)) >= 2
+
+
+def _narration_source_duration_anomalies(
+    segments: list[dict[str, Any]],
+    *,
+    ordered_blocks: list[str],
+    block_durations_seconds: list[float],
+) -> list[dict[str, Any]]:
+    """Find isolated English TTS receipts that make a fixed block impossible."""
+    if len(segments) < 3 or len(ordered_blocks) != len(block_durations_seconds):
+        return []
+    measured_durations = sorted(float(item["source_duration"]) for item in segments)
+    midpoint = len(measured_durations) // 2
+    typical_duration = (
+        measured_durations[midpoint]
+        if len(measured_durations) % 2
+        else (measured_durations[midpoint - 1] + measured_durations[midpoint]) / 2
+    )
+    anomalies: list[dict[str, Any]] = []
+    for block_id, raw_duration in zip(
+        ordered_blocks, block_durations_seconds, strict=True
+    ):
+        block_duration = _coerce_float(raw_duration, 0.0)
+        block_segments = [
+            item for item in segments if item["block_id"] == block_id
+        ]
+        source_total = sum(float(item["source_duration"]) for item in block_segments)
+        if source_total / NARRATION_MAX_TEMPO_FACTOR <= block_duration + 0.05:
+            continue
+        for item in block_segments:
+            text = str(item["text"])
+            if not text.isascii():
+                continue
+            word_count = len(re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)?", text))
+            source_duration = float(item["source_duration"])
+            anomaly_threshold = max(
+                10.0,
+                typical_duration * 3.0,
+                word_count * 1.5,
+            )
+            if word_count and source_duration > anomaly_threshold:
+                anomalies.append(item)
+    return anomalies
 
 
 WAIT_MEDIA_JOBS_SCHEMA = {
@@ -151,6 +214,40 @@ WAIT_MEDIA_JOBS_SCHEMA = {
                 },
             },
             "required": ["job_ids"],
+        },
+    },
+}
+
+
+SEARCH_FREE_MUSIC_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "search_free_music",
+        "description": "Search Manor's commercially reusable Openverse music catalog. Returns track IDs and license/attribution details; it does not import a file.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Mood, genre, or instrument keywords."},
+                "page": {"type": "integer", "default": 1},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+
+IMPORT_FREE_MUSIC_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "import_free_music",
+        "description": "Recheck a catalog track's commercial license and import it as a durable Manor Knowledge audio Document beside an editable project canvas or video. Requires edit access to that source Document.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "track_id": {"type": "string", "description": "ID returned by search_free_music."},
+                "source_document_id": {"type": "string", "description": "Knowledge Document ID of this project's CANVAS.md or video that the current user can edit."},
+            },
+            "required": ["track_id", "source_document_id"],
         },
     },
 }
@@ -403,6 +500,8 @@ class TimelineAudioTrack:
     fade_in: float
     fade_out: float
     duration: float
+    source_start: float = 0.0
+    source_duration: float | None = None
 
 
 @dataclass(frozen=True)
@@ -636,6 +735,15 @@ PREPARE_NARRATION_TIMELINE_SCHEMA = {
                     "maximum": 1,
                     "default": 0.9,
                 },
+                "force_normalize_segment_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^S[0-9]{3}$"},
+                    "uniqueItems": True,
+                    "description": (
+                        "Exact repaired source segment IDs whose existing normalized "
+                        "derivatives must not be reused."
+                    ),
+                },
                 "manifest_name": {"type": "string"},
                 "timeline_name": {"type": "string"},
                 "cues_name": {"type": "string"},
@@ -670,6 +778,16 @@ INSPECT_NARRATION_RECOVERY_SCHEMA = {
                 "transcript_path": {"type": "string"},
                 "segment_manifest_path": {"type": "string"},
                 "source_audio_directory": {"type": "string"},
+                "block_durations_seconds": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {"type": "number", "minimum": 0.25, "maximum": 60},
+                    "description": (
+                        "Optional ordered visual-block durations. When supplied, isolated "
+                        "source-duration anomalies that make a block impossible are returned "
+                        "as exact repair segments."
+                    ),
+                },
             },
             "required": [
                 "transcript_path",
@@ -780,7 +898,14 @@ RENDER_FRAME_SAMPLES_SCHEMA = {
             "type": "object",
             "properties": {
                 "input_path": {"type": "string"},
-                "output_dir": {"type": "string"},
+                "output_dir": {
+                    "type": "string",
+                    "description": (
+                        "Knowledge-visible destination for generated PNG frames, for example "
+                        "Video-Analysis/frames. Never place output under uploads/chat; "
+                        "that directory contains private input attachments."
+                    ),
+                },
                 "timestamps": {
                     "type": "array",
                     "items": {"type": "number", "minimum": 0},
@@ -809,6 +934,31 @@ RENDER_FRAME_SAMPLES_SCHEMA = {
 }
 
 
+TRANSCRIBE_VIDEO_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "transcribe_video",
+        "description": (
+            "Extract the audio track from an authorized Knowledge or current-chat video "
+            "and transcribe its speech. Return measured segment timestamps when the selected "
+            "STT route supports them, otherwise return text with timestamps_available=false. "
+            "Use a window of at most 30 minutes per call for long videos. "
+            "STT credit and BYOK checks use the normal Manor transcription path."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "input_path": {"type": "string"},
+                "start_seconds": {"type": "number", "minimum": 0, "default": 0},
+                "end_seconds": {"type": "number", "minimum": 0},
+            },
+            "required": ["input_path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
 ANALYZE_AUDIO_SCHEMA = {
     "type": "function",
     "function": {
@@ -823,6 +973,12 @@ ANALYZE_AUDIO_SCHEMA = {
                 "input_path": {"type": "string"},
                 "target_lufs_min": {"type": "number", "minimum": -40, "maximum": 0, "default": -20},
                 "target_lufs_max": {"type": "number", "minimum": -40, "maximum": 0, "default": -14},
+                "loudness_tolerance_lu": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 3,
+                    "default": 0,
+                },
                 "max_true_peak_dbfs": {"type": "number", "minimum": -12, "maximum": 0, "default": -1},
                 "silence_noise_db": {"type": "number", "minimum": -80, "maximum": -20, "default": -50},
                 "minimum_silence_seconds": {"type": "number", "minimum": 0.1, "maximum": 10, "default": 0.5},
@@ -1072,7 +1228,7 @@ async def _merge_videos_handler(
         if not inputs:
             return _json_error("At least one video input is required to merge or normalize.")
 
-        final_path, final_rel_path, final_filename, input_payloads, total_duration = await _merge_video_files(
+        final_path, final_rel_path, final_filename, input_payloads, total_duration, document_id = await _merge_video_files(
             ffmpeg=ffmpeg,
             ffprobe=ffprobe,
             entity_id=entity_id,
@@ -1086,40 +1242,12 @@ async def _merge_videos_handler(
             crf=target_crf,
             preset=target_preset,
             include_source_audio=bool(include_source_audio),
-        )
-
-        document_id = await _register_merged_video(
-            entity_id=entity_id,
             user_id=user_id,
-            filename=final_filename,
-            rel_path=final_rel_path,
-            file_size=os.path.getsize(final_path),
-            workspace_id=workspace_id,
-            task_id=task_id,
             agent_id=agent_id,
             conversation_id=conversation_id,
-            inputs=input_payloads,
             resolution=resolution,
             aspect_ratio=aspect_ratio,
-            fps=target_fps,
-            crf=target_crf,
-            preset=target_preset,
-            include_source_audio=bool(include_source_audio),
         )
-
-        if workspace_id and document_id:
-            from packages.core.services.knowledge_sync import bind_document_to_workspace
-
-            await bind_document_to_workspace(
-                entity_id=entity_id,
-                document_id=document_id,
-                workspace_id=workspace_id,
-                task_id=task_id,
-                agent_id=agent_id,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                tool_name="merge_videos",
-            )
 
         return _json(
             {
@@ -1127,8 +1255,12 @@ async def _merge_videos_handler(
                 "status": "completed",
                 "document_id": document_id,
                 "name": final_filename,
-                "result_url": f"/api/v1/fs/{entity_id}/{final_rel_path}",
+                "result_url": _fs_url(entity_id, final_rel_path),
                 "fs_path": final_rel_path,
+                "file": _produced_file(
+                    entity_id, final_rel_path, document_id=document_id, name=final_filename,
+                    size=os.path.getsize(final_path), mime="video/mp4",
+                ),
                 "file_size": os.path.getsize(final_path),
                 "duration_seconds": round(total_duration, 2),
                 "resolution": resolution,
@@ -1187,6 +1319,9 @@ async def _compose_video_timeline_handler(
             code="ffmpeg_missing",
         )
 
+    saved_video: dict[str, Any] | None = None
+    editor_recipe: dict[str, Any] | None = None
+    stage = "compose_video"
     try:
         from packages.core.services import entity_fs
 
@@ -1269,24 +1404,45 @@ async def _compose_video_timeline_handler(
         target_preset = preset if preset in allowed_presets else "veryfast"
         target_crf = int(_clamp_float(crf, 14, 28, 18))
 
-        final_path, final_rel_path, final_filename = await _compose_video_file(
-            ffmpeg=ffmpeg,
-            entity_id=entity_id,
-            output_name=output_name,
-            workspace_id=workspace_id,
-            task_id=task_id,
-            clean_video_abs=clean_abs,
-            subtitle_abs=subtitle_abs,
-            subtitle_style=resolved_subtitle_style,
-            audio_tracks=audio_tracks,
-            include_source_audio=bool(include_source_audio and media_info.get("has_audio")),
-            ducking_config=ducking_config,
-            loudness_config=loudness_config,
-            crf=target_crf,
-            preset=target_preset,
-            total_duration=total_duration,
-            clean_video_duration=clean_video_duration,
-        )
+        # Burn a normalized copy of an ASS file; the Knowledge file is untouched.
+        with tempfile.TemporaryDirectory(prefix="compose-subtitles-") as subtitles_dir:
+            burn_subtitle_abs = (
+                _burnable_ass_copy(subtitle_abs, subtitles_dir)
+                if subtitle_abs and Path(subtitle_abs).suffix.lower() == ".ass"
+                else subtitle_abs
+            )
+            final_path, final_rel_path, final_filename = await _compose_video_file(
+                ffmpeg=ffmpeg,
+                entity_id=entity_id,
+                output_name=output_name,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                clean_video_abs=clean_abs,
+                subtitle_abs=burn_subtitle_abs,
+                subtitle_style=resolved_subtitle_style,
+                canvas_height=canvas_height,
+                audio_tracks=audio_tracks,
+                include_source_audio=bool(include_source_audio and media_info.get("has_audio")),
+                ducking_config=ducking_config,
+                loudness_config=loudness_config,
+                crf=target_crf,
+                preset=target_preset,
+                total_duration=total_duration,
+                clean_video_duration=clean_video_duration,
+            )
+        saved_video = {
+            "kind": "video",
+            "name": final_filename,
+            "fs_path": final_rel_path,
+            "result_url": _fs_url(entity_id, final_rel_path),
+            "file": _produced_file(
+                entity_id, final_rel_path, name=final_filename,
+                size=os.path.getsize(final_path), mime="video/mp4",
+            ),
+            "file_size": os.path.getsize(final_path),
+            "document_id": None,
+            "file_saved": True,
+        }
 
         audio_payloads = [
             {
@@ -1298,9 +1454,11 @@ async def _compose_video_timeline_handler(
                 "duration_seconds": round(track.duration, 3),
                 "volume_db": track.volume_db,
                 "loop": track.loop,
+                **({"source_start": track.source_start} if track.source_start else {}),
             }
             for track in audio_tracks
         ]
+        stage = "register_video"
         document_id = await _register_merged_video(
             entity_id=entity_id,
             user_id=user_id,
@@ -1337,7 +1495,15 @@ async def _compose_video_timeline_handler(
             include_source_audio=bool(include_source_audio and media_info.get("has_audio")),
             operation="compose_video_timeline",
         )
+        if not document_id:
+            raise RuntimeError("Composed video Knowledge projection is unavailable")
+        saved_video["document_id"] = document_id
+        saved_video["file"] = _produced_file(
+            entity_id, final_rel_path, document_id=document_id, name=final_filename,
+            size=saved_video["file_size"], mime="video/mp4",
+        )
 
+        stage = "bind_video"
         if workspace_id and document_id:
             from packages.core.services.knowledge_sync import bind_document_to_workspace
 
@@ -1352,6 +1518,7 @@ async def _compose_video_timeline_handler(
                 tool_name="compose_video_timeline",
             )
 
+        stage = "create_editor_recipe"
         editor_recipe = await _create_video_editor_recipe_sidecar(
             entity_id=entity_id,
             user_id=user_id,
@@ -1375,6 +1542,9 @@ async def _compose_video_timeline_handler(
             preset=target_preset,
             include_source_audio=bool(include_source_audio and media_info.get("has_audio")),
         )
+        if not editor_recipe.get("document_id"):
+            raise RuntimeError("Video editor recipe Knowledge projection is unavailable")
+        stage = "attach_editor_recipe"
         await _attach_video_editor_recipe_to_video(
             entity_id=entity_id,
             final_document_id=document_id,
@@ -1387,8 +1557,14 @@ async def _compose_video_timeline_handler(
                 "status": "completed",
                 "document_id": document_id,
                 "name": final_filename,
-                "result_url": f"/api/v1/fs/{entity_id}/{final_rel_path}",
+                "result_url": _fs_url(entity_id, final_rel_path),
                 "fs_path": final_rel_path,
+                "file": saved_video["file"],
+                **(
+                    {"files": [saved_video["file"], editor_recipe["file"]]}
+                    if isinstance(editor_recipe.get("file"), dict)
+                    else {}
+                ),
                 "file_size": os.path.getsize(final_path),
                 "duration_seconds": round(total_duration, 2),
                 "audio_tracks": audio_payloads,
@@ -1406,6 +1582,37 @@ async def _compose_video_timeline_handler(
         )
     except Exception as exc:  # noqa: BLE001 - tool results should be structured
         logger.exception("compose_video_timeline failed")
+        if saved_video is not None:
+            from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+
+            if isinstance(exc, _VideoEditorRecipeProjectionError):
+                editor_recipe = exc.saved_output
+                stage = "register_editor_recipe"
+            saved_outputs = [saved_video]
+            if editor_recipe:
+                saved_outputs.append(editor_recipe)
+            return _json(tool_error_payload(
+                tool_name="compose_video_timeline",
+                code="compose_incomplete",
+                message=(
+                    "The rendered video is already saved, but composition delivery is incomplete. "
+                    "Reuse the saved output; do not re-render the video to repair its metadata or editor recipe."
+                ),
+                details={
+                    "status": "partial",
+                    "action_executed": True,
+                    "retryable": False,
+                    "do_not_replay": True,
+                    "execution": {
+                        "failed_stage": stage,
+                        "saved_outputs": [
+                            {key: value for key, value in output.items() if key != "abs_path"}
+                            for output in saved_outputs
+                        ],
+                    },
+                    "cause": {"type": type(exc).__name__, "message": str(exc)},
+                },
+            ))
         return _json_error(str(exc), code="compose_failed")
 
 
@@ -1883,8 +2090,11 @@ async def _align_subtitles_handler(
                 "status": "completed",
                 "document_id": document_id,
                 "name": target.filename,
-                "result_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
+                "result_url": _fs_url(entity_id, target.rel_path),
                 "fs_path": target.rel_path,
+                "file": _produced_file(
+                    entity_id, target.rel_path, document_id=document_id, name=target.filename,
+                ),
                 "format": subtitle_format,
                 "cue_count": len(cues),
                 "estimated_cues": sum(1 for cue in cues if cue.estimated),
@@ -1925,19 +2135,11 @@ def _narration_segment_cue_bounds(
 
 def _narrator_profile_audio_output_name(output_name: str, voice: str) -> str:
     """Place normalized task narration beside its source voice segments."""
-    voice_slug = re.sub(r"[^a-z0-9]+", "-", str(voice or "").strip().lower()).strip("-")
-    if not voice_slug:
-        raise ValueError("Narrator profile voice must produce a non-empty storage folder name.")
-    normalized = str(output_name or "").replace("\\", "/").strip("/")
-    filename = normalized.rsplit("/", 1)[-1].strip()
-    if not filename:
+    from packages.core.services.generated_media_naming import narrator_audio_output_name
+
+    if not str(output_name or "").strip().rstrip("/"):
         raise ValueError("Normalized narration output name must include a filename.")
-    if normalized.startswith("runs/") and "/" in normalized:
-        parent = normalized.rsplit("/", 1)[0]
-        if parent.rsplit("/", 1)[-1].strip().lower() == voice_slug:
-            return normalized
-        return f"{parent}/{voice_slug}/{filename}"
-    return f"audio/{voice_slug}/{filename}"
+    return narrator_audio_output_name(output_name, voice)
 
 
 @_with_media_file_access
@@ -2403,9 +2605,9 @@ async def _build_narration_timeline_handler(
             timeline["narration_profile"] = narrator_profile
         cue_document = {"cues": cue_payloads}
         outputs = [
-            (manifest_name or "technical/narration-manifest.json", "narration-manifest", manifest),
-            (timeline_name or "timeline/narration-timeline.json", "narration-timeline", timeline),
-            (cues_name or "subtitles/subtitle-cues.json", "subtitle-cues", cue_document),
+            (manifest_name or "narration-manifest.json", "narration-manifest", manifest),
+            (timeline_name or "narration-timeline.json", "narration-timeline", timeline),
+            (cues_name or "subtitle-cues.json", "subtitle-cues", cue_document),
         ]
         artifact_outputs: dict[str, dict[str, str | None]] = {}
         for output_name, fallback, payload in outputs:
@@ -2483,6 +2685,14 @@ async def _build_narration_timeline_handler(
                 "manifest": artifact_outputs["narration-manifest"],
                 "timeline": artifact_outputs["narration-timeline"],
                 "cues": artifact_outputs["subtitle-cues"],
+                "files": [
+                    _produced_file(
+                        entity_id, str(output["fs_path"] or ""),
+                        document_id=output["document_id"], name=output["name"],
+                        mime="application/json",
+                    )
+                    for output in artifact_outputs.values()
+                ],
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -2497,6 +2707,7 @@ async def _inspect_narration_recovery_handler(
     transcript_path: str = "",
     segment_manifest_path: str = "",
     source_audio_directory: str = "",
+    block_durations_seconds: list[float] | None = None,
     workspace_id: str | None = None,
     task_id: str | None = None,
     **_: Any,
@@ -2575,11 +2786,12 @@ async def _inspect_narration_recovery_handler(
                 )
             segment_id = str(item.get("segment_id") or "").strip().upper()
             expected_id = f"S{index:03d}"
+            numeric_id = f"{index:03d}"
             filename_style_id = f"SEGMENT-{index:03d}"
             text = str(item.get("text") or "").strip()
             block_id = str(item.get("block_id") or "").strip().upper()
             if (
-                segment_id not in {expected_id, filename_style_id}
+                segment_id not in {expected_id, numeric_id, filename_style_id}
                 or not block_id
                 or not text
                 or (block_id in ordered_blocks and ordered_blocks[-1] != block_id)
@@ -2595,7 +2807,9 @@ async def _inspect_narration_recovery_handler(
                 ordered_blocks.append(block_id)
             expected_segments.append(
                 {
+                    "index": index,
                     "segment_id": expected_id,
+                    "block_id": block_id,
                     "text": text,
                     "text_key": _canonical_subtitle_text(text),
                 }
@@ -2611,7 +2825,7 @@ async def _inspect_narration_recovery_handler(
             raise ValueError(f"Path escapes entity root: {source_dir_rel}")
         if source_dir_abs.exists():
             source_dir_abs = Path(_resolve_entity_dir(entity_root, source_dir_rel))
-        source_receipts: list[dict[str, str]] = []
+        source_receipts: list[dict[str, Any]] = []
         warnings: list[dict[str, str]] = []
         ffprobe = shutil.which("ffprobe")
         source_paths = sorted(source_dir_abs.rglob("*")) if source_dir_abs.is_dir() else []
@@ -2663,6 +2877,7 @@ async def _inspect_narration_recovery_handler(
                 {
                     "source_path": source_rel,
                     "text_key": _canonical_subtitle_text(prompt),
+                    "source_duration": duration_seconds,
                 }
             )
 
@@ -2697,6 +2912,7 @@ async def _inspect_narration_recovery_handler(
         reused_segment_ids: list[str] = []
         source_segments: list[dict[str, str]] = []
         repair_segments: list[dict[str, str]] = []
+        resolved_sources: list[dict[str, Any]] = []
         claimed_paths: set[str] = set()
         for index, expected in enumerate(expected_segments, start=1):
             candidates = [
@@ -2719,9 +2935,26 @@ async def _inspect_narration_recovery_handler(
                 for item in candidates
                 if Path(item["source_path"]).stem.lower() == expected_stem
             ]
+            collision_retry_candidates = [
+                item
+                for item in candidates
+                if _is_narration_collision_retry_path(
+                    item["source_path"], expected_stem
+                )
+            ]
             if len(base_candidates) == 1:
                 selected = base_candidates[0]
-            elif len(base_candidates) > 1 or len(candidates) > 1:
+            elif len(base_candidates) > 1:
+                return _json_error(
+                    (
+                        f"Expected one provenance-matched source receipt for "
+                        f"{expected['segment_id']}; found {len(candidates)}."
+                    ),
+                    code="narration_source_receipt_ambiguous",
+                )
+            elif len(collision_retry_candidates) == 1:
+                selected = collision_retry_candidates[0]
+            elif len(candidates) > 1:
                 return _json_error(
                     (
                         f"Expected one provenance-matched source receipt for "
@@ -2740,6 +2973,59 @@ async def _inspect_narration_recovery_handler(
                 }
             )
 
+            resolved_sources.append(
+                {
+                    **expected,
+                    "source_path": selected["source_path"],
+                    "source_duration": selected["source_duration"],
+                }
+            )
+
+        duration_anomalies: list[dict[str, Any]] = []
+        if block_durations_seconds is not None:
+            if len(ordered_blocks) != len(block_durations_seconds):
+                return _json_error(
+                    (
+                        f"Narration manifest has {len(ordered_blocks)} blocks but "
+                        f"block_durations_seconds has {len(block_durations_seconds)} entries."
+                    ),
+                    code="narration_block_plan_mismatch",
+                )
+            duration_anomalies = _narration_source_duration_anomalies(
+                resolved_sources,
+                ordered_blocks=ordered_blocks,
+                block_durations_seconds=block_durations_seconds,
+            )
+        if duration_anomalies:
+            anomaly_ids = {item["segment_id"] for item in duration_anomalies}
+            reused_segment_ids = [
+                segment_id
+                for segment_id in reused_segment_ids
+                if segment_id not in anomaly_ids
+            ]
+            source_segments = [
+                item for item in source_segments if item["segment_id"] not in anomaly_ids
+            ]
+            for item in duration_anomalies:
+                repair_segments.append(
+                    {
+                        "segment_id": item["segment_id"],
+                        "text": item["text"],
+                        "output_name": (
+                            f"{source_dir_rel.rstrip('/')}/segment-{item['index']:03d}.wav"
+                        ),
+                    }
+                )
+                warnings.append(
+                    {
+                        "code": "narration_source_duration_anomaly",
+                        "segment_id": item["segment_id"],
+                        "block_id": item["block_id"],
+                        "source_path": item["source_path"],
+                        "duration_seconds": round(float(item["source_duration"]), 3),
+                    }
+                )
+
         return _json(
             {
                 "status": "repair_required" if repair_segments else "completed",
@@ -2748,6 +3034,11 @@ async def _inspect_narration_recovery_handler(
                 "reused_segment_ids": reused_segment_ids,
                 "source_segments": source_segments,
                 "repair_segments": repair_segments,
+                **(
+                    {"code": "narration_source_duration_anomaly"}
+                    if duration_anomalies
+                    else {}
+                ),
             }
         )
     except Exception as exc:  # noqa: BLE001
@@ -2768,6 +3059,7 @@ async def _prepare_narration_timeline_handler(
     occupancy_ratio: float = 0.84,
     minimum_block_fill_ratio: float = 0.72,
     maximum_block_fill_ratio: float = 0.9,
+    force_normalize_segment_ids: list[str] | None = None,
     manifest_name: str = "",
     timeline_name: str = "",
     cues_name: str = "",
@@ -2858,11 +3150,16 @@ async def _prepare_narration_timeline_handler(
                     code="narration_segment_manifest_invalid",
                 )
             expected_id = f"S{index:03d}"
+            numeric_id = f"{index:03d}"
             filename_style_id = f"SEGMENT-{index:03d}"
             segment_id = str(item.get("segment_id") or "").strip().upper()
             block_id = str(item.get("block_id") or "").strip().upper()
             text = str(item.get("text") or "").strip()
-            if segment_id not in {expected_id, filename_style_id} or not block_id or not text:
+            if (
+                segment_id not in {expected_id, numeric_id, filename_style_id}
+                or not block_id
+                or not text
+            ):
                 return _json_error(
                     (
                         f"Narration manifest item {index} must contain segment_id={expected_id} "
@@ -2910,8 +3207,15 @@ async def _prepare_narration_timeline_handler(
                         transcript=text,
                     ):
                         matching_candidates.append(candidate)
+                collision_retry_candidates = [
+                    candidate
+                    for candidate in matching_candidates
+                    if _is_narration_collision_retry_path(candidate, expected_stem)
+                ]
                 if len(matching_candidates) == 1:
                     source_abs = matching_candidates[0]
+                elif len(collision_retry_candidates) == 1:
+                    source_abs = collision_retry_candidates[0]
                 elif not matching_candidates:
                     return _json(
                         {
@@ -2993,9 +3297,22 @@ async def _prepare_narration_timeline_handler(
                 code="narration_block_plan_mismatch",
             )
 
+        forced_normalization_ids = {
+            str(segment_id or "").strip().upper()
+            for segment_id in (force_normalize_segment_ids or [])
+        }
+        known_segment_ids = {item["segment_id"] for item in prepared_sources}
+        if not forced_normalization_ids.issubset(known_segment_ids):
+            return _json_error(
+                "force_normalize_segment_ids must reference exact manifest segment IDs.",
+                code="narration_force_normalize_segment_invalid",
+            )
+
         output_dir = str(normalized_output_directory).replace("\\", "/").strip("/")
         reusable_normalized_segments: dict[int, dict[str, Any]] = {}
         for item in prepared_sources:
+            if item["segment_id"] in forced_normalization_ids:
+                continue
             expected_normalized_rel = _narrator_profile_audio_output_name(
                 f"{output_dir}/segment-{item['index']:03d}.wav",
                 str(narrator_profile["voice"]),
@@ -3307,7 +3624,12 @@ async def _normalize_audio_loudness_handler(
             entity_id=entity_id,
             audio_rel_path=_normalize_user_path(rel_input),
         )
-        if narration_profile is not None:
+        from packages.core.services.generated_media_naming import workspace_artifact_default_dir
+        if narration_profile is not None and (
+            "/" in output_name or workspace_artifact_default_dir(
+                workspace_base_dir, WorkspaceArtifactDir.AUDIO.value
+            ) != workspace_base_dir
+        ):
             output_name = _narrator_profile_audio_output_name(
                 output_name,
                 str(narration_profile["voice"]),
@@ -3322,7 +3644,7 @@ async def _normalize_audio_loudness_handler(
             output_name=output_name,
             ext=f".{fmt}",
             fallback="normalized-audio",
-            default_dir="audio",
+            default_dir=WorkspaceArtifactDir.AUDIO.value,
         )
         if not target.abs_dir or not target.abs_path:
             raise ValueError("Could not resolve audio output path")
@@ -3344,6 +3666,20 @@ async def _normalize_audio_loudness_handler(
             if requested_duration > 0 and source_duration > 0
             else 1.0
         )
+        if math.isclose(
+            tempo_factor,
+            NARRATION_MIN_TEMPO_FACTOR,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            tempo_factor = NARRATION_MIN_TEMPO_FACTOR
+        elif math.isclose(
+            tempo_factor,
+            NARRATION_MAX_TEMPO_FACTOR,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            tempo_factor = NARRATION_MAX_TEMPO_FACTOR
         if (
             narration_profile is not None
             and requested_duration > 0
@@ -3440,9 +3776,13 @@ async def _normalize_audio_loudness_handler(
                 "status": "completed",
                 "document_id": document_id,
                 "name": target.filename,
-                "result_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
-                "audio_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
+                "result_url": _fs_url(entity_id, target.rel_path),
+                "audio_url": _fs_url(entity_id, target.rel_path),
                 "fs_path": target.rel_path,
+                "file": _produced_file(
+                    entity_id, target.rel_path, document_id=document_id, name=target.filename,
+                    size=os.path.getsize(target.abs_path),
+                ),
                 "file_size": os.path.getsize(target.abs_path),
                 "format": fmt,
                 "target_lufs": _loudness_target_lufs(target_lufs),
@@ -3478,22 +3818,45 @@ async def _probe_media_handler(
         return _json_error("ffprobe is required for media inspection", code="ffprobe_missing")
     try:
         from packages.core.services import entity_fs
+        from packages.core.services.ai_file_permissions import is_chat_upload_path
 
         entity_root = entity_fs.get_entity_root(entity_id)
-        workspace_base_dir = await _workspace_media_base_dir(
-            entity_id=entity_id,
-            workspace_id=workspace_id,
+        upload_path = _entity_fs_url_path(input_path, entity_id) or unquote(
+            urlparse(input_path.strip()).path
         )
-        rel_input = _workspace_media_reference(
-            input_path,
-            entity_id=entity_id,
-            workspace_base_dir=workspace_base_dir,
-        )
-        input_abs = await _resolve_entity_file(entity_root, rel_input)
+        if is_chat_upload_path(upload_path):
+            # Uploaded inputs stay at their exact Entity path. They are not
+            # generated Workspace outputs and must pass the attachment ACL.
+            access = _CURRENT_MEDIA_FILE_ACCESS.get()
+            blocked = await runtime_guard_file_read_access(
+                entity_id=entity_id,
+                user_id=access.user_id if access else None,
+                conversation_id=access.conversation_id if access else None,
+                workspace_id=workspace_id,
+                runtime_envelope=access.runtime_envelope if access else None,
+                tool_name="probe_media", paths=[upload_path],
+            )
+            input_abs = os.path.join(entity_root, upload_path)
+            if blocked or not os.path.isfile(input_abs):
+                raise ValueError(f"Media file not found or access denied: {upload_path}")
+            rel_input = upload_path
+        else:
+            workspace_base_dir = await _workspace_media_base_dir(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+            )
+            rel_input = _workspace_media_reference(
+                input_path,
+                entity_id=entity_id,
+                workspace_base_dir=workspace_base_dir,
+            )
+            input_abs = await _resolve_entity_file(entity_root, rel_input)
         report = await _probe_media_report(ffprobe, input_abs)
         return _json({
             "status": "completed",
-            "fs_path": _normalize_user_path(rel_input),
+            # Chat uploads live under hidden `uploads/` and cannot pass the
+            # user-visible path gate. Other media still return a normalized path.
+            "fs_path": rel_input if is_chat_upload_path(upload_path) else _normalize_user_path(rel_input),
             "report": report,
         })
     except Exception as exc:  # noqa: BLE001
@@ -3518,11 +3881,15 @@ async def _verify_stickman_final_media_handler(
         "status": "completed",
         "publication_ready": False,
         "verified_video_source": "",
+        "document_id": "",
+        "filename": "",
+        "sha256": "",
         "duration_seconds": 0.0,
         "duration_tolerance_seconds": 0.0,
         "duration_within_target_tolerance": False,
         "subtitle_cue_count": 0,
         "narration_quality_evidence_available": False,
+        "audio_qa": {},
         "findings": [],
         "blocker": "",
     }
@@ -3586,6 +3953,21 @@ async def _verify_stickman_final_media_handler(
         _assert_video_path(final_abs)
         _assert_subtitle_path(subtitle_abs)
 
+        documents = await _lookup_documents_by_rel_paths(entity_id, [final_rel])
+        final_document = documents.get(final_rel)
+        document_id = str((final_document or {}).get("document_id") or "").strip()
+        filename = Path(final_rel).name
+        if (
+            not document_id
+            or (final_document or {}).get("fs_path") != final_rel
+            or (final_document or {}).get("mime_type") != "video/mp4"
+            or not filename.lower().endswith(".mp4")
+        ):
+            raise ValueError(
+                "The verified final video must resolve to one active MP4 Knowledge Document"
+            )
+        digest = await asyncio.to_thread(_sha256_file, final_abs)
+
         report = await _probe_media_report(ffprobe, final_abs)
         duration = float(_probe_number(report.get("duration_seconds")))
         tolerance = max(3.0, target_duration * 0.05)
@@ -3596,6 +3978,9 @@ async def _verify_stickman_final_media_handler(
         )
         base_result.update({
             "verified_video_source": _normalize_user_path(final_rel),
+            "document_id": document_id,
+            "filename": filename,
+            "sha256": digest,
             "duration_seconds": round(duration, 3),
             "duration_tolerance_seconds": round(tolerance, 3),
             "duration_within_target_tolerance": within_tolerance,
@@ -3630,13 +4015,41 @@ async def _verify_stickman_final_media_handler(
                 input_path=final_rel,
                 target_lufs_min=-15,
                 target_lufs_max=-13,
+                loudness_tolerance_lu=0.5,
                 max_true_peak_dbfs=-1,
                 max_silence_ratio=0.35,
                 workspace_id=workspace_id,
             )
         )
+        audio_qa_keys = (
+            "status",
+            "verdict",
+            "code",
+            "error",
+            "duration_seconds",
+            "non_empty",
+            "integrated_lufs",
+            "loudness_range_lu",
+            "true_peak_dbfs",
+            "clipping_detected",
+            "total_silence_seconds",
+            "leading_silence_seconds",
+            "trailing_silence_seconds",
+            "silence_ratio",
+            "thresholds",
+            "findings",
+        )
+        audio_qa = {
+            key: audio_result[key]
+            for key in audio_qa_keys
+            if key in audio_result
+        }
+        base_result["audio_qa"] = audio_qa
         if audio_result.get("status") != "completed" or audio_result.get("verdict") != "pass":
-            findings.append({"code": "final_media_audio_qa_failed"})
+            findings.append({
+                "code": "final_media_audio_qa_failed",
+                "audio_qa": audio_qa,
+            })
 
         subtitle_result = json.loads(
             await _validate_subtitles_handler(
@@ -3848,8 +4261,12 @@ async def _still_to_video_handler(
             "status": "completed",
             "document_id": document_id,
             "name": target.filename,
-            "result_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
+            "result_url": _fs_url(entity_id, target.rel_path),
             "fs_path": target.rel_path,
+            "file": _produced_file(
+                entity_id, target.rel_path, document_id=document_id, name=target.filename,
+                size=os.path.getsize(target.abs_path), mime="video/mp4",
+            ),
             "file_size": os.path.getsize(target.abs_path),
             "duration_seconds": round(duration, 3),
             "width": width,
@@ -3893,20 +4310,12 @@ async def _render_frame_samples_handler(
 
     completed_frames: list[dict[str, Any]] = []
     try:
-        from packages.core.services import entity_fs
-
-        entity_root = entity_fs.get_entity_root(entity_id)
-        workspace_base_dir = await _workspace_media_base_dir(
+        rel_input, input_abs, is_upload = await _resolve_video_analysis_source(
             entity_id=entity_id,
+            input_path=input_path,
             workspace_id=workspace_id,
             task_id=task_id,
         )
-        rel_input = _workspace_media_reference(
-            input_path,
-            entity_id=entity_id,
-            workspace_base_dir=workspace_base_dir,
-        )
-        input_abs = await _resolve_entity_file(entity_root, rel_input)
         _assert_video_path(input_abs)
         report = await _probe_media_report(ffprobe, input_abs)
         if not report.get("has_video"):
@@ -3921,7 +4330,17 @@ async def _render_frame_samples_handler(
         duration = video_duration if video_duration > 0 else media_duration
         if duration <= 0:
             raise ValueError("Frame sampling requires a positive media duration")
-        output_base = _normalize_user_path(output_dir).rstrip("/")
+        try:
+            output_base = _normalize_user_path(output_dir).rstrip("/")
+        except ValueError:
+            # Models sometimes mirror the uploaded source directory for their
+            # output. Keep the input ACL intact and store evidence in a visible
+            # generated-artifact directory instead. Other unsafe paths fail.
+            if not is_upload or not re.fullmatch(
+                r"uploads/chat/[A-Za-z0-9_/-]{1,100}", output_dir.strip()
+            ):
+                raise
+            output_base = f"Video-Analysis/{Path(rel_input).stem}/frames"
         sample_times = _frame_sample_times(
             duration_seconds=duration,
             timestamps=timestamps,
@@ -3972,7 +4391,7 @@ async def _render_frame_samples_handler(
                 raise RuntimeError(f"ffmpeg did not produce frame sample {index}")
             generation = {
                 "operation": "render_frame_samples",
-                "input_path": _normalize_user_path(rel_input),
+                "input_path": rel_input if is_upload else _normalize_user_path(rel_input),
                 "timestamp_seconds": timestamp,
                 "sample_index": index,
                 "media_duration_seconds": round(duration, 3),
@@ -4009,15 +4428,20 @@ async def _render_frame_samples_handler(
                 "document_id": document_id,
                 "name": target.filename,
                 "fs_path": target.rel_path,
-                "result_url": f"/api/v1/fs/{entity_id}/{target.rel_path}",
+                "result_url": _fs_url(entity_id, target.rel_path),
                 "file_size": os.path.getsize(target.abs_path),
+                "file": _produced_file(
+                    entity_id, target.rel_path, document_id=document_id, name=target.filename,
+                    size=os.path.getsize(target.abs_path),
+                ),
             })
         return _json({
             "status": "completed",
-            "input_path": _normalize_user_path(rel_input),
+            "input_path": rel_input if is_upload else _normalize_user_path(rel_input),
             "duration_seconds": round(duration, 3),
             "sample_count": len(completed_frames),
             "frames": completed_frames,
+            "files": [frame["file"] for frame in completed_frames],
         })
     except Exception as exc:  # noqa: BLE001
         logger.exception("render_frame_samples failed")
@@ -4030,12 +4454,106 @@ async def _render_frame_samples_handler(
 
 
 @_with_media_file_access
+async def _transcribe_video_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    input_path: str = "",
+    start_seconds: float = 0,
+    end_seconds: float | None = None,
+    workspace_id: str | None = None,
+    task_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
+    **_: Any,
+) -> str:
+    if not entity_id or not str(input_path or "").strip():
+        return _json_error("entity_id and input_path are required")
+    ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if not ffmpeg or not ffprobe:
+        return _json_error("ffmpeg and ffprobe are required", code="ffmpeg_missing")
+    try:
+        rel_input, input_abs, _is_upload = await _resolve_video_analysis_source(
+            entity_id=entity_id,
+            input_path=input_path,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        # Speech is all that is transcribed, so an audio file (a narration
+        # take) works as well as a video with sound.
+        is_audio_file = Path(input_abs).suffix.lower() in AUDIO_EXTENSIONS - VIDEO_EXTENSIONS
+        if not is_audio_file:
+            _assert_video_path(input_abs)
+        report = await _probe_media_report(ffprobe, input_abs)
+        if not is_audio_file and not report.get("has_video"):
+            raise ValueError("Video transcription requires a video stream")
+        duration = float(_probe_number(report.get("duration_seconds")))
+        start = float(start_seconds)
+        end = duration if end_seconds is None else float(end_seconds)
+        if math.isfinite(end) and math.isfinite(duration) and end > duration > start:
+            # "Up to the end" (for example the video's length for a narration
+            # take a few ms shorter) means the end of this media.
+            end = duration
+        if not all(math.isfinite(value) for value in (duration, start, end)) or not (
+            duration > 0 and 0 <= start < end <= duration + 0.05
+        ):
+            raise ValueError("Select a valid start/end range within the video duration")
+        if end - start > 1800:
+            raise ValueError("Transcribe at most 30 minutes per call; split longer videos into windows")
+        if not report.get("has_audio"):
+            return _json({
+                "status": "completed", "input_path": rel_input,
+                "start_seconds": start, "end_seconds": end,
+                "has_audio": False, "text": "", "segments": [],
+            })
+        with tempfile.TemporaryDirectory(prefix="video-speech-") as tmp_dir:
+            audio_path = os.path.join(tmp_dir, "speech.mp3")
+            await _run_process(
+                [
+                    ffmpeg, "-v", "error", "-y", "-ss", f"{start:.3f}",
+                    "-i", input_abs, "-t", f"{end - start:.3f}",
+                    "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000",
+                    "-b:a", "48k", audio_path,
+                ],
+                timeout_seconds=max(180.0, end - start),
+            )
+            access = _CURRENT_MEDIA_FILE_ACCESS.get()
+            transcript = await _transcribe_narration_audio(
+                audio_path=audio_path,
+                entity_id=entity_id,
+                user_id=(access.user_id if access else None) or user_id,
+                workspace_id=workspace_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                require_timestamps=False,
+            )
+        segments = [
+            {**segment, "start": round(start + float(segment["start"]), 3),
+             "end": round(start + float(segment["end"]), 3)}
+            for segment in transcript.segments or []
+        ]
+        return _json({
+            "status": "completed", "input_path": rel_input,
+            "start_seconds": start, "end_seconds": end,
+            "has_audio": True, "text": transcript.text,
+            "segments": segments, "model": transcript.model,
+            "timestamps_available": bool(segments),
+            **({"note": "This STT route returned text without measured speech timestamps."}
+               if not segments else {}),
+        })
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("transcribe_video failed")
+        return _json_error(str(exc), code="transcribe_video_failed")
+
+
+@_with_media_file_access
 async def _analyze_audio_handler(
     *,
     entity_id: str = "",
     input_path: str = "",
     target_lufs_min: float = -20.0,
     target_lufs_max: float = -14.0,
+    loudness_tolerance_lu: float = 0.0,
     max_true_peak_dbfs: float = -1.0,
     silence_noise_db: float = -50.0,
     minimum_silence_seconds: float = 0.5,
@@ -4079,6 +4597,9 @@ async def _analyze_audio_handler(
         lufs_max = _clamp_float(target_lufs_max, -40.0, 0.0, -14.0)
         if lufs_min > lufs_max:
             raise ValueError("target_lufs_min must not exceed target_lufs_max")
+        lufs_tolerance = _clamp_float(loudness_tolerance_lu, 0.0, 3.0, 0.0)
+        accepted_lufs_min = lufs_min - lufs_tolerance
+        accepted_lufs_max = lufs_max + lufs_tolerance
         peak_limit = _clamp_float(max_true_peak_dbfs, -12.0, 0.0, -1.0)
         noise = _clamp_float(silence_noise_db, -80.0, -20.0, -50.0)
         silence_minimum = _clamp_float(minimum_silence_seconds, 0.1, 10.0, 0.5)
@@ -4129,12 +4650,15 @@ async def _analyze_audio_handler(
         findings: list[dict[str, Any]] = []
         if integrated_lufs is None:
             findings.append({"code": "loudness_unavailable"})
-        elif not lufs_min <= integrated_lufs <= lufs_max:
+        elif not accepted_lufs_min <= integrated_lufs <= accepted_lufs_max:
             findings.append({
                 "code": "integrated_loudness_out_of_range",
                 "actual_lufs": integrated_lufs,
                 "minimum_lufs": lufs_min,
                 "maximum_lufs": lufs_max,
+                "loudness_tolerance_lu": lufs_tolerance,
+                "accepted_minimum_lufs": accepted_lufs_min,
+                "accepted_maximum_lufs": accepted_lufs_max,
             })
         if true_peak is None:
             findings.append({"code": "true_peak_unavailable"})
@@ -4169,6 +4693,9 @@ async def _analyze_audio_handler(
             "thresholds": {
                 "target_lufs_min": lufs_min,
                 "target_lufs_max": lufs_max,
+                "loudness_tolerance_lu": lufs_tolerance,
+                "accepted_lufs_min": accepted_lufs_min,
+                "accepted_lufs_max": accepted_lufs_max,
                 "max_true_peak_dbfs": peak_limit,
                 "max_silence_ratio": silence_ratio_limit,
             },
@@ -4177,6 +4704,115 @@ async def _analyze_audio_handler(
     except Exception as exc:  # noqa: BLE001
         logger.exception("analyze_audio failed")
         return _json_error(str(exc), code="analyze_audio_failed")
+
+
+def _validate_subtitle_content(
+    content: str,
+    subtitle_format: str,
+    duration: float,
+    *,
+    max_lines: int = 2,
+    min_margin_v: int = 28,
+) -> dict[str, Any]:
+    """Validate supplied subtitle content without reopening any source file."""
+    parsed = _parse_subtitle_content(content, subtitle_format)
+    subtitle_format = parsed["format"]
+    duration = float(_probe_number(duration))
+    if duration <= 0:
+        raise ValueError("Subtitle validation requires a positive media duration")
+
+    line_limit = max(1, min(4, int(max_lines or 2)))
+    margin_limit = max(0, min(500, int(min_margin_v or 0)))
+    cues = list(parsed["cues"])
+    findings: list[dict[str, Any]] = []
+    if not cues:
+        findings.append({"code": "no_subtitle_cues"})
+
+    for cue in cues:
+        cue_id = cue["id"]
+        if not str(cue.get("text") or "").strip():
+            findings.append({"code": "blank_cue", "cue_id": cue_id})
+        if float(cue["end"]) <= float(cue["start"]):
+            findings.append({
+                "code": "non_positive_duration",
+                "cue_id": cue_id,
+                "start": cue["start"],
+                "end": cue["end"],
+            })
+        if float(cue["start"]) < 0 or float(cue["end"]) > duration + 0.001:
+            findings.append({
+                "code": "cue_outside_media",
+                "cue_id": cue_id,
+                "start": cue["start"],
+                "end": cue["end"],
+                "media_duration_seconds": round(duration, 3),
+            })
+        if int(cue.get("line_count") or 0) > line_limit:
+            findings.append({
+                "code": "too_many_lines",
+                "cue_id": cue_id,
+                "line_count": cue["line_count"],
+                "maximum_lines": line_limit,
+            })
+
+    active_cue: dict[str, Any] | None = None
+    for cue in sorted(cues, key=lambda item: (float(item["start"]), float(item["end"]))):
+        if active_cue is not None and float(cue["start"]) < float(active_cue["end"]) - 0.001:
+            findings.append({
+                "code": "cue_overlap",
+                "cue_id": cue["id"],
+                "overlaps_cue_id": active_cue["id"],
+            })
+        if active_cue is None or float(cue["end"]) > float(active_cue["end"]):
+            active_cue = cue
+
+    style_evidence: dict[str, dict[str, Any]] = {}
+    if subtitle_format == "ass":
+        used_styles = sorted({str(cue.get("style") or "Default") for cue in cues})
+        for style_name in used_styles:
+            style = parsed["styles"].get(style_name)
+            if style is None:
+                findings.append({"code": "ass_style_missing", "style": style_name})
+                continue
+            alignment = int(style.get("alignment") or 0)
+            margin_v = int(style.get("margin_v") or 0)
+            bottom_safe = alignment == 2 and margin_v >= margin_limit
+            style_evidence[style_name] = {
+                "font_size": style.get("font_size"),
+                "outline": style.get("outline"),
+                "shadow": style.get("shadow"),
+                "alignment": alignment,
+                "margin_v": margin_v,
+                "bottom_safe": bottom_safe,
+            }
+            if not bottom_safe:
+                findings.append({
+                    "code": "ass_style_not_bottom_safe",
+                    "style": style_name,
+                    "required_alignment": 2,
+                    "minimum_margin_v": margin_limit,
+                })
+
+    starts = [float(cue["start"]) for cue in cues]
+    ends = [float(cue["end"]) for cue in cues]
+    return {
+        "status": "completed",
+        "verdict": "pass" if not findings else "fail",
+        "media_duration_seconds": round(duration, 3),
+        "subtitle_format": subtitle_format,
+        "cue_count": len(cues),
+        "maximum_line_count": max(
+            (int(cue.get("line_count") or 0) for cue in cues),
+            default=0,
+        ),
+        "timing_bounds": {
+            "start_seconds": round(min(starts), 3) if starts else None,
+            "end_seconds": round(max(ends), 3) if ends else None,
+        },
+        "play_res_y": parsed["play_res_y"],
+        "style_evidence": style_evidence,
+        "findings": findings,
+    }
 
 
 @_with_media_file_access
@@ -4212,10 +4848,7 @@ async def _validate_subtitles_handler(
         subtitle_abs = await _resolve_entity_file(entity_root, subtitle_rel)
         _assert_subtitle_path(subtitle_abs)
         subtitle_format = Path(subtitle_abs).suffix.lower().lstrip(".")
-        parsed = _parse_subtitle_content(
-            Path(subtitle_abs).read_text(encoding="utf-8-sig"),
-            subtitle_format,
-        )
+        subtitle_content = Path(subtitle_abs).read_text(encoding="utf-8-sig")
 
         duration = float(_probe_number(media_duration_seconds))
         media_rel = ""
@@ -4233,102 +4866,14 @@ async def _validate_subtitles_handler(
             media_abs = await _resolve_entity_file(entity_root, media_rel)
             report = await _probe_media_report(ffprobe, media_abs)
             duration = float(_probe_number(report.get("duration_seconds")))
-        if duration <= 0:
-            raise ValueError("Subtitle validation requires a positive media duration")
-
-        line_limit = max(1, min(4, int(max_lines or 2)))
-        margin_limit = max(0, min(500, int(min_margin_v or 0)))
-        cues = list(parsed["cues"])
-        findings: list[dict[str, Any]] = []
-        if not cues:
-            findings.append({"code": "no_subtitle_cues"})
-
-        for cue in cues:
-            cue_id = cue["id"]
-            if not str(cue.get("text") or "").strip():
-                findings.append({"code": "blank_cue", "cue_id": cue_id})
-            if float(cue["end"]) <= float(cue["start"]):
-                findings.append({
-                    "code": "non_positive_duration",
-                    "cue_id": cue_id,
-                    "start": cue["start"],
-                    "end": cue["end"],
-                })
-            if float(cue["start"]) < 0 or float(cue["end"]) > duration + 0.001:
-                findings.append({
-                    "code": "cue_outside_media",
-                    "cue_id": cue_id,
-                    "start": cue["start"],
-                    "end": cue["end"],
-                    "media_duration_seconds": round(duration, 3),
-                })
-            if int(cue.get("line_count") or 0) > line_limit:
-                findings.append({
-                    "code": "too_many_lines",
-                    "cue_id": cue_id,
-                    "line_count": cue["line_count"],
-                    "maximum_lines": line_limit,
-                })
-
-        active_cue: dict[str, Any] | None = None
-        for cue in sorted(cues, key=lambda item: (float(item["start"]), float(item["end"]))):
-            if active_cue is not None and float(cue["start"]) < float(active_cue["end"]) - 0.001:
-                findings.append({
-                    "code": "cue_overlap",
-                    "cue_id": cue["id"],
-                    "overlaps_cue_id": active_cue["id"],
-                })
-            if active_cue is None or float(cue["end"]) > float(active_cue["end"]):
-                active_cue = cue
-
-        style_evidence: dict[str, dict[str, Any]] = {}
-        if subtitle_format == "ass":
-            used_styles = sorted({str(cue.get("style") or "Default") for cue in cues})
-            for style_name in used_styles:
-                style = parsed["styles"].get(style_name)
-                if style is None:
-                    findings.append({"code": "ass_style_missing", "style": style_name})
-                    continue
-                alignment = int(style.get("alignment") or 0)
-                margin_v = int(style.get("margin_v") or 0)
-                bottom_safe = alignment == 2 and margin_v >= margin_limit
-                style_evidence[style_name] = {
-                    "font_size": style.get("font_size"),
-                    "outline": style.get("outline"),
-                    "shadow": style.get("shadow"),
-                    "alignment": alignment,
-                    "margin_v": margin_v,
-                    "bottom_safe": bottom_safe,
-                }
-                if not bottom_safe:
-                    findings.append({
-                        "code": "ass_style_not_bottom_safe",
-                        "style": style_name,
-                        "required_alignment": 2,
-                        "minimum_margin_v": margin_limit,
-                    })
-
-        starts = [float(cue["start"]) for cue in cues]
-        ends = [float(cue["end"]) for cue in cues]
+        result = _validate_subtitle_content(
+            subtitle_content, subtitle_format, duration,
+            max_lines=max_lines, min_margin_v=min_margin_v,
+        )
         return _json({
-            "status": "completed",
-            "verdict": "pass" if not findings else "fail",
+            **result,
             "fs_path": _normalize_user_path(subtitle_rel),
             "media_path": _normalize_user_path(media_rel) if media_rel else None,
-            "media_duration_seconds": round(duration, 3),
-            "subtitle_format": subtitle_format,
-            "cue_count": len(cues),
-            "maximum_line_count": max(
-                (int(cue.get("line_count") or 0) for cue in cues),
-                default=0,
-            ),
-            "timing_bounds": {
-                "start_seconds": round(min(starts), 3) if starts else None,
-                "end_seconds": round(max(ends), 3) if ends else None,
-            },
-            "play_res_y": parsed["play_res_y"],
-            "style_evidence": style_evidence,
-            "findings": findings,
         })
     except Exception as exc:  # noqa: BLE001
         logger.exception("validate_subtitles failed")
@@ -4378,6 +4923,11 @@ async def _jobs_to_payload(entity_id: str, jobs: list[Any]) -> list[dict[str, An
         params = getattr(job, "params", {}) or {}
         doc_id = params.get("result_document_id")
         doc = docs_by_id.get(str(doc_id)) if doc_id else None
+        job_fs_path = (
+            getattr(doc, "fs_path", None)
+            if doc
+            else _rel_path_from_reference(getattr(job, "result_url", None), entity_id)
+        )
         payloads.append(
             {
                 "job_id": getattr(job, "id", None),
@@ -4388,16 +4938,36 @@ async def _jobs_to_payload(entity_id: str, jobs: list[Any]) -> list[dict[str, An
                 "source_url": getattr(job, "source_url", None),
                 "error": getattr(job, "error", None),
                 "document_id": doc_id,
-                "fs_path": (
-                    getattr(doc, "fs_path", None)
-                    if doc
-                    else _rel_path_from_reference(getattr(job, "result_url", None), entity_id)
+                "fs_path": job_fs_path,
+                **(
+                    {
+                        "file": _produced_file(
+                            entity_id, job_fs_path,
+                            document_id=doc_id if doc else None,
+                            name=getattr(doc, "name", None),
+                            size=getattr(job, "file_size", None),
+                        )
+                    }
+                    if job_fs_path
+                    else {}
                 ),
                 "file_size": getattr(job, "file_size", None),
                 "duration_seconds": getattr(job, "duration_seconds", None),
                 "created_at": _iso(getattr(job, "created_at", None)),
                 "started_at": _iso(getattr(job, "started_at", None)),
                 "completed_at": _iso(getattr(job, "completed_at", None)),
+                # Provider completion does not erase route limitations or
+                # post-production intent from the generation receipt.
+                **{
+                    output_key: params[param_key]
+                    for param_key, output_key in (
+                        ("route_warnings", "warnings"),
+                        ("audio_policy", "audio_policy"),
+                        ("omitted_seedance_inputs", "omitted_seedance_inputs"),
+                        ("post_production_intent", "post_production_intent"),
+                    )
+                    if params.get(param_key) is not None
+                },
             }
         )
     return payloads
@@ -4676,13 +5246,16 @@ async def _merge_video_files(
     crf: int,
     preset: str,
     include_source_audio: bool,
-) -> tuple[str, str, str, list[dict[str, Any]], float]:
+    user_id: str,
+    agent_id: str | None,
+    conversation_id: str | None,
+    resolution: str,
+    aspect_ratio: str,
+) -> tuple[str, str, str, list[dict[str, Any]], float, str]:
+    from packages.core.ai.runtime.media_outputs import runtime_generated_media_target
     from packages.core.services import entity_fs
     from packages.core.services.generated_media_naming import (
-        build_generated_media_target,
         resolve_workspace_artifact_base_dir,
-        scope_workspace_artifact_path,
-        workspace_artifact_default_dir,
     )
 
     entity_root = entity_fs.get_entity_root(entity_id)
@@ -4691,16 +5264,13 @@ async def _merge_video_files(
         workspace_id=workspace_id,
         task_id=task_id,
     )
-    target = build_generated_media_target(
+    target = runtime_generated_media_target(
+        kind="video",
+        entity_id=entity_id,
+        workspace_base_dir=workspace_base_dir,
         prompt=output_name,
-        desired_name=scope_workspace_artifact_path(
-            output_name,
-            workspace_base_dir,
-            preserve_leaf_default=True,
-        ),
+        output_name=output_name,
         ext=".mp4",
-        fallback="merged-video",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
         entity_root=entity_root,
     )
     if not target.abs_dir or not target.abs_path:
@@ -4784,22 +5354,95 @@ async def _merge_video_files(
             ],
             timeout_seconds=max(120.0, total_duration * 4.0 + 60.0),
         )
-        runtime_copy_entity_file_atomic(
-            entity_id,
-            target.rel_path,
-            tmp_output,
-            expected_size=os.path.getsize(tmp_output),
-            allow_empty=False,
+        document_id = await _commit_merged_video_output(
+            entity_id=entity_id,
+            user_id=user_id,
+            entity_root=entity_root,
+            target=target,
+            source_path=tmp_output,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            generation={
+                "operation": "merge_videos",
+                "inputs": input_payloads,
+                "resolution": resolution,
+                "aspect_ratio": aspect_ratio,
+                "fps": fps,
+                "crf": crf,
+                "preset": preset,
+                "include_source_audio": include_source_audio,
+            },
         )
 
-    return target.abs_path, target.rel_path, target.filename, input_payloads, total_duration
+    return target.abs_path, target.rel_path, target.filename, input_payloads, total_duration, document_id
+
+
+async def _commit_merged_video_output(
+    *,
+    entity_id: str,
+    user_id: str,
+    entity_root: str,
+    target: Any,
+    source_path: str,
+    workspace_id: str | None,
+    task_id: str | None,
+    agent_id: str | None,
+    conversation_id: str | None,
+    generation: dict[str, Any],
+) -> str:
+    """Commit the exact prepared CREATE target and Knowledge row together."""
+    from packages.core.ai.runtime.file_actions import (
+        RuntimeFileProjectionTransactionFactory,
+        runtime_entity_filesystem_mutation_lock,
+    )
+    from packages.core.models.document import Document
+    from packages.core.services.document_metadata import merge_document_metadata
+
+    content_sha256 = await asyncio.to_thread(_sha256_file, source_path)
+    source_size = os.path.getsize(source_path)
+    async with runtime_entity_filesystem_mutation_lock(entity_root):
+        async with RuntimeFileProjectionTransactionFactory.create(entity_id) as transaction:
+            abs_path = await transaction.copy_file(
+                target.rel_path,
+                source_path,
+                expected_content_sha256=content_sha256,
+                expected_size=source_size,
+                allow_empty=False,
+                require_missing=True,
+            )
+            sync = await transaction.project_file(
+                abs_path=abs_path,
+                entity_root=entity_root,
+                source="ai_generated",
+                created_by=user_id or "ai-agent",
+                force=True,
+                workspace_id=workspace_id,
+                task_id=task_id,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                tool_name="merge_videos",
+                expected_content_sha256=content_sha256,
+            )
+            document = await transaction.db.get(Document, sync.document_id)
+            if document is None or document.entity_id != entity_id:
+                raise RuntimeError("Merged video Knowledge projection is unavailable")
+            document.mime_type = "video/mp4"
+            document.metadata_ = merge_document_metadata(document.metadata_, generation=generation)
+            await transaction.commit()
+            return sync.document_id
 
 
 async def _artifact_document_folder_id(
     *,
     entity_id: str,
+    user_id: str,
     workspace_id: str | None,
     rel_path: str,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
 ) -> str | None:
     from packages.core.services.generated_artifact_service import (
         generated_artifact_document_folder_id,
@@ -4807,8 +5450,11 @@ async def _artifact_document_folder_id(
 
     return await generated_artifact_document_folder_id(
         entity_id=entity_id,
+        user_id=user_id,
         workspace_id=workspace_id,
         rel_path=rel_path,
+        conversation_id=conversation_id,
+        task_id=task_id,
     )
 
 
@@ -4835,10 +5481,20 @@ async def _register_merged_video(
     from packages.core.database import async_session
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services.document_service import upsert_document_by_fs_path
+    from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+
+    target_workspace_id = await infer_workspace_id_from_storage_path(
+        entity_id=entity_id, rel_path=rel_path,
+    )
+    if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+        raise ValueError("Generated video belongs to another Workspace")
     folder_id = await _artifact_document_folder_id(
         entity_id=entity_id,
-        workspace_id=workspace_id,
+        user_id=user_id,
+        workspace_id=target_workspace_id,
         rel_path=rel_path,
+        conversation_id=conversation_id,
+        task_id=task_id,
     )
     async with async_session() as db:
         doc = await upsert_document_by_fs_path(
@@ -4851,6 +5507,8 @@ async def _register_merged_video(
             mime_type="video/mp4",
             source="ai_generated",
             created_by=user_id or None,
+            owner_id=user_id or None,
+            visibility="workspace" if target_workspace_id else "private",
             folder_id=folder_id,
         )
         doc.source = "ai_generated"
@@ -4881,6 +5539,14 @@ async def _register_merged_video(
         document_id = doc.id
         await db.commit()
     return document_id
+
+
+class _VideoEditorRecipeProjectionError(RuntimeError):
+    """Keep exact saved bytes observable when the later Document commit fails."""
+
+    def __init__(self, cause: Exception, saved_output: dict[str, Any]):
+        super().__init__(str(cause))
+        self.saved_output = saved_output
 
 
 async def _create_video_editor_recipe_sidecar(
@@ -4941,39 +5607,55 @@ async def _create_video_editor_recipe_sidecar(
         rel_path=recipe_rel_path,
         payload=recipe,
     )
-    recipe_document_id = await _register_video_editor_recipe(
-        entity_id=entity_id,
-        user_id=user_id,
-        filename=Path(recipe_rel_path).name,
-        rel_path=recipe_rel_path,
-        file_size=recipe_file_size,
-        final_document_id=final_document_id,
-        final_rel_path=final_rel_path,
-        timeline_path=timeline_path,
-        clean_video_path=clean_video_path,
-        subtitle_path=subtitle_path,
-        workspace_id=workspace_id,
-        task_id=task_id,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-    )
-    return {
-        "document_id": recipe_document_id,
+    saved_output = {
+        "document_id": None,
         "name": Path(recipe_rel_path).name,
         "fs_path": recipe_rel_path,
-        "result_url": f"/api/v1/fs/{entity_id}/{recipe_rel_path}",
+        "result_url": _fs_url(entity_id, recipe_rel_path),
+        "file": _produced_file(
+            entity_id, recipe_rel_path, name=Path(recipe_rel_path).name,
+            size=recipe_file_size, mime="application/json",
+        ),
         "file_size": recipe_file_size,
         "abs_path": recipe_abs_path,
         "kind": "manor.video_edit_recipe",
+        "file_saved": True,
+    }
+    try:
+        recipe_document_id = await _register_video_editor_recipe(
+            entity_id=entity_id,
+            user_id=user_id,
+            filename=Path(recipe_rel_path).name,
+            rel_path=recipe_rel_path,
+            file_size=recipe_file_size,
+            final_document_id=final_document_id,
+            final_rel_path=final_rel_path,
+            timeline_path=timeline_path,
+            clean_video_path=clean_video_path,
+            subtitle_path=subtitle_path,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+        )
+        if not recipe_document_id:
+            raise RuntimeError("Video editor recipe Knowledge projection is unavailable")
+    except Exception as exc:
+        raise _VideoEditorRecipeProjectionError(exc, saved_output) from exc
+    return {
+        **saved_output,
+        "document_id": recipe_document_id,
+        "file": _produced_file(
+            entity_id, recipe_rel_path, document_id=recipe_document_id,
+            name=Path(recipe_rel_path).name, size=recipe_file_size, mime="application/json",
+        ),
     }
 
 
 def _video_editor_recipe_rel_path(video_rel_path: str) -> str:
-    normalized = _normalize_user_path(video_rel_path)
-    path = Path(normalized)
-    filename = f"{path.stem}.video-edit.json" if path.suffix else f"{path.name}.video-edit.json"
-    parent = str(path.parent).replace("\\", "/")
-    return filename if parent == "." else f"{parent}/{filename}"
+    from packages.core.services.generated_media_naming import video_editor_recipe_path
+
+    return video_editor_recipe_path(_normalize_user_path(video_rel_path))
 
 
 def _editor_recipe_candidate_paths(
@@ -5066,6 +5748,7 @@ def _build_video_editor_recipe_payload(
         timeline=timeline,
         duration=duration,
         documents_by_path=documents_by_path,
+        include_source_audio=include_source_audio,
     )
     shots = _editor_recipe_shots(timeline, duration, clips)
     captions = _editor_recipe_captions(
@@ -5175,6 +5858,7 @@ def _write_video_editor_recipe_file(
         data,
         expected_size=len(data),
         allow_empty=False,
+        require_missing=True,
     )
     return abs_path, len(data)
 
@@ -5199,10 +5883,20 @@ async def _register_video_editor_recipe(
     from packages.core.database import async_session
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services.document_service import upsert_document_by_fs_path
+    from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+
+    target_workspace_id = await infer_workspace_id_from_storage_path(
+        entity_id=entity_id, rel_path=rel_path,
+    )
+    if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+        raise ValueError("Generated recipe belongs to another Workspace")
     folder_id = await _artifact_document_folder_id(
         entity_id=entity_id,
-        workspace_id=workspace_id,
+        user_id=user_id,
+        workspace_id=target_workspace_id,
         rel_path=rel_path,
+        conversation_id=conversation_id,
+        task_id=task_id,
     )
     async with async_session() as db:
         doc = await upsert_document_by_fs_path(
@@ -5215,6 +5909,8 @@ async def _register_video_editor_recipe(
             mime_type="application/json",
             source="ai_generated",
             created_by=user_id or None,
+            owner_id=user_id or None,
+            visibility="workspace" if target_workspace_id else "private",
             folder_id=folder_id,
         )
         doc.metadata_ = merge_document_metadata(
@@ -5272,7 +5968,7 @@ async def _attach_video_editor_recipe_to_video(
         )
         doc = result.scalar_one_or_none()
         if doc is None:
-            return
+            raise RuntimeError("Composed video Document disappeared before recipe attachment")
         doc.metadata_ = merge_document_metadata(
             doc.metadata_,
             artifact={
@@ -5581,7 +6277,10 @@ async def _resolve_timeline_audio_tracks(
             continue
         raw_path = str(item.get("path") or item.get("fs_path") or "").strip()
         if not raw_path:
-            continue
+            raise ValueError(
+                f"audio_tracks[{index}].path or fs_path is required; "
+                "source is not a supported audio path field"
+            )
         rel_path = _workspace_media_reference(
             raw_path,
             entity_id=entity_id,
@@ -5596,9 +6295,19 @@ async def _resolve_timeline_audio_tracks(
                 f"audio_tracks[{index}] source does not contain an audio stream: {rel_path}"
             )
         source_duration = max(0.01, float(media_info.get("duration_seconds") or 0.01))
-        end = _timeline_track_end(item, start, source_duration, index)
+        source_start = _coerce_required_time(
+            _first_present(item, ("source_start", "sourceStart")) or 0,
+            f"audio_tracks[{index}].source_start",
+        )
+        if not math.isfinite(source_start) or source_start >= source_duration:
+            raise ValueError(f"audio_tracks[{index}].source_start is outside the audio source")
+        if source_start and item.get("loop"):
+            raise ValueError(f"audio_tracks[{index}].source_start cannot be combined with loop")
+        end = _timeline_track_end(item, start, source_duration - source_start, index)
         if end <= start:
             raise ValueError(f"audio_tracks[{index}].end must be greater than start")
+        if source_start and source_start + end - start > source_duration + 0.001:
+            raise ValueError(f"audio_tracks[{index}] exceeds the remaining audio source")
         fade_in = max(0.0, _coerce_float(item.get("fade_in"), 0.0))
         fade_out = max(0.0, _coerce_float(item.get("fade_out"), 0.0))
         tracks.append(
@@ -5614,6 +6323,8 @@ async def _resolve_timeline_audio_tracks(
                 fade_in=fade_in,
                 fade_out=fade_out,
                 duration=end - start,
+                source_start=source_start,
+                source_duration=source_duration,
             )
         )
     return tracks
@@ -5630,6 +6341,9 @@ def _composition_duration(
 def _timeline_audio_track_items(timeline: dict[str, Any]) -> tuple[Any, str]:
     raw_tracks = timeline.get("audio_tracks")
     if raw_tracks is None:
+        raw_tracks = timeline.get("audio")
+        if isinstance(raw_tracks, list):
+            return raw_tracks, "audio"
         return timeline.get("tracks") or [], "tracks"
     return raw_tracks, "audio_tracks"
 
@@ -5695,6 +6409,7 @@ def _editor_recipe_clips(
     timeline: dict[str, Any],
     duration: float,
     documents_by_path: dict[str, dict[str, Any]],
+    include_source_audio: bool = True,
 ) -> list[dict[str, Any]]:
     items = _timeline_video_items(timeline)
     if not items:
@@ -5704,7 +6419,7 @@ def _editor_recipe_clips(
                 "label": "Final composed picture",
                 "sourceStart": 0,
                 "sourceEnd": round(max(0.05, duration), 3),
-                "muted": False,
+                "muted": not include_source_audio,
                 "color": "#0f766e",
                 "replacementPrompt": "",
                 "editNotes": "No shot-level clip list was found in the source timeline; this covers the final rendered picture master.",
@@ -5734,12 +6449,14 @@ def _editor_recipe_clips(
             "label": _editor_label(item, index, prefix="Clip"),
             "sourceStart": round(source_start, 3),
             "sourceEnd": round(source_end, 3),
-            "muted": bool(item.get("muted", False)),
+            "muted": bool(item.get("muted", False)) or not include_source_audio,
             "color": _editor_color(index),
             "assetDocumentId": asset_document_id,
             "assetName": _string_or_none(item.get("assetName") or item.get("asset_name") or (doc or {}).get("name") or Path(media_path).name),
             "assetMimeType": _string_or_none(item.get("assetMimeType") or item.get("asset_mime_type") or (doc or {}).get("mime_type")),
-            "assetDuration": round(span, 3) if asset_document_id else None,
+            # The editor clamps sourceEnd to assetDuration on load. A trimmed
+            # asset still needs its full source window, not the timeline span.
+            "assetDuration": round(source_end, 3) if asset_document_id else None,
             "replacementPrompt": str(item.get("replacement_prompt") or item.get("prompt") or item.get("video_prompt") or ""),
             "editNotes": _editor_clip_notes(item, media_path),
         }
@@ -5807,7 +6524,8 @@ def _editor_recipe_captions(
     track_by_path = {track.rel_path: track for track in audio_tracks}
     captions: list[dict[str, Any]] = []
     for item in _subtitle_items_from_payload(timeline):
-        text = _subtitle_text(item)
+        raw_text = item.get("text")
+        text = raw_text.strip() if isinstance(raw_text, str) and raw_text.strip() else _subtitle_text(item)
         if not text:
             continue
         start = _coerce_float(item.get("start"), -1.0)
@@ -5825,25 +6543,33 @@ def _editor_recipe_captions(
             continue
         cue_type = str(item.get("type") or item.get("kind") or "dialogue").lower()
         style = "narrationBox" if cue_type == "narration" else "subtitle"
-        captions.append(
-            {
-                "id": str(item.get("id") or item.get("cue_id") or f"caption-{len(captions) + 1:03d}"),
-                "speaker": _string_or_none(item.get("speaker") or item.get("character")),
-                "emotion": _string_or_none(item.get("emotion") or item.get("performance")),
-                "style": style,
-                "text": text,
-                "start": round(max(0.0, start), 3),
-                "end": round(min(duration, max(start + 0.05, end)), 3),
-                "x": 50,
-                "y": 84 if style == "subtitle" else 12,
-                "size": 32,
-                "color": "#ffffff",
-                "background": "rgba(15,23,42,0.72)",
-                "backgroundColor": "#0f172a",
-                "backgroundOpacity": 0.72,
-                "align": "center",
-            }
-        )
+        explicit_style = item.get("style")
+        if isinstance(explicit_style, str) and explicit_style in {"speechBubble", "narrationBox", "subtitle", "titleCard", "lowerThird"}:
+            style = explicit_style
+        caption = {
+            "id": str(item.get("id") or item.get("cue_id") or f"caption-{len(captions) + 1:03d}"),
+            "speaker": _string_or_none(item.get("speaker") or item.get("character")),
+            "emotion": _string_or_none(item.get("emotion") or item.get("performance")),
+            "style": style,
+            "text": text,
+            "start": round(max(0.0, start), 3),
+            "end": round(min(duration, max(start + 0.05, end)), 3),
+            "x": 50,
+            "y": 84 if style == "subtitle" else 12,
+            "size": 32,
+            "color": "#ffffff",
+            "background": "rgba(15,23,42,0.72)",
+            "backgroundColor": "#0f172a",
+            "backgroundOpacity": 0.72,
+            "align": "center",
+        }
+        for key in ("x", "y", "size", "backgroundOpacity", "fontWeight", "maxWidth", "paddingX", "paddingY"):
+            if item.get(key) is not None:
+                caption[key] = _coerce_float(item[key], caption.get(key, 0))
+        for key in ("color", "background", "backgroundColor", "align", "fontFamily"):
+            if isinstance(item.get(key), str) and item[key].strip():
+                caption[key] = item[key].strip()
+        captions.append(caption)
 
     if not captions:
         captions.extend(_editor_recipe_captions_from_subtitle_file(subtitle_abs_path or subtitle_path, duration))
@@ -5944,6 +6670,9 @@ def _editor_recipe_audio_cues(
                 "fadeIn": track.fade_in,
                 "fadeOut": track.fade_out,
                 "loop": track.loop,
+                "sourceStart": track.source_start,
+                "sourceEnd": round(track.source_start + track.duration, 3),
+                "assetDuration": track.source_duration,
                 "duckUnderDialogue": cue_type in {"music", "ambience"} or bool(raw.get("duckUnderDialogue") or raw.get("duck_under_dialogue")),
                 "muted": False,
                 "assetDocumentId": _string_or_none(
@@ -6230,6 +6959,10 @@ def _audio_mime_from_path(path: str) -> str:
 def _editor_canvas_size(spec: dict[str, Any], media_info: dict[str, Any]) -> tuple[int, int]:
     width = int(_coerce_float(media_info.get("width"), 0.0))
     height = int(_coerce_float(media_info.get("height"), 0.0))
+    if width > 0 and height > 0:
+        return width, height
+    width = int(_coerce_float(spec.get("width"), 0.0))
+    height = int(_coerce_float(spec.get("height"), 0.0))
     if width > 0 and height > 0:
         return width, height
     resolution = str(spec.get("resolution") or "")
@@ -6678,6 +7411,7 @@ async def _transcribe_narration_audio(
     user_id: str,
     entity_id: str,
     reference_transcript: str = "",
+    require_timestamps: bool = True,
     workspace_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
@@ -6727,7 +7461,7 @@ async def _transcribe_narration_audio(
         "filename": path.name,
         "user_api_key": user_key,
         "resolved_model": stt_model,
-        "require_timestamps": True,
+        "require_timestamps": require_timestamps,
         "reference_transcript": reference_transcript,
     }
     if user_base_url:
@@ -7556,7 +8290,7 @@ async def _enforce_encoded_true_peak(
     input_path: str,
     target_true_peak: float,
     total_duration: float,
-    max_attempts: int = 2,
+    max_attempts: int = 3,
 ) -> None:
     """Cap post-AAC true peak while preserving the already-normalized mix."""
     target = _loudness_true_peak(target_true_peak)
@@ -7570,23 +8304,18 @@ async def _enforce_encoded_true_peak(
         if measured <= target:
             return
 
-        # One tenth of a decibel of safety headroom absorbs measurement
-        # rounding and the small overshoot introduced by the next AAC encode.
-        if attempt == 0:
-            # First limit only transient sample peaks so the mix keeps its
-            # normalized LUFS. If AAC inter-sample overshoot survives, the
-            # next pass must attenuate the encoded mix by the measured delta.
-            limiter_ceiling_db += target - measured - 0.1
-            limiter_limit = max(
-                0.0625,
-                min(1.0, math.pow(10.0, limiter_ceiling_db / 20.0)),
-            )
-            correction_filter = (
-                f"alimiter=limit={limiter_limit:.6f}:level=false:latency=true"
-            )
-        else:
-            attenuation_db = target - measured - 0.1
-            correction_filter = f"volume={attenuation_db:.3f}dB"
+        # Lower only the limiter ceiling by the measured overage. Global volume
+        # attenuation would also lower the already-normalized integrated LUFS.
+        # FFmpeg's latency compensation can create a new encoded boundary peak,
+        # so retain the limiter lookahead instead of shifting its output.
+        limiter_ceiling_db += target - measured - 0.1
+        limiter_limit = max(
+            0.0625,
+            min(1.0, math.pow(10.0, limiter_ceiling_db / 20.0)),
+        )
+        correction_filter = (
+            f"alimiter=limit={limiter_limit:.6f}:level=false:latency=false"
+        )
         temp_path = f"{input_path}.true-peak-{generate_ulid()}.mp4"
         try:
             await _run_process(
@@ -7665,13 +8394,13 @@ async def _compose_video_file(
     preset: str,
     total_duration: float,
     clean_video_duration: float | None = None,
+    canvas_height: int = 0,
 ) -> tuple[str, str, str]:
+    from packages.core.ai.runtime.file_actions import RuntimeFileCommitGuardFactory
+    from packages.core.ai.runtime.media_outputs import runtime_generated_media_target
     from packages.core.services import entity_fs
     from packages.core.services.generated_media_naming import (
-        build_generated_media_target,
         resolve_workspace_artifact_base_dir,
-        scope_workspace_artifact_path,
-        workspace_artifact_default_dir,
     )
 
     entity_root = entity_fs.get_entity_root(entity_id)
@@ -7680,20 +8409,23 @@ async def _compose_video_file(
         workspace_id=workspace_id,
         task_id=task_id,
     )
-    target = build_generated_media_target(
+    target = runtime_generated_media_target(
+        kind="video",
+        entity_id=entity_id,
+        workspace_base_dir=workspace_base_dir,
         prompt=output_name,
-        desired_name=scope_workspace_artifact_path(
-            output_name,
-            workspace_base_dir,
-            preserve_leaf_default=True,
-        ),
+        output_name=output_name,
         ext=".mp4",
-        fallback="composed-video",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
         entity_root=entity_root,
     )
     if not target.abs_dir or not target.abs_path:
         raise ValueError("Could not resolve output path")
+    # Reject known collisions or incomplete legacy grants before rendering.
+    # Each atomic write repeats this guard to close the intervening race.
+    guard = RuntimeFileCommitGuardFactory.create(entity_id, require_missing=True)
+    for path in (target.rel_path, _video_editor_recipe_rel_path(target.rel_path)):
+        absolute = os.path.join(entity_root, path)
+        guard(path, os.path.lexists(absolute), os.path.realpath(absolute))
     os.makedirs(target.abs_dir, exist_ok=True)
 
     args = [ffmpeg, "-y", "-i", clean_video_abs]
@@ -7710,7 +8442,9 @@ async def _compose_video_file(
     if extension_seconds > 0.001:
         video_filters.append(f"tpad=stop_mode=clone:stop_duration={extension_seconds:.3f}")
     if subtitle_abs:
-        video_filters.append(f"subtitles={_subtitles_filter_value(subtitle_abs, subtitle_style)}")
+        video_filters.append(
+            f"subtitles={_subtitles_filter_value(subtitle_abs, subtitle_style, canvas_height=canvas_height)}"
+        )
     if video_filters:
         video_map = "vout"
         filter_parts.append(f"[0:v:0]{','.join(video_filters)}[vout]")
@@ -7730,7 +8464,8 @@ async def _compose_video_file(
         effects = [
             f"[{index}:a:0]aresample=48000",
             "aformat=sample_fmts=fltp:channel_layouts=stereo",
-            f"atrim=0:{duration:.3f}",
+            (f"atrim={track.source_start:.3f}:{track.source_start + duration:.3f}"
+             if track.source_start else f"atrim=0:{duration:.3f}"),
             "asetpts=PTS-STARTPTS",
             f"volume={track.volume_db}dB",
         ]
@@ -7818,6 +8553,7 @@ async def _compose_video_file(
             rendered_path,
             expected_size=os.path.getsize(rendered_path),
             allow_empty=False,
+            require_missing=True,
         )
     return target.abs_path, target.rel_path, target.filename
 
@@ -7919,10 +8655,12 @@ def _frame_sample_times(
     end_margin = min(0.1, duration / 2)
     end_time = round(max(0.0, duration - end_margin), 3)
     candidates = {0.0, end_time}
+    requested: set[float] = set()
     for value in [*(timestamps or []), *(scene_boundaries or [])]:
         number = float(_probe_number(value))
         if 0 <= number < duration:
-            candidates.add(round(min(number, end_time), 3))
+            requested.add(round(min(number, end_time), 3))
+    candidates |= requested
 
     interval = max(0.25, float(_probe_number(interval_seconds)) or 10.0)
     cursor = interval
@@ -7934,6 +8672,15 @@ def _frame_sample_times(
     limit = max(1, min(24, int(max_samples or 12)))
     if len(ordered) <= limit:
         return ordered
+    # The moments a caller asked for come first; coverage frames fill the rest
+    # (a capped request for the closing frame must not return the opening one).
+    if requested:
+        chosen = sorted(requested)[:limit]
+        if len(chosen) < limit:
+            spare = [value for value in ordered if value not in requested]
+            step = len(spare) / (limit - len(chosen))
+            chosen += [spare[int(index * step)] for index in range(limit - len(chosen))]
+        return sorted(set(chosen))
     if limit == 1:
         return [ordered[0]]
     indexes = {
@@ -8309,14 +9056,16 @@ async def _normalize_clip(
             "-c:a",
             "aac",
             "-filter:a",
-            _atempo_filter(speed),
+            # AAC packet rounding must not truncate the last video frame or
+            # accumulate drift across chapters. Pad only the missing audio tail;
+            # the explicit output -t remains the authoritative cut duration.
+            _atempo_filter(speed) + f",apad=whole_dur={output_span:.3f}",
             "-ar",
             "48000",
             "-ac",
             "2",
             "-t",
             f"{output_span:.3f}",
-            "-shortest",
             output_path,
         ]
     else:
@@ -8514,18 +9263,14 @@ def _clamp_float(value: Any, minimum: float, maximum: float, default: float) -> 
 
 
 def _rel_path_from_reference(value: str | None, entity_id: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        return ""
-    parsed = urlparse(raw)
-    path = parsed.path if parsed.scheme or parsed.netloc else raw
-    marker = f"/api/v1/fs/{entity_id}/"
-    if path.startswith(marker):
-        return _normalize_user_path(unquote(path[len(marker):]))
-    alt_marker = f"api/v1/fs/{entity_id}/"
-    if path.startswith(alt_marker):
-        return _normalize_user_path(unquote(path[len(alt_marker):]))
-    return ""
+    rel_path = _entity_fs_url_path(value, entity_id)
+    return _normalize_user_path(rel_path) if rel_path else ""
+
+
+def _entity_fs_url_path(value: str | None, entity_id: str) -> str:
+    """The literal entity path of this entity's fs URL, hidden areas included."""
+    parsed = parse_entity_fs_url((value or "").strip())
+    return parsed[1] if parsed is not None and parsed[0] == entity_id else ""
 
 
 def _workspace_media_reference(
@@ -8534,15 +9279,64 @@ def _workspace_media_reference(
     entity_id: str,
     workspace_base_dir: str = "",
 ) -> str:
-    """Resolve a media input reference inside its Workspace storage root."""
-    from packages.core.services.generated_media_naming import scope_workspace_artifact_path
+    """Scope logical inputs without relocating explicit Workspace sources."""
+    from packages.core.services.generated_media_naming import (
+        scope_workspace_artifact_path,
+        workspace_storage_root,
+    )
 
     rel_path = _rel_path_from_reference(value, entity_id) or str(value or "").strip()
     if not rel_path:
         return ""
-    if workspace_base_dir:
+    # Existing source references identify bytes, not a new output destination.
+    # An explicit Workspace (canonical or legacy) must never be rebound to the
+    # active Workspace's same-named file. Unknown legacy identities remain
+    # literal and fail normal existence/ACL checks rather than being guessed.
+    if workspace_base_dir and not workspace_storage_root(rel_path):
         rel_path = scope_workspace_artifact_path(rel_path, workspace_base_dir)
     return _normalize_user_path(rel_path)
+
+
+async def _resolve_video_analysis_source(
+    *,
+    entity_id: str,
+    input_path: str,
+    workspace_id: str | None,
+    task_id: str | None = None,
+) -> tuple[str, str, bool]:
+    """Resolve an existing video, including a current-chat upload with its ACL."""
+    from packages.core.services.ai_file_permissions import is_chat_upload_path
+    from packages.core.services.entity_fs import get_entity_root
+    from packages.core.services.knowledge_visibility import normalize_rel_path
+
+    entity_root = get_entity_root(entity_id)
+    upload_path = normalize_rel_path(
+        _entity_fs_url_path(input_path, entity_id) or unquote(urlparse(input_path.strip()).path)
+    )
+    if is_chat_upload_path(upload_path):
+        access = _CURRENT_MEDIA_FILE_ACCESS.get()
+        blocked = await runtime_guard_file_read_access(
+            entity_id=entity_id,
+            user_id=access.user_id if access else None,
+            conversation_id=access.conversation_id if access else None,
+            workspace_id=workspace_id,
+            runtime_envelope=access.runtime_envelope if access else None,
+            tool_name=access.tool_name if access else "probe_media",
+            paths=[upload_path],
+        )
+        root = os.path.realpath(entity_root)
+        absolute = os.path.realpath(os.path.join(root, upload_path))
+        if blocked or os.path.commonpath([root, absolute]) != root or not os.path.isfile(absolute):
+            raise ValueError(f"Media file not found or access denied: {upload_path}")
+        return upload_path, absolute, True
+
+    workspace_base_dir = await _workspace_media_base_dir(
+        entity_id=entity_id, workspace_id=workspace_id, task_id=task_id,
+    )
+    rel_input = _workspace_media_reference(
+        input_path, entity_id=entity_id, workspace_base_dir=workspace_base_dir,
+    )
+    return rel_input, await _resolve_entity_file(entity_root, rel_input), False
 
 
 async def _workspace_media_base_dir(
@@ -8627,10 +9421,76 @@ def _assert_subtitle_path(abs_path: str) -> None:
         raise ValueError(f"Unsupported subtitle extension: {abs_path}")
 
 
-def _subtitles_filter_value(abs_path: str, style: dict[str, Any] | None = None) -> str:
+_ASS_TIME = re.compile(r"^\s*(?:(\d+):)?(?:(\d{1,2}):)?(\d{1,2}(?:[.,]\d+)?)\s*$")
+
+
+def _ass_timestamp(value: str) -> str:
+    """``H:MM:SS.cc`` from any of ``H:MM:SS.cc``, ``M:SS.cc``, or ``SS.cc``."""
+    match = _ASS_TIME.match(value)
+    if not match:
+        return value
+    first, second, seconds = match.groups()
+    hours, minutes = (first, second) if second is not None else ("0", first or "0")
+    total = int(hours) * 3600 + int(minutes) * 60 + float(seconds.replace(",", "."))
+    centis = int(round(total * 100))
+    return f"{centis // 360000}:{centis // 6000 % 60:02d}:{centis // 100 % 60:02d}.{centis % 100:02d}"
+
+
+def _burnable_ass_copy(abs_path: str, directory: str) -> str:
+    """A copy of an ASS file whose Dialogue times are all ``H:MM:SS.cc``.
+
+    libass misreads a short time such as ``0:17.50`` (it showed a closing
+    title for the whole video and hid another), so every event start and end
+    is normalized before burning.
+    """
+    with open(abs_path, encoding="utf-8-sig") as handle:
+        lines = handle.read().splitlines()
+    fixed = []
+    for line in lines:
+        head, sep, rest = line.partition(":")
+        if sep and head.strip().lower() in {"dialogue", "comment"}:
+            fields = rest.split(",", 9)
+            if len(fields) == 10:
+                fields[1] = _ass_timestamp(fields[1])
+                fields[2] = _ass_timestamp(fields[2])
+                line = f"{head}:{','.join(fields)}"
+        fixed.append(line)
+    copy_path = os.path.join(directory, Path(abs_path).name)
+    with open(copy_path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(fixed) + "\n")
+    return copy_path
+
+
+def _ass_style_count(abs_path: str) -> int:
+    try:
+        with open(abs_path, encoding="utf-8-sig") as handle:
+            return sum(1 for line in handle if line.lstrip().lower().startswith("style:"))
+    except OSError:
+        return 0
+
+
+def _subtitles_filter_value(
+    abs_path: str,
+    style: dict[str, Any] | None = None,
+    *,
+    canvas_height: int = 0,
+) -> str:
     escaped = abs_path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
     value = f"'{escaped}'"
-    force_style = _subtitle_force_style(style or {})
+    resolved_style = dict(style or {})
+    if Path(abs_path).suffix.lower() == ".ass" and _ass_style_count(abs_path) > 1:
+        # An ASS file with several styles (titles and captions) places each
+        # on purpose; one forced style would flatten them all into one.
+        resolved_style = {}
+    if canvas_height > 0 and Path(abs_path).suffix.lower() in {".srt", ".vtt"}:
+        # libass imports these formats with a 288-line script resolution.
+        # Their force_style dimensions otherwise grow with the output frame.
+        scale = 288 / canvas_height
+        for key in ("font_size", "fontsize", "margin_v", "outline", "shadow"):
+            if key in resolved_style:
+                desired = _coerce_float(resolved_style[key], 0)
+                resolved_style[key] = max(1 if desired > 0 and key != "margin_v" else 0, round(desired * scale))
+    force_style = _subtitle_force_style(resolved_style)
     if force_style:
         value += f":force_style='{force_style}'"
     return value
@@ -8756,6 +9616,31 @@ def _json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _fs_url(entity_id: str, rel_path: str) -> str:
+    """Legacy ``result_url``-style address: always the encoded fs route.
+
+    Callers decode these back to an fs path, so they never take the viewer form.
+    """
+    return entity_fs_open_url(entity_id, rel_path)
+
+
+def _produced_file(
+    entity_id: str,
+    rel_path: str,
+    *,
+    document_id: Any = None,
+    name: Any = None,
+    size: Any = None,
+    mime: Any = None,
+    sha256: Any = None,
+) -> dict[str, Any]:
+    """The FileRef of one file a media tool produced."""
+    return file_ref(
+        entity_id=entity_id, fs_path=rel_path, document_id=document_id or None,
+        name=name, mime=mime, size=size, sha256=sha256,
+    )
+
+
 def _json_error(message: str, *, code: str = "invalid_request") -> str:
     return _json({"status": "error", "code": code, "error": message})
 
@@ -8764,8 +9649,112 @@ def _json_blocked(message: str, *, code: str, **details: Any) -> str:
     return _json({"status": "blocked", "code": code, "error": message, **details})
 
 
+async def _free_music_actor(db: Any, *, entity_id: str, user_id: str) -> Any:
+    """Recheck the current actor and build the same request-local User view as the API."""
+    from sqlalchemy.orm.attributes import set_committed_value
+
+    from packages.core.models.user import User
+    from packages.core.services.actor_authorization import (
+        AuthenticatedUserCredential,
+        resolve_current_user_actor,
+    )
+
+    credential = AuthenticatedUserCredential(
+        user_id=user_id, entity_id=entity_id, token_version=None,
+    )
+    actor = await resolve_current_user_actor(db, credential)
+    if actor is None:
+        raise PermissionError("Current user has no active access to this Entity")
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None:
+        raise PermissionError("Current user is unavailable")
+    user._authenticated_user_credential = credential
+    set_committed_value(user, "entity_id", actor.entity_id)
+    set_committed_value(user, "role", actor.display_role)
+    return user
+
+
+@_with_media_file_access
+async def _search_free_music_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    query: str = "",
+    page: int = 1,
+    **_: Any,
+) -> str:
+    from packages.core.database import async_session
+    from packages.core.services.open_music_catalog import search_open_music
+
+    access = _CURRENT_MEDIA_FILE_ACCESS.get()
+    actor_id = str((access.user_id if access else user_id) or "").strip()
+    if not entity_id or not actor_id or not query.strip():
+        return _json_error("Entity, current user, and query are required", code="invalid_request")
+    try:
+        async with async_session() as db:
+            await _free_music_actor(db, entity_id=entity_id, user_id=actor_id)
+        result = await search_open_music(query.strip(), page=max(1, int(page)), page_size=18)
+        return _json({"status": "ok", **result})
+    except Exception as exc:
+        return _json_error(str(exc), code="free_music_search_failed")
+
+
+@_with_media_file_access
+async def _import_free_music_handler(
+    *,
+    entity_id: str = "",
+    user_id: str = "",
+    track_id: str = "",
+    source_document_id: str = "",
+    **_: Any,
+) -> str:
+    from fastapi import HTTPException
+
+    from apps.api.routers.media import FreeMusicImportRequest, import_free_music
+    from packages.core.database import async_session
+    from packages.core.services.document_service import StorageLimitExceeded
+
+    access = _CURRENT_MEDIA_FILE_ACCESS.get()
+    actor_id = str((access.user_id if access else user_id) or "").strip()
+    if not entity_id or not actor_id or not track_id.strip() or not source_document_id.strip():
+        return _json_error(
+            "Entity, current user, track_id, and source_document_id are required",
+            code="invalid_request",
+        )
+    try:
+        async with async_session() as db:
+            user = await _free_music_actor(db, entity_id=entity_id, user_id=actor_id)
+            imported = await import_free_music(
+                body=FreeMusicImportRequest(
+                    track_id=track_id.strip(),
+                    source_document_id=source_document_id.strip(),
+                ),
+                user=user,
+                db=db,
+            )
+        return _json({
+            "status": "completed",
+            "document": {
+                **imported.document,
+                "document_id": imported.document.get("id"),
+            },
+            "track": imported.track.model_dump(),
+        })
+    except StorageLimitExceeded as exc:
+        return _json_blocked(
+            str(exc), code="knowledge_storage_limit",
+            plan=exc.plan, limit=exc.limit, current=exc.current,
+        )
+    except HTTPException as exc:
+        return _json_error(str(exc.detail), code="free_music_import_denied")
+    except Exception as exc:
+        return _json_error(str(exc), code="free_music_import_failed")
+
+
 def get_tools():
     return [
+        (SEARCH_FREE_MUSIC_SCHEMA, _search_free_music_handler),
+        (IMPORT_FREE_MUSIC_SCHEMA, _import_free_music_handler),
         (WAIT_MEDIA_JOBS_SCHEMA, _wait_media_jobs_handler),
         (MERGE_VIDEOS_SCHEMA, _merge_videos_handler),
         (ALIGN_SUBTITLES_SCHEMA, _align_subtitles_handler),
@@ -8777,6 +9766,7 @@ def get_tools():
         (PROBE_MEDIA_SCHEMA, _probe_media_handler),
         (VERIFY_STICKMAN_FINAL_MEDIA_SCHEMA, _verify_stickman_final_media_handler),
         (RENDER_FRAME_SAMPLES_SCHEMA, _render_frame_samples_handler),
+        (TRANSCRIBE_VIDEO_SCHEMA, _transcribe_video_handler),
         (ANALYZE_AUDIO_SCHEMA, _analyze_audio_handler),
         (VALIDATE_SUBTITLES_SCHEMA, _validate_subtitles_handler),
         (STILL_TO_VIDEO_SCHEMA, _still_to_video_handler),

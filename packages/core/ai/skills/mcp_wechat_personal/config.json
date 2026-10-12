@@ -13,5 +13,9 @@
     "mcp__wechat_personal__send_direct_message",
     "mcp__wechat_personal__get_bot_status",
     "mcp__wechat_personal__get_qr_code"
-  ]
+  ],
+  "search": {
+    "terms": ["wechat", "weixin", "group chat", "qr login", "contact", "chinese messaging", "bot runner"],
+    "examples": ["reply to wechat group message", "send message to wechat contact", "re-scan wechat login qr code", "check wechat bot runner status"]
+  }
 }

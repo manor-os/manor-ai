@@ -2,11 +2,13 @@
 
 Marketplace blueprints, including platform-owned built-ins, are served from
 ``workspace_blueprints``. Platform configs are published into that table by
-the startup seeder; historical ``builtin:<slug>`` and slug-only handles resolve
-to the same canonical row.
+the Cloud deployment publisher or the single-machine OSS startup owner;
+historical ``builtin:<slug>`` and slug-only handles resolve to the same
+canonical row.
 
 Endpoints:
 
+  POST   /api/v1/workspaces/{id}/export-blueprint-payload  export portable config
   POST   /api/v1/workspaces/{id}/export-blueprint   export current ws as draft
   GET    /api/v1/blueprints                          list mine
   GET    /api/v1/blueprints/{id}                     fetch one (mine or published)
@@ -21,6 +23,7 @@ from __future__ import annotations
 import logging
 import json
 import os
+import re
 import secrets
 import tempfile
 from datetime import datetime, timezone
@@ -37,7 +40,6 @@ from packages.core.constants.blueprints import (
     BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
     BLUEPRINT_KNOWLEDGE_LIST_PAGE_SIZE,
     BLUEPRINT_KNOWLEDGE_LIST_MAX_PAGE_SIZE,
-    BlueprintPurchaseStatus,
     BlueprintStatus,
 )
 from packages.core.blueprints import (
@@ -58,8 +60,7 @@ from packages.core.blueprints.exporter import (
     ExportContext,
     list_exportable_knowledge_documents,
 )
-from packages.core.blueprints.freshness import blueprint_content_fingerprint
-from packages.core.blueprints.installer import resolve_install_variables
+from packages.core.blueprints.installer import author_hard_blocks, resolve_install_variables
 from packages.core.blueprints.payload import PayloadError, migrate_payload
 from packages.core.blueprints.setup_preflight import (
     BlueprintSetupPreflight,
@@ -77,13 +78,14 @@ from packages.core.models.blueprint import (
     BlueprintFavorite,
     WorkspaceBlueprint,
 )
-from packages.core.models.blueprint_purchase import BlueprintPurchase
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
 from packages.core.permissions import Permission, check_effective_user_permission
 from packages.core.services.blueprint_cover_service import (
     build_blueprint_cover_template,
 )
+from packages.core.services.file_refs import parse_file_reference
+from packages.core.services.generated_file_refs import entity_fs_open_url
 from packages.core.services.entity_fs import (
     EntityFilesystemError,
     assert_entity_filesystem_ready,
@@ -91,11 +93,16 @@ from packages.core.services.entity_fs import (
     resolve_path,
 )
 from packages.core.services.entity_service import get_workspace
-from packages.core.services.workspace_access import user_can_manage_workspace
+from packages.core.services.workspace_access import (
+    lock_workspace_access_boundary,
+    lock_workspace_recipient_authorization,
+    user_can_manage_workspace,
+)
 from packages.core.services.marketplace_billing import (
-    blueprint_delivery_requires_paid_plan,
+    blueprint_delivery_is_paid,
     blueprint_delivery_source,
 )
+from packages.core.services.user_email_proof import email_is_verified
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +117,16 @@ BLUEPRINT_SHOWCASE_IMAGE_MAX_BYTES = 12 * 1024 * 1024
 BLUEPRINT_SHOWCASE_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 _SHOWCASE_IMAGE_EXTENSIONS = {".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"}
 _SHOWCASE_VIDEO_EXTENSIONS = {".m4v", ".mov", ".mp4", ".webm"}
+_SHOWCASE_MIME_EXTENSIONS = {
+    "image/avif": ".avif",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+}
 _BLUEPRINT_CONFIGURATION_INVALID_DETAIL = (
     "Blueprint configuration or personalization is invalid."
 )
@@ -142,16 +159,12 @@ class BlueprintInstallVariableDeclaration(BaseModel):
         return value
 
 
-class ExportBlueprintRequest(BaseModel):
-    # Exact Marketplace counterpart when editing a previously published
-    # Workspace. Omit for the first export; the server records the minted id.
-    marketplace_blueprint_id: Optional[str] = Field(None, max_length=160)
-    slug: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]$")
-    title: str = Field(..., min_length=1, max_length=200)
+class ExportBlueprintPayloadRequest(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
     summary: Optional[str] = Field(None, max_length=500)
     description: Optional[str] = None
+    usage_guide: Optional[str] = Field(None, max_length=10000)
     tags: list[str] = Field(default_factory=list)
-    cover_image_url: Optional[str] = None
     author_handle: Optional[str] = None
     author_display_name: Optional[str] = None
     # Personalization schema is authored by the Blueprint creator. Installer
@@ -166,6 +179,7 @@ class ExportBlueprintRequest(BaseModel):
     include_stats: bool = True
     include_scheduled_jobs: bool = True
     include_workflows: bool = True
+    include_blocking_setup: bool = True
     include_custom_fields: bool = True
     include_governance: bool = True
     include_channel_requirements: bool = True
@@ -178,16 +192,12 @@ class ExportBlueprintRequest(BaseModel):
     # Deprecated alias retained for existing clients. True maps to
     # knowledge_pack_mode=inline_text when the explicit mode is omitted.
     include_memory_files: bool = False
-    # Request-only local Document ids. They select exact safe Markdown bodies
+    # Request-only local Document ids. They select exact safe text bodies
     # and are never persisted in the portable Blueprint payload.
     knowledge_document_ids: Optional[list[str]] = Field(
         None,
         max_length=BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS,
     )
-    # Re-freeze the editable Blueprint with this slug when it came from the
-    # same Workspace. Reviewed/published payloads remain immutable.
-    replace_existing: bool = False
-
     @model_validator(mode="after")
     def validate_knowledge_document_selection(self):
         if self.install_variables is not None:
@@ -214,6 +224,25 @@ class ExportBlueprintRequest(BaseModel):
                 "knowledge_document_ids requires knowledge_pack_mode='inline_text'"
             )
         return self
+
+
+class WorkspaceBlueprintPayloadSource(BaseModel):
+    workspace_id: str = Field(..., min_length=1, max_length=26)
+    export_options: ExportBlueprintPayloadRequest = Field(
+        default_factory=ExportBlueprintPayloadRequest,
+    )
+
+
+class ExportBlueprintRequest(ExportBlueprintPayloadRequest):
+    # Exact Marketplace counterpart when editing a previously published
+    # Workspace. Omit for the first export; the server records the minted id.
+    marketplace_blueprint_id: Optional[str] = Field(None, max_length=160)
+    slug: str = Field(..., pattern=r"^[a-z0-9][a-z0-9_-]{1,118}[a-z0-9]$")
+    title: str = Field(..., min_length=1, max_length=200)
+    cover_image_url: Optional[str] = None
+    # Re-freeze the editable Blueprint with this slug when it came from the
+    # same Workspace. Reviewed/published payloads remain immutable.
+    replace_existing: bool = False
 
 
 class BlueprintExportKnowledgeGroup(BaseModel):
@@ -260,6 +289,9 @@ class BlueprintSetupPreview(BaseModel):
     not_included: list[str] = Field(default_factory=list)
     services: list[BlueprintSetupItem] = Field(default_factory=list)
     rules: list[str] = Field(default_factory=list)
+    #: never_allow entries the author shipped. Installed as approval gates
+    #: unless the operator opts in with ``install_author_hard_blocks``.
+    author_hard_blocks: list[str] = Field(default_factory=list)
 
 
 class BlueprintShowcaseAsset(BaseModel):
@@ -297,6 +329,7 @@ class BlueprintSummary(BaseModel):
     status: str
     install_count: int
     payload_version: str
+    content_version: str
     source_workspace_id: Optional[str] = None
     cover_image_url: Optional[str] = None
     showcase_assets: list[BlueprintShowcaseAsset] = Field(default_factory=list)
@@ -317,6 +350,7 @@ class BlueprintSummary(BaseModel):
     currency: str = "usd"
     purchase_count: int = 0
     has_share_token: bool = False
+    share_allowed_emails: list[str] = Field(default_factory=list)
     # Whether the *caller* owns this row. Built-in marketplace blueprints
     # and other tenants' published blueprints are never "owned" by the
     # viewer, even though they're visible. The frontend uses this (not
@@ -336,6 +370,7 @@ class UpdateBlueprintRequest(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=200)
     summary: Optional[str] = Field(None, max_length=500)
     description: Optional[str] = None
+    usage_guide: Optional[str] = Field(None, max_length=10000)
     tags: Optional[list[str]] = None
     cover_image_url: Optional[str] = None
 
@@ -351,16 +386,40 @@ class ShareTokenResponse(BaseModel):
     share_token: str
 
 
+class ShareTokenRequest(BaseModel):
+    # None retains the current setting when rotating an existing link.
+    # An explicit empty list restores the legacy any-signed-in-user link.
+    allowed_emails: Optional[list[str]] = Field(None, max_length=50)
+
+    @field_validator("allowed_emails")
+    @classmethod
+    def normalize_emails(cls, value: Optional[list[str]]) -> Optional[list[str]]:
+        if value is None:
+            return None
+        emails = [email.strip().casefold() for email in value]
+        if any(
+            len(email) > 255
+            or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+            for email in emails
+        ):
+            raise ValueError("allowed_emails must contain valid email addresses")
+        return list(dict.fromkeys(emails))
+
+
 class InstallBlueprintRequest(BaseModel):
     mode: InstallMode = InstallMode.SIMULATE
     workspace_name: Optional[str] = Field(None, max_length=200)
     share_token: Optional[str] = None
     create_missing_agents: bool = False
+    agent_ids_by_service_key: dict[str, str] = Field(default_factory=dict)
     variable_values: dict[str, Any] = Field(default_factory=dict)
     channel_config_ids: dict[str, str] = Field(default_factory=dict)
+    #: The author's never_allow entries are installed as approval gates unless
+    #: the operator explicitly asks for the hard blocks.
+    install_author_hard_blocks: bool = False
     governance_preset: str = Field(
-        "standard",
-        pattern="^(safe|standard|aggressive)$",
+        "automatic",
+        pattern="^(automatic|follow_default|confirm_changes|risk_based)$",
         description="Overlay applied to the blueprint's governance policy.",
     )
 
@@ -500,6 +559,15 @@ class PromoteResponse(BaseModel):
     promoted: bool
     unmet: list[UnmetRequirementResponse]
     notes: list[str]
+
+
+class InstallPayloadPreflightRequest(BaseModel):
+    """Read-only setup request for a portable JSON payload."""
+
+    payload: dict[str, Any]
+    mode: InstallMode = InstallMode.LIVE
+    variable_values: dict[str, Any] = Field(default_factory=dict)
+    channel_config_ids: dict[str, str] = Field(default_factory=dict)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -670,6 +738,7 @@ def _payload_setup_preview(payload: dict[str, Any] | None) -> BlueprintSetupPrev
         not_included=_string_list(expected.get("not_included")),
         services=services,
         rules=_string_list(operating_model.get("rules")),
+        author_hard_blocks=author_hard_blocks(p),
     )
 
 
@@ -727,6 +796,7 @@ def _summary(
         status=b.status,
         install_count=b.install_count,
         payload_version=b.payload_version,
+        content_version=b.content_version,
         source_workspace_id=b.source_workspace_id,
         cover_image_url=b.cover_image_url,
         showcase_assets=_showcase_assets(b.showcase_assets),
@@ -760,6 +830,7 @@ def _summary(
         purchase_count=b.purchase_count,
         # share-token existence is owner-only metadata.
         has_share_token=bool(b.share_token) if is_owner else False,
+        share_allowed_emails=list(b.share_allowed_emails or []) if is_owner else [],
         is_owner=is_owner,
     )
 
@@ -989,6 +1060,17 @@ def _sniff_showcase_file(path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _showcase_asset_relative_path(
+    blueprint_id: str,
+    asset_id: str,
+    mime_type: str | None,
+) -> str | None:
+    extension = _SHOWCASE_MIME_EXTENSIONS.get(str(mime_type or "").lower())
+    if extension is None:
+        return None
+    return f"marketplace/blueprints/{blueprint_id}/{asset_id}{extension}"
+
+
 async def _persist_showcase_upload(
     *,
     entity_id: str,
@@ -1037,9 +1119,11 @@ async def _persist_showcase_upload(
             )
 
         asset_id = generate_ulid()
-        rel_path = (
-            f"marketplace/blueprints/{blueprint_id}/{asset_id}{extension}"
-        )
+        rel_path = _showcase_asset_relative_path(
+            blueprint_id,
+            asset_id,
+            mime_type,
+        ) or f"marketplace/blueprints/{blueprint_id}/{asset_id}{extension}"
         copy_entity_file_atomic(
             entity_id,
             rel_path,
@@ -1050,7 +1134,7 @@ async def _persist_showcase_upload(
         return {
             "id": asset_id,
             "kind": kind,
-            "url": f"/api/v1/fs/{entity_id}/{rel_path}",
+            "url": entity_fs_open_url(entity_id, rel_path),
             "mime_type": mime_type,
             "size_bytes": total,
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
@@ -1062,14 +1146,20 @@ async def _persist_showcase_upload(
             pass
 
 
+def _showcase_entity_rel_path(row: WorkspaceBlueprint, url: Any) -> str | None:
+    """Entity path of a showcase file this Blueprint uploaded, else ``None``."""
+    file_ref = parse_file_reference(url)
+    if file_ref is None or not row.entity_id or file_ref.entity_id != row.entity_id:
+        return None
+    if not file_ref.fs_path.startswith(f"marketplace/blueprints/{row.id}/"):
+        return None
+    return file_ref.fs_path
+
+
 def _remove_showcase_file(row: WorkspaceBlueprint, asset: dict[str, Any]) -> None:
-    expected_prefix = (
-        f"/api/v1/fs/{row.entity_id}/marketplace/blueprints/{row.id}/"
-    )
-    url = str(asset.get("url") or "")
-    if not url.startswith(expected_prefix):
+    rel_path = _showcase_entity_rel_path(row, asset.get("url"))
+    if rel_path is None:
         return
-    rel_path = url.removeprefix(f"/api/v1/fs/{row.entity_id}/")
     full_path = resolve_path(row.entity_id, rel_path)
     if full_path and os.path.isfile(full_path):
         try:
@@ -1090,15 +1180,10 @@ async def _require_published_blueprint(
 
 async def _completed_purchase(
     db: AsyncSession, blueprint_id: str, entity_id: str,
-) -> BlueprintPurchase | None:
+) -> Any | None:
     """Return the live purchase entitlement held by ``entity_id``."""
-    return (await db.execute(
-        select(BlueprintPurchase).where(
-            BlueprintPurchase.blueprint_id == blueprint_id,
-            BlueprintPurchase.buyer_entity_id == entity_id,
-            BlueprintPurchase.status == BlueprintPurchaseStatus.COMPLETED.value,
-        )
-    )).scalar_one_or_none()
+    purchase = None
+    return purchase
 
 
 async def _has_completed_purchase(
@@ -1112,28 +1197,17 @@ async def _paid_purchase_matching_payload(
     db: AsyncSession,
     payload: dict[str, Any],
     entity_id: str,
-) -> tuple[BlueprintPurchase, WorkspaceBlueprint, str | None] | None:
+) -> tuple[Any, WorkspaceBlueprint, str | None] | None:
     """Return paid provenance for an exact owned snapshot/current release.
 
     This match is provenance metadata only. Cloud raw imports are plan-gated
     independently because client-supplied JSON cannot prove it was not copied
     from or trivially modified from paid Marketplace content.
     """
-    rows = (await db.execute(
-        select(BlueprintPurchase, WorkspaceBlueprint)
-        .join(
-            WorkspaceBlueprint,
-            WorkspaceBlueprint.id == BlueprintPurchase.blueprint_id,
-        )
-        .where(
-            BlueprintPurchase.buyer_entity_id == entity_id,
-            BlueprintPurchase.status == BlueprintPurchaseStatus.COMPLETED.value,
-            BlueprintPurchase.amount_cents > 0,
-        )
-    )).all()
+    rows: list[tuple[Any, WorkspaceBlueprint]] = []
     matches: dict[
         str,
-        tuple[BlueprintPurchase, WorkspaceBlueprint, str | None],
+        tuple[Any, WorkspaceBlueprint, str | None],
     ] = {}
     # Prefer the current published release for each Blueprint when it also
     # equals the receipt. Provenance is attached only when the payload resolves
@@ -1182,7 +1256,7 @@ async def _published_platform_blueprint_matching_payload(
     db: AsyncSession,
     payload: dict[str, Any],
 ) -> WorkspaceBlueprint | None:
-    """Return the official row only when its installable content is exact."""
+    """Return the official row only when the complete JSON payload is exact."""
     payload_slug = str(_manifest(payload).get("slug") or "").strip()
     if not payload_slug:
         return None
@@ -1195,8 +1269,8 @@ async def _published_platform_blueprint_matching_payload(
         row is None
         or row.entity_id is not None
         or row.status != BlueprintStatus.PUBLISHED
-        or blueprint_content_fingerprint(row.payload)
-        != blueprint_content_fingerprint(payload)
+        or json.dumps(row.payload, sort_keys=True)
+        != json.dumps(payload, sort_keys=True)
     ):
         return None
     return row
@@ -1205,10 +1279,12 @@ async def _published_platform_blueprint_matching_payload(
 async def _load_blueprint(
     db: AsyncSession, blueprint_id: str, entity_id: str,
     *, allow_published: bool = True, share_token: Optional[str] = None,
+    viewer: User | None = None,
 ) -> WorkspaceBlueprint:
     """Loader with tenant + visibility check. Owners always see their
     own; anyone authenticated sees published ones. A valid share token
-    unlocks any status (unlisted distribution), and a completed purchase
+    unlocks any status (unlisted distribution); when an email list is set,
+    the recipient must have a matching verified email. A completed purchase
     keeps the blueprint visible to its buyer even after the seller
     archives/unpublishes it (spec §4.3/§5.3).
 
@@ -1220,15 +1296,30 @@ async def _load_blueprint(
         raise HTTPException(404, "blueprint not found")
     if row.entity_id != entity_id:
         if not (allow_published and row.status == BlueprintStatus.PUBLISHED):
-            token_ok = allow_published and bool(share_token) and bool(
-                row.share_token
-            ) and share_token == row.share_token
+            token_ok = (
+                allow_published
+                and bool(share_token)
+                and bool(row.share_token)
+                and share_token == row.share_token
+                and _share_recipient_allowed(row, viewer)
+            )
             purchased_ok = False
             if not token_ok and allow_published:
                 purchased_ok = await _has_completed_purchase(db, row.id, entity_id)
             if not token_ok and not purchased_ok:
                 raise HTTPException(404, "blueprint not found")
     return row
+
+
+def _share_recipient_allowed(row: WorkspaceBlueprint, viewer: User | None) -> bool:
+    emails = row.share_allowed_emails or []
+    if not emails:
+        return True
+    return bool(
+        viewer
+        and email_is_verified(viewer)
+        and viewer.email.casefold() in emails
+    )
 
 
 def _require_blueprint_content_editable(row: WorkspaceBlueprint) -> None:
@@ -1309,6 +1400,24 @@ async def _commit_and_start_installed_workspace(
             )
         return
 
+    # Setup can block execution while still requiring an immediate Strategist
+    # input request. Its occurrence was staged with the installation transaction.
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_initial_review import dispatch_initial_workspace_review
+
+    try:
+        installed_workspace = await db.get(Workspace, result.workspace_id)
+        if installed_workspace is not None:
+            if await dispatch_initial_workspace_review(db, installed_workspace):
+                result.notes.append("First Strategist assessment queued after install.")
+    except Exception:  # noqa: BLE001
+        await db.rollback()
+        logger.exception(
+            "workspace %s was installed but initial review dispatch failed",
+            result.workspace_id,
+        )
+        result.notes.append("Workspace installed; initial review dispatch remains pending.")
+
     startup = None
     try:
         from packages.core.services.blueprint_startup_service import (
@@ -1335,6 +1444,38 @@ async def _commit_and_start_installed_workspace(
         result.notes.append(
             "Workspace installed; Blueprint startup will retry from readiness monitoring."
         )
+
+    # Blueprint-owned startup replaces the generic post-commit path, but Agent
+    # introductions are still part of every live Workspace's Chat experience.
+    if (
+        blocking_todos
+        or startup is None
+        or startup.state != "not_configured"
+    ):
+        from packages.core.services.workspace_setup_service import (
+            dispatch_workspace_agent_greetings_once,
+        )
+
+        try:
+            greeting_dispatch = await dispatch_workspace_agent_greetings_once(
+                db,
+                workspace_id=result.workspace_id,
+                entity_id=entity_id,
+            )
+            await db.commit()
+            if greeting_dispatch.get("warnings"):
+                result.notes.append(
+                    "Workspace installed; Agent introductions could not be queued."
+                )
+        except Exception:  # noqa: BLE001
+            await db.rollback()
+            logger.exception(
+                "workspace %s was installed but Agent greetings dispatch failed",
+                result.workspace_id,
+            )
+            result.notes.append(
+                "Workspace installed; Agent introductions could not be queued."
+            )
 
     if blocking_todos:
         result.notes.append(
@@ -1395,7 +1536,57 @@ async def _increment_blueprint_install_count(
     )
 
 
-# ── Export (workspace → draft blueprint row) ──────────────────────────
+# ── Export (workspace → portable payload / draft blueprint row) ───────
+
+async def _export_workspace_payload(
+    db: AsyncSession,
+    *,
+    workspace_id: str,
+    workspace_name: str,
+    req: ExportBlueprintPayloadRequest,
+    user: User,
+    install_variables: tuple[dict[str, Any], ...] | None = None,
+) -> dict[str, Any]:
+    context = ExportContext(
+        include_subscriptions=req.include_subscriptions,
+        include_goals=req.include_goals,
+        include_stats=req.include_stats,
+        include_scheduled_jobs=req.include_scheduled_jobs,
+        include_workflows=req.include_workflows,
+        include_blocking_setup=req.include_blocking_setup,
+        include_custom_fields=req.include_custom_fields,
+        include_governance=req.include_governance,
+        include_channel_requirements=req.include_channel_requirements,
+        include_session_requirements=req.include_session_requirements,
+        include_embedded_agents=req.include_embedded_agents,
+        include_embedded_skills=req.include_embedded_skills,
+        include_knowledge_packs=req.include_knowledge_packs,
+        knowledge_pack_mode=req.knowledge_pack_mode,
+        knowledge_document_ids=(
+            frozenset(req.knowledge_document_ids)
+            if req.knowledge_document_ids is not None
+            else None
+        ),
+        include_starter_memory=req.include_starter_memory,
+        include_memory_files=req.include_memory_files,
+        install_variables=install_variables,
+    )
+    author_display_name = req.author_display_name or _user_display_name(user)
+    try:
+        return await export_workspace(
+            db,
+            workspace_id,
+            title=req.title or workspace_name,
+            summary=req.summary,
+            description=req.description,
+            usage_guide=req.usage_guide,
+            tags=req.tags,
+            author_handle=req.author_handle,
+            author_display_name=author_display_name,
+            context=context,
+        )
+    except ExportError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 @workspace_router.get(
     "/{workspace_id}/blueprint-export/knowledge-documents",
@@ -1420,6 +1611,58 @@ async def list_blueprint_export_knowledge_documents(
         limit=limit,
         offset=offset,
     )
+
+
+async def _export_authorized_workspace_payload(
+    workspace_id: str,
+    req: ExportBlueprintPayloadRequest,
+    user: User,
+    db: AsyncSession,
+) -> dict[str, Any]:
+    # Lock the Workspace lifecycle boundary without ``get_workspace()``, whose
+    # artifact-folder repair is a write. The lock also prevents a concurrent
+    # soft delete from making this export outlive its source Workspace.
+    workspace = await lock_workspace_access_boundary(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+    )
+    if workspace is None or workspace.deleted_at is not None:
+        raise HTTPException(404, "Workspace not found")
+    await lock_workspace_recipient_authorization(
+        db,
+        workspace_id=workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+    )
+    await require_workspace_writable(db, user, workspace_id)
+    install_variables = (
+        tuple(item.model_dump(exclude_none=True) for item in req.install_variables)
+        if req.install_variables is not None
+        else None
+    )
+    return await _export_workspace_payload(
+        db,
+        workspace_id=workspace_id,
+        workspace_name=workspace.name,
+        req=req,
+        user=user,
+        install_variables=install_variables,
+    )
+
+
+@workspace_router.post(
+    "/{workspace_id}/export-blueprint-payload",
+    response_model=dict[str, Any],
+)
+async def export_workspace_blueprint_payload(
+    workspace_id: str,
+    req: ExportBlueprintPayloadRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the validated portable configuration without publishing it."""
+    return await _export_authorized_workspace_payload(workspace_id, req, user, db)
 
 
 @workspace_router.post(
@@ -1558,43 +1801,15 @@ async def export_workspace_as_blueprint(
             if isinstance(item, dict)
         )
 
-    ctx = ExportContext(
-        include_subscriptions=req.include_subscriptions,
-        include_goals=req.include_goals,
-        include_stats=req.include_stats,
-        include_scheduled_jobs=req.include_scheduled_jobs,
-        include_workflows=req.include_workflows,
-        include_custom_fields=req.include_custom_fields,
-        include_governance=req.include_governance,
-        include_channel_requirements=req.include_channel_requirements,
-        include_session_requirements=req.include_session_requirements,
-        include_embedded_agents=req.include_embedded_agents,
-        include_embedded_skills=req.include_embedded_skills,
-        include_knowledge_packs=req.include_knowledge_packs,
-        knowledge_pack_mode=req.knowledge_pack_mode,
-        knowledge_document_ids=(
-            frozenset(req.knowledge_document_ids)
-            if req.knowledge_document_ids is not None
-            else None
-        ),
-        include_starter_memory=req.include_starter_memory,
-        include_memory_files=req.include_memory_files,
+    payload = await _export_workspace_payload(
+        db,
+        workspace_id=workspace_id,
+        workspace_name=ws.name,
+        req=req,
+        user=user,
         install_variables=install_variables,
     )
     author_display_name = req.author_display_name or _user_display_name(user)
-    try:
-        payload = await export_workspace(
-            db, workspace_id,
-            title=req.title,
-            summary=req.summary,
-            description=req.description,
-            tags=req.tags,
-            author_handle=req.author_handle,
-            author_display_name=author_display_name,
-            context=ctx,
-        )
-    except ExportError as exc:
-        raise HTTPException(400, str(exc))
 
     source_blueprint = (
         (ws.settings or {}).get("_blueprint")
@@ -1718,7 +1933,8 @@ async def list_blueprints(
         WorkspaceBlueprint.created_at.desc(),
     )
     rows = list((await db.execute(stmt)).scalars().all())
-    # Platform blueprints are seeded into workspace_blueprints at startup.
+    # Platform blueprints are seeded into workspace_blueprints by the Cloud
+    # deployment publisher and the single-machine OSS startup owner.
     # Appending the frozen configs here as well returns every platform entry
     # twice (with the same id), so the table is the list's single source.
     signals = await _marketplace_signals(db, rows, user.id)
@@ -1744,7 +1960,7 @@ async def list_blueprints(
 async def get_governance_presets(
     user: User = Depends(get_current_user),
 ):
-    """The 3 install-time governance overlays the operator can pick from."""
+    """Install-time governance overlays the operator can pick from."""
     return [
         GovernancePresetSummary(key=p.key, title=p.title, summary=p.summary)
         for p in list_presets()
@@ -1764,27 +1980,13 @@ async def resolve_shared_blueprint(
     )).scalar_one_or_none()
     if row is None:
         raise HTTPException(404, "share link not found or revoked")
+    if row.entity_id != user.entity_id and not _share_recipient_allowed(row, user):
+        raise HTTPException(404, "share link not found or revoked")
     purchase = None
     if row.entity_id != user.entity_id:
         purchase = await _completed_purchase(db, row.id, user.entity_id)
     purchased = purchase is not None
-    # The payload IS the paid product — a share token grants VIEWING only.
-    # A completed purchase unlocks it only while the buyer's paid Manor plan
-    # is active; summary/setup_preview stay available for the buy page.
     source_payload, _source_version = blueprint_delivery_source(row, purchase)
-    payload = source_payload
-    if (
-        row.entity_id != user.entity_id
-        and blueprint_delivery_requires_paid_plan(row, purchase)
-    ):
-        from packages.core.services.marketplace_billing import (
-            has_paid_marketplace_plan,
-        )
-        if not purchased or not await has_paid_marketplace_plan(
-            db,
-            entity_id=user.entity_id,
-        ):
-            payload = {}
     summary = (
         await _summary_with_signals(db, row, user.entity_id, user.id)
     ).model_dump()
@@ -1793,7 +1995,7 @@ async def resolve_shared_blueprint(
     return BlueprintDetail(
         **summary,
         description=row.description,
-        payload=payload,
+        payload=source_payload,
         purchased=purchased,
     )
 
@@ -1806,28 +2008,13 @@ async def get_blueprint(
     db: AsyncSession = Depends(get_db),
 ):
     row = await _load_blueprint(
-        db, blueprint_id, user.entity_id, share_token=share_token,
+        db, blueprint_id, user.entity_id, share_token=share_token, viewer=user,
     )
     purchase = None
     if row.entity_id != user.entity_id:
         purchase = await _completed_purchase(db, row.id, user.entity_id)
     purchased = purchase is not None
-    # The payload IS the paid product — expose it only to owners or buyers
-    # whose paid Manor plan is active. Metadata stays intact for the buy page.
     source_payload, _source_version = blueprint_delivery_source(row, purchase)
-    payload = source_payload
-    if (
-        row.entity_id != user.entity_id
-        and blueprint_delivery_requires_paid_plan(row, purchase)
-    ):
-        from packages.core.services.marketplace_billing import (
-            has_paid_marketplace_plan,
-        )
-        if not purchased or not await has_paid_marketplace_plan(
-            db,
-            entity_id=user.entity_id,
-        ):
-            payload = {}
     summary = (
         await _summary_with_signals(db, row, user.entity_id, user.id)
     ).model_dump()
@@ -1836,7 +2023,7 @@ async def get_blueprint(
     detail = BlueprintDetail(
         **summary,
         description=row.description,
-        payload=payload,
+        payload=source_payload,
         purchased=purchased,
     )
     return detail
@@ -1860,6 +2047,10 @@ async def update_blueprint(
         row.summary = req.summary
     if req.description is not None:
         row.description = req.description
+    if req.usage_guide is not None:
+        guide = req.usage_guide.strip()
+    else:
+        guide = _manifest(row.payload).get("usage_guide")
     if req.tags is not None:
         row.tags = list(req.tags)
     if req.cover_image_url is not None:
@@ -1869,6 +2060,7 @@ async def update_blueprint(
         "title": row.title,
         "summary": row.summary,
         "description": row.description,
+        "usage_guide": guide,
         "tags": list(row.tags or []),
         "cover_image_url": row.cover_image_url,
     })
@@ -2047,6 +2239,7 @@ async def toggle_blueprint_favorite(
 @blueprint_router.post("/{blueprint_id}/share-token", response_model=ShareTokenResponse)
 async def create_or_rotate_share_token(
     blueprint_id: str,
+    req: ShareTokenRequest | None = Body(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2054,6 +2247,8 @@ async def create_or_rotate_share_token(
     if _builtin_payload_for_id(blueprint_id) is not None:
         raise HTTPException(409, "built-in blueprints cannot be link-shared")
     row = await _load_blueprint(db, blueprint_id, user.entity_id, allow_published=False)
+    if req is not None and req.allowed_emails is not None:
+        row.share_allowed_emails = req.allowed_emails
     row.share_token = secrets.token_urlsafe(32)
     await db.flush()
     token = row.share_token
@@ -2072,6 +2267,7 @@ async def revoke_share_token(
         raise HTTPException(409, "built-in blueprints cannot be link-shared")
     row = await _load_blueprint(db, blueprint_id, user.entity_id, allow_published=False)
     row.share_token = None
+    row.share_allowed_emails = []
     await db.commit()
 
 
@@ -2098,11 +2294,7 @@ async def delete_blueprint(
     if row is None:
         raise HTTPException(404, "blueprint not found")
     _require_blueprint_content_editable(row)
-    purchase_id = (await db.execute(
-        select(BlueprintPurchase.id)
-        .where(BlueprintPurchase.blueprint_id == row.id)
-        .limit(1)
-    )).scalar_one_or_none()
+    purchase_id = None
     if purchase_id is not None:
         raise HTTPException(
             409,
@@ -2244,6 +2436,7 @@ async def install_preflight(
         blueprint_id,
         user.entity_id,
         share_token=share_token,
+        viewer=user,
     )
     purchase = None
     if row.entity_id != user.entity_id:
@@ -2276,6 +2469,37 @@ async def install_preflight(
 
 
 @blueprint_router.post(
+    "/install-payload-preflight",
+    response_model=InstallPreflightResponse,
+)
+async def install_payload_preflight(
+    req: InstallPayloadPreflightRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Preview raw-payload setup without creating a Workspace.
+
+    The install route repeats this check under its normal transaction, so this
+    endpoint is guidance only and cannot be used to bypass current access.
+    """
+    try:
+        setup_payload, _ = resolve_install_variables(
+            migrate_payload(req.payload), req.variable_values,
+        )
+        result = await BlueprintSetupPreflightFactory.from_payload(
+            db,
+            payload=setup_payload,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            selected_channel_config_ids=req.channel_config_ids,
+        )
+    except (BlueprintSetupPreflightError, InstallError, PayloadError) as exc:
+        logger.warning("Blueprint payload preflight rejected a payload", exc_info=True)
+        raise HTTPException(400, _BLUEPRINT_PREFLIGHT_INVALID_DETAIL) from exc
+    return _install_preflight_response(result, mode=req.mode)
+
+
+@blueprint_router.post(
     "/{blueprint_id}/install",
     response_model=InstallResponse,
     status_code=201,
@@ -2287,28 +2511,15 @@ async def install(
     db: AsyncSession = Depends(get_db),
 ):
     row = await _load_blueprint(
-        db, blueprint_id, user.entity_id, share_token=req.share_token,
+        db, blueprint_id, user.entity_id, share_token=req.share_token, viewer=user,
     )
     purchase = None
     if row.entity_id != user.entity_id:
         purchase = await _completed_purchase(db, row.id, user.entity_id)
     if (
         row.entity_id != user.entity_id
-        and blueprint_delivery_requires_paid_plan(row, purchase)
+        and blueprint_delivery_is_paid(row, purchase)
     ):
-        from packages.core.services.marketplace_billing import (
-            MarketplacePaidPlanRequiredError,
-            require_paid_marketplace_plan,
-        )
-        try:
-            await require_paid_marketplace_plan(
-                db,
-                entity_id=user.entity_id,
-                blueprint_id=row.id,
-            )
-        except MarketplacePaidPlanRequiredError as exc:
-            raise HTTPException(402, detail=exc.detail) from exc
-
         if purchase is None:
             raise HTTPException(402, "purchase required to install this blueprint")
     # Published installs follow the current supported release.  A completed
@@ -2336,7 +2547,9 @@ async def install(
             blueprint_slug=row.slug,
             blueprint_version=source_version,
             create_missing_agents=req.create_missing_agents,
+            agent_ids_by_service_key=req.agent_ids_by_service_key,
             governance_preset=req.governance_preset,
+            install_author_hard_blocks=req.install_author_hard_blocks,
             variable_values=req.variable_values,
             channel_config_ids={
                 requirement.requirement_key: requirement.resource_id
@@ -2363,9 +2576,9 @@ async def install(
 # generates blueprints externally without round-tripping through the
 # blueprint table.
 #
-# Cloud raw imports require an active paid plan. Unlike canonical installs,
-# arbitrary client-supplied JSON has no server-verifiable Marketplace origin,
-# so structural or exact-payload matching cannot enforce paid entitlements.
+# Cloud raw imports require an active paid plan. A Workspace source can instead
+# prove origin through a fresh authorized server export, held through install.
+# Matching arbitrary JSON to a Marketplace listing is not proof of entitlement.
 
 @blueprint_router.post(
     "/install-payload",
@@ -2377,17 +2590,40 @@ async def install_from_payload(
     mode: InstallMode = Body(InstallMode.SIMULATE),
     workspace_name: Optional[str] = Body(None),
     create_missing_agents: bool = Body(False),
-    governance_preset: str = Body("standard"),
+    agent_ids_by_service_key: dict[str, str] = Body(default_factory=dict),
+    governance_preset: str = Body("automatic"),
+    install_author_hard_blocks: bool = Body(False),
     variable_values: dict[str, Any] = Body(default_factory=dict),
     channel_config_ids: dict[str, str] = Body(default_factory=dict),
+    workspace_source: Optional[WorkspaceBlueprintPayloadSource] = Body(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if workspace_source is not None:
+        from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+
+        # The installer also needs this lock. Acquire it before the source row
+        # to match Workspace deletion and operating-model updates; taking it
+        # after export would invert their lifecycle -> Workspace lock order.
+        await lock_reusable_resource_lifecycle(db, entity_id=user.entity_id)
+        source_payload = await _export_authorized_workspace_payload(
+            workspace_source.workspace_id, workspace_source.export_options, user, db,
+        )
+        # Compare the entire document, including metadata and JSON value types.
+        # Never use a client assertion of origin or the looser upgrade fingerprint
+        # as authority. A stale/edited export must be exported again or imported
+        # through the ordinary raw-payload gate.
+        if json.dumps(payload, sort_keys=True) != json.dumps(source_payload, sort_keys=True):
+            raise HTTPException(409, detail={
+                "code": "blueprint_workspace_source_mismatch",
+                "message": "Payload does not match the current Workspace export. Export it again before installing.",
+            })
+        payload = source_payload
+
     payload_slug = str(_manifest(payload).get("slug") or "").strip()
-    paid_source = await _paid_purchase_matching_payload(
-        db,
-        payload,
-        user.entity_id,
+    paid_source = (
+        await _paid_purchase_matching_payload(db, payload, user.entity_id)
+        if workspace_source is None else None
     )
     paid_purchase = paid_source[0] if paid_source else None
     paid_blueprint_id = paid_purchase.blueprint_id if paid_purchase else None
@@ -2396,15 +2632,18 @@ async def install_from_payload(
         require_paid_marketplace_plan,
     )
     try:
-        await require_paid_marketplace_plan(
-            db,
-            entity_id=user.entity_id,
-            blueprint_id=paid_blueprint_id,
-        )
+        if workspace_source is None:
+            await require_paid_marketplace_plan(
+                db,
+                entity_id=user.entity_id,
+                blueprint_id=paid_blueprint_id,
+            )
     except MarketplacePaidPlanRequiredError as exc:
         raise HTTPException(402, detail=exc.detail) from exc
 
-    matched = (
+    # A Workspace snapshot is independent configuration, not a Marketplace
+    # install/upgrade receipt, even if a listing happens to have equal content.
+    matched = None if workspace_source is not None else (
         paid_source[1]
         if paid_source
         else await _published_platform_blueprint_matching_payload(db, payload)
@@ -2434,7 +2673,9 @@ async def install_from_payload(
                 else matched.content_version if matched else None
             ),
             create_missing_agents=create_missing_agents,
+            agent_ids_by_service_key=agent_ids_by_service_key,
             governance_preset=governance_preset,
+            install_author_hard_blocks=install_author_hard_blocks,
             variable_values=variable_values,
             channel_config_ids={
                 requirement.requirement_key: requirement.resource_id

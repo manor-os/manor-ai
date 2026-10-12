@@ -17,6 +17,10 @@ from typing import Any
 
 from packages.core.ai.runtime.file_contracts import FileMutationAction
 from packages.core.ai.runtime.bash_command_specs import BashCommandSpecFactory
+from packages.core.ai.runtime.bash_output_paths import (
+    BashOutputPathError,
+    scope_bash_output_command,
+)
 from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_handler
 
 logger = logging.getLogger(__name__)
@@ -70,12 +74,7 @@ ALLOWED_PREFIXES: list[str] = [
 
 # Commands that must run locally (on the API container with JuiceFS),
 # never routed to the sandbox which has no filesystem mount.
-_LOCAL_ONLY_CMDS: set[str] = {
-    "mkdir", "cp", "mv", "touch", "chmod", "rm",
-    "ls", "cat", "head", "tail", "find", "tree", "file", "wc",
-    "grep", "rg", "sort", "uniq", "cut", "tr", "diff",
-    "echo", "date", "pwd", "which", "whoami",
-}
+_LOCAL_ONLY_CMDS = BashCommandSpecFactory.LOCAL_ONLY_COMMANDS
 # Local commands that inspect or mutate paths must never fall back to the API
 # container's /tmp when an entity mount is unavailable. Pure informational
 # shell builtins remain usable without a mount (unless they use redirection).
@@ -1082,6 +1081,82 @@ async def _repair_pending_projection_for_bash(
     return None
 
 
+async def _workspace_bash_artifact_base(
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    task_id: str | None,
+    workflow_run_id: str | None,
+    workflow_lineage_root_run_id: str | None,
+    entity_root: str,
+) -> str:
+    """Read the already-provisioned Workspace output root without creating it."""
+    normalized_workspace_id = str(workspace_id or "").strip()
+    if not normalized_workspace_id:
+        return ""
+
+    from packages.core.ai.runtime.authorization_receipts import (
+        runtime_current_tool_authorization_receipt,
+    )
+
+    receipt = runtime_current_tool_authorization_receipt()
+    if (
+        receipt is not None
+        and receipt.entity_id == entity_id
+        and receipt.workspace_id == normalized_workspace_id
+        and receipt.workspace_artifact_base_dir
+    ):
+        return receipt.workspace_artifact_base_dir
+
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.generated_media_naming import (
+        workspace_execution_artifact_dir,
+    )
+    from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+
+    async with async_session() as db:
+        artifact_folder_id = (await db.execute(
+            select(Workspace.artifact_folder_id).where(
+                Workspace.id == normalized_workspace_id,
+                Workspace.entity_id == entity_id,
+                Workspace.deleted_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
+    if not artifact_folder_id:
+        raise ValueError("Workspace artifact directory is unavailable")
+    return workspace_execution_artifact_dir(
+        workspace_artifact_storage_base(str(artifact_folder_id)),
+        task_id=task_id,
+        workflow_run_id=workflow_run_id,
+        workflow_lineage_root_run_id=workflow_lineage_root_run_id,
+        entity_root=entity_root,
+    )
+
+
+def _ensure_bash_output_directories(
+    *,
+    entity_root: str,
+    artifact_base_dir: str,
+    output_paths: tuple[str, ...],
+) -> None:
+    """Create only scoped output ancestors after the mutation has been approved."""
+    root = os.path.realpath(entity_root)
+    base = artifact_base_dir.rstrip("/") + "/"
+    for output_path in output_paths:
+        if not output_path.startswith(base):
+            continue
+        parent = os.path.realpath(os.path.join(root, os.path.dirname(output_path)))
+        try:
+            if os.path.commonpath([root, parent]) != root:
+                raise ValueError("Bash output directory escaped the entity filesystem")
+        except ValueError:
+            raise ValueError("Bash output directory escaped the entity filesystem")
+        os.makedirs(parent, exist_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Handler
 # ---------------------------------------------------------------------------
@@ -1115,6 +1190,35 @@ async def _bash_impl(
             entity_root = os.path.realpath(os.path.join(settings.MANOR_FS_ROOT, entity_id))
     cwd_in_entity_fs = bool(entity_root) and os.path.realpath(cwd) == entity_root
     may_mutate_entity_fs = False
+    artifact_base_dir = ""
+    scoped_output_paths: tuple[str, ...] = ()
+
+    base_cmd = command.strip().split()[0].rsplit("/", 1)[-1]
+    if cwd_in_entity_fs and base_cmd in _LOCAL_ONLY_CMDS and (
+        _visible_mutation_paths(command) or _may_create_files(command)
+    ):
+        try:
+            artifact_base_dir = await _workspace_bash_artifact_base(
+                entity_id=entity_id,
+                workspace_id=runtime_context.workspace_id,
+                task_id=runtime_context.task_id,
+                workflow_run_id=runtime_context.workflow_run_id,
+                workflow_lineage_root_run_id=runtime_context.workflow_lineage_root_run_id,
+                entity_root=entity_root,
+            )
+            output_scope = scope_bash_output_command(
+                command,
+                artifact_base_dir=artifact_base_dir,
+                entity_root=entity_root,
+            )
+            command = output_scope.command
+            scoped_output_paths = output_scope.output_paths
+        except (BashOutputPathError, ValueError) as exc:
+            return json.dumps({
+                "error": "bash_output_scope_invalid",
+                "reason": str(exc),
+                "command_executed": False,
+            })
 
     command_segments = _shell_command_segments(command)
     requires_entity_fs = any(
@@ -1215,7 +1319,6 @@ async def _bash_impl(
 
     # Route: sandbox for code execution (python3, node, curl, etc.),
     # local for filesystem ops that need JuiceFS access.
-    base_cmd = command.strip().split()[0].rsplit("/", 1)[-1]
     recovery_paths: list[str] = []
     recovery_operations: list[dict[str, Any]] = []
     if cwd_in_entity_fs and may_mutate_entity_fs and base_cmd in _LOCAL_ONLY_CMDS:
@@ -1259,6 +1362,12 @@ async def _bash_impl(
         if sandbox_url and base_cmd not in _LOCAL_ONLY_CMDS:
             result = await _execute_via_sandbox(sandbox_url, command, timeout, cwd)
         elif base_cmd in _LOCAL_ONLY_CMDS:
+            if artifact_base_dir:
+                _ensure_bash_output_directories(
+                    entity_root=entity_root,
+                    artifact_base_dir=artifact_base_dir,
+                    output_paths=scoped_output_paths,
+                )
             result = await _execute_local(command, timeout, cwd)
             ran_against_entity_fs = cwd_in_entity_fs
         else:

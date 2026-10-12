@@ -39,6 +39,10 @@ export interface DetailPayload {
   width?: number;
   /** Optional key — opening with the same key replaces content without re-animating. */
   key?: string;
+  /** Element that should regain focus after the drawer closes. */
+  returnFocusTo?: HTMLElement | null;
+  /** Defer close or replacement while an editor has an unsaved draft. */
+  beforeClose?: (proceed: () => void) => void;
 }
 
 interface DetailState {
@@ -47,10 +51,18 @@ interface DetailState {
   closeDetail: () => void;
 }
 
-export const useDetailStore = create<DetailState>((set) => ({
+export const useDetailStore = create<DetailState>((set, get) => ({
   payload: null,
-  openDetail: (payload) => set({ payload }),
-  closeDetail: () => set({ payload: null }),
+  openDetail: (payload) => {
+    const apply = () => set((state) => ({ payload: { ...payload, returnFocusTo: payload.returnFocusTo ?? state.payload?.returnFocusTo } }));
+    const guard = get().payload?.beforeClose;
+    if (guard) guard(apply); else apply();
+  },
+  closeDetail: () => {
+    const apply = () => set({ payload: null });
+    const guard = get().payload?.beforeClose;
+    if (guard) guard(apply); else apply();
+  },
 }));
 
 /** Convenience helpers for non-hook call sites. */

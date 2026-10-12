@@ -27,6 +27,7 @@ class RuntimeAgentIdentityPrompt:
     prompt: str
     source: str
     agent_files_loaded: dict[str, str] = field(default_factory=dict)
+    sections: list[dict] = field(default_factory=list)
 
 
 _AGENT_FILE_SECTIONS = (
@@ -49,16 +50,20 @@ def runtime_agent_identity_prompt(
     agent_id: str | None = None,
     user_id: str | None = None,
     allow_agent_files: bool = True,
+    strict: bool = False,
 ) -> RuntimeAgentIdentityPrompt:
     """Render the base agent identity and optional file-backed supplements."""
     base_prompt = str(agent_system_prompt or "").strip()
     parts: list[str] = []
     source = "default"
     loaded_levels: dict[str, str] = {}
+    from packages.core.ai.runtime.context_window import context_section
+    sections: list[dict] = []
 
     if base_prompt:
         source = "db"
         parts.append(base_prompt)
+        sections.append(context_section("agent_identity", base_prompt, source="agent.system_prompt"))
 
     if entity_id and allow_agent_files:
         try:
@@ -74,6 +79,7 @@ def runtime_agent_identity_prompt(
                 entity_id,
                 effective_id,
                 user_id=user_id,
+                **({"strict": True} if strict else {}),
             )
             if files.has_content() and agent_files_have_custom_content(files, effective_id):
                 source = "db+files" if base_prompt else "files"
@@ -82,10 +88,20 @@ def runtime_agent_identity_prompt(
                 for filename, attr, title in _AGENT_FILE_SECTIONS:
                     value = getattr(files, attr, "")
                     if agent_file_has_custom_content(effective_id, filename, value):
-                        file_parts.append(f"## {title}\n{value}")
+                        rendered = f"## {title}\n{value}"
+                        file_parts.append(rendered)
+                        section = context_section(
+                            filename, rendered,
+                            category="memory_files" if filename in {"MEMORY.md", "LEARNINGS.md"} else "agent_instructions",
+                            source=f"agent_files:{entity_id}:{effective_id}:{levels.get(filename, 'entity')}:{user_id if levels.get(filename) == 'user' else ''}:{filename}",
+                        )
+                        section["resolved_scope"] = levels.get(filename)
+                        sections.append(section)
                 if file_parts:
                     parts.append("\n\n".join(file_parts))
         except Exception:
+            if strict:
+                raise
             logger.debug("Runtime agent identity file loading failed", exc_info=True)
 
     if parts:
@@ -93,12 +109,14 @@ def runtime_agent_identity_prompt(
             prompt="\n\n".join(parts),
             source=source,
             agent_files_loaded=loaded_levels,
+            sections=sections,
         )
 
     return RuntimeAgentIdentityPrompt(
         prompt=DEFAULT_MANOR_IDENTITY,
         source="default",
         agent_files_loaded={},
+        sections=[context_section("agent_identity", DEFAULT_MANOR_IDENTITY, source="runtime.default_identity")],
     )
 
 
@@ -182,6 +200,8 @@ def runtime_workspace_operating_memory_prompt(
     workspace_id: str | None,
     workspace: Any = None,
     agent_id: str | None = None,
+    sections_out: list[dict] | None = None,
+    strict: bool = False,
 ) -> str | None:
     """Render workspace memory only when the runtime mounted workspace memory."""
     if not entity_id or not workspace_id:
@@ -191,8 +211,8 @@ def runtime_workspace_operating_memory_prompt(
     try:
         from packages.core.memory.canonical import (
             ensure_workspace_memory_docs,
-            load_workspace_agent_memory,
-            load_workspace_operating_memory,
+            WORKSPACE_MEMORY_DEFAULT_LOAD_ORDER, WORKSPACE_AGENT_MEMORY_FILES,
+            read_workspace_memory_file, read_workspace_agent_memory_file,
         )
         from packages.core.services.agent_files import effective_agent_id
         from packages.core.services.entity_fs import is_fs_enabled
@@ -206,19 +226,32 @@ def runtime_workspace_operating_memory_prompt(
             workspace_name=getattr(workspace, "name", None),
             workspace_kind=getattr(workspace, "kind", None),
         )
-        workspace_memory = load_workspace_operating_memory(entity_id, workspace_id)
-        agent_memory = load_workspace_agent_memory(
-            entity_id,
-            workspace_id,
-            effective_agent_id(agent_id),
-        )
-        sections: list[str] = []
-        if workspace_memory:
-            sections.append("## Workspace Operating Memory\n" + workspace_memory)
-        if agent_memory:
-            sections.append("## Workspace-Agent Override Memory\n" + agent_memory)
-        return "\n\n".join(sections) if sections else None
+        from packages.core.ai.runtime.context_window import context_section, manage_prompt_sections
+        sections = []
+        aid = effective_agent_id(agent_id)
+        for scope, filenames in (("workspace", WORKSPACE_MEMORY_DEFAULT_LOAD_ORDER),
+                                 ("workspace_agent", WORKSPACE_AGENT_MEMORY_FILES)):
+            for filename in filenames:
+                content = (
+                    read_workspace_memory_file(entity_id, workspace_id, filename)
+                    if scope == "workspace" else
+                    read_workspace_agent_memory_file(entity_id, workspace_id, aid, filename)
+                )
+                if content:
+                    title = "Workspace Operating Memory" if scope == "workspace" else "Workspace-Agent Override Memory"
+                    sections.append(context_section(
+                        f"{scope}:{filename}", f"## {title}\n### {filename}\n{content}",
+                        category="rules" if filename == "RULES.md" else "memory_files",
+                        source=f"{scope}:{entity_id}:{workspace_id}:{aid if scope == 'workspace_agent' else ''}:{filename}",
+                    ))
+        if sections_out is not None:
+            sections_out.extend(sections)
+        else:
+            sections = manage_prompt_sections(sections)
+        return "\n\n".join(section["content"] for section in sections) or None
     except Exception:
+        if strict:
+            raise
         logger.debug("Runtime workspace operating memory loading failed", exc_info=True)
         return None
 

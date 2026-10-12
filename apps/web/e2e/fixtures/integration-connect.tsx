@@ -16,7 +16,7 @@ import { INTEGRATION_CATALOG_QUERY_KEY } from "../../src/lib/integrationCatalog"
 import { setLocale } from "../../src/lib/i18n";
 import "../../src/index.css";
 
-setLocale("en");
+await setLocale("en");
 useAuthStore.setState({ token: "fixture-only", isLoading: false, user: null });
 useConfigStore.setState({ loaded: true, deployment_mode: "oss", flows_available: false, flows_released: false });
 const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -25,12 +25,13 @@ let authorizationRequests = 0;
 let syncRequests = 0;
 let authorizationResponses = 0;
 let syncResponses = 0;
-const delayedPhase = new URLSearchParams(window.location.search).get("delay");
+const query = new URLSearchParams(window.location.search);
+const delayedPhase = query.get("delay");
 const startedConnections = new Set<string>();
 let authorizationOutcome = "success";
 let failCatalog = false;
-let ready = false;
-let hasConnection = false;
+let ready = query.has("ready");
+let hasConnection = ready;
 const subscribers = new Set<() => void>();
 const notify = () => subscribers.forEach(callback => callback());
 api.integrations.mcpServers = async () => {
@@ -41,6 +42,7 @@ api.integrations.mcpServers = async () => {
     server_key: "gmail", name: "Gmail", tagline: "Read and send email", category: "productivity",
     description: "Connect Gmail to read and send email.", auth_type: "oauth2", oauth_configured: true,
     nango_provider_config_key: "google-mail", agent_can_use: ready,
+    setup_pending: query.get("setup") === "checking", setup_unavailable: query.get("setup") === "unavailable",
     user_connected: hasConnection, entity_connected: false, connections: [], entity_accounts: [],
     oauth_scopes: [], tools: [], coming_soon: false,
   }] as unknown as IntegrationMCPServer[];

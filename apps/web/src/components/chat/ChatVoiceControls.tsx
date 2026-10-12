@@ -34,9 +34,10 @@ export function ReadAloudButton({ text, scope = {}, messageId, disabled = false,
 }) {
   const [phase, setPhase] = useState<"idle" | "loading" | "playing" | "ready">("idle");
   const [error, setError] = useState("");
-  const audio = useRef<HTMLAudioElement | null>(null);
+  const audioContext = useRef<AudioContext | null>(null);
+  const audioSource = useRef<AudioBufferSourceNode | null>(null);
+  const playReadyAudio = useRef<(() => Promise<void>) | null>(null);
   const controller = useRef<AbortController | null>(null);
-  const objectUrl = useRef("");
   const release = useRef<(() => void)>();
   const generation = useRef(0);
   const scopeKey = chatVoiceScopeKey(scope);
@@ -46,28 +47,30 @@ export function ReadAloudButton({ text, scope = {}, messageId, disabled = false,
     generation.current++;
     controller.current?.abort();
     controller.current = null;
-    if (audio.current) {
-      audio.current.onended = audio.current.onerror = null;
-      audio.current.pause();
-      audio.current.removeAttribute("src");
-      audio.current.load();
-      audio.current = null;
+    playReadyAudio.current = null;
+    if (audioSource.current) {
+      audioSource.current.onended = null;
+      try { audioSource.current.stop(); } catch { /* already stopped */ }
+      audioSource.current.disconnect();
+      audioSource.current = null;
     }
-    if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
-    objectUrl.current = "";
+    if (audioContext.current) {
+      void audioContext.current.close().catch(() => undefined);
+      audioContext.current = null;
+    }
     release.current?.();
     release.current = undefined;
     setPhase("idle");
   }, []);
 
-  useEffect(() => { stop(); setError(""); return stop; }, [scopeKey, messageId, text, disabled, stop]);
+  useEffect(() => { stop(); setError(""); return stop; }, [scopeKey, messageId, text, disabled, locale, stop]);
 
   const start = async () => {
     if (disabled) return;
-    // A browser autoplay block can be retried with a fresh user gesture,
-    // using the already generated audio instead of charging for it again.
-    if (phase === "ready" && audio.current) {
-      try { await audio.current.play(); setPhase("playing"); setError(""); }
+    // Resume the already decoded clip with a fresh user gesture without
+    // generating or charging for the speech a second time.
+    if (phase === "ready" && playReadyAudio.current) {
+      try { await playReadyAudio.current(); setError(""); }
       catch { setError(say("playback_failed")); }
       return;
     }
@@ -76,29 +79,70 @@ export function ReadAloudButton({ text, scope = {}, messageId, disabled = false,
     const run = ++generation.current;
     const request = new AbortController();
     controller.current = request;
-    const player = new Audio();
-    audio.current = player;
+    let player: AudioContext;
+    try {
+      player = new AudioContext();
+    } catch {
+      stop();
+      setError(say("playback_failed"));
+      return;
+    }
+    audioContext.current = player;
+    // Start the browser's audio session during the click. Waiting for the TTS
+    // response first loses transient user activation in Safari and Chromium,
+    // which made a single click appear to do nothing.
+    const initialResume = player.resume().catch(() => undefined);
+    const ensureRunning = async () => {
+      await initialResume;
+      if (player.state !== "running") await player.resume().catch(() => undefined);
+      return player.state === "running";
+    };
     const chunks = speechChunks(text);
     let index = 0;
     setError("");
+    const startBuffer = (buffer: AudioBuffer) => {
+      if (run !== generation.current) return;
+      const source = player.createBufferSource();
+      source.buffer = buffer;
+      source.connect(player.destination);
+      source.onended = () => {
+        if (audioSource.current === source) audioSource.current = null;
+        source.disconnect();
+        void playNext();
+      };
+      audioSource.current = source;
+      playReadyAudio.current = null;
+      source.start();
+      setPhase("playing");
+    };
     const playNext = async () => {
       if (run !== generation.current) return;
       if (index >= chunks.length) { stop(); return; }
       setPhase("loading");
       try {
-        const blob = await fetchChatSpeech(chunks[index++], scope, request.signal, messageId);
+        const blob = await fetchChatSpeech(chunks[index++], scope, request.signal, messageId, locale);
         if (run !== generation.current) return;
-        if (objectUrl.current) URL.revokeObjectURL(objectUrl.current);
-        objectUrl.current = URL.createObjectURL(blob);
-        player.src = objectUrl.current;
-        try { await player.play(); if (run === generation.current) setPhase("playing"); }
-        catch { if (run === generation.current) { setPhase("ready"); setError(say("tap_to_play")); } }
+        let buffer: AudioBuffer;
+        try {
+          buffer = await player.decodeAudioData(await blob.arrayBuffer());
+        } catch {
+          throw new Error(say("playback_failed"));
+        }
+        if (run !== generation.current) return;
+        if (await ensureRunning()) {
+          startBuffer(buffer);
+        } else {
+          playReadyAudio.current = async () => {
+            if (!(await ensureRunning())) throw new Error("Audio playback is blocked");
+            startBuffer(buffer);
+          };
+          setPhase("ready");
+          setError(say("tap_to_play"));
+        }
       } catch (err) {
         if (run === generation.current) { stop(); setError(err instanceof Error ? err.message : say("playback_failed")); }
       }
     };
-    player.onended = () => void playNext();
-    player.onerror = () => { if (run === generation.current) { stop(); setError(say("playback_failed")); } };
     void playNext();
   };
 

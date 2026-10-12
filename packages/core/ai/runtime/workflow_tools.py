@@ -122,11 +122,16 @@ def runtime_workflow_tool_context_args(
     """Map durable Workflow capture context to hidden Runtime tool arguments."""
 
     source = context if isinstance(context, dict) else {}
-    return {
+    result = {
         argument: value
         for key, argument in RUNTIME_WORKFLOW_TOOL_CONTEXT_ARGUMENTS.items()
         if (value := _runtime_workflow_context_value(source.get(key))) is not None
     }
+    workflow_run_id = _runtime_workflow_context_value(source.get("workflow_run_id"))
+    if workflow_run_id:
+        result["_performance_run_id_from_context"] = workflow_run_id
+    return result
+
 
 
 async def runtime_execute_workflow_tool_step(
@@ -145,6 +150,20 @@ async def runtime_execute_workflow_tool_step(
     )
     runtime_arguments = dict(arguments)
     runtime_arguments.update(runtime_workflow_tool_context_args(workflow_context))
+    # A deterministic tool node has a durable invocation even though it does
+    # not enter the agent loop or receive a provider tool-call ID. Retries use
+    # the same run/node identity; a new WorkflowRun is a new operation.
+    runtime_arguments.pop("_runtime_run_id_from_context", None)
+    runtime_arguments.pop("_runtime_tool_call_id_from_context", None)
+    context = workflow_context or {}
+    run_id = _runtime_workflow_context_value(context.get("workflow_run_id"))
+    step_id = _runtime_workflow_context_value(context.get("workflow_step_id"))
+    execution_node_id = _runtime_workflow_context_value(context.get("workflow_execution_node_id"))
+    if run_id and step_id:
+        runtime_arguments["_runtime_run_id_from_context"] = f"workflow:{run_id}"
+        runtime_arguments["_runtime_tool_call_id_from_context"] = (
+            f"execution:{execution_node_id}" if execution_node_id else f"node:{step_id}"
+        )
     output = await runtime_execute_tool(
         tool_name,
         runtime_arguments,

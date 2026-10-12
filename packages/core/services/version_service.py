@@ -1,6 +1,8 @@
 """Version and trash services for documents."""
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
 import time
 from datetime import datetime, timezone
@@ -98,6 +100,126 @@ def _restore_file_from_hidden_trash(doc: Document, entity_id: str) -> None:
 
 # ── Versioning ──
 
+def _snapshot_file(entity_id: str, source_path: str, snapshot_path: str) -> tuple[int, str]:
+    from packages.core.services.entity_fs import (
+        EntityFileWriteError,
+        copy_entity_file_atomic,
+        open_entity_file_snapshot,
+        unlink_entity_file_entry,
+    )
+
+    def require_new(_rel_path: str, exists: bool, _full_path: str) -> None:
+        if exists:
+            raise EntityFileWriteError("Document version snapshot already exists")
+
+    created = False
+    try:
+        with open_entity_file_snapshot(entity_id, source_path) as source:
+            copy_entity_file_atomic(
+                entity_id,
+                snapshot_path,
+                source.descriptor_path,
+                source_fd=source.file_descriptor,
+                expected_size=source.stat.st_size,
+                allow_empty=True,
+                write_precondition=require_new,
+            )
+            created = True
+        with open_entity_file_snapshot(entity_id, snapshot_path) as snapshot:
+            digest = hashlib.sha256()
+            with open(snapshot.descriptor_path, "rb") as stored:
+                for chunk in iter(lambda: stored.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return snapshot.stat.st_size, digest.hexdigest()
+    except Exception:
+        if created:
+            unlink_entity_file_entry(entity_id, snapshot_path)
+        raise
+
+
+async def _version_workspace_id(db: AsyncSession, doc: Document, entity_id: str) -> str | None:
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import (
+        artifact_folder_id_from_entity_storage_path,
+        resolve_workspace_folder_binding,
+    )
+
+    origin = (doc.metadata_ or {}).get("origin")
+    candidates = set()
+    if isinstance(origin, dict) and origin.get("workspace_id"):
+        candidates.add(str(origin["workspace_id"]))
+    if doc.folder_id:
+        binding = await resolve_workspace_folder_binding(
+            db, entity_id=entity_id, folder_id=doc.folder_id,
+        )
+        if binding:
+            candidates.add(binding.workspace_id)
+    artifact_folder_id = artifact_folder_id_from_entity_storage_path(doc.fs_path)
+    if artifact_folder_id:
+        path_workspace_id = await db.scalar(
+            select(Workspace.id).where(
+                Workspace.entity_id == entity_id,
+                Workspace.artifact_folder_id == artifact_folder_id,
+                Workspace.deleted_at.is_(None),
+            )
+        )
+        if path_workspace_id:
+            candidates.add(path_workspace_id)
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
+async def _create_version(
+    db: AsyncSession,
+    document_id: str,
+    entity_id: str,
+    change_summary: str | None,
+    created_by: str | None,
+) -> DocumentVersion:
+    doc = await get_document(db, document_id, entity_id)
+    if not doc:
+        raise ValueError("Document not found")
+
+    result = await db.execute(
+        select(func.coalesce(func.max(DocumentVersion.version_number), 0))
+        .where(DocumentVersion.document_id == document_id)
+    )
+    next_version = result.scalar() + 1
+    version_id = generate_ulid()
+    snapshot_path = None
+    file_size = doc.file_size
+    content_sha256 = None
+    if doc.fs_path:
+        if _entity_root(entity_id) is None:
+            raise ValueError("Document filesystem is not enabled")
+        snapshot_path = f".versions/documents/{document_id}/{version_id}"
+        file_size, content_sha256 = await asyncio.to_thread(
+            _snapshot_file, entity_id, doc.fs_path, snapshot_path,
+        )
+
+    version = DocumentVersion(
+        id=version_id,
+        document_id=document_id,
+        version_number=next_version,
+        name=doc.name,
+        fs_path=snapshot_path,
+        file_size=file_size,
+        snapshot_key=version_id if snapshot_path else None,
+        content_sha256=content_sha256,
+        workspace_id=await _version_workspace_id(db, doc, entity_id),
+        change_summary=change_summary or f"Version {next_version}",
+        created_by=created_by,
+    )
+    db.add(version)
+    try:
+        await db.flush()
+    except Exception:
+        if snapshot_path:
+            from packages.core.services.entity_fs import unlink_entity_file_entry
+
+            await asyncio.to_thread(unlink_entity_file_entry, entity_id, snapshot_path)
+        raise
+    return version
+
 async def create_version(
     db: AsyncSession,
     document_id: str,
@@ -105,32 +227,16 @@ async def create_version(
     *,
     change_summary: str | None = None,
     created_by: str | None = None,
+    filesystem_lock_held: bool = False,
 ) -> DocumentVersion:
     """Create a version snapshot of the current document state."""
-    doc = await get_document(db, document_id, entity_id)
-    if not doc:
-        raise ValueError("Document not found")
+    root = _entity_root(entity_id)
+    if root and not filesystem_lock_held:
+        from packages.core.services.entity_fs import entity_filesystem_mutation_lock
 
-    # Get next version number
-    result = await db.execute(
-        select(func.coalesce(func.max(DocumentVersion.version_number), 0))
-        .where(DocumentVersion.document_id == document_id)
-    )
-    next_version = result.scalar() + 1
-
-    version = DocumentVersion(
-        id=generate_ulid(),
-        document_id=document_id,
-        version_number=next_version,
-        name=doc.name,
-        fs_path=doc.fs_path,
-        file_size=doc.file_size,
-        change_summary=change_summary or f"Version {next_version}",
-        created_by=created_by,
-    )
-    db.add(version)
-    await db.flush()
-    return version
+        async with entity_filesystem_mutation_lock(root):
+            return await _create_version(db, document_id, entity_id, change_summary, created_by)
+    return await _create_version(db, document_id, entity_id, change_summary, created_by)
 
 
 async def list_versions(
@@ -290,6 +396,9 @@ async def empty_trash(db: AsyncSession, entity_id: str) -> int:
         source_cleanup_bases = set(fs_paths) - set(active_fs_paths)
 
     await delete_resource_comments(db, entity_id, "document", document_ids)
+    await db.execute(
+        delete(DocumentVersion).where(DocumentVersion.document_id.in_(document_ids))
+    )
     result = await db.execute(
         delete(Document).where(
             Document.entity_id == entity_id,
@@ -300,10 +409,14 @@ async def empty_trash(db: AsyncSession, entity_id: str) -> int:
         ARTIFACT_CLEANUP_KIND_FILE,
         document_derived_file_cleanup_bases,
         document_derived_tree_cleanup_bases,
+        document_version_snapshot_cleanup_bases,
         enqueue_artifact_cleanup_jobs,
     )
 
-    cleanup_bases = document_derived_tree_cleanup_bases(document_ids)
+    cleanup_bases = (
+        document_derived_tree_cleanup_bases(document_ids)
+        | document_version_snapshot_cleanup_bases(document_ids)
+    )
     file_cleanup_bases = (
         source_cleanup_bases
         | document_derived_file_cleanup_bases(document_ids)

@@ -19,6 +19,7 @@ import pytest
 
 from packages.core.constants.approvals import HitlType
 from packages.core.governance.approvals import validate_hitl_payload
+from packages.core.governance.approval_projection import compile_workspace_rules, policy_override
 from packages.core.models.base import generate_ulid
 from packages.core.services.workspace_operation_service import (
     operation_review_diff,
@@ -34,8 +35,9 @@ def _state(rules: list[dict], *, never_allow: list[str]) -> dict:
         "operating_model": {"rules": rules},
         "rules": rules,
         "governance_policy": {
-            "never_allow_actions": never_allow,
-            "hitl_required_actions": ["social_post.publish"],
+            "approval": {"mode": None, "rules": [rule.model_dump() for rule in compile_workspace_rules([
+                *[dict(_HARD_BLOCK_RULE, action_patterns=[action]) for action in never_allow], _HITL_RULE,
+            ])]},
             "max_risk_level": "high",
         },
     }
@@ -89,6 +91,8 @@ def test_dropping_a_never_allow_rule_is_reported_as_a_removed_hard_block():
     # changes rules" is exactly the copy that hid the change.
     assert "payments.refund" in payload["why"]
     assert "REMOVES hard blocks" in payload["why"]
+    assert "approval requirements and workspace rules still apply" in payload["why"]
+    assert "no approval" not in payload["why"]
 
 
 def test_a_draft_that_keeps_its_hard_blocks_reports_none():
@@ -218,15 +222,32 @@ def test_the_review_diff_is_the_policy_apply_would_write():
     rules = _enrich_operating_rules(state["rules"])
 
     rebuilt = _resolved_governance_policy(
-        state, operating_rules=rules, rules_touched=True, changed_keys={"rules"},
+        state, operating_rules=rules, rules_touched=True, edited_governance_keys=set(),
     )
-    assert rebuilt.never_allow_actions == []
+    assert not any(rule.effect == "deny" for rule in policy_override(rebuilt).rules)
     # Non-rebuilt knobs survive the rebuild untouched.
     assert rebuilt.max_risk_level == "high"
     assert "max_risk_level" not in _REBUILT_GOVERNANCE_POLICY_KEYS
 
-    # Same state, but the draft did not touch rules → nothing is rebuilt.
+    # User-authored exceptions survive source projection even without a rule edit.
+    state["governance_policy"]["approval"]["rules"].append({
+        "id": "operator-ban", "effect": "deny",
+        "selector": {"kind": "action", "action_key": "payments.refund"},
+    })
     kept = _resolved_governance_policy(
-        state, operating_rules=rules, rules_touched=False, changed_keys={"goals"},
+        state, operating_rules=rules, rules_touched=False, edited_governance_keys=set(),
     )
-    assert kept.never_allow_actions == ["payments.refund"]
+    denials = [rule for rule in policy_override(kept).rules if rule.effect == "deny"]
+    assert [(rule.id, rule.selector.action_key, rule.source_kind) for rule in denials] == [
+        ("operator-ban", "payments.refund", "user"),
+    ]
+
+
+def test_review_without_workspace_policy_has_no_removed_hard_blocks():
+    draft = {
+        "current_state": {},
+        "patches": [],
+        "diff": {"changed_keys": [], "changes": {}},
+    }
+    assert policy_override(None).rules == []
+    assert operation_review_diff(draft)["removed_hard_blocks"] == []

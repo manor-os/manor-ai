@@ -112,8 +112,8 @@ def main() -> int:
     print(
         f"{len(missing)} declared queue(s) have NO consumer: {', '.join(missing)}\n"
         "Every declared queue needs a worker started with -Q for it. Check that "
-        "the deploy starts one service per queue (see docker-compose.yml and the "
-        "APP_SERVICES list in .github/workflows/deploy.yml).\n"
+        "the deploy starts one service per queue (see docker-compose.yml and "
+        "the deployment's worker service list).\n"
         "Observed:",
         file=sys.stderr,
     )

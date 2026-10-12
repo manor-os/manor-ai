@@ -1,0 +1,16 @@
+{
+  "id": "product-promotion-video",
+  "name": "product-promotion-video",
+  "display_name": "Product Promotion Video",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Product-specific identity, UI, proof, and continuity guidance for a product video brief or script in the Video Production suite.",
+  "category": "video",
+  "output_format": "guidance",
+  "tags": ["video", "product", "script-to-video", "demo", "runtime-guidance", "builtin"],
+  "tools": [],
+  "search": {
+    "terms": ["product demo", "app demo", "ad video", "feature showcase", "commercial", "screen recording", "customer story", "explainer"],
+    "examples": ["promo video showing our app interface", "product demo video from script", "feature walkthrough video accurate ui", "video of real product customer result"]
+  }
+}

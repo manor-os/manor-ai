@@ -9,5 +9,9 @@
   "tools": [
     "mcp__tavily__search",
     "mcp__tavily__extract"
-  ]
+  ],
+  "search": {
+    "terms": ["internet search", "web research", "scrape article", "extract url text", "news search", "readable content", "crawl page"],
+    "examples": ["search web for latest ai news", "extract article text from url", "deep web research on a topic", "pull body text from several links"]
+  }
 }

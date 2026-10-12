@@ -130,34 +130,42 @@ async def get_relevant_memory(
         if not embedding:
             embedding = None
 
+    if embedding and not await _agent_memory_embedding_available(db):
+        logger.warning("agent_memories.embedding missing — falling back to recency memory search")
+        embedding = None
     if embedding:
-        if not await _agent_memory_embedding_available(db):
-            logger.warning("agent_memories.embedding missing — falling back to recency memory search")
-            return await _recency_search(
-                db,
-                entity_id=entity_id,
-                workspace_id=workspace_id,
-                k=k,
-                scopes_filter=scopes_filter,
-                min_confidence=min_confidence,
-            )
-        return await _vector_search(
-            db,
-            entity_id=entity_id,
-            workspace_id=workspace_id,
-            embedding=embedding,
-            k=k,
-            scopes_filter=scopes_filter,
-            min_confidence=min_confidence,
+        records = await _vector_search(
+            db, entity_id=entity_id, workspace_id=workspace_id, embedding=embedding,
+            k=k, scopes_filter=scopes_filter, min_confidence=min_confidence,
         )
-    return await _recency_search(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        k=k,
-        scopes_filter=scopes_filter,
-        min_confidence=min_confidence,
-    )
+    else:
+        records = await _recency_search(
+            db, entity_id=entity_id, workspace_id=workspace_id,
+            k=k, scopes_filter=scopes_filter, min_confidence=min_confidence,
+        )
+    from packages.core.memory.manager import select_memory_records
+    from packages.core.memory.policy import content_fingerprint
+
+    snapshot = [{**r, "revision": content_fingerprint(r["content"])} for r in records]
+    selected = await select_memory_records(snapshot, query=query, entity_id=entity_id, workspace_id=workspace_id)
+    if not selected:
+        return []
+    # Recheck after the asynchronous worker. clock_timestamp observes expiry
+    # now, unlike PostgreSQL now(), which is fixed at transaction start.
+    current = (await db.execute(text("""
+        SELECT id, content, scope FROM agent_memories
+        WHERE id = ANY(:ids) AND entity_id = :entity AND workspace_id = :ws
+          AND user_id IS NULL AND agent_id IS NULL AND status = 'active'
+          AND confidence >= :confidence
+          AND (expires_at IS NULL OR expires_at > clock_timestamp())
+    """), {"ids": [r["id"] for r in selected], "entity": entity_id, "ws": workspace_id,
+            "confidence": min_confidence})).mappings().all()
+    valid = {r["id"]: r for r in current}
+    selected_ids = {r["id"] for r in selected if r["id"] in valid
+                    and content_fingerprint(valid[r["id"]]["content"]) == r["revision"]
+                    and valid[r["id"]]["scope"] == r["scope"]}
+    by_id = {r["id"]: r for r in records}
+    return [by_id[r["id"]] for r in selected if r["id"] in selected_ids]
 
 
 async def _agent_memory_embedding_available(db: AsyncSession) -> bool:
@@ -190,6 +198,7 @@ async def _vector_search(
         FROM agent_memories
         WHERE entity_id = :entity
           AND workspace_id = :ws
+          AND agent_id IS NULL AND user_id IS NULL
           AND status = 'active'
           AND confidence >= :min_conf
           AND embedding IS NOT NULL
@@ -225,6 +234,7 @@ async def _recency_search(
         FROM agent_memories
         WHERE entity_id = :entity
           AND workspace_id = :ws
+          AND agent_id IS NULL AND user_id IS NULL
           AND status = 'active'
           AND confidence >= :min_conf
           AND (expires_at IS NULL OR expires_at > NOW())
@@ -285,6 +295,21 @@ async def record_memory(
     human-readable operating-memory surface for future loops.
     """
     prepared_body, body_meta = _prepare_body_for_store(body)
+    from packages.core.memory.dedup import find_duplicate
+    from packages.core.memory.policy import content_fingerprint, normalized_content
+    from packages.core.memory.repo import read_entry
+    duplicate = await find_duplicate(db, entity_id=entity_id, workspace_id=workspace_id,
+        scope=scope, memory_type=scope, content=prepared_body)
+    if duplicate is not None:
+        path = (duplicate.metadata_ or {}).get("file_path")
+        existing = read_entry(path) if path else None
+        if (existing is not None and existing.entity_id == entity_id
+                and existing.workspace_id == workspace_id and existing.scope == scope
+                and existing.frontmatter.id == duplicate.id
+                and existing.frontmatter.status == "active" and existing.frontmatter.expires_at is None
+                and normalized_content(existing.body) == normalized_content(prepared_body)):
+            return existing
+    body_meta["content_fingerprint"] = content_fingerprint(prepared_body)
     fm = stub_frontmatter(
         id_=generate_ulid(),
         title=title,
@@ -299,7 +324,8 @@ async def record_memory(
         entity_id=entity_id,
         workspace_id=workspace_id,
         scope=scope,
-        slug=slug,
+        # Different memories with the same title must not overwrite each other.
+        slug=slug or f"memory-{fm.id.lower()}",
         frontmatter=fm,
         body=prepared_body,
     )
@@ -329,39 +355,8 @@ def _mirror_entry_to_canonical(entry: MemoryEntry) -> dict[str, object] | None:
 
 
 def _canonical_filename_for_entry(entry: MemoryEntry) -> str:
-    scope = str(entry.scope or "").strip().lower()
-    title = entry.frontmatter.title or ""
-    body = entry.body or ""
-    tags = [str(tag or "").lower() for tag in (entry.frontmatter.tags or [])]
-    text = f"{title}\n{body}".lower()
-    if scope == "learning":
-        return "LEARNINGS.md"
-    if scope == "guidance":
-        return "RULES.md"
-    if _looks_like_guardrail(text, tags):
-        return "RULES.md"
-    return "MEMORY.md"
-
-
-def _looks_like_guardrail(text: str, tags: list[str]) -> bool:
-    if {"approval", "hitl", "guardrail", "rule"} & set(tags):
-        return True
-    return any(token in text for token in [
-        "必须",
-        "不要",
-        "不能",
-        "不准",
-        "审核",
-        "批准",
-        "同意",
-        "must",
-        "never",
-        "do not",
-        "approval",
-        "approve",
-        "permission",
-        "guardrail",
-    ])
+    from packages.core.memory.policy import canonical_filename
+    return canonical_filename(entry.scope, entry.body, entry.frontmatter.tags)
 
 
 def _canonical_block_for_entry(entry: MemoryEntry, *, marker: str) -> str:

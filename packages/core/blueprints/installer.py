@@ -31,6 +31,8 @@ before this works for real").
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import hashlib
 import json
 import math
@@ -70,12 +72,15 @@ from packages.core.blueprints.simulation import resolve_simulation_experience
 from packages.core.blueprints.workflow_dependencies import (
     WorkflowDependencyError,
     WorkflowDependencyFactory,
+    WorkflowSkillDependencyFactory,
+    WorkflowDocumentDependencyFactory,
 )
 from packages.core.governance import WorkspacePolicy, update_policy
 from packages.core.models.base import generate_ulid
 from packages.core.models.custom_field import CustomFieldDefinition
 from packages.core.models.document import (
     Document,
+    DocumentFolder,
     DocumentGroup,
     DocumentGroupMember,
     VectorStatus,
@@ -191,6 +196,54 @@ class InstallTodo:
     soft warning instead of a red flag."""
 
 
+def author_hard_blocks(payload: Mapping[str, Any] | None) -> list[str]:
+    """The hard-block scopes shipped in either policy or operating rules."""
+
+    policy = payload.get("policy") if isinstance(payload, Mapping) else None
+    governance = policy.get("governance") if isinstance(policy, Mapping) else None
+    out: list[str] = []
+    for key in ("never_allow_actions", "never_allow_capabilities"):
+        for value in (governance.get(key) or []) if isinstance(governance, Mapping) else []:
+            text = str(value or "").strip()
+            if text and text not in out:
+                out.append(text)
+    from packages.core.governance.approval_projection import (
+        compile_workspace_rules, policy_override, selector_label,
+    )
+    if isinstance(governance, dict) and "approval" in governance:
+        for rule in policy_override(governance).rules:
+            if rule.effect == "deny" and selector_label(rule) not in out:
+                out.append(selector_label(rule))
+    recipe = payload.get("recipe") if isinstance(payload, Mapping) else None
+    operating_model = recipe.get("operating_model") if isinstance(recipe, Mapping) else None
+    rules = operating_model.get("rules") if isinstance(operating_model, Mapping) else None
+    if isinstance(rules, list):
+        from packages.core.services.workspace_setup_service import _infer_rule_enforcement
+
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("approval_selectors") is not None:
+                for compiled in compile_workspace_rules([rule]):
+                    if compiled.effect == "deny" and selector_label(compiled) not in out:
+                        out.append(selector_label(compiled))
+                continue
+            enforcement = _infer_rule_enforcement(rule)
+            if enforcement and enforcement["effect"] == "deny":
+                for pattern in enforcement["patterns"] + enforcement["capability_patterns"]:
+                    if pattern not in out:
+                        out.append(pattern)
+    return out
+
+
+def demote_author_hard_blocks(policy: WorkspacePolicy) -> tuple[WorkspacePolicy, list[str]]:
+    """Compatibility helper for policy-only author defaults; input is unchanged."""
+    from packages.core.governance.defaults import normalize_default_workspace_governance
+
+    _, projected, moved = normalize_default_workspace_governance([], policy)
+    return projected, moved
+
+
 @dataclass
 class InstallResult:
     workspace_id: str
@@ -204,6 +257,9 @@ class InstallResult:
     workflow_binding_ids: list[str] = field(default_factory=list)
     custom_field_ids: list[str] = field(default_factory=list)
     governance_applied: bool = False
+    #: Author never_allow entries installed as approval gates instead (the
+    #: operator did not opt in to the author's hard blocks).
+    demoted_hard_blocks: list[str] = field(default_factory=list)
     todos: list[InstallTodo] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -377,6 +433,19 @@ def resolve_install_variables(
     return replace(payload), materialized
 
 
+def _effective_install_todos(workspace: Workspace, todos: list[InstallTodo]) -> list[InstallTodo]:
+    from packages.core.services.workspace_integration_scope import (
+        disabled_workspace_providers,
+        integration_provider_for_requirement,
+    )
+
+    disabled = disabled_workspace_providers(workspace.operating_model)
+    return [
+        todo for todo in todos
+        if integration_provider_for_requirement({"kind": todo.kind, "payload": todo.payload}) not in disabled
+    ]
+
+
 def _persist_install_todos(
     workspace: Workspace,
     todos: list[InstallTodo],
@@ -417,6 +486,7 @@ def _persist_install_todos(
             payload = {
                 "skill_slug": payload.get("skill_slug"),
                 "marketplace_skill_id": payload.get("marketplace_skill_id"),
+                "marketplace_source": payload.get("marketplace_source"),
                 "skill_component_key": payload.get("skill_component_key"),
                 "agent_slug": payload.get("agent_slug"),
                 "installed_agent_id": payload.get("installed_agent_id"),
@@ -426,7 +496,8 @@ def _persist_install_todos(
 
     settings = dict(workspace.settings or {})
     blueprint = dict(settings.get("_blueprint") or {})
-    blueprint["install_todos"] = [serialize(todo) for todo in todos]
+    effective_todos = _effective_install_todos(workspace, todos)
+    blueprint["install_todos"] = [serialize(todo) for todo in effective_todos]
     durable_requirements: list[dict[str, Any]] = []
     seen_requirements: set[str] = set()
     for requirement in [*live_requirements, *todos]:
@@ -437,7 +508,7 @@ def _persist_install_todos(
         durable_requirements.append(serialize(requirement))
     blueprint["live_setup_requirements"] = durable_requirements
     blueprint["blocking_todo_count"] = sum(
-        1 for todo in todos if todo.blocking
+        1 for todo in effective_todos if todo.blocking
     )
     settings["_blueprint"] = blueprint
     workspace.settings = settings
@@ -575,18 +646,40 @@ async def _bind_blueprint_channel_configs(
             "linked_service_key": linked_service_key,
         }
         if existing_binding is not None:
+            target_agent_id = (
+                subscription.agent_id if subscription is not None else None
+            )
+            target_subscription_id = (
+                subscription.id if subscription is not None else None
+            )
+            if channel_type == "twilio_voice" and (
+                existing_binding.agent_id != target_agent_id
+                or existing_binding.agent_subscription_id
+                != target_subscription_id
+                or existing_binding.workspace_id != workspace.id
+                or existing_binding.status != "active"
+            ):
+                from packages.core.services.voice.call_sessions import (
+                    cancel_unconnected_call_sessions_for_binding,
+                )
+
+                await cancel_unconnected_call_sessions_for_binding(
+                    db,
+                    channel_config_id=channel_config.id,
+                    channel_binding_id=existing_binding.id,
+                    reason=(
+                        "Twilio Voice Blueprint binding changed before the call "
+                        "connected."
+                    ),
+                )
             existing_binding.name = str(
                 requirement.get("label")
                 or existing_binding.name
                 or channel_config.name
                 or channel_type
             )
-            existing_binding.agent_id = (
-                subscription.agent_id if subscription is not None else None
-            )
-            existing_binding.agent_subscription_id = (
-                subscription.id if subscription is not None else None
-            )
+            existing_binding.agent_id = target_agent_id
+            existing_binding.agent_subscription_id = target_subscription_id
             # Blueprint owns routing fields, not per-Workspace runtime options
             # such as the operator's language preference.
             existing_binding.config = {
@@ -777,7 +870,13 @@ async def sync_workspace_live_setup_requirements(
         select(AgentSkillBinding, Skill).join(
             Skill,
             Skill.id == AgentSkillBinding.skill_id,
-        ).where(AgentSkillBinding.agent_id.in_(agent_ids))
+        ).where(
+            AgentSkillBinding.agent_id.in_(agent_ids),
+            AgentSkillBinding.status == "active",
+            Skill.status == "active",
+            or_(Skill.entity_id == workspace.entity_id,
+                and_(Skill.entity_id.is_(None), Skill.is_public.is_(True))),
+        )
     )).all()) if agent_ids else []
     skills_by_agent: dict[str, list[Skill]] = {}
     for binding, skill in skill_rows:
@@ -848,33 +947,31 @@ async def sync_workspace_live_setup_requirements(
                 or requirement.get("marketplace_id")
                 or ""
             ).strip()
+            marketplace_source = str(
+                exact_ref.get("marketplace_source")
+                or requirement.get("marketplace_source") or "platform"
+            ).strip()
             installed_skill_id: str | None = None
-            for skill in skills_by_agent.get(installed_agent_id or "", []):
-                source_skill_id = str(
-                    (skill.config or {}).get("source_skill_id") or ""
-                ).strip()
-                identity_matches = (
-                    (
-                        marketplace_skill_id
-                        and (
-                            str(skill.id) == marketplace_skill_id
-                            or source_skill_id == marketplace_skill_id
-                        )
-                    )
-                    or (
-                        not marketplace_skill_id
-                        and str(skill.slug or "").strip() == skill_slug
-                    )
+            bound_skills = skills_by_agent.get(installed_agent_id or "", [])
+            if marketplace_skill_id:
+                from packages.core.services.marketplace_skill_service import resolve_bound_blueprint_skill
+
+                installed_skill_id = await resolve_bound_blueprint_skill(
+                    db, entity_id=workspace.entity_id, skills=bound_skills,
+                    marketplace_id=marketplace_skill_id,
+                    marketplace_source=marketplace_source,
                 )
-                if identity_matches:
-                    installed_skill_id = str(skill.id)
-                    break
+            elif not candidates or len(candidates) == 1:
+                matches = {skill.id for skill in bound_skills
+                           if str(skill.slug or "").strip() == skill_slug}
+                installed_skill_id = next(iter(matches)) if len(matches) == 1 else None
             requirements.append(InstallTodo(
                 kind=BlueprintInstallTodoKind.MISSING_SKILL.value,
                 detail=f"Restore skill {skill_slug!r} for agent {agent_slug!r}.",
                 payload={
                     "skill_slug": skill_slug,
                     "marketplace_skill_id": marketplace_skill_id or None,
+                    **({"marketplace_source": marketplace_source} if marketplace_skill_id else {}),
                     "skill_component_key": embedded_skill_component_keys.get(
                         skill_slug
                     ),
@@ -982,6 +1079,46 @@ async def sync_workspace_live_setup_requirements(
 
 # ── Public API ────────────────────────────────────────────────────────
 
+def _declare_subscribed_services(
+    operating_model: dict[str, Any],
+    recipe: Mapping[str, Any],
+    embedded: Mapping[str, Any],
+) -> None:
+    """Declare every subscribed service the payload's service list omitted.
+
+    Once a Workspace declares services, each Agent mapping must name one of
+    them; otherwise every later Workspace operation inherits validation errors
+    (R2-4: a merged payload subscribed ``product_video.*`` roles but declared
+    only ``video_studio.*``). Installed state must validate, so an incomplete
+    payload is completed here from its own subscription and Agent data.
+    A payload declaring no services keeps that shape: nothing is checked
+    against an empty list, and synthesizing one would change its meaning.
+    """
+    services = operating_model.get("services")
+    if not isinstance(services, list) or not services:
+        return
+    declared = {
+        str(row.get("key") or row.get("service_key") or "").strip()
+        for row in services if isinstance(row, dict)
+    }
+    agent_names = {
+        agent.get("slug"): agent.get("name")
+        for agent in embedded.get("agents") or [] if isinstance(agent, dict)
+    }
+    added = []
+    for sub in recipe.get("subscriptions") or []:
+        key = str(sub.get("service_key") or "").strip() if isinstance(sub, dict) else ""
+        if not key or key in declared:
+            continue
+        config = sub.get("config") if isinstance(sub.get("config"), dict) else {}
+        name = config.get("service_name") or agent_names.get(sub.get("agent_slug")) or key
+        operating_model["services"] = services = [*services, {"key": key, "name": str(name)}]
+        declared.add(key)
+        added.append(key)
+    if added:
+        logger.info("blueprint subscriptions referenced undeclared services; declared %s", added)
+
+
 async def install_blueprint(
     db: AsyncSession,
     *,
@@ -994,9 +1131,11 @@ async def install_blueprint(
     blueprint_slug: Optional[str] = None,
     blueprint_version: Optional[str] = None,
     create_missing_agents: bool = False,
-    governance_preset: str = "standard",
+    agent_ids_by_service_key: Optional[dict[str, str]] = None,
+    governance_preset: str = "automatic",
     variable_values: Optional[dict[str, Any]] = None,
     channel_config_ids: Optional[dict[str, str]] = None,
+    install_author_hard_blocks: bool = False,
 ) -> InstallResult:
     """Materialise a blueprint payload as a new workspace. Caller commits.
 
@@ -1030,12 +1169,54 @@ async def install_blueprint(
             raise InstallError("workflow definition must be an object")
         _blueprint_workflow_definition_values(workflow)
 
-    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
-
     manifest = payload["manifest"]
     contract = payload["contract"]
     recipe = payload["recipe"]
+    selected_agents = agent_ids_by_service_key or {}
+    declared_service_keys = {
+        sub["service_key"] for sub in recipe.get("subscriptions") or []
+    }
+    if any(
+        not isinstance(key, str) or key not in declared_service_keys
+        or not isinstance(agent_id, str) or not agent_id.strip()
+        for key, agent_id in selected_agents.items()
+    ):
+        raise InstallError("Agent selections must name a Blueprint service and an existing Agent id")
+    if selected_agents and not user_id:
+        raise InstallError("Selecting an existing Agent requires an installing user")
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
     policy = payload["policy"]
+
+    # One materialized governance projection owns source rules, embedded-tool
+    # preview, and the persisted policy. Keep the delivered payload unchanged
+    # for provenance, personalization fingerprints, and upgrade comparisons.
+    from packages.core.governance.defaults import normalize_default_workspace_governance
+    from packages.core.governance.presets import PRESETS, apply_preset
+
+    if governance_preset not in PRESETS:
+        raise InstallError(
+            f"unknown governance_preset {governance_preset!r}; "
+            f"valid: {sorted(PRESETS)}"
+        )
+    governance_section = policy.get("governance") or {}
+    try:
+        from packages.core.governance.approval_projection import import_blueprint_governance
+        base_policy, imported_rules = import_blueprint_governance(
+            governance_section, (recipe.get("operating_model") or {}).get("rules") or [],
+            preserve_hard_blocks=install_author_hard_blocks,
+        )
+        operating_rules, final_policy, demoted_hard_blocks = normalize_default_workspace_governance(
+            imported_rules, base_policy,
+            preserve_hard_blocks=install_author_hard_blocks,
+        )
+        # Template consent is nonportable; the installer's execution choice is
+        # local operator configuration and must survive template normalization.
+        final_policy = apply_preset(final_policy, governance_preset)
+    except (ValueError, TypeError) as exc:
+        raise InstallError(f"governance_policy malformed: {exc}") from exc
+
+    # Simulation never creates reusable approval authority.
+    simulation_task_grant_added = False
 
     if channel_config_ids is not None and (
         mode != InstallMode.SIMULATE or channel_config_ids
@@ -1057,6 +1238,8 @@ async def install_blueprint(
     # primary_work / settings) during migration. Extract them back out
     # before writing the JSONB column so the column stays clean.
     om_full = dict(recipe.get("operating_model") or {})
+    if "rules" in om_full:
+        om_full["rules"] = operating_rules
     ws_kind = manifest.get("kind") or om_full.pop("kind", None) or ""
     operating_context = om_full.pop("context", None) or ""
     primary_work = om_full.pop("primary_work", None) or ""
@@ -1099,6 +1282,7 @@ async def install_blueprint(
                 merged[key] = strategist_cfg[key]
         om_full["strategist"] = merged
 
+    _declare_subscribed_services(om_full, recipe, payload.get("embedded") or {})
     workspace_operating_model = om_full  # remaining keys (services, rules, strategist, ...)
     # Prompts are portable workspace guidance, not executable task instances.
     # Keep them under the operating model so export/install has one durable
@@ -1149,10 +1333,11 @@ async def install_blueprint(
         # mode. Runtime action governance still applies, and simulation plans route external
         # side effects to their simulated adapters.
         strategist_settings = dict(settings.get("strategist") or {})
-        strategist_settings["auto_approve_proposals"] = True
-        strategist_settings["auto_approve_proposals_source"] = (
-            "blueprint_simulation"
-        )
+        if simulation_task_grant_added:
+            strategist_settings["proposal_task_approval_source"] = "blueprint_simulation"
+        else:
+            # A grant retained from the installed policy is not simulation-owned.
+            strategist_settings.pop("proposal_task_approval_source", None)
         settings["strategist"] = strategist_settings
         settings["simulation_experience"] = resolve_simulation_experience(payload)
     else:
@@ -1161,7 +1346,11 @@ async def install_blueprint(
     settings["_blueprint"] = {
         "blueprint_id": blueprint_id,
         "blueprint_slug": blueprint_slug,
+        # Raw JSON is portable configuration but has no durable release
+        # provenance.  Never let its manifest slug become an upgrade source.
+        "source": "marketplace" if blueprint_id else "raw_payload",
         "title": manifest.get("title"),
+        "usage_guide": manifest.get("usage_guide"),
         "installed_at": datetime.now(timezone.utc).isoformat(),
         # What was actually copied, so a later blueprint fix can be detected.
         # manifest.blueprint_version is the payload *format* version and does
@@ -1240,25 +1429,7 @@ async def install_blueprint(
     # operator's chosen preset would never allow. The actual policy row
     # is written later in this function (one source of truth, same
     # values).
-    from packages.core.governance.presets import PRESETS, apply_preset
-    if governance_preset not in PRESETS:
-        raise InstallError(
-            f"unknown governance_preset {governance_preset!r}; "
-            f"valid: {sorted(PRESETS)}"
-        )
-    governance_section = policy.get("governance") or {}
-    try:
-        base_policy_preview = WorkspacePolicy(**{
-            k: v for k, v in governance_section.items()
-            if k in {
-                "never_allow_actions", "hitl_required_actions",
-                "auto_approve_actions", "max_risk_level",
-                "budget_caps_per_kind",
-            }
-        })
-    except TypeError as exc:
-        raise InstallError(f"governance_policy malformed: {exc}")
-    final_policy_preview = apply_preset(base_policy_preview, governance_preset)
+    final_policy_preview = final_policy
 
     # ── Embedded skills ──
     # Skills first because embedded agents may bind to them.
@@ -1392,6 +1563,7 @@ async def install_blueprint(
             db, entity_id=entity_id, workspace_id=workspace.id, sub=sub,
             create_missing=create_missing_agents, owner_user_id=user_id,
             embedded_agent_ids=agent_id_by_slug,
+            selected_agent_id=selected_agents.get(sub["service_key"]),
         )
         if sub_id:
             result.subscription_ids.append(sub_id)
@@ -1466,6 +1638,7 @@ async def install_blueprint(
     )
     workflow_specs = list(recipe.get("workflows") or [])
     workflow_id_by_key: dict[str, str] = {}
+    app_binding_id_by_key: dict[str, str] = {}
     for w in workflow_specs:
         workflow_id = await _install_workflow(
             db,
@@ -1513,6 +1686,7 @@ async def install_blueprint(
             )
             if binding_id:
                 result.workflow_binding_ids.append(binding_id)
+                app_binding_id_by_key[str(w.get("slug") or "").strip()] = binding_id
         if workflow_id and blueprint_id:
             await record_marketplace_resource_link(
                 db,
@@ -1540,32 +1714,40 @@ async def install_blueprint(
         )
         result.scheduled_job_ids.append(sj_id)
 
+    if workspace_operating_model.get("app_view") is not None:
+        from packages.core.blueprints.app_view import remap_app_view
+        from packages.core.blueprints.exporter import _portable_agent_slug
+
+        app_agents = (await db.execute(select(Agent).join(
+            AgentSubscription, AgentSubscription.agent_id == Agent.id,
+        ).where(AgentSubscription.workspace_id == workspace.id,
+                AgentSubscription.entity_id == entity_id,
+                AgentSubscription.status == "active"))).scalars().all()
+        try:
+            workspace.operating_model = {
+                **workspace.operating_model,
+                "app_view": remap_app_view(
+                    workspace_operating_model["app_view"], workflows=app_binding_id_by_key,
+                    agents={_portable_agent_slug(a): a.id for a in app_agents},
+                    automations={j["job_id"]: installed_blueprint_job_id(j["job_id"], workspace.id)
+                                 for j in recipe.get("scheduled_jobs") or []},
+                ),
+            }
+        except ValueError as exc:
+            raise InstallError(str(exc)) from exc
+
     # ── Governance policy ──
     # The post-preset policy was already computed at the top of this
     # function (so embedded agents could be validated against it). Reuse
     # those values here — there's only one source of truth.
-    governance = governance_section
-    try:
-        base_policy = WorkspacePolicy(**{
-            k: v for k, v in governance.items()
-            if k in {
-                "never_allow_actions", "hitl_required_actions",
-                "auto_approve_actions", "max_risk_level",
-                "never_allow_capabilities", "hitl_required_capabilities",
-                "auto_approve_capabilities",
-                "budget_caps_per_kind",
-            }
-        })
-    except TypeError as exc:
-        raise InstallError(f"governance_policy malformed: {exc}")
-    final_policy = apply_preset(base_policy, governance_preset)
+    result.demoted_hard_blocks = demoted_hard_blocks
 
     # Always write a policy row so the audit chain shows the active
     # ruleset — even when the blueprint had no governance section but
     # the operator picked 'safe'.
     if (
-        governance
-        or governance_preset != "standard"
+        governance_section
+        or governance_preset != "follow_default"
         or final_policy != base_policy
     ):
         await update_policy(
@@ -1586,6 +1768,9 @@ async def install_blueprint(
     # simulation report can later say "you ran on Safe".
     bp_meta = dict(workspace.settings.get("_blueprint") or {})
     bp_meta["governance_preset"] = governance_preset
+    bp_meta["author_hard_blocks_installed"] = bool(install_author_hard_blocks)
+    if demoted_hard_blocks:
+        bp_meta["demoted_hard_blocks"] = list(demoted_hard_blocks)
     settings = dict(workspace.settings or {})
     settings["_blueprint"] = bp_meta
     workspace.settings = settings
@@ -1691,6 +1876,9 @@ async def install_blueprint(
         live_setup_requirements,
     )
 
+    # Persist the original requirements above so explicit integration.enable
+    # restores them. The install receipt reflects only currently effective setup.
+    result.todos = _effective_install_todos(workspace, result.todos)
     blocking_todos = [todo for todo in result.todos if todo.blocking]
 
     if mode == InstallMode.SIMULATE:
@@ -1715,7 +1903,11 @@ async def install_blueprint(
                 db,
                 workspace,
                 cadence=workspace.heartbeat_cadence,
+                user_id=user_id,
             )
+            from packages.core.services.workspace_initial_review import prepare_initial_workspace_review
+
+            await prepare_initial_workspace_review(db, workspace)
         if blocking_todos:
             result.notes.append(
                 "Installed in LIVE mode with runtime startup suspended until "
@@ -1726,6 +1918,9 @@ async def install_blueprint(
                 "Installed in LIVE mode — actions hit real systems."
             )
 
+    from packages.core.blueprints.reconfigure import capture_install_baseline
+
+    await capture_install_baseline(db, workspace=workspace, payload=payload)
     return result
 
 
@@ -1779,10 +1974,11 @@ async def _install_subscription(
     sub: dict[str, Any], create_missing: bool,
     owner_user_id: Optional[str] = None,
     embedded_agent_ids: Optional[dict[str, str]] = None,
+    selected_agent_id: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[InstallTodo]]:
     slug = sub.get("agent_slug")
     marketplace_agent_id = str(sub.get("marketplace_agent_id") or "").strip()
-    if not slug and not marketplace_agent_id:
+    if not slug and not marketplace_agent_id and not selected_agent_id:
         return None, InstallTodo(
             kind=BlueprintInstallTodoKind.MISSING_AGENT.value,
             detail=(
@@ -1793,7 +1989,29 @@ async def _install_subscription(
         )
     agent = None
     embedded_agent_id = (embedded_agent_ids or {}).get(str(slug or ""))
-    if marketplace_agent_id:
+    if selected_agent_id:
+        # An installer's choice is a local runtime binding, not a portable
+        # Blueprint identity. The UI lists readable entity Agents, and the
+        # installer enforces the same rule for direct API callers.
+        candidate = (await db.execute(
+            select(Agent).where(
+                Agent.id == selected_agent_id,
+                Agent.entity_id == entity_id,
+                Agent.status == "active",
+                Agent.deleted_at.is_(None),
+            )
+        )).scalar_one_or_none()
+        if candidate is None or candidate.id not in await readable_resource_ids(
+            db,
+            descriptors=[ResourceDescriptor.from_row(candidate, RESOURCE_AGENT)] if candidate else [],
+            entity_id=entity_id,
+            user_id=owner_user_id,
+        ):
+            raise InstallError(
+                f"selected Agent for service {sub.get('service_key')!r} is unavailable"
+            )
+        agent = candidate
+    elif marketplace_agent_id:
         from packages.core.services.marketplace_agent_service import (
             ensure_marketplace_agent_installed,
         )
@@ -2134,6 +2352,105 @@ async def _install_stat(
     return stat.id
 
 
+async def _resolve_blueprint_skill_target(
+    db: AsyncSession, *, entity_id: str, user_id: Optional[str],
+    target: dict[str, Any], skill_id_by_component_key: dict[str, str],
+) -> Skill:
+    """Resolve exact portable identity before the ordinary resource lock."""
+    component_key = str(
+        target.get("skill_component_key") or ""
+    ).strip()
+    marketplace_skill_id = str(
+        target.get("skill_marketplace_id") or ""
+    ).strip()
+    marketplace_source = str(
+        target.get("skill_marketplace_source") or "platform"
+    ).strip()
+    skill_id = skill_id_by_component_key.get(component_key)
+    skill = None
+    if skill_id and not marketplace_skill_id:
+        skill = (await db.execute(select(Skill).where(
+            Skill.id == skill_id,
+            Skill.entity_id == entity_id,
+            Skill.status == "active",
+        ))).scalar_one_or_none()
+    elif marketplace_skill_id and marketplace_source == "manor":
+        # The curated Manor marketplace bundle is Cloud-only. Keep this
+        # branch syntactically valid when OSS export removes its body.
+        skill = None
+        skill_resolution_error: str | None = None
+        if skill is None:
+            detail = (
+                f": {skill_resolution_error}"
+                if skill_resolution_error else ""
+            )
+            raise InstallError(
+                f"Blueprint Manor Skill {component_key!r} could not be "
+                f"installed{detail}"
+            )
+    elif marketplace_skill_id and marketplace_source == "platform":
+        from packages.core.services.marketplace_skill_service import (
+            ensure_marketplace_skill_installed,
+        )
+
+        try:
+            skill = await ensure_marketplace_skill_installed(
+                db,
+                entity_id=entity_id,
+                skill_id=marketplace_skill_id,
+                owner_user_id=user_id,
+            )
+        except (MarketplaceIdentityConflictError, ValueError) as exc:
+            raise InstallError(
+                f"Blueprint skill {component_key!r} could not be installed: {exc}"
+            ) from exc
+    elif component_key:
+        # Compatibility for payloads written before exact component refs.
+        candidates = list((await db.execute(select(Skill).where(
+            Skill.slug == component_key,
+            Skill.status == "active",
+            or_(
+                Skill.entity_id == entity_id,
+                and_(
+                    Skill.entity_id.is_(None),
+                    Skill.is_public.is_(True),
+                ),
+            ),
+        ))).scalars().all())
+        candidates = await _readable_legacy_candidates(
+            db,
+            candidates=candidates,
+            entity_id=entity_id,
+            user_id=user_id,
+            resource_type=RESOURCE_SKILL,
+        )
+        if len(candidates) == 1:
+            skill = candidates[0]
+            if skill.entity_id is None:
+                from packages.core.services.marketplace_skill_service import (
+                    ensure_marketplace_skill_installed,
+                )
+
+                try:
+                    skill = await ensure_marketplace_skill_installed(
+                        db,
+                        entity_id=entity_id,
+                        skill_id=skill.id,
+                        owner_user_id=user_id,
+                    )
+                except (MarketplaceIdentityConflictError, ValueError) as exc:
+                    raise InstallError(
+                        f"Blueprint skill {component_key!r} could not be "
+                        f"installed: {exc}"
+                    ) from exc
+    if skill is None:
+        raise InstallError(
+            "Blueprint skill requires a resolvable "
+            "target.skill_component_key"
+        )
+    return skill
+
+
 async def _install_scheduled_job(
     db: AsyncSession, *, entity_id: str, workspace_id: str,
     sj: dict[str, Any], user_id: Optional[str], mode: InstallMode,
@@ -2157,97 +2474,10 @@ async def _install_scheduled_job(
         execution_target["workspace_id"] = workspace_id
 
     if execution_type == "skill":
-        component_key = str(
-            execution_target.get("skill_component_key") or ""
-        ).strip()
-        marketplace_skill_id = str(
-            execution_target.get("skill_marketplace_id") or ""
-        ).strip()
-        marketplace_source = str(
-            execution_target.get("skill_marketplace_source") or "platform"
-        ).strip()
-        skill_id = (skill_id_by_component_key or {}).get(component_key)
-        skill = None
-        if skill_id:
-            skill = (await db.execute(select(Skill).where(
-                Skill.id == skill_id,
-                Skill.entity_id == entity_id,
-                Skill.status == "active",
-            ))).scalar_one_or_none()
-        elif marketplace_skill_id and marketplace_source == "manor":
-            # The curated Manor marketplace bundle is Cloud-only. Keep this
-            # branch syntactically valid when OSS export removes its body.
-            skill = None
-            skill_resolution_error: str | None = None
-            if skill is None:
-                detail = (
-                    f": {skill_resolution_error}"
-                    if skill_resolution_error else ""
-                )
-                raise InstallError(
-                    f"scheduled Manor Skill {component_key!r} could not be "
-                    f"installed{detail}"
-                )
-        elif marketplace_skill_id and marketplace_source == "platform":
-            from packages.core.services.marketplace_skill_service import (
-                ensure_marketplace_skill_installed,
-            )
-
-            try:
-                skill = await ensure_marketplace_skill_installed(
-                    db,
-                    entity_id=entity_id,
-                    skill_id=marketplace_skill_id,
-                    owner_user_id=user_id,
-                )
-            except (MarketplaceIdentityConflictError, ValueError) as exc:
-                raise InstallError(
-                    f"scheduled skill {component_key!r} could not be installed: {exc}"
-                ) from exc
-        elif component_key:
-            # Compatibility for payloads written before exact component refs.
-            candidates = list((await db.execute(select(Skill).where(
-                Skill.slug == component_key,
-                Skill.status == "active",
-                or_(
-                    Skill.entity_id == entity_id,
-                    and_(
-                        Skill.entity_id.is_(None),
-                        Skill.is_public.is_(True),
-                    ),
-                ),
-            ))).scalars().all())
-            candidates = await _readable_legacy_candidates(
-                db,
-                candidates=candidates,
-                entity_id=entity_id,
-                user_id=user_id,
-                resource_type=RESOURCE_SKILL,
-            )
-            if len(candidates) == 1:
-                skill = candidates[0]
-                if skill.entity_id is None:
-                    from packages.core.services.marketplace_skill_service import (
-                        ensure_marketplace_skill_installed,
-                    )
-
-                    try:
-                        skill = await ensure_marketplace_skill_installed(
-                            db,
-                            entity_id=entity_id,
-                            skill_id=skill.id,
-                            owner_user_id=user_id,
-                        )
-                    except (MarketplaceIdentityConflictError, ValueError) as exc:
-                        raise InstallError(
-                            f"scheduled skill {component_key!r} could not be "
-                            f"installed: {exc}"
-                        ) from exc
-        if skill is None:
-            raise InstallError(
-                "scheduled skill requires a resolvable "
-                "execution_target.skill_component_key"
-            )
+        skill = await _resolve_blueprint_skill_target(
+            db, entity_id=entity_id, user_id=user_id, target=execution_target,
+            skill_id_by_component_key=skill_id_by_component_key or {},
+        )
         execution_target["skill_id"] = skill.id
         execution_target["workspace_id"] = workspace_id
 
@@ -2316,16 +2546,27 @@ async def _install_scheduled_job(
     agent_id = sj.get("agent_id")
     service_key = str(execution_target.get("service_key") or "").strip()
     if not agent_id and service_key:
-        sub = (await db.execute(
+        subscriptions = list((await db.execute(
             select(AgentSubscription).where(
                 AgentSubscription.entity_id == entity_id,
                 AgentSubscription.workspace_id == workspace_id,
                 AgentSubscription.service_key == service_key,
                 AgentSubscription.status == "active",
-            ).limit(1)
-        )).scalar_one_or_none()
-        if sub is not None:
-            agent_id = sub.agent_id
+            ).order_by(AgentSubscription.id.asc()).limit(2)
+        )).scalars().all())
+        if not subscriptions:
+            raise InstallError(
+                f"scheduled agent service {service_key!r} has no active "
+                "Workspace subscription"
+            )
+        if len(subscriptions) > 1:
+            raise InstallError(
+                f"scheduled agent service {service_key!r} is ambiguous in "
+                "this Workspace"
+            )
+        sub = subscriptions[0]
+        agent_id = sub.agent_id
+        execution_target["agent_subscription_id"] = sub.id
     if execution_type == "agent" and not service_key:
         raise InstallError(
             "scheduled agent requires a portable execution_target.service_key"
@@ -2974,6 +3215,7 @@ async def _install_embedded_agent(
                     payload={
                         "skill_slug": sk_slug,
                         "marketplace_skill_id": marketplace_skill_id or None,
+                        **({"marketplace_source": marketplace_source} if marketplace_skill_id else {}),
                         "agent_slug": slug,
                         "installed_agent_id": agent.id,
                         **(
@@ -3009,6 +3251,7 @@ async def _install_embedded_agent(
             payload={
                 "skill_slug": sk_slug,
                 "marketplace_skill_id": marketplace_skill_id or None,
+                **({"marketplace_source": marketplace_source} if marketplace_skill_id else {}),
                 "installed_skill_id": skill_id,
                 "agent_slug": slug,
                 "installed_agent_id": agent.id,
@@ -3071,23 +3314,15 @@ def _enforce_governance_against_agent(
     by the post-preset governance policy. Tool names are matched by glob
     against ``never_allow_actions`` after stripping the ``tool.`` prefix
     (so ``tool.x.delete_account`` matches ``x.delete_*``)."""
-    import fnmatch
-    never = final_policy.never_allow_actions or []
-    if not never:
-        return
+    from packages.core.governance.approval_projection import policy_override
+    rules = policy_override(final_policy).rules
     for tool in a.get("tool_bindings") or []:
         if not isinstance(tool, str):
             continue
-        action_form = tool[len("tool."):] if tool.startswith("tool.") else tool
-        for pattern in never:
-            if fnmatch.fnmatchcase(action_form, pattern) or fnmatch.fnmatchcase(tool, pattern):
-                raise InstallError(
-                    f"embedded agent {a.get('slug')!r} binds tool {tool!r} "
-                    f"which is permanently blocked by governance policy "
-                    f"pattern {pattern!r} under the chosen preset. Either "
-                    f"drop the binding from the blueprint or pick a less "
-                    f"restrictive preset."
-                )
+        action_form = tool.removeprefix("tool.")
+        for rule in rules:
+            if rule.effect == "deny" and rule.selector.kind == "action" and rule.selector.action_key in {tool, action_form}:
+                raise InstallError(f"embedded agent {a.get('slug')!r} binds tool {tool!r} prohibited by {rule.id}")
 
 
 async def _install_knowledge_pack(
@@ -3100,12 +3335,8 @@ async def _install_knowledge_pack(
 ) -> Optional[str]:
     """Create a DocumentGroup and materialize its inline starter documents.
 
-    Inline Markdown does not need a filesystem object: ``Document`` already
-    supports durable text in ``metadata.content_text`` and scoped retrieval
-    reads that representation while embeddings are pending.  Keeping the
-    starter content as install todos left otherwise-complete Blueprints with
-    an empty Knowledge Net, so their first workflow run could not use the
-    policy and voice material shipped by the Blueprint.
+    Text is indexed in ``metadata.content_text`` and, when filesystem storage
+    is enabled, materialized at the Workspace path for native file tools.
     """
     slug = kp.get("slug")
     title = kp.get("title") or slug
@@ -3236,12 +3467,9 @@ def _blueprint_starter_document_predicate(document: dict[str, Any], pack_slug: s
     if key:
         return Document.metadata_["blueprint_document_key"].astext == key
     path = str(document.get("path") or "").strip()
-    return or_(
-        and_(
-            Document.metadata_["blueprint_knowledge_pack_slug"].astext == pack_slug,
-            Document.metadata_["blueprint_starter_path"].astext == path,
-        ),
-        Document.name == path,
+    return and_(
+        Document.metadata_["blueprint_knowledge_pack_slug"].astext == pack_slug,
+        Document.metadata_["blueprint_starter_path"].astext == path,
     )
 
 
@@ -3282,11 +3510,60 @@ def _matches_blueprint_starter_document(
             metadata.get("blueprint_knowledge_pack_slug") == knowledge_pack_slug
             and metadata.get("blueprint_starter_path") == path
         )
-        # Older/manual materializations may have no provenance marker. Treat a
-        # same-path row in this exact pack as authoritative instead of creating
-        # a duplicate beside the operator's document.
-        or row.name == path
     )
+
+
+async def _knowledge_starter_path_is_occupied(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    group_id: str,
+    path: str,
+) -> bool:
+    """Whether an unproven row already occupies a starter's canonical path."""
+    parent_id: str | None = None
+    workspace = await db.get(Workspace, workspace_id)
+    if (
+        workspace is not None
+        and workspace.entity_id == entity_id
+        and workspace.artifact_folder_id
+    ):
+        parent_id = workspace.artifact_folder_id
+        for part in (path.rsplit("/", 1)[0].split("/") if "/" in path else []):
+            folder = (await db.execute(
+                select(DocumentFolder).where(
+                    DocumentFolder.entity_id == entity_id,
+                    DocumentFolder.parent_id == parent_id,
+                    DocumentFolder.name == part,
+                ).order_by(
+                    DocumentFolder.owner_id.isnot(None),
+                    DocumentFolder.id,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if folder is None:
+                parent_id = None
+                break
+            parent_id = folder.id
+    conditions = [and_(
+        Document.name == path,
+        Document.folder_id.is_(None),
+        Document.id.in_(select(DocumentGroupMember.document_id).where(
+            DocumentGroupMember.group_id == group_id,
+        )),
+    )]
+    if parent_id is not None:
+        conditions.append(and_(
+            Document.name == path.rsplit("/", 1)[-1],
+            Document.folder_id == parent_id,
+        ))
+    return (await db.execute(
+        select(Document.id).where(
+            Document.entity_id == entity_id,
+            Document.is_trashed.is_(False),
+            or_(*conditions),
+        ).order_by(Document.id).limit(1)
+    )).scalar_one_or_none() is not None
 
 
 def _blueprint_document_template(document: dict[str, Any]) -> dict[str, Any] | None:
@@ -3311,7 +3588,11 @@ async def _materialize_knowledge_pack_document(
     document: dict[str, Any],
 ) -> tuple[Optional[Document], bool]:
     """Ensure one inline Blueprint document exists without overwriting it."""
-    path = str(document.get("path") or "").strip()
+    from packages.core.services.knowledge_visibility import normalize_rel_path
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+    from packages.core.services.knowledge_sync import repair_workspace_document_projection
+
+    path = normalize_rel_path(str(document.get("path") or "").strip())
     body = str(document.get("body_md") or "")
     document_key = str(document.get("key") or "").strip()
     if not path or not body:
@@ -3359,6 +3640,9 @@ async def _materialize_knowledge_pack_document(
                     },
                 )
             await db.flush()
+            await repair_workspace_document_projection(
+                db, entity_id=entity_id, workspace_id=workspace_id, document_ids=(row.id,),
+            )
             return row, False
 
     for row in rows:
@@ -3382,19 +3666,40 @@ async def _materialize_knowledge_pack_document(
                         "blueprint_template": template,
                     },
                 )
+            await repair_workspace_document_projection(
+                db, entity_id=entity_id, workspace_id=workspace_id, document_ids=(row.id,),
+            )
             return row, False
 
+    if await _knowledge_starter_path_is_occupied(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        group_id=group_id,
+        path=path,
+    ):
+        raise InstallError(
+            f"Blueprint Knowledge starter path {path!r} is already occupied by an unproven document"
+        )
+
+    folder_id = await ensure_workspace_document_folder(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        rel_path=path,
+        db=db,
+    )
     row = Document(
         id=generate_ulid(),
         entity_id=entity_id,
-        name=path,
+        name=path.rsplit("/", 1)[-1],
         file_size=len(body.encode("utf-8")),
-        file_type="md",
-        mime_type="text/markdown",
+        file_type="csv" if path.endswith(".csv") else "md",
+        mime_type="text/csv" if path.endswith(".csv") else "text/markdown",
         vector_status=VectorStatus.PENDING,
         source="blueprint",
         visibility="workspace",
         classification="public",
+        folder_id=folder_id,
         metadata_=merge_document_metadata(
             origin={"workspace_id": workspace_id},
             extra={
@@ -3410,6 +3715,22 @@ async def _materialize_knowledge_pack_document(
             },
         ),
     )
+    from packages.core.config import get_settings
+
+    if get_settings().MANOR_FS_ENABLED:
+        from packages.core.blueprints.knowledge_files import create_starter_file
+        from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is None or workspace.entity_id != entity_id or not workspace.artifact_folder_id:
+            raise InstallError("Blueprint starter file requires a Workspace artifact folder")
+        row.fs_path = f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/{path}"
+        from packages.core.services.entity_fs import EntityFilesystemError
+
+        try:
+            create_starter_file(db, entity_id=entity_id, path=row.fs_path, body=body)
+        except (ValueError, EntityFilesystemError) as exc:
+            raise InstallError(f"Could not create Blueprint starter {path!r}: {exc}") from exc
     db.add(row)
     db.add(DocumentGroupMember(document_id=row.id, group_id=group_id))
     await db.flush()
@@ -3458,18 +3779,42 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
         sid = s["id"]
         step_type = _blueprint_runtime_step_type(s)
         config = _blueprint_runtime_step_config(s, step_type)
+        has_explicit_routes = any(key in s for key in ("true_next", "false_next"))
+        if step_type == "switch":
+            has_explicit_routes = has_explicit_routes or bool(
+                config.get("cases") or config.get("default_next")
+            )
         step = {
             "id": sid,
             "type": step_type,
             "name": s.get("name") or sid,
             "config": config,
-            "next": _workflow_targets(s.get("next")) if "next" in s else next_map.get(sid, []),
+            "next": (
+                _workflow_targets(s.get("next"))
+                if "next" in s
+                else []
+                if has_explicit_routes
+                else next_map.get(sid, [])
+            ),
         }
         for route_key in ("true_next", "false_next"):
             if route_key in s:
                 step[route_key] = _workflow_targets(s.get(route_key))
         if s.get("meta"):
             step["meta"] = s["meta"]
+        if "chat_projection" in s:
+            step["chat_projection"] = deepcopy(s["chat_projection"])
+        if isinstance(s.get("position"), dict):
+            position = s["position"]
+            if all(
+                isinstance(position.get(axis), (int, float))
+                and not isinstance(position.get(axis), bool)
+                for axis in ("x", "y")
+            ):
+                step["position"] = {
+                    "x": position["x"],
+                    "y": position["y"],
+                }
         runtime_steps.append(step)
 
     if runtime_steps and not any(
@@ -3563,6 +3908,118 @@ def _blueprint_workflow_definition_values(w: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _materialize_workflow_document_refs(
+    db: AsyncSession, *, entity_id: str, workspace_id: Optional[str], node: Any,
+) -> Any:
+    try:
+        keys = WorkflowDocumentDependencyFactory.portable_keys(node)
+    except WorkflowDependencyError as exc:
+        raise InstallError(str(exc)) from exc
+    if not keys:
+        return deepcopy(node)
+    if not workspace_id:
+        raise InstallError("Workflow Knowledge references require a Workspace")
+    ids = {}
+    for key in keys:
+        rows = await _workspace_blueprint_document_rows(
+            db, entity_id=entity_id, workspace_id=workspace_id, document_key=key,
+        )
+        if len(rows) != 1 or rows[0].is_trashed:
+            raise InstallError("Workflow Knowledge starter is missing or ambiguous in this Workspace")
+        await _require_blueprint_document_owned_by_workspace(db, rows[0], workspace_id)
+        ids[key] = rows[0].id
+    return WorkflowDocumentDependencyFactory.to_runtime(node, document_id_by_key=ids)
+
+
+async def _materialize_workflow_skill_refs(
+    db: AsyncSession, *, entity_id: str, workspace_id: Optional[str],
+    user_id: Optional[str], node: Any, allow_install_external: bool = True,
+) -> Any:
+    """Only this installed Workspace's components may satisfy embedded refs."""
+    node = await _materialize_workflow_document_refs(
+        db, entity_id=entity_id, workspace_id=workspace_id, node=node,
+    )
+    if not WorkflowSkillDependencyFactory.has_portable_refs(node):
+        return deepcopy(node)
+    component_ids = {}
+    if workspace_id:
+        skills = list((await db.execute(select(Skill).where(
+            Skill.entity_id == entity_id, Skill.workspace_id == workspace_id,
+            Skill.status == "active",
+        ))).scalars().all())
+        for skill in skills:
+            key = str((skill.config or {}).get("source_blueprint_component_key") or "").strip()
+            if key:
+                if key in component_ids:
+                    raise InstallError(f"Blueprint Skill component {key!r} is ambiguous")
+                component_ids[key] = skill.id
+        from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
+
+        links = list((await db.execute(select(MarketplaceResourceLink).where(
+            MarketplaceResourceLink.entity_id == entity_id,
+            MarketplaceResourceLink.relationship == "installed_component",
+            MarketplaceResourceLink.scope_type == "workspace",
+            MarketplaceResourceLink.scope_id == workspace_id,
+            MarketplaceResourceLink.local_resource_type == RESOURCE_SKILL,
+        ))).scalars().all())
+        active_ids = {skill.id for skill in skills}
+        for link in links:
+            if link.component_key and link.local_resource_id in active_ids:
+                previous = component_ids.setdefault(link.component_key, link.local_resource_id)
+                if previous != link.local_resource_id:
+                    raise InstallError(f"Blueprint Skill component {link.component_key!r} is ambiguous")
+    resolved_ids = {}
+
+    async def materialize(value):
+        if isinstance(value, list):
+            return [await materialize(item) for item in value]
+        if not isinstance(value, dict):
+            return deepcopy(value)
+        result = {key: await materialize(item) for key, item in value.items() if key != "skill_refs"}
+        refs = value.get("skill_refs", [])
+        if not isinstance(refs, list):
+            raise InstallError("Workflow Skill references must name skill or skill_id arguments")
+        for ref in refs:
+            if not isinstance(ref, dict):
+                raise InstallError("Workflow Skill reference must be an object")
+            field, target = ref.get("field"), ref.get("target")
+            if (field not in WorkflowSkillDependencyFactory.FIELDS
+                or not isinstance(target, dict) or field in result):
+                raise InstallError("Workflow Skill reference is invalid or conflicts with a runtime argument")
+            if (not target.get("skill_marketplace_id")
+                and target.get("skill_component_key") not in component_ids):
+                raise InstallError("Workflow Skill component is missing from this installed Workspace")
+            key = json.dumps(target, sort_keys=True)
+            if key not in resolved_ids:
+                if target.get("skill_marketplace_id") and not allow_install_external:
+                    from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
+
+                    candidates = list((await db.execute(select(Skill).join(
+                        MarketplaceResourceLink,
+                        MarketplaceResourceLink.local_resource_id == Skill.id,
+                    ).where(
+                        Skill.entity_id == entity_id, Skill.status == "active",
+                        MarketplaceResourceLink.entity_id == entity_id,
+                        MarketplaceResourceLink.relationship == "installed_from",
+                        MarketplaceResourceLink.local_resource_type == RESOURCE_SKILL,
+                        MarketplaceResourceLink.marketplace_resource_id == target["skill_marketplace_id"],
+                        MarketplaceResourceLink.marketplace_source == target.get("skill_marketplace_source", "platform"),
+                    ))).scalars().unique().all())
+                    if len(candidates) != 1:
+                        raise InstallError("Workflow external Skill must already be installed before upgrading")
+                    skill = candidates[0]
+                else:
+                    skill = await _resolve_blueprint_skill_target(
+                        db, entity_id=entity_id, user_id=user_id, target=target,
+                        skill_id_by_component_key=component_ids,
+                    )
+                resolved_ids[key] = skill.id
+            result[field] = resolved_ids[key]
+        return result
+
+    return await materialize(node)
+
+
 async def _install_workflow(
     db: AsyncSession,
     *,
@@ -3588,6 +4045,11 @@ async def _install_workflow(
     if not slug:
         logger.warning("blueprint install: workflow missing slug, skipping")
         return None
+    w = deepcopy(w)
+    w["steps"] = await _materialize_workflow_skill_refs(
+        db, entity_id=entity_id, workspace_id=workspace_id,
+        user_id=installed_by, node=w.get("steps") or [],
+    )
     values = _blueprint_workflow_definition_values(w)
     await lock_reusable_resource_payload_references(
         db,
@@ -3721,6 +4183,8 @@ def _blueprint_runtime_step_config(
         "true_next",
         "false_next",
         "meta",
+        "position",
+        "chat_projection",
     }
     for key, value in step.items():
         if key not in excluded:

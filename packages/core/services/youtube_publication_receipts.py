@@ -20,7 +20,7 @@ from packages.core.services.youtube_public_video import (
 )
 
 
-RECEIPT_DIRECTORY = "technical"
+RECEIPT_DIRECTORY = ""
 RECEIPT_FILENAME = "latest-youtube-publication.json"
 RECEIPT_SCHEMA_VERSION = 1
 RECEIPT_KEYS = frozenset(
@@ -277,10 +277,16 @@ async def read_publication_receipt(
 ) -> dict[str, Any]:
     """Read the latest receipt from its deterministic Workspace path."""
 
-    _, rel_path, entity_root = await _receipt_location(
+    base = await _existing_receipt_base(
         entity_id=entity_id,
         workspace_id=workspace_id,
     )
+    entity_root = runtime_entity_file_root(entity_id)
+    rel_path = f"{base}/{RECEIPT_FILENAME}"
+    # Existing receipts remain readable without moving their bytes or
+    # provisioning a logical folder during a read.
+    if not os.path.isfile(os.path.join(entity_root, rel_path)):
+        rel_path = f"{base}/technical/{RECEIPT_FILENAME}"
     abs_path = os.path.realpath(os.path.join(entity_root, rel_path))
     root = os.path.realpath(entity_root)
     if os.path.commonpath([root, abs_path]) != root:
@@ -302,3 +308,19 @@ async def read_publication_receipt(
             "The YouTube publication receipt cannot be read",
         ) from exc
     return validate_publication_receipt(receipt)
+
+
+async def _existing_receipt_base(*, entity_id: str, workspace_id: str) -> str:
+    from sqlalchemy import select
+    from packages.core.database import async_session
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+
+    async with async_session() as db:
+        folder_id = (await db.execute(select(Workspace.artifact_folder_id).where(
+            Workspace.entity_id == entity_id, Workspace.id == workspace_id,
+            Workspace.deleted_at.is_(None),
+        ))).scalar_one_or_none()
+    if not folder_id:
+        raise YouTubePublicationReceiptError("receipt_missing", "No verified YouTube publication receipt exists for this Workspace")
+    return workspace_artifact_storage_base(folder_id)

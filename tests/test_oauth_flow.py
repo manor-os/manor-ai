@@ -1593,6 +1593,134 @@ async def test_callback_clears_stale_failed_health_on_reconnect(client: AsyncCli
 
 
 @pytest.mark.asyncio
+async def test_expired_gmail_reconnect_preserves_refresh_and_rejects_bad_grants(
+    client: AsyncClient, monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.user import OAuthAccount
+    from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
+
+    headers, user_id, _ = await _register_owner(client, "expired_gmail_reconnect")
+    monkeypatch.setenv("GOOGLE_CLIENT_ID", "cid")
+    monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "csec")
+    monkeypatch.setenv("APP_URL", "http://localhost:3010")
+
+    import packages.core.database as dbmod
+
+    connection_id = generate_ulid()
+    async with dbmod.async_session() as db:
+        account = OAuthAccount(
+            id=connection_id,
+            user_id=user_id,
+            provider="gmail",
+            provider_user_id="google-sub-1",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            profile={"email": "mailbox@example.com", "is_default": True},
+        )
+        store_oauth_account_tokens(
+            account, access_token="old-access", refresh_token="old-refresh",
+        )
+        db.add(account)
+        await db.commit()
+
+    start = await client.get(
+        f"/api/v1/integrations/oauth/gmail/start?connection_id={connection_id}",
+        headers=headers,
+    )
+    assert start.status_code == 200
+
+    class _MockResp:
+        status_code = 200
+        text = ""
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def json(self):
+            return self.payload
+
+    class _MockClient:
+        profile = {"sub": "google-sub-1", "email": "mailbox@example.com"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def post(self, *args, **kwargs):
+            return _MockResp({"access_token": "new-access", "expires_in": 3600})
+
+        async def get(self, *args, **kwargs):
+            return _MockResp(self.profile)
+
+    with patch("httpx.AsyncClient", lambda *args, **kwargs: _MockClient()):
+        response = await client.get(
+            "/api/v1/integrations/oauth/gmail/callback"
+            f"?code=abc&state={start.json()['state']}",
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 302
+    async with dbmod.async_session() as db:
+        account = await db.get(OAuthAccount, connection_id)
+        assert account is not None
+        assert account.token_expires_at > datetime.now(timezone.utc)
+        assert _leased_tokens(account) == {
+            "access_token": "new-access",
+            "refresh_token": "old-refresh",
+        }
+
+    wrong_account_start = await client.get(
+        f"/api/v1/integrations/oauth/gmail/start?connection_id={connection_id}",
+        headers=headers,
+    )
+    assert wrong_account_start.status_code == 200
+    _MockClient.profile = {"sub": "another-google-sub", "email": "other@example.com"}
+    with patch("httpx.AsyncClient", lambda *args, **kwargs: _MockClient()):
+        wrong_account_response = await client.get(
+            "/api/v1/integrations/oauth/gmail/callback"
+            f"?code=abc&state={wrong_account_start.json()['state']}",
+            follow_redirects=False,
+        )
+    assert wrong_account_response.status_code == 409
+    async with dbmod.async_session() as db:
+        account = await db.get(OAuthAccount, connection_id)
+        assert account is not None
+        assert account.provider_user_id == "google-sub-1"
+        assert _leased_tokens(account) == {
+            "access_token": "new-access",
+            "refresh_token": "old-refresh",
+        }
+
+        account.profile = {
+            **(account.profile or {}),
+            "oauth_refresh": {"reauth_required": True},
+        }
+        await db.commit()
+
+    incomplete_start = await client.get(
+        f"/api/v1/integrations/oauth/gmail/start?connection_id={connection_id}",
+        headers=headers,
+    )
+    assert incomplete_start.status_code == 200
+    _MockClient.profile = {"sub": "google-sub-1", "email": "mailbox@example.com"}
+    with patch("httpx.AsyncClient", lambda *args, **kwargs: _MockClient()):
+        incomplete_response = await client.get(
+            "/api/v1/integrations/oauth/gmail/callback"
+            f"?code=abc&state={incomplete_start.json()['state']}",
+            follow_redirects=False,
+        )
+    assert incomplete_response.status_code == 502
+    async with dbmod.async_session() as db:
+        account = await db.get(OAuthAccount, connection_id)
+        assert account is not None
+        assert account.profile["oauth_refresh"]["reauth_required"] is True
+
+
+@pytest.mark.asyncio
 async def test_oauth_callback_keeps_multiple_external_accounts(
     client: AsyncClient,
     monkeypatch,

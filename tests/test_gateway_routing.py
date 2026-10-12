@@ -22,6 +22,34 @@ def _nginx_location_blocks(nginx_conf: str) -> list[str]:
     return re.findall(r"(?ms)^    (location [^{\n]+ \{\n.*?^    \})", nginx_conf)
 
 
+def test_group_file_upload_nginx_limit_is_route_scoped():
+    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
+    upload_route = next(
+        block for block in _nginx_location_blocks(nginx_conf)
+        if "^/api/v1/chat/rooms/[^/]+/files/?$" in block
+    )
+    assert "client_max_body_size 101m;" in upload_route
+    assert "proxy_request_buffering off;" in upload_route
+    assert "proxy_pass http://$api_upstream;" in upload_route
+    assert nginx_conf.index("location ~ ^/api/v1/chat/rooms/") < nginx_conf.index("location /api/")
+
+
+def test_group_file_body_precheck_runs_after_rate_limiters():
+    from fastapi import FastAPI
+
+    from apps.api.middleware import setup_middleware
+    from apps.api.middleware.rate_limit import ChatRateLimitMiddleware
+    from apps.api.middleware.room_file_ingress import RoomFileIngressLimitMiddleware
+    from apps.api.middleware_core import RateLimitMiddleware
+
+    app = FastAPI()
+    setup_middleware(app)
+    order = [entry.cls for entry in app.user_middleware]  # outermost first
+    assert order.index(ChatRateLimitMiddleware) < order.index(RoomFileIngressLimitMiddleware)
+    assert order.index(RateLimitMiddleware) < order.index(RoomFileIngressLimitMiddleware)
+    assert order[-1] is RoomFileIngressLimitMiddleware
+
+
 
 
 def test_nginx_routes_streams_to_manor_chat_before_generic_api():
@@ -60,6 +88,21 @@ def test_nginx_marks_static_web_responses_for_gateway_smoke():
     )
 
 
+def test_nginx_gzips_static_text_assets_without_including_api_or_sse_types():
+    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
+
+    assert "gzip on;" in nginx_conf
+    assert "gzip_vary on;" in nginx_conf
+    assert "gzip_min_length 1024;" in nginx_conf
+    assert (
+        "gzip_types text/css application/javascript text/javascript "
+        "application/wasm image/svg+xml;"
+    ) in nginx_conf
+    gzip_types = nginx_conf.split("gzip_types", 1)[1].split(";", 1)[0]
+    assert "application/json" not in gzip_types
+    assert "text/event-stream" not in gzip_types
+
+
 def test_nginx_custom_static_locations_preserve_app_security_headers():
     nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
     dockerfile = (ROOT / "docker" / "Dockerfile.web").read_text()
@@ -88,25 +131,16 @@ def test_nginx_custom_static_locations_preserve_app_security_headers():
         assert APP_SECURITY_HEADERS_INCLUDE in block, location
 
 
-def test_nginx_domain_root_sitemap_redirects_to_public_marketplace_sitemap():
+def test_nginx_blueprint_alias_bypasses_public_asset_directory():
     nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
-    robots = (ROOT / "apps" / "web" / "public" / "robots.txt").read_text()
+    blocks = _nginx_location_blocks(nginx_conf)
 
-    root_sitemap = nginx_conf.split("location = /sitemap.xml", 1)[1].split("}", 1)[0]
-    assert (
-        "return 308 $manor_forwarded_scheme://$host/marketplace/sitemap.xml;"
-        in root_sitemap
-    )
-    assert nginx_conf.index("location = /sitemap.xml") < nginx_conf.index("location / {")
-    assert "Allow: /sitemap.xml" in robots
-    assert "Sitemap: https://app.manorai.xyz/marketplace/sitemap.xml" in robots
-
-
-def test_nginx_marketplace_redirect_uses_external_scheme_without_internal_port():
-    nginx_conf = (ROOT / "docker" / "nginx.conf").read_text()
-
-    marketplace = nginx_conf.split("location = /marketplace", 1)[1].split("}", 1)[0]
-    assert "return 308 $manor_forwarded_scheme://$host/marketplace/;" in marketplace
+    for route in ("/blueprints", "/blueprints/"):
+        block = next(block for block in blocks if block.startswith(f"location = {route} {{"))
+        assert "rewrite ^ /index.html last;" in block
+        assert "$uri/" not in block
+    # Nested cover/sample URLs continue through the normal static-file handler.
+    assert "location ^~ /blueprints/" not in nginx_conf
 
 
 

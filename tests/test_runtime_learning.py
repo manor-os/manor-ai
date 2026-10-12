@@ -109,7 +109,8 @@ def test_profile_patch_candidate_requires_repeated_failure():
 
 
 @pytest.mark.asyncio
-async def test_workspace_agent_profile_patch_targets_workspace_override(tmp_path):
+@pytest.mark.parametrize("agent_id", [None, "master", "manor-master", "_master"])
+async def test_workspace_agent_profile_patch_targets_workspace_override(tmp_path, agent_id):
     from packages.core.config import get_settings
     from packages.core.memory.canonical import read_workspace_agent_memory_file
     from packages.core.services.agent_files import effective_agent_id, read_agent_file
@@ -127,7 +128,7 @@ async def test_workspace_agent_profile_patch_targets_workspace_override(tmp_path
             id="cand_workspace_profile",
             entity_id="ent_runtime_learning",
             workspace_id="ws_runtime_learning",
-            agent_id=None,
+            agent_id=agent_id,
             user_id="user_runtime_learning",
             candidate_type="agent_profile_patch",
             scope="agent",
@@ -176,7 +177,7 @@ async def test_workspace_agent_profile_patch_targets_workspace_override(tmp_path
             ChatContext(
                 entity_id="ent_runtime_learning",
                 workspace_id="ws_runtime_learning",
-                agent_id=None,
+                agent_id=agent_id,
                 workspace=type("WorkspaceObj", (), {"name": "Runtime Learning WS", "kind": "leasing"})(),
                 mode="full",
             )

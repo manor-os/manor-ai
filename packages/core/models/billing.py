@@ -209,7 +209,7 @@ class Order(Base, TimestampMixin):
     # order_type: subscription, one_time, recharge, blueprint
     agent_id: Mapped[Optional[str]] = mapped_column(String(26))
     plan_id: Mapped[Optional[str]] = mapped_column(String(26))
-    blueprint_id: Mapped[Optional[str]] = mapped_column(String(26))
+    blueprint_id: Mapped[Optional[str]] = mapped_column(String(160))
     user_id: Mapped[Optional[str]] = mapped_column(String(26))
     amount: Mapped[int] = mapped_column(Integer, nullable=False)  # in cents
     currency: Mapped[str] = mapped_column(String(10), nullable=False, server_default="usd")

@@ -39,6 +39,9 @@ def run_in_worker(coro: Awaitable[Any]) -> Any:
             return await coro
         finally:
             try:
+                from packages.core.tasks.media_tasks import drain_media_background_tasks
+
+                await drain_media_background_tasks()
                 # Transaction callbacks schedule committed external delivery.
                 # Drain it before this per-task event loop is torn down.
                 from packages.core.services.event_emitter import (

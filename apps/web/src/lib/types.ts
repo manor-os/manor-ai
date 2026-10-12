@@ -136,6 +136,39 @@ export interface PeopleDirectoryEntry extends UserSummary {
 }
 
 // Tasks
+export interface TaskBlocker {
+  kind: "capability_unavailable" | "tool_missing" | "connection_required" | "approval_required" | "policy_denied";
+  stage: "planning" | "execution";
+  affected_agents: Array<{
+    service_key?: string;
+    subscription_id?: string;
+    agent_id?: string;
+    agent_name?: string;
+  }>;
+  missing_capabilities: string[];
+  generation?: string;
+  operation_draft_id?: string;
+  request_id?: string;
+  log_id?: string;
+  observed_at?: string;
+}
+
+export interface TaskInputRequest {
+  message_id: string;
+  request_id: string;
+  plan_id: string;
+  step_id: string;
+  pending_action: {
+    kind: "human_input" | "needs_input";
+    hitl_type: "input";
+    approval_request_id: string;
+    task_id: string;
+    plan_id: string;
+    step_id: string;
+    [key: string]: any;
+  };
+}
+
 export interface Task {
   id: string;
   entity_id: string;
@@ -149,6 +182,12 @@ export interface Task {
   agent_type?: string;
   owner_service_key?: string | null;
   owner_subscription_id?: string | null;
+  owner_agent_id?: string | null;
+  owner_agent_name?: string | null;
+  owner_agent_avatar?: string | null;
+  current_blocker?: TaskBlocker | null;
+  /** Exact live INPUT cards, projected by Task detail from the Chat origin. */
+  pending_input_requests?: TaskInputRequest[];
   session_host_agent_id?: string | null;
   session_host_subscription_id?: string | null;
   session_host_name?: string | null;
@@ -586,7 +625,9 @@ export interface Conversation {
   entity_id: string;
   user_id?: string;
   agent_id?: string;
+  agent_subscription_id?: string | null;
   workspace_id?: string;
+  scope?: string;
   title?: string;
   summary?: string;
   channel: string;
@@ -670,6 +711,9 @@ export interface Document {
 export interface Agent {
   id: string;
   entity_id?: string;
+  workspace_id?: string | null;
+  workspace_name?: string | null;
+  visibility?: string | null;
   name: string;
   slug?: string;
   description?: string;
@@ -788,7 +832,12 @@ export interface Workspace {
   /** Whether the blueprint this workspace was installed from has changed
    *  since. Detection only — applying an update is a deliberate act. */
   blueprint_update?: {
-    status: "current" | "update_available" | "unknown" | "not_from_blueprint";
+    status:
+      | "current"
+      | "update_available"
+      | "reconfigure_required"
+      | "unknown"
+      | "not_from_blueprint";
     blueprint_id?: string | null;
     blueprint_slug?: string | null;
     installed_version?: string | null;
@@ -801,11 +850,15 @@ export interface Workspace {
   status: string;
   created_at?: string;
   updated_at?: string;
+  /** Latest persisted chat post by the current viewer in this Workspace. */
+  last_chat_at?: string | null;
   created_by_user_id?: string;
   created_by_name?: string;
   created_by_email?: string;
   created_by_avatar_url?: string;
   can_manage?: boolean;
+  /** Server-authorized Workspace soft-delete; stricter than can_manage. */
+  can_delete?: boolean;
   deleted_at?: string | null;
 }
 
@@ -816,6 +869,7 @@ export interface WorkspaceStaff {
   user_id?: string;
   display_name?: string;
   email?: string;
+  avatar_url?: string;
   /** Workspace-level role (Permission-v1, see RFC §5.2). */
   role?: WorkspaceRole | string;
   added_by?: string;
@@ -1372,6 +1426,38 @@ export interface DocumentShare {
   created_at?: string;
 }
 
+export type { DocumentSignatureField, SignatureFieldType } from "./signatureFields";
+
+export interface DocumentSignatureRequest {
+  id: string;
+  recipient_name: string;
+  recipient_email: string;
+  recipient_emails?: string[];
+  signed_by_email?: string | null;
+  message?: string | null;
+  status: "pending" | "completed" | "revoked" | "expired";
+  delivery_status: "pending" | "sent" | "failed";
+  delivery_error?: string | null;
+  fields?: import("./signatureFields").DocumentSignatureField[];
+  placement: {
+    page: number;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  created_at?: string;
+  expires_at?: string;
+  viewed_at?: string;
+  signed_at?: string;
+  url?: string | null;
+  group_id?: string | null;
+  group_size?: number;
+  group_signed_count?: number;
+  group_finalized?: boolean;
+  group_delivery_failed_count?: number;
+}
+
 export interface DocumentAccessLogRow {
   ts: string;
   actor_type: string;
@@ -1390,7 +1476,7 @@ export interface DocumentFolderInfo {
   entity_id: string;
   name: string;
   parent_id?: string | null;
-  document_count?: number;
+  document_count?: number | null;
   created_at?: string;
   visibility?: Visibility;
   classification?: Classification;

@@ -18,19 +18,23 @@ import packages.core.database as db_module
 import packages.core.ai.tools.file_tools as file_tools_module
 from packages.core.ai.tools.file_tools import (
     _delete_file,
-    _edit_file,
+    _patch_file,
     _glob_files,
     _grep_files,
     _list_files,
     _read_file,
 )
 from packages.core.config import get_settings
+from packages.core.models.document import Document
 from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace
 from packages.core.models.base import generate_ulid
 from packages.core.services.auth_service import hash_password
 from packages.core.services.document_service import create_document
-from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
+from packages.core.services.workspace_artifacts import (
+    ensure_workspace_artifact_folder,
+    workspace_artifact_storage_base,
+)
 
 SECRET = "机密:董事会薪酬明细 BOARD-COMP-SECRET"
 
@@ -71,10 +75,76 @@ async def _make_user(entity_id: str, name: str, role: str) -> str:
     return uid
 
 
+@pytest.mark.asyncio
+async def test_empty_workspace_listing_never_falls_back_to_entity_root(fs_enabled, tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    entity_id = "empty_workspace_listing"
+    root = tmp_path / entity_id
+    root.mkdir()
+    (root / "outside.md").write_text("Outside this Workspace", encoding="utf-8")
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir",
+        AsyncMock(return_value="Workspaces/_by_id/EMPTY"),
+    )
+    monkeypatch.setattr(file_tools_module, "_blocked_doc_paths", AsyncMock(return_value=[]))
+    monkeypatch.setattr(file_tools_module, "_blocked_doc_paths_batched", AsyncMock(return_value=[]))
+
+    result = json.loads(await _list_files(entity_id, path="", workspace_id="workspace1"))
+
+    assert result == {"error": "Directory not found: Workspaces/_by_id/EMPTY"}
+    assert not (root / "Workspaces").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("archive_has_folder", [False, True])
+async def test_execution_archive_listing_finds_workspace_home_folders(
+    fs_enabled, tmp_path, monkeypatch, archive_has_folder,
+):
+    """list_files must find what generate_file(storage_scope='workspace') wrote.
+
+    Inside a Workflow run the resolved base is the run archive; read_file
+    already falls back to the Workspace home, and listing the same logical
+    folder must agree with it rather than report "Directory not found".
+    """
+    from unittest.mock import AsyncMock
+
+    entity_id = "archive_home_listing"
+    home = "Workspaces/_by_id/HOME"
+    archive = f"{home}/workflow/run1"
+    root = tmp_path / entity_id
+    (root / home / "Videos" / "kinetic-quote-zh").mkdir(parents=True)
+    (root / home / "Videos" / "kinetic-quote-zh" / "CANVAS.md").write_text("# Canvas", encoding="utf-8")
+    (root / "Workspaces/_by_id/OTHER/Videos").mkdir(parents=True)
+    (root / "Workspaces/_by_id/OTHER/Videos/private.md").write_text("other", encoding="utf-8")
+    if archive_has_folder:
+        (root / archive / "documents" / "Videos").mkdir(parents=True)
+        (root / archive / "documents" / "Videos" / "run-only.md").write_text("run", encoding="utf-8")
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir",
+        AsyncMock(return_value=archive),
+    )
+    monkeypatch.setattr(file_tools_module, "_blocked_doc_paths", AsyncMock(return_value=[]))
+    monkeypatch.setattr(file_tools_module, "_blocked_doc_paths_batched", AsyncMock(return_value=[]))
+
+    listed = await _list_files(entity_id, path="Videos", recursive=True, workspace_id="workspace1")
+
+    if archive_has_folder:
+        # The run's own folder keeps precedence, exactly like read_file.
+        assert f"{archive}/documents/Videos/run-only.md" in listed
+        assert "CANVAS.md" not in listed
+    else:
+        assert f"{home}/Videos/kinetic-quote-zh/CANVAS.md" in listed
+    assert "OTHER" not in listed and "private.md" not in listed
+
+    missing = json.loads(await _list_files(entity_id, path="Nope", workspace_id="workspace1"))
+    assert missing == {"error": f"Directory not found: {archive}/documents/Nope"}
+
+
 @pytest.mark.parametrize(
     ("handler", "kwargs"),
     (
-        (_edit_file, {"old_text": "protected", "new_text": "changed"}),
+        (_patch_file, {"operations": [{"op": "text.replace", "old_text": "protected", "new_text": "changed"}]}),
         (_delete_file, {"expected_sha256": "stale"}),
     ),
 )
@@ -217,12 +287,15 @@ async def test_file_tools_hide_private_doc_from_member(fs_enabled, tmp_path, cli
         user_id=member_id,
     ))
     assert "candidates" not in missing
-    missing_edit = json.loads(await _edit_file(
-        entity_id,
-        path="missing/board-comp.md",
-        content="replacement",
-        user_id=member_id,
-    ))
+    missing_edit = json.loads(
+        await _patch_file(
+            entity_id,
+            path="missing/board-comp.md",
+            content="replacement",
+            user_id=member_id,
+            operations=[{"op": "text.replace"}],
+        )
+    )
     assert "candidates" not in missing_edit
     missing_delete = json.loads(await _delete_file(
         entity_id,
@@ -439,7 +512,7 @@ async def test_workspace_agent_cannot_read_another_workspace_artifact(
         user_id=owner_id,
         workspace_id=workspace_a_id,
     ))
-    generic_denied = json.loads(await _read_file(
+    generic_allowed = json.loads(await _read_file(
         entity_id,
         path=generic_other_path,
         user_id=owner_id,
@@ -460,10 +533,410 @@ async def test_workspace_agent_cannot_read_another_workspace_artifact(
 
     assert denied.get("error")
     assert "content" not in denied
-    assert generic_denied.get("error")
-    assert "content" not in generic_denied
+    assert generic_allowed["content"] == "workspace B generic only"
     assert "candidates" not in basename_miss
     assert other_path not in globbed["files"]
+
+
+@pytest.mark.asyncio
+async def test_userless_workspace_task_reads_its_bound_human_input_document(
+    fs_enabled, tmp_path,
+):
+    entity_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+    (root / "asset-provenance.txt").write_text(
+        "TEST_FIXTURE / NOT_FOR_DISTRIBUTION", encoding="utf-8",
+    )
+
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Release entity"))
+        workspace = Workspace(entity_id=entity_id, name="Release", status="active")
+        db.add(workspace)
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        await create_document(
+            db, entity_id, name="asset-provenance.txt",
+            fs_path="asset-provenance.txt", folder_id=folder.id,
+            source="upload", visibility="workspace",
+            metadata={"origin": {
+                "workspace_id": workspace.id,
+                "tool_name": "hitl_upload",
+            }},
+        )
+        workspace_id = workspace.id
+        await db.commit()
+
+    read = json.loads(await _read_file(
+        entity_id, path="asset-provenance.txt", workspace_id=workspace_id,
+    ))
+    assert read["content"] == "TEST_FIXTURE / NOT_FOR_DISTRIBUTION"
+
+
+@pytest.mark.asyncio
+async def test_read_file_document_id_disambiguates_same_named_workspace_file(
+    fs_enabled, tmp_path,
+):
+    assert "document_id" in file_tools_module.READ_FILE_SCHEMA["function"]["parameters"]["properties"]
+    entity_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+    (root / "asset-provenance.txt").write_text("release A", encoding="utf-8")
+
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Release Workspace entity"))
+        workspace = Workspace(entity_id=entity_id, name="Release Workspace", status="active")
+        db.add(workspace)
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        root_document = await create_document(
+            db, entity_id, name="asset-provenance.txt",
+            fs_path="asset-provenance.txt", folder_id=folder.id,
+            source="upload", visibility="workspace",
+            metadata={"origin": {
+                "workspace_id": workspace.id, "tool_name": "hitl_upload",
+            }},
+        )
+        scoped_path = f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/asset-provenance.txt"
+        await create_document(
+            db, entity_id, name="asset-provenance.txt",
+            fs_path=scoped_path, folder_id=folder.id,
+            source="ai_generated", visibility="workspace",
+            metadata={"origin": {"workspace_id": workspace.id}},
+        )
+        workspace_id, document_id = workspace.id, root_document.id
+        await db.commit()
+
+    scoped_file = root / scoped_path
+    scoped_file.parent.mkdir(parents=True)
+    scoped_file.write_text("release B", encoding="utf-8")
+    result = json.loads(await _read_file(
+        entity_id, path="asset-provenance.txt", document_id=document_id,
+        workspace_id=workspace_id,
+    ))
+    assert result["content"] == "release A"
+    assert result["resolved_path"] == "asset-provenance.txt"
+    mismatched = json.loads(await _read_file(
+        entity_id, path=scoped_path, document_id=document_id,
+        workspace_id=workspace_id,
+    ))
+    # The path is another readable file: an explicit conflict that names the
+    # document's real fs_path, never a silent read of either file.
+    assert mismatched["error"] == "identity_conflict"
+    assert mismatched["document_id"] == document_id
+    assert mismatched["fs_path"] == "asset-provenance.txt"
+    assert "content" not in mismatched
+
+
+@pytest.mark.asyncio
+async def test_read_file_by_document_id_tolerates_a_display_path(fs_enabled, tmp_path):
+    """FILES.md shows a display path first; agents pass it with the right id."""
+
+    entity_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Video Studio Eval entity"))
+        workspace = Workspace(entity_id=entity_id, name="Video Studio Eval R1", status="active")
+        db.add(workspace)
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        storage = f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/launch-taglines.md"
+        document = await create_document(
+            db, entity_id, name="launch-taglines.md", fs_path=storage,
+            folder_id=folder.id, visibility="workspace",
+            metadata={"origin": {"workspace_id": workspace.id}},
+        )
+        private = await create_document(
+            db, entity_id, name="private.md",
+            fs_path=f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/private.md",
+            folder_id=folder.id, visibility="private",
+            metadata={"origin": {"workspace_id": workspace.id}},
+        )
+        workspace_id, document_id, private_id = workspace.id, document.id, private.id
+        await db.commit()
+
+    (root / storage).parent.mkdir(parents=True)
+    (root / storage).write_text("Ride the night ferry.", encoding="utf-8")
+    (root / storage).parent.joinpath("private.md").write_text("private note", encoding="utf-8")
+    display = "Workspaces/Video Studio Eval R1/launch-taglines.md"
+
+    read = json.loads(await _read_file(
+        entity_id, document_id=document_id, path=display, workspace_id=workspace_id,
+    ))
+    assert read["content"] == "Ride the night ferry."
+    assert read["document_id"] == document_id
+    # The model learns the real storage path for later calls.
+    assert read["path"] == storage and read["resolved_path"] == storage
+    assert read["requested_path"] == display
+    # The document's own access check still applies, and a refusal never
+    # echoes the storage path of a document the caller cannot read.
+    private_storage = f"{storage.rsplit('/', 1)[0]}/private.md"
+    for path in ("Workspaces/Video Studio Eval R1/private.md", None):
+        raw = await _read_file(
+            entity_id, document_id=private_id, workspace_id=workspace_id,
+            **({"path": path} if path else {}),
+        )
+        denied = json.loads(raw)
+        assert denied.get("error") and "content" not in denied
+        assert private_storage not in raw and "_by_id" not in raw
+    # A document whose bytes are gone: not found, by the caller's own input.
+    (root / storage).unlink()
+    raw = await _read_file(entity_id, document_id=document_id, path=display, workspace_id=workspace_id)
+    assert json.loads(raw).get("error") and storage not in raw and "_by_id" not in raw
+
+
+@pytest.mark.asyncio
+async def test_document_id_read_with_a_chat_upload_path_is_no_existence_oracle(fs_enabled, tmp_path, monkeypatch):
+    from packages.core.services import ai_file_permissions
+
+    entity_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Release entity"))
+        workspace = Workspace(entity_id=entity_id, name="Release", status="active")
+        db.add(workspace)
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        note = f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/note.md"
+        document = await create_document(
+            db, entity_id, name="note.md", fs_path=note, folder_id=folder.id,
+            source="upload", visibility="workspace",
+            metadata={"origin": {"workspace_id": workspace.id}},
+        )
+        workspace_id, document_id = workspace.id, document.id
+        await db.commit()
+    (root / note).parent.mkdir(parents=True)
+    (root / note).write_text("the note", encoding="utf-8")
+    upload_path = "uploads/chat/0123456789abcdef.pdf"
+    assert ai_file_permissions.is_chat_upload_path(upload_path)
+    (root / upload_path).parent.mkdir(parents=True)
+    (root / upload_path).write_bytes(b"%PDF secret")
+    guarded = []
+
+    async def deny(**kwargs):
+        guarded.append(kwargs.get("paths"))
+        return "blocked"
+
+    monkeypatch.setattr(ai_file_permissions, "guard_ai_file_read_access", deny)
+    raw = await _read_file(entity_id, document_id=document_id, path=upload_path, workspace_id=workspace_id)
+    # The attachment someone else uploaded is never confirmed to exist: the
+    # id decides and the read returns the document.
+    assert json.loads(raw).get("content") == "the note", raw
+    assert [upload_path] in guarded
+
+
+@pytest.mark.asyncio
+async def test_read_file_resolves_canonical_workspace_document_by_id_without_storage_path(
+    fs_enabled, tmp_path,
+):
+    entity_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Release A entity"))
+        workspace = Workspace(entity_id=entity_id, name="Release A", status="active")
+        foreign = Workspace(entity_id=entity_id, name="Release B", status="active")
+        db.add_all([workspace, foreign])
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        await ensure_workspace_artifact_folder(db, foreign)
+        path = f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/releases/night-ferry/release-state.md"
+        document = await create_document(
+            db, entity_id, name="release-state.md", fs_path=path,
+            folder_id=folder.id, visibility="workspace",
+            metadata={"origin": {"workspace_id": workspace.id}},
+        )
+        private = await create_document(
+            db, entity_id, name="private.md", fs_path=f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/private.md",
+            folder_id=folder.id, visibility="private",
+            metadata={"origin": {"workspace_id": workspace.id}},
+        )
+        workspace_id, foreign_id, document_id, private_id = (
+            workspace.id, foreign.id, document.id, private.id,
+        )
+        await db.commit()
+
+    file = root / path
+    file.parent.mkdir(parents=True)
+    file.write_text("release_id: night-ferry\nstate_revision: 1", encoding="utf-8")
+    (file.parent.parent.parent / "private.md").write_text("private release note", encoding="utf-8")
+
+    schema = file_tools_module.READ_FILE_SCHEMA["function"]["parameters"]
+    assert "path" not in schema["required"]
+    read = json.loads(await _read_file(
+        entity_id, document_id=document_id, workspace_id=workspace_id,
+    ))
+    assert read["content"] == "release_id: night-ferry\nstate_revision: 1"
+    assert read["resolved_path"] == path
+    foreign_read = json.loads(await _read_file(
+        entity_id, document_id=document_id, workspace_id=foreign_id,
+    ))
+    assert foreign_read.get("error")
+    assert "content" not in foreign_read
+    private_read = json.loads(await _read_file(
+        entity_id, document_id=private_id, workspace_id=workspace_id,
+    ))
+    assert private_read.get("error")
+    assert "content" not in private_read
+    missing_locator = json.loads(await _read_file(entity_id, workspace_id=workspace_id))
+    assert missing_locator.get("error")
+
+
+@pytest.mark.asyncio
+async def test_read_file_returns_same_task_write_origin_only_for_unchanged_document(
+    fs_enabled, tmp_path,
+):
+    entity_id = generate_ulid()
+    task_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Release A entity"))
+        workspace = Workspace(entity_id=entity_id, name="Release A", status="active")
+        db.add(workspace)
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        path = f"{workspace_artifact_storage_base(workspace.artifact_folder_id)}/releases/song/eligibility.md"
+        file = root / path
+        file.parent.mkdir(parents=True)
+        file.write_text("release_id: song\n", encoding="utf-8")
+        document = await create_document(
+            db, entity_id, name="eligibility.md", fs_path=path,
+            folder_id=folder.id, source="ai_generated", visibility="workspace",
+            file_size=file.stat().st_size,
+            metadata={
+                "origin": {
+                    "workspace_id": workspace.id,
+                    "task_id": task_id,
+                    "tool_name": "generate_file",
+                },
+                "file_integrity": {
+                    "status": "ok", "mtime_ns": file.stat().st_mtime_ns,
+                },
+            },
+        )
+        workspace_id, document_id = workspace.id, document.id
+        await db.commit()
+
+    read = json.loads(await _read_file(
+        entity_id, document_id=document_id,
+        workspace_id=workspace_id, task_id=task_id,
+    ))
+    assert read["content"] == "release_id: song\n"
+    assert read["document_id"] == document_id
+    assert read["write_receipt"] == {
+        "origin_task_id": task_id,
+        "origin_workspace_id": workspace_id,
+        "tool_name": "generate_file",
+        "source_sha256": read["source_sha256"],
+    }
+
+    other_task = json.loads(await _read_file(
+        entity_id, document_id=document_id,
+        workspace_id=workspace_id, task_id=generate_ulid(),
+    ))
+    assert "write_receipt" not in other_task
+    path_only = json.loads(await _read_file(
+        entity_id, path=path, workspace_id=workspace_id, task_id=task_id,
+    ))
+    assert "write_receipt" not in path_only
+
+    async with db_module.async_session() as db:
+        document = await db.get(Document, document_id)
+        document.source = "upload"
+        await db.commit()
+    uploaded = json.loads(await _read_file(
+        entity_id, document_id=document_id,
+        workspace_id=workspace_id, task_id=task_id,
+    ))
+    assert "write_receipt" not in uploaded
+
+    async with db_module.async_session() as db:
+        document = await db.get(Document, document_id)
+        document.source = "ai_generated"
+        document.metadata_ = {**document.metadata_, "file_integrity": {"status": "missing"}}
+        document.updated_at = document.created_at
+        await db.commit()
+    stale = json.loads(await _read_file(
+        entity_id, document_id=document_id,
+        workspace_id=workspace_id, task_id=task_id,
+    ))
+    assert "write_receipt" not in stale
+
+    file.write_text("changed bytes", encoding="utf-8")
+    changed = json.loads(await _read_file(
+        entity_id, document_id=document_id,
+        workspace_id=workspace_id, task_id=task_id,
+    ))
+    assert "write_receipt" not in changed
+
+
+@pytest.mark.asyncio
+async def test_userless_workspace_task_cannot_read_other_root_documents(
+    fs_enabled, tmp_path,
+):
+    from packages.core.services.document_service import add_document_to_group, create_group
+
+    entity_id = generate_ulid()
+    root = tmp_path / entity_id
+    root.mkdir(parents=True)
+    names = (
+        "unbound.txt", "foreign.txt", "private.txt", "restricted.txt",
+        "quarantined.txt", "shared.txt", "trashed.txt",
+    )
+    for name in names:
+        (root / name).write_text(f"secret: {name}", encoding="utf-8")
+
+    document_ids = {}
+    async with db_module.async_session() as db:
+        db.add(Entity(id=entity_id, name="Release entity"))
+        workspace = Workspace(entity_id=entity_id, name="Release A", status="active")
+        foreign = Workspace(entity_id=entity_id, name="Release B", status="active")
+        db.add_all([workspace, foreign])
+        await db.flush()
+        folder = await ensure_workspace_artifact_folder(db, workspace)
+        await ensure_workspace_artifact_folder(db, foreign)
+        shared_group = await create_group(
+            db, entity_id, name="Shared B", workspace_id=foreign.id,
+        )
+        for name in names:
+            doc = await create_document(
+                db, entity_id, name=name, fs_path=name, folder_id=folder.id,
+                source="upload",
+                visibility="private" if name == "private.txt" else "workspace",
+                classification="restricted" if name == "restricted.txt" else "internal",
+                metadata={"origin": {
+                    "workspace_id": foreign.id if name == "foreign.txt" else workspace.id,
+                    "tool_name": "upload" if name == "unbound.txt" else "hitl_upload",
+                }},
+            )
+            document_ids[name] = doc.id
+            if name == "quarantined.txt":
+                doc.quarantine_status = "quarantined"
+            if name == "trashed.txt":
+                doc.is_trashed = True
+            if name == "shared.txt":
+                await add_document_to_group(db, doc.id, shared_group.id, entity_id=entity_id)
+        workspace_id = workspace.id
+        await db.commit()
+
+    for name in names:
+        for kwargs in ({}, {"document_id": document_ids[name]}):
+            result = json.loads(await _read_file(
+                entity_id, path=name, workspace_id=workspace_id, **kwargs,
+            ))
+            assert result.get("error"), name
+            assert "content" not in result, name
+
+    listed = json.loads(await _list_files(
+        entity_id, path="", workspace_id=workspace_id,
+    ))
+    assert not any(name in str(listed) for name in names)
 
 
 @pytest.mark.asyncio

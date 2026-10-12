@@ -6,13 +6,13 @@ import hashlib
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Optional
 
-from sqlalchemy import String, and_, func, not_, or_, select, text, update
+from sqlalchemy import String, and_, delete, func, not_, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,10 +71,21 @@ class DocumentMutationConflictError(RuntimeError):
     """The document's lifecycle or policy scope changed during admission."""
 
 
+class DocumentSignatureCommitUncertainError(RuntimeError):
+    """The database did not acknowledge a signature-output commit."""
+
+
 @dataclass(frozen=True)
 class DocumentFileSaveResult:
     document: Document
     replayed: bool
+
+
+@dataclass(frozen=True)
+class DocumentSignatureOutputSaveResult:
+    source_document: Document
+    signed_document: Document | None
+    fs_path: str
 
 
 @dataclass(frozen=True)
@@ -235,45 +246,167 @@ def _visible_fs_path_clause():
         hidden_checks.append(Document.fs_path.ilike(f"%/{dirname}/%"))
     return or_(Document.fs_path.is_(None), not_(or_(*hidden_checks)))
 
+
+def _workspace_chat_upload_clause(
+    entity_id: str,
+    workspace_ids: Sequence[str] | None = None,
+):
+    """Allow only chat uploads explicitly projected into Workspace Knowledge."""
+    membership_conditions = [
+        DocumentGroupMember.document_id == Document.id,
+        DocumentGroup.entity_id == entity_id,
+        DocumentGroup.workspace_id.isnot(None),
+    ]
+    if workspace_ids:
+        membership_conditions.append(DocumentGroup.workspace_id.in_(workspace_ids))
+    workspace_membership = (
+        select(DocumentGroupMember.document_id)
+        .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+        .where(*membership_conditions)
+        .exists()
+    )
+    return and_(
+        Document.source == "chat_upload",
+        Document.fs_path.like("uploads/chat/%"),
+        workspace_membership,
+    )
+
 async def list_documents(
     db: AsyncSession, entity_id: str, *,
     name_search: str | None = None,
     folder_id: str | None = None,
-    folder_ids: set[str] | None = None,
+    folder_ids: Sequence[str] | None = None,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
+    file_types: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    vector_statuses: Sequence[str] | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    file_size_min: int | None = None,
+    file_size_max: int | None = None,
     include_generated_assets: bool = True,
     limit: int | None = 100, offset: int = 0,
+    count_total: bool = True,
+    sort_by: str = "date",
+    favorite_user_id: str | None = None,
+    file_type_filter: str | None = None,
+    after_key: tuple[object, str] | None = None,
 ) -> tuple[list[Document], int]:
     conditions = _document_scope_conditions(
         entity_id,
         name_search=name_search,
         workspace_id=workspace_id,
+        workspace_ids=workspace_ids,
+        file_types=file_types,
+        sources=sources,
+        vector_statuses=vector_statuses,
+        created_after=created_after,
+        created_before=created_before,
+        updated_after=updated_after,
+        updated_before=updated_before,
+        file_size_min=file_size_min,
+        file_size_max=file_size_max,
         include_generated_assets=include_generated_assets,
     )
     q = select(Document).where(*conditions)
-    count_q = select(func.count()).select_from(Document).where(*conditions)
+    count_q = select(func.count()).select_from(Document).where(*conditions) if count_total else None
+    if file_type_filter and file_type_filter != "all":
+        grouped_extensions = {
+            "png": ("png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico"),
+            "mp4": ("mp4", "webm", "ogg", "mov", "avi", "mkv"),
+            "mp3": ("mp3", "wav", "ogg", "aac", "flac", "m4a", "wma"),
+        }
+        extensions = grouped_extensions.get(file_type_filter, (file_type_filter,))
+        type_filter = or_(
+            func.lower(Document.file_type).in_(extensions),
+            *(
+                func.lower(Document.name).like(f"%.{extension}")
+                for extension in extensions
+            ),
+        )
+        q = q.where(type_filter)
+        if count_q is not None:
+            count_q = count_q.where(type_filter)
+    if favorite_user_id is not None:
+        from packages.core.models.favorite import Favorite
+
+        favorite_ids = select(Favorite.resource_id).where(
+            Favorite.entity_id == entity_id,
+            Favorite.user_id == favorite_user_id,
+            Favorite.resource_type == "document",
+        )
+        q = q.where(Document.id.in_(favorite_ids))
+        if count_q is not None:
+            count_q = count_q.where(Document.id.in_(favorite_ids))
     if folder_ids is not None:
         if not folder_ids:
             return [], 0
-        q = q.where(Document.folder_id.in_(folder_ids))
-        count_q = count_q.where(Document.folder_id.in_(folder_ids))
+        root_requested = bool({"", "root"} & set(folder_ids))
+        concrete_folder_ids = set(folder_ids) - {"", "root"}
+        folder_filter = (
+            or_(
+                Document.folder_id.is_(None) if root_requested else False,
+                (
+                    Document.folder_id.in_(concrete_folder_ids)
+                    if concrete_folder_ids
+                    else False
+                ),
+            )
+            if root_requested
+            else Document.folder_id.in_(concrete_folder_ids)
+        )
+        q = q.where(folder_filter)
+        if count_q is not None:
+            count_q = count_q.where(folder_filter)
     elif folder_id is not None:
         # "root" or empty string means documents with no folder
         if folder_id == "" or folder_id == "root":
             q = q.where(Document.folder_id.is_(None))
-            count_q = count_q.where(Document.folder_id.is_(None))
+            if count_q is not None:
+                count_q = count_q.where(Document.folder_id.is_(None))
         else:
             q = q.where(Document.folder_id == folder_id)
-            count_q = count_q.where(Document.folder_id == folder_id)
+            if count_q is not None:
+                count_q = count_q.where(Document.folder_id == folder_id)
     # OFFSET pagination needs a total order. ``created_at`` is not unique
     # (bulk imports commonly share one timestamp), so use the immutable id as
     # a deterministic tie-breaker to prevent skipped or duplicated rows.
-    q = q.order_by(Document.created_at.desc(), Document.id.desc())
+    if sort_by == "name":
+        sort_column = Document.name
+        if after_key is not None:
+            value, document_id = after_key
+            q = q.where(or_(
+                sort_column > value,
+                and_(sort_column == value, Document.id > document_id),
+            ))
+        q = q.order_by(sort_column.asc(), Document.id.asc())
+    elif sort_by == "size":
+        sort_column = func.coalesce(Document.file_size, 0)
+        if after_key is not None:
+            value, document_id = after_key
+            q = q.where(or_(
+                sort_column < value,
+                and_(sort_column == value, Document.id < document_id),
+            ))
+        q = q.order_by(sort_column.desc(), Document.id.desc())
+    else:
+        if after_key is not None:
+            value, document_id = after_key
+            q = q.where(or_(
+                Document.created_at < value,
+                and_(Document.created_at == value, Document.id < document_id),
+            ))
+        q = q.order_by(Document.created_at.desc(), Document.id.desc())
     if limit is not None:
         q = q.limit(limit).offset(offset)
     elif offset:
         q = q.offset(offset)
     result = await db.execute(q)
+    if count_q is None:
+        return list(result.scalars().all()), 0
     count_result = await db.execute(count_q)
     return list(result.scalars().all()), count_result.scalar_one()
 
@@ -282,6 +415,16 @@ def _document_scope_conditions(
     entity_id: str, *,
     name_search: str | None = None,
     workspace_id: str | None = None,
+    workspace_ids: Sequence[str] | None = None,
+    file_types: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    vector_statuses: Sequence[str] | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    file_size_min: int | None = None,
+    file_size_max: int | None = None,
     include_generated_assets: bool = True,
 ) -> list:
     """Shared WHERE clauses for the visible-document scope.
@@ -291,10 +434,17 @@ def _document_scope_conditions(
     minus the per-folder filter and pagination. Used by both the paginated
     listing and the storage-usage aggregate so the two always agree.
     """
+    workspace_values = _document_filter_values(workspace_id, workspace_ids)
+    visible_path = _visible_fs_path_clause()
+    if workspace_values:
+        visible_path = or_(
+            visible_path,
+            _workspace_chat_upload_clause(entity_id, workspace_values),
+        )
     conditions = [
         Document.entity_id == entity_id,
         Document.is_trashed == False,  # noqa: E712
-        _visible_fs_path_clause(),
+        visible_path,
     ]
     if not include_generated_assets:
         generated_media = and_(
@@ -317,22 +467,134 @@ def _document_scope_conditions(
             Document.source.ilike(search),
             Document.metadata_.cast(String).ilike(search),
         ))
-    if workspace_id:
+    if workspace_values:
+        from packages.core.models.workspace import Workspace
+        from packages.core.services.workspace_artifacts import (
+            WORKSPACE_FOLDER_ROOT,
+            WORKSPACE_STORAGE_SEGMENT,
+        )
+
         group_membership = (
             select(DocumentGroupMember.document_id)
             .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
             .where(
                 DocumentGroupMember.document_id == Document.id,
                 DocumentGroup.entity_id == entity_id,
-                DocumentGroup.workspace_id == workspace_id,
+                DocumentGroup.workspace_id.in_(workspace_values),
             )
+            .exists()
+        )
+        artifact_storage_base = func.concat(
+            WORKSPACE_FOLDER_ROOT,
+            "/",
+            WORKSPACE_STORAGE_SEGMENT,
+            "/",
+            Workspace.artifact_folder_id,
+        )
+        physical_workspace_owner = (
+            select(Workspace.id)
+            .where(
+                Workspace.entity_id == entity_id,
+                Workspace.id.in_(workspace_values),
+                Workspace.deleted_at.is_(None),
+                Workspace.artifact_folder_id.is_not(None),
+                or_(
+                    Document.fs_path == artifact_storage_base,
+                    Document.fs_path.like(func.concat(artifact_storage_base, "/%")),
+                ),
+            )
+            .correlate(Document)
             .exists()
         )
         conditions.append(or_(
             group_membership,
-            Document.metadata_["origin"]["workspace_id"].astext == workspace_id,
+            and_(
+                Document.visibility == "workspace",
+                or_(
+                    Document.metadata_["origin"]["workspace_id"].astext.in_(workspace_values),
+                    Document.metadata_["workspace_id"].astext.in_(workspace_values),
+                ),
+            ),
+            physical_workspace_owner,
         ))
+    for column, values in (
+        (Document.file_type, _document_filter_values(None, file_types, lowercase=True)),
+        (Document.source, _document_filter_values(None, sources, lowercase=True)),
+        (
+            Document.vector_status,
+            _document_filter_values(None, vector_statuses, lowercase=True),
+        ),
+    ):
+        if values:
+            conditions.append(func.lower(column).in_(values))
+    if file_size_min is not None and file_size_max is not None and file_size_min > file_size_max:
+        raise ValueError("file_size_min must be less than or equal to file_size_max")
+    if file_size_min is not None:
+        conditions.extend((Document.file_size.is_not(None), Document.file_size >= file_size_min))
+    if file_size_max is not None:
+        conditions.extend((Document.file_size.is_not(None), Document.file_size <= file_size_max))
+    for column, after, before, field_name in (
+        (Document.created_at, created_after, created_before, "created"),
+        (Document.updated_at, updated_after, updated_before, "updated"),
+    ):
+        after_dt, before_dt = _document_datetime_range(after, before, field_name)
+        if after_dt is not None:
+            conditions.append(column >= after_dt)
+        if before_dt is not None:
+            conditions.append(column <= before_dt)
     return conditions
+
+
+def _document_filter_values(
+    single: object,
+    plural: Sequence[object] | None,
+    *,
+    lowercase: bool = False,
+) -> tuple[str, ...]:
+    values: list[str] = []
+    for value in (single, *(plural or ())):
+        normalized = str(value or "").strip()
+        if lowercase:
+            normalized = normalized.lower()
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return tuple(values)
+
+
+def _document_datetime_bound(
+    value: str | datetime | None,
+    field_name: str,
+) -> datetime | None:
+    if value in (None, ""):
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(
+                str(value).strip().replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{field_name} range endpoints must be ISO-8601 datetimes"
+            ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _document_datetime_range(
+    after: str | datetime | None,
+    before: str | datetime | None,
+    field_name: str,
+) -> tuple[datetime | None, datetime | None]:
+    after_dt = _document_datetime_bound(after, field_name)
+    before_dt = _document_datetime_bound(before, field_name)
+    if after_dt is not None and before_dt is not None and after_dt > before_dt:
+        raise ValueError(
+            f"{field_name}_after must be less than or equal to {field_name}_before"
+        )
+    return after_dt, before_dt
 
 
 async def storage_usage(
@@ -375,6 +637,8 @@ async def get_document(
     entity_id: str,
     *,
     for_filesystem_mutation: bool = False,
+    allow_workspace_chat_upload: bool = False,
+    workspace_id: str | None = None,
     mutation_authorizer: (
         Callable[[AsyncSession, Document], Awaitable[None]] | None
     ) = None,
@@ -386,12 +650,19 @@ async def get_document(
             entity_id,
             mutation_authorizer=mutation_authorizer,
         )
+    visible_path = _visible_fs_path_clause()
+    if allow_workspace_chat_upload:
+        workspace_ids = (workspace_id,) if workspace_id else None
+        visible_path = or_(
+            visible_path,
+            _workspace_chat_upload_clause(entity_id, workspace_ids),
+        )
     result = await db.execute(
         select(Document).where(
             Document.id == doc_id,
             Document.entity_id == entity_id,
             Document.is_trashed == False,  # noqa: E712
-            _visible_fs_path_clause(),
+            visible_path,
         )
     )
     return result.scalar_one_or_none()
@@ -425,6 +696,7 @@ async def _get_document_for_policy_mutation(
     *,
     is_trashed: bool,
     require_visible_path: bool,
+    allow_workspace_chat_upload: bool = False,
     mutation_authorizer: (
         Callable[[AsyncSession, Document], Awaitable[None]] | None
     ) = None,
@@ -432,6 +704,7 @@ async def _get_document_for_policy_mutation(
     """Lock Workspace/folder policy before one Document mutation."""
 
     from packages.core.services.document_access import (
+        document_entity_is_unavailable,
         lock_folder_policy_rows,
         lock_workspace_policy_rows,
         resolve_document_policy_lock_scope,
@@ -443,7 +716,13 @@ async def _get_document_for_policy_mutation(
         Document.is_trashed.is_(is_trashed),
     ]
     if require_visible_path:
-        conditions.append(_visible_fs_path_clause())
+        visible_path = _visible_fs_path_clause()
+        if allow_workspace_chat_upload:
+            visible_path = or_(
+                visible_path,
+                _workspace_chat_upload_clause(entity_id),
+            )
+        conditions.append(visible_path)
     base_stmt = select(Document).where(*conditions)
     for _attempt in range(3):
         savepoint = await db.begin_nested()
@@ -454,12 +733,12 @@ async def _get_document_for_policy_mutation(
                 return None
 
             scope = await resolve_document_policy_lock_scope(db, document)
-            workspaces = await lock_workspace_policy_rows(
+            await lock_workspace_policy_rows(
                 db,
                 entity_id=entity_id,
                 workspace_ids=scope.workspace_ids,
             )
-            if any(workspace.deleted_at is not None for workspace in workspaces):
+            if await document_entity_is_unavailable(db, document):
                 await savepoint.commit()
                 return None
             await lock_folder_policy_rows(
@@ -508,6 +787,22 @@ async def get_document_for_update(
     )
 
 
+async def get_document_for_read(
+    db: AsyncSession,
+    doc_id: str,
+    entity_id: str,
+) -> Optional[Document]:
+    """Lock one visible document for an authorized read response."""
+    return await _get_document_for_policy_mutation(
+        db,
+        doc_id,
+        entity_id,
+        is_trashed=False,
+        require_visible_path=True,
+        allow_workspace_chat_upload=True,
+    )
+
+
 async def _folder_default_visibility(
     db: AsyncSession,
     *,
@@ -532,7 +827,7 @@ async def _folder_default_visibility(
     ).scalar_one_or_none()
     if folder_visibility:
         return str(folder_visibility)
-    return "private" if owner_id is not None else "entity"
+    return "private"
 
 
 async def create_document(
@@ -547,6 +842,8 @@ async def create_document(
     classification: str | None = None,
     client_visible: bool | None = None,
     owner_id: str | None = None,
+    upload_idempotency_key: str | None = None,
+    upload_request_fingerprint: str | None = None,
     # When True, skip the plan storage-limit check. Used for bookkeeping that
     # re-projects files already on disk (e.g. filesystem reconcile), which must
     # not be blocked just because the entity is over its quota.
@@ -571,9 +868,15 @@ async def create_document(
         source=source,
         created_by=created_by,
         folder_id=folder_id,
+        upload_idempotency_key=upload_idempotency_key,
+        upload_request_fingerprint=upload_request_fingerprint,
     )
     if visibility is not None:
         doc.visibility = visibility
+    elif owner_id is not None:
+        # A person filing content inside a shared folder does not implicitly
+        # publish it. Sharing is a separate, explicit ACL/visibility action.
+        doc.visibility = "private"
     elif folder_id:
         # Inherit the folder's visibility. Filing a document used to make it
         # *more* public than leaving it loose — a document dropped at the root
@@ -582,8 +885,6 @@ async def create_document(
         doc.visibility = await _folder_default_visibility(
             db, entity_id=entity_id, folder_id=folder_id, owner_id=owner_id,
         )
-    elif owner_id is not None:
-        doc.visibility = "private"
     if classification is not None:
         doc.classification = classification
     if client_visible is not None:
@@ -634,6 +935,7 @@ async def upsert_document_by_fs_path_result(
 
     Updating an existing projection never counts as "adding" storage, so the
     limit is only enforced on the new-row branch (and skippable for reconcile).
+    Reprojecting bytes must not change existing ownership, placement, or ACLs.
     """
     # Serialize same-path projection writers in PostgreSQL. This prevents a
     # loser from observing no row, colliding with the partial unique index, and
@@ -676,23 +978,8 @@ async def upsert_document_by_fs_path_result(
         doc.is_trashed = False
         doc.trashed_at = None
         doc.trashed_by = None
-        if folder_id is not None:
-            doc.folder_id = folder_id
         if not doc.source:
             doc.source = source
-        if created_by and not doc.created_by:
-            doc.created_by = created_by
-        # Filesystem projection updates describe who performed the sync, not an
-        # ownership transfer. Preserve an established owner so a collaborator
-        # with EDIT access cannot become the owner merely by changing bytes.
-        if owner_id is not None and doc.owner_id is None:
-            doc.owner_id = owner_id
-        if visibility is not None:
-            doc.visibility = visibility
-        if classification is not None:
-            doc.classification = classification
-        if client_visible is not None:
-            doc.client_visible = client_visible
         await bump_tool_cache_version(entity_id, "documents")
         return doc
 
@@ -806,7 +1093,17 @@ async def delete_document(
     if not doc:
         return False
     await delete_resource_comments(db, entity_id, "document", [doc.id])
+    from packages.core.models.document_version import DocumentVersion
+    from packages.core.services.workspace_artifact_purge import (
+        document_version_snapshot_cleanup_bases,
+        enqueue_artifact_cleanup_jobs,
+    )
+
+    await db.execute(delete(DocumentVersion).where(DocumentVersion.document_id == doc.id))
     await db.delete(doc)
+    await enqueue_artifact_cleanup_jobs(
+        db, entity_id, document_version_snapshot_cleanup_bases({doc.id}),
+    )
     await db.flush()
     await bump_tool_cache_version(entity_id, "documents")
     return True
@@ -881,14 +1178,13 @@ async def trigger_reindex(db: AsyncSession, entity_id: str) -> int:
         lock_reusable_resource_lifecycle,
     )
     from packages.core.services.document_access import (
-        document_workspace_ids_batched,
+        knowledge_entity_is_unavailable,
     )
-    from packages.core.models.workspace import Workspace
 
-    # Workspace soft-delete/restore takes this same entity lifecycle fence
-    # before changing deleted_at, so the active-owner snapshot and UPDATE are
-    # one linearized operation.
+    # Knowledge outlives its source Workspace, but never its Entity.
     await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    if await knowledge_entity_is_unavailable(db, entity_id):
+        return 0
     candidates = list((await db.execute(
         select(Document).where(
             Document.entity_id == entity_id,
@@ -897,29 +1193,7 @@ async def trigger_reindex(db: AsyncSession, entity_id: str) -> int:
             _visible_fs_path_clause(),
         )
     )).scalars())
-    workspace_ids_by_document = await document_workspace_ids_batched(db, candidates)
-    workspace_ids = {
-        workspace_id
-        for owned_workspace_ids in workspace_ids_by_document.values()
-        for workspace_id in owned_workspace_ids
-    }
-    deleted_workspace_ids = set()
-    if workspace_ids:
-        deleted_workspace_ids = set((await db.execute(
-            select(Workspace.id).where(
-                Workspace.entity_id == entity_id,
-                Workspace.id.in_(workspace_ids),
-                Workspace.deleted_at.is_not(None),
-            )
-        )).scalars())
-    active_ids = [
-        document.id
-        for document in candidates
-        if not (
-            workspace_ids_by_document.get(str(document.id), set())
-            & deleted_workspace_ids
-        )
-    ]
+    active_ids = [document.id for document in candidates]
     if not active_ids:
         return 0
     result = await db.execute(
@@ -1198,9 +1472,15 @@ def _allocate_document_fs_path(doc: Document, entity_root: str) -> str:
 
 async def get_document_content(
     db: AsyncSession, document_id: str, entity_id: str, *, allow_filesystem: bool = True,
+    allow_workspace_chat_upload: bool = False,
 ) -> str | None:
     """Read content, optionally restricting fallback to the authorized DB snapshot."""
-    doc = await get_document(db, document_id, entity_id)
+    doc = await get_document(
+        db,
+        document_id,
+        entity_id,
+        allow_workspace_chat_upload=allow_workspace_chat_upload,
+    )
     if not doc:
         return None
     from packages.core.services.stickman_topic_ledger import (
@@ -1241,7 +1521,23 @@ def _is_office_binary_document(doc: Document) -> bool:
     ) is not None
 
 
+def _require_unsigned_document_content(doc: Document) -> None:
+    signature_lock = (
+        doc.metadata_.get("signature_lock")
+        if isinstance(doc.metadata_, dict)
+        else None
+    )
+    status = signature_lock.get("status") if isinstance(signature_lock, dict) else None
+    if status in {"pending", "completed", "cancelled"}:
+        raise DocumentMutationConflictError(
+            "Signed PDFs are immutable; make a copy before editing"
+            if status == "completed" else
+            "PDF has an active or cancelled signing group; make a copy before editing"
+        )
+
+
 def _require_text_content_save(doc: Document) -> None:
+    _require_unsigned_document_content(doc)
     if _is_office_binary_document(doc):
         raise ValueError(
             "Office documents must be saved as complete binary files",
@@ -1413,6 +1709,7 @@ async def save_document_content(
                 entity_id,
                 change_summary="Edited",
                 created_by=created_by,
+                filesystem_lock_held=True,
             )
             await db.commit()
             await _invalidate_document_preview_versions(entity_root, document_id)
@@ -1442,6 +1739,8 @@ async def save_document_file(
     created_by: str | None = None,
     save_session_id: str | None = None,
     save_sequence: int | None = None,
+    expected_source_sha256: str | None = None,
+    allow_signature_lock_creation: bool = False,
     mutation_authorizer: (
         Callable[[AsyncSession, Document], Awaitable[None]] | None
     ) = None,
@@ -1453,6 +1752,12 @@ async def save_document_file(
         raise ValueError("Filesystem storage is not enabled")
     if (save_session_id is None) != (save_sequence is None):
         raise ValueError("save_session_id and save_sequence must be provided together")
+    expected_source_digest = str(expected_source_sha256 or "").strip().lower()
+    if expected_source_digest and (
+        len(expected_source_digest) != 64
+        or any(character not in "0123456789abcdef" for character in expected_source_digest)
+    ):
+        raise ValueError("expected_source_sha256 must be a 64-character SHA-256 digest")
 
     from packages.core.services.office_editing import OfficeConversionFactory
 
@@ -1471,6 +1776,7 @@ async def save_document_file(
         claim_entity_editor_write_intent,
         entity_filesystem_mutation_lock,
         finish_entity_filesystem_mutation,
+        open_entity_file_snapshot,
         write_entity_file_atomic,
     )
     assert_entity_filesystem_ready()
@@ -1485,6 +1791,8 @@ async def save_document_file(
         )
         if not doc:
             return None
+        if not allow_signature_lock_creation:
+            _require_unsigned_document_content(doc)
         if not doc.fs_path:
             if filename:
                 raw_name = normalize_rel_path(filename)
@@ -1535,6 +1843,58 @@ async def save_document_file(
         root = os.path.realpath(entity_root)
         if os.path.commonpath([root, full_path]) != root:
             raise ValueError("Document path escaped entity root")
+        expected_source_version = None
+        if expected_source_digest:
+            accepted_source_digests = [expected_source_digest]
+            if save_session_id is not None and save_sequence is not None:
+                previous_session = _metadata_editor_write_session(
+                    doc.metadata_,
+                    save_session_id,
+                )
+                previous_sequence = (
+                    previous_session.get("sequence")
+                    if isinstance(previous_session, dict)
+                    else None
+                )
+                previous_digest = (
+                    previous_session.get("content_digest")
+                    if isinstance(previous_session, dict)
+                    else None
+                )
+                if (
+                    previous_session
+                    and previous_session.get("committed") is True
+                    and isinstance(previous_sequence, int)
+                    and previous_sequence <= save_sequence
+                    and isinstance(previous_digest, str)
+                    and previous_digest not in accepted_source_digests
+                ):
+                    accepted_source_digests.append(previous_digest)
+
+            stale_error: EntityFilesystemStaleWriteError | None = None
+            source_fs_path = replaced_legacy_fs_path or doc.fs_path
+            for accepted_digest in accepted_source_digests:
+                try:
+                    with open_entity_file_snapshot(
+                        entity_id,
+                        source_fs_path,
+                        expected_content_sha256=accepted_digest,
+                    ) as source_snapshot:
+                        # A legacy Office save validates the old binary source,
+                        # then writes a newly allocated OOXML path. The entity
+                        # mutation lock fences that two-path transition; a
+                        # same-path save also carries the version into the
+                        # atomic writer to close the validation/write gap.
+                        if source_fs_path == doc.fs_path:
+                            expected_source_version = source_snapshot.version
+                    stale_error = None
+                    break
+                except EntityFilesystemStaleWriteError as exc:
+                    stale_error = exc
+            if stale_error is not None:
+                raise EntityFilesystemStaleWriteError(
+                    "The document changed after this editor snapshot was loaded",
+                ) from stale_error
         file_digest = hashlib.sha256(file_bytes).hexdigest()
         if save_session_id is not None and save_sequence is not None:
             claim_result = await asyncio.to_thread(
@@ -1581,6 +1941,7 @@ async def save_document_file(
                 file_bytes,
                 expected_size=len(file_bytes),
                 allow_empty=True,
+                expected_source_version=expected_source_version,
             )
 
             ext = office_extension or os.path.splitext(doc.name or filename or "")[1].lstrip(".").lower()
@@ -1598,6 +1959,7 @@ async def save_document_file(
                 entity_id,
                 change_summary="Edited file",
                 created_by=created_by,
+                filesystem_lock_held=True,
             )
             await db.commit()
             await _invalidate_document_preview_versions(entity_root, document_id)
@@ -1625,5 +1987,347 @@ async def save_document_file(
                     document_id=document_id,
                 )
             return DocumentFileSaveResult(document=doc, replayed=False)
+
+        return await finish_entity_filesystem_mutation(persist_and_commit())
+
+
+async def save_document_signature_output(
+    db: AsyncSession,
+    source_document_id: str,
+    entity_id: str,
+    file_bytes: bytes,
+    *,
+    input_fs_path: str,
+    expected_input_sha256: str,
+    working_fs_path: str | None = None,
+    signed_name: str | None = None,
+    created_by: str | None = None,
+    mutation_authorizer: Callable[
+        [AsyncSession, Document, Document | None, str], Awaitable[None]
+    ],
+) -> DocumentSignatureOutputSaveResult | None:
+    """Persist one signature step without replacing the source document.
+
+    Partial multi-signer output is kept at a caller-provided hidden path with
+    no ``Document`` projection. Final output is projected as a new immutable
+    ``Document`` beside the source in Knowledge.
+    """
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    if not settings.MANOR_FS_ENABLED:
+        raise ValueError("Filesystem storage is not enabled")
+    expected_digest = str(expected_input_sha256 or "").strip().lower()
+    if len(expected_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_digest
+    ):
+        raise ValueError("expected_input_sha256 must be a 64-character SHA-256 digest")
+    if (working_fs_path is None) == (signed_name is None):
+        raise ValueError("Provide exactly one of working_fs_path or signed_name")
+
+    from packages.core.services.entity_fs import (
+        assert_entity_filesystem_ready,
+        entity_filesystem_mutation_lock,
+        finish_entity_filesystem_mutation,
+        open_entity_file_snapshot,
+        stage_entity_file_rollback_snapshot,
+        unlink_entity_file_entry,
+        write_entity_file_atomic,
+    )
+
+    assert_entity_filesystem_ready()
+    entity_root = os.path.join(settings.MANOR_FS_ROOT, entity_id)
+
+    async with entity_filesystem_mutation_lock(entity_root):
+        source_document = await get_document(
+            db,
+            source_document_id,
+            entity_id,
+            for_filesystem_mutation=True,
+        )
+        if source_document is None:
+            return None
+        if not source_document.fs_path:
+            raise EntityFilesystemStaleWriteError("Signature source file is unavailable")
+
+        normalized_input = normalize_rel_path(input_fs_path)
+        source_fs_path = normalize_rel_path(source_document.fs_path)
+        signature_lock = (
+            source_document.metadata_.get("signature_lock")
+            if isinstance(source_document.metadata_, dict)
+            else None
+        )
+        locked_working_path = (
+            normalize_rel_path(str(signature_lock.get("working_fs_path") or ""))
+            if isinstance(signature_lock, dict)
+            else ""
+        )
+        if normalized_input not in {source_fs_path, locked_working_path}:
+            raise EntityFilesystemStaleWriteError(
+                "Signature input is not linked to the source document"
+            )
+        with open_entity_file_snapshot(
+            entity_id,
+            normalized_input,
+            expected_content_sha256=expected_digest,
+        ) as input_snapshot:
+            input_version = input_snapshot.version
+
+        signed_document: Document | None = None
+        if working_fs_path is not None:
+            output_fs_path = normalize_rel_path(working_fs_path)
+            if (
+                os.path.dirname(output_fs_path) != ".signatures"
+                or not os.path.basename(output_fs_path)
+                or is_user_visible_path(output_fs_path)
+            ):
+                raise ValueError("Signature working path must be inside .signatures")
+        else:
+            requested_name = os.path.basename(normalize_rel_path(signed_name or ""))
+            if not requested_name or not is_user_visible_path(requested_name):
+                raise ValueError("Signed document name must be user-visible")
+            source_directory = os.path.dirname(normalize_rel_path(source_document.fs_path))
+            requested_stem, requested_ext = os.path.splitext(requested_name)
+            copy_stem = requested_stem.removesuffix("-signed") or requested_stem
+            candidate_name = requested_name
+            collision_index = 2
+            while True:
+                output_fs_path = normalize_rel_path(
+                    os.path.join(source_directory, candidate_name)
+                )
+                output_full_path = os.path.join(entity_root, output_fs_path)
+                projected = (await db.execute(
+                    select(Document.id).where(
+                        Document.entity_id == entity_id,
+                        Document.fs_path == output_fs_path,
+                        Document.is_trashed.is_(False),
+                    ).limit(1)
+                )).scalar_one_or_none()
+                if projected is None and not os.path.exists(output_full_path):
+                    break
+                candidate_name = (
+                    f"{copy_stem}-{collision_index}-signed{requested_ext}"
+                )
+                collision_index += 1
+
+            signed_document = await create_document(
+                db,
+                entity_id,
+                name=candidate_name,
+                fs_path=output_fs_path,
+                file_size=len(file_bytes),
+                file_type=(requested_ext.lstrip(".").lower() or "pdf"),
+                mime_type="application/pdf",
+                source="signature",
+                created_by=source_document.created_by,
+                folder_id=source_document.folder_id,
+                visibility=source_document.visibility,
+                classification=source_document.classification,
+                client_visible=source_document.client_visible,
+                owner_id=source_document.owner_id,
+                metadata={"signature_source_document_id": source_document.id},
+            )
+
+        await mutation_authorizer(
+            db,
+            source_document,
+            signed_document,
+            output_fs_path,
+        )
+
+        async def persist_and_commit() -> DocumentSignatureOutputSaveResult:
+            from packages.core.services.workspace_artifact_purge import (
+                ARTIFACT_CLEANUP_KIND_FILE,
+                clear_artifact_cleanup_jobs,
+                enqueue_artifact_cleanup_jobs,
+            )
+
+            expected_output_version = (
+                input_version if normalized_input == output_fs_path else None
+            )
+            rollback_snapshot = await asyncio.to_thread(
+                stage_entity_file_rollback_snapshot,
+                entity_id,
+                output_fs_path,
+                expected_source_version=expected_output_version,
+            )
+            rollback_backup_path = rollback_snapshot.backup_rel_path
+            written_version = None
+            output_digest = hashlib.sha256(file_bytes).hexdigest()
+            cleanup_paths: set[str] = set()
+            if rollback_backup_path:
+                cleanup_paths.add(rollback_backup_path)
+            completed_working_path = (
+                normalized_input
+                if (
+                    signed_document is not None
+                    and normalized_input != source_fs_path
+                    and os.path.dirname(normalized_input) == ".signatures"
+                )
+                else None
+            )
+            if completed_working_path:
+                cleanup_paths.add(completed_working_path)
+
+            def require_unoccupied_signed_path(
+                _rel_path: str,
+                target_exists: bool,
+                _full_path: str,
+            ) -> None:
+                if signed_document is not None and target_exists:
+                    raise EntityFilesystemStaleWriteError(
+                        "Signed document path became occupied before commit"
+                    )
+
+            def rollback_output() -> None:
+                current_version = written_version
+                if current_version is None:
+                    try:
+                        with open_entity_file_snapshot(
+                            entity_id,
+                            output_fs_path,
+                            expected_resolved_path=rollback_snapshot.resolved_path,
+                        ) as current_output:
+                            current_version = current_output.version
+                    except Exception:  # noqa: BLE001 - rollback handles a missing target
+                        current_version = None
+                if current_version is None:
+                    rollback_snapshot.discard_unwritten()
+                else:
+                    rollback_snapshot.rollback(current_version)
+
+            commit_started = False
+            try:
+                await asyncio.to_thread(
+                    write_entity_file_atomic,
+                    entity_id,
+                    output_fs_path,
+                    file_bytes,
+                    expected_size=len(file_bytes),
+                    allow_empty=True,
+                    write_precondition=(
+                        require_unoccupied_signed_path
+                        if signed_document is not None
+                        else None
+                    ),
+                    expected_source_version=rollback_snapshot.source_version,
+                )
+                with open_entity_file_snapshot(
+                    entity_id,
+                    output_fs_path,
+                    expected_resolved_path=rollback_snapshot.resolved_path,
+                    expected_content_sha256=output_digest,
+                ) as current_output:
+                    written_version = current_output.version
+
+                if signed_document is not None:
+                    signed_document.file_size = len(file_bytes)
+                    signed_document.vector_status = VectorStatus.PENDING
+                    signed_document.updated_at = datetime.now(timezone.utc)
+                    source_lock = (
+                        source_document.metadata_.get("signature_lock")
+                        if isinstance(source_document.metadata_, dict)
+                        else None
+                    )
+                    if isinstance(source_lock, dict):
+                        signed_metadata = dict(signed_document.metadata_ or {})
+                        signed_metadata["signature_lock"] = dict(source_lock)
+                        signed_document.metadata_ = signed_metadata
+                    await db.flush()
+                    from packages.core.services.version_service import create_version
+
+                    await create_version(
+                        db,
+                        signed_document.id,
+                        entity_id,
+                        change_summary="Signed copy",
+                        created_by=created_by,
+                        filesystem_lock_held=True,
+                    )
+                if cleanup_paths:
+                    await enqueue_artifact_cleanup_jobs(
+                        db,
+                        entity_id,
+                        cleanup_paths,
+                        target_kind=ARTIFACT_CLEANUP_KIND_FILE,
+                    )
+                commit_started = True
+                await db.commit()
+            except Exception as exc:
+                try:
+                    await db.rollback()
+                finally:
+                    if not commit_started or isinstance(exc, IntegrityError):
+                        try:
+                            await asyncio.to_thread(rollback_output)
+                        except Exception:  # noqa: BLE001 - surface the original failure
+                            logger.critical(
+                                "Could not roll back failed signature output %s",
+                                output_fs_path,
+                                exc_info=True,
+                            )
+                if commit_started and not isinstance(exc, IntegrityError):
+                    # A lost COMMIT acknowledgement is not proof of rollback.
+                    # Preserve the exact output so a durable Document/Share
+                    # receipt can never point at bytes this request removed.
+                    raise DocumentSignatureCommitUncertainError(
+                        "Signature completion is still being reconciled"
+                    ) from exc
+                raise
+
+            cleaned_paths: set[str] = set()
+            try:
+                await asyncio.to_thread(rollback_snapshot.commit)
+                if rollback_backup_path:
+                    cleaned_paths.add(rollback_backup_path)
+            except Exception:  # noqa: BLE001 - durable cleanup intent remains
+                logger.warning(
+                    "Could not remove committed signature rollback snapshot %s",
+                    output_fs_path,
+                    exc_info=True,
+                )
+            if completed_working_path:
+                try:
+                    await asyncio.to_thread(
+                        unlink_entity_file_entry,
+                        entity_id,
+                        completed_working_path,
+                    )
+                    cleaned_paths.add(completed_working_path)
+                except Exception:  # noqa: BLE001 - durable cleanup intent remains
+                    logger.warning(
+                        "Could not remove completed signature working file %s",
+                        completed_working_path,
+                        exc_info=True,
+                    )
+            if cleaned_paths:
+                try:
+                    await clear_artifact_cleanup_jobs(
+                        db,
+                        entity_id,
+                        cleaned_paths,
+                    )
+                    await db.commit()
+                except Exception:  # noqa: BLE001 - cleanup retry remains durable
+                    try:
+                        await db.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.warning(
+                        "Committed signature cleanup intents remain queued",
+                        exc_info=True,
+                    )
+            try:
+                await bump_tool_cache_version(entity_id, "documents")
+            except Exception:  # noqa: BLE001 - do not mask a committed signature
+                logger.warning(
+                    "Could not invalidate document cache after signature completion",
+                    exc_info=True,
+                )
+            return DocumentSignatureOutputSaveResult(
+                source_document=source_document,
+                signed_document=signed_document,
+                fs_path=output_fs_path,
+            )
 
         return await finish_entity_filesystem_mutation(persist_and_commit())

@@ -29,27 +29,55 @@ Step state transitions managed here:
                                        fail_lease puts step back in queue)
   running          → waiting_human   (lease_needs_human)
   running          → pending         (expire_leases, retry remaining)
+  running          → waiting_human   (expire_leases, captured external effect)
   running          → failed          (expire_leases, attempts exhausted)
 """
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Optional
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.task import TaskLogType
+from packages.core.constants.pending_actions import PendingActionKind
+from packages.core.i18n import t
+from packages.core.plans.response_language import resolve_plan_response_locale
 from packages.core.constants.execution import (
+    ACTION_EFFECT_GENERATION_PARAM_KEY,
+    COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY,
+    COORDINATOR_CHILD_ITEM_PARAM_KEY,
+    COORDINATOR_CHILD_PARAM_KEY,
+    COORDINATOR_CHILD_RELEASED_PARAM_KEY,
+    COORDINATOR_TYPED_CHILD_PARAM_KEY,
+    COORDINATOR_TYPED_VERSION,
+    COORDINATOR_VERSION_PARAM_KEY,
+    COORDINATOR_WAITING_CHILD_PARAM_KEY,
+    COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY,
+    COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
+    COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY,
+    COORDINATOR_PARAM_KEY,
+    COORDINATOR_PARENT_STEP_PARAM_KEY,
+    DISPATCH_SKIP_KEY,
+    DISPATCH_SKIPPED_ERROR_TYPE,
+    LEASE_REVOKED_ERROR_TYPE,
+    LEASE_SUPERSEDED_ERROR_TYPE,
+    DispatchSkipReason,
     ExecutionPlanStatus,
     ExecutionStepStatus,
     WorkLeaseStatus,
     WorkerStatus,
 )
+from packages.core.constants.tool_effects import ToolEffectOutcome
 from packages.core.constants.integrations import INTEGRATION_ACCOUNT_SELECTION_ARGUMENT
+from packages.core.ai.runtime.outcome import attempt_forbids_replay
 from packages.core.ai.pending_action import (
     KIND_HUMAN_INPUT,
     LEASE_HITL_CLOSEABLE_KINDS,
@@ -68,6 +96,7 @@ from packages.core.contracts.task_output import (
     output_contract_for_schema,
 )
 from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
+from packages.core.dispatcher.action_params import executable_action_params
 from packages.core.dispatcher.validation import (
     SchemaError,
     output_schema_is_advisory,
@@ -82,13 +111,802 @@ from packages.core.models.worker import (
     WorkerActivityLog,
     WorkLease,
 )
+from packages.core.models.workspace import Workspace
+from packages.core.contracts.tool_effects import (
+    EffectReconciliationDecisionFactory,
+    ToolEffectEvidenceFactory,
+)
 from packages.core.plans.refs import ReferenceError as PlanReferenceError
 from packages.core.plans.refs import resolve_refs
 from packages.core.services.integration_account_service import (
     IntegrationAccountFanoutResultFactory,
 )
+from packages.core.workers.registry import INTERNAL_WORKER_KIND
 
 logger = logging.getLogger(__name__)
+
+INTERNAL_FILE_RECOVERY_FAILED = "InternalFileRecoveryFailed"
+
+
+async def _failed_step_review_operation_id(db: AsyncSession, step: ExecutionStep) -> str | None:
+    """A recovery decision belongs to a failed lease, never its spent execution grant."""
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.plans.step_reset import step_approval_operation_id
+
+    operation_id = step_approval_operation_id(step)
+    prior = await db.scalar(select(HitlRequest.id).where(
+        HitlRequest.entity_id == step.entity_id,
+        HitlRequest.workspace_id == step.workspace_id,
+        HitlRequest.origin_kind == ApprovalOriginKind.STEP.value,
+        HitlRequest.origin_step_id == step.id,
+        HitlRequest.origin_plan_id == step.plan_id,
+        HitlRequest.action_key == step.action_key,
+        HitlRequest.dedup_key == f"operation:{operation_id}",
+        HitlRequest.status.in_([ApprovalStatus.CONSUMED.value, ApprovalStatus.EXPIRED.value]),
+    ).order_by(HitlRequest.created_at.desc(), HitlRequest.id.desc()).limit(1))
+    if prior is None:
+        return None
+    lease_id = await db.scalar(select(WorkLease.id).where(
+        WorkLease.entity_id == step.entity_id,
+        WorkLease.step_id == step.id,
+        WorkLease.plan_id == step.plan_id,
+        WorkLease.status.in_([WorkLeaseStatus.FAILED.value, WorkLeaseStatus.EXPIRED.value]),
+    ).order_by(WorkLease.created_at.desc(), WorkLease.id.desc()).limit(1))
+    return f"{operation_id}:failure:{lease_id}" if lease_id else None
+
+
+def _is_system_file_effect(ref: Any) -> bool:
+    """File execution failures belong to Manor, not a customer verdict.
+
+    This classifies who owns recovery, never whether a write committed. Only
+    the narrower journal contract below can supply that execution evidence.
+    """
+    fields = ref.get("fields") if isinstance(ref, dict) else None
+    return bool(
+        isinstance(fields, dict) and ref.get("kind") == "tool_effect"
+        and isinstance(fields.get("tool"), str) and fields["tool"] and not fields["tool"].startswith("mcp__")
+        and fields.get("provider") in (None, "") and fields.get("capability_id") == "file.write"
+        and isinstance(fields.get("action_key"), str) and fields["action_key"] in (
+            "workspace.file.create", "workspace.file.modify", "workspace.file.write", "workspace.file.delete",
+        )
+        and fields.get("classification") in (None, "action")
+        and ToolEffectEvidenceFactory.has_valid_effect_id(ref)
+    )
+
+
+def _failure_checkpoint(
+    step: ExecutionStep, supplied: Any, *, persisted_evidence: list | None = None,
+) -> dict | None:
+    """Never replace an exact pending call with a transcript that lost it."""
+    current = step.runtime_checkpoint
+    if not isinstance(supplied, dict):
+        return copy.deepcopy(current) if isinstance(current, dict) else None
+    if supplied == current:
+        return copy.deepcopy(current)
+    from packages.core.dispatcher.effect_safety import _checkpoint_contains_tool_result, _checkpoint_proves_tool_effect
+
+    evidence = list(getattr(step, "evidence_refs", None) or [])
+    authoritative = evidence if persisted_evidence is None else persisted_evidence
+    proven_ids = set()
+    for effect in evidence:
+        if not isinstance(effect, dict) or effect.get("kind") != "tool_effect":
+            continue
+        fields = effect.get("fields")
+        if not isinstance(fields, dict):
+            return copy.deepcopy(current) if isinstance(current, dict) else None
+        call_id = fields.get("tool_call_id")
+        if (
+            effect.get("effect") == "pending"
+            and fields.get("intent_state") == "started"
+            and ToolEffectEvidenceFactory.has_valid_effect_id(effect)
+        ):
+            # A first pause may carry its exact pre-I/O checkpoint alongside
+            # the pending intent. This preserves where to resume after the
+            # human reconciles it, without accepting a claimed tool result.
+            from packages.core.services.effect_reconciliation import (
+                EffectReconciliationError,
+                _pending_effect_checkpoint,
+            )
+
+            try:
+                _pending_effect_checkpoint(
+                    SimpleNamespace(
+                        id=step.id,
+                        plan_id=step.plan_id,
+                        params=step.params,
+                        runtime_checkpoint=supplied,
+                    ),
+                    effect,
+                )
+            except (AttributeError, EffectReconciliationError):
+                pass
+            else:
+                if not _checkpoint_contains_tool_result(supplied, call_id):
+                    continue
+        proven = [ref for ref in authoritative if (
+            isinstance(ref, dict) and ref.get("kind") == "tool_effect"
+            and ref.get("effect") in ("action", "publish")
+            and ToolEffectEvidenceFactory.identity(ref) == ToolEffectEvidenceFactory.identity(effect)
+        )]
+        if not any(_checkpoint_proves_tool_effect(
+            supplied, ref, evidence_refs=authoritative, owner_step=step,
+        ) for ref in proven):
+            # Worker-supplied transcript/evidence is not a new proof of a
+            # pending host action. Only a previously persisted exact return
+            # can replace that frame; otherwise use the journal/current state.
+            return copy.deepcopy(current) if isinstance(current, dict) else None
+        proven_ids.add(str(call_id or ""))
+    if isinstance(current, dict):
+        from packages.core.ai.runtime.nested_agent import runtime_checkpoint_leaf_call_id
+
+        try:
+            pending_id = runtime_checkpoint_leaf_call_id(current)
+        except (KeyError, TypeError, ValueError):
+            pending_id = None
+        recorded_ids = {
+            str((ref.get("fields") or {}).get("tool_call_id") or "")
+            for ref in getattr(step, "evidence_refs", None) or []
+            if isinstance(ref, dict) and isinstance(ref.get("fields"), dict)
+            and _checkpoint_contains_tool_result(current, ref["fields"].get("tool_call_id"))
+        }
+        if pending_id:
+            recorded_ids.add(pending_id)
+        if any(not _checkpoint_contains_tool_result(supplied, call_id) for call_id in recorded_ids - proven_ids):
+            # A later exact pending frame is acceptable only if it contains
+            # the earlier call's observation. Otherwise retain the host frame.
+            return copy.deepcopy(current)
+    return copy.deepcopy(supplied)
+
+
+async def _recover_internal_file_effects(
+    db: AsyncSession, lease: WorkLease, step: ExecutionStep,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Observe committed local writes under the caller's execution fence.
+
+    This never executes a tool or infers a negative outcome. Storage/query
+    failures propagate; only absent or mismatched proof is an evidence gap.
+    """
+    from packages.core.ai.runtime.nested_agent import runtime_checkpoint_tool_owner
+    from packages.core.ai.runtime.workspace_delegation_actions import _tool_arguments_hash, _tool_result_canonical_sha256
+    from packages.core.services.runtime_file_effect_recovery import (
+        is_runtime_file_effect, read_runtime_file_effect_receipt,
+    )
+
+    evidence = _merge_durable_evidence_refs(step.evidence_refs, lease.evidence_refs)
+    markers = [ref for ref in evidence if isinstance(ref, dict) and ref.get("kind") in (
+        "tool_effect_reconciliation", "tool_result_handoff",
+    )]
+    recovered = False
+    unresolved = []
+    for ref in evidence:
+        if not _is_system_file_effect(ref) or not await _has_ambiguous_external_effect(
+            db, [ref, *markers], owner_step=step,
+        ):
+            continue
+        if not is_runtime_file_effect(ref):
+            unresolved.append(ref)
+            continue
+        fields = ref.get("fields") or {}
+        checkpoint = copy.deepcopy(step.runtime_checkpoint)
+        try:
+            leaf = runtime_checkpoint_tool_owner(checkpoint, str(fields.get("tool_call_id") or ""))
+            pending = leaf["pending_tool_call"]
+            matches = (
+                pending.get("name") == fields.get("tool")
+                and _tool_arguments_hash(pending.get("arguments") or {}) == fields.get("arguments_hash")
+            )
+        except (KeyError, TypeError, ValueError):
+            matches = False
+        if not matches:
+            unresolved.append(ref)
+            continue
+        task_id = await db.scalar(select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id))
+        receipt = await read_runtime_file_effect_receipt(
+            db, entity_id=step.entity_id, workspace_id=step.workspace_id,
+            task_id=task_id, plan_id=step.plan_id, step_id=step.id, effect_ref=ref,
+            runtime_checkpoint=checkpoint,
+        )
+        if receipt is None or receipt.operation_status != "committed":
+            unresolved.append(ref)
+            continue
+        serialized_observation = json.dumps(receipt.observation, ensure_ascii=False)
+        leaf["pending_tool_result"] = {"id": pending["id"], "content": serialized_observation}
+        leaf.setdefault("tool_continuations", {}).setdefault(pending["id"], {})["runtime_file_recovery"] = {
+            "journal_ids": list(receipt.journal_ids),
+            "effect_id": ToolEffectEvidenceFactory.effect_id(ref),
+        }
+        terminal = ToolEffectEvidenceFactory.bind_effect_id(ToolEffectEvidenceFactory.effect(
+            ToolEffectOutcome.ACTION,
+            {
+                **fields, "intent_state": "returned", "runtime_file_journal_ids": list(receipt.journal_ids),
+                "result_sha256": hashlib.sha256(serialized_observation.encode("utf-8")).hexdigest(),
+                "result_canonical_sha256": _tool_result_canonical_sha256(serialized_observation),
+                "runtime_file_observation": copy.deepcopy(receipt.observation),
+                "runtime_file_original_effect": copy.deepcopy(ref),
+            },
+        ))
+        if ref.get("coordinator_child_step_id"):
+            terminal["coordinator_child_step_id"] = ref["coordinator_child_step_id"]
+            terminal = ToolEffectEvidenceFactory.bind_effect_id(terminal)
+        # A lost native response and this explicit journal observation have
+        # different result hashes. Retain the original receipt inside the
+        # replacement instead of leaving an obsolete executable observation.
+        step.evidence_refs = _merge_durable_evidence_refs(
+            [item for item in step.evidence_refs or [] if item != ref], [terminal],
+        )
+        lease.evidence_refs = _merge_durable_evidence_refs(
+            [item for item in lease.evidence_refs or [] if item != ref], [terminal],
+        )
+        step.runtime_checkpoint = checkpoint
+        recovered = True
+    return recovered, unresolved
+
+
+def _internal_file_recovery_error(
+    error: dict, effects: list[dict[str, Any]], *, runtime_checkpoint: dict | None = None,
+    output_repair_exhausted: bool = False,
+) -> dict:
+    from packages.core.ai.runtime.nested_agent import runtime_checkpoint_tool_owner
+    from packages.core.ai.runtime.workspace_delegation_actions import _tool_arguments_hash
+    from packages.core.contracts.file_engine import FilePatchOperation, PATCH_OPERATION_ALIASES
+
+    def display_path(value: Any) -> str | None:
+        return value.strip()[:200] if isinstance(value, str) and value.strip() and value.isprintable() else None
+
+    file_operations = []
+    summaries: list[str] = []
+    for ref in effects:
+        fields = ref.get("fields") if isinstance(ref.get("fields"), dict) else {}
+        observation = fields.get("runtime_file_observation") or {}
+        files = observation.get("files") if isinstance(observation, dict) else None
+        candidates = [fields.get(key) for key in ("path", "file_path", "target_path", "project_path")]
+        if isinstance(files, list):
+            candidates.extend(item.get("path") for item in files if isinstance(item, dict))
+        tool = fields.get("tool")
+        operation = {
+            "patch_file": "patch", "replace_file": "replace", "delete_file": "delete",
+            "generate_file": "create", "video_edit": "video edit",
+        }.get(tool, "file operation") if isinstance(tool, str) else "file operation"
+        context: dict[str, Any] = {"operation": operation}
+        # Only the selected host frame may supply missing display metadata.
+        # Its target describes the attempted call, never proves it committed.
+        try:
+            leaf = runtime_checkpoint_tool_owner(runtime_checkpoint, str(fields.get("tool_call_id") or ""))
+            pending = leaf["pending_tool_call"]
+            arguments = pending.get("arguments")
+            matches = (
+                pending.get("name") == tool and isinstance(arguments, dict)
+                and _tool_arguments_hash(arguments) == fields.get("arguments_hash")
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            matches = False
+        if matches:
+            context["source"] = "host_pending_checkpoint"
+            candidates.extend(arguments.get(key) for key in ("path", "file_path", "target_path", "project_path", "output_path"))
+            if source_path := display_path(arguments.get("source_path")):
+                context["source_path"] = source_path
+            if tool == "generate_file" and (name := display_path(arguments.get("name"))):
+                context["requested_name"] = name
+            patches = arguments.get("operations")
+            if tool == "patch_file" and isinstance(patches, list):
+                context["patch_operation_count"] = len(patches)
+                allowed = FilePatchOperation.values() + list(PATCH_OPERATION_ALIASES)
+                context["patch_operation_types"] = list(dict.fromkeys(
+                    item["op"] for item in patches if isinstance(item, dict)
+                    and isinstance(item.get("op"), str) and item["op"] in allowed
+                ))[:8]
+                kinds = ", ".join(context["patch_operation_types"])
+                operation += f" ({len(patches)} operations{': ' + kinds if kinds else ''})"
+            elif tool == "video_edit" and arguments.get("operation") in (
+                "start", "prepare", "push_assets", "write_files", "sync", "review", "render", "close",
+            ):
+                context["operation"] = operation = f"video edit: {arguments['operation']}"
+        paths: list[str] = []
+        for value in candidates:
+            path = display_path(value)
+            if path and path not in paths:
+                paths.append(path)
+        context["targets"] = paths[:3]
+        file_operations.append({**copy.deepcopy(fields), "display_context": context})
+        summary = operation + (f" for {', '.join(paths[:3])}" if paths else "")
+        if context.get("requested_name") and not paths:
+            summary += f" (requested name: {context['requested_name']})"
+        if summary not in summaries:
+            summaries.append(summary)
+    target = "; ".join(summaries[:3]) or "internal file operation"
+    reason = (
+        f"The file operation ({target}) has a verified result, but the AI could not finish "
+        "the required output within its retry budget. Execution stopped with the file evidence retained."
+        if output_repair_exhausted else
+        f"The system could not verify the exact result of the internal file operation ({target}). "
+        "Execution stopped without repeating it, and its recorded evidence was retained."
+    )
+    return {
+        **error, "type": INTERNAL_FILE_RECOVERY_FAILED, "message": reason,
+        "cause": error,
+        "recovery": {
+            "status": "failed", "reason": "output_repair_exhausted" if output_repair_exhausted else "exact_result_unavailable",
+            "effect_ids": [ToolEffectEvidenceFactory.effect_id(ref) for ref in effects],
+            "file_operations": file_operations,
+        },
+        "failure": {"reason": reason, "retryable": False, "requires_human": False, "blockers": []},
+    }
+
+
+def _worker_lease_limit(capabilities: Any) -> int:
+    """Return the persisted worker concurrency ceiling, failing closed."""
+
+    raw_limit = (
+        capabilities.get("max_concurrent_leases", 1)
+        if isinstance(capabilities, dict)
+        else 1
+    )
+    if isinstance(raw_limit, bool):
+        return 1
+    try:
+        parsed = int(raw_limit)
+    except (TypeError, ValueError):
+        return 1
+    return min(max(parsed, 1), 64)
+
+
+async def _lock_worker_lease_admission(
+    db: AsyncSession,
+    *,
+    worker_id: str,
+) -> None:
+    """Serialize capacity accounting without taking the Worker row first.
+
+    Checkout later locks Workspace/Plan/Step rows.  A Worker row lock here
+    would invert the completion path's Workspace -> ... -> Worker order, so a
+    transaction-scoped advisory lock owns only this worker's admission lane.
+    """
+
+    bind = db.get_bind()
+    if bind is None or getattr(bind.dialect, "name", None) != "postgresql":
+        return
+
+    from packages.core.constants.advisory_locks import AdvisoryLockNamespace
+
+    with db.no_autoflush:
+        await db.execute(
+            text(
+                "SELECT pg_advisory_xact_lock("
+                ":namespace, hashtext(:worker_id))"
+            ),
+            {
+                "namespace": int(AdvisoryLockNamespace.WORKER_LEASE_ADMISSION),
+                "worker_id": worker_id,
+            },
+        )
+
+
+def _merge_durable_evidence_refs(
+    existing: Any,
+    incoming: Any,
+) -> list[dict[str, Any]]:
+    """Merge worker reports without erasing pre-I/O effect intents."""
+
+    return ToolEffectEvidenceFactory.merge_untrusted(existing, incoming)
+
+
+def _expired_external_action_attempt_evidence(
+    lease: WorkLease,
+    step: ExecutionStep,
+) -> dict[str, Any]:
+    """Materialize the exact dispatched action as an unknown effect.
+
+    The tokenized WorkLease is committed before its DTO is returned, so it is
+    the durable pre-handler intent for an external process. If that process
+    outlives the lease without reporting a receipt, the provider outcome is
+    unknown; convert the attempt identity into the normal reconciliation
+    contract instead of silently replaying it.
+    """
+
+    raw_params = step.params if isinstance(step.params, dict) else {}
+    effect_generation = str(
+        raw_params.get(ACTION_EFFECT_GENERATION_PARAM_KEY)
+        or step.attempt_count
+        or 1
+    )
+    arguments = executable_action_params(
+        raw_params,
+        human_input_response=step.human_input_response,
+    )
+    arguments_hash = hashlib.sha256(json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")).hexdigest()
+    provider = str(step.provider or "")
+    action_key = str(step.action_key or "")
+    tool = ".".join(part for part in (provider, action_key) if part)
+    return ToolEffectEvidenceFactory.bind_effect_id(
+        ToolEffectEvidenceFactory.effect(
+            ToolEffectOutcome.PENDING,
+            {
+                "tool": tool or step.step_key,
+                "provider": provider or None,
+                "action_key": action_key or None,
+                "integration_id": step.integration_id,
+                "arguments_hash": arguments_hash,
+                "tool_call_id": f"external-lease:{lease.id}",
+                "effect_generation": effect_generation,
+                "owner_plan_id": step.plan_id,
+                "owner_step_id": step.id,
+                "external_attempt_state": "expired_outcome_unknown",
+                "lease_id": lease.id,
+                "delivery_confirmed": False,
+            },
+        )
+    )
+
+
+async def _has_ambiguous_external_effect(
+    db: AsyncSession,
+    evidence_refs: Any,
+    *,
+    owner_step: ExecutionStep,
+) -> bool:
+    """Compatibility wrapper around the shared retry/lease safety gate."""
+
+    from packages.core.dispatcher.effect_safety import (
+        has_ambiguous_external_effect,
+    )
+
+    return await has_ambiguous_external_effect(
+        db,
+        evidence_refs,
+        owner_step=owner_step,
+    )
+
+
+def _coordinator_reverse_placeholder(
+    binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Reverse link persisted before the canonical outer request exists."""
+
+    return {
+        **binding,
+        "request_id": None,
+        "nested_request_id": binding.get("request_id"),
+    }
+
+
+def _matches_coordinator_reverse_placeholder(
+    value: Any,
+    binding: dict[str, Any],
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    expected = _coordinator_reverse_placeholder(binding)
+    return all(value.get(key) == expected_value for key, expected_value in expected.items())
+
+
+async def _typed_coordinator_nested_approval_binding(
+    db: AsyncSession,
+    *,
+    step: ExecutionStep,
+    lease: WorkLease,
+    task_id: str | None,
+    token: str,
+    pending_action: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Bind a typed V2 child pause to its own exact Runtime approval."""
+
+    from packages.core.ai.runtime.approval_messages import approval_args_hash
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
+    from packages.core.models.hitl_request import HitlRequest
+
+    params = step.params if isinstance(step.params, dict) else {}
+    parent_step_key = str(
+        params.get(COORDINATOR_PARENT_STEP_PARAM_KEY) or ""
+    ).strip()
+    item_key = str(params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY) or "").strip()
+    idempotency_key = str(
+        params.get(COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY) or ""
+    ).strip()
+    if (
+        params.get(COORDINATOR_CHILD_PARAM_KEY) is not True
+        or not parent_step_key
+        or not item_key
+        or not idempotency_key
+        or step.current_lease_id != lease.id
+    ):
+        return None
+
+    # ``_lock_active_execution`` already owns the child lock.  Taking the
+    # coordinator root lock here would invert the normal root -> child order
+    # used by materialization/handoff and can deadlock concurrent completion.
+    # Read and freeze the unique root identity instead; the approval mirror
+    # revalidates it later while holding its canonical Task/Plan locks.
+    coordinator_parent = (await db.execute(
+        select(ExecutionStep).where(
+            ExecutionStep.plan_id == step.plan_id,
+            ExecutionStep.entity_id == step.entity_id,
+            ExecutionStep.workspace_id == step.workspace_id,
+            ExecutionStep.step_key == parent_step_key,
+        )
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    coordinator_parent_params = (
+        coordinator_parent.params
+        if coordinator_parent is not None
+        and isinstance(coordinator_parent.params, dict)
+        else {}
+    )
+    waiting_child = coordinator_parent_params.get(
+        COORDINATOR_WAITING_CHILD_PARAM_KEY
+    )
+    if (
+        coordinator_parent is None
+        or coordinator_parent.id == step.id
+        or coordinator_parent.step_status != ExecutionStepStatus.PAUSED.value
+        or coordinator_parent_params.get(COORDINATOR_PARAM_KEY) is not True
+        or coordinator_parent_params.get(COORDINATOR_VERSION_PARAM_KEY)
+        != COORDINATOR_TYPED_VERSION
+        or not isinstance(waiting_child, dict)
+        or waiting_child.get("version") != 1
+        or str(waiting_child.get("child_step_id") or "") != step.id
+        or str(waiting_child.get("child_step_key") or "") != step.step_key
+        or str(waiting_child.get("checklist_item_key") or "") != item_key
+    ):
+        logger.warning(
+            "typed coordinator child %s has no exact V2 coordinator root",
+            step.id,
+        )
+        return None
+
+    nested = (await db.execute(
+        select(HitlRequest).where(
+            HitlRequest.id == token,
+            HitlRequest.entity_id == step.entity_id,
+            HitlRequest.workspace_id == step.workspace_id,
+            HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
+            HitlRequest.origin_step_id == step.id,
+            HitlRequest.origin_task_id == task_id,
+            HitlRequest.status == ApprovalStatus.PENDING.value,
+            HitlRequest.consumed_at.is_(None),
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if nested is None:
+        logger.warning(
+            "typed coordinator child %s returned an unbound approval token",
+            step.id,
+        )
+        return None
+
+    context = dict(nested.context or {})
+    nested_tool = str(context.get("tool") or "").strip()
+    nested_args_hash = str(context.get("args_hash") or "").strip()
+    continuation = context.get("continuation")
+    continuation_arguments = (
+        continuation.get("arguments") if isinstance(continuation, dict) else None
+    )
+    pending_tool = str(pending_action.get("tool") or "").strip()
+    if (
+        not nested_tool
+        or not nested_args_hash
+        or pending_tool != nested_tool
+        or not isinstance(continuation, dict)
+        or continuation.get("version") != 1
+        or str(continuation.get("tool") or "").strip() != nested_tool
+        or not isinstance(continuation_arguments, dict)
+        or approval_args_hash(continuation_arguments) != nested_args_hash
+    ):
+        logger.warning(
+            "typed coordinator child %s Runtime approval context was not exact",
+            step.id,
+        )
+        return None
+
+    binding = {
+        "version": COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
+        "request_id": nested.id,
+        "child_step_id": step.id,
+        "parent_step_id": step.id,
+        "coordinator_parent_step_key": parent_step_key,
+        "coordinator_parent_step_id": coordinator_parent.id,
+        "parent_lease_id": lease.id,
+        "parent_execution_claim_id": lease.execution_claim_id,
+        "plan_id": step.plan_id,
+        "task_id": task_id,
+        "child_step_key": step.step_key,
+        "service_key": step.service_key,
+        "idempotency_key": idempotency_key,
+        "typed_child": True,
+        "nested_tool": nested_tool,
+        "nested_args_hash": nested_args_hash,
+    }
+    placeholder = _coordinator_reverse_placeholder(binding)
+    existing = context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY)
+    if existing is not None and existing != placeholder:
+        logger.warning(
+            "typed coordinator child %s Runtime approval already has a different outer binding",
+            step.id,
+        )
+        return None
+    # The nested request exists before its lease-scoped UI mirror.  Mark it as
+    # coordinator-owned in this locked transaction before minting the outer
+    # request, closing the generic-approval race window.
+    context[COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY] = placeholder
+    nested.context = context
+    return binding
+
+
+async def _coordinator_nested_approval_binding(
+    db: AsyncSession,
+    *,
+    step: ExecutionStep,
+    lease: WorkLease,
+    task_id: str | None,
+    pending_action: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Bind a coordinator pause to its exact nested Runtime approval.
+
+    A delegated tool first creates a ``tool_call`` HitlRequest.  Promoting its
+    envelope to the parent worker pause also creates the ordinary lease request
+    used by Task UI.  Without a server-validated link, approving that outer
+    card only sets generic confirmation flags and leaves the exact nested call
+    unapproved.  The next coordinator attempt can then re-plan/replay it.
+
+    The link below is derived only from durable rows: a model-supplied token is
+    accepted only when it names a pending Runtime request whose saved
+    ``delegation_resume`` matches this tenant/workspace and whose one waiting
+    child belongs to this coordinator parent.  The approval service revalidates
+    the same binding before mirroring any verdict.
+    """
+
+    params = step.params if isinstance(step.params, dict) else {}
+    if not isinstance(pending_action, dict):
+        return None
+    is_legacy_root = params.get(COORDINATOR_PARAM_KEY) is True
+    is_typed_child = params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is True
+    if not is_legacy_root and not is_typed_child:
+        return None
+    token = str(pending_action.get("approval_token") or "").strip()
+    if not token:
+        return None
+    if (
+        not str(lease.execution_claim_id or "").strip()
+        or lease.lease_until is None
+        or lease.lease_until <= datetime.now(timezone.utc)
+    ):
+        logger.warning(
+            "coordinator step %s returned nested approval from a stale execution claim",
+            step.id,
+        )
+        return None
+
+    if is_typed_child:
+        return await _typed_coordinator_nested_approval_binding(
+            db,
+            step=step,
+            lease=lease,
+            task_id=task_id,
+            token=token,
+            pending_action=pending_action,
+        )
+
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus
+    from packages.core.models.hitl_request import HitlRequest
+
+    candidates = (await db.execute(
+        select(ExecutionStep).where(
+            ExecutionStep.plan_id == step.plan_id,
+            ExecutionStep.workspace_id == step.workspace_id,
+            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN.value,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalars().all()
+    children: list[ExecutionStep] = []
+    for child in candidates:
+        child_params = child.params if isinstance(child.params, dict) else {}
+        child_result = child.result if isinstance(child.result, dict) else {}
+        if (
+            child_params.get(COORDINATOR_CHILD_PARAM_KEY) is True
+            and child_params.get(COORDINATOR_PARENT_STEP_PARAM_KEY) == step.step_key
+            and str(child_result.get("approval_token") or "") == token
+        ):
+            children.append(child)
+    if len(children) != 1:
+        logger.warning(
+            "coordinator step %s nested approval matched %d waiting children",
+            step.id,
+            len(children),
+        )
+        return None
+    child = children[0]
+    child_params = child.params if isinstance(child.params, dict) else {}
+    child_idempotency_key = str(
+        child_params.get(COORDINATOR_CHILD_IDEMPOTENCY_PARAM_KEY) or ""
+    ).strip()
+    # Lock ordering is shared with coordinator child persistence:
+    # lease -> parent -> child -> nested approval.  Reversing the final two
+    # lets the dispatcher and the last nested Chat round deadlock each other.
+    nested = (await db.execute(
+        select(HitlRequest).where(
+            HitlRequest.id == token,
+            HitlRequest.entity_id == step.entity_id,
+            HitlRequest.workspace_id == step.workspace_id,
+            HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
+            HitlRequest.status == ApprovalStatus.PENDING.value,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if nested is None:
+        logger.warning(
+            "coordinator step %s returned an unbound nested approval token",
+            step.id,
+        )
+        return None
+    if str(nested.origin_task_id or "") != str(task_id or ""):
+        logger.warning(
+            "coordinator step %s nested approval task origin mismatched",
+            step.id,
+        )
+        return None
+    context = nested.context if isinstance(nested.context, dict) else {}
+    resume = context.get("delegation_resume")
+    if (
+        not isinstance(resume, dict)
+        or resume.get("version") != 1
+        or str(resume.get("approval_token") or "") != token
+        or str(resume.get("entity_id") or "") != str(step.entity_id or "")
+        or str(resume.get("workspace_id") or "") != str(step.workspace_id or "")
+        or str(resume.get("conversation_id") or "")
+        != str(nested.origin_conversation_id or "")
+    ):
+        logger.warning(
+            "coordinator step %s nested approval continuation was not exact",
+            step.id,
+        )
+        return None
+    if (
+        str(nested.origin_step_id or "") != child.id
+        or str(resume.get("task_id") or "") != str(task_id or "")
+        or str(resume.get("step_id") or "") != child.id
+        or str(resume.get("service_key") or "") != str(child.service_key or "")
+        or not child_idempotency_key
+        or str(resume.get("delegation_idempotency_key") or "")
+        != child_idempotency_key
+        or not str(child_params.get(COORDINATOR_CHILD_ITEM_PARAM_KEY) or "").strip()
+    ):
+        logger.warning(
+            "coordinator step %s nested approval did not match its child run",
+            step.id,
+        )
+        return None
+    binding = {
+        "version": COORDINATOR_NESTED_APPROVAL_CONTEXT_VERSION,
+        "request_id": nested.id,
+        "child_step_id": child.id,
+        "parent_step_id": step.id,
+        "parent_lease_id": lease.id,
+        "parent_execution_claim_id": lease.execution_claim_id,
+        "plan_id": step.plan_id,
+        "task_id": task_id,
+        "child_step_key": child.step_key,
+        "service_key": child.service_key,
+        "idempotency_key": child_idempotency_key,
+    }
+    if not _matches_coordinator_reverse_placeholder(
+        context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY),
+        binding,
+    ):
+        logger.warning(
+            "coordinator step %s nested approval has no exact pre-link placeholder",
+            step.id,
+        )
+        return None
+    return binding
 
 
 class _MissingResult:
@@ -106,8 +924,51 @@ class _MissingResult:
 MISSING_RESULT: Any = _MissingResult()
 
 
+def _reported_worker_failure(
+    result: Any,
+    *,
+    step_kind: str,
+) -> dict[str, Any] | None:
+    """Interpret the closed StepResult status only for agent step kinds."""
+    if step_kind not in {"llm", "subagent"} or not isinstance(result, dict):
+        return None
+    raw_status = result.get("status")
+    if raw_status is None:
+        return None
+    from packages.core.contracts.envelope import StepResultStatus
+
+    try:
+        status = StepResultStatus(str(raw_status))
+    except ValueError:
+        return {
+            "type": "InvalidStepResultStatus",
+            "message": f"invalid StepResult status {raw_status!r}",
+        }
+    if status is not StepResultStatus.FAILED:
+        return None
+    failure = result.get("failure")
+    reason = (
+        str(failure.get("reason") or "").strip()
+        if isinstance(failure, dict)
+        else ""
+    )
+    error: dict[str, Any] = {
+        "type": "WorkerReportedFailure",
+        "message": reason or str(
+            result.get("summary") or "step reported a failed StepResult"
+        ),
+    }
+    if isinstance(failure, dict) and failure:
+        error["failure"] = failure
+    return error
+
+
 _RISK_RANK = {"low": 0, "medium": 1, "high": 2}
 _DEFAULT_LEASE_TTL = timedelta(seconds=300)
+# execute_lease shares CeleryQueue.HEAVY with run_strategist_review
+# (hard limit 1800s). The 300s TTL is in-process liveness after execute
+# starts; a never-heartbeated lease is still queued, not dead.
+_QUEUED_LEASE_GRACE = timedelta(seconds=1800)
 
 
 class DispatchError(Exception):
@@ -120,6 +981,10 @@ class NoMatchingSteps(DispatchError):
 
 class LeaseNotActive(DispatchError):
     """The lease being completed/failed/extended isn't in 'active' state."""
+
+
+class CoordinatorCompletionRejected(LeaseNotActive):
+    """A coordinator root attempted DONE before its durable handoff gate."""
 
 
 class RuntimeActionSchemaUnavailable(DispatchError):
@@ -377,78 +1242,78 @@ async def _agent_allows_action_step(
     provider: str | None,
     action_key: str | None,
 ) -> tuple[bool, dict[str, Any] | None]:
-    """Check the resolved service agent owns the MCP action being leased."""
+    """Check the resolved service agent owns the MCP action being leased.
 
-    provider_key = str(provider or "").strip()
-    action = str(action_key or "").strip()
-    if provider_key == "browser_setup":
-        return True, None
-    if not agent_id or not provider_key or not action:
-        return False, {
-            "type": "ActionBindingDenied",
-            "message": "action step is missing resolved agent, provider, or action_key",
-            "provider": provider_key,
-            "action_key": action,
-        }
+    Thin wrapper over the predicate the planner also uses
+    (``agent_action_binding_allowed``): a step that planned fine must not be
+    able to fail at lease time on a second, drifting reading of the same
+    binding tables. Looked up at call time so tests can patch the shared
+    function.
+    """
+    from packages.core.services import agent_action_binding
 
-    from packages.core.models.mcp import AgentMCPBinding, MCPServer
-
-    row = (
-        await db.execute(
-            select(AgentMCPBinding, MCPServer)
-            .join(MCPServer, MCPServer.id == AgentMCPBinding.mcp_server_id)
-            .where(
-                AgentMCPBinding.agent_id == agent_id,
-                AgentMCPBinding.status == "active",
-                MCPServer.server_key == provider_key,
-                MCPServer.status == "active",
-            )
-            .limit(1)
-        )
-    ).first()
-    from packages.core.services.agent_permission_service import resolve_agent_direct_mcp_actions
-
-    direct_actions = await resolve_agent_direct_mcp_actions(db, agent_id)
-    if action in direct_actions.get(provider_key, set()):
-        return True, None
-
-    if not row:
-        return False, {
-            "type": "ActionBindingDenied",
-            "message": (
-                f"agent {agent_id} is not bound to MCP provider "
-                f"{provider_key!r}"
-            ),
-            "provider": provider_key,
-            "action_key": action,
-            "agent_id": agent_id,
-        }
-
-    binding, server = row
-    allowed_tools = (
-        binding.allowed_tools
-        if binding.allowed_tools is not None
-        else server.default_allowed_tools
+    return await agent_action_binding.agent_action_binding_allowed(
+        db,
+        agent_id=agent_id,
+        provider=provider,
+        action_key=action_key,
     )
-    if allowed_tools is None:
-        return True, None
 
-    allowed = {str(name) for name in allowed_tools if str(name or "").strip()}
-    qualified = f"mcp__{provider_key}__{action}"
-    if action in allowed or qualified in allowed:
-        return True, None
 
-    return False, {
-        "type": "ActionBindingDenied",
-        "message": (
-            f"agent {agent_id} is not allowed to execute "
-            f"{provider_key}.{action}"
-        ),
-        "provider": provider_key,
-        "action_key": action,
-        "agent_id": agent_id,
-        "allowed_tools": sorted(allowed),
+def _stamp_dispatch_skip(
+    step: ExecutionStep,
+    reason: DispatchSkipReason,
+    message: str,
+    *,
+    structural: bool,
+    now: datetime,
+) -> None:
+    """Record why the dispatcher declined to lease ``step`` this pass.
+
+    The record lives under ``step.error[DISPATCH_SKIP_KEY]`` so a real prior
+    execution error (retry feedback, ``next_retry_at``) survives the stamp;
+    when there is no real error the whole ``error`` becomes a
+    ``DispatchSkipped`` marker. ``since`` is preserved while the reason is
+    unchanged so the executor's watchdog can measure how long the step has
+    been undispatchable for one reason. ``step.error`` is always reassigned:
+    JSONB change detection only sees a new object.
+    """
+    existing = step.error if isinstance(step.error, dict) else None
+    prior = (existing or {}).get(DISPATCH_SKIP_KEY)
+    since = now.isoformat()
+    if (
+        isinstance(prior, dict)
+        and str(prior.get("reason") or "") == reason.value
+        and prior.get("since")
+    ):
+        since = str(prior["since"])
+    record = {
+        "reason": reason.value,
+        "message": message,
+        "since": since,
+        "structural": bool(structural),
     }
+    if existing is None or existing.get("type") == DISPATCH_SKIPPED_ERROR_TYPE:
+        step.error = {
+            "type": DISPATCH_SKIPPED_ERROR_TYPE,
+            "message": message,
+            DISPATCH_SKIP_KEY: record,
+        }
+        return
+    merged = dict(existing)
+    merged[DISPATCH_SKIP_KEY] = record
+    step.error = merged
+
+
+def _clear_dispatch_skip_on_grant(step: ExecutionStep) -> None:
+    """A lease went out: the skip record is stale. Keep any real error."""
+    error = step.error
+    if not isinstance(error, dict):
+        return
+    if error.get("type") == DISPATCH_SKIPPED_ERROR_TYPE:
+        step.error = None
+    elif DISPATCH_SKIP_KEY in error:
+        step.error = {k: v for k, v in error.items() if k != DISPATCH_SKIP_KEY}
 
 
 def _worker_supported_capability_ids(capabilities: dict[str, Any]) -> set[str] | None:
@@ -508,6 +1373,10 @@ class Dispatcher:
     ) -> list[tuple[WorkLease, ExecutionStep]]:
         """Atomically claim up to ``max_n`` runnable steps for this worker.
 
+        ``max_n`` is only the caller's requested batch size.  The persisted
+        ``max_concurrent_leases`` ceiling and current ACTIVE lease count are
+        authoritative.
+
         ``plan_id`` filter is for testing / scoped runs; production
         callers leave it None and the worker picks across all plans.
 
@@ -541,10 +1410,43 @@ class Dispatcher:
         plan_id: Optional[str],
         _sp: Any = None,
     ) -> list[tuple[WorkLease, ExecutionStep]]:
-        if worker.status != WorkerStatus.ACTIVE:
+        requested_max_n = max(int(max_n), 0)
+        if requested_max_n == 0:
             return []
 
-        capabilities = worker.capabilities or {}
+        # Per-step SKIP LOCKED prevents two workers from claiming one Step, but
+        # it does not prevent two concurrent heartbeats for the *same* worker
+        # from each claiming a different Step.  Serialize only that worker's
+        # admission transaction, then derive remaining capacity from persisted
+        # state.  The advisory lock is intentionally acquired before any
+        # Workspace/Plan/Step row lock and does not lock the Worker row.
+        await _lock_worker_lease_admission(db, worker_id=worker.id)
+        with db.no_autoflush:
+            stored_worker = (await db.execute(
+                select(Worker.status, Worker.capabilities).where(
+                    Worker.id == worker.id,
+                )
+            )).one_or_none()
+        if stored_worker is None or stored_worker.status != WorkerStatus.ACTIVE:
+            return []
+
+        active_lease_count = int((await db.scalar(
+            select(func.count(WorkLease.id)).where(
+                WorkLease.worker_id == worker.id,
+                WorkLease.status == WorkLeaseStatus.ACTIVE.value,
+            )
+        )) or 0)
+        remaining_capacity = max(
+            _worker_lease_limit(stored_worker.capabilities) - active_lease_count,
+            0,
+        )
+        max_n = min(requested_max_n, remaining_capacity)
+        if max_n == 0:
+            return []
+
+        # Use the same fresh persisted snapshot for every capability gate;
+        # the caller's ORM instance may predate an operator update.
+        capabilities = dict(stored_worker.capabilities or {})
         supported_kinds = capabilities.get("supported_kinds") or []
         if not supported_kinds:
             return []
@@ -577,8 +1479,32 @@ class Dispatcher:
             SubscriptionWorker.worker_id == worker.id,
         )
 
-        # Pre-build the candidate query. Dependency check is in Python
-        # below — keeping the SQL simpler and easier to audit.
+        # Pre-build the candidate query. The authoritative dependency check
+        # is still ``_check_dependency_status`` in Python below; the SQL
+        # exclusion only keeps steps with an unfinished dependency out of the
+        # bounded candidate window. Without it, a handful of older dependents
+        # waiting on one running upstream fill the whole ``max_n * 4`` window
+        # on every heartbeat and a newer plan's root step is never even seen.
+        from sqlalchemy.orm import aliased
+
+        from packages.core.services.task_execution_origin import plan_manual_execution_predicate
+
+        dependency = aliased(ExecutionStep, name="dependency")
+        dependency_keys = (
+            select(func.jsonb_array_elements_text(ExecutionStep.depends_on))
+            .correlate(ExecutionStep)
+        )
+        unfinished_dependency = (
+            select(dependency.id)
+            .where(
+                dependency.plan_id == ExecutionStep.plan_id,
+                dependency.step_key.in_(dependency_keys),
+                dependency.step_status != ExecutionStepStatus.DONE.value,
+            )
+            .correlate(ExecutionStep)
+            .exists()
+        )
+
         stmt = (
             select(ExecutionStep, ExecutionPlan)
             .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
@@ -589,6 +1515,27 @@ class Dispatcher:
                 ExecutionStep.risk_level.in_(allowed_risk_levels),
                 ExecutionStep.attempt_count < ExecutionStep.max_attempts,
                 ExecutionPlan.status.in_((ExecutionPlanStatus.DRAFT, ExecutionPlanStatus.RUNNING,)),
+                # Keep inactive Workspace rows out of the bounded candidate
+                # window.  Filtering only after LIMIT makes old paused/deleted
+                # steps reappear on every heartbeat and can starve runnable
+                # work behind them.
+                or_(
+                    ExecutionStep.workspace_id.is_(None),
+                    exists().where(
+                        and_(
+                            Workspace.id == ExecutionStep.workspace_id,
+                            Workspace.entity_id == ExecutionStep.entity_id,
+                            or_(
+                                Workspace.status == "active",
+                                and_(
+                                    Workspace.status == "paused",
+                                    plan_manual_execution_predicate(),
+                                ),
+                            ),
+                            Workspace.deleted_at.is_(None),
+                        )
+                    ),
+                ),
                 # No active lease for this step (the partial unique index
                 # is the hard guarantee; this filter is the soft one
                 # that lets the DB skip already-leased rows fast).
@@ -598,11 +1545,41 @@ class Dispatcher:
                         WorkLease.status == WorkLeaseStatus.ACTIVE,
                     )
                 ),
+                # Head-of-line blocking guard (see ``unfinished_dependency``).
+                ~unfinished_dependency,
             )
             .order_by(ExecutionStep.created_at.asc())
             .limit(max_n * 4)  # room to skip un-mappable rows
-            .with_for_update(skip_locked=True)
         )
+        typed_child_marker = ExecutionStep.params[
+            COORDINATOR_TYPED_CHILD_PARAM_KEY
+        ].astext
+        typed_child_release = ExecutionStep.params[
+            COORDINATOR_CHILD_RELEASED_PARAM_KEY
+        ].astext
+        # Typed coordinator children are durable, pre-created work records.
+        # They are not runnable merely because some stale/bypassing writer put
+        # them in PENDING: only the coordinator's locked release transition may
+        # expose one to the dispatcher.
+        stmt = stmt.where(
+            or_(
+                typed_child_marker.is_(None),
+                typed_child_marker != "true",
+                typed_child_release == "true",
+            )
+        )
+        if worker.kind != INTERNAL_WORKER_KIND:
+            coordinator_marker = ExecutionStep.params[COORDINATOR_PARAM_KEY].astext
+            # The coordinator root runs AgenticLoop and owns server-side child
+            # handoffs.  That protocol exists only in the in-process worker;
+            # external workers may execute released typed children, never the
+            # root control plane.
+            stmt = stmt.where(
+                or_(
+                    coordinator_marker.is_(None),
+                    coordinator_marker != "true",
+                )
+            )
         dispatcher_target_worker_id = ExecutionPlan.dispatcher_state["target_worker_id"].astext
         plan_target_worker_id = ExecutionPlan.plan_dag["target_worker_id"].astext
         stmt = stmt.where(
@@ -623,7 +1600,32 @@ class Dispatcher:
         if plan_id is not None:
             stmt = stmt.where(ExecutionStep.plan_id == plan_id)
 
-        rows = (await db.execute(stmt)).all()
+        # Discover a bounded set without locking Steps/Plans, then acquire
+        # Workspace lifecycle boundaries first. Re-run admission under those
+        # locks: a pause committed after discovery must not become a lease.
+        candidate_scopes = (await db.execute(stmt.with_only_columns(
+            ExecutionStep.id, ExecutionStep.workspace_id,
+        ))).all()
+        if not candidate_scopes:
+            return []
+        workspace_ids = {scope.workspace_id for scope in candidate_scopes if scope.workspace_id}
+        locked_workspace_ids = set()
+        if workspace_ids:
+            locked_workspace_ids = set((await db.execute(
+                select(Workspace.id)
+                .where(Workspace.id.in_(workspace_ids), Workspace.entity_id == worker.entity_id)
+                .order_by(Workspace.id.asc())
+                .with_for_update(skip_locked=True)
+            )).scalars().all())
+        rows = (await db.execute(
+            stmt.where(
+                ExecutionStep.id.in_([scope.id for scope in candidate_scopes]),
+                or_(
+                    ExecutionStep.workspace_id.is_(None),
+                    ExecutionStep.workspace_id.in_(locked_workspace_ids),
+                ),
+            ).with_for_update(skip_locked=True)
+        )).all()
         if not rows:
             return []
 
@@ -637,6 +1639,22 @@ class Dispatcher:
                 break
             now = datetime.now(timezone.utc)
             local_worker_plan = _plan_source(plan) == "local_worker"
+            step_params = step.params if isinstance(step.params, dict) else {}
+
+            if (
+                step_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is True
+                and step_params.get(COORDINATOR_CHILD_RELEASED_PARAM_KEY) is not True
+            ):
+                # Defense in depth for dialect/cached-query differences and
+                # rows made PENDING by an older process during rolling upgrade.
+                step.step_status = ExecutionStepStatus.PAUSED.value
+                step.current_lease_id = None
+                continue
+            if (
+                step_params.get(COORDINATOR_PARAM_KEY) is True
+                and worker.kind != INTERNAL_WORKER_KIND
+            ):
+                continue
 
             # Materialize the canonical Runtime capability as soon as a
             # candidate is inspected.  Some cloud-only provider/connection
@@ -681,13 +1699,25 @@ class Dispatcher:
             # Capability check beyond what SQL can express.
             step_risk = _RISK_RANK.get(step.risk_level or "low", 0)
             if step_risk > max_risk:
+                _stamp_dispatch_skip(
+                    step,
+                    DispatchSkipReason.RISK_EXCEEDS_WORKER,
+                    (
+                        f"step risk level {step.risk_level!r} exceeds worker "
+                        f"ceiling {capabilities.get('max_risk_level') or 'low'!r}"
+                    ),
+                    structural=True,
+                    now=now,
+                )
                 continue
 
             # ── Workspace lifecycle + Blueprint setup admission ──
             setup_status = None
             if step.workspace_id:
+                from packages.core.models.task import Task
                 from packages.core.services.workspace_readiness import (
                     evaluate_current_workspace_blocking_setup,
+                    task_is_authorized_workspace_setup,
                 )
 
                 if step.workspace_id not in workspace_setup_cache:
@@ -699,7 +1729,16 @@ class Dispatcher:
                         )
                     )
                 setup_status = workspace_setup_cache[step.workspace_id]
-                if setup_status is not None and setup_status.blocks_work:
+                setup_task = await db.get(Task, plan.task_id) if (
+                    setup_status is not None and setup_status.blocks_work and plan.task_id
+                ) else None
+                authorized_setup = bool(
+                    setup_task is not None
+                    and plan.workspace_id == step.workspace_id == setup_task.workspace_id
+                    and plan.entity_id == step.entity_id == setup_task.entity_id
+                    and await task_is_authorized_workspace_setup(db, setup_task)
+                )
+                if setup_status is not None and setup_status.blocks_work and not authorized_setup:
                     logger.info(
                         "dispatcher: skipping step %s — %s",
                         step.step_key,
@@ -716,10 +1755,27 @@ class Dispatcher:
             ws_ok, ws_reason = await check_workspace_budget(db, step.workspace_id)
             if not ws_ok:
                 logger.info("dispatcher: skipping step %s — %s", step.step_key, ws_reason)
+                _stamp_dispatch_skip(
+                    step,
+                    DispatchSkipReason.WORKSPACE_BUDGET,
+                    ws_reason or "workspace monthly budget is exhausted",
+                    structural=False,
+                    now=now,
+                )
                 continue
 
             if supported_capabilities is not None and not local_worker_plan:
                 if not step_capability_id or step_capability_id not in supported_capabilities:
+                    _stamp_dispatch_skip(
+                        step,
+                        DispatchSkipReason.CAPABILITY_UNSUPPORTED,
+                        (
+                            f"worker does not support capability "
+                            f"{step_capability_id or '(none declared)'!r}"
+                        ),
+                        structural=True,
+                        now=now,
+                    )
                     continue
 
             # ── Unified approval gate ──
@@ -769,7 +1825,10 @@ class Dispatcher:
             _hitl_type = HitlType.AUTHORIZE.value
             _payload: dict = {}
             _prior = step.last_execution_error
-            if step.attempt_count and isinstance(_prior, dict) and _prior:
+            failure_review_operation_id = None
+            if isinstance(step.error, dict) and isinstance(_prior, dict) and _prior:
+                failure_review_operation_id = await _failed_step_review_operation_id(db, step)
+            if (step.attempt_count or failure_review_operation_id) and step.error and isinstance(_prior, dict) and _prior:
                 _hint = classify_execution_error(_prior)
                 _raw = str(_prior.get("message") or "").strip()
                 _hitl_type = HitlType.ERROR.value
@@ -824,6 +1883,7 @@ class Dispatcher:
                 principal_kind=RuntimePrincipalKind.SYSTEM_WORKER,
                 task_id=plan.task_id,
             )
+            from packages.core.plans.step_reset import step_approval_operation_id
             decision = await resolve_approval(
                 db,
                 subject=ApprovalSubject(
@@ -842,11 +1902,14 @@ class Dispatcher:
                     step_id=step.id,
                     plan_id=step.plan_id,
                     task_id=plan.task_id,
+                    operation_id=failure_review_operation_id or step_approval_operation_id(step),
+                    args_hash=hashlib.sha256(json.dumps(step.params or {}, sort_keys=True, default=str).encode()).hexdigest(),
                 ),
                 spent_credits=spent_credits_per_kind,
                 permission_decision=permission_decision,
                 intrinsic_high_risk_approved=proposal_high_risk_approved,
                 policy_hitl_preauthorized=proposal_high_risk_approved,
+                require_explicit_approval=failure_review_operation_id is not None,
                 hitl_type=_hitl_type,
                 payload=_payload,
             )
@@ -925,13 +1988,23 @@ class Dispatcher:
                 )
                 continue
             if decision.outcome == "deny":
+                # A hard block is a rule only a person can change: name it,
+                # hand back the soften patch, and mark the failure
+                # human-required so the plan parks on a recovery card
+                # instead of replanning into the same wall.
+                from packages.core.governance.hard_block_provenance import (
+                    governance_denial_step_error,
+                )
+
                 step.step_status = ExecutionStepStatus.FAILED.value
-                step.error = {
-                    "type": "GovernancePolicy",
-                    "message": decision.reason,
-                    "matched_rule": decision.matched_rule,
-                    "capability_id": approval_capability_id,
-                }
+                step.error = await governance_denial_step_error(
+                    db,
+                    workspace_id=step.workspace_id,
+                    action_key=step.action_key,
+                    capability_id=approval_capability_id,
+                    matched_rule=decision.matched_rule,
+                    reason=decision.reason,
+                )
                 step.finished_at = now
                 logger.info(
                     "dispatcher: step %s blocked by policy (%s) — %s",
@@ -949,6 +2022,17 @@ class Dispatcher:
                 if ws_sub is not None:
                     if ws_sub.id not in bound_sub_ids:
                         # Worker not bound to this subscription — skip.
+                        _stamp_dispatch_skip(
+                            step,
+                            DispatchSkipReason.WORKER_NOT_BOUND,
+                            (
+                                f"the agent subscribed to service "
+                                f"{step.service_key or ws_sub.service_key!r} is not "
+                                f"bound to worker {worker.id}"
+                            ),
+                            structural=True,
+                            now=now,
+                        )
                         continue
                     step.resolved_subscription_id = ws_sub.id
                     step.resolved_agent_id = ws_sub.agent_id
@@ -971,6 +2055,16 @@ class Dispatcher:
                 elif step.service_key or step.workspace_id:
                     # Plan/workspace-routed steps must resolve to a
                     # subscription before they can be leased.
+                    _stamp_dispatch_skip(
+                        step,
+                        DispatchSkipReason.SUBSCRIPTION_UNRESOLVED,
+                        (
+                            f"no active agent is subscribed to service "
+                            f"{step.service_key!r} in this workspace"
+                        ),
+                        structural=True,
+                        now=now,
+                    )
                     continue
 
             # Dependency check — if any dep failed/cancelled, mark
@@ -987,10 +2081,23 @@ class Dispatcher:
             # resolves refs, but worker heartbeat can reach the dispatcher
             # before the next executor cycle. Resolve here too so downstream
             # workers never receive raw `${{ steps.* }}` placeholders.
-            if _contains_step_ref(step.params):
+            if (
+                _contains_step_ref(step_params)
+                and step_params.get(COORDINATOR_PARAM_KEY) is not True
+                and step_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is not True
+            ):
+                # A consumer that commits to an external publish never gets a
+                # degraded ref value (a sibling field or a JSON dump of the
+                # producer's result): that would go to a real audience.
+                from packages.core.plans.executor import _step_expects_external_publish
+
                 try:
                     prior_results = await _collect_done_step_results(db, step)
-                    step.params = resolve_refs(step.params or {}, prior_results)
+                    step.params = resolve_refs(
+                        step.params or {},
+                        prior_results,
+                        strict=_step_expects_external_publish(step, plan.plan_dag),
+                    )
                 except PlanReferenceError as exc:
                     step.step_status = ExecutionStepStatus.FAILED.value
                     step.error = {
@@ -1013,7 +2120,13 @@ class Dispatcher:
 
             # Optional input-schema validation, before the lease goes out.
             try:
-                validate_step_input(step, step.params or {})
+                input_params = step.params or {}
+                if step.kind == "action":
+                    input_params = executable_action_params(
+                        input_params,
+                        human_input_response=step.human_input_response,
+                    )
+                validate_step_input(step, input_params)
             except SchemaError as exc:
                 step.step_status = ExecutionStepStatus.FAILED.value
                 step.error = {
@@ -1031,6 +2144,15 @@ class Dispatcher:
                 step.error = None
                 step.human_input_prompt = None
 
+            # The step is being leased: whatever skip reason an earlier pass
+            # stamped no longer applies. A real prior error stays for retry
+            # feedback.
+            _clear_dispatch_skip_on_grant(step)
+
+            from packages.core.workers.protocol import (
+                supports_lease_attempt_token,
+            )
+
             lease = WorkLease(
                 id=generate_ulid(),
                 step_id=step.id,
@@ -1039,8 +2161,13 @@ class Dispatcher:
                 workspace_id=step.workspace_id,
                 worker_id=worker.id,
                 subscription_id=step.resolved_subscription_id,
-                lease_until=now + self._lease_ttl,
+                lease_until=now + _QUEUED_LEASE_GRACE + self._lease_ttl,
                 status=WorkLeaseStatus.ACTIVE.value,
+                execution_claim_id=(
+                    generate_ulid()
+                    if supports_lease_attempt_token(capabilities)
+                    else None
+                ),
             )
             db.add(lease)
 
@@ -1104,12 +2231,22 @@ class Dispatcher:
         *,
         result: Any = MISSING_RESULT,
         cost: Optional[dict] = None,
-        evidence_refs: Optional[list[str]] = None,
+        evidence_refs: Optional[list[str | dict[str, Any]]] = None,
         metadata: Optional[dict] = None,
         task_output_value_kind: TaskOutputValueKind | str | None = None,
+        runtime_checkpoint: Optional[dict] = None,
+        expected_worker_id: str | None = None,
+        expected_execution_claim_id: str | None = None,
+        require_execution_claim_id_if_present: bool = False,
     ) -> WorkLease:
         """Worker reports success. Validates output against step schema,
-        marks lease + step done, releases credential subleases. Caller commits."""
+        marks lease + step done, releases credential subleases. Caller commits.
+
+        ``runtime_checkpoint`` is the worker's transcript for this attempt. It
+        is only used when completion turns into a failure here (schema /
+        envelope / fan-out / artifact sync): the retry then resumes from it
+        instead of starting over.
+        """
         from packages.core.observability import span
 
         async with span(
@@ -1119,7 +2256,7 @@ class Dispatcher:
                 "cost.usd": (cost or {}).get("usd"),
             },
         ):
-            return await self._complete_lease_inner(
+            lease = await self._complete_lease_inner(
                 db,
                 lease_id,
                 result=result,
@@ -1127,7 +2264,21 @@ class Dispatcher:
                 evidence_refs=evidence_refs,
                 metadata=metadata,
                 task_output_value_kind=task_output_value_kind,
+                runtime_checkpoint=runtime_checkpoint,
+                expected_worker_id=expected_worker_id,
+                expected_execution_claim_id=expected_execution_claim_id,
+                require_execution_claim_id_if_present=(
+                    require_execution_claim_id_if_present
+                ),
             )
+            from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+            await stage_plan_cycle_wake(
+                db,
+                lease.plan_id,
+                reason="lease_completed",
+            )
+            return lease
 
     async def _complete_lease_inner(
         self,
@@ -1136,15 +2287,81 @@ class Dispatcher:
         *,
         result: Any,
         cost: Optional[dict],
-        evidence_refs: Optional[list[str]],
+        evidence_refs: Optional[list[str | dict[str, Any]]],
         metadata: Optional[dict],
         task_output_value_kind: TaskOutputValueKind | str | None = None,
+        runtime_checkpoint: Optional[dict] = None,
+        expected_worker_id: str | None = None,
+        expected_execution_claim_id: str | None = None,
+        require_execution_claim_id_if_present: bool = False,
     ) -> WorkLease:
-        lease = await self._get_active_lease(db, lease_id)
-        step = await self._get_step(db, lease.step_id)
+        lease, step = await self._lock_active_execution(
+            db,
+            lease_id,
+            expected_worker_id=expected_worker_id,
+            expected_execution_claim_id=expected_execution_claim_id,
+            require_execution_claim_id_if_present=(
+                require_execution_claim_id_if_present
+            ),
+            lock_workspace=True,
+        )
         now = datetime.now(timezone.utc)
 
+        if not self._lease_owns_step(lease, step):
+            if result is not MISSING_RESULT:
+                lease.result = result
+            if cost:
+                lease.cost = cost
+            if evidence_refs is not None:
+                lease.evidence_refs = _merge_durable_evidence_refs(
+                    lease.evidence_refs, evidence_refs
+                )
+            return await self._supersede_lease(
+                db, lease, step, surface="complete_lease", now=now,
+            )
+
+        step_params = step.params if isinstance(step.params, dict) else {}
+        if step_params.get(COORDINATOR_PARAM_KEY) is True:
+            worker_kind = (await db.execute(
+                select(Worker.kind).where(Worker.id == lease.worker_id)
+            )).scalar_one_or_none()
+            if worker_kind != INTERNAL_WORKER_KIND:
+                raise CoordinatorCompletionRejected(
+                    "coordinator root completion is reserved for the internal worker"
+                )
+            # AgenticLoop's submit handler is a cooperative guard.  The
+            # dispatcher is the authoritative DONE boundary and re-checks the
+            # durable child states plus exact parent-transcript handoff ACKs so
+            # no alternate caller or old worker can bypass the checklist.
+            from packages.core.workers.coordinator_tools import (
+                coordinator_completion_error,
+            )
+
+            completion_error = await coordinator_completion_error(db, step)
+            if completion_error:
+                raise CoordinatorCompletionRejected(
+                    f"coordinator root cannot complete: {completion_error}"
+                )
+
         output_contract = output_contract_for_schema(step.expected_output_schema)
+        # Execution evidence survives a later output-contract failure. Losing
+        # a real receipt here would turn schema repair into another publish.
+        runtime_checkpoint = _failure_checkpoint(
+            SimpleNamespace(
+                id=step.id, plan_id=step.plan_id, params=step.params,
+                runtime_checkpoint=step.runtime_checkpoint,
+                evidence_refs=_merge_durable_evidence_refs(step.evidence_refs, evidence_refs),
+            ),
+            runtime_checkpoint,
+            persisted_evidence=copy.deepcopy(step.evidence_refs or []),
+        )
+        if evidence_refs is not None:
+            lease.evidence_refs = _merge_durable_evidence_refs(
+                lease.evidence_refs, evidence_refs
+            )
+            step.evidence_refs = _merge_durable_evidence_refs(
+                step.evidence_refs, evidence_refs
+            )
         omitted_result = result is MISSING_RESULT
         if omitted_result:
             # Keep legacy/no-schema completion behavior unchanged while making
@@ -1171,6 +2388,12 @@ class Dispatcher:
                     db,
                     lease_id,
                     error=omission_error,
+                    runtime_checkpoint=runtime_checkpoint,
+                    expected_worker_id=expected_worker_id,
+                    expected_execution_claim_id=expected_execution_claim_id,
+                    require_execution_claim_id_if_present=(
+                        require_execution_claim_id_if_present
+                    ),
                 )
         # A hard contract must validate even when the worker returned Python
         # None: omitted ``result`` and explicit JSON null are distinct at the
@@ -1208,6 +2431,12 @@ class Dispatcher:
                         ],
                     },
                     will_retry=False,
+                    runtime_checkpoint=runtime_checkpoint,
+                    expected_worker_id=expected_worker_id,
+                    expected_execution_claim_id=expected_execution_claim_id,
+                    require_execution_claim_id_if_present=(
+                        require_execution_claim_id_if_present
+                    ),
                 )
             except SchemaError as exc:
                 if output_schema_is_advisory(step.kind, step.expected_output_schema):
@@ -1238,6 +2467,12 @@ class Dispatcher:
                             "errors": exc.errors,
                             **_validation_failure_debug(result),
                         },
+                        runtime_checkpoint=runtime_checkpoint,
+                        expected_worker_id=expected_worker_id,
+                        expected_execution_claim_id=expected_execution_claim_id,
+                        require_execution_claim_id_if_present=(
+                            require_execution_claim_id_if_present
+                        ),
                     )
 
         if (
@@ -1262,6 +2497,12 @@ class Dispatcher:
                     ),
                     **_validation_failure_debug(result),
                 },
+                runtime_checkpoint=runtime_checkpoint,
+                expected_worker_id=expected_worker_id,
+                expected_execution_claim_id=expected_execution_claim_id,
+                require_execution_claim_id_if_present=(
+                    require_execution_claim_id_if_present
+                ),
             )
             step.result = result
             return failed_lease
@@ -1288,8 +2529,8 @@ class Dispatcher:
             will_retry = None
             if isinstance(failure, dict) and failure:
                 error["failure"] = failure
-                if isinstance(failure.get("retryable"), bool):
-                    will_retry = failure["retryable"]
+                if failure.get("retryable") is False or attempt_forbids_replay(failure):
+                    will_retry = False
             logger.warning(
                 "[dispatcher] step %s returned a failed StepResult envelope: %s",
                 step.step_key, error["message"],
@@ -1299,6 +2540,12 @@ class Dispatcher:
                 lease_id,
                 error=error,
                 will_retry=will_retry,
+                runtime_checkpoint=runtime_checkpoint,
+                expected_worker_id=expected_worker_id,
+                expected_execution_claim_id=expected_execution_claim_id,
+                require_execution_claim_id_if_present=(
+                    require_execution_claim_id_if_present
+                ),
             )
             # Keep the envelope on the step too — the operator needs to see
             # what actually came back, not just the derived error.
@@ -1310,7 +2557,60 @@ class Dispatcher:
         # Document and add its canonical viewer id to the step result. This is
         # the shared backstop for code/action/subagent producers that did not
         # use the standard generated-file helper themselves.
-        if isinstance(result, dict):
+        from packages.core.contracts.artifact_delivery import (
+            readonly_artifact_delivery,
+            reused_artifact_evidence,
+        )
+
+        if readonly_artifact_delivery(step.params):
+            from packages.core.models.task import Task
+            from packages.core.services.artifact_delivery import (
+                ArtifactDeliveryError,
+                submitted_artifact_refs,
+                verify_artifact_delivery_refs,
+            )
+            from packages.core.services.task_requester_identity import resolve_task_execution_user_id
+
+            task = (await db.execute(select(Task).join(
+                ExecutionPlan, ExecutionPlan.task_id == Task.id,
+            ).where(ExecutionPlan.id == step.plan_id))).scalar_one_or_none()
+            user_id = await resolve_task_execution_user_id(db, task) if task is not None else None
+            try:
+                delivery = await verify_artifact_delivery_refs(
+                    db, entity_id=step.entity_id, workspace_id=step.workspace_id,
+                    user_id=user_id, refs=submitted_artifact_refs(result, output_schema=step.expected_output_schema),
+                )
+            except ArtifactDeliveryError as exc:
+                lease.result = result
+                step.result = result
+                return await self.fail_lease(
+                    db, lease_id,
+                    error={"type": "ArtifactDeliveryError", "code": exc.code, "message": str(exc), "details": exc.details},
+                    runtime_checkpoint=runtime_checkpoint,
+                    expected_worker_id=expected_worker_id,
+                    expected_execution_claim_id=expected_execution_claim_id,
+                    require_execution_claim_id_if_present=require_execution_claim_id_if_present,
+                )
+            if isinstance(result, dict):
+                result = _attach_knowledge_artifacts_for_contract(
+                    result, delivery.projection, output_contract=output_contract, step_kind=step.kind,
+                )
+            # This evidence is constructed under the live server lease fence.
+            # Worker-supplied lookalikes are stripped by merge_untrusted; they
+            # cannot mint a reused-file delivery or bypass its read boundary.
+            persisted_result = result if output_contract.preserves_native_payload or isinstance(result, dict) else (
+                {"value": result} if result is not None else None
+            )
+            verified_refs = reused_artifact_evidence(
+                step, persisted_result, delivery.snapshots, lease_id=lease.id, completed_at=now,
+            )
+            step.evidence_refs = _merge_durable_evidence_refs(
+                [*(step.evidence_refs or []), *verified_refs], [],
+            )
+            lease.evidence_refs = _merge_durable_evidence_refs(
+                [*(lease.evidence_refs or []), *verified_refs], [],
+            )
+        elif isinstance(result, dict):
             from packages.core.plans.executor import _artifact_refs_from_result
             from packages.core.services.artifact_knowledge import (
                 project_artifact_refs_to_knowledge,
@@ -1328,6 +2628,7 @@ class Dispatcher:
                     task_id=task_id,
                     agent_id=step.resolved_agent_id,
                     tool_name="dispatcher.complete_lease",
+                    db=db,
                 )
                 if projection.failures:
                     lease.result = result
@@ -1349,6 +2650,12 @@ class Dispatcher:
                             "artifacts": projection.failures,
                         },
                         will_retry=False,
+                        runtime_checkpoint=runtime_checkpoint,
+                        expected_worker_id=expected_worker_id,
+                        expected_execution_claim_id=expected_execution_claim_id,
+                        require_execution_claim_id_if_present=(
+                            require_execution_claim_id_if_present
+                        ),
                     )
                 result = _attach_knowledge_artifacts_for_contract(
                     result,
@@ -1359,15 +2666,20 @@ class Dispatcher:
 
         # Lease side
         lease.status = WorkLeaseStatus.COMPLETED.value
+        lease.execution_claim_id = None
+        lease.execution_claimed_at = None
         lease.result = result
         if cost:
             lease.cost = cost
         if evidence_refs:
-            lease.evidence_refs = list(evidence_refs)
+            lease.evidence_refs = _merge_durable_evidence_refs(
+                lease.evidence_refs, evidence_refs
+            )
 
         # Step side — mirror the result so PlanExecutor can pick it
         # up without joining work_leases on every cycle.
         step.step_status = ExecutionStepStatus.DONE.value
+        step.runtime_checkpoint = None
         # Explicit PlanStep payload contracts are bare values: persist the
         # validated JSON value unchanged (including arrays, scalars, and
         # null). Schema-less and explicit StepResult-envelope rows retain the
@@ -1382,7 +2694,9 @@ class Dispatcher:
         if cost:
             step.cost = cost
         if evidence_refs:
-            step.evidence_refs = list(evidence_refs)
+            step.evidence_refs = _merge_durable_evidence_refs(
+                step.evidence_refs, evidence_refs
+            )
         step.error = None
         step.current_lease_id = None  # lease is terminal
 
@@ -1415,18 +2729,12 @@ class Dispatcher:
         # workspace.monthly_spent_usd lands atomically with the lease
         # state transition. The accumulator may emit a chat alert if
         # we just crossed 80% / 100% thresholds.
-        try:
-            from packages.core.budget import accumulate_step_cost
+        from packages.core.budget import accumulate_step_cost
 
-            await accumulate_step_cost(db, step, lease)
-        except Exception:
-            logger.warning(
-                "dispatcher: budget accumulation failed for step %s",
-                step.id,
-                exc_info=True,
-            )
+        await accumulate_step_cost(db, step, lease)
 
-        await _safe_chat_step_done(step, cost=cost)
+        locale = await _step_response_locale(db, step)
+        await _safe_chat_step_done(step, cost=cost, locale=locale, db=db)
         dur = _duration(step)
         step_label = step.step_key.replace("_", " ").title()
         result_preview = ""
@@ -1437,8 +2745,8 @@ class Dispatcher:
         elif isinstance(step.result, str) and step.result.strip():
             result_preview = step.result.strip()[:300]
         log_content = (
-            f"✓ **{step_label}** completed"
-            + (f" in {dur:.1f}s" if dur else "")
+            t("plan.step.completed", locale=locale, step=step_label)
+            + (t("plan.log.duration", locale=locale, seconds=f"{dur:.1f}") if dur else "")
             + (f"\n\n{result_preview}" if result_preview else "")
         )
         log_meta_extra = {"duration_s": dur, "cost": cost}
@@ -1454,6 +2762,7 @@ class Dispatcher:
             TaskLogType.STEP_COMPLETED,
             log_content,
             metadata=_step_log_meta(step, lease, **log_meta_extra),
+            db=db,
         )
         return lease
 
@@ -1464,16 +2773,58 @@ class Dispatcher:
         *,
         error: dict,
         will_retry: Optional[bool] = None,
+        evidence_refs: Optional[list[str | dict[str, Any]]] = None,
+        runtime_checkpoint: Optional[dict] = None,
+        expected_worker_id: str | None = None,
+        expected_execution_claim_id: str | None = None,
+        require_execution_claim_id_if_present: bool = False,
     ) -> WorkLease:
         """Worker reports failure. Step retries if attempts remain.
 
         ``will_retry`` overrides the auto-retry decision (used by the
         worker when it knows the failure is permanent — bad credentials,
         unsupported action, etc.).
+
+        ``evidence_refs`` is what the attempt actually did before failing. A
+        recorded ``tool_effect`` (an external action receipt) turns the
+        failure human-required: the action must not be repeated blindly.
+
+        ``runtime_checkpoint`` is the attempt's transcript. It is kept on the
+        step when the step goes back to PENDING (retry), or when an unresolved
+        effect needs reconciliation; an ordinary terminal failure clears it.
         """
-        lease = await self._get_active_lease(db, lease_id)
-        step = await self._get_step(db, lease.step_id)
+        lease, step = await self._lock_active_execution(
+            db,
+            lease_id,
+            expected_worker_id=expected_worker_id,
+            expected_execution_claim_id=expected_execution_claim_id,
+            require_execution_claim_id_if_present=(
+                require_execution_claim_id_if_present
+            ),
+        )
         now = datetime.now(timezone.utc)
+
+        if not self._lease_owns_step(lease, step):
+            if evidence_refs is not None:
+                lease.evidence_refs = _merge_durable_evidence_refs(
+                    lease.evidence_refs, evidence_refs
+                )
+            return await self._supersede_lease(
+                db, lease, step, surface="fail_lease", now=now,
+                reported_error=error,
+            )
+
+        persisted_evidence = copy.deepcopy(step.evidence_refs or [])
+        # Evidence lands BEFORE the captured-effect decision below reads it:
+        # a receipt reported with the failure must block the retry exactly
+        # like one reported earlier through complete_lease.
+        if evidence_refs is not None:
+            lease.evidence_refs = _merge_durable_evidence_refs(
+                lease.evidence_refs, evidence_refs
+            )
+            step.evidence_refs = _merge_durable_evidence_refs(
+                step.evidence_refs, evidence_refs
+            )
 
         from packages.core.governance.error_signatures import classify_execution_error
         from packages.core.services.retry_policy import (
@@ -1481,13 +2832,55 @@ class Dispatcher:
             apply_retry_policy_to_step,
             apply_transient_backoff,
             error_with_retry_policy,
-            human_prompt_for_exhausted_step,
             resolve_retry_policy_for_step,
         )
 
         retry_policy = await resolve_retry_policy_for_step(db, step)
         apply_retry_policy_to_step(step, retry_policy)
 
+        # The report is now fenced to this exact lease. Its usable transcript
+        # must be visible to replay-safety checks, but must not erase a durable
+        # pre-I/O frame merely because a generic failure transcript lost it.
+        step.runtime_checkpoint = _failure_checkpoint(step, runtime_checkpoint, persisted_evidence=persisted_evidence)
+        file_recovered, unresolved_files = await _recover_internal_file_effects(db, lease, step)
+        runtime_checkpoint = step.runtime_checkpoint
+        internal_recovery_failed = bool(unresolved_files)
+
+        captured_effect = await _has_ambiguous_external_effect(
+            db,
+            _merge_durable_evidence_refs(
+                step.evidence_refs,
+                lease.evidence_refs,
+            ),
+            owner_step=step,
+        )
+        file_effects = [ref for ref in step.evidence_refs or [] if _is_system_file_effect(ref)]
+        file_contract_failure = bool(file_effects) and error.get("type") in {
+            "MissingOutputContract", "OutputSchemaError", "WorkerProtocolError", "InternalFileContinuationInterrupted",
+        }
+        if internal_recovery_failed:
+            step.result = lease.result
+            error = _internal_file_recovery_error(error, unresolved_files, runtime_checkpoint=step.runtime_checkpoint)
+            will_retry = False
+        elif captured_effect:
+            step.result = lease.result
+            error = {**error, "failure": {
+                "reason": (
+                    "An external action receipt was recorded, but result validation failed. "
+                    "Reconcile the recorded outcome before repeating the action."
+                ),
+                "retryable": False, "requires_human": True, "blockers": [],
+            }}
+            will_retry = False
+        elif file_recovered or file_contract_failure:
+            # Continue the existing model frame after its proven observation;
+            # this neither creates a new Plan nor replenishes the attempt budget.
+            will_retry = step.attempt_count < step.max_attempts
+            if not will_retry:
+                internal_recovery_failed = True
+                error = _internal_file_recovery_error(
+                    error, file_effects, runtime_checkpoint=step.runtime_checkpoint, output_repair_exhausted=True,
+                )
         retry = will_retry if will_retry is not None else step.attempt_count < step.max_attempts
         stored_error, next_retry_at = error_with_retry_policy(
             error,
@@ -1496,10 +2889,19 @@ class Dispatcher:
             attempt_count=step.attempt_count,
         )
 
-        # ── Transient failure: back off, don't bill it, don't re-ask ──
-        # Nothing Manor asked for actually ran, so this attempt bought
-        # nothing and the operator's grant was never really spent.
-        _hint = classify_execution_error(error)
+        # Transient infrastructure failures refund the attempt budget and back
+        # off. A consumed approval remains terminal even if no effect was seen.
+        failure_control = error.get("failure")
+        has_submitted_retry_control = (
+            error.get("type") == "StepResultFailed"
+            and isinstance(failure_control, dict)
+            and isinstance(failure_control.get("retryable"), bool)
+        )
+        # A model's summary is not proof that no provider/tool work ran.
+        # Structured failure control keeps the normal attempt budget and must
+        # not mint an attempt refund by matching transient-error prose.
+        # Runtime/provider failures retain that budget-refund path.
+        _hint = None if has_submitted_retry_control or captured_effect or file_effects else classify_execution_error(error)
         transient_streak = (
             advance_transient_retry(step.last_execution_error, now=now)
             if _hint is not None and _hint.is_transient
@@ -1524,18 +2926,19 @@ class Dispatcher:
             retry = True
             # The attempt never executed — give the budget back.
             step.attempt_count = max(0, (step.attempt_count or 0) - 1)
-            from packages.core.governance.approvals import (
-                restore_consumed_grant_for_step,
-            )
 
-            await restore_consumed_grant_for_step(
-                db,
-                entity_id=step.entity_id,
-                step_id=step.id,
-                reason="transient_failure_retry",
-            )
-
-        lease.status = WorkLeaseStatus.FAILED.value
+        # Once the handler has returned into fail_lease, its provider call is
+        # no longer in flight. Keep an ambiguous external-effect lease at the
+        # explicit reconciliation boundary instead of labelling it FAILED;
+        # the latter made the recovery card's "not applied" choice
+        # impossible and discarded the only exact retry checkpoint.
+        lease.status = (
+            WorkLeaseStatus.NEEDS_HUMAN.value
+            if captured_effect and not internal_recovery_failed
+            else WorkLeaseStatus.FAILED.value
+        )
+        lease.execution_claim_id = None
+        lease.execution_claimed_at = None
         lease.error = stored_error
         lease.credential_leases = []
 
@@ -1549,17 +2952,22 @@ class Dispatcher:
             step.step_status = ExecutionStepStatus.PENDING.value  # back in the queue
             step.error = stored_error  # surface the most recent error
             step.current_lease_id = None
-        elif retry_policy.auto_human_on_exhausted:
-            step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
-            step.error = stored_error
-            step.human_input_prompt = human_prompt_for_exhausted_step(step, stored_error, retry_policy)
-            step.finished_at = None
-            step.current_lease_id = None
+            if isinstance(runtime_checkpoint, dict):
+                step.runtime_checkpoint = dict(runtime_checkpoint)
         else:
+            # Running out of attempts is an execution outcome, not a user
+            # question. Real input/approval and unknown-effect reconciliation
+            # have their own durable HITL paths above and in lease_needs_human.
             step.step_status = ExecutionStepStatus.FAILED.value
             step.error = stored_error
             step.finished_at = now
             step.current_lease_id = None
+            step.human_input_prompt = None
+            if captured_effect or internal_recovery_failed:
+                if isinstance(runtime_checkpoint, dict):
+                    step.runtime_checkpoint = dict(runtime_checkpoint)
+            else:
+                step.runtime_checkpoint = None
 
         db.add(
             WorkerActivityLog(
@@ -1572,22 +2980,28 @@ class Dispatcher:
                     "will_retry": retry,
                     "error_type": stored_error.get("type"),
                     # Present only on a backed-off transient retry — this is
-                    # the audit trail for both the refunded attempt and the
-                    # restored operator grant.
+                    # the audit trail for the refunded attempt budget.
                     "transient_retry": (
                         transient_streak.as_marker() if transient_streak else None
                     ),
                 },
             )
         )
-        await _safe_chat_step_failed(step, error=stored_error, will_retry=retry)
+        locale = await _step_response_locale(db, step)
+        await _safe_chat_step_failed(
+            step,
+            error=stored_error,
+            will_retry=retry,
+            locale=locale,
+            db=db,
+        )
         err_type = stored_error.get("type", "unknown")
         err_msg = stored_error.get("message", "")[:200]
         await _safe_task_log(
             step,
             "step_failed" if not retry else "step_retrying",
-            f"✗ Step '{step.step_key}' failed: {err_type}"
-            + (" — retrying" if retry else "")
+            t("plan.step.failed", locale=locale, step=step.step_key, error=err_type)
+            + (t("plan.step.retrying", locale=locale) if retry else "")
             + (f"\n{err_msg}" if err_msg else ""),
             metadata=_step_log_meta(
                 step,
@@ -1602,36 +3016,8 @@ class Dispatcher:
                     "auto_human_on_exhausted": retry_policy.auto_human_on_exhausted,
                 },
             ),
+            db=db,
         )
-        if not retry and retry_policy.auto_human_on_exhausted:
-            await _safe_chat_step_needs_human(step, prompt=step.human_input_prompt or "")
-            await _safe_task_log(
-                step,
-                "step_needs_human",
-                f"⏸ Step '{step.step_key}' needs human guidance after retry exhaustion.",
-                metadata=_step_log_meta(
-                    step,
-                    lease,
-                    error=stored_error,
-                    prompt=step.human_input_prompt,
-                    hitl={
-                        "kind": "human_input",
-                        "fields": [{"name": "response", "type": "textarea", "required": True}],
-                    },
-                ),
-            )
-            await _safe_task_event(
-                step,
-                "task.hitl_requested",
-                {
-                    "plan_id": step.plan_id,
-                    "step_ids": [step.id],
-                    "lease_id": lease.id,
-                    "worker_id": lease.worker_id,
-                    "prompt": step.human_input_prompt,
-                    "reason": "retry_policy_exhausted",
-                },
-            )
         # Quarantine workers that fail repeatedly — keeps a buggy
         # external worker from holding the queue hostage.
         worker = (await db.execute(select(Worker).where(Worker.id == lease.worker_id))).scalar_one_or_none()
@@ -1648,6 +3034,13 @@ class Dispatcher:
                 )
 
         await db.flush()
+        from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+        await stage_plan_cycle_wake(
+            db,
+            lease.plan_id,
+            reason="lease_failed",
+        )
         return lease
 
     async def extend_lease(
@@ -1657,6 +3050,9 @@ class Dispatcher:
         *,
         extra_seconds: Optional[float] = None,
         progress: Optional[float] = None,
+        expected_worker_id: str | None = None,
+        expected_execution_claim_id: str | None = None,
+        require_execution_claim_id_if_present: bool = False,
     ) -> WorkLease:
         """Worker is still alive — bump ``lease_until``.
 
@@ -1664,7 +3060,20 @@ class Dispatcher:
         Increments ``heartbeat_count`` so we can audit chatty workers.
         Caller commits.
         """
-        lease = await self._get_active_lease(db, lease_id)
+        lease, step = await self._lock_active_execution(
+            db,
+            lease_id,
+            expected_worker_id=expected_worker_id,
+            expected_execution_claim_id=expected_execution_claim_id,
+            require_execution_claim_id_if_present=(
+                require_execution_claim_id_if_present
+            ),
+        )
+        if not self._lease_owns_step(lease, step):
+            return await self._supersede_lease(
+                db, lease, step, surface="extend_lease",
+                now=datetime.now(timezone.utc),
+            )
         delta = timedelta(seconds=extra_seconds) if extra_seconds else self._lease_ttl
         lease.lease_until = datetime.now(timezone.utc) + delta
         lease.heartbeat_count = (lease.heartbeat_count or 0) + 1
@@ -1682,6 +3091,13 @@ class Dispatcher:
         *,
         prompt: str,
         pending_action: Optional[dict] = None,
+        evidence_refs: Optional[list[str | dict[str, Any]]] = None,
+        runtime_checkpoint: Optional[dict] = None,
+        expected_worker_id: str | None = None,
+        expected_execution_claim_id: str | None = None,
+        require_execution_claim_id_if_present: bool = False,
+        effect_not_applied_allowed: bool = True,
+        retain_execution_claim: bool = False,
     ) -> WorkLease:
         """Worker hit a CAPTCHA / approval / 2FA wall. Lease pauses;
         step → waiting_human; chat surfaces an interactive prompt.
@@ -1694,8 +3110,103 @@ class Dispatcher:
         ``prompt`` is still used for log lines + step.human_input_prompt
         so existing UIs that read that field continue to work.
         """
-        lease = await self._get_active_lease(db, lease_id)
-        step = await self._get_step(db, lease.step_id)
+        lease, step = await self._lock_active_execution(
+            db,
+            lease_id,
+            expected_worker_id=expected_worker_id,
+            expected_execution_claim_id=expected_execution_claim_id,
+            require_execution_claim_id_if_present=(
+                require_execution_claim_id_if_present
+            ),
+        )
+        if not self._lease_owns_step(lease, step):
+            return await self._supersede_lease(
+                db, lease, step, surface="lease_needs_human",
+                now=datetime.now(timezone.utc),
+            )
+        merged_step_evidence = _merge_durable_evidence_refs(
+            step.evidence_refs,
+            evidence_refs,
+        )
+        from packages.core.dispatcher.effect_safety import (
+            ambiguous_effect_reconciliation_snapshot,
+        )
+
+        selected_checkpoint = _failure_checkpoint(
+            SimpleNamespace(id=step.id, plan_id=step.plan_id, params=step.params, runtime_checkpoint=step.runtime_checkpoint, evidence_refs=merged_step_evidence),
+            runtime_checkpoint,
+            persisted_evidence=copy.deepcopy(step.evidence_refs or []),
+        )
+        rejected_checkpoint = isinstance(runtime_checkpoint, dict) and selected_checkpoint != runtime_checkpoint
+        effect_owner = SimpleNamespace(
+            id=step.id,
+            step_key=step.step_key,
+            plan_id=step.plan_id,
+            entity_id=step.entity_id,
+            workspace_id=step.workspace_id,
+            params=step.params,
+            step_status=step.step_status,
+            evidence_refs=merged_step_evidence,
+            runtime_checkpoint=None if rejected_checkpoint else selected_checkpoint,
+        )
+        runtime_checkpoint = selected_checkpoint
+        # A file recovery gap is owned by the system. Do not replace it with
+        # a card asking the customer to guess whether a filesystem write ran.
+        # Proven earlier writes leave the real approval/input path below intact.
+        markers = [ref for ref in merged_step_evidence if isinstance(ref, dict) and ref.get("kind") in (
+            "tool_effect_reconciliation", "tool_result_handoff",
+        )]
+        for effect in merged_step_evidence:
+            if _is_system_file_effect(effect) and await _has_ambiguous_external_effect(
+                db, [effect, *markers], owner_step=effect_owner,
+            ):
+                return await self.fail_lease(
+                    db, lease_id,
+                    error={"type": "InternalFileContinuationInterrupted", "message": prompt},
+                    evidence_refs=evidence_refs, runtime_checkpoint=runtime_checkpoint,
+                    expected_worker_id=expected_worker_id,
+                    expected_execution_claim_id=expected_execution_claim_id,
+                    require_execution_claim_id_if_present=require_execution_claim_id_if_present,
+                )
+        reconciliation = await ambiguous_effect_reconciliation_snapshot(
+            db,
+            [
+                effect_owner,
+            ],
+            plan_id=step.plan_id,
+        )
+        if reconciliation is not None:
+            reconciliation = {
+                **reconciliation,
+                "not_applied_allowed": effect_not_applied_allowed,
+            }
+            prompt = (
+                f"Reconcile step '{step.step_key}': an external action may already "
+                "have happened. Verify it with the provider before continuing."
+            )
+            pending_action = {
+                "kind": PendingActionKind.EFFECT_RECONCILIATION.value,
+                "hitl_type": "error",
+                "prompt": "External action outcome needs verification",
+                "options": (
+                    EffectReconciliationDecisionFactory.card_options(
+                        reconciliation
+                    )
+                ),
+                "payload": {
+                    "what_happened": (
+                        "The worker crossed an external-action boundary but the "
+                        "final result was not durably confirmed."
+                    ),
+                    "why": prompt,
+                    "action_to_take": (
+                        EffectReconciliationDecisionFactory.action_to_take(
+                            reconciliation
+                        )
+                    ),
+                    "reconciliation": reconciliation,
+                },
+            }
         plan_task_id = (await db.execute(
             select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id)
         )).scalar_one_or_none()
@@ -1720,6 +3231,31 @@ class Dispatcher:
         # No policy evaluation here: the human is being asked for information,
         # not permission — that decision belongs to resolve_approval.
         pending_kind = str((pending_action or {}).get("kind") or KIND_HUMAN_INPUT.value)
+        step_params = step.params if isinstance(step.params, dict) else {}
+        approval_context: dict[str, Any] = {"pending_kind": pending_kind}
+        if reconciliation is not None:
+            approval_context["effect_reconciliation"] = reconciliation
+        nested_approval = await _coordinator_nested_approval_binding(
+            db,
+            step=step,
+            lease=lease,
+            task_id=plan_task_id,
+            pending_action=pending_action,
+        )
+        if (
+            (
+                step_params.get(COORDINATOR_PARAM_KEY) is True
+                or step_params.get(COORDINATOR_TYPED_CHILD_PARAM_KEY) is True
+            )
+            and isinstance(pending_action, dict)
+            and str(pending_action.get("approval_token") or "").strip()
+            and nested_approval is None
+        ):
+            raise RuntimeError(
+                "Coordinator nested approval is not bound to its exact child continuation."
+            )
+        if nested_approval is not None:
+            approval_context[COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY] = nested_approval
         # Bound on every path: the notifier call below reads it outside the
         # branches that assign it.
         approval_request = None
@@ -1734,6 +3270,7 @@ class Dispatcher:
             from packages.core.constants.approvals import (
                 LEASE_KIND_HITL_TYPES,
                 ApprovalOriginKind,
+                ApprovalStatus,
                 HitlType,
             )
             from packages.core.governance.approvals import (
@@ -1741,6 +3278,7 @@ class Dispatcher:
                 ApprovalSubject,
                 mint_approval_request,
             )
+            from packages.core.models.hitl_request import HitlRequest
 
             approval_request = await mint_approval_request(
                 db,
@@ -1758,7 +3296,7 @@ class Dispatcher:
                     step_id=step.id,
                     plan_id=step.plan_id,
                     task_id=plan_task_id,
-                    context={"pending_kind": pending_kind},
+                    context=approval_context,
                 ),
                 reason=prompt,
                 matched_rule=f"lease.{pending_kind}",
@@ -1771,14 +3309,90 @@ class Dispatcher:
                 hitl_type=LEASE_KIND_HITL_TYPES.get(
                     pending_kind, HitlType.AUTHORIZE.value,
                 ),
+                payload=(
+                    dict((pending_action or {}).get("payload") or {})
+                    if reconciliation is not None
+                    else None
+                ),
             )
+            if reconciliation is not None:
+                # ``mint_approval_request`` intentionally reuses an open
+                # dedup row. Its effect snapshot is not immutable, though: a
+                # late provider receipt can replace the pending identity.
+                # Refresh the reused request before the notifier projects it.
+                request_context = dict(approval_request.context or {})
+                request_context["effect_reconciliation"] = dict(reconciliation)
+                approval_request.context = request_context
+                request_payload = dict(approval_request.payload or {})
+                request_payload["reconciliation"] = dict(reconciliation)
+                approval_request.payload = request_payload
+            if nested_approval is not None:
+                # ``mint_approval_request`` may roll the transaction back when
+                # it loses a dedup race.  Re-lock and revalidate the durable
+                # placeholder after minting instead of relying on the earlier
+                # identity-map snapshot or row lock surviving that rollback.
+                nested_request = (await db.execute(
+                    select(HitlRequest)
+                    .where(
+                        HitlRequest.id == nested_approval["request_id"],
+                        HitlRequest.entity_id == step.entity_id,
+                        HitlRequest.workspace_id == step.workspace_id,
+                        HitlRequest.status == ApprovalStatus.PENDING.value,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )).scalar_one_or_none()
+                nested_context = (
+                    dict(nested_request.context or {})
+                    if nested_request is not None
+                    else {}
+                )
+                if (
+                    nested_request is None
+                    or not _matches_coordinator_reverse_placeholder(
+                        nested_context.get(COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY),
+                        nested_approval,
+                    )
+                ):
+                    raise RuntimeError(
+                        "Coordinator nested approval changed before it was linked."
+                    )
+                nested_context[COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY] = {
+                    **nested_approval,
+                    "request_id": approval_request.id,
+                    "nested_request_id": nested_request.id,
+                }
+                nested_request.context = nested_context
 
+        # Apply worker evidence only after minting: mint can recover a dedup
+        # race with rollback, so writes made before it are not durable.
+        step.evidence_refs = _merge_durable_evidence_refs(
+            step.evidence_refs,
+            evidence_refs,
+        )
+        lease.evidence_refs = _merge_durable_evidence_refs(
+            lease.evidence_refs,
+            evidence_refs,
+        )
         lease.status = WorkLeaseStatus.NEEDS_HUMAN.value
+        # A worker-originated need-human report is a terminal reporting
+        # boundary, so its valid token can be released atomically.  Expiry is
+        # different: the server has not heard from the token holder and cannot
+        # infer that provider I/O stopped.  The expiry reconciliation caller
+        # therefore retains the claim until quiescence is proved explicitly.
+        if not retain_execution_claim:
+            lease.execution_claim_id = None
+            lease.execution_claimed_at = None
         lease.credential_leases = []  # release while waiting
 
         step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
         step.human_input_prompt = prompt
         step.current_lease_id = None
+        # A request_input pause keeps the subagent transcript so the answer
+        # resumes the loop; any other pause starts the step over on resume.
+        step.runtime_checkpoint = (
+            dict(runtime_checkpoint) if isinstance(runtime_checkpoint, dict) else None
+        )
 
         db.add(
             WorkerActivityLog(
@@ -1798,16 +3412,19 @@ class Dispatcher:
         # card — including the fallback card it builds itself when the caller
         # passed no pending_action (apps/api/routers/workers.py never does).
         # Injecting it into ``pending_action`` here would miss that branch.
+        locale = await _step_response_locale(db, step)
         await _safe_chat_step_needs_human(
             step,
+            locale=locale,
             prompt=prompt,
             pending_action=pending_action,
             approval_request_id=approval_request.id if approval_request else None,
+            db=db,
         )
         await _safe_task_log(
             step,
             "step_needs_human",
-            f"⏸ Step '{step.step_key}' waiting for human input: {prompt[:200]}",
+            t("plan.step.waiting", locale=locale, step=step.step_key, prompt=prompt[:200]),
             metadata=_step_log_meta(
                 step,
                 lease,
@@ -1817,6 +3434,7 @@ class Dispatcher:
                     "fields": [{"name": "response", "type": "textarea", "required": True}],
                 },
             ),
+            db=db,
         )
         await _safe_task_event(
             step,
@@ -1829,6 +3447,7 @@ class Dispatcher:
                 "prompt": prompt,
                 "task_status": "in_progress",
             },
+            db=db,
         )
         return lease
 
@@ -1843,50 +3462,154 @@ class Dispatcher:
     ) -> int:
         """Reclaim leases past lease_until. Caller commits.
 
-        Each expired lease bumps its step back to pending (if attempts
-        remain) or failed (if exhausted). Returns count expired.
+        Requeue within the attempt budget only when replay is proven safe.
+        Recover exact internal file observations or retain a system failure;
+        unresolved provider effects keep their reconciliation boundary.
+        Expiry alone never proves that an action can repeat. Returns count expired.
         """
         now = now or datetime.now(timezone.utc)
-        rows = list(
+        candidate_ids = list(
             (
                 await db.execute(
-                    select(WorkLease)
+                    select(WorkLease.id)
                     .where(
                         WorkLease.status == WorkLeaseStatus.ACTIVE,
                         WorkLease.lease_until < now,
                     )
-                    .with_for_update(skip_locked=True)
+                    .order_by(WorkLease.id.asc())
                 )
             )
             .scalars()
             .all()
         )
 
-        for lease in rows:
-            lease.status = WorkLeaseStatus.EXPIRED.value
+        expired_count = 0
+        expired_plan_ids: set[str] = set()
+        for lease_id in candidate_ids:
+            try:
+                lease, step = await self._lock_active_execution(db, lease_id)
+            except (DispatchError, LeaseNotActive):
+                continue
+            lease_until = lease.lease_until
+            if lease_until is None or lease_until >= now:
+                continue
+            expired_count += 1
             lease.credential_leases = []
             if plan_ids is not None and lease.plan_id:
                 plan_ids.add(lease.plan_id)
-
-            step = await self._get_step(db, lease.step_id)
-            if step is None:
-                continue
+            if lease.plan_id:
+                expired_plan_ids.add(lease.plan_id)
 
             from packages.core.services.retry_policy import (
                 apply_retry_policy_to_step,
                 error_with_retry_policy,
-                human_prompt_for_exhausted_step,
                 resolve_retry_policy_for_step,
             )
 
             retry_policy = await resolve_retry_policy_for_step(db, step)
             apply_retry_policy_to_step(step, retry_policy)
+            if not self._lease_owns_step(lease, step):
+                await self._supersede_lease(db, lease, step, surface="expire_leases", now=now)
+                continue
+            _, unresolved_files = await _recover_internal_file_effects(db, lease, step)
+            internal_recovery_failed = bool(unresolved_files)
+            expired_file_effects = [
+                ref for ref in _merge_durable_evidence_refs(step.evidence_refs, lease.evidence_refs)
+                if _is_system_file_effect(ref)
+            ]
+            if expired_file_effects and step.attempt_count >= step.max_attempts:
+                internal_recovery_failed = True
+            step_evidence = list(step.evidence_refs or [])
+            lease_evidence = list(lease.evidence_refs or [])
+            captured_effect = await _has_ambiguous_external_effect(
+                db,
+                (*step_evidence, *lease_evidence),
+                owner_step=step,
+            )
+            worker_kind = await db.scalar(
+                select(Worker.kind).where(Worker.id == lease.worker_id)
+            )
+            plan_execution_mode = await db.scalar(
+                select(ExecutionPlan.execution_mode).where(
+                    ExecutionPlan.id == lease.plan_id
+                )
+            )
+            unreported_external_attempt = bool(
+                not captured_effect
+                and lease.execution_claim_id
+                and worker_kind != "internal"
+                and step.kind == "action"
+                and plan_execution_mode == "live"
+            )
+            if unreported_external_attempt:
+                # The committed tokenized lease is the server's pre-handler
+                # intent. Expiry fences DB settlement, but it cannot prove the
+                # external process stopped provider I/O. Persist that exact
+                # ambiguity before entering the ordinary reconciliation path.
+                unknown_effect = _expired_external_action_attempt_evidence(
+                    lease,
+                    step,
+                )
+                step_evidence = _merge_durable_evidence_refs(
+                    step_evidence,
+                    [unknown_effect],
+                )
+                lease_evidence = _merge_durable_evidence_refs(
+                    lease_evidence,
+                    [unknown_effect],
+                )
+                captured_effect = True
+            if captured_effect:
+                # A per-round checkpoint can persist the receipt on the Step,
+                # while a worker report can persist it on the Lease.  Keep
+                # both sources and project their union onto both rows.  The
+                # reconciliation service proves quiescence from the exact
+                # failed/expired Lease, so leaving a Step-only intent detached
+                # from that Lease would strand NOT_APPLIED even after its
+                # execution claim is durably released.
+                for ref in lease_evidence:
+                    if ref not in step_evidence:
+                        step_evidence.append(ref)
+                step.evidence_refs = step_evidence
+                lease.evidence_refs = _merge_durable_evidence_refs(
+                    lease_evidence,
+                    step_evidence,
+                )
             expired_error, next_retry_at = error_with_retry_policy(
-                {"type": "lease_expired", "message": "lease expired before completion"},
+                {
+                    "type": "lease_expired",
+                    "message": "lease expired before completion",
+                    **(
+                        {
+                            "failure": {
+                                "reason": (
+                                    "The external action lease expired after dispatch, so its "
+                                    "provider outcome is not safely replayable. Reconcile the "
+                                    "recorded attempt before repeating the action."
+                                ),
+                                "retryable": False,
+                                "requires_human": True,
+                                "blockers": [],
+                            }
+                        }
+                        if captured_effect
+                        else {}
+                    ),
+                },
                 policy=retry_policy,
                 now=now,
                 attempt_count=step.attempt_count,
             )
+            if internal_recovery_failed:
+                expired_error = _internal_file_recovery_error(
+                    expired_error, unresolved_files or expired_file_effects,
+                    runtime_checkpoint=step.runtime_checkpoint,
+                    output_repair_exhausted=not unresolved_files and not captured_effect,
+                )
+            if captured_effect:
+                expired_error.pop("next_retry_at", None)
+                next_retry_at = None
+                lease.error = expired_error
 
             # Same reasoning as fail_lease: a lease that expired without a
             # report IS a real execution failure (the worker died / never came
@@ -1894,20 +3617,61 @@ class Dispatcher:
             # gate — which would otherwise be the last thing the user hears.
             step.last_execution_error = expired_error
 
-            if step.attempt_count < step.max_attempts:
+            if internal_recovery_failed:
+                lease.status = WorkLeaseStatus.EXPIRED.value
+                step.step_status = ExecutionStepStatus.FAILED.value
+                step.error = expired_error
+                step.finished_at = now
+                step.current_lease_id = None
+                # A worker may still finish an in-flight filesystem boundary.
+                # Its expired lease cannot settle the Step or repeat the call;
+                # preserve the claim as evidence until that worker exits.
+            elif captured_effect:
+                reconciliation_prompt = (
+                    f"Reconcile step '{step.step_key}': it may have completed an external action before its "
+                    "worker lease expired. Review the recorded receipts with the provider. "
+                    "Only answer to retry after you have verified the action did not occur; "
+                    "otherwise decline/cancel so Manor cannot repeat it."
+                )
+                # Reuse the normal path-C request/card writer while this row is
+                # still ACTIVE. It atomically mints a closeable HitlRequest,
+                # posts the visible Workspace card, and parks the transcript.
+                # We then retain EXPIRED as the lease's terminal audit state.
+                await self.lease_needs_human(
+                    db,
+                    lease.id,
+                    prompt=reconciliation_prompt,
+                    runtime_checkpoint=(
+                        dict(step.runtime_checkpoint)
+                        if isinstance(step.runtime_checkpoint, dict)
+                        else None
+                    ),
+                    # Expiry fences the lease but cannot prove that a process
+                    # holding its execution claim has stopped provider I/O.
+                    # Keep retry off the card until quiescence is durable; do
+                    # not clear the claim here because a live holder may still
+                    # complete the external action.
+                    effect_not_applied_allowed=(
+                        lease.execution_claim_id is None
+                    ),
+                    retain_execution_claim=True,
+                )
+                lease.status = WorkLeaseStatus.EXPIRED.value
+                step.error = expired_error
+            elif step.attempt_count < step.max_attempts:
+                lease.status = WorkLeaseStatus.EXPIRED.value
                 step.step_status = ExecutionStepStatus.PENDING.value
                 step.error = expired_error
                 step.current_lease_id = None
-            elif retry_policy.auto_human_on_exhausted:
-                step.step_status = ExecutionStepStatus.WAITING_HUMAN.value
-                step.error = expired_error
-                step.human_input_prompt = human_prompt_for_exhausted_step(step, expired_error, retry_policy)
-                step.current_lease_id = None
             else:
+                # A worker timeout with no ambiguous effect is not a user
+                # request, regardless of the old retry-policy flag.
+                lease.status = WorkLeaseStatus.EXPIRED.value
                 step.step_status = ExecutionStepStatus.FAILED.value
                 step.error = {"type": "lease_expired", "message": "all attempts expired", **expired_error}
                 step.finished_at = now
                 step.current_lease_id = None
+                step.human_input_prompt = None
 
             db.add(
                 WorkerActivityLog(
@@ -1918,21 +3682,166 @@ class Dispatcher:
                         "step_key": step.step_key,
                         "attempts_remaining": step.max_attempts - step.attempt_count,
                         "next_retry_at": next_retry_at.isoformat() if next_retry_at else None,
+                        "captured_effect": captured_effect,
+                        "unreported_external_attempt": unreported_external_attempt,
                     },
                 )
             )
 
+        from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+        for expired_plan_id in sorted(expired_plan_ids):
+            await stage_plan_cycle_wake(
+                db,
+                expired_plan_id,
+                reason="lease_expired",
+            )
         await db.flush()
-        return len(rows)
+        return expired_count
+
+    # ── Revocation ───────────────────────────────────────────────────
+
+    async def revoke_active_leases(
+        self,
+        db: AsyncSession,
+        *,
+        plan_id: Optional[str] = None,
+        step_ids: Optional[list[str]] = None,
+        reason: str,
+    ) -> list[WorkLease]:
+        """Cancel every ACTIVE / NEEDS_HUMAN lease in scope. Caller commits.
+
+        Called by ``cancel_plan`` / ``cancel_step`` before the steps are
+        flipped, and by the plan deadline. The worker's heartbeat stops
+        extending a lease that is no longer active and cancels the body; a
+        late report on the revoked lease is refused by ``_get_active_lease``.
+        Steps are deliberately not touched here — the caller owns that.
+        """
+        if plan_id is None and not step_ids:
+            return []
+        conditions = [
+            WorkLease.status.in_(
+                (WorkLeaseStatus.ACTIVE.value, WorkLeaseStatus.NEEDS_HUMAN.value),
+            ),
+        ]
+        if plan_id is not None:
+            conditions.append(WorkLease.plan_id == plan_id)
+        if step_ids:
+            conditions.append(WorkLease.step_id.in_([str(item) for item in step_ids]))
+        leases = list(
+            (
+                await db.execute(
+                    select(WorkLease)
+                    .where(*conditions)
+                    .order_by(WorkLease.id.asc())
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for lease in leases:
+            lease.status = WorkLeaseStatus.CANCELLED.value
+            lease.error = {"type": LEASE_REVOKED_ERROR_TYPE, "message": reason}
+            lease.credential_leases = []
+            db.add(
+                WorkerActivityLog(
+                    worker_id=lease.worker_id,
+                    event="lease_revoke",
+                    lease_id=lease.id,
+                    payload_summary={
+                        "step_id": lease.step_id,
+                        "plan_id": lease.plan_id,
+                        "reason": reason,
+                    },
+                )
+            )
+        if leases:
+            logger.info(
+                "dispatcher: revoked %d lease(s) (plan=%s steps=%s): %s",
+                len(leases), plan_id, step_ids, reason,
+            )
+        await db.flush()
+        return leases
 
     # ── Internals ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _lease_owns_step(lease: WorkLease, step: ExecutionStep) -> bool:
+        """Whether ``lease`` is still the attempt the step is running.
+
+        A step reset by a retry surface (PENDING, ``current_lease_id`` None),
+        cancelled, or re-leased to a newer attempt no longer belongs to this
+        lease; a report through it must not overwrite the step.
+        """
+        return (
+            step.current_lease_id == lease.id
+            and step.step_status == ExecutionStepStatus.RUNNING.value
+        )
+
+    async def _supersede_lease(
+        self,
+        db: AsyncSession,
+        lease: WorkLease,
+        step: ExecutionStep,
+        *,
+        surface: str,
+        now: datetime,
+        reported_error: Optional[dict] = None,
+    ) -> WorkLease:
+        """Close a stale lease for audit and leave the step alone."""
+        message = (
+            f"lease {lease.id} no longer owns step {step.step_key} "
+            f"(step is {step.step_status!r}, current lease "
+            f"{step.current_lease_id!r}); {surface} ignored"
+        )
+        if lease.status == WorkLeaseStatus.ACTIVE.value:
+            lease.status = WorkLeaseStatus.CANCELLED.value
+        lease.execution_claim_id = None
+        lease.execution_claimed_at = None
+        superseded: dict[str, Any] = {
+            "type": LEASE_SUPERSEDED_ERROR_TYPE,
+            "message": message,
+            "surface": surface,
+        }
+        if reported_error is not None:
+            superseded["reported_error"] = reported_error
+        lease.error = superseded
+        lease.credential_leases = []
+        db.add(
+            WorkerActivityLog(
+                worker_id=lease.worker_id,
+                event="lease_superseded",
+                lease_id=lease.id,
+                payload_summary={
+                    "step_key": step.step_key,
+                    "step_status": step.step_status,
+                    "current_lease_id": step.current_lease_id,
+                    "surface": surface,
+                    "reported_error_type": (
+                        reported_error.get("type")
+                        if isinstance(reported_error, dict)
+                        else None
+                    ),
+                },
+            )
+        )
+        logger.info("dispatcher: %s", message)
+        await db.flush()
+        return lease
 
     async def _get_active_lease(
         self,
         db: AsyncSession,
         lease_id: str,
+        *,
+        for_update: bool = False,
     ) -> WorkLease:
-        lease = (await db.execute(select(WorkLease).where(WorkLease.id == lease_id))).scalar_one_or_none()
+        stmt = select(WorkLease).where(WorkLease.id == lease_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        lease = (await db.execute(stmt)).scalar_one_or_none()
         if lease is None:
             raise DispatchError(f"lease {lease_id} not found")
         if lease.status != WorkLeaseStatus.ACTIVE:
@@ -1943,14 +3852,143 @@ class Dispatcher:
         self,
         db: AsyncSession,
         step_id: str,
+        *,
+        for_update: bool = False,
     ) -> ExecutionStep:
-        step = (await db.execute(select(ExecutionStep).where(ExecutionStep.id == step_id))).scalar_one_or_none()
+        stmt = select(ExecutionStep).where(ExecutionStep.id == step_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        step = (await db.execute(stmt)).scalar_one_or_none()
         if step is None:
             raise DispatchError(f"step {step_id} not found")
         return step
 
+    async def _lock_active_execution(
+        self,
+        db: AsyncSession,
+        lease_id: str,
+        *,
+        expected_worker_id: str | None = None,
+        expected_execution_claim_id: str | None = None,
+        require_execution_claim_id_if_present: bool = False,
+        lock_workspace: bool = False,
+    ) -> tuple[WorkLease, ExecutionStep]:
+        """Lock and fence one terminal worker report.
+
+        Reports use Task -> Plan -> Lease -> Step. Completion additionally
+        requests the Workspace lock first because its cost roll-up later locks
+        Workspace then Worker; cancel/retry and monthly reset use that same
+        Workspace-first prefix. Non-cost report paths deliberately do not lock
+        Workspace: the expiry sweeper may process several workspaces in one
+        transaction and must not accumulate unordered lifecycle locks.
+        """
+
+        lease_snapshot = (await db.execute(
+            select(WorkLease).where(WorkLease.id == lease_id)
+        )).scalar_one_or_none()
+        if lease_snapshot is None:
+            raise DispatchError(f"lease {lease_id} not found")
+        plan_snapshot = (await db.execute(
+            select(ExecutionPlan).where(
+                ExecutionPlan.id == lease_snapshot.plan_id
+            )
+        )).scalar_one_or_none()
+        if plan_snapshot is None:
+            raise DispatchError(f"plan {lease_snapshot.plan_id} not found")
+        if lock_workspace and plan_snapshot.workspace_id:
+            from packages.core.models.workspace import Workspace
+
+            locked_workspace = (await db.execute(
+                select(Workspace)
+                .where(
+                    Workspace.id == plan_snapshot.workspace_id,
+                    Workspace.entity_id == plan_snapshot.entity_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if locked_workspace is None:
+                raise DispatchError(
+                    f"workspace {plan_snapshot.workspace_id} not found"
+                )
+        if plan_snapshot.task_id:
+            from packages.core.models.task import Task
+
+            locked_task = (await db.execute(
+                select(Task)
+                .where(Task.id == plan_snapshot.task_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if locked_task is not None and (
+                locked_task.entity_id != plan_snapshot.entity_id
+                or locked_task.workspace_id != plan_snapshot.workspace_id
+            ):
+                raise DispatchError(
+                    f"task {plan_snapshot.task_id} crosses the lease scope"
+                )
+        locked_plan = (await db.execute(
+            select(ExecutionPlan)
+            .where(ExecutionPlan.id == plan_snapshot.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if locked_plan is None:
+            raise DispatchError(f"plan {plan_snapshot.id} not found")
+        if (
+            locked_plan.entity_id != plan_snapshot.entity_id
+            or locked_plan.workspace_id != plan_snapshot.workspace_id
+            or locked_plan.task_id != plan_snapshot.task_id
+        ):
+            raise LeaseNotActive(
+                f"lease {lease_id} plan ownership changed while locking"
+            )
+        lease = await self._get_active_lease(db, lease_id, for_update=True)
+        if (
+            lease.plan_id != locked_plan.id
+            or lease.step_id != lease_snapshot.step_id
+            or lease.entity_id != locked_plan.entity_id
+            or lease.workspace_id != locked_plan.workspace_id
+        ):
+            raise LeaseNotActive(f"lease {lease_id} ownership changed")
+        expected_owner = str(expected_worker_id or "").strip()
+        if expected_owner and lease.worker_id != expected_owner:
+            raise LeaseNotActive(
+                f"lease {lease_id} is not owned by worker {expected_owner}"
+            )
+        expected_claim = str(expected_execution_claim_id or "").strip()
+        actual_claim = str(lease.execution_claim_id or "").strip()
+        if require_execution_claim_id_if_present and actual_claim and not expected_claim:
+            raise LeaseNotActive(
+                f"lease {lease_id} requires its current attempt token"
+            )
+        if expected_claim:
+            now = datetime.now(timezone.utc)
+            if (
+                not actual_claim
+                or actual_claim != expected_claim
+                or lease.lease_until is None
+                or lease.lease_until <= now
+            ):
+                raise LeaseNotActive(
+                    f"lease {lease_id} execution claim is stale or no longer active"
+                )
+        step = await self._get_step(db, lease.step_id, for_update=True)
+        if (
+            step.plan_id != locked_plan.id
+            or step.entity_id != locked_plan.entity_id
+            or step.workspace_id != locked_plan.workspace_id
+        ):
+            raise LeaseNotActive(f"lease {lease_id} step ownership changed")
+        return lease, step
+
 
 # ── Module helpers ────────────────────────────────────────────────────
+
+
+async def _step_response_locale(db: AsyncSession, step: ExecutionStep) -> str:
+    plan = await db.get(ExecutionPlan, step.plan_id)
+    return await resolve_plan_response_locale(db, plan) if plan is not None else "en"
 
 
 def _contains_step_ref(value: Any) -> bool:
@@ -1994,21 +4032,24 @@ async def _resolve_subscription_for_step(
     from packages.core.models.workspace import AgentSubscription
 
     if step.resolved_subscription_id:
-        conditions = [
-            AgentSubscription.id == step.resolved_subscription_id,
-            AgentSubscription.status == "active",
-        ]
-        if step.workspace_id:
-            conditions.append(AgentSubscription.workspace_id == step.workspace_id)
-        sub = (
+        # A materialized pin is an immutable execution identity, not a cache
+        # hint.  If any scoped field changed or the subscription was disabled,
+        # fail closed; silently falling back to another row can run the step as
+        # a different agent under load or during a Blueprint update.
+        return (
             await db.execute(
                 select(AgentSubscription)
-                .where(*conditions)
+                .where(
+                    AgentSubscription.id == step.resolved_subscription_id,
+                    AgentSubscription.status == "active",
+                    AgentSubscription.entity_id == step.entity_id,
+                    AgentSubscription.workspace_id == step.workspace_id,
+                    AgentSubscription.service_key == step.service_key,
+                    AgentSubscription.agent_id == step.resolved_agent_id,
+                )
                 .limit(1)
             )
         ).scalar_one_or_none()
-        if sub:
-            return sub
 
     if not step.service_key or not step.workspace_id:
         return None
@@ -2017,6 +4058,7 @@ async def _resolve_subscription_for_step(
         await db.execute(
             select(AgentSubscription)
             .where(
+                AgentSubscription.entity_id == step.entity_id,
                 AgentSubscription.workspace_id == step.workspace_id,
                 AgentSubscription.service_key == step.service_key,
                 AgentSubscription.status == "active",
@@ -2158,80 +4200,95 @@ async def _enrich_step_log_author_meta(db: AsyncSession, step: ExecutionStep, me
 
 
 # ── Task log + Chat notifications ────────────────────────────────────
-# These run AFTER db.flush() but inside the caller's transaction. Each
-# notifier opens its own session and commits independently, so a chat
-# write failure can't roll back the lease state. Best-effort by design.
+# These run after the execution rows are staged and share the caller's
+# transaction. A visible receipt/log must never commit ahead of (or disappear
+# behind) the lease transition it describes. Realtime fanout is queued for
+# after commit by workspace_chat.service and remains best-effort.
 
 
-async def _safe_task_log(step: ExecutionStep, log_type: str, content: str, metadata: dict | None = None) -> None:
-    """Write a TaskLog entry for plan step events. Best-effort."""
-    try:
-        from packages.core.database import async_session as _session
-        from packages.core.constants.agents import MANOR_AGENT_NAME
-        from packages.core.constants.task_actors import TaskActor
-        from packages.core.services.task_service import add_task_log
-        from packages.core.models.execution import ExecutionPlan
+async def _safe_task_log(
+    step: ExecutionStep,
+    log_type: str,
+    content: str,
+    metadata: dict | None = None,
+    *,
+    db: AsyncSession,
+) -> None:
+    """Stage one TaskLog atomically with its lease/step transition."""
 
-        async with _session() as db:
-            plan = (
-                await db.execute(select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id))
-            ).scalar_one_or_none()
-            if plan:
-                enriched_metadata = await _enrich_step_log_author_meta(db, step, metadata)
-                created_by = enriched_metadata.get("agent_name") or enriched_metadata.get("agent_id")
-                # A step with no resolvable agent ran under the master agent,
-                # not under "system" — the dispatcher is the scheduler, but
-                # something did the work.
-                actor = TaskActor.AGENT if created_by else TaskActor.MANOR
-                await add_task_log(
-                    db, plan, log_type, content,
-                    actor=actor,
-                    created_by=created_by or MANOR_AGENT_NAME,
-                    metadata=enriched_metadata,
-                )
-                await db.commit()
-    except Exception:
-        logger.warning("dispatcher: task log write failed for step %s", step.id, exc_info=True)
+    from packages.core.constants.agents import MANOR_AGENT_NAME
+    from packages.core.constants.task_actors import TaskActor
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.services.task_service import add_task_log
+
+    task_id = (
+        await db.execute(
+            select(ExecutionPlan.task_id).where(ExecutionPlan.id == step.plan_id)
+        )
+    ).scalar_one_or_none()
+    if not task_id:
+        return
+    enriched_metadata = await _enrich_step_log_author_meta(db, step, metadata)
+    created_by = enriched_metadata.get("agent_name") or enriched_metadata.get(
+        "agent_id"
+    )
+    # A step with no resolvable agent ran under the master agent, not under
+    # "system" — the dispatcher schedules it, but something did the work.
+    actor = TaskActor.AGENT if created_by else TaskActor.MANOR
+    await add_task_log(
+        db,
+        task_id,
+        log_type,
+        content,
+        actor=actor,
+        created_by=created_by or MANOR_AGENT_NAME,
+        metadata=enriched_metadata,
+    )
 
 
-async def _safe_task_event(step: ExecutionStep, event_type: str, payload: dict) -> None:
-    """Emit task domain events for step-level dispatcher transitions."""
-    try:
-        from packages.core.database import async_session as _session
-        from packages.core.models.execution import ExecutionPlan
-        from packages.core.services import event_emitter
+async def _safe_task_event(
+    step: ExecutionStep,
+    event_type: str,
+    payload: dict,
+    *,
+    db: AsyncSession,
+) -> None:
+    """Stage a durable task event with the dispatcher state transition."""
+    from packages.core.models.execution import ExecutionPlan
+    from packages.core.services import event_emitter
 
-        async with _session() as db:
-            plan = (
-                await db.execute(select(ExecutionPlan).where(ExecutionPlan.id == step.plan_id))
-            ).scalar_one_or_none()
-            if not plan or not plan.task_id:
-                return
-            event_payload = {
-                **payload,
-                "task_id": plan.task_id,
-                "plan_id": plan.id,
-            }
-            event_emitter.emit(
-                step.entity_id,
-                event_type,
-                source="dispatcher",
-                payload=event_payload,
-            )
-    except Exception:
-        logger.warning("dispatcher: task event emit failed for step %s", step.id, exc_info=True)
+    plan = (
+        await db.execute(select(ExecutionPlan).where(ExecutionPlan.id == step.plan_id))
+    ).scalar_one_or_none()
+    if not plan or not plan.task_id:
+        return
+    event_payload = {
+        **payload,
+        "task_id": plan.task_id,
+        "plan_id": plan.id,
+    }
+    await event_emitter.emit_in_session(
+        db,
+        step.entity_id,
+        event_type,
+        source="dispatcher",
+        payload=event_payload,
+        workspace_id=step.workspace_id,
+        deliver_after_commit=True,
+    )
 
 
 async def _safe_chat_step_done(
     step: ExecutionStep,
     *,
     cost: Optional[dict] = None,
+    locale: str = "en",
+    db: AsyncSession,
 ) -> None:
     if not step.workspace_id:
         return
     try:
         from packages.core.workspace_chat import notifiers as chat_notify
-        from packages.core.database import async_session as _session
 
         # Resolve agent name from subscription
         agent_name = None
@@ -2239,23 +4296,22 @@ async def _safe_chat_step_done(
             try:
                 from packages.core.models.workspace import AgentSubscription
 
-                async with _session() as _db:
-                    sub = (
-                        await _db.execute(
-                            select(AgentSubscription).where(
-                                AgentSubscription.id == step.resolved_subscription_id,
-                            )
+                sub = (
+                    await db.execute(
+                        select(AgentSubscription).where(
+                            AgentSubscription.id == step.resolved_subscription_id,
                         )
-                    ).scalar_one_or_none()
-                    if sub:
-                        agent_name = sub.name or sub.service_key
+                    )
+                ).scalar_one_or_none()
+                if sub:
+                    agent_name = sub.name or sub.service_key
             except Exception:
                 pass  # best-effort — don't block on agent lookup failure
 
         # Extract result summary from step
         result_summary = None
         if step.result:
-            result_summary = chat_notify.summarize_result_for_chat(step.result, max_chars=2000)
+            result_summary = chat_notify.summarize_result_for_chat(step.result, max_chars=2000, locale=locale)
 
         description = getattr(step, "description", None) or step.step_key.replace("_", " ").title()
         duration = _duration(step)
@@ -2275,9 +4331,12 @@ async def _safe_chat_step_done(
             agent_name=agent_name,
             result_summary=result_summary,
             result=step.result,
+            locale=locale,
+            db=db,
         )
     except Exception:
-        logger.warning("dispatcher: chat notify (done) failed", exc_info=True)
+        logger.exception("dispatcher: atomic chat notify (done) failed")
+        raise
 
 
 async def _safe_chat_step_failed(
@@ -2285,6 +4344,8 @@ async def _safe_chat_step_failed(
     *,
     error: dict,
     will_retry: bool,
+    locale: str = "en",
+    db: AsyncSession,
 ) -> None:
     if not step.workspace_id:
         return
@@ -2299,10 +4360,13 @@ async def _safe_chat_step_failed(
             step_key=step.step_key,
             error=error,
             will_retry=will_retry,
+            locale=locale,
             subscription_id=step.resolved_subscription_id,
+            db=db,
         )
     except Exception:
-        logger.warning("dispatcher: chat notify (failed) failed", exc_info=True)
+        logger.exception("dispatcher: atomic chat notify (failed) failed")
+        raise
 
 
 async def _safe_chat_step_needs_human(
@@ -2311,6 +4375,8 @@ async def _safe_chat_step_needs_human(
     prompt: str,
     pending_action: Optional[dict] = None,
     approval_request_id: Optional[str] = None,
+    locale: str = "en",
+    db: AsyncSession,
 ) -> None:
     if not step.workspace_id:
         return
@@ -2327,6 +4393,9 @@ async def _safe_chat_step_needs_human(
             subscription_id=step.resolved_subscription_id,
             pending_action=pending_action,
             approval_request_id=approval_request_id,
+            locale=locale,
+            db=db,
         )
     except Exception:
-        logger.warning("dispatcher: chat notify (needs_human) failed", exc_info=True)
+        logger.exception("dispatcher: atomic chat notify (needs_human) failed")
+        raise

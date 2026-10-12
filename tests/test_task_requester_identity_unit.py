@@ -3,11 +3,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from packages.core.constants.task import TaskLogType
 from packages.core.constants.task_actors import TASK_ACTOR_META_KEY, TaskActor
 from packages.core.models.task import Task, TaskLog
+from packages.core.models.user import User
 
 
 class _ScalarResult:
@@ -202,6 +204,10 @@ async def test_scheduled_task_keeps_user_owner_with_system_creation_receipt():
         async def flush(self):
             return None
 
+        async def scalar(self, statement):
+            assert statement.compare(select(User.locale).where(User.id == "user-1"))
+            return "zh"
+
     db = FakeDb()
     try:
         task = await create_task(
@@ -229,23 +235,10 @@ async def test_scheduled_task_keeps_user_owner_with_system_creation_receipt():
         assert isinstance(task, Task)
         assert task.creator_id == "user-1"
         assert task.owner_id == "user-1"
+        assert creation_log.content == "任务已创建：Scheduled task"
         assert creation_log.created_by == "system"
         assert creation_log.meta[TASK_ACTOR_META_KEY] == TaskActor.SYSTEM.value
         assert creation_log.meta["scheduled_job_id"] == "scheduler:daily"
         assert creation_log.meta["scheduled_run_id"] == "run-1"
     finally:
         db.sync_session.close()
-
-
-def test_scheduler_records_manual_task_provenance_link():
-    import inspect
-
-    from packages.core.tasks import scheduler_tasks
-
-    source = inspect.getsource(scheduler_tasks._dispatch_job)
-    assert "job.manor_task_id = task.id" in source
-    assert '"entity_id": job.entity_id' in source
-    assert '"workspace_id": job.workspace_id' in source
-    assert '"scheduled_run_id": run_id' in source
-    assert "creation_log_metadata=" in source
-    assert "creation_logged_by_system=True" in source

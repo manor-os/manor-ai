@@ -1,0 +1,43 @@
+{
+  "name": "workspace-app",
+  "display_name": "Workspace App",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Configure the Workspace App layout, main action, forms and internal links to Agent Chat, Workflow or Automation.",
+  "category": "workspace-operations",
+  "output_format": "guidance",
+  "tags": [
+    "workspace-operations",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "allowed_surfaces": [
+    "workspace_chat"
+  ],
+  "tools": [
+    "manor"
+  ],
+  "workspace_operations": {
+    "workspace_actions": [
+      "operation"
+    ],
+    "patch_ops": [
+      "app_view.update",
+      "workflow_binding.attach"
+    ],
+    "route_terms": [
+      "app",
+      "main action",
+      "run with",
+      "主功能",
+      "应用页",
+      "应用页面",
+      "布局",
+      "主页"
+    ]
+  },
+  "search": {
+    "terms": ["app builder", "home page", "landing form", "button", "interface", "layout", "shortcut", "ui"],
+    "examples": ["configure workspace app main button", "add form to workspace app", "link app action to workflow", "change workspace app layout"]
+  }
+}

@@ -1,4 +1,6 @@
 /** A setup link selects a catalog provider; it never starts authorization. */
+export const PLATFORM_OAUTH_CLIENTS_HREF = "/admin/integrations#oauth-clients";
+
 export function integrationSetupHref(provider: string): string {
   return `/integrations?provider=${encodeURIComponent(provider)}`;
 }

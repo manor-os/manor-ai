@@ -1,3 +1,7 @@
+import ApprovalSettingsPanel from "../components/approvals/ApprovalSettingsPanel";
+import ApprovalModeTrigger from "../components/approvals/ApprovalModeTrigger";
+import { approvalKeys } from "../lib/approvalQueries";
+import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import { useState, useCallback, useEffect, useMemo } from "react";
 import { Link, useLocation, useParams, useNavigate, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -20,13 +24,21 @@ import { useToastStore } from "../stores/toast";
 import type { AgentLearningCandidate, RuntimeEvidence, Workspace, WorkspaceStaff, WorkspaceActivity } from "../lib/types";
 import { canManageWorkspace, canWriteWorkspace } from "../lib/permissions";
 import { useAuthStore } from "../stores/auth";
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
+import { useDisplayPreferences } from "../stores/displayPreferences";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
 import { openAgentEditModal } from "../stores/agentEditModal";
 import { formatDate, relativeTime } from "../lib/format";
 import PageHeader from "../components/ui/PageHeader";
 import TabSwitcher from "../components/ui/TabSwitcher";
+import { FeatureDiscoveryBadge } from "../components/ui/FeatureDiscoveryHint";
+import useFeatureDiscovery from "../components/useFeatureDiscovery";
+import { FEATURE_DISCOVERIES } from "../lib/featureDiscovery";
 import StatusBadge from "../components/ui/StatusBadge";
 import Chip from "../components/ui/Chip";
+import Card from "../components/ui/Card";
+import { WorkspaceCollaborationManagement } from "./WorkspaceCollaboration";
+import ClientDeliveryDialog from "./clients/ClientDeliveryDialog";
 import GlassCard from "../components/ui/GlassCard";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import EmptyState from "../components/ui/EmptyState";
@@ -38,6 +50,7 @@ import Input from "../components/ui/Input";
 import Textarea from "../components/ui/Textarea";
 import Select from "../components/ui/Select";
 import Toggle from "../components/ui/Toggle";
+import Tooltip from "../components/ui/Tooltip";
 import UserAvatar from "../components/ui/UserAvatar";
 import AgentAvatar from "../components/ui/AgentAvatar";
 import WebchatPageEditor from "../components/webchat/WebchatPageEditor";
@@ -48,17 +61,26 @@ import {
   IconCopy,
   IconDocument,
   IconDownload,
+  IconHelp,
   IconInfo,
+  IconRefresh,
   IconShare,
 } from "../components/icons";
 import WorkspaceGoalGraph from "../components/ui/WorkspaceGoalGraph";
 import WorkspaceWorkflows from "../components/workflows/WorkspaceWorkflows";
 import WorkspaceStatsPanel from "../components/workspaces/WorkspaceStatsPanel";
+import WorkspaceAppViewSettings from "../components/workspaces/WorkspaceAppViewSettings";
+import WorkspaceConnectionNotice from "../components/workspaces/WorkspaceConnectionNotice";
+import InlineIntegrationLink from "../components/InlineIntegrationLink";
 import ScheduledJobs from "./ScheduledJobs";
 import ExportBlueprintModal from "../components/blueprints/ExportBlueprintModal";
 import BlueprintUpgradeDialog from "../components/blueprints/BlueprintUpgradeDialog";
+import BlueprintGuideDialog, { workspaceUsageGuide } from "../components/blueprints/BlueprintGuideDialog";
+import SimulationPromotionPanel from "../components/blueprints/SimulationPromotionPanel";
 import { SUPPORTED_LOCALES, t } from "../lib/i18n";
-import { inferRuntimeRuleFromText, runtimeCapabilitiesForActionPatterns, uniqueActionPatterns } from "../lib/runtimeRules";
+import {
+  isHardBlockRuleType,
+  softenHardBlockRule, buildRuntimeRuleFromText, runtimeRuleSelectorLabels, uniqueActionPatterns } from "../lib/runtimeRules";
 import { formatUserFacingLabel, formatUserFacingText } from "../lib/taskDisplay";
 import { goalIdentityDedupeKey } from "../lib/goalIdentity";
 import { formatGoalNumber, goalProgressPercent } from "../lib/goalNumbers";
@@ -153,6 +175,8 @@ type WorkspaceAgentSource = "hosted" | "https" | "custom";
 
 type WorkspaceAgentForm = {
   source: WorkspaceAgentSource;
+  service_mode: "new" | "existing";
+  service_name: string;
   service_key: string;
   agent_id: string;
   custom_prompt: string;
@@ -161,6 +185,7 @@ type WorkspaceAgentForm = {
   system_prompt: string;
   https_url: string;
   runtime_display_name: string;
+  worker_registration: { key: string; registration: WorkerRegisterResponse } | null;
 };
 
 type AgentConnectionResult =
@@ -169,6 +194,8 @@ type AgentConnectionResult =
 
 const DEFAULT_AGENT_FORM: WorkspaceAgentForm = {
   source: "hosted",
+  service_mode: "new",
+  service_name: "",
   service_key: "",
   agent_id: "",
   custom_prompt: "",
@@ -177,6 +204,7 @@ const DEFAULT_AGENT_FORM: WorkspaceAgentForm = {
   system_prompt: "",
   https_url: "",
   runtime_display_name: "",
+  worker_registration: null,
 };
 
 function filterWorkspaceAgentMappingOptions(agents: any[], workspaceId?: string): any[] {
@@ -224,8 +252,8 @@ const KPI_CARD: React.CSSProperties = {
   padding: "20px 24px",
 };
 
-type Tab = "overview" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "workflows" | "automations" | "learning" | "activity" | "settings";
-type PrimaryTab = "overview" | "configure" | "activity" | "settings";
+type Tab = "overview" | "app" | "staff" | "agents" | "capabilities" | "channels" | "documents" | "rules" | "goals" | "workflows" | "automations" | "learning" | "activity" | "settings" | "collaboration";
+type PrimaryTab = "overview" | "configure" | "activity" | "settings" | "collaboration";
 
 function blueprintSetupDestination(check: { todo_kind?: string; kind?: string }): Tab | "/integrations" {
   const kind = check.todo_kind || check.kind || "";
@@ -250,6 +278,7 @@ type EvaluationDimensionKey =
 function _isWorkspaceDetailTab(value: string | null): value is Tab {
   return Boolean(value && [
     "overview",
+    "app",
     "staff",
     "agents",
     "capabilities",
@@ -262,6 +291,7 @@ function _isWorkspaceDetailTab(value: string | null): value is Tab {
     "learning",
     "activity",
     "settings",
+    "collaboration",
   ].includes(value));
 }
 
@@ -273,6 +303,7 @@ function _normalizeWorkspaceDetailTab(value: string | null): Tab {
 }
 
 const SETUP_TABS: Tab[] = [
+  "app",
   "staff",
   "agents",
   "capabilities",
@@ -293,6 +324,7 @@ function _primaryTabFor(value: Tab): PrimaryTab {
   if (_isSetupTab(value)) return "configure";
   if (value === "activity") return "activity";
   if (value === "settings") return "settings";
+  if (value === "collaboration") return "collaboration";
   return "overview";
 }
 
@@ -323,28 +355,6 @@ function _humanize(key: string | null | undefined): string {
 /** Settings → Approval automation: the Strategist proposal kinds, in the
  *  order the M8 catalog lists them. Rows the server sends for an unknown
  *  kind are simply not grouped (the catalog is the source of truth). */
-const APPROVAL_MATRIX_GROUPS = [
-  "task",
-  "automation_change",
-  "workflow_change",
-  "goal_change",
-  "experiment",
-] as const;
-
-function approvalGroupLabel(kind: string): string {
-  const key = `page.workspace_detail.approval_group.${kind}`;
-  const label = t(key);
-  return label === key ? _humanize(kind) : label;
-}
-
-/** Localised row label, falling back to the server's English catalog label
- *  so a new action_key is never rendered as a raw i18n key. */
-function approvalActionLabel(row: { action_key: string; label: string }): string {
-  const key = `page.workspace_detail.approval_action.${row.action_key}`;
-  const label = t(key);
-  return label === key ? row.label : label;
-}
-
 function _friendlyCodeLabel(value: string | null | undefined): string {
   const raw = String(value || "").trim();
   if (!raw) return "";
@@ -434,6 +444,17 @@ function _formatCredits(value: number | null | undefined): string {
   });
 }
 
+function _CreditMetricValue({ value }: { value: number }) {
+  return (
+    <div className="workspace-credit-metric-value">
+      <span>{Math.max(0, Math.round(value)).toLocaleString()}</span>
+      <span className="workspace-credit-metric-unit">
+        {t("page.workspace_detail.credits_unit")}
+      </span>
+    </div>
+  );
+}
+
 function _isInternalChannel(ch: any): boolean {
   return ch?.channel_type === "internal_chat" || ch?.provider === "internal_chat";
 }
@@ -468,6 +489,17 @@ function _channelDisplayName(ch: any): string {
   if (raw && !_isTechnicalChannelName(raw)) return raw;
   if (ch?.channel_type === "webchat") return t("page.workspace_detail.public_web_chat_channel");
   return _channelKindLabel(ch);
+}
+
+function _channelIntegrationLabel(ch: any): string {
+  return _humanize(ch?.integration_provider || ch?.provider || ch?.channel_type)
+    || t("page.workspace_detail.integration");
+}
+
+function _channelAccountLabel(ch: any): string {
+  return String(ch?.account_label || "").trim()
+    || _channelDisplayName(ch)
+    || t("page.workspace_detail.account");
 }
 
 function _serviceLabel(svc: { name?: string; service_key?: string; key?: string } | null | undefined): string {
@@ -761,12 +793,6 @@ function _riskChipVariant(risk: string): "teal" | "orange" | "blue" | "green" | 
 }
 
 const DEFAULT_GOVERNANCE_POLICY: GovernancePolicy = {
-  never_allow_actions: [],
-  hitl_required_actions: [],
-  auto_approve_actions: [],
-  never_allow_capabilities: [],
-  hitl_required_capabilities: [],
-  auto_approve_capabilities: [],
   max_risk_level: "high",
   budget_caps_per_kind: {},
 };
@@ -785,35 +811,7 @@ function _uniqueStrings(values: string[]): string[] {
 }
 
 function _mergeGovernancePolicy(policy?: Partial<GovernancePolicy> | null): GovernancePolicy {
-  return {
-    ...DEFAULT_GOVERNANCE_POLICY,
-    ...(policy || {}),
-    never_allow_actions: _uniqueStrings(policy?.never_allow_actions || []),
-    hitl_required_actions: _uniqueStrings(policy?.hitl_required_actions || []),
-    auto_approve_actions: _uniqueStrings(policy?.auto_approve_actions || []),
-    never_allow_capabilities: _uniqueStrings(policy?.never_allow_capabilities || []),
-    hitl_required_capabilities: _uniqueStrings(policy?.hitl_required_capabilities || []),
-    auto_approve_capabilities: _uniqueStrings(policy?.auto_approve_capabilities || []),
-    max_risk_level: (policy?.max_risk_level || "high") as GovernancePolicy["max_risk_level"],
-    budget_caps_per_kind: policy?.budget_caps_per_kind || {},
-  };
-}
-
-function _inferGovernanceRule(text: string): {
-  field: "hitl_required_actions" | "never_allow_actions";
-  patterns: string[];
-  capabilityField: "hitl_required_capabilities" | "never_allow_capabilities";
-  capabilityPatterns: string[];
-  rule_type: string;
-} {
-  const inferred = inferRuntimeRuleFromText(text);
-  return {
-    field: inferred.field,
-    patterns: inferred.patterns,
-    capabilityField: inferred.capabilityField,
-    capabilityPatterns: inferred.capabilityPatterns,
-    rule_type: inferred.rule_type,
-  };
+  return { max_risk_level: policy?.max_risk_level || DEFAULT_GOVERNANCE_POLICY.max_risk_level, budget_caps_per_kind: policy?.budget_caps_per_kind || {} };
 }
 
 function _ruleCopy() {
@@ -841,6 +839,8 @@ function _ruleCopy() {
     noPatterns: t("page.workspace_detail.rule_copy.no_patterns"),
     enforcedAs: t("page.workspace_detail.rule_copy.enforced_as"),
     noEnforcement: t("page.workspace_detail.rule_copy.no_enforcement"),
+    hardBlockNote: t("page.workspace_detail.rule_copy.hard_block_note"),
+    softenToApproval: t("page.workspace_detail.rule_copy.soften_to_approval"),
     actionKeyHint: t("page.workspace_detail.rule_copy.action_key_hint"),
     patternNeedsApproval: t("page.workspace_detail.rule_copy.pattern_needs_approval"),
     patternNeedsApprovalDesc: t("page.workspace_detail.rule_copy.pattern_needs_approval_desc"),
@@ -986,10 +986,12 @@ const PRIMARY_TABS: { key: PrimaryTab; label: string }[] = [
   { key: "overview", label: t("page.agent_detail.overview") },
   { key: "configure", label: t("page.workspace_detail.configure") },
   { key: "activity", label: t("nav.activity") },
+  { key: "collaboration", label: t("page.collaboration.tab") },
   { key: "settings", label: t("nav.settings") },
 ];
 
 const SETUP_TAB_ITEMS: { key: Tab; label: string }[] = [
+  { key: "app", label: t("component.workspace_app_view.page_tab") },
   { key: "staff", label: t("page.workspace_detail.staff") },
   { key: "agents", label: t("nav.agents") },
   { key: "capabilities", label: t("page.workspace_detail.capabilities") },
@@ -1347,7 +1349,14 @@ export default function WorkspaceDetail() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedTab = searchParams.get("tab");
+  const simpleMode = useDisplayPreferences((state) => state.interfaceMode === "simple");
+  const simpleSetupTab = simpleMode && searchParams.get("setup") === "1"
+    && (requestedTab === "channels" || requestedTab === "capabilities")
+    ? requestedTab
+    : null;
+  const simpleSetupMode = simpleSetupTab !== null;
   const queryClient = useQueryClient();
+  const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const currentUser = useAuthStore((s) => s.user);
   const authToken = useAuthStore((s) => s.token);
@@ -1362,10 +1371,24 @@ export default function WorkspaceDetail() {
   });
   const [lastSetupTab, setLastSetupTab] = useState<Tab>(() => {
     const initialTab = _normalizeWorkspaceDetailTab(requestedTab);
-    return _isSetupTab(initialTab) && (initialTab !== "workflows" || flowsAvailable) ? initialTab : "agents";
+    return _isSetupTab(initialTab) && (initialTab !== "workflows" || flowsAvailable) ? initialTab : "app";
   });
-  const shouldShowWorkspaceWelcome = searchParams.get("created") === "1" || searchParams.get("welcome") === "1";
+  const shouldShowWorkspaceSetup = searchParams.get("setup") === "1";
+  const showBlueprintGuideOnArrival = searchParams.get("guide") === "1";
+  const shouldShowWorkspaceWelcome = (
+    searchParams.get("created") === "1" || searchParams.get("welcome") === "1"
+  ) && !shouldShowWorkspaceSetup && !showBlueprintGuideOnArrival;
   const [showWorkspaceWelcome, setShowWorkspaceWelcome] = useState(shouldShowWorkspaceWelcome);
+  const [guideOpen, setGuideOpen] = useState(false);
+  useEffect(() => setGuideOpen(false), [workspaceId]);
+
+  const appDiscovery = useFeatureDiscovery({
+    feature: FEATURE_DISCOVERIES.workspaceApp,
+    userId: currentUser?.id,
+    enabled: privateApiEnabled,
+    alreadyUsed: tab === "app",
+    autoShow: false,
+  });
 
   const setupTabItems = useMemo(
     () => SETUP_TAB_ITEMS.filter((item) => flowsAvailable || item.key !== "workflows"),
@@ -1396,7 +1419,7 @@ export default function WorkspaceDetail() {
     const nextTab = normalizedTab === "workflows" && !flowsAvailable ? "overview" : normalizedTab;
     setTab(nextTab);
     if (normalizedTab === "workflows" && !flowsAvailable) {
-      setLastSetupTab((current) => current === "workflows" ? "agents" : current);
+      setLastSetupTab((current) => current === "workflows" ? "app" : current);
     }
     if (_isSetupTab(nextTab)) setLastSetupTab(nextTab);
     if (requestedTab && requestedTab !== nextTab) {
@@ -1411,12 +1434,14 @@ export default function WorkspaceDetail() {
   }, [workspaceId, requestedTab, searchParams, setSearchParams, navigate, configLoaded, flowsAvailable]);
 
   useEffect(() => {
-    if (shouldShowWorkspaceWelcome) setShowWorkspaceWelcome(true);
+    setShowWorkspaceWelcome(shouldShowWorkspaceWelcome);
   }, [shouldShowWorkspaceWelcome]);
 
   useEffect(() => {
     const targetId = tab === "settings" && location.hash === "#workspace-approval-automation"
       ? "workspace-approval-automation"
+      : tab === "settings" && location.hash === "#workspace-cover-image"
+        ? "workspace-cover-image"
       : tab === "overview" && location.hash === "#workspace-stats"
         ? "workspace-stats"
         : "";
@@ -1446,6 +1471,23 @@ export default function WorkspaceDetail() {
   const dismissWorkspaceWelcome = useCallback(() => {
     setShowWorkspaceWelcome(false);
     const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("created");
+    nextParams.delete("welcome");
+    setSearchParams(nextParams, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  const dismissWorkspaceSetup = useCallback(() => {
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("created");
+    nextParams.delete("welcome");
+    nextParams.delete("setup");
+    setSearchParams(nextParams, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  const dismissBlueprintGuide = useCallback(() => {
+    setGuideOpen(false);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("guide");
     nextParams.delete("created");
     nextParams.delete("welcome");
     setSearchParams(nextParams, { replace: true });
@@ -1486,8 +1528,12 @@ export default function WorkspaceDetail() {
   const [showChannelModal, setShowChannelModal] = useState(false);
   const [editingChannel, setEditingChannel] = useState<any | null>(null);
   const [pageChannel, setPageChannel] = useState<any | null>(null);
+  const [residentPmsEnabled, setResidentPmsEnabled] = useState(false);
+  const [residentPmsAccountId, setResidentPmsAccountId] = useState("");
   const [channelForm, setChannelForm] = useState({
     mode: "existing",
+    channel_type: "",
+    integration_provider: "",
     channel_config_id: "",
     name: "",
     purpose: "",
@@ -1520,6 +1566,8 @@ export default function WorkspaceDetail() {
   const [confirmDeleteKnowledgeGroup, setConfirmDeleteKnowledgeGroup] = useState<{ groupId: string; name: string } | null>(null);
   // M12 Workspace Blueprint flow.
   const [exportOpen, setExportOpen] = useState(false);
+  const [deliveryOpen, setDeliveryOpen] = useState(false);
+  const [simulationPromotionOpen, setSimulationPromotionOpen] = useState(false);
   const [confirmDeleteWs, setConfirmDeleteWs] = useState(false);
 
   /* ---- queries ---- */
@@ -1530,12 +1578,29 @@ export default function WorkspaceDetail() {
     enabled: !!workspaceId,
   });
 
-  const { data: setupStatus } = useQuery({
+  const {
+    data: setupStatus,
+    isLoading: setupStatusLoading,
+    isError: setupStatusError,
+    refetch: refetchSetupStatus,
+  } = useQuery({
     queryKey: ["workspace-setup-status", workspaceId],
     queryFn: () => api.workspaces.setupStatus(workspaceId!),
-    enabled: !!workspaceId && tab === "overview",
+    enabled: !!workspaceId && (tab === "overview" || shouldShowWorkspaceSetup),
     staleTime: 10_000,
+    refetchInterval: (query) => {
+      const current = query.state.data;
+      return shouldShowWorkspaceSetup
+        && current != null
+        && !current.ready
+        && current.incomplete_checks.some((check) => Boolean(check.setup_job_id))
+        ? 2_000
+        : false;
+    },
   });
+  const hasAutomaticBlueprintSetup = Boolean(
+    setupStatus?.incomplete_checks.some((check) => check.setup_job_id),
+  );
 
   const { data: dashboardStats } = useQuery({
     queryKey: ["workspace-dashboard", workspaceId],
@@ -1562,8 +1627,22 @@ export default function WorkspaceDetail() {
     staleTime: 30_000,
   });
   const canManageWs = canManageWorkspace(currentUser, staffList || []);
+  let openSimulationReport = () => setSimulationPromotionOpen(true);
+  let openPromotion = () => setSimulationPromotionOpen(true);
   const canWriteWs = canWriteWorkspace(currentUser, staffList || []);
+  const canDeleteWs = workspace?.can_delete === true;
   const [showBlueprintUpgrade, setShowBlueprintUpgrade] = useState(false);
+
+  useEffect(() => {
+    if (canManageWs) return;
+    setShowChannelModal(false);
+    setEditingChannel(null);
+    setConfirmRemoveChannel(null);
+  }, [canManageWs]);
+
+  useEffect(() => {
+    if (!canDeleteWs) setConfirmDeleteWs(false);
+  }, [canDeleteWs]);
 
   // Pool of staff members in the entity that can be picked for assignment.
   // Only fetched when the assign modal is open to avoid a hot query on tab load.
@@ -1584,9 +1663,8 @@ export default function WorkspaceDetail() {
   // *name* (instead of bare ULID) on the agent mappings table and the
   // Overview "Services + Matched Agents" panel.
   const { data: entityAgents } = useQuery({
-    queryKey: ["entity-agents-for-mapping"],
-    queryFn: () => api.agents.list(),
-    enabled: !!workspaceId && (tab === "agents" || tab === "overview" || tab === "channels"),
+    ...agentListQueryOptions(catalogScope),
+    enabled: !!catalogScope && !!workspaceId && (tab === "agents" || tab === "overview" || tab === "channels"),
   });
 
   const { data: channels } = useQuery({
@@ -1621,10 +1699,39 @@ export default function WorkspaceDetail() {
     };
   }, [webchatResourcePages]);
 
-  const { data: availableChannels } = useQuery({
+  const {
+    data: availableChannels,
+    isLoading: availableChannelsLoading,
+    isError: availableChannelsFailed,
+    refetch: refetchAvailableChannels,
+  } = useQuery({
     queryKey: ["workspace-available-channels", workspaceId],
     queryFn: () => api.workspaces.availableChannels(workspaceId!),
-    enabled: !!workspaceId && showChannelModal,
+    enabled: !!workspaceId && canManageWs && tab === "channels",
+  });
+
+  const {
+    data: workspaceConnectionStatus,
+    isPending: workspaceConnectionStatusLoading,
+    isError: workspaceConnectionStatusFailed,
+  } = useQuery({
+    queryKey: [
+      "workspace-connection-status",
+      currentUser?.entity_id,
+      currentUser?.id,
+      workspaceId,
+    ],
+    queryFn: ({ signal }) => api.workspaces.connectionStatus(workspaceId!, signal),
+    enabled: !!currentUser && !!workspaceId && tab === "channels",
+    staleTime: 0,
+    refetchOnWindowFocus: "always",
+  });
+
+  const residentPmsAccounts = useQuery({
+    queryKey: ["workspace-resident-pms-accounts", workspaceId],
+    queryFn: () => api.workspaces.residentPmsAccounts(workspaceId!),
+    enabled: !!workspaceId && canManageWs && showChannelModal && channelForm.mode === "webchat",
+    staleTime: 0,
   });
 
   const { data: workspaceCapabilities } = useQuery({
@@ -1643,6 +1750,7 @@ export default function WorkspaceDetail() {
     queryKey: ["workspace-documents", workspaceId],
     queryFn: () => api.workspaces.documents(workspaceId!),
     enabled: !!workspaceId && tab === "documents",
+    staleTime: 30_000,
   });
 
   const { data: availableKnowledgeDocs } = useQuery({
@@ -1660,12 +1768,6 @@ export default function WorkspaceDetail() {
     queryKey: ["workspace-governance", workspaceId],
     queryFn: () => api.workspaces.governance.get(workspaceId!),
     enabled: !!workspaceId && tab === "rules",
-  });
-
-  const { data: approvalMatrix } = useQuery({
-    queryKey: ["workspace-approval-matrix", workspaceId],
-    queryFn: () => api.workspaces.governance.approvalMatrix(workspaceId!),
-    enabled: !!workspaceId && tab === "settings",
   });
 
   const { data: goals, isLoading: goalsLoading } = useQuery({
@@ -1737,6 +1839,18 @@ export default function WorkspaceDetail() {
     enabled: !!workspaceId && (tab === "overview" || tab === "settings"),
   });
 
+  const {
+    data: creditUsageSummary,
+    isLoading: creditUsageSummaryLoading,
+    isError: creditUsageSummaryFailed,
+    refetch: refetchCreditUsageSummary,
+  } = useQuery({
+    queryKey: ["workspace-credit-usage-summary", workspaceId],
+    queryFn: () => api.workspaces.creditUsageSummary(workspaceId!),
+    enabled: !!workspaceId && tab === "settings",
+    staleTime: 30_000,
+  });
+
   const { data: workspaceAutomationSummary } = useQuery({
     queryKey: ["workspace-scheduled-job-summary", workspaceId],
     queryFn: () => api.jobs.list({ workspace_id: workspaceId!, include_workflows: true, limit: 1 }),
@@ -1765,6 +1879,24 @@ export default function WorkspaceDetail() {
     (operatingModelRaw as any)?.operating_model ?? operatingModelRaw;
 
   /* ---- mutations ---- */
+
+  const reconcileBlueprintStartup = useMutation({
+    mutationFn: () => api.workspaces.reconcileBlueprintStartup(workspaceId!),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["workspace-setup-status", workspaceId] });
+      toast.success(t("page.workspace_detail.blueprint_setup_started"));
+    },
+    onError: (err: Error) => toast.error(
+      t("page.workspace_detail.blueprint_setup_start_failed"),
+      err.message,
+    ),
+  });
+
+  const openWorkspaceChatDuringSetup = useCallback(() => {
+    if (!workspaceId) return;
+    reconcileBlueprintStartup.mutate();
+    navigate(`/chat?workspace=${encodeURIComponent(workspaceId)}&setup=1${showBlueprintGuideOnArrival ? "&guide=1" : ""}`);
+  }, [navigate, reconcileBlueprintStartup, showBlueprintGuideOnArrival, workspaceId]);
 
   const heartbeatEnable = useMutation({
     mutationFn: () => api.workspaces.heartbeat.enable(workspaceId!),
@@ -1816,25 +1948,30 @@ export default function WorkspaceDetail() {
   const mapAgent = useMutation({
     mutationFn: async (data: WorkspaceAgentForm) => {
       const serviceKey = data.service_key.trim();
-      if (!serviceKey) throw new Error("Choose a workspace service first.");
+      if (!serviceKey) throw new Error("Choose or name a workspace service first.");
       if (data.source === "https" && !data.https_url.trim()) {
         throw new Error("Enter the HTTPS agent endpoint.");
       }
       const services = ((operatingModel?.services as any[]) || []);
-      const service = services.find((svc: any) => (svc.service_key || svc.key) === serviceKey) || {};
+      const newService = data.service_mode === "new"
+        ? { key: serviceKey, name: data.service_name.trim() }
+        : undefined;
+      if (newService && services.some((svc: any) => (svc.service_key || svc.key) === serviceKey)) {
+        throw new Error(t("page.workspace_detail.service_already_exists"));
+      }
+      const service = newService || services.find((svc: any) => (svc.service_key || svc.key) === serviceKey) || {};
       const serviceName = service.name || _humanize(serviceKey) || "Workspace Agent";
       const customPrompt = data.custom_prompt.trim() || undefined;
 
       const bindWorkerToMappedSubscription = async (workerId: string) => {
         const mappings = await api.workspaces.agents.list(workspaceId!);
         const mapped = (mappings || []).find((m: any) => m.service_key === serviceKey);
-        if (mapped?.id) {
-          await api.agents.bindSubscriptionWorker(mapped.id, {
-            worker_id: workerId,
-            priority: 50,
-            is_preferred: true,
-          });
-        }
+        if (!mapped?.id) throw new Error("The workspace agent mapping could not be found. Try connecting again.");
+        await api.agents.bindSubscriptionWorker(mapped.id, {
+          worker_id: workerId,
+          priority: 50,
+          is_preferred: true,
+        });
       };
 
       if (data.source === "hosted") {
@@ -1843,6 +1980,7 @@ export default function WorkspaceDetail() {
           service_key: serviceKey,
           agent_id: data.agent_id,
           custom_prompt: customPrompt,
+          new_service: newService,
         });
         return { source: data.source, connection: null as AgentConnectionResult };
       }
@@ -1860,7 +1998,7 @@ export default function WorkspaceDetail() {
           ? { source: "https", endpoint_url: data.https_url.trim() }
           : { source: "manor_hosted" };
 
-      const created = await api.agents.create({
+      const agentPayload = {
         name: agentName,
         description: data.description.trim() || `${serviceName} agent for ${ws.name}.`,
         system_prompt: systemPrompt,
@@ -1875,19 +2013,37 @@ export default function WorkspaceDetail() {
           runtime_connection: runtimeConnection,
           runtime_learning: { enabled: true },
         },
-      });
+      };
+      const created = data.agent_id
+        ? await api.agents.update(data.agent_id, agentPayload)
+        : await api.agents.create(agentPayload);
+      // A failed mapping retry reconnects the Agent already created here.
+      setAgentForm((current) => ({ ...current, agent_id: created.id }));
 
       await api.workspaces.agents.map(workspaceId!, {
         service_key: serviceKey,
         agent_id: created.id,
         custom_prompt: customPrompt,
+        new_service: newService,
       });
+      // The service and mapping have committed even if the connection below
+      // fails. Retrying must use that existing service, not create it again.
+      setAgentForm((current) => ({ ...current, service_mode: "existing" }));
+      queryClient.invalidateQueries({ queryKey: ["workspace-agents", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-operating-model", workspaceId] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
 
       if (data.source === "https") {
         const endpoint = data.https_url.trim();
-        const registration = await api.workers.register({
+        const displayName = data.runtime_display_name.trim() || `${created.name} HTTPS`;
+        const registrationKey = JSON.stringify([created.id, serviceKey, endpoint, created.name, displayName]);
+        const registration = data.worker_registration?.key === registrationKey
+          ? data.worker_registration.registration
+          : await api.workers.register({
           kind: "custom_http",
-          display_name: data.runtime_display_name.trim() || `${created.name} HTTPS`,
+          display_name: displayName,
           description: `Generic HTTPS agent endpoint for ${created.name}: ${endpoint}`,
           version: "https-1",
           trust_level: "standard",
@@ -1906,6 +2062,9 @@ export default function WorkspaceDetail() {
             service_key: serviceKey,
           },
         });
+        // Retain the registration and its one-time secret when only binding
+        // fails, so a retry does not create another Worker.
+        setAgentForm((current) => ({ ...current, worker_registration: { key: registrationKey, registration } }));
         await bindWorkerToMappedSubscription(registration.worker_id);
         return { source: data.source, connection: { type: "https", registration, agentName: created.name, endpoint } as AgentConnectionResult };
       }
@@ -1917,7 +2076,9 @@ export default function WorkspaceDetail() {
       queryClient.invalidateQueries({ queryKey: ["workspace-operating-model", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-activity", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-capabilities", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["entity-agents-for-mapping"] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
     },
     onSettled: (result) => {
       if (!result) return;
@@ -2004,7 +2165,9 @@ export default function WorkspaceDetail() {
     },
     onSuccess: ({ mapped, created, failed }) => {
       queryClient.invalidateQueries({ queryKey: ["workspace-agents", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["entity-agents-for-mapping"] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       const summary: string[] = [];
       if (mapped > 0) summary.push(`mapped ${mapped}`);
       if (created > 0) summary.push(`created ${created} new agent${created === 1 ? "" : "s"}`);
@@ -2024,6 +2187,9 @@ export default function WorkspaceDetail() {
       queryClient.invalidateQueries({ queryKey: ["workspace-operating-model", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-activity", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-capabilities", workspaceId] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       setConfirmUnmapAgent(null);
       toast.success(t("page.workspace_detail.agent_unmapped"));
     },
@@ -2048,6 +2214,9 @@ export default function WorkspaceDetail() {
         config: {
           language: channelForm.language || "en",
           ...(existing ? {} : { login_required: channelForm.login_required }),
+          ...(existing ? {} : { resident_pms: residentPmsEnabled
+            ? { enabled: true, integration_account_id: residentPmsAccountId }
+            : { enabled: false } }),
         },
       });
     },
@@ -2058,6 +2227,8 @@ export default function WorkspaceDetail() {
       setShowChannelModal(false);
       setChannelForm({
         mode: "existing",
+        channel_type: "",
+        integration_provider: "",
         channel_config_id: "",
         name: "",
         purpose: "",
@@ -2078,6 +2249,9 @@ export default function WorkspaceDetail() {
         (m: any) => m.service_key === channelForm.linked_service_key,
       );
       return api.workspaces.updateChannel(workspaceId!, editingChannel.channel_binding_id, {
+        channel_config_id: channelForm.mode === "existing"
+          ? channelForm.channel_config_id
+          : undefined,
         name: channelForm.name.trim() || undefined,
         purpose: channelForm.purpose.trim(),
         role: channelForm.role,
@@ -2087,6 +2261,9 @@ export default function WorkspaceDetail() {
         config: {
           login_required: channelForm.login_required,
           language: channelForm.language || "en",
+          ...(channelForm.mode === "webchat" ? { resident_pms: residentPmsEnabled
+            ? { enabled: true, integration_account_id: residentPmsAccountId }
+            : { enabled: false } } : {}),
         },
       });
     },
@@ -2095,6 +2272,7 @@ export default function WorkspaceDetail() {
       queryClient.invalidateQueries({ queryKey: ["workspace-available-channels", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-dashboard", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-activity", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-connection-status"] });
       setShowChannelModal(false);
       setEditingChannel(null);
       toast.success(t("page.workspace_detail.channel_updated"));
@@ -2140,6 +2318,8 @@ export default function WorkspaceDetail() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
       toast.success(t("page.workspace_detail.workspace_updated"));
     },
     onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_update_workspace"), err.message),
@@ -2195,6 +2375,9 @@ export default function WorkspaceDetail() {
     mutationFn: () => api.workspaces.delete(workspaceId!),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      invalidateCatalogQueries(queryClient, "agents", { queryKey: ["agents", "list"] });
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       toast.success(t("page.workspace_detail.workspace_deleted"));
       navigate("/workspaces");
     },
@@ -2285,6 +2468,10 @@ export default function WorkspaceDetail() {
     mutationFn: (model: Record<string, any>) => api.workspaces.updateOperatingModel(workspaceId!, model),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["workspace-operating-model", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-governance", workspaceId] });
+      if (currentUser?.entity_id) {
+        queryClient.invalidateQueries({ queryKey: approvalKeys.entity(currentUser.entity_id) });
+      }
       queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
       setShowSettingsEditor(false);
       toast.success(t("page.workspace_detail.operating_model_saved"));
@@ -2302,29 +2489,6 @@ export default function WorkspaceDetail() {
     onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_save_guardrails"), err.message),
   });
 
-  const revokeStandingGrant = useMutation({
-    mutationFn: ({ kind, value }: { kind: "action" | "capability"; value: string }) =>
-      api.workspaces.governance.revokeStandingGrant(workspaceId!, kind, value),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["workspace-standing-grants", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspace-approval-matrix", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspace-governance", workspaceId] });
-      toast.success(t("page.workspace_detail.standing_grant_revoked"));
-    },
-    onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_revoke_standing_grant"), err.message),
-  });
-
-  const setApprovalMatrixRow = useMutation({
-    mutationFn: ({ actionKey, autoApproved }: { actionKey: string; autoApproved: boolean }) =>
-      api.workspaces.governance.setApprovalMatrix(workspaceId!, actionKey, autoApproved),
-    onSuccess: (data) => {
-      queryClient.setQueryData(["workspace-approval-matrix", workspaceId], data);
-      queryClient.invalidateQueries({ queryKey: ["workspace-standing-grants", workspaceId] });
-      queryClient.invalidateQueries({ queryKey: ["workspace-governance", workspaceId] });
-    },
-    onError: (err: Error) => toast.error(t("page.workspace_detail.could_not_save_approval_automation"), err.message),
-  });
-
   const togglePause = useMutation({
     mutationFn: () => ws?.status === "active"
       ? api.workspaces.pause(workspaceId!)
@@ -2333,6 +2497,7 @@ export default function WorkspaceDetail() {
       queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-heartbeat", workspaceId] });
       queryClient.invalidateQueries({ queryKey: ["workspace-activity", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["agent-deployments"] });
       toast.success(ws?.status === "active" ? t("page.workspace_detail.workspace_paused") : t("page.workspace_detail.workspace_resumed"));
     },
     onError: (err: Error) => toast.error(t("page.dashboard.failed"), err.message),
@@ -2365,6 +2530,7 @@ export default function WorkspaceDetail() {
   }
 
   const ws = workspace;
+  const usageGuide = workspaceUsageGuide(ws);
 
   /* ---- helpers ---- */
 
@@ -2736,29 +2902,40 @@ export default function WorkspaceDetail() {
           </GlassCard>
         )}
 
-        {ws.blueprint_update?.status === "update_available" && (
+        {(ws.blueprint_update?.status === "update_available"
+          || ws.blueprint_update?.status === "reconfigure_required") && (
           <GlassCard hoverable={false}>
             <div style={{ display: "flex", gap: 12, alignItems: "flex-start" }}>
               <div style={{
                 width: 28, height: 28, borderRadius: 9, flexShrink: 0,
-                background: "#eaf1ef", color: "#3f6f68",
+                background: ws.blueprint_update.status === "reconfigure_required" ? "#fff5df" : "#eaf1ef",
+                color: ws.blueprint_update.status === "reconfigure_required" ? "#8a5d1f" : "#3f6f68",
                 display: "flex", alignItems: "center", justifyContent: "center",
               }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
-                     stroke="currentColor" strokeWidth={2.5}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 19V5M5 12l7-7 7 7" />
-                </svg>
+                {ws.blueprint_update.status === "reconfigure_required" ? (
+                  <IconInfo size={14} />
+                ) : (
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" strokeWidth={2.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 19V5M5 12l7-7 7 7" />
+                  </svg>
+                )}
               </div>
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 13, fontWeight: 800, color: "#292524", marginBottom: 4 }}>
-                  {t("page.workspaces.blueprint_update_title")}
+                  {ws.blueprint_update.status === "reconfigure_required"
+                    ? t("page.workspaces.blueprint_reconfigure_title")
+                    : t("page.workspaces.blueprint_update_title")}
                 </div>
                 <p style={{ fontSize: 12.5, color: "#57534e", lineHeight: 1.6, margin: 0 }}>
-                  {t("page.workspaces.blueprint_update_body")
-                    .replace("{slug}", ws.blueprint_update.blueprint_slug || "—")
-                    .replace("{date}", formatDate(ws.blueprint_update.installed_at || "") || "—")}
+                  {ws.blueprint_update.status === "reconfigure_required"
+                    ? t("page.workspaces.blueprint_reconfigure_body")
+                    : t("page.workspaces.blueprint_update_body")
+                      .replace("{slug}", ws.blueprint_update.blueprint_slug || "—")
+                      .replace("{date}", formatDate(ws.blueprint_update.installed_at || "") || "—")}
                 </p>
-                {(ws.blueprint_update.changed?.length ?? 0) > 0 && (
+                {ws.blueprint_update.status === "update_available"
+                  && (ws.blueprint_update.changed?.length ?? 0) > 0 && (
                   <p style={{ fontSize: 12.5, color: "#57534e", lineHeight: 1.6, margin: "6px 0 0" }}>
                     {t("page.workspaces.blueprint_update_changed").replace(
                       "{sections}",
@@ -2771,7 +2948,9 @@ export default function WorkspaceDetail() {
                 {canManageWs && (
                   <div style={{ marginTop: 10 }}>
                     <Button size="sm" onClick={() => setShowBlueprintUpgrade(true)}>
-                      {t("page.workspaces.blueprint_update_review")}
+                      {ws.blueprint_update.status === "reconfigure_required"
+                        ? t("page.workspaces.blueprint_reconfigure_review")
+                        : t("page.workspaces.blueprint_update_review")}
                     </Button>
                   </div>
                 )}
@@ -2986,99 +3165,6 @@ export default function WorkspaceDetail() {
           );
         })()}
 
-        {/* Missing integrations — flagged by the architect during creation */}
-        {(() => {
-          const flagged = (((ws.settings as any)?.flagged_integrations) || []) as any[];
-          if (!flagged || flagged.length === 0) return null;
-          return (
-            <GlassCard hoverable={false} className="workspace-overview-card workspace-overview-setup-card">
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <div className="workspace-overview-setup-title" style={{ ...SECTION_TITLE, color: "var(--text-default)" }}>
-                  {t("page.workspace_detail.needs_setup")} {flagged.length} {t("page.apps.integration")}{flagged.length === 1 ? "" : "s"}
-                </div>
-                <div style={{ display: "flex", gap: 6 }}>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    onClick={async () => {
-                      try {
-                        const result = await api.workspaces.resolveIntegrations(workspaceId!);
-                        if (result.resolved.length > 0) {
-                          toast.success(`${t("page.workspace_detail.connected")}: ${result.resolved.join(", ")}`);
-                          queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId] });
-                          queryClient.invalidateQueries({ queryKey: ["workspace-channels", workspaceId] });
-                        } else {
-                          toast.info(t("page.workspace_detail.no_new_integrations_found_set_them_up_first"));
-                        }
-                      } catch {
-                        toast.error(t("page.workspace_detail.failed_to_check_integrations"));
-                      }
-                    }}
-                  >
-                    {t("page.workspace_detail.check_again")}
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-                    {t("page.workspace_detail.open_integrations")}
-                  </Button>
-                </div>
-              </div>
-              <p className="workspace-overview-setup-copy" style={{ fontSize: 12, color: "var(--text-muted)", margin: "0 0 12px", lineHeight: 1.5 }}>
-                {t("page.workspace_detail.these_integrations_were_referenced_when_the_work")}
-              </p>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 240px), 1fr))", gap: 10 }}>
-                {flagged.map((f: any, i: number) => {
-                  const source = String(f.source || "");
-                  const providerKey = String(f.provider || "").toLowerCase();
-                  const legacyChannelProviders = new Set([
-                    "telegram", "slack", "discord", "whatsapp", "email", "wechat",
-                    "wechat_official", "wechat_personal", "twilio", "twilio_sms",
-                    "twilio_voice", "facebook", "webchat", "in_app", "inapp",
-                  ]);
-                  const isChannelSetup = source === "channel_setup" || (!source && legacyChannelProviders.has(providerKey));
-                  return (
-                    <div className="workspace-overview-setup-item" key={i} style={{
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      background: "var(--surface-muted)",
-                      border: "1px solid var(--border-subtle)",
-                    }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, justifyContent: "space-between" }}>
-                        <span className="workspace-overview-setup-item-title" style={{ fontSize: 13, fontWeight: 700, color: "var(--text-strong)" }}>
-                          {String(f.provider || "").replace(/[_\-]+/g, " ").replace(/\b\w/g, (c: string) => c.toUpperCase())}
-                        </span>
-                        <div style={{ display: "flex", gap: 4 }}>
-                          <Chip variant="slate" size="sm">
-                            {isChannelSetup ? t("page.workspace_detail.channel") : t("page.workspace_detail.capability")}
-                          </Chip>
-                          {f.setup_kind === "browser_extension" && (
-                            <Chip variant="slate" size="sm">
-                              {t("page.integrations.local_browser_setup_required")}
-                            </Chip>
-                          )}
-                          {f.required && <Chip variant="slate" size="sm">{t("page.login.required")}</Chip>}
-                        </div>
-                      </div>
-                      {f.purpose && (
-                        <div className="workspace-overview-setup-item-copy" style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.4 }}>
-                          {f.purpose}
-                        </div>
-                      )}
-                      {Array.isArray(f.linked_service_keys) && f.linked_service_keys.length > 0 && (
-                        <div className="workspace-overview-setup-chip-row" style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
-                          {f.linked_service_keys.map((sk: string) => (
-                            <Chip key={sk} variant="slate" size="sm">
-                              {_serviceLabelFromKey(sk, (operatingModel?.services as any[]) || [])}
-                            </Chip>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </GlassCard>
-          );
-        })()}
 
         {/* Goal progress — compact inline cards */}
         {(() => {
@@ -3728,10 +3814,12 @@ export default function WorkspaceDetail() {
       setAgentForm(DEFAULT_AGENT_FORM);
     };
     const submitAgentDisabled =
-      !agentForm.service_key ||
+      !operatingModel || !agentForm.service_key ||
+      (agentForm.service_mode === "new" && (!agentForm.service_name.trim() || serviceByKey.has(agentForm.service_key) || existingByKey.has(agentForm.service_key))) ||
       (agentForm.source === "hosted" && !agentForm.agent_id) ||
       (agentForm.source === "https" && !agentForm.https_url.trim()) ||
       mapAgent.isPending;
+    const replacingAgent = agentForm.service_mode === "existing" && existingByKey.has(agentForm.service_key);
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -3908,7 +3996,7 @@ export default function WorkspaceDetail() {
                   loading={mapAgent.isPending}
                   onClick={() => mapAgent.mutate(agentForm)}
                 >
-                  {mapAgent.isPending ? "Adding..." : "Add agent"}
+                  {mapAgent.isPending ? t("page.agents.saving") : replacingAgent ? t("page.workspace_detail.replace_service_agent") : "Add agent"}
                 </Button>
               </>
             )
@@ -3961,13 +4049,38 @@ export default function WorkspaceDetail() {
                   })}
                 </div>
 
-            <div>
-              <div style={{ fontSize: 12, fontWeight: 600, color: "#57534e", marginBottom: 6 }}>
+            <div className="flex flex-col gap-3">
+              <div style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}>
                 {t("page.workspace_detail.service")}
               </div>
               <Select
+                ariaLabel={t("page.workspace_detail.service_assignment")}
+                value={agentForm.service_mode}
+                onChange={(value) => setAgentForm({ ...agentForm, service_mode: value as "new" | "existing", service_key: "", service_name: "", agent_id: agentForm.source === "hosted" ? "" : agentForm.agent_id })}
+                options={[
+                  { value: "new", label: t("page.workspace_detail.new_service") },
+                  { value: "existing", label: t("page.workspace_detail.existing_service") },
+                ]}
+              />
+              {agentForm.service_mode === "new" ? (
+                <>
+                  <Input
+                    label={t("page.workspace_detail.new_service_name")}
+                    value={agentForm.service_name}
+                    onChange={(event) => {
+                      const name = event.target.value;
+                      setAgentForm({ ...agentForm, service_name: name, service_key: name.trim().toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "_").replace(/^_+|_+$/g, "") });
+                    }}
+                  />
+                  {(serviceByKey.has(agentForm.service_key) || existingByKey.has(agentForm.service_key)) && (
+                    <p role="alert" className="text-xs text-stone-500">{t("page.workspace_detail.service_already_exists")}</p>
+                  )}
+                </>
+              ) : (
+              <Select
+                ariaLabel={t("page.workspace_detail.existing_service")}
                 value={agentForm.service_key}
-                onChange={(v) => setAgentForm({ ...agentForm, service_key: v })}
+                onChange={(v) => setAgentForm({ ...agentForm, service_key: v, agent_id: agentForm.source === "hosted" ? "" : agentForm.agent_id })}
                 placeholder={
                   operatingModel
                     ? t("page.workspace_detail.select_a_service_from_the_operating_model")
@@ -3976,9 +4089,11 @@ export default function WorkspaceDetail() {
                 filterable
                 options={(((operatingModel as any)?.services as any[]) || []).map((svc: any) => ({
                   value: svc.service_key || svc.key || "",
-                  label: _serviceLabel(svc),
+                  label: `${_serviceLabel(svc)}${existingByKey.has(svc.service_key || svc.key) ? ` · ${t("page.workspace_detail.replace_service_agent")}` : ""}`,
                 }))}
               />
+              )}
+              {replacingAgent && <p role="status" className="text-xs text-stone-500">{t("page.workspace_detail.replace_service_agent_description")}</p>}
               {operatingModel && (((operatingModel as any).services as any[]) || []).length === 0 && (
                 <div style={{ fontSize: 12, color: "#a8a29e", marginTop: 6 }}>
                   {t("page.workspace_detail.no_services_defined_in_this_workspace_s_operatin")}
@@ -3992,11 +4107,14 @@ export default function WorkspaceDetail() {
                   Manor hosted agent
                 </div>
                 <Select
+                  ariaLabel="Manor hosted agent"
                   value={agentForm.agent_id}
                   onChange={(v) => setAgentForm({ ...agentForm, agent_id: v })}
                   placeholder={entityAgents ? t("page.workspace_detail.select_an_agent") : t("page.workspace_detail.loading_agents")}
                   filterable
-                  options={filterWorkspaceAgentMappingOptions(entityAgents || [], workspaceId).map((a: any) => ({
+                  options={filterWorkspaceAgentMappingOptions(entityAgents || [], workspaceId).filter((agent: any) => !items.some((mapping: any) => (
+                    mapping.agent_id === agent.id && (agentForm.service_mode === "new" || mapping.service_key !== agentForm.service_key)
+                  ))).map((a: any) => ({
                     value: a.id,
                     label: _agentLabel(a),
                   }))}
@@ -4336,7 +4454,8 @@ export default function WorkspaceDetail() {
   }
 
   function renderChannels() {
-    const items: any[] = channels || [];
+    const channelConfigs: any[] = channels || [];
+    const items = channelConfigs.filter((ch) => ch.channel_binding_id);
     const mappings = (agentMappings as any[]) || [];
     const availableItems: any[] = availableChannels || [];
     const agentById = new Map<string, any>();
@@ -4387,6 +4506,24 @@ export default function WorkspaceDetail() {
       const provider = String(flag.provider || "").toLowerCase();
       return provider && !plannedProviderTypes.has(provider) && !boundChannelTypes.has(provider) && !availableChannelTypes.has(provider);
     });
+    const toolIntegrationByProvider = new Map<string, any>();
+    for (const flag of extraIntegrationFlags) {
+      const provider = String(flag.provider || "").trim().toLowerCase();
+      if (provider) toolIntegrationByProvider.set(provider, { ...flag, provider, live: false });
+    }
+    for (const requirement of (workspaceConnectionStatus?.requirements || [])) {
+      if (requirement.kind !== "integration") continue;
+      const provider = String(requirement.provider || "").trim().toLowerCase();
+      if (!provider) continue;
+      const current = toolIntegrationByProvider.get(provider);
+      if (!current || (requirement.required && !requirement.ready)) {
+        toolIntegrationByProvider.set(provider, { ...current, ...requirement, provider, live: true });
+      }
+    }
+    const toolIntegrationEntries = Array.from(toolIntegrationByProvider.values());
+    const toolIntegrationIssueCount = toolIntegrationEntries.filter((entry) => (
+      entry.live && entry.required && !entry.ready
+    )).length;
     const serviceOptions = mappings
       .filter((m: any) => m.service_key)
       .map((m: any) => {
@@ -4395,22 +4532,58 @@ export default function WorkspaceDetail() {
         const label = agent ? `${serviceLabel} → ${_agentLabel(agent)}` : serviceLabel;
         return { value: m.service_key, label };
       });
+    const currentExternalChannel = editingChannel && editingChannel.channel_type !== "webchat"
+      ? editingChannel
+      : null;
+    const externalConnectionItems = availableItems
+      .filter((ch) => ch.channel_type !== "webchat" && ch.channel_type !== "internal_chat");
+    if (
+      currentExternalChannel
+      && !externalConnectionItems.some((ch) => ch.id === currentExternalChannel.id)
+    ) {
+      externalConnectionItems.unshift(currentExternalChannel);
+    }
+    const compatibleConnectionItems = externalConnectionItems.filter((ch) => (
+      !channelForm.channel_type || ch.channel_type === channelForm.channel_type
+    ));
+    const selectedConnection = compatibleConnectionItems.find(
+      (ch) => ch.id === channelForm.channel_config_id,
+    );
+    const selectedIntegrationProvider = String(
+      selectedConnection?.integration_provider
+      || channelForm.integration_provider
+      || "",
+    );
+    const integrationOptions = Array.from(new Set(
+      compatibleConnectionItems
+        .map((ch) => String(ch.integration_provider || ch.provider || ch.channel_type || ""))
+        .filter(Boolean),
+    )).map((provider) => ({ value: provider, label: _humanize(provider) }));
+    const accountItems = compatibleConnectionItems.filter((ch) => (
+      String(ch.integration_provider || ch.provider || ch.channel_type || "")
+      === selectedIntegrationProvider
+    ));
     const canAttachChannel =
       !attachChannel.isPending &&
       (channelForm.mode !== "existing" || !!channelForm.channel_config_id);
     const isEditingChannel = !!editingChannel;
     const canSaveChannel =
-      isEditingChannel
-        ? !updateChannel.isPending
-        : canAttachChannel;
+      canManageWs
+      && (channelForm.mode !== "webchat" || !residentPmsEnabled || (!residentPmsAccounts.isFetching && !residentPmsAccounts.isError && !!residentPmsAccounts.data?.accounts.some(account => account.id === residentPmsAccountId)))
+      && (channelForm.mode !== "existing" || !!channelForm.channel_config_id)
+      && (isEditingChannel ? !updateChannel.isPending : canAttachChannel);
     const closeChannelModal = () => {
       setShowChannelModal(false);
       setEditingChannel(null);
     };
     const openAddChannel = () => {
+      if (!canManageWs) return;
       setEditingChannel(null);
+      setResidentPmsEnabled(false); setResidentPmsAccountId("");
       setChannelForm({
         mode: "existing",
+        channel_type: "",
+        integration_provider: "",
         channel_config_id: "",
         name: "",
         purpose: "",
@@ -4422,11 +4595,16 @@ export default function WorkspaceDetail() {
       setShowChannelModal(true);
     };
     const openEditChannel = (ch: any) => {
+      if (!canManageWs) return;
       const cfg = ch.config || {};
+      setResidentPmsEnabled(cfg.resident_pms?.enabled === true);
+      setResidentPmsAccountId(cfg.resident_pms?.integration_account_id || "");
       const linkedServiceKey = cfg.linked_service_key || cfg.service_key || "";
       setEditingChannel(ch);
       setChannelForm({
         mode: ch.channel_type === "webchat" ? "webchat" : "existing",
+        channel_type: ch.channel_type || "",
+        integration_provider: ch.integration_provider || ch.provider || "",
         channel_config_id: ch.id || "",
         name: _channelDisplayName(ch),
         purpose: cfg.purpose || "",
@@ -4434,6 +4612,43 @@ export default function WorkspaceDetail() {
         role: cfg.role || "primary_external",
         login_required: Boolean(cfg.login_required),
         language: (cfg.language || "en").toLowerCase().split(/[-_]/)[0],
+      });
+      setShowChannelModal(true);
+    };
+    const openPlannedChannel = (entry: typeof plannedChannels[number]) => {
+      if (!canManageWs || entry.isInternal) return;
+      setResidentPmsEnabled(false); setResidentPmsAccountId("");
+      const boundChannel = items.find((ch) => (
+        ch.channel_binding_id
+        && String(ch.channel_type || ch.provider || "").toLowerCase() === entry.channelType
+      ));
+      if (boundChannel) {
+        openEditChannel(boundChannel);
+        return;
+      }
+      const candidates = availableItems.filter((ch) => (
+        String(ch.channel_type || ch.provider || "").toLowerCase() === entry.channelType
+      ));
+      const providerKeys = Array.from(new Set(candidates.map((ch) => (
+        String(ch.integration_provider || ch.provider || ch.channel_type || "")
+      )).filter(Boolean)));
+      const planChannel = entry.channel || {};
+      setEditingChannel(null);
+      setChannelForm({
+        mode: "existing",
+        channel_type: entry.channelType,
+        integration_provider: providerKeys.length === 1 ? providerKeys[0] : "",
+        channel_config_id: candidates.length === 1 ? candidates[0].id : "",
+        name: planChannel.name || "",
+        purpose: planChannel.purpose || entry.missingFlag?.purpose || "",
+        linked_service_key: planChannel.linked_service_key
+          || planChannel.service_key
+          || entry.missingFlag?.linked_service_keys?.[0]
+          || mappings[0]?.service_key
+          || "",
+        role: String(entry.role || "primary_external").toLowerCase().replace(/\s+/g, "_"),
+        login_required: Boolean(planChannel.login_required),
+        language: (planChannel.language || "en").toLowerCase().split(/[-_]/)[0],
       });
       setShowChannelModal(true);
     };
@@ -4447,116 +4662,202 @@ export default function WorkspaceDetail() {
               {t("page.workspace_detail.connect_inbound_surfaces_such_as_webchat_wechat")}
             </p>
           </div>
-          <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
-            <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-              {t("page.workspace_detail.manage_integrations")}
-            </Button>
+          {canManageWs && (
             <Button variant="primary" size="sm" onClick={openAddChannel}>
               {t("page.workspace_detail.add_channel")}
             </Button>
-          </div>
+          )}
         </div>
 
-        {(plannedChannels.length > 0 || extraIntegrationFlags.length > 0) && (
-          <GlassCard hoverable={false} style={{ padding: 18, borderRadius: 18 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+        <GlassCard hoverable={false} style={{ padding: "12px 14px", borderRadius: 12 }}>
+          <div className="workspace-integrations-toolbar">
+            <div className="workspace-integrations-toolbar__title" style={{ maxWidth: 520 }}>
               <div>
-                <div style={{ ...SECTION_TITLE, marginBottom: 6 }}>Designed channel plan</div>
-                <p style={{ margin: 0, color: "#78716c", fontSize: 12, lineHeight: 1.55, maxWidth: 760 }}>
-                  Workspace setup generated these surfaces. Ready items can receive or route work now; missing providers need to be connected in Integrations.
-                </p>
+                {t("page.workspace_detail.workspace_integrations")}
+                {!workspaceConnectionStatusLoading && !workspaceConnectionStatusFailed && toolIntegrationIssueCount > 0 && (
+                  <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>
+                    {` · ${t("page.workspace_detail.needs_setup_2")}`}
+                  </span>
+                )}
               </div>
-              {flaggedIntegrations.length > 0 && (
-                <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
-                  {t("page.workspace_detail.open_integrations")}
-                </Button>
-              )}
+              <p style={{ margin: "3px 0 0", color: "var(--text-muted)", fontSize: 11, lineHeight: 1.45, fontWeight: 500 }}>
+                {t("page.workspace_detail.workspace_integrations_description")}
+              </p>
             </div>
-
-            {plannedChannels.length > 0 && (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 260px), 1fr))", gap: 10 }}>
-                {plannedChannels.map((entry, idx) => {
-                  const planChannel = entry.channel || {};
-                  const planAsChannel = {
-                    channel_type: entry.channelType,
-                    provider: entry.channelType,
-                    name: planChannel.name,
-                  };
-                  const statusType = entry.isConnected ? "active" : "warning";
-                  const statusLabel = entry.isInternal
-                    ? "Built-in"
-                    : entry.isConnected
-                      ? t("page.workspace_detail.connected")
-                      : t("page.workspace_detail.needs_setup_2");
-                  const serviceKey = planChannel.linked_service_key || planChannel.service_key || entry.missingFlag?.linked_service_keys?.[0];
+            <div className="workspace-integrations-toolbar__links">
+              {workspaceConnectionStatusLoading ? (
+                <StatusBadge type="warning" dot>
+                  {t("page.workspace_detail.checking_integration_status")}
+                </StatusBadge>
+              ) : workspaceConnectionStatusFailed ? (
+                <StatusBadge type="warning" dot>
+                  {t("page.workspace_detail.integration_status_unavailable")}
+                </StatusBadge>
+              ) : toolIntegrationEntries.length > 0 ? (
+                toolIntegrationEntries.map((entry: any, idx: number) => {
+                  const needsSetup = entry.live && entry.required && !entry.ready;
+                  const statusLabel = entry.live
+                    ? entry.ready
+                      ? t("page.workspace_detail.ready_for_agents")
+                      : entry.required
+                        ? t("page.workspace_detail.needs_setup_2")
+                        : t("page.workspace_detail.optional")
+                    : t("page.workspace_detail.required_by_plan");
+                  const providerLabel = _humanize(entry.label || entry.provider);
                   return (
-                    <div
-                      key={`${entry.role}-${entry.channelType || idx}`}
-                      style={{
-                        border: "1px solid rgba(28,25,23,0.06)",
-                        background: "rgba(250,250,249,0.74)",
-                        borderRadius: 14,
-                        padding: "12px 14px",
-                        minWidth: 0,
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-                        <span style={{ fontSize: 13, fontWeight: 800, color: "#1c1917", flex: 1, minWidth: 0 }}>
-                          {_channelKindLabel(planAsChannel)}
-                        </span>
-                        <StatusBadge type={statusType} dot>{statusLabel}</StatusBadge>
+                    <div key={`${entry.provider || "integration"}-${idx}`} style={{ minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 5, flexWrap: "wrap" }}>
+                        {needsSetup && entry.setup_kind === "mcp_binding" ? (
+                          <Link to={`/workspaces/${workspaceId}?tab=capabilities`} style={{ fontSize: 11, fontWeight: 750 }}>
+                            {t("page.workspace_detail.finish_agent_binding", { integration: providerLabel })}
+                          </Link>
+                        ) : (
+                          <InlineIntegrationLink
+                            provider={entry.provider}
+                            label={needsSetup
+                              ? t("page.workspace_detail.set_up_integration", { integration: providerLabel })
+                              : providerLabel}
+                          />
+                        )}
+                        <StatusBadge type={needsSetup ? "warning" : "active"} dot>
+                          {statusLabel}
+                        </StatusBadge>
                       </div>
-                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
-                        <Chip variant="slate" size="sm">{entry.role}</Chip>
-                        {planChannel.login_required && <Chip variant="blue" size="sm">{t("page.workspace_detail.login_required")}</Chip>}
-                        {entry.missingFlag?.required && <Chip variant="red" size="sm">{t("page.login.required")}</Chip>}
-                      </div>
-                      {(planChannel.purpose || entry.missingFlag?.purpose) && (
-                        <p style={{ margin: 0, color: "#57534e", fontSize: 12, lineHeight: 1.45 }}>
-                          {planChannel.purpose || entry.missingFlag?.purpose}
-                        </p>
-                      )}
-                      {serviceKey && (
-                        <div style={{ marginTop: 8, fontSize: 11, color: "#a8a29e", fontWeight: 700 }}>
-                          Routes to {_serviceLabel(serviceByKey.get(serviceKey) || { service_key: serviceKey })}
+                      {needsSetup && entry.reason && (
+                        <div style={{ marginTop: 3, maxWidth: 360, color: "var(--text-muted)", fontSize: 10, lineHeight: 1.4 }}>
+                          {entry.reason}
                         </div>
                       )}
                     </div>
                   );
-                })}
-              </div>
-            )}
+                })
+              ) : (
+                <StatusBadge type="active" dot>
+                  {t("page.workspace_detail.no_integration_setup_required")}
+                </StatusBadge>
+              )}
+            </div>
+            <div className="workspace-integrations-toolbar__manage">
+              <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
+                {t("page.workspace_detail.add_or_manage_integrations")}
+              </Button>
+            </div>
+          </div>
+        </GlassCard>
 
-            {extraIntegrationFlags.length > 0 && (
-              <div style={{ marginTop: plannedChannels.length > 0 ? 12 : 0, display: "flex", flexDirection: "column", gap: 8 }}>
-                <div style={{ fontSize: 11, color: "#a8a29e", fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em" }}>
-                  Tool integrations needed by agents
-                </div>
-                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                  {extraIntegrationFlags.map((flag: any, idx: number) => (
-                    <span
-                      key={`${flag.provider || "integration"}-${idx}`}
-                      style={{
-                        display: "inline-flex",
-                        alignItems: "center",
-                        gap: 6,
-                        padding: "6px 9px",
-                        borderRadius: 999,
-                        background: "rgba(249,244,236,0.78)",
-                        border: "1px solid rgba(251,146,60,0.32)",
-                        color: "#7c4a2e",
-                        fontSize: 12,
-                        fontWeight: 800,
-                      }}
-                      title={flag.purpose || ""}
-                    >
-                      {_humanize(flag.provider)}
-                      <span style={{ color: "#9a5630" }}>{t("page.workspace_detail.needs_setup_2")}</span>
-                    </span>
-                  ))}
-                </div>
+        {plannedChannels.length > 0 && (
+          <GlassCard hoverable={false} style={{ padding: 18, borderRadius: 18 }}>
+            <div style={{ marginBottom: 12 }}>
+              <div style={{ ...SECTION_TITLE, marginBottom: 6 }}>
+                {t("page.workspace_detail.channel_plan")}
               </div>
-            )}
+              <p style={{ margin: 0, color: "#78716c", fontSize: 12, lineHeight: 1.55, maxWidth: 760 }}>
+                {t("page.workspace_detail.channel_plan_description")}
+              </p>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 280px), 1fr))", gap: 10 }}>
+              {plannedChannels.map((entry, idx) => {
+                const planChannel = entry.channel || {};
+                const planAsChannel = {
+                  channel_type: entry.channelType,
+                  provider: entry.channelType,
+                  name: planChannel.name,
+                };
+                const boundChannel = items.find((ch) => (
+                  ch.channel_binding_id
+                  && String(ch.channel_type || ch.provider || "").toLowerCase() === entry.channelType
+                ));
+                const compatibleAccounts = availableItems.filter((ch) => (
+                  String(ch.channel_type || ch.provider || "").toLowerCase() === entry.channelType
+                ));
+                const statusType = entry.isConnected ? "active" : "warning";
+                const statusLabel = entry.isInternal
+                  ? t("page.workspace_detail.built_in")
+                  : entry.isConnected
+                    ? t("page.workspace_detail.connected")
+                    : t("page.workspace_detail.needs_setup_2");
+                const serviceKey = planChannel.linked_service_key || planChannel.service_key || entry.missingFlag?.linked_service_keys?.[0];
+                const actionLabel = boundChannel
+                  ? t("page.workspace_detail.change_connection")
+                  : compatibleAccounts.length > 0
+                    ? t("page.workspace_detail.choose_connection")
+                    : t("page.workspace_detail.connect_account");
+                return (
+                  <div
+                    key={`${entry.role}-${entry.channelType || idx}`}
+                    style={{
+                      background: "var(--surface-muted)",
+                      borderRadius: 14,
+                      padding: "12px 14px",
+                      minWidth: 0,
+                      boxShadow: "var(--shadow-sm)",
+                    }}
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 800, color: "var(--text-strong)", flex: 1, minWidth: 0 }}>
+                        {_channelKindLabel(planAsChannel)}
+                      </span>
+                      <StatusBadge type={statusType} dot>{statusLabel}</StatusBadge>
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 8 }}>
+                      <Chip variant="slate" size="sm">{entry.role}</Chip>
+                      {planChannel.login_required && <Chip variant="blue" size="sm">{t("page.workspace_detail.login_required")}</Chip>}
+                      {entry.missingFlag?.required && <Chip variant="red" size="sm">{t("page.login.required")}</Chip>}
+                    </div>
+                    {(planChannel.purpose || entry.missingFlag?.purpose) && (
+                      <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.45 }}>
+                        {planChannel.purpose || entry.missingFlag?.purpose}
+                      </p>
+                    )}
+                    {!entry.isInternal && (
+                      <div style={{ marginTop: 10, padding: "8px 10px", borderRadius: 10, background: "var(--surface-panel)" }}>
+                        {boundChannel ? (
+                          <>
+                            <div style={LABEL}>{t("page.workspace_detail.connected_account")}</div>
+                            <div style={{ fontSize: 12, color: "var(--text-default)", fontWeight: 750, wordBreak: "break-word" }}>
+                              {_channelAccountLabel(boundChannel)}
+                            </div>
+                            <div style={{ marginTop: 2, fontSize: 10, color: "var(--text-faint)", fontWeight: 650 }}>
+                              {t("page.workspace_detail.via_integration", { integration: _channelIntegrationLabel(boundChannel) })}
+                            </div>
+                          </>
+                        ) : (
+                          <div style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                            {t("page.workspace_detail.no_channel_account_bound")}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    <div style={{ marginTop: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                      <span style={{ fontSize: 11, color: "var(--text-faint)", fontWeight: 700 }}>
+                        {serviceKey
+                          ? `${t("page.workspace_detail.routes_to")} ${_serviceLabel(serviceByKey.get(serviceKey) || { service_key: serviceKey })}`
+                          : ""}
+                      </span>
+                      {canManageWs && !entry.isInternal && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={availableChannelsLoading}
+                          onClick={() => {
+                            if (availableChannelsFailed) {
+                              void refetchAvailableChannels();
+                            } else if (boundChannel || compatibleAccounts.length > 0) {
+                              openPlannedChannel(entry);
+                            } else {
+                              navigate("/integrations");
+                            }
+                          }}
+                        >
+                          {availableChannelsFailed ? t("page.workspace_detail.retry") : actionLabel}
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </GlassCard>
         )}
 
@@ -4564,11 +4865,11 @@ export default function WorkspaceDetail() {
           <EmptyState
             title={t("page.workspace_detail.no_channels")}
             description={t("page.workspace_detail.attach_a_ready_integration_or_create_a_public_we")}
-            action={
+            action={canManageWs ? (
               <Button variant="primary" onClick={openAddChannel}>
                 {t("page.workspace_detail.add_channel")}
               </Button>
-            }
+            ) : undefined}
           />
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(min(100%, 360px), 1fr))", gap: 16, alignItems: "start" }}>
@@ -4649,6 +4950,22 @@ export default function WorkspaceDetail() {
                         {t("settings.language")}: {_channelLanguageLabel(channelLanguage)}
                       </span>
                     </div>
+                    {!isWebchat && !isInternal && (
+                      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 8 }}>
+                        <div style={{ minWidth: 0, padding: "8px 10px", borderRadius: 10, background: "var(--surface-muted)" }}>
+                          <div style={LABEL}>{t("page.workspace_detail.integration")}</div>
+                          <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, fontWeight: 700, color: "var(--text-default)" }}>
+                            {_channelIntegrationLabel(ch)}
+                          </div>
+                        </div>
+                        <div style={{ minWidth: 0, padding: "8px 10px", borderRadius: 10, background: "var(--surface-muted)" }}>
+                          <div style={LABEL}>{t("page.workspace_detail.account")}</div>
+                          <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 12, fontWeight: 700, color: "var(--text-default)" }} title={_channelAccountLabel(ch)}>
+                            {_channelAccountLabel(ch)}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Webchat: QR code + public link */}
@@ -4866,7 +5183,7 @@ export default function WorkspaceDetail() {
                     )}
                   </div>
 
-                  {ch.channel_binding_id && (
+                  {canManageWs && ch.channel_binding_id && (
                     <div style={{
                       marginTop: 12,
                       display: "flex",
@@ -4904,7 +5221,7 @@ export default function WorkspaceDetail() {
         )}
 
         <Modal
-          open={showChannelModal}
+          open={canManageWs && showChannelModal}
           onClose={closeChannelModal}
           title={isEditingChannel ? t("page.workspace_detail.edit_channel") : t("page.workspace_detail.add_channel")}
           maxWidth="560px"
@@ -4916,6 +5233,7 @@ export default function WorkspaceDetail() {
                 disabled={!canSaveChannel}
                 loading={isEditingChannel ? updateChannel.isPending : attachChannel.isPending}
                 onClick={() => {
+                  if (!canManageWs) return;
                   if (isEditingChannel) updateChannel.mutate();
                   else attachChannel.mutate();
                 }}
@@ -4932,7 +5250,13 @@ export default function WorkspaceDetail() {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 10 }}>
                 <button
                   type="button"
-                  onClick={() => setChannelForm({ ...channelForm, mode: "existing" })}
+                  onClick={() => setChannelForm({
+                    ...channelForm,
+                    mode: "existing",
+                    channel_type: "",
+                    integration_provider: "",
+                    channel_config_id: "",
+                  })}
                   style={{
                     textAlign: "left",
                     padding: "12px 14px",
@@ -4950,7 +5274,13 @@ export default function WorkspaceDetail() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setChannelForm({ ...channelForm, mode: "webchat" })}
+                  onClick={() => setChannelForm({
+                    ...channelForm,
+                    mode: "webchat",
+                    channel_type: "webchat",
+                    integration_provider: "",
+                    channel_config_id: "",
+                  })}
                   style={{
                     textAlign: "left",
                     padding: "12px 14px",
@@ -4969,47 +5299,87 @@ export default function WorkspaceDetail() {
               </div>
             )}
 
-            {isEditingChannel ? (
+            {channelForm.mode === "existing" ? (
               <>
-                <Input
-                  label={t("page.workspace_detail.channel_name")}
-                  value={channelForm.name}
-                  onChange={(e) => setChannelForm({ ...channelForm, name: e.target.value })}
-                  placeholder={t("page.workspace_detail.channel_2")}
-                />
-                {channelForm.mode === "webchat" && (
-                  <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#44403c" }}>
-                    <input
-                      type="checkbox"
-                      checked={channelForm.login_required}
-                      onChange={(e) => setChannelForm({ ...channelForm, login_required: e.target.checked })}
-                    />
-                    {t("page.workspace_detail.require_visitor_login_before_chat_starts")}
-                  </label>
+                {isEditingChannel && (
+                  <Input
+                    label={t("page.workspace_detail.channel_name")}
+                    value={channelForm.name}
+                    onChange={(e) => setChannelForm({ ...channelForm, name: e.target.value })}
+                    placeholder={t("page.workspace_detail.channel_2")}
+                  />
+                )}
+                <p style={{ margin: 0, color: "var(--text-muted)", fontSize: 12, lineHeight: 1.5 }}>
+                  {t("page.workspace_detail.connection_picker_description")}
+                </p>
+                {availableChannelsLoading ? (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 48, color: "var(--text-muted)", fontSize: 12 }}>
+                    <LoadingSpinner size={16} />
+                    {t("page.workspace_detail.loading_channel_accounts")}
+                  </div>
+                ) : availableChannelsFailed ? (
+                  <div style={{ padding: 12, borderRadius: 10, background: "var(--surface-muted)", color: "var(--text-muted)", fontSize: 12 }}>
+                    <div>{t("page.workspace_detail.failed_to_load_channel_accounts")}</div>
+                    <Button variant="outline" size="sm" style={{ marginTop: 8 }} onClick={() => void refetchAvailableChannels()}>
+                      {t("page.workspace_detail.retry")}
+                    </Button>
+                  </div>
+                ) : (
+                  <>
+                    <_Field label={t("page.workspace_detail.integration")}>
+                      <Select
+                        value={selectedIntegrationProvider}
+                        onChange={(value) => setChannelForm({
+                          ...channelForm,
+                          integration_provider: value,
+                          channel_config_id: "",
+                        })}
+                        placeholder={t("page.workspace_detail.select_integration")}
+                        filterable
+                        options={integrationOptions}
+                      />
+                    </_Field>
+                    <_Field label={t("page.workspace_detail.account")}>
+                      <Select
+                        value={channelForm.channel_config_id}
+                        onChange={(value) => {
+                          const selected = accountItems.find((ch) => ch.id === value);
+                          setChannelForm({
+                            ...channelForm,
+                            channel_config_id: value,
+                            channel_type: selected?.channel_type || channelForm.channel_type,
+                          });
+                        }}
+                        placeholder={selectedIntegrationProvider
+                          ? t("page.workspace_detail.select_account")
+                          : t("page.workspace_detail.select_integration_first")}
+                        filterable
+                        disabled={!selectedIntegrationProvider}
+                        options={accountItems.map((ch: any) => ({
+                          value: ch.id,
+                          label: `${_channelAccountLabel(ch)} · ${_channelKindLabel(ch)}${ch.attached ? ` · ${t("page.workspace_detail.already_attached")}` : ""}`,
+                        }))}
+                      />
+                    </_Field>
+                    {compatibleConnectionItems.length === 0 && (
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: 12, borderRadius: 10, background: "var(--surface-muted)" }}>
+                        <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
+                          {t("page.workspace_detail.no_compatible_channel_accounts")}
+                        </span>
+                        <Button variant="outline" size="sm" onClick={() => navigate("/integrations")}>
+                          {t("page.workspace_detail.connect_account")}
+                        </Button>
+                      </div>
+                    )}
+                  </>
                 )}
               </>
-            ) : channelForm.mode === "existing" ? (
-              <_Field label={t("page.workspace_detail.channel_integration")}>
-                <Select
-                  value={channelForm.channel_config_id}
-                  onChange={(v) => setChannelForm({ ...channelForm, channel_config_id: v })}
-                  placeholder={availableItems.length ? t("page.workspace_detail.select_a_ready_channel") : t("page.workspace_detail.no_ready_channel_integrations_found")}
-                  filterable
-                  options={availableItems.map((ch: any) => ({
-                    value: ch.id,
-                    label: `${_channelDisplayName(ch)} · ${_channelKindLabel(ch)}${ch.attached ? ` · ${t("page.workspace_detail.already_attached")}` : ""}`,
-                  }))}
-                />
-                {availableItems.length === 0 && (
-                  <div style={{ marginTop: 8, fontSize: 12, color: "#78716c" }}>
-                    {t("page.workspace_detail.connect_external_providers_in_integrations_first")}
-                  </div>
-                )}
-              </_Field>
             ) : (
               <>
                 <Input
-                  label={t("page.workspace_detail.webchat_name")}
+                  label={isEditingChannel
+                    ? t("page.workspace_detail.channel_name")
+                    : t("page.workspace_detail.webchat_name")}
                   value={channelForm.name}
                   onChange={(e) => setChannelForm({ ...channelForm, name: e.target.value })}
                   placeholder={t("page.workspace_detail.website_chat")}
@@ -5022,6 +5392,18 @@ export default function WorkspaceDetail() {
                   />
                   {t("page.workspace_detail.require_visitor_login_before_chat_starts")}
                 </label>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+                  <input type="checkbox" checked={residentPmsEnabled} onChange={event => setResidentPmsEnabled(event.target.checked)} />
+                  {t("webchat_resident.enable")}
+                </label>
+                {residentPmsEnabled && <>
+                  <p className="webchat-page-note">{t("webchat_resident.owner_hint")}</p>
+                  {residentPmsAccounts.isPending ? <p role="status">{t("webchat_resident.accounts_loading")}</p>
+                    : residentPmsAccounts.isError ? <><p role="alert">{t("webchat_resident.accounts_failed")}</p><Button variant="outline" size="sm" onClick={() => void residentPmsAccounts.refetch()}>{t("webchat_resident.retry")}</Button></>
+                    : <Select ariaLabel={t("webchat_resident.account")} value={residentPmsAccountId} placeholder={t("webchat_resident.select_account")}
+                        onChange={setResidentPmsAccountId} options={(residentPmsAccounts.data?.accounts || []).map(account => ({ value: account.id, label: account.display_name }))} />}
+                  {!residentPmsAccounts.isPending && !residentPmsAccounts.isError && !residentPmsAccounts.data?.accounts.length && <p>{t("webchat_resident.no_accounts")}</p>}
+                </>}
               </>
             )}
 
@@ -5431,11 +5813,6 @@ export default function WorkspaceDetail() {
                             {doc.name}
                           </span>
                           <span style={{ fontSize: 11, color: "#a8a29e", flexShrink: 0 }}>{doc.file_type || ""}</span>
-                          {doc.vector_status === "ready" || doc.vector_status === "indexed" ? (
-                            <StatusBadge type="success" dot>{t("page.workspace_detail.indexed")}</StatusBadge>
-                          ) : doc.vector_status === "pending" ? (
-                            <StatusBadge type="warning" dot>{t("page.workspace_detail.queued")}</StatusBadge>
-                          ) : null}
                         </Link>
                         {canManageWs && !group.is_workspace_file_bucket && !group.settings?.readonly && (
                           <Button
@@ -5577,138 +5954,38 @@ export default function WorkspaceDetail() {
     const operatingRules = ((operatingModel?.rules as any[]) || []).filter(Boolean);
     const copy = _ruleCopy();
     const commitPolicy = (next: GovernancePolicy, summary: string) => {
+      if (!canManageWs || updateGovernance.isPending) return;
       updateGovernance.mutate({ policy: next, summary });
     };
-    type GovernanceActionField = "hitl_required_actions" | "never_allow_actions" | "auto_approve_actions";
-    type GovernanceCapabilityField = "hitl_required_capabilities" | "never_allow_capabilities" | "auto_approve_capabilities";
-    const capabilityFieldFor = (field: GovernanceActionField): GovernanceCapabilityField => (
-      field === "never_allow_actions"
-        ? "never_allow_capabilities"
-        : field === "auto_approve_actions"
-          ? "auto_approve_capabilities"
-          : "hitl_required_capabilities"
-    );
-    const addPatterns = (
-      field: GovernanceActionField,
-      patterns: string[],
-      summary: string,
-      capabilityPatterns = runtimeCapabilitiesForActionPatterns(patterns),
-    ) => {
-      if (updateGovernance.isPending) return;
-      const capabilityField = capabilityFieldFor(field);
-      const next = {
-        ...policy,
-        [field]: _uniqueStrings([...(policy[field] || []), ...patterns]),
-        [capabilityField]: _uniqueStrings([...(policy[capabilityField] || []), ...capabilityPatterns]),
-      };
-      commitPolicy(next, summary);
-    };
-    const removePattern = (
-      field: GovernanceActionField | GovernanceCapabilityField,
-      pattern: string,
-    ) => {
-      const next = {
-        ...policy,
-        [field]: (policy[field] || []).filter((p) => p !== pattern),
-      };
-      commitPolicy(next, `Remove ${pattern} from ${field}`);
-    };
     const addNaturalRule = () => {
+      if (!canManageWs || updateOperatingModel.isPending) return;
       const text = rulePrompt.trim();
       if (!text) return;
-      const inferred = _inferGovernanceRule(text);
-      addPatterns(inferred.field, inferred.patterns, `Natural-language rule: ${text}`, inferred.capabilityPatterns);
-      const nextRules = [
-        ...operatingRules,
-        {
-          rule_key: `operator_${Date.now()}`,
-          rule_type: inferred.rule_type,
-          description: text,
-          severity: inferred.field === "never_allow_actions" ? "high" : "medium",
-          action_patterns: inferred.patterns,
-          capability_patterns: inferred.capabilityPatterns,
-          source: "operator",
-        },
-      ];
+      const nextRules = [...operatingRules, buildRuntimeRuleFromText(text)];
       updateOperatingModel.mutate({ ...(operatingModel || {}), rules: nextRules });
       setRulePrompt("");
     };
     const removeOperatingRule = (idx: number) => {
+      if (!canManageWs || updateOperatingModel.isPending) return;
       const nextRules = operatingRules.filter((_, i) => i !== idx);
       updateOperatingModel.mutate({ ...(operatingModel || {}), rules: nextRules });
     };
-
-    const PatternList = ({
-      title,
-      description,
-      field,
-      tone,
-    }: {
-      title: string;
-      description: string;
-      field: GovernanceActionField | GovernanceCapabilityField;
-      tone: "orange" | "red" | "green";
-    }) => {
-      const patterns = policy[field] || [];
-      const bg = tone === "red" ? "rgba(241,221,219,0.55)" : tone === "green" ? "rgba(228,239,232,0.55)" : "rgba(249,244,236,0.7)";
-      const border = tone === "red" ? "rgba(209,139,134,0.35)" : tone === "green" ? "rgba(84,161,118,0.3)" : "rgba(251,146,60,0.35)";
-      return (
-        <GlassCard hoverable={false}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 800, color: "#1c1917" }}>{title}</div>
-              <p style={{ fontSize: 12, color: "#78716c", margin: "4px 0 0", lineHeight: 1.5 }}>{description}</p>
-            </div>
-            <Chip variant={tone} size="sm">{patterns.length}</Chip>
-          </div>
-          {patterns.length === 0 ? (
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{copy.noPatterns}</p>
-          ) : (
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              {patterns.map((pattern) => (
-                <span key={pattern} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "6px 8px", borderRadius: 999, background: bg, border: `1px solid ${border}`, fontSize: 12, fontWeight: 700, color: "#44403c" }}>
-                  {_friendlyCodeLabel(pattern)}
-                  <button
-                    type="button"
-                    onClick={() => removePattern(field, pattern)}
-                    disabled={updateGovernance.isPending}
-                    style={{ border: "none", background: "transparent", color: "#78716c", cursor: "pointer", fontWeight: 900 }}
-                    title={copy.remove}
-                  >
-                    ×
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-        </GlassCard>
-      );
+    // draft_only / deny are hard blocks: the agent never acts, a person
+    // does it by hand. Offer the one-click switch to an approval gate so
+    // the owner is never stuck with a rule they did not mean to make final.
+    const softenOperatingRule = (idx: number) => {
+      if (!canManageWs || updateOperatingModel.isPending) return;
+      const rule = operatingRules[idx];
+      const next = softenHardBlockRule(rule);
+      const nextRules = operatingRules.map((item, i) => (i === idx ? next : item));
+      updateOperatingModel.mutate({ ...(operatingModel || {}), rules: nextRules });
     };
+
     const ruleDescription = (rule: any) => (
       rule.description || rule.summary || rule.title || _humanize(rule.rule_key)
     );
-    const ruleActionPatterns = (rule: any) => _uniqueStrings([
-      ...(Array.isArray(rule.action_patterns) ? rule.action_patterns : []),
-      ...(Array.isArray(rule.action_keys) ? rule.action_keys : []),
-      ...(Array.isArray(rule.capability_patterns) ? rule.capability_patterns : []),
-    ]);
+    const ruleActionPatterns = runtimeRuleSelectorLabels;
     const enforcementMeta = (pattern: string, rule?: any) => {
-      if ((policy.never_allow_actions || []).includes(pattern) || (policy.never_allow_capabilities || []).includes(pattern)) {
-        return {
-          label: copy.patternNeverAllow,
-          bg: "rgba(241,221,219,0.62)",
-          border: "rgba(209,139,134,0.4)",
-          color: "#883a35",
-        };
-      }
-      if ((policy.auto_approve_actions || []).includes(pattern) || (policy.auto_approve_capabilities || []).includes(pattern)) {
-        return {
-          label: copy.patternAutoApprove,
-          bg: "rgba(228,239,232,0.62)",
-          border: "rgba(84,161,118,0.35)",
-          color: "#3a6047",
-        };
-      }
       const enforcement = String(rule?.enforcement || rule?.rule_type || "").toLowerCase();
       if (enforcement === "blocked" || enforcement === "deny" || enforcement === "never_allow") {
         return {
@@ -5774,7 +6051,7 @@ export default function WorkspaceDetail() {
             className="manor-input"
             value={policy.max_risk_level}
             onChange={(e) => commitPolicy({ ...policy, max_risk_level: e.target.value as GovernancePolicy["max_risk_level"] }, t("page.workspace_detail.change_max_risk_level"))}
-            disabled={updateGovernance.isPending}
+            disabled={!canManageWs || updateGovernance.isPending}
           >
             {copy.riskOptions.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
@@ -5782,67 +6059,7 @@ export default function WorkspaceDetail() {
           </select>
         </div>
 
-        <div style={{ marginBottom: 12 }}>
-          <div style={SECTION_TITLE}>{copy.quickTemplates}</div>
-          <p style={{ fontSize: 12, color: "#a8a29e", margin: "-8px 0 10px" }}>{copy.quickTemplatesHint}</p>
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            <Button variant="outline" size="sm" disabled={updateGovernance.isPending} onClick={() => addPatterns("hitl_required_actions", ["social_post.publish"], t("page.workspace_detail.rule_copy.summary_require_social_posts"))}>
-              {copy.templates.social}
-            </Button>
-            <Button variant="outline" size="sm" disabled={updateGovernance.isPending} onClick={() => addPatterns("hitl_required_actions", ["email.send"], t("page.workspace_detail.rule_copy.summary_require_email_send"))}>
-              {copy.templates.email}
-            </Button>
-            <Button variant="outline" size="sm" disabled={updateGovernance.isPending} onClick={() => addPatterns("hitl_required_actions", ["external_message.send"], t("page.workspace_detail.rule_copy.summary_require_external_messages"))}>
-              {copy.templates.message}
-            </Button>
-            <Button variant="outline" size="sm" disabled={updateGovernance.isPending} onClick={() => addPatterns("never_allow_actions", ["social_post.delete", "email.delete"], t("page.workspace_detail.rule_copy.summary_block_external_deletes"))}>
-              {copy.templates.delete}
-            </Button>
-            <Button variant="outline" size="sm" disabled={updateGovernance.isPending} onClick={() => addPatterns("never_allow_actions", ["workspace.file.modify", "workspace.file.delete", "workspace.file.write"], t("page.workspace_detail.rule_copy.summary_allow_only_new_files"))}>
-              {copy.templates.files}
-            </Button>
-          </div>
-        </div>
 
-        <div style={SECTION_TITLE}>{copy.actionPatterns}</div>
-        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 12 }}>
-          <PatternList
-            title={copy.patternNeedsApproval}
-            description={copy.patternNeedsApprovalDesc}
-            field="hitl_required_actions"
-            tone="orange"
-          />
-          <PatternList
-            title={copy.patternNeverAllow}
-            description={copy.patternNeverAllowDesc}
-            field="never_allow_actions"
-            tone="red"
-          />
-          <PatternList
-            title={copy.patternAutoApprove}
-            description={copy.patternAutoApproveDesc}
-            field="auto_approve_actions"
-            tone="green"
-          />
-          <PatternList
-            title={`${copy.patternNeedsApproval} · capability`}
-            description={copy.patternNeedsApprovalDesc}
-            field="hitl_required_capabilities"
-            tone="orange"
-          />
-          <PatternList
-            title={`${copy.patternNeverAllow} · capability`}
-            description={copy.patternNeverAllowDesc}
-            field="never_allow_capabilities"
-            tone="red"
-          />
-          <PatternList
-            title={`${copy.patternAutoApprove} · capability`}
-            description={copy.patternAutoApproveDesc}
-            field="auto_approve_capabilities"
-            tone="green"
-          />
-        </div>
       </Modal>
     );
 
@@ -5863,44 +6080,47 @@ export default function WorkspaceDetail() {
               </Button>
             </div>
           </div>
+          <div style={{ marginTop: 18 }}><ApprovalModeTrigger scope={{ kind: "workspace", id: workspaceId }} compact={false} /></div>
         </GlassCard>
 
-        <GlassCard hoverable={false}>
-          <div style={SECTION_TITLE}>{copy.addTitle}</div>
-          <Textarea
-            rows={3}
-            value={rulePrompt}
-            onChange={(e) => setRulePrompt(e.target.value)}
-            placeholder={copy.placeholder}
-            disabled={updateGovernance.isPending || updateOperatingModel.isPending}
-          />
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginTop: 10 }}>
-            <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
-              {copy.note}
-            </p>
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={addNaturalRule}
-              disabled={!rulePrompt.trim() || updateGovernance.isPending || updateOperatingModel.isPending}
-              loading={updateGovernance.isPending || updateOperatingModel.isPending}
-            >
-              {copy.addRule}
-            </Button>
-          </div>
-          <div style={{ marginTop: 14 }}>
-            <div style={{ fontSize: 11, color: "#a8a29e", fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>
-              {copy.examples}
+        {canManageWs && (
+          <GlassCard hoverable={false}>
+            <div style={SECTION_TITLE}>{copy.addTitle}</div>
+            <Textarea
+              rows={3}
+              value={rulePrompt}
+              onChange={(e) => setRulePrompt(e.target.value)}
+              placeholder={copy.placeholder}
+              disabled={updateOperatingModel.isPending}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginTop: 10 }}>
+              <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
+                {copy.note}
+              </p>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={addNaturalRule}
+                disabled={!rulePrompt.trim() || updateOperatingModel.isPending}
+                loading={updateOperatingModel.isPending}
+              >
+                {copy.addRule}
+              </Button>
             </div>
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-              {copy.examplesList.map((example) => (
-                <Button key={example.label} variant="outline" size="sm" onClick={() => setRulePrompt(example.text)}>
-                  {example.label}
-                </Button>
-              ))}
+            <div style={{ marginTop: 14 }}>
+              <div style={{ fontSize: 11, color: "#a8a29e", fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 8 }}>
+                {copy.examples}
+              </div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                {copy.examplesList.map((example) => (
+                  <Button key={example.label} variant="outline" size="sm" onClick={() => setRulePrompt(example.text)}>
+                    {example.label}
+                  </Button>
+                ))}
+              </div>
             </div>
-          </div>
-        </GlassCard>
+          </GlassCard>
+        )}
 
         <GlassCard hoverable={false}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
@@ -5953,10 +6173,27 @@ export default function WorkspaceDetail() {
                         {copy.noEnforcement}
                       </div>
                     )}
+                    {isHardBlockRuleType(rule.rule_type) && (
+                      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, marginTop: 8 }}>
+                        <span style={{ fontSize: 11, color: "#883a35", lineHeight: 1.5 }}>{copy.hardBlockNote}</span>
+                        {canManageWs && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => softenOperatingRule(idx)}
+                            disabled={updateOperatingModel.isPending}
+                          >
+                            {copy.softenToApproval}
+                          </Button>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <Button variant="ghost" size="sm" onClick={() => removeOperatingRule(idx)}>
-                    <span style={{ color: "#d65f59", fontWeight: 800 }}>{copy.remove}</span>
-                  </Button>
+                  {canManageWs && (
+                    <Button variant="ghost" size="sm" onClick={() => removeOperatingRule(idx)} disabled={updateOperatingModel.isPending}>
+                      <span style={{ color: "#d65f59", fontWeight: 800 }}>{copy.remove}</span>
+                    </Button>
+                  )}
                 </div>
               ))}
             </div>
@@ -7185,7 +7422,7 @@ export default function WorkspaceDetail() {
                 />
               </_Field>
             </div>
-            <div style={{ gridColumn: "1 / -1" }}>
+            <div id="workspace-cover-image" style={{ gridColumn: "1 / -1" }}>
               <_Field label={t("page.workspace_detail.cover_image_url")}>
                 <input
                   className="manor-input"
@@ -7317,94 +7554,160 @@ export default function WorkspaceDetail() {
           </div>
         </GlassCard>
 
-        {/* ── Budget ── */}
+        {/* ── Credits & budget ── */}
         <GlassCard hoverable={false}>
-          <div style={SECTION_TITLE}>{t("page.workspace_detail.budget")}</div>
-          {budgetStatus && (
-            <div style={{ marginBottom: 14 }}>
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 150px), 1fr))", gap: 10 }}>
-                <div style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(250,250,249,0.7)", border: "1px solid rgba(28,25,23,0.06)" }}>
-                  <div style={LABEL}>{t("page.workspace_detail.spent_this_month")}</div>
-                  <div style={{ fontSize: 18, fontWeight: 800, color: "var(--text-strong)" }}>
-                    {_formatCredits(budgetStatus.monthly_spent_credits)}
+          <div style={SECTION_TITLE}>{t("page.workspace_detail.credits_and_budget")}</div>
+
+          <section className="workspace-credit-budget-section">
+            <div className="workspace-credit-group-heading">
+              <span>{t("page.workspace_detail.usage")}</span>
+              <Tooltip
+                content={t("page.workspace_detail.credit_usage_tooltip", {
+                  timezone: creditUsageSummary?.timezone ?? "UTC",
+                })}
+                position="right"
+              >
+                <button
+                  type="button"
+                  className="workspace-credit-info-button"
+                  aria-label={t("page.workspace_detail.credit_usage_tooltip", {
+                    timezone: creditUsageSummary?.timezone ?? "UTC",
+                  })}
+                >
+                  <IconInfo size={14} aria-hidden="true" />
+                </button>
+              </Tooltip>
+            </div>
+
+            {creditUsageSummaryLoading ? (
+              <div className="workspace-credit-metric-grid" aria-hidden="true">
+                {[0, 1, 2].map(index => (
+                  <div className="workspace-credit-metric" key={index}>
+                    <div className="skeleton workspace-credit-usage-skeleton" />
                   </div>
+                ))}
+              </div>
+            ) : creditUsageSummaryFailed ? (
+              <div className="workspace-credit-usage-error" role="status">
+                <span>{t("page.workspace_detail.usage_unavailable")}</span>
+                <Tooltip content={t("page.workspace_detail.retry_usage")} position="right">
+                  <button
+                    type="button"
+                    className="workspace-credit-retry-button"
+                    aria-label={t("page.workspace_detail.retry_usage")}
+                    onClick={() => { void refetchCreditUsageSummary(); }}
+                  >
+                    <IconRefresh size={14} aria-hidden="true" />
+                  </button>
+                </Tooltip>
+              </div>
+            ) : creditUsageSummary ? (
+              <div className="workspace-credit-metric-grid">
+                <div className="workspace-credit-metric">
+                  <div className="workspace-credit-metric-label">{t("page.workspace_detail.today")}</div>
+                  <_CreditMetricValue value={creditUsageSummary.today_credits} />
                 </div>
-                <div style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(250,250,249,0.7)", border: "1px solid rgba(28,25,23,0.06)" }}>
-                  <div style={LABEL}>{t("page.workspace_detail.cap")}</div>
-                  <div style={{ fontSize: 18, fontWeight: 800, color: "#1c1917" }}>
-                    {budgetStatus.monthly_budget_credits != null
-                      ? _formatCredits(budgetStatus.monthly_budget_credits)
-                      : t("page.workspace_detail.no_cap")}
-                  </div>
+                <div className="workspace-credit-metric">
+                  <div className="workspace-credit-metric-label">{t("page.workspace_detail.this_week")}</div>
+                  <_CreditMetricValue value={creditUsageSummary.week_credits} />
                 </div>
-                <div style={{ padding: "10px 12px", borderRadius: 12, background: "rgba(250,250,249,0.7)", border: "1px solid rgba(28,25,23,0.06)" }}>
-                  <div style={LABEL}>{t("page.workspace_detail.remaining")}</div>
-                  <div style={{ fontSize: 18, fontWeight: 800, color: "#1c1917" }}>
-                    {budgetStatus.monthly_remaining_credits != null
-                      ? _formatCredits(budgetStatus.monthly_remaining_credits)
-                      : "—"}
-                  </div>
+                <div className="workspace-credit-metric">
+                  <div className="workspace-credit-metric-label">{t("page.workspace_detail.all_time")}</div>
+                  <_CreditMetricValue value={creditUsageSummary.all_time_credits} />
                 </div>
               </div>
-              {budgetStatus.monthly_budget_credits != null && (
-                <div style={{ marginTop: 10 }}>
-                  <div style={{ height: 6, borderRadius: 999, background: "var(--surface-muted)", overflow: "hidden" }}>
-                    <div
-                      style={{
-                        height: "100%",
-                        width: `${Math.min(100, Math.round((budgetStatus.pct_used ?? 0) * 100))}%`,
-                        background: (budgetStatus.pct_used ?? 0) >= 1 ? "var(--editor-danger-text)" : (budgetStatus.pct_used ?? 0) >= 0.8 ? "var(--text-muted)" : "var(--accent)",
-                      }}
-                    />
+            ) : null}
+          </section>
+
+          <section className="workspace-credit-budget-section">
+            <div className="workspace-credit-group-heading">
+              {t("page.workspace_detail.monthly_budget")}
+            </div>
+            {budgetStatus && (
+              <div style={{ marginBottom: 14 }}>
+                <div className="workspace-credit-metric-grid">
+                  <div className="workspace-credit-metric">
+                    <div className="workspace-credit-metric-label">{t("page.workspace_detail.used_this_month")}</div>
+                    <_CreditMetricValue value={budgetStatus.monthly_spent_credits} />
                   </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 11, color: "var(--text-faint)" }}>
-                    <span>{Math.round((budgetStatus.pct_used ?? 0) * 100)}%</span>
-                    <span>{t("page.workspace_detail.resets_in_days", { days: budgetStatus.days_until_month_end })}</span>
+                  <div className="workspace-credit-metric">
+                    <div className="workspace-credit-metric-label">{t("page.workspace_detail.cap")}</div>
+                    {budgetStatus.monthly_budget_credits != null
+                      ? <_CreditMetricValue value={budgetStatus.monthly_budget_credits} />
+                      : <div className="workspace-credit-metric-text">{t("page.workspace_detail.no_cap")}</div>}
+                  </div>
+                  <div className="workspace-credit-metric">
+                    <div className="workspace-credit-metric-label">{t("page.workspace_detail.remaining")}</div>
+                    {budgetStatus.monthly_remaining_credits != null
+                      ? <_CreditMetricValue value={budgetStatus.monthly_remaining_credits} />
+                      : <div className="workspace-credit-metric-text">—</div>}
                   </div>
                 </div>
-              )}
-              {budgetStatus.alert_state && budgetStatus.alert_state !== "normal" && (
-                <div style={{ marginTop: 10 }}>
-                  <StatusBadge type={budgetStatus.alert_state === "critical_100" ? "danger" : "warning"} dot>
-                    {budgetStatus.alert_state}
-                  </StatusBadge>
-                </div>
-              )}
+                {budgetStatus.monthly_budget_credits != null && (
+                  <div style={{ marginTop: 14 }}>
+                    <div style={{ height: 6, borderRadius: 999, background: "var(--surface-muted)", overflow: "hidden" }}>
+                      <div
+                        style={{
+                          height: "100%",
+                          width: `${Math.min(100, Math.round((budgetStatus.pct_used ?? 0) * 100))}%`,
+                          background: (budgetStatus.pct_used ?? 0) >= 1 ? "var(--editor-danger-text)" : (budgetStatus.pct_used ?? 0) >= 0.8 ? "#b27c34" : "var(--accent)",
+                        }}
+                      />
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4, fontSize: 11, color: "var(--text-faint)" }}>
+                      <span>{Math.round((budgetStatus.pct_used ?? 0) * 100)}%</span>
+                      <span>{t("page.workspace_detail.resets_in_days", { days: budgetStatus.days_until_month_end })}</span>
+                    </div>
+                  </div>
+                )}
+                {budgetStatus.alert_state && budgetStatus.alert_state !== "normal" && (
+                  <div style={{ marginTop: 10 }}>
+                    <StatusBadge type={budgetStatus.alert_state === "critical_100" ? "danger" : "warning"} dot>
+                      {budgetStatus.alert_state}
+                    </StatusBadge>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+
+          {canManageWs && (
+            <div className="workspace-credit-budget-controls">
+              <_Field label={t("page.workspace_detail.monthly_cap_credits_empty_no_cap")}>
+                <input
+                  className="manor-input"
+                  type="number"
+                  step="1"
+                  min="0"
+                  defaultValue={budgetStatus?.monthly_budget_credits ?? ""}
+                  key={`ws-budget-${budgetStatus?.monthly_budget_credits ?? "none"}`}
+                  onBlur={(e) => {
+                    const v = e.target.value.trim();
+                    const rawNext = v === "" ? null : Number(v);
+                    if (rawNext !== null && (!Number.isFinite(rawNext) || rawNext < 0)) {
+                      toast.error(t("page.workspace_detail.invalid_amount"), t("page.workspace_detail.enter_non_negative_number_or_leave_empty"));
+                      return;
+                    }
+                    const next = rawNext === null || rawNext <= 0 ? null : Math.floor(rawNext);
+                    if (next === (budgetStatus?.monthly_budget_credits ?? null)) return;
+                    updateBudget.mutate({ monthly_budget_credits: next });
+                  }}
+                  disabled={updateBudget.isPending}
+                />
+              </_Field>
+              <div className="workspace-credit-auto-pause">
+                <span>{t("page.workspace_detail.auto_pause_workspace_when_cap_is_hit")}</span>
+                <Toggle
+                  checked={!!budgetStatus?.auto_pause_on_budget}
+                  onChange={() => updateBudget.mutate({
+                    auto_pause_on_budget: !budgetStatus?.auto_pause_on_budget,
+                  })}
+                  disabled={updateBudget.isPending}
+                  aria-label={t("page.workspace_detail.auto_pause_workspace_when_cap_is_hit")}
+                />
+              </div>
             </div>
           )}
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 240px), 1fr))", gap: 12, alignItems: "end" }}>
-            <_Field label={t("page.workspace_detail.monthly_cap_credits_empty_no_cap")}>
-              <input
-                className="manor-input"
-                type="number"
-                step="1"
-                min="0"
-                defaultValue={budgetStatus?.monthly_budget_credits ?? ""}
-                key={`ws-budget-${budgetStatus?.monthly_budget_credits ?? "none"}`}
-                onBlur={(e) => {
-                  const v = e.target.value.trim();
-                  const rawNext = v === "" ? null : Number(v);
-                  if (rawNext !== null && (!Number.isFinite(rawNext) || rawNext < 0)) {
-                    toast.error(t("page.workspace_detail.invalid_amount"), t("page.workspace_detail.enter_non_negative_number_or_leave_empty"));
-                    return;
-                  }
-                  const next = rawNext === null || rawNext <= 0 ? null : Math.floor(rawNext);
-                  if (next === (budgetStatus?.monthly_budget_credits ?? null)) return;
-                  updateBudget.mutate({ monthly_budget_credits: next });
-                }}
-                disabled={updateBudget.isPending}
-              />
-            </_Field>
-            <label style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 13, color: "#44403c", paddingBottom: 10 }}>
-              <input
-                type="checkbox"
-                checked={!!budgetStatus?.auto_pause_on_budget}
-                onChange={(e) => updateBudget.mutate({ auto_pause_on_budget: e.target.checked })}
-                disabled={updateBudget.isPending}
-              />
-              {t("page.workspace_detail.auto_pause_workspace_when_cap_is_hit")}
-            </label>
-          </div>
         </GlassCard>
 
         {/* ── Execution policy ── */}
@@ -7470,137 +7773,9 @@ export default function WorkspaceDetail() {
           </div>
         </GlassCard>
 
-        {/* ── Approval automation (standing grants) ── */}
-        <GlassCard
-          id="workspace-approval-automation"
-          className="workspace-settings-anchor"
-          hoverable={false}
-        >
-          <div style={SECTION_TITLE}>{t("page.workspace_detail.approval_automation")}</div>
-          <p style={{ fontSize: 12, color: "#78716c", marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
-            {t("page.workspace_detail.approval_automation_desc")}
-          </p>
-          {(() => {
-            const rows = approvalMatrix?.rows || [];
-            const otherGrants = approvalMatrix?.other_grants || [];
-            const groups = APPROVAL_MATRIX_GROUPS
-              .map((kind) => ({ kind, rows: rows.filter((row) => row.kind === kind) }))
-              .filter((group) => group.rows.length > 0);
-            return (
-              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                {groups.map((group) => (
-                  <div key={group.kind} style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                    <div style={{
-                      fontSize: 11,
-                      fontWeight: 800,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.06em",
-                      color: "#a8a29e",
-                      marginBottom: 4,
-                    }}>
-                      {approvalGroupLabel(group.kind)}
-                    </div>
-                    {group.rows.map((row) => (
-                      <div
-                        key={row.action_key}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
-                          padding: "8px 0",
-                          borderTop: "1px solid rgba(28,25,23,0.06)",
-                        }}
-                      >
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-                            <span style={{ fontSize: 13, fontWeight: 600, color: "#1c1917" }}>
-                              {approvalActionLabel(row)}
-                            </span>
-                            {row.risk_level === "high" && (
-                              <Chip size="sm" variant="red">{t("page.workspace_detail.approval_high_risk")}</Chip>
-                            )}
-                          </div>
-                          <code className="mono" style={{ fontSize: 10, color: "#a8a29e" }}>{row.action_key}</code>
-                        </div>
-                        <span style={{ fontSize: 11, color: "#78716c", whiteSpace: "nowrap" }}>
-                          {row.auto_approved
-                            ? t("page.workspace_detail.approval_auto")
-                            : t("page.workspace_detail.approval_human")}
-                        </span>
-                        <Toggle
-                          size="sm"
-                          checked={row.auto_approved}
-                          disabled={!canManageWs || setApprovalMatrixRow.isPending}
-                          onChange={() => setApprovalMatrixRow.mutate({
-                            actionKey: row.action_key,
-                            autoApproved: !row.auto_approved,
-                          })}
-                          aria-label={`${approvalActionLabel(row)} — ${row.action_key}`}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                ))}
-
-                {otherGrants.length > 0 && (
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                    <div style={{
-                      fontSize: 11,
-                      fontWeight: 800,
-                      textTransform: "uppercase",
-                      letterSpacing: "0.06em",
-                      color: "#a8a29e",
-                    }}>
-                      {t("page.workspace_detail.other_standing_grants")}
-                    </div>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-                      {otherGrants.map((grant) => (
-                        <span
-                          key={`${grant.kind}:${grant.value}`}
-                          style={{
-                            display: "inline-flex",
-                            alignItems: "center",
-                            gap: 6,
-                            padding: "6px 10px",
-                            borderRadius: 999,
-                            background: "rgba(245,245,244,0.9)",
-                            fontSize: 12,
-                            fontWeight: 700,
-                            color: "#44403c",
-                          }}
-                        >
-                          {_friendlyCodeLabel(grant.value)}
-                          <span style={{ fontSize: 10, fontWeight: 800, color: "#78716c", textTransform: "uppercase", letterSpacing: "0.04em" }}>
-                            {grant.kind === "action"
-                              ? t("page.workspace_detail.standing_grant_action")
-                              : t("page.workspace_detail.standing_grant_capability")}
-                          </span>
-                          {canManageWs && (
-                            <button
-                              type="button"
-                              onClick={() => revokeStandingGrant.mutate({ kind: grant.kind, value: grant.value })}
-                              disabled={revokeStandingGrant.isPending}
-                              style={{ border: "none", background: "transparent", color: "#78716c", cursor: "pointer", fontWeight: 900 }}
-                              title={t("page.workspace_detail.revoke_standing_grant")}
-                              aria-label={`${t("page.workspace_detail.revoke_standing_grant")}: ${grant.value}`}
-                            >
-                              ×
-                            </button>
-                          )}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {groups.length === 0 && otherGrants.length === 0 && (
-                  <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>
-                    {t("page.workspace_detail.no_standing_grants")}
-                  </p>
-                )}
-              </div>
-            );
-          })()}
+        <GlassCard id="workspace-approval-automation" className="workspace-settings-anchor" hoverable={false}>
+          <div style={SECTION_TITLE}>{t("approval_settings.title")}</div>
+          <ApprovalSettingsPanel scope={{ kind: "workspace", id: workspaceId }} />
         </GlassCard>
 
         {/* ── Notification policy ── */}
@@ -7737,7 +7912,7 @@ export default function WorkspaceDetail() {
         </GlassCard>
 
         {/* ── Danger zone ── */}
-        {canManageWs && (
+        {canDeleteWs && (
           <GlassCard hoverable={false} className="border-red-200">
             <div style={{ ...SECTION_TITLE, color: "#b91c1c" }}>{t("page.workspace_detail.danger_zone")}</div>
             <p style={{ fontSize: 13, color: "#78716c", marginTop: 0, marginBottom: 12, lineHeight: 1.5 }}>
@@ -7799,6 +7974,7 @@ export default function WorkspaceDetail() {
 
   const tabContent: Record<Tab, () => React.ReactNode> = {
     overview: renderOverview,
+    app: () => <WorkspaceAppViewSettings workspaceId={workspaceId!} canManage={canManageWs} />,
     staff: renderStaff,
     agents: renderAgents,
     capabilities: renderCapabilities,
@@ -7816,6 +7992,13 @@ export default function WorkspaceDetail() {
     learning: renderLearning,
     activity: renderActivity,
     settings: renderSettings,
+    collaboration: () => canManageWs ? <div className="space-y-4">
+      <Card minHeight={0} hoverable={false} title={t("page.clients.deliver")} description={t("page.clients.delivery_policy")}
+        headerAction={<Button onClick={() => setDeliveryOpen(true)}>{t("page.clients.deliver")}</Button>}>
+        <p className="mt-2 text-sm text-stone-500">{t("page.clients.materials_policy")}</p>
+      </Card>
+      <WorkspaceCollaborationManagement key={`${currentUser?.id}:${workspaceId}`} workspaceId={workspaceId!} identity={`${currentUser?.id}:${currentUser?.entity_id}`} />
+    </div> : <EmptyState title={t("page.collaboration.manager_required")} />,
   };
   const primaryTab = _primaryTabFor(tab);
 
@@ -7823,17 +8006,30 @@ export default function WorkspaceDetail() {
     <div style={{ height: "100%", display: "flex", flexDirection: "column", padding: "clamp(0.5rem, 2.5vw, 1rem)", overflow: "hidden", position: "relative", zIndex: 10 }}>
       {/* Header */}
       <PageHeader
-        title={ws.name}
-        meta={
+        title={simpleSetupMode ? t("page.workspace_detail.blueprint_setup_title") : ws.name}
+        subtitle={simpleSetupMode ? ws.name : undefined}
+        meta={!simpleSetupMode && (
           <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <StatusBadge type={ws.status === "active" ? "active" : "inactive"} dot pulse={ws.status === "active"}>
               {ws.status}
             </StatusBadge>
             {ws.category && <Chip variant="teal" size="sm">{ws.category}</Chip>}
           </span>
-        }
-      >
-        {canManageWs && (
+        )}
+        actions={<>
+        {usageGuide && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setGuideOpen(true)}
+            ariaLabel={t("page.blueprint_detail.workspace_usage_guide", { name: ws.name })}
+            title={t("page.blueprint_detail.workspace_usage_guide", { name: ws.name })}
+            style={{ width: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+          >
+            <IconHelp size={18} />
+          </Button>
+        )}
+        {!simpleSetupMode && canManageWs && (
           <Button
             variant={ws.status === "active" ? "ghost" : "primary"}
             size="sm"
@@ -7846,11 +8042,15 @@ export default function WorkspaceDetail() {
         <Button
           variant="outline"
           size="sm"
-          onClick={() => navigate("/workspaces")}
+          onClick={() => navigate(simpleSetupMode
+            ? `/chat?workspace=${encodeURIComponent(ws.id)}&setup=1`
+            : "/workspaces")}
         >
-          {t("page.workspace_detail.back_to_workspaces")}
+          {t(simpleSetupMode
+            ? "page.workspace_detail.open_workspace_chat"
+            : "page.workspace_detail.back_to_workspaces")}
         </Button>
-        {canManageWs && (
+        {!simpleSetupMode && canManageWs && (
           <Button
             variant="outline"
             size="sm"
@@ -7859,7 +8059,12 @@ export default function WorkspaceDetail() {
             {t("page.workspace_detail.export_as_blueprint")}
           </Button>
         )}
-        {canManageWs && ws.blueprint_update?.blueprint_id && (
+        {!simpleSetupMode && canManageWs && tab !== "collaboration" && (
+          <Button variant="ghost" size="sm" onClick={() => setDeliveryOpen(true)}>
+            {t("page.clients.deliver")}
+          </Button>
+        )}
+        {!simpleSetupMode && canManageWs && ws.blueprint_update?.blueprint_id && (
           <Button
             variant="outline"
             size="sm"
@@ -7868,7 +8073,39 @@ export default function WorkspaceDetail() {
             {t("page.workspaces.blueprint_check_updates")}
           </Button>
         )}
+        {!simpleSetupMode && (ws.settings as any)?.sandbox ? (
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openSimulationReport}
+            >
+              {t("page.simulation_report.title")}
+            </Button>
+            {canManageWs && (
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={openPromotion}
+              >
+                {t("page.workspace_detail.promote_to_live")}
+              </Button>
+            )}
+          </>
+        ) : null}
+        </>}
+      >
       </PageHeader>
+
+      {canManageWs && <ClientDeliveryDialog key={ws.id} open={deliveryOpen} onClose={() => setDeliveryOpen(false)} workspace={{ id: ws.id, name: ws.name }} />}
+      <WorkspaceConnectionNotice workspaceId={ws.id} />
+
+      <BlueprintGuideDialog
+        open={Boolean(usageGuide && (guideOpen || showBlueprintGuideOnArrival))}
+        guide={usageGuide}
+        workspaceName={ws.name}
+        onClose={dismissBlueprintGuide}
+      />
 
       {canManageWs && (
         <ExportBlueprintModal
@@ -7886,6 +8123,123 @@ export default function WorkspaceDetail() {
           workspaceName={ws.name}
         />
       )}
+      <SimulationPromotionPanel
+        open={simulationPromotionOpen}
+        onClose={() => setSimulationPromotionOpen(false)}
+        workspaceId={ws.id}
+        canPromote={canManageWs}
+      />
+
+      <Modal
+        open={!simpleSetupMode && shouldShowWorkspaceSetup && !showBlueprintGuideOnArrival && setupStatus?.status !== "not_required"}
+        onClose={dismissWorkspaceSetup}
+        title={t(
+          setupStatus?.ready
+            ? "page.workspace_detail.blueprint_setup_complete_title"
+            : "page.workspace_detail.blueprint_setup_title",
+        )}
+        maxWidth="560px"
+        footer={
+          setupStatus?.ready ? (
+            <>
+              <Button
+                variant="primary"
+                onClick={() => {
+                  dismissWorkspaceSetup();
+                  if (workspaceId) navigate(`/chat?workspace=${encodeURIComponent(workspaceId)}${showBlueprintGuideOnArrival ? "&guide=1" : ""}`);
+                }}
+              >
+                {t("page.workspace_detail.open_workspace_chat")}
+              </Button>
+              <Button variant="ghost" onClick={dismissWorkspaceSetup}>
+                {t("page.workspace_detail.stay_on_details")}
+              </Button>
+            </>
+          ) : setupStatusError ? (
+            <>
+              <Button variant="primary" onClick={() => refetchSetupStatus()}>
+                {t("page.workspace_detail.check_setup_again")}
+              </Button>
+              <Button variant="ghost" onClick={dismissWorkspaceSetup}>
+                {t("action.close")}
+              </Button>
+            </>
+          ) : setupStatus && !setupStatus.ready ? (
+            <>
+              {hasAutomaticBlueprintSetup && canManageWs ? (
+                <Button
+                  variant="primary"
+                  onClick={openWorkspaceChatDuringSetup}
+                >
+                  {t("page.workspace_detail.open_workspace_chat")}
+                </Button>
+              ) : (
+                <Button
+                  variant="primary"
+                  onClick={() => {
+                    const target = blueprintSetupDestination(
+                      setupStatus.incomplete_checks[0] || {},
+                    );
+                    dismissWorkspaceSetup();
+                    if (target === "/integrations") navigate(target);
+                    else handleTabChange(target);
+                  }}
+                >
+                  {t("page.workspace_detail.review_setup")}
+                </Button>
+              )}
+              <Button variant="ghost" onClick={dismissWorkspaceSetup}>
+                {t("page.workspace_detail.stay_on_details")}
+              </Button>
+            </>
+          ) : null
+        }
+      >
+        {setupStatusLoading ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, color: "var(--text-muted)", fontSize: 13 }}>
+            <LoadingSpinner size={16} />
+            <span>{t("page.workspace_detail.checking_blueprint_setup")}</span>
+          </div>
+        ) : setupStatusError ? (
+          <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, color: "var(--text-muted)" }}>
+            {t("page.workspace_detail.blueprint_setup_check_failed")}
+          </p>
+        ) : setupStatus?.ready ? (
+          <p style={{ margin: 0, fontSize: 13, lineHeight: 1.6, color: "var(--text-muted)" }}>
+            {t("page.workspace_detail.blueprint_setup_complete_body")}
+          </p>
+        ) : setupStatus ? (
+          <div>
+            <p style={{ margin: "0 0 14px", fontSize: 13, lineHeight: 1.6, color: "var(--text-muted)" }}>
+              {hasAutomaticBlueprintSetup
+                ? t("page.workspace_detail.blueprint_setup_automatic_body")
+                : t("page.workspace_detail.blueprint_setup_manual_body")}
+            </p>
+            <div style={{ display: "grid", gap: 8 }}>
+              {setupStatus.incomplete_checks.map((check, index) => (
+                <div
+                  key={String(check.key || `${check.todo_kind || check.kind || "setup"}-${index}`)}
+                  style={{
+                    display: "flex",
+                    alignItems: "flex-start",
+                    gap: 9,
+                    padding: "10px 12px",
+                    borderRadius: 8,
+                    background: "var(--surface-muted)",
+                    border: "1px solid var(--border-subtle)",
+                    color: "var(--text-default)",
+                    fontSize: 12,
+                    lineHeight: 1.5,
+                  }}
+                >
+                  <IconInfo size={14} />
+                  <span>{String(check.reason || t("page.workspace_detail.setup_item_incomplete"))}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : null}
+      </Modal>
 
       <Modal
         open={showWorkspaceWelcome}
@@ -7978,10 +8332,10 @@ export default function WorkspaceDetail() {
         </form>
       </Modal>
 
-      <div className="workspace-detail-tab-navigation">
+      {!simpleSetupMode && <div className="workspace-detail-tab-navigation">
         <div className="workspace-detail-primary-tabs">
           <TabSwitcher
-            tabs={PRIMARY_TABS}
+            tabs={PRIMARY_TABS.filter(item => item.key !== "collaboration" || canManageWs)}
             value={primaryTab}
             onChange={handlePrimaryTabChange}
             ariaLabel={ws.name}
@@ -7995,7 +8349,12 @@ export default function WorkspaceDetail() {
             </span>
             <div className="workspace-detail-config-tab-scroll">
               <TabSwitcher
-                tabs={setupTabItems}
+                tabs={setupTabItems.map((item) => ({
+                  ...item,
+                  badge: item.key === "app" && appDiscovery.badgeVisible
+                    ? <FeatureDiscoveryBadge label={t("component.feature_discovery.new")} />
+                    : undefined,
+                }))}
                 value={tab}
                 onChange={handleTabChange}
                 size="sm"
@@ -8005,11 +8364,11 @@ export default function WorkspaceDetail() {
             </div>
           </nav>
         )}
-      </div>
+      </div>}
 
       {/* Tab content */}
       <div style={{ flex: 1, overflowY: "auto", padding: "4px 4px 20px" }}>
-        {tabContent[tab]()}
+        {tabContent[simpleSetupTab || tab]()}
       </div>
 
       <ConfirmDialog
@@ -8033,9 +8392,9 @@ export default function WorkspaceDetail() {
       />
 
       <ConfirmDialog
-        open={!!confirmRemoveChannel}
+        open={canManageWs && !!confirmRemoveChannel}
         onClose={() => setConfirmRemoveChannel(null)}
-        onConfirm={() => { if (confirmRemoveChannel) removeChannel.mutate(confirmRemoveChannel.id); }}
+        onConfirm={() => { if (canManageWs && confirmRemoveChannel) removeChannel.mutate(confirmRemoveChannel.id); }}
         title={t("page.workspace_detail.remove_channel")}
         message={t("page.workspace_detail.remove_channel_message").replace("{name}", confirmRemoveChannel?.name || t("page.workspace_detail.this_channel"))}
         confirmLabel={t("page.task_detail.runtime.remove_rule")}
@@ -8077,9 +8436,9 @@ export default function WorkspaceDetail() {
       />
 
       <ConfirmDialog
-        open={confirmDeleteWs}
+        open={canDeleteWs && confirmDeleteWs}
         onClose={() => setConfirmDeleteWs(false)}
-        onConfirm={() => { if (canManageWs) deleteWorkspace.mutate(); }}
+        onConfirm={() => { if (canDeleteWs) deleteWorkspace.mutate(); }}
         title={t("page.workspaces.delete_workspace")}
         message={`Move "${ws.name}" to trash? Recoverable for 30 days from the Workspaces page (Trash section). After that, the operating model, agent subscriptions, memory, and channel configs are permanently deleted.`}
         confirmLabel={t("page.workspaces.move_to_trash")}

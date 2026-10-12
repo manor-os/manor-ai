@@ -1,12 +1,19 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
-import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { useQuery, useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  ApiError,
+  api,
+  DocumentUploadAuthChangedError,
+  DocumentUploadStalledError,
+  type DocumentUploadProgress,
+} from "../lib/api";
 import { useToastStore } from "../stores/toast";
+import { useDocumentDownload } from "../lib/useDocumentDownload";
 import { useUpgradeStore } from "../stores/upgrade";
 import { useWorkspaceFilter } from "../stores/workspace";
-import { relativeTime, formatFileSize, getVectorStatusBadge, VectorStatus, isVectorInProgress } from "../lib/format";
+import { relativeTime, formatFileSize, VectorStatus } from "../lib/format";
 import PageHeader, { PageHeaderAddButton } from "../components/ui/PageHeader";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
@@ -19,13 +26,12 @@ import Textarea from "../components/ui/Textarea";
 import Button from "../components/ui/Button";
 import Select from "../components/ui/Select";
 import Dropdown from "../components/ui/Dropdown";
-import { IconChevronLeft, IconChevronRight, IconPlus, IconUpload, IconList, IconDashboard, IconFolder, IconTrash, IconDocument, IconEdit, IconInfo, IconEye, IconLink, IconDownload, IconClose, IconRefresh, IconStar, IconExternalLink, IconText, IconWorkspace, IconShare, IconFlow } from "../components/icons";
+import { IconChevronLeft, IconChevronRight, IconPlus, IconUpload, IconList, IconDashboard, IconFolder, IconTrash, IconDocument, IconEdit, IconInfo, IconEye, IconLink, IconDownload, IconClose, IconRefresh, IconStar, IconExternalLink, IconText, IconWorkspace, IconShare } from "../components/icons";
 import SmartToolbar from "../components/ui/SmartToolbar";
 import ContextMenu, { useContextMenu } from "../components/ui/ContextMenu";
 import type { MenuItem } from "../components/ui/ContextMenu";
-import CardStatusOverlay, { cardStatusClass, parseIndexingProgress } from "../components/ui/CardStatusOverlay";
+import CardStatusOverlay from "../components/ui/CardStatusOverlay";
 import { WikiLinkedText, type WikiLinkInfo } from "../components/WikiLinkedText";
-import WikiMapModal, { type WikiMapPage } from "../components/WikiMapModal";
 import { pickFile, isConfigured as isGoogleDriveConfigured } from "../lib/google-drive";
 import { UploadOptionsDialog, FolderPropertiesDialog, DocumentPropertiesDialog, ShareDialog, ClassificationBadge, VisibilityIcon } from "../components/permissions";
 import type { NewExternalShareConfig } from "../components/permissions";
@@ -33,12 +39,17 @@ import type { Document, DocumentFolderInfo, DocumentGrant, DocumentShare, UserSu
 import type { UploadOptionsValue } from "../components/permissions";
 import {
   getKnowledgeBrowseParams,
-  getKnowledgeDocumentsForView,
   type KnowledgeFileTypeFilter,
   type KnowledgeLibrarySection,
   type KnowledgeSortKey,
 } from "../lib/knowledgeLayout";
 import { useAuthStore } from "../stores/auth";
+import { authPrincipalKey, getAuthToken } from "../lib/authToken";
+import {
+  knowledgeUploadControllers,
+  useKnowledgeUploadStore,
+  type KnowledgeUploadItem,
+} from "../stores/knowledgeUploads";
 import {
   canDeleteDocument,
   canEditDocument,
@@ -47,86 +58,46 @@ import {
   canManageFolderMetadata,
   canShareFolder,
   canShareDocument,
-  hasPermission,
-  isEntityAdmin,
+  usePermission,
 } from "../lib/permissions";
 import { isCodeLikeFile } from "../lib/codeFiles";
+import { capabilitiesToShareRole, shareRoleCapabilities, type ShareRole } from "../lib/shareRoles";
 
 import { t } from "../lib/i18n";
 
-type WikiMapLink = NonNullable<WikiMapPage["links"]>[number];
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function normalizeWikiPagePath(path: string | null | undefined): string {
-  return String(path || "")
-    .replace(/\\/g, "/")
-    .trim()
-    .replace(/^\/+/, "")
-    .replace(/\/+/g, "/")
-    .replace(/^(?:\.\/)+/, "");
-}
-
-function uniqueWikiLinks(links: WikiMapLink[] = []): WikiMapLink[] {
-  const seen = new Set<string>();
-  const out: WikiMapLink[] = [];
-  for (const link of links) {
-    const key = [
-      normalizeWikiPagePath(link.resolved_path),
-      link.document_id || "",
-      String(link.target || "").trim(),
-      String(link.display || "").trim(),
-    ].join("|");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(link);
+function createKnowledgeUploadId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
   }
-  return out;
+  return `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function uniqueWikiBacklinks(backlinks: NonNullable<WikiMapPage["backlinks"]> = []): NonNullable<WikiMapPage["backlinks"]> {
-  const seen = new Set<string>();
-  const out: NonNullable<WikiMapPage["backlinks"]> = [];
-  for (const backlink of backlinks) {
-    const key = `${normalizeWikiPagePath(backlink.source_path)}|${backlink.source_title || ""}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(backlink);
+function isUploadAbortError(error: unknown): boolean {
+  return (
+    (error instanceof DOMException && error.name === "AbortError")
+    || (
+      typeof error === "object"
+      && error !== null
+      && "name" in error
+      && (error as { name?: unknown }).name === "AbortError"
+    )
+  );
+}
+
+function uploadLimitErrorMessage(error: unknown, maxUploadMb: number | null): string {
+  if (error instanceof ApiError && error.code) {
+    return t(error.code, error.vars);
   }
-  return out;
+  if (maxUploadMb !== null) {
+    return t("page.knowledge.file_too_large_max_mb", { max: maxUploadMb });
+  }
+  return error instanceof Error && error.message
+    ? error.message
+    : t("page.knowledge.upload_failed");
 }
 
 function isExternalFileDrag(e: React.DragEvent): boolean {
   return Array.from(e.dataTransfer.types || []).includes("Files");
-}
-
-function dedupeWikiPages(rawPages: WikiMapPage[]): WikiMapPage[] {
-  const byIdentity = new Map<string, WikiMapPage>();
-  for (const rawPage of rawPages) {
-    const path = normalizeWikiPagePath(rawPage.path);
-    const identity = rawPage.document_id ? `doc:${rawPage.document_id}` : `path:${path}`;
-    const page: WikiMapPage = { ...rawPage, path };
-    const existing = byIdentity.get(identity);
-    if (!existing) {
-      byIdentity.set(identity, {
-        ...page,
-        links: uniqueWikiLinks(page.links || []),
-        backlinks: uniqueWikiBacklinks(page.backlinks || []),
-      });
-      continue;
-    }
-    existing.links = uniqueWikiLinks([...(existing.links || []), ...(page.links || [])]);
-    existing.backlinks = uniqueWikiBacklinks([...(existing.backlinks || []), ...(page.backlinks || [])]);
-    existing.document_id = existing.document_id || page.document_id;
-    existing.document_name = existing.document_name || page.document_name;
-    existing.title = existing.title || page.title;
-    existing.path = existing.path || page.path;
-  }
-  return Array.from(byIdentity.values()).sort((a, b) =>
-    String(a.title || a.path).localeCompare(String(b.title || b.path))
-  );
 }
 /* ── Scoped styles ─────────────────────────────────── */
 
@@ -305,29 +276,6 @@ const STYLES = `
   color: #57534e;
 }
 
-.kb-wiki-map-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 7px;
-  margin-left: auto;
-  border-radius: 999px;
-  border: 1px solid rgba(79, 125, 117, 0.22);
-  background: rgba(242, 246, 245, 0.62);
-  color: #436b65;
-  height: 28px;
-  padding: 0 11px;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  cursor: pointer;
-  transition: background 0.16s ease, border-color 0.16s ease, transform 0.16s ease;
-}
-.kb-wiki-map-pill:hover {
-  background: rgba(229, 238, 235, 0.72);
-  border-color: rgba(79, 125, 117, 0.34);
-  transform: translateY(-1px);
-}
-
 .kb-breadcrumb-item {
   padding: 4px 8px;
   border-radius: 6px;
@@ -464,6 +412,15 @@ const STYLES = `
   background: rgba(255,255,255,0.9);
   border-color: rgba(231,229,228,0.8);
   box-shadow: 0 4px 16px rgba(0,0,0,0.04);
+}
+.knowledge-page .kb-file-card.card-uploading {
+  cursor: default;
+  pointer-events: auto;
+}
+.kb-file-card.card-upload-failed {
+  cursor: default;
+  background: var(--surface-muted);
+  border-color: var(--border-default);
 }
 .kb-file-card-body {
   padding: 12px 16px 14px;
@@ -743,13 +700,11 @@ html[data-theme="dark"] .kb-video-placeholder span {
 html[data-theme="dark"] .kb-breadcrumb-item:hover {
   background: rgba(255,255,255,0.07);
 }
-html[data-theme="dark"] .kb-wiki-map-pill,
 html[data-theme="dark"] .wiki-inline-link {
   background: rgba(125,218,205,0.12);
   border-color: rgba(125,218,205,0.24);
   color: var(--accent);
 }
-html[data-theme="dark"] .kb-wiki-map-pill:hover,
 html[data-theme="dark"] .wiki-inline-link:hover {
   background: rgba(125,218,205,0.18);
   border-color: rgba(125,218,205,0.36);
@@ -1342,7 +1297,7 @@ function DocumentMediaPreview({ doc, media }: { doc: any; media: { type: Knowled
     if (media.type !== "video" || !isVisible || !previewRequested || previewFailed) return undefined;
     let cancelled = false;
     let objectUrl: string | null = null;
-    api.documents.download(doc.id)
+    api.documents.preview(doc.id)
       .then((url) => {
         if (cancelled) {
           if (url.startsWith("blob:")) URL.revokeObjectURL(url);
@@ -1690,7 +1645,7 @@ function QuickLookPreview({ doc }: { doc: any }) {
         return undefined;
       }
     }
-    api.documents.download(doc.id).then((url) => {
+    api.documents.preview(doc.id).then((url) => {
       if (cancelled) {
         if (url.startsWith("blob:")) URL.revokeObjectURL(url);
         return;
@@ -1802,15 +1757,12 @@ function WorkspacePickerContent({
 
 
 const DOCUMENT_POLL_INTERVAL_MS = 5_000;
-const DOCUMENT_QUEUED_POLL_INTERVAL_MS = 15_000;
 
 function documentStatusPollInterval(value: unknown): number | false {
   const docs = Array.isArray(value) ? value : [];
-  const inProgressDocs = docs.filter((d: any) => isVectorInProgress(String(d?.vector_status || "")));
-  if (inProgressDocs.length === 0) return false;
-  return inProgressDocs.some((d: any) => d.vector_status === VectorStatus.PROCESSING || d.vector_status === VectorStatus.GENERATING)
+  return docs.some((document: any) => document?.vector_status === VectorStatus.GENERATING)
     ? DOCUMENT_POLL_INTERVAL_MS
-    : DOCUMENT_QUEUED_POLL_INTERVAL_MS;
+    : false;
 }
 
 
@@ -1819,12 +1771,16 @@ function documentStatusPollInterval(value: unknown): number | false {
 export default function Knowledge() {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const { activeIds: downloadingIds, downloadDocument } = useDocumentDownload();
   const currentUser = useAuthStore((s) => s.user);
+  const can = usePermission();
   const navigate = useNavigate();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const filePickerFolderIdRef = useRef<string | null | undefined>(undefined);
+  const recoveryFileInputRef = useRef<HTMLInputElement>(null);
+  const recoveryUploadIdRef = useRef<string | null>(null);
   const inlineFolderRef = useRef<HTMLInputElement>(null);
 
   const [search, setSearch] = useState(searchParams.get("q") || "");
@@ -1839,14 +1795,7 @@ export default function Knowledge() {
   const workspaceIdParam = searchParams.get("workspace_id") || "";
   const previousWorkspaceIdParamRef = useRef<string | null>(null);
   const suppressWorkspaceUrlWriteRef = useRef(false);
-  const canUploadKnowledge = Boolean(
-    currentUser
-    && (
-      hasPermission(currentUser.role, "docs.upload")
-      || currentUser.permissions?.includes("docs.upload")
-    ),
-  );
-  const canManageAllDocuments = isEntityAdmin(currentUser);
+  const canUploadKnowledge = Boolean(currentUser && can("docs.upload"));
   const canEditDoc = useCallback((doc: Pick<Document, "owner_id" | "created_by" | "current_user_capabilities"> | null | undefined) => (
     canEditDocument(currentUser, doc)
   ), [currentUser]);
@@ -1859,7 +1808,7 @@ export default function Knowledge() {
   const canDeleteDoc = useCallback((doc: Pick<Document, "owner_id" | "created_by" | "current_user_capabilities"> | null | undefined) => (
     canDeleteDocument(currentUser, doc)
   ), [currentUser]);
-  const canManageFolderItem = useCallback((folder: Pick<DocumentFolderInfo, "owner_id"> | null | undefined) => (
+  const canManageFolderItem = useCallback((folder: Pick<DocumentFolderInfo, "owner_id" | "current_user_capabilities"> | null | undefined) => (
     canManageFolder(currentUser, folder)
   ), [currentUser]);
   const canManageFolderMetadataItem = useCallback((folder: Pick<DocumentFolderInfo, "owner_id" | "current_user_capabilities"> | null | undefined) => (
@@ -1887,7 +1836,6 @@ export default function Knowledge() {
 
   // Quick Look drawer
   const [quickLookDoc, setQuickLookDoc] = useState<any | null>(null);
-  const [showWikiMap, setShowWikiMap] = useState(false);
 
   // Trash view is activated via librarySection === "trash"
 
@@ -1955,14 +1903,8 @@ export default function Knowledge() {
       navigateToDocument(doc, "edit");
       return;
     }
-    api.documents.download(doc.id).then((url) => {
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = doc.name;
-      a.click();
-      URL.revokeObjectURL(url);
-    });
-  }, [canEditDoc, navigateToDocument]);
+    void downloadDocument(doc);
+  }, [canEditDoc, navigateToDocument, downloadDocument]);
 
   // Inline folder creation
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -1981,10 +1923,17 @@ export default function Knowledge() {
   const [workspacePickerDoc, setWorkspacePickerDoc] = useState<any | null>(null);
   const [workspacePickerFolder, setWorkspacePickerFolder] = useState<any | null>(null);
   const [movePickerDoc, setMovePickerDoc] = useState<any | null>(null);
+  const [filingOnly, setFilingOnly] = useState(false);
 
   // Drag and drop for moving files/folders between folders
   const [draggingItem, setDraggingItem] = useState<{ id: string; type: "file" | "folder"; name: string } | null>(null);
-  const [uploadingFiles, setUploadingFiles] = useState<string[]>([]);
+  const allUploadingFiles = useKnowledgeUploadStore((state) => state.items);
+  const setUploadingFiles = useKnowledgeUploadStore((state) => state.setItems);
+  const uploadScopeId = `${currentUser?.entity_id || "anonymous"}:${currentUser?.id || "anonymous"}`;
+  const uploadingFiles = useMemo(
+    () => allUploadingFiles.filter((item) => item.scopeId === uploadScopeId),
+    [allUploadingFiles, uploadScopeId],
+  );
   const [dragOverTarget, setDragOverTarget] = useState<string | null>(null);
 
   // Context menu
@@ -1993,35 +1942,76 @@ export default function Knowledge() {
   const isSearching = searchTerm.length > 0;
 
   const documentBrowseCacheKey = useMemo(
-    () => ["documents-browse", searchTerm, currentFolderId, selectedWorkspaceId, librarySection],
-    [currentFolderId, librarySection, searchTerm, selectedWorkspaceId],
+    () => ["documents-browse", currentUser?.entity_id, currentUser?.id, searchTerm, currentFolderId, selectedWorkspaceId, librarySection, fileTypeFilter, sortKey],
+    [currentUser?.entity_id, currentUser?.id, currentFolderId, fileTypeFilter, librarySection, searchTerm, selectedWorkspaceId, sortKey],
   );
-  const { data, isLoading } = useQuery({
-    queryKey: ["documents-browse", searchTerm, currentFolderId, selectedWorkspaceId, librarySection],
-    queryFn: () => api.documents.browse(getKnowledgeBrowseParams({
-      currentFolderId,
-      librarySection,
-      searchTerm,
-      selectedWorkspaceId,
-    })),
+  const {
+    data: browsePages,
+    isLoading,
+    isError: browseFailed,
+    refetch: retryBrowse,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isFetchNextPageError,
+  } = useInfiniteQuery({
+    queryKey: documentBrowseCacheKey,
+    initialPageParam: "",
+    queryFn: ({ pageParam, signal }) => api.documents.browsePage({
+      ...getKnowledgeBrowseParams({
+        currentFolderId,
+        librarySection,
+        searchTerm,
+        selectedWorkspaceId,
+      }),
+      favorite_only: librarySection === "favorites",
+      file_type_filter: fileTypeFilter,
+      sort_by: librarySection === "recent" ? "date" : sortKey,
+      limit: librarySection === "recent" ? 20 : 50,
+      cursor: pageParam,
+    }, signal),
+    getNextPageParam: (lastPage) => librarySection === "recent" ? undefined : lastPage.next_cursor ?? undefined,
+    enabled: librarySection !== "trash",
     staleTime: 60_000,
-    // Keep the previous folder's listing on screen while the next folder
-    // loads — navigation swaps content in place instead of flashing empty.
-    placeholderData: keepPreviousData,
     // Global default disables focus refetch; knowledge changes out-of-band
     // (agents, other users, editors in other tabs), so re-check on focus.
     refetchOnWindowFocus: true,
   });
+  const data = useMemo(() => {
+    const pages = browsePages?.pages;
+    if (!pages?.length) return undefined;
+    const documents = [...new Map(pages.flatMap((page) => page.items).map((doc) => [doc.id, doc])).values()];
+    return {
+      ...pages[0],
+      items: documents,
+      documents,
+      total: documents.length,
+    };
+  }, [browsePages]);
+  const maxUploadMb = (
+    typeof data?.max_upload_mb === "number"
+    && Number.isFinite(data.max_upload_mb)
+    && data.max_upload_mb > 0
+  ) ? data.max_upload_mb : null;
+  const maxUploadBytes = maxUploadMb === null
+    ? null
+    : maxUploadMb * 1024 * 1024;
 
   const inProgressDocumentIds = useMemo(
     () => ((data?.items || []) as Document[])
-      .filter((document) => isVectorInProgress(String(document.vector_status || "")))
+      .filter((document) => document.vector_status === VectorStatus.GENERATING)
       .map((document) => document.id),
     [data?.items],
   );
   const { data: indexingStatuses = [] } = useQuery({
     queryKey: ["document-indexing-status", inProgressDocumentIds],
-    queryFn: () => api.documents.indexingStatuses(inProgressDocumentIds),
+    queryFn: async () => {
+      const batches = [];
+      for (let index = 0; index < inProgressDocumentIds.length; index += 100) {
+        batches.push(inProgressDocumentIds.slice(index, index + 100));
+      }
+      return (await Promise.all(batches.map((ids) => api.documents.indexingStatuses(ids)))).flat();
+    },
     enabled: inProgressDocumentIds.length > 0,
     staleTime: 0,
     refetchOnWindowFocus: true,
@@ -2043,8 +2033,10 @@ export default function Knowledge() {
       });
       return {
         ...current,
-        items: mergeStatuses(current.items) || current.items,
-        documents: mergeStatuses(current.documents) || current.documents,
+        pages: current.pages.map((page: any) => ({
+          ...page,
+          items: mergeStatuses(page.items) || page.items,
+        })),
       };
     });
   }, [documentBrowseCacheKey, indexingStatuses, queryClient]);
@@ -2061,7 +2053,7 @@ export default function Knowledge() {
 
   const { data: folders = [] } = useQuery({
     queryKey: ["folder-tree"],
-    queryFn: () => api.folders.tree(),
+    queryFn: () => api.folders.tree(false),
     staleTime: 60_000,
     refetchOnWindowFocus: true,
   });
@@ -2079,12 +2071,6 @@ export default function Knowledge() {
     const folder = (folders as any[]).find((f: any) => f.id === folderId);
     return canManageFolderItem(folder);
   }, [canManageFolderItem, folders]);
-
-  const { data: wikiIndex } = useQuery({
-    queryKey: ["fs-wiki-index"],
-    queryFn: () => api.fs.wikiIndex(),
-    staleTime: 60_000,
-  });
 
   useEffect(() => {
     const nextSearch = searchParams.get("q") || "";
@@ -2207,28 +2193,97 @@ export default function Knowledge() {
     onError: () => { toast.error(t("page.knowledge.failed_to_rename_document")); },
   });
 
-  const uploadMutation = useMutation({
-    mutationFn: ({ files, folderId, options }: {
-      files: File[];
-      folderId?: string | null;
-      options?: UploadOptionsValue;
-    }) => {
-      setUploadingFiles(files.map((f) => f.name));
-      const opts = options
-        ? {
-            visibility: options.visibility,
-            classification: options.classification,
-            client_visible: options.client_visible,
-          }
-        : undefined;
-      return Promise.all(files.map((f) => api.documents.upload(f, folderId, opts)));
-    },
-    onSuccess: (results) => {
-      setUploadingFiles([]);
-      invalidateDocumentBrowseAndFolderTree();
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
-      // DLP feedback: if server auto-upgraded classification due to PII, tell the user
-      const piiUpgraded = results.filter((d) => d?.pii_detected && d?.classification === "confidential");
+  const uploadOne = useCallback(async (item: KnowledgeUploadItem): Promise<Document> => {
+    if (!item.file || authPrincipalKey(getAuthToken()) !== item.principalKey) {
+      throw new DocumentUploadAuthChangedError();
+    }
+    const controller = new AbortController();
+    knowledgeUploadControllers.set(item.id, controller);
+    setUploadingFiles((current) => current.map((entry) => (
+      entry.id === item.id
+        ? { ...entry, status: "uploading", progress: 0, error: null }
+        : entry
+    )));
+
+    const opts = item.options
+      ? {
+          visibility: item.options.visibility,
+          classification: item.options.classification,
+          client_visible: item.options.client_visible,
+        }
+      : undefined;
+    const onProgress = (progress: DocumentUploadProgress) => {
+      setUploadingFiles((current) => current.map((entry) => (
+        entry.id === item.id
+          ? {
+              ...entry,
+              status: progress.phase,
+              progress: progress.percent,
+              error: null,
+            }
+          : entry
+      )));
+    };
+
+    try {
+      const document = await api.documents.upload(
+        item.file,
+        item.folderId,
+        opts,
+        {
+          signal: controller.signal,
+          onProgress,
+          idempotencyKey: item.id,
+        },
+      );
+      setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
+      return document;
+    } catch (error) {
+      if (isUploadAbortError(error)) {
+        setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
+      } else {
+        setUploadingFiles((current) => current.map((entry) => (
+          entry.id === item.id
+            ? {
+                ...entry,
+                status: "failed",
+                error: error instanceof DocumentUploadStalledError
+                  ? "stalled"
+                  : error instanceof DocumentUploadAuthChangedError
+                    ? "identity_changed"
+                    : "failed",
+              }
+            : entry
+        )));
+      }
+      throw error;
+    } finally {
+      knowledgeUploadControllers.delete(item.id);
+    }
+  }, [setUploadingFiles]);
+
+  const runUploadBatch = useCallback(async (items: KnowledgeUploadItem[]) => {
+    const settled = await Promise.allSettled(items.map(uploadOne));
+    const results = settled.flatMap((result) => result.status === "fulfilled" ? [result.value] : []);
+    const errors = settled.flatMap((result) => (
+      result.status === "rejected" && !isUploadAbortError(result.reason) ? [result.reason] : []
+    ));
+    const processingStalled = errors.some((error) => (
+      error instanceof DocumentUploadStalledError && error.phase === "processing"
+    ));
+    const batchPrincipalKey = items[0]?.principalKey;
+    if (!batchPrincipalKey || authPrincipalKey(getAuthToken()) !== batchPrincipalKey) {
+      return;
+    }
+
+    if (results.length > 0 || processingStalled) {
+      await invalidateDocumentBrowseAndFolderTree();
+      if (authPrincipalKey(getAuthToken()) !== batchPrincipalKey) return;
+    }
+    if (results.length > 0) {
+      const piiUpgraded = results.filter((document) => (
+        document?.pii_detected && document?.classification === "confidential"
+      ));
       if (piiUpgraded.length > 0) {
         toast.success(
           piiUpgraded.length === 1
@@ -2236,19 +2291,231 @@ export default function Knowledge() {
             : t("page.knowledge.pii_upgrade_multi", { count: piiUpgraded.length }),
         );
       } else {
-        toast.success(results.length > 1 ? `${results.length} ${t("page.knowledge.documents_uploaded")}` : t("page.knowledge.document_uploaded"));
+        toast.success(
+          results.length > 1
+            ? `${results.length} ${t("page.knowledge.documents_uploaded")}`
+            : t("page.knowledge.document_uploaded"),
+        );
       }
-    },
-    onError: (err: any) => {
-      setUploadingFiles([]);
-      const msg = err?.status === 413 ? t("page.knowledge.file_too_large_max_500mb") : t("page.knowledge.upload_failed");
-      toast.error(msg);
-    },
-  });
+    }
+
+    if (errors.length > 0) {
+      const tooLargeError = errors.find((error: any) => error?.status === 413);
+      const message = tooLargeError
+        ? uploadLimitErrorMessage(tooLargeError, maxUploadMb)
+        : errors.some((error) => error instanceof DocumentUploadStalledError)
+          ? t("page.knowledge.upload_stalled")
+          : t("page.knowledge.upload_failed");
+      toast.error(message);
+    }
+  }, [invalidateDocumentBrowseAndFolderTree, maxUploadMb, queryClient, toast, uploadOne]);
+
+  useEffect(() => {
+    const currentPrincipalKey = authPrincipalKey(getAuthToken());
+    uploadingFiles
+      .filter((item) => (
+        item.status === "processing"
+        && item.file === null
+        && item.principalKey === currentPrincipalKey
+        && !knowledgeUploadControllers.has(item.id)
+      ))
+      .forEach((item) => {
+        const controller = new AbortController();
+        knowledgeUploadControllers.set(item.id, controller);
+        void api.documents.reconcileUploadReceipt(item.id, { signal: controller.signal })
+          .then(async (document) => {
+            if (authPrincipalKey(getAuthToken()) !== item.principalKey) return;
+            setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
+            await invalidateDocumentBrowseAndFolderTree();
+            if (authPrincipalKey(getAuthToken()) !== item.principalKey) return;
+            toast.success(
+              document.pii_detected && document.classification === "confidential"
+                ? t("page.knowledge.pii_upgrade_single", { name: document.name })
+                : t("page.knowledge.document_uploaded"),
+            );
+          })
+          .catch((error) => {
+            if (
+              isUploadAbortError(error)
+              || error instanceof DocumentUploadAuthChangedError
+            ) {
+              setUploadingFiles((current) => current.filter((entry) => entry.id !== item.id));
+              return;
+            }
+            setUploadingFiles((current) => current.map((entry) => (
+              entry.id === item.id
+                ? {
+                    ...entry,
+                    status: "failed",
+                    error: error instanceof DocumentUploadStalledError ? "stalled" : "failed",
+                  }
+                : entry
+            )));
+            if (authPrincipalKey(getAuthToken()) === item.principalKey) {
+              toast.error(
+                error instanceof DocumentUploadStalledError
+                  ? t("page.knowledge.upload_stalled")
+                  : t("page.knowledge.upload_failed"),
+              );
+            }
+          })
+          .finally(() => {
+            knowledgeUploadControllers.delete(item.id);
+          });
+      });
+  }, [
+    invalidateDocumentBrowseAndFolderTree,
+    queryClient,
+    setUploadingFiles,
+    toast,
+    uploadingFiles,
+  ]);
+
+  const startUploads = useCallback((
+    files: File[],
+    folderId?: string | null,
+    options?: UploadOptionsValue,
+  ) => {
+    const accepted = maxUploadBytes === null
+      ? files
+      : files.filter((file) => file.size <= maxUploadBytes);
+    if (accepted.length !== files.length) {
+      toast.error(t("page.knowledge.file_too_large_max_mb", { max: maxUploadMb! }));
+    }
+    if (accepted.length === 0) return;
+
+    // Uploads are persisted to a concrete Knowledge folder, not to a search,
+    // Workspace filter, or library section. Reveal that target before starting
+    // so progress, failure, retry, and transfer cancellation remain reachable.
+    const targetFolderId = normalizeKnowledgeFolderId(folderId);
+    const targetIsVisible = (
+      !selectedWorkspaceId
+      && librarySection === "all"
+      && !isSearching
+      && normalizeKnowledgeFolderId(currentFolderId) === targetFolderId
+    );
+    if (!targetIsVisible) {
+      setSelectedWorkspaceId(null);
+      setLibrarySection("all");
+      setSearch("");
+      const targetFolder = targetFolderId
+        ? (folders as any[]).find((folder: any) => folder.id === targetFolderId)
+        : null;
+      setFolderPath(targetFolder ? buildFolderPath(targetFolder, folders as any[]) : []);
+      updateKnowledgeUrl({
+        folderId: targetFolderId,
+        workspaceId: null,
+        section: "all",
+        search: null,
+      }, true);
+    }
+
+    const items = accepted.map<KnowledgeUploadItem>((file) => ({
+      id: createKnowledgeUploadId(),
+      scopeId: uploadScopeId,
+      principalKey: authPrincipalKey(getAuthToken()),
+      file,
+      fileName: file.name,
+      fileSize: file.size,
+      folderId,
+      options,
+      status: "uploading",
+      progress: 0,
+      error: null,
+      createdAt: Date.now(),
+    }));
+    setUploadingFiles((current) => [...current, ...items]);
+    void runUploadBatch(items);
+  }, [
+    currentFolderId,
+    folders,
+    isSearching,
+    librarySection,
+    maxUploadBytes,
+    maxUploadMb,
+    runUploadBatch,
+    selectedWorkspaceId,
+    toast,
+    uploadScopeId,
+    updateKnowledgeUrl,
+  ]);
+
+  const handleRecoveryFileSelection = useCallback((files: FileList | null) => {
+    const uploadId = recoveryUploadIdRef.current;
+    recoveryUploadIdRef.current = null;
+    const file = files?.item(0) || null;
+    if (!uploadId || !file) return;
+    const item = uploadingFiles.find((entry) => entry.id === uploadId);
+    if (
+      !item
+      || item.status !== "failed"
+      || item.file !== null
+      || item.principalKey !== authPrincipalKey(getAuthToken())
+    ) return;
+    if (file.name !== item.fileName || file.size !== item.fileSize) {
+      toast.error(t("page.knowledge.select_original_file_mismatch", { name: item.fileName }));
+      return;
+    }
+    const retryItem: KnowledgeUploadItem = {
+      ...item,
+      file,
+      status: "uploading",
+      progress: 0,
+      error: null,
+    };
+    setUploadingFiles((current) => current.map((entry) => (
+      entry.id === retryItem.id ? retryItem : entry
+    )));
+    void runUploadBatch([retryItem]);
+  }, [runUploadBatch, setUploadingFiles, toast, uploadingFiles]);
+
+  const retryUpload = useCallback((id: string) => {
+    if (knowledgeUploadControllers.has(id)) return;
+    const item = uploadingFiles.find((entry) => entry.id === id);
+    if (!item || item.status !== "failed") return;
+    if (!item.file) {
+      recoveryUploadIdRef.current = item.id;
+      recoveryFileInputRef.current?.click();
+      return;
+    }
+    void runUploadBatch([item]);
+  }, [runUploadBatch, uploadingFiles]);
+
+  const cancelUpload = useCallback((id: string) => {
+    const controller = knowledgeUploadControllers.get(id);
+    if (controller) controller.abort();
+    else setUploadingFiles((current) => current.filter((entry) => entry.id !== id));
+  }, [setUploadingFiles]);
+
+  const dismissUpload = useCallback((id: string) => {
+    setUploadingFiles((current) => current.filter((entry) => entry.id !== id));
+  }, [setUploadingFiles]);
+
+  const visibleUploadingFiles = useMemo(() => {
+    if (selectedWorkspaceId || librarySection !== "all" || isSearching) return [];
+    const visibleFolderId = normalizeKnowledgeFolderId(currentFolderId);
+    return uploadingFiles.filter((item) => (
+      item.principalKey === authPrincipalKey(getAuthToken())
+      &&
+      normalizeKnowledgeFolderId(item.folderId) === visibleFolderId
+    ));
+  }, [currentFolderId, isSearching, librarySection, selectedWorkspaceId, uploadingFiles]);
 
   // ── Upload-options wizard (cloud-drive style: ask before upload) ──
   const [pendingUploadFiles, setPendingUploadFiles] = useState<File[]>([]);
   const [pendingUploadFolderId, setPendingUploadFolderId] = useState<string | null>(null);
+  const pendingUploadWorkspaceTarget = useMemo(() => {
+    const workspaceRoots = new Set(workspaces.map((workspace) => workspace.artifact_folder_id).filter(Boolean));
+    const folderById = new Map((folders as DocumentFolderInfo[]).map((folder) => [folder.id, folder]));
+    const seen = new Set<string>();
+    let folderId = pendingUploadFolderId;
+    while (folderId && !seen.has(folderId)) {
+      if (workspaceRoots.has(folderId)) return true;
+      seen.add(folderId);
+      folderId = folderById.get(folderId)?.parent_id ?? null;
+    }
+    return false;
+  }, [pendingUploadFolderId, folders, workspaces]);
   // Folder Properties dialog (Phase B). Holds the target folder; null = closed.
   const [folderPropsTarget, setFolderPropsTarget] = useState<DocumentFolderInfo | null>(null);
   // Folder ShareDialog target — opens the existing Phase A dialog scoped
@@ -2287,7 +2554,6 @@ export default function Knowledge() {
         folder_id: currentFolderId,
       });
       invalidateDocumentBrowseAndFolderTree();
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
       toast.success(`"${doc.name}" ${t("page.knowledge.added_from_google_drive")}`);
     } catch (err: any) {
       toast.error(err?.message || t("page.knowledge.failed_to_add_from_google_drive"));
@@ -2300,14 +2566,13 @@ export default function Knowledge() {
     mutationFn: (id: string) => api.documents.delete(id),
     onSuccess: () => {
       invalidateDocumentBrowseAndFolderTree();
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
       queryClient.invalidateQueries({ queryKey: ["documents-trash"] });
       toast.success(t("page.knowledge.document_deleted"));
     },
   });
 
   const moveMutation = useMutation({
-    mutationFn: (d: { id: string; folder_id: string | null }) => api.documents.move(d.id, d.folder_id),
+    mutationFn: (d: { id: string; folder_id: string | null; filing_only?: boolean }) => api.documents.move(d.id, d.folder_id, d.filing_only),
     onSuccess: () => {
       invalidateDocumentBrowseAndFolderTree();
       toast.success(t("page.knowledge.document_moved"));
@@ -2376,7 +2641,6 @@ export default function Knowledge() {
     mutationFn: (d: { name: string; file_type?: string }) => api.documents.createBlank(d),
     onSuccess: (doc: any) => {
       invalidateDocumentBrowse();
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
       toast.success(t("page.knowledge.blank_document_created"));
       setShowCreateBlankModal(false);
       setBlankDocName("");
@@ -2428,31 +2692,20 @@ export default function Knowledge() {
     mutationFn: (docId: string) => api.favorites.toggle("document", docId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["favorites", "document"] });
+      queryClient.invalidateQueries({ queryKey: ["documents-browse"] });
     },
-  });
-
-  // Reindex / cancel index
-  const reindexMutation = useMutation({
-    mutationFn: (docId: string) => api.documents.reindexOne(docId),
-    onSuccess: () => {
-      invalidateDocumentBrowse();
-      toast.success(t("page.knowledge.re_indexing_started"));
-    },
-    onError: () => { toast.error(t("page.knowledge.failed_to_start_re_indexing")); },
-  });
-  const cancelIndexMutation = useMutation({
-    mutationFn: (docId: string) => api.documents.cancelIndex(docId),
-    onSuccess: () => {
-      invalidateDocumentBrowse();
-      toast.success(t("page.knowledge.indexing_cancelled"));
-    },
-    onError: () => { toast.error(t("page.knowledge.failed_to_cancel_indexing")); },
   });
 
   // Trash operations
-  const { data: trashData = [], isLoading: isLoadingTrash } = useQuery({
+  const {
+    data: trashData,
+    isLoading: isLoadingTrash,
+    isError: trashFailed,
+    refetch: refetchTrash,
+  } = useQuery({
     queryKey: ["documents-trash"],
     queryFn: () => api.documents.listTrash(),
+    enabled: librarySection === "trash",
     staleTime: 60_000,
   });
 
@@ -2689,33 +2942,7 @@ export default function Knowledge() {
   }, [folders]);
 
   // Derived: documents
-  const allDocuments = useMemo(() => getKnowledgeDocumentsForView({
-    documents: data?.documents || data?.items || [],
-    currentFolderId,
-    favoriteDocIds,
-    fileTypeFilter,
-    isSearching,
-    librarySection,
-    selectedWorkspaceId,
-    sortKey,
-  }), [data?.documents, data?.items, currentFolderId, favoriteDocIds, fileTypeFilter, isSearching, librarySection, selectedWorkspaceId, sortKey]);
-
-  const wikiPages = useMemo<WikiMapPage[]>(() => (
-    dedupeWikiPages(Array.isArray((wikiIndex as any)?.pages) ? (wikiIndex as any).pages : [])
-  ), [wikiIndex]);
-  const wikiMissingLinks = useMemo(() => (
-    Array.isArray((wikiIndex as any)?.missing_links) ? (wikiIndex as any).missing_links : []
-  ), [wikiIndex]);
-
-  // Summarize every visible file below the current location, including files
-  // nested in descendant folders.
-  const totalStorage = useMemo(
-    () =>
-      data?.total_size ??
-      (data?.items || []).reduce((sum, doc) => sum + (doc.file_size || 0), 0),
-    [data?.total_size, data?.items],
-  );
-  const totalFiles = data?.total_files ?? data?.total ?? 0;
+  const allDocuments = data?.items || [];
 
   // Counts
   const folderCount = foldersAtLevel.length;
@@ -2774,96 +3001,6 @@ export default function Knowledge() {
     setShowCreateBlankModal(true);
   }, []);
 
-  const openWikiPage = useCallback(
-    (page: WikiMapPage) => {
-      if (page?.document_id) {
-        navigate(`/editor/${page.document_id}`, { state: knowledgeReturnState });
-        return;
-      }
-      const q = page?.title || page?.path || "";
-      if (q) handleSearchChange(q);
-    },
-    [handleSearchChange, knowledgeReturnState, navigate],
-  );
-
-  const connectWikiPagesMutation = useMutation({
-    mutationFn: async ({ source, target }: { source: WikiMapPage; target: WikiMapPage }) => {
-      if (!source.document_id) throw new Error(t("page.knowledge.wiki_map_source_missing_document"));
-      if (source.path === target.path) return { already: true };
-      const alreadyLinked = (source.links || []).some((link) =>
-        link.resolved_path === target.path || (target.document_id && link.document_id === target.document_id)
-      );
-      if (alreadyLinked) return { already: true };
-
-      const rawTitle = String(target.title || target.document_name || target.path || "").replace(/\.md$/i, "");
-      const safeTitle = rawTitle.replace(/[\[\]\r\n]/g, " ").trim();
-      if (!safeTitle) throw new Error(t("page.knowledge.wiki_map_target_missing_title"));
-
-      const current = await api.documents.getContent(source.document_id);
-      const content = current?.content || "";
-      const nextContent = `${content.trimEnd()}${content.trim() ? "\n\n" : ""}[[${safeTitle}]]\n`;
-      await api.documents.saveContent(source.document_id, nextContent);
-      return { already: false, title: safeTitle, sourcePath: source.path };
-    },
-    onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
-      if (result.sourcePath) queryClient.invalidateQueries({ queryKey: ["fs-wiki-links", result.sourcePath] });
-      if (result.already) toast.info(t("page.knowledge.wiki_map_already_linked"));
-      else toast.success(
-        t("page.knowledge.wiki_map_link_created"),
-        result.title ? `${t("page.knowledge.wiki_map_added_link_prefix")} [[${result.title}]] ${t("page.knowledge.wiki_map_added_link_suffix")}` : undefined,
-      );
-    },
-    onError: (err: any) => {
-      toast.error(t("page.knowledge.wiki_map_failed_to_create_link"), err?.message || t("page.knowledge.wiki_map_try_again"));
-    },
-  });
-
-  const removeWikiLinkMutation = useMutation({
-    mutationFn: async ({ source, link }: { source: WikiMapPage; link: WikiMapLink }) => {
-      if (!source.document_id) throw new Error(t("page.knowledge.wiki_map_source_missing_document"));
-      const target = String(link.target || "").trim();
-      if (!target) throw new Error(t("page.knowledge.wiki_map_remove_link_missing_target"));
-
-      const current = await api.documents.getContent(source.document_id);
-      const content = current?.content || "";
-      const wikiLinkPattern = new RegExp(`\\[\\[\\s*${escapeRegExp(target)}\\s*(?:\\|[^\\]]*)?\\]\\]`);
-      if (!wikiLinkPattern.test(content)) throw new Error(t("page.knowledge.wiki_map_remove_link_not_found"));
-
-      const nextContent = content
-        .replace(wikiLinkPattern, "")
-        .replace(/[ \t]+\n/g, "\n")
-        .replace(/\n{3,}/g, "\n\n");
-      await api.documents.saveContent(source.document_id, nextContent);
-      return { sourcePath: source.path, title: target };
-    },
-    onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: ["fs-wiki-index"] });
-      if (result.sourcePath) queryClient.invalidateQueries({ queryKey: ["fs-wiki-links", result.sourcePath] });
-      toast.success(t("page.knowledge.wiki_map_link_removed"), `[[${result.title}]]`);
-    },
-    onError: (err: any) => {
-      toast.error(t("page.knowledge.wiki_map_failed_to_remove_link"), err?.message || t("page.knowledge.wiki_map_try_again"));
-    },
-  });
-
-  const handleConnectWikiPages = useCallback(
-    (source: WikiMapPage, target: WikiMapPage) => {
-      connectWikiPagesMutation.mutate({ source, target });
-    },
-    [connectWikiPagesMutation],
-  );
-
-  const handleRemoveWikiLink = useCallback(
-    (source: WikiMapPage, link: WikiMapLink) => {
-      const label = String(link.target || "").trim();
-      if (window.confirm(`${t("page.knowledge.wiki_map_confirm_remove_link")} [[${label}]]?`)) {
-        removeWikiLinkMutation.mutate({ source, link });
-      }
-    },
-    [removeWikiLinkMutation],
-  );
-
   // Start inline folder creation
   const startCreateFolder = () => {
     if (!canUploadKnowledge) return;
@@ -2898,11 +3035,7 @@ export default function Knowledge() {
     const canShare = canShareDoc(doc);
     const canManageMetadata = canManageDocMetadata(doc);
     const canDelete = canDeleteDoc(doc);
-    const canAddToWorkspace = canManageAllDocuments && canManageMetadata;
-
-    const indexItem: MenuItem = isVectorInProgress(doc.vector_status)
-      ? { label: t("page.knowledge.cancel_indexing"), icon: <IconClose size={14} />, onClick: () => cancelIndexMutation.mutate(doc.id) }
-      : { label: doc.vector_status === VectorStatus.READY || doc.vector_status === VectorStatus.INDEXED ? t("page.knowledge.re_index") : t("page.knowledge.index_now"), icon: <IconRefresh size={14} />, onClick: () => reindexMutation.mutate(doc.id) };
+    const canAddToWorkspace = canManageMetadata;
 
     const items: MenuItem[] = [
       {
@@ -2923,7 +3056,7 @@ export default function Knowledge() {
       { label: t("page.knowledge.quick_look"), icon: <IconEye size={14} />, onClick: () => setQuickLookDoc(doc) },
       { label: favoriteDocIds.has(doc.id) ? t("page.knowledge.remove_from_favorites") : t("page.knowledge.add_to_favorites"), icon: <IconStar size={14} />, onClick: () => favoriteMutation.mutate(doc.id) },
       { label: t("page.knowledge.get_info"), icon: <IconInfo size={14} />, onClick: () => setInfoTarget(doc) },
-      { label: t("page.knowledge.download"), icon: <IconDownload size={14} />, onClick: () => { api.documents.download(doc.id).then((url) => { const a = document.createElement("a"); a.href = url; a.download = doc.name; a.click(); URL.revokeObjectURL(url); }); } },
+      { label: t("page.knowledge.download"), icon: <IconDownload size={14} />, disabled: downloadingIds.includes(doc.id), onClick: () => { void downloadDocument(doc); } },
     ];
     const managedItems: MenuItem[] = [];
     if (canManageMetadata) {
@@ -2934,7 +3067,6 @@ export default function Knowledge() {
       if (canAddToWorkspace) {
         managedItems.push({ label: t("page.knowledge.add_to_workspace"), icon: <IconWorkspace size={14} />, onClick: () => setWorkspacePickerDoc(doc) });
       }
-      managedItems.push(indexItem);
       if (hasMoveTargets) {
         managedItems.push({ label: t("page.knowledge.move_to_folder_2"), icon: <IconFolder size={14} />, onClick: () => setMovePickerDoc(doc) });
       }
@@ -3183,7 +3315,7 @@ export default function Knowledge() {
                 label={section.label}
                 icon={section.icon}
                 isActive={librarySection === section.key && folderPath.length === 0}
-                count={section.key === "all" && data ? data.total : undefined}
+                count={section.key === "all" && data && !hasNextPage ? data.total : undefined}
                 onClick={() => {
                   setLibrarySection(section.key);
                   setSelectedWorkspaceId(null);
@@ -3313,7 +3445,7 @@ export default function Knowledge() {
           title={t("page.knowledge.knowledge_base")}
           subtitle={t("page.knowledge.subtitle")}
           meta={data
-            ? `${totalFiles} ${totalFiles === 1 ? t("page.knowledge.file") : t("page.knowledge.files").toLocaleLowerCase()} · ${formatFileSize(totalStorage)}`
+            ? `${fileCount}${hasNextPage ? "+" : ""} ${fileCount === 1 ? t("page.knowledge.file") : t("page.knowledge.files").toLocaleLowerCase()}`
             : undefined}
           toolbar={librarySection !== "trash" ? (
               <div className="flex w-full flex-wrap items-center gap-2 lg:w-auto lg:justify-end">
@@ -3455,9 +3587,11 @@ export default function Knowledge() {
                 </div>
                 <div>
                   <h3 className="text-[15px] font-bold text-stone-800">{t("page.workspaces.trash")}</h3>
-                  <p className="text-xs text-stone-400">
-                    {Array.isArray(trashData) ? trashData.length : 0} {t("page.knowledge.item")}{(Array.isArray(trashData) ? trashData.length : 0) !== 1 ? "s" : ""} {t("page.knowledge.in_trash")}
-                  </p>
+                  {Array.isArray(trashData) && (
+                    <p className="text-xs text-stone-400">
+                      {trashData.length} {t("page.knowledge.item")}{trashData.length !== 1 ? "s" : ""} {t("page.knowledge.in_trash")}
+                    </p>
+                  )}
                 </div>
               </div>
               {Array.isArray(trashData) && trashData.length > 0 && (
@@ -3480,6 +3614,11 @@ export default function Knowledge() {
             {isLoadingTrash ? (
               <div style={{ padding: "16px" }}>
                 <SkeletonTable rows={4} cols={4} />
+              </div>
+            ) : trashFailed ? (
+              <div className="p-4" role="alert">
+                <p className="text-sm text-stone-500">{t("page.tasks.load_more_failed")}</p>
+                <Button variant="outline" size="sm" onClick={() => void refetchTrash()}>{t("page.tasks.retry_load_more")}</Button>
               </div>
             ) : !Array.isArray(trashData) || trashData.length === 0 ? (
               <EmptyState
@@ -3566,13 +3705,8 @@ export default function Knowledge() {
               {folderCount > 0 && <span>{folderCount} {t("page.knowledge.folder")}{folderCount !== 1 ? "s" : ""}</span>}
               {folderCount > 0 && fileCount > 0 && <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />}
               {fileCount > 0 && <span>{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>}
-              {folderCount === 0 && fileCount === 0 && !isLoading && <span>{t("page.knowledge.empty_folder")}</span>}
-              {wikiIndex && (
-                <button type="button" className="kb-wiki-map-pill" onClick={() => setShowWikiMap(true)}>
-                  <IconFlow size={13} />
-                  {t("page.knowledge.wiki_map")}
-                  <span>{wikiPages.length}</span>
-                </button>
+              {folderCount === 0 && fileCount === 0 && visibleUploadingFiles.length === 0 && !isLoading && (
+                <span>{t("page.knowledge.empty_folder")}</span>
               )}
             </div>
 
@@ -3581,6 +3715,7 @@ export default function Knowledge() {
               ref={fileInputRef}
               type="file"
               multiple
+              aria-label="Choose upload file"
               className="hidden"
               onChange={(e) => {
                 const folderId = filePickerFolderIdRef.current === undefined
@@ -3589,6 +3724,16 @@ export default function Knowledge() {
                 handleFiles(e.target.files, folderId);
                 filePickerFolderIdRef.current = undefined;
                 e.currentTarget.value = "";
+              }}
+            />
+            <input
+              ref={recoveryFileInputRef}
+              type="file"
+              aria-label={t("page.knowledge.select_original_file")}
+              className="hidden"
+              onChange={(event) => {
+                handleRecoveryFileSelection(event.target.files);
+                event.currentTarget.value = "";
               }}
             />
 
@@ -3637,7 +3782,18 @@ export default function Knowledge() {
                 <div style={{ padding: "16px" }}>
                   <SkeletonTable rows={6} cols={4} />
                 </div>
-              ) : (foldersAtLevel.length === 0 && allDocuments.length === 0 && !creatingFolder) ? (
+              ) : browseFailed && !data ? (
+                <div className="flex justify-center p-6">
+                  <Button variant="outline" onClick={() => { void retryBrowse(); }}>
+                    {t("page.tasks.retry_load_more")}
+                  </Button>
+                </div>
+              ) : (
+                foldersAtLevel.length === 0
+                && allDocuments.length === 0
+                && visibleUploadingFiles.length === 0
+                && !creatingFolder
+              ) ? (
                 <div className="kb-empty-folder-shell">
                   <div
                     className={`kb-empty-folder-panel${canAddToCurrentFolder ? " can-upload" : ""}${dragOver ? " is-drag-over" : ""}`}
@@ -3675,7 +3831,7 @@ export default function Knowledge() {
                       </svg>
                     </div>
                     <h3 className="kb-empty-folder-title">
-                      {uploadMutation.isPending ? t("page.knowledge.uploading") : t("page.knowledge.empty_folder")}
+                      {t("page.knowledge.empty_folder")}
                     </h3>
                     <p className="kb-empty-folder-copy">
                       {canAddToCurrentFolder
@@ -3811,7 +3967,7 @@ export default function Knowledge() {
                             <div className="flex-1 min-w-0">
                               <p className="text-[14px] font-semibold text-stone-800 truncate">{folder.name}</p>
                               <p className="text-xs text-stone-400 mt-0.5">
-                                {folder.document_count ?? 0} {t("page.knowledge.item")}{(folder.document_count ?? 0) !== 1 ? "s" : ""}
+                                {folder.document_count == null ? "" : `${folder.document_count} ${t("page.knowledge.item")}${folder.document_count !== 1 ? "s" : ""}`}
                               </p>
                             </div>
                             <IconChevronRight size={14} className="text-stone-300 flex-shrink-0" />
@@ -3831,15 +3987,23 @@ export default function Knowledge() {
                       </h3>
                       <span className="kb-section-count">{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>
                     </div>
-                    {allDocuments.length === 0 && uploadingFiles.length === 0 ? (
+                    {allDocuments.length === 0 && visibleUploadingFiles.length === 0 ? (
                       <p className="kb-section-empty">{t("page.knowledge.no_files_in_current_folder")}</p>
                     ) : (
                       <div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-4">
                         {/* Uploading placeholder cards */}
-                        {uploadingFiles.map((name) => {
-                          const typeInfo = getFileTypeInfo(name);
+                        {visibleUploadingFiles.map((upload) => {
+                          const typeInfo = getFileTypeInfo(upload.fileName);
+                          const isFailed = upload.status === "failed";
+                          const retryLabel = upload.file
+                            ? t("page.knowledge.retry_upload")
+                            : t("page.knowledge.select_original_file");
                           return (
-                            <div key={`uploading-${name}`} className="kb-file-card card-uploading" style={{ position: "relative" }}>
+                            <div
+                              key={upload.id}
+                              className={`kb-file-card ${isFailed ? "card-upload-failed" : "card-uploading"}`}
+                              style={{ position: "relative" }}
+                            >
                               <div
                                 className="w-full flex items-center justify-center"
                                 style={{ aspectRatio: "16/10", background: typeInfo.bg }}
@@ -3847,21 +4011,70 @@ export default function Knowledge() {
                                 <span className="text-2xl font-black tracking-wide" style={{ color: typeInfo.color, opacity: 0.7 }}>{typeInfo.icon}</span>
                               </div>
                               <div className="kb-file-card-body">
-                                <p className="text-[13px] font-semibold text-stone-800 mb-1 truncate">{name}</p>
+                                <p className="text-[13px] font-semibold text-stone-800 mb-1 truncate">{upload.fileName}</p>
                                 <div className="flex items-center gap-2 mb-2">
-                                  <span className="text-[11px] text-stone-400">--</span>
+                                  <span className="text-[11px] text-stone-400">{formatFileSize(upload.fileSize)}</span>
+                                  {!isFailed && upload.status === "uploading" && (
+                                    <>
+                                      <span className="w-[3px] h-[3px] rounded-full bg-stone-300" />
+                                      <span className="text-[11px] font-mono text-stone-500">{upload.progress}%</span>
+                                    </>
+                                  )}
                                 </div>
-                                <CardStatusOverlay variant="uploading" />
+                                {isFailed ? (
+                                  <div className="flex items-center justify-between gap-2">
+                                    <StatusBadge type="danger" dot>
+                                      {upload.error === "stalled"
+                                        ? t("page.knowledge.upload_stalled_short")
+                                        : t("page.knowledge.upload_failed")}
+                                    </StatusBadge>
+                                    <div className="flex items-center gap-1">
+                                      <Button size="sm" variant="ghost" onClick={() => retryUpload(upload.id)}>
+                                        {upload.file ? <IconRefresh size={13} /> : <IconUpload size={13} />}
+                                        {retryLabel}
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        ariaLabel={t("action.close")}
+                                        title={t("action.close")}
+                                        onClick={() => dismissUpload(upload.id)}
+                                      >
+                                        <IconClose size={13} />
+                                      </Button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between gap-2">
+                                    <div className="card-status-chip">
+                                      <div className="status-spinner" style={{ width: 12, height: 12, borderWidth: 2 }} />
+                                      <span>{t(upload.status === "processing" ? "page.knowledge.processing_upload" : "page.knowledge.uploading")}</span>
+                                    </div>
+                                    {upload.status === "uploading" && (
+                                      <Button size="sm" variant="ghost" onClick={() => cancelUpload(upload.id)}>
+                                        {t("action.cancel")}
+                                      </Button>
+                                    )}
+                                  </div>
+                                )}
                               </div>
+                              {upload.status === "uploading" && (
+                                <div
+                                  className="card-progress-bar determinate"
+                                  role="progressbar"
+                                  aria-label={`${upload.fileName} ${t("page.knowledge.uploading")}`}
+                                  aria-valuemin={0}
+                                  aria-valuemax={100}
+                                  aria-valuenow={upload.progress}
+                                  style={{ "--progress": upload.progress } as React.CSSProperties}
+                                />
+                              )}
                             </div>
                           );
                         })}
                         {allDocuments.map((doc) => {
                       const typeInfo = getFileTypeInfo(doc.name, doc.file_type || undefined);
-                      const statusInfo = getVectorStatusBadge(doc.vector_status);
-                      const statusCls = cardStatusClass(doc.vector_status);
                       const isGenerating = doc.vector_status === VectorStatus.GENERATING;
-                      const idxProgress = parseIndexingProgress(doc.indexing_progress);
                       const media = getMediaPreviewUrl(doc);
                       const docCanManageMetadata = canManageDocMetadata(doc);
                       const docManage = docCanManageMetadata || canDeleteDoc(doc);
@@ -3874,11 +4087,11 @@ export default function Knowledge() {
                       return (
                         <div
                           key={doc.id}
-                          className={`kb-file-card${draggingItem?.id === doc.id ? " dragging" : ""}${selectMode && selectedIds.has(doc.id) ? " !border-manor-500" : ""}${statusCls ? ` ${statusCls}` : ""}`}
+                          className={`kb-file-card${draggingItem?.id === doc.id ? " dragging" : ""}${selectMode && selectedIds.has(doc.id) ? " !border-manor-500" : ""}${isGenerating ? " card-generating" : ""}`}
                           data-selection-context="knowledge"
                           data-selection-source-label={doc.name}
                           data-selection-source-path={selectionSourcePath}
-                          draggable={!selectMode && !statusCls && docCanManageMetadata}
+                          draggable={!selectMode && !isGenerating && docCanManageMetadata}
                           onDragStart={(e) => { if (!selectMode && docCanManageMetadata) handleDragStartItem(e, { id: doc.id, type: "file", name: doc.name }); }}
                           onDragEnd={handleDragEndItem}
                           onClick={() => {
@@ -3935,15 +4148,7 @@ export default function Knowledge() {
                               </span>
                             </div>
 
-                            {statusCls ? (
-                              <CardStatusOverlay
-                                vectorStatus={doc.vector_status}
-                                progress={idxProgress.progress}
-                                stepLabel={idxProgress.stepLabel}
-                              />
-                            ) : (
-                              <StatusBadge type={statusInfo.type} dot>{statusInfo.label}</StatusBadge>
-                            )}
+                            {isGenerating && <CardStatusOverlay variant="generating" />}
                           </div>
                         </div>
                       );
@@ -4053,7 +4258,7 @@ export default function Knowledge() {
                                 </div>
                               </td>
                               <td className="text-right text-xs text-stone-500">
-                                {folder.document_count ?? 0}
+                                {folder.document_count ?? "—"}
                               </td>
                               <td className="text-right">
                                 {folderManage && (
@@ -4082,7 +4287,7 @@ export default function Knowledge() {
                       </h3>
                       <span className="kb-section-count">{fileCount} {t("page.knowledge.file")}{fileCount !== 1 ? "s" : ""}</span>
                     </div>
-                    {(allDocuments.length > 0 || uploadingFiles.length > 0) ? (
+                    {(allDocuments.length > 0 || visibleUploadingFiles.length > 0) ? (
                       <table className="glass-table">
                         <thead>
                           <tr>
@@ -4096,10 +4301,14 @@ export default function Knowledge() {
                           </tr>
                         </thead>
                         <tbody>
-                          {uploadingFiles.map((name) => {
-                            const typeInfo = getFileTypeInfo(name);
+                          {visibleUploadingFiles.map((upload) => {
+                            const typeInfo = getFileTypeInfo(upload.fileName);
+                            const isFailed = upload.status === "failed";
+                            const retryLabel = upload.file
+                              ? t("page.knowledge.retry_upload")
+                              : t("page.knowledge.select_original_file");
                             return (
-                              <tr key={`uploading-${name}`} style={{ opacity: 0.55 }}>
+                              <tr key={upload.id} style={{ opacity: isFailed ? 1 : 0.72 }}>
                                 {selectMode && <td />}
                                 <td>
                                   <div className="flex items-center gap-3">
@@ -4107,23 +4316,64 @@ export default function Knowledge() {
                                       <span className="text-[10px] font-extrabold" style={{ color: typeInfo.color }}>{typeInfo.icon}</span>
                                     </div>
                                     <div className="flex items-center gap-2">
-                                      <div className="status-spinner" style={{ color: "#4a7d96", width: 14, height: 14, borderWidth: 2 }} />
-                                      <span className="text-sm font-semibold text-stone-500">{name}</span>
+                                      {!isFailed && <div className="status-spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />}
+                                      <span className="text-sm font-semibold text-stone-600">{upload.fileName}</span>
                                     </div>
                                   </div>
                                 </td>
                                 <td className="text-center"><span className="text-[10px] font-extrabold py-0.5 px-1.5 rounded" style={{ background: typeInfo.bg, color: typeInfo.color }}>{typeInfo.icon}</span></td>
-                                <td className="text-right text-xs text-stone-400">--</td>
-                                <td className="text-right text-xs text-stone-400">--</td>
-                                <td className="text-center"><StatusBadge type="info" dot>{t("page.knowledge.uploading")}</StatusBadge></td>
-                                <td />
+                                <td className="text-right text-xs font-mono text-stone-500">{formatFileSize(upload.fileSize)}</td>
+                                <td className="text-right text-xs font-mono text-stone-500">
+                                  {upload.status === "uploading" ? `${upload.progress}%` : "--"}
+                                </td>
+                                <td className="text-center">
+                                  <StatusBadge type={isFailed ? "danger" : "info"} dot>
+                                    {isFailed
+                                      ? upload.error === "stalled"
+                                        ? t("page.knowledge.upload_stalled_short")
+                                        : t("page.knowledge.upload_failed")
+                                      : t(upload.status === "processing" ? "page.knowledge.processing_upload" : "page.knowledge.uploading")}
+                                  </StatusBadge>
+                                </td>
+                                <td>
+                                  {isFailed ? (
+                                    <div className="flex items-center gap-1">
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        ariaLabel={retryLabel}
+                                        title={retryLabel}
+                                        onClick={() => retryUpload(upload.id)}
+                                      >
+                                        {upload.file ? <IconRefresh size={13} /> : <IconUpload size={13} />}
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        ariaLabel={t("action.close")}
+                                        title={t("action.close")}
+                                        onClick={() => dismissUpload(upload.id)}
+                                      >
+                                        <IconClose size={13} />
+                                      </Button>
+                                    </div>
+                                  ) : upload.status === "uploading" ? (
+                                    <Button
+                                      size="sm"
+                                      variant="ghost"
+                                      ariaLabel={t("action.cancel")}
+                                      title={t("action.cancel")}
+                                      onClick={() => cancelUpload(upload.id)}
+                                    >
+                                      <IconClose size={13} />
+                                    </Button>
+                                  ) : null}
+                                </td>
                               </tr>
                             );
                           })}
                           {allDocuments.map((doc) => {
                             const typeInfo = getFileTypeInfo(doc.name, doc.file_type || undefined);
-                            const statusInfo = getVectorStatusBadge(doc.vector_status);
-                            const tblIdxProgress = parseIndexingProgress(doc.indexing_progress);
                             const docCanManageMetadata = canManageDocMetadata(doc);
                             const docManage = docCanManageMetadata || canDeleteDoc(doc);
                             const folderPathLabel = isSearching ? folderPathLabelForDocument(doc) : "";
@@ -4168,14 +4418,9 @@ export default function Knowledge() {
                                         </button>
                                       ) : (
                                         <button
-                                          onClick={async () => {
-                                            const url = await api.documents.download(doc.id);
-                                            const a = document.createElement("a");
-                                            a.href = url;
-                                            a.download = doc.name;
-                                            a.click();
-                                            URL.revokeObjectURL(url);
-                                          }}
+                                          onClick={() => { void downloadDocument(doc); }}
+                                          disabled={downloadingIds.includes(doc.id)}
+                                          aria-busy={downloadingIds.includes(doc.id)}
                                           className="kb-doc-name-link"
                                           type="button"
                                         >
@@ -4205,15 +4450,12 @@ export default function Knowledge() {
                                   {doc.created_at ? new Date(doc.created_at).toLocaleDateString() : "--"}
                                 </td>
                                 <td className="text-center">
-                                  <div className="flex items-center justify-center gap-1.5">
-                                    {isVectorInProgress(doc.vector_status) && (
-                                      <div className="status-spinner" style={{ width: 12, height: 12, borderWidth: 2, color: doc.vector_status === VectorStatus.GENERATING ? "#9079c2" : "#4f7d75" }} />
-                                    )}
-                                    <StatusBadge type={statusInfo.type} dot>
-                                      {statusInfo.label}
-                                      {tblIdxProgress.progress != null && tblIdxProgress.progress > 0 && ` ${tblIdxProgress.progress}%`}
-                                    </StatusBadge>
-                                  </div>
+                                  {doc.vector_status === VectorStatus.GENERATING && (
+                                    <div className="flex items-center justify-center gap-1.5">
+                                      <div className="status-spinner" style={{ width: 12, height: 12, borderWidth: 2, color: "#9079c2" }} />
+                                      <StatusBadge type="warning" dot>{t("component.card_status_overlay.generating")}</StatusBadge>
+                                    </div>
+                                  )}
                                 </td>
                                 <td className="text-right">
                                   {canDeleteDoc(doc) && (
@@ -4237,23 +4479,23 @@ export default function Knowledge() {
                   </section>
                 </div>
               )}
+              {(hasNextPage || isFetchNextPageError) && (
+                <div className="flex justify-center py-5">
+                  <Button
+                    variant="outline"
+                    disabled={isFetchingNextPage}
+                    ariaLabel={isFetchNextPageError ? t("page.tasks.retry_load_more") : t("webchat_page.load_more_documents")}
+                    onClick={() => { void fetchNextPage(); }}
+                  >
+                    {isFetchNextPageError ? t("page.tasks.retry_load_more") : t("webchat_page.load_more_documents")}
+                  </Button>
+                </div>
+              )}
             </div>
           </>
         </>
       )}
       </div>
-
-      <WikiMapModal
-        open={showWikiMap}
-        pages={wikiPages}
-        missingLinks={wikiMissingLinks}
-        onClose={() => setShowWikiMap(false)}
-        onCreatePage={startCreateWikiPage}
-        onOpenPage={openWikiPage}
-        onConnect={handleConnectWikiPages}
-        onRemoveLink={handleRemoveWikiLink}
-        isConnecting={connectWikiPagesMutation.isPending || removeWikiLinkMutation.isPending}
-      />
 
       {/* ── Quick Look Drawer ────────────────────────── */}
       {quickLookDoc && (
@@ -4312,7 +4554,6 @@ export default function Knowledge() {
                 {[
                   { label: t("page.qr.size"), value: quickLookDoc.file_size != null ? formatFileSize(quickLookDoc.file_size) : t("page.workspace_detail.unknown") },
                   { label: t("page.dashboard.created"), value: quickLookDoc.created_at ? new Date(quickLookDoc.created_at).toLocaleString() : t("page.workspace_detail.unknown") },
-                  { label: t("page.knowledge.vector_status"), value: quickLookDoc.vector_status || "Unknown" },
                   { label: t("page.skills.source"), value: quickLookDoc.source || "Upload" },
                 ].map((row) => (
                   <div key={row.label} className="flex items-center justify-between py-1.5 border-b border-stone-100">
@@ -4336,14 +4577,9 @@ export default function Knowledge() {
               )}
               <Button
                 variant="primary"
-                onClick={async () => {
-                  const url = await api.documents.download(quickLookDoc.id);
-                  const a = document.createElement("a");
-                  a.href = url;
-                  a.download = quickLookDoc.name;
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
+                loading={downloadingIds.includes(quickLookDoc.id)}
+                ariaBusy={downloadingIds.includes(quickLookDoc.id)}
+                onClick={() => { void downloadDocument(quickLookDoc); }}
               >
                 <IconDownload size={14} />
                 {t("page.knowledge.download")}
@@ -4439,7 +4675,6 @@ export default function Knowledge() {
               { label: t("page.custom_fields.type"), value: infoTarget.file_type || infoTarget.name?.split(".").pop() || "Unknown" },
               { label: t("page.qr.size"), value: infoTarget.file_size != null ? formatFileSize(infoTarget.file_size) : t("page.workspace_detail.unknown") },
               { label: t("page.skills.source"), value: infoTarget.source || "Upload" },
-              { label: t("page.knowledge.vector_status"), value: infoTarget.vector_status || "Unknown" },
               { label: t("page.dashboard.created"), value: infoTarget.created_at ? new Date(infoTarget.created_at).toLocaleString() : t("page.workspace_detail.unknown") },
             ].map((row) => (
               <div key={row.label} className="flex items-center justify-between py-1.5">
@@ -4532,7 +4767,7 @@ export default function Knowledge() {
 
       {/* ── Add to Workspace Picker ──────────────── */}
       <Modal
-        open={!!workspacePickerDoc && canManageAllDocuments && canManageDocMetadata(workspacePickerDoc)}
+        open={!!workspacePickerDoc && canManageDocMetadata(workspacePickerDoc)}
         onClose={() => setWorkspacePickerDoc(null)}
         title={t("page.knowledge.add_to_workspace")}
       >
@@ -4581,15 +4816,19 @@ export default function Knowledge() {
       {/* ── Move to Folder Picker ────────────────── */}
       <Modal
         open={!!movePickerDoc && canManageDocMetadata(movePickerDoc)}
-        onClose={() => setMovePickerDoc(null)}
+        onClose={() => { setMovePickerDoc(null); setFilingOnly(false); }}
         title={t("page.knowledge.move_to_folder_2")}
       >
         {movePickerDoc && (
           <div className="flex flex-col gap-1 max-h-[320px] overflow-y-auto">
+            <label className="flex items-center gap-2 px-3 py-2 text-sm text-stone-700">
+              <input type="checkbox" checked={filingOnly} onChange={(event) => setFilingOnly(event.target.checked)} />
+              {t("page.knowledge.keep_original_file_path")}
+            </label>
             {movePickerDoc.folder_id && (
               <button
                 className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-left hover:bg-stone-50 transition-colors"
-                onClick={() => { moveMutation.mutate({ id: movePickerDoc.id, folder_id: null }); setMovePickerDoc(null); }}
+                onClick={() => { moveMutation.mutate({ id: movePickerDoc.id, folder_id: null, filing_only: filingOnly }); setMovePickerDoc(null); setFilingOnly(false); }}
               >
                 <IconFolder size={16} className="text-amber-500 shrink-0" />
                 <span className="text-sm font-medium text-stone-700">{t("page.knowledge.root_no_folder")}</span>
@@ -4599,7 +4838,7 @@ export default function Knowledge() {
               <button
                 key={f.id}
                 className="flex items-center gap-3 w-full px-3 py-2.5 rounded-lg text-left hover:bg-stone-50 transition-colors"
-                onClick={() => { moveMutation.mutate({ id: movePickerDoc.id, folder_id: f.id }); setMovePickerDoc(null); }}
+                onClick={() => { moveMutation.mutate({ id: movePickerDoc.id, folder_id: f.id, filing_only: filingOnly }); setMovePickerDoc(null); setFilingOnly(false); }}
               >
                 <IconFolder size={16} className="text-amber-500 shrink-0" />
                 <span className="text-sm font-medium text-stone-700 truncate">{f.name}</span>
@@ -4811,6 +5050,7 @@ export default function Knowledge() {
       <UploadOptionsDialog
         open={canUploadKnowledge && uploadDialogOpen}
         files={pendingUploadFiles}
+        workspaceTarget={pendingUploadWorkspaceTarget}
         onCancel={() => {
           setPendingUploadFiles([]);
           setPendingUploadFolderId(null);
@@ -4821,7 +5061,7 @@ export default function Knowledge() {
           const folderId = pendingUploadFolderId;
           setPendingUploadFiles([]);
           setPendingUploadFolderId(null);
-          uploadMutation.mutate({ files, folderId, options: opts });
+          startUploads(files, folderId, opts);
         }}
       />
 
@@ -5030,24 +5270,12 @@ function FolderShareDialogContainer({
   );
 }
 
-// Adapter: capability set (server) -> role enum (UI). Mirrors the same
-// mapping FileViewer uses, kept inline to avoid an extra shared module
-// for two callers.
-function _folderCapsToRole(caps: string[]): "viewer" | "commenter" | "editor" | "curator" {
-  const set = new Set(caps);
-  if (set.has("manage_metadata") || set.has("grant_access")) return "curator";
-  if (set.has("edit")) return "editor";
-  if (set.has("comment")) return "commenter";
-  return "viewer";
+function _folderCapsToRole(caps: string[]): ShareRole {
+  return capabilitiesToShareRole(caps, "document_folder");
 }
 
-function _folderRoleToCaps(role: "viewer" | "commenter" | "editor" | "curator"): string[] {
-  switch (role) {
-    case "viewer":    return ["view"];
-    case "commenter": return ["view", "comment"];
-    case "editor":    return ["view", "comment", "edit", "upload_to"];
-    case "curator":   return ["view", "comment", "edit", "upload_to", "manage_metadata", "grant_access", "share_internal"];
-  }
+function _folderRoleToCaps(role: ShareRole): string[] {
+  return shareRoleCapabilities(role, "document_folder");
 }
 
 function _folderGrantToInternal(g: DocumentGrant) {
@@ -5259,21 +5487,12 @@ function DocShareDialogContainer({
   );
 }
 
-function _docCapsToRole(caps: string[]): "viewer" | "commenter" | "editor" | "curator" {
-  const set = new Set(caps);
-  if (set.has("manage_metadata") || set.has("grant_access")) return "curator";
-  if (set.has("edit")) return "editor";
-  if (set.has("comment")) return "commenter";
-  return "viewer";
+function _docCapsToRole(caps: string[]): ShareRole {
+  return capabilitiesToShareRole(caps);
 }
 
-function _docRoleToCaps(role: "viewer" | "commenter" | "editor" | "curator"): string[] {
-  switch (role) {
-    case "viewer":    return ["view"];
-    case "commenter": return ["view", "comment"];
-    case "editor":    return ["view", "comment", "edit"];
-    case "curator":   return ["view", "comment", "edit", "manage_metadata", "grant_access", "share_internal"];
-  }
+function _docRoleToCaps(role: ShareRole): string[] {
+  return shareRoleCapabilities(role);
 }
 
 function _docGrantToInternal(g: DocumentGrant, userById: Map<string, UserSummary>) {

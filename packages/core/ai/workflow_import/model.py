@@ -41,6 +41,12 @@ CANONICAL_NODE_TYPES = frozenset({
     "sort", "dedupe", "stop", "extractfromfile",
 })
 
+# Node types existing workflows still run but that nothing offers for new
+# ones: not the builder palette, the AI generator, importers or agent prompts.
+# ``rag`` is hidden while document indexing is paused — its retrieval only
+# sees content indexed before the pause.
+HIDDEN_NODE_TYPES = frozenset({"rag"})
+
 
 @dataclass
 class GraphNode:

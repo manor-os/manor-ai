@@ -405,6 +405,76 @@ async def test_tk_get_user_info_default_fields(tk_http):
     assert "follower_count" in q["fields"]
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "data"),
+    [
+        ("get_user_info", {}, {"user": {"display_name": "Example Creator"}}),
+        ("get_creator_info", {}, {
+            "creator_username": "creator_example",
+            "privacy_level_options": ["PUBLIC_TO_EVERYONE"],
+        }),
+        ("list_videos", {}, {"videos": [], "has_more": False}),
+        ("post_video", {"video_url": "uploads/chat/0123456789abcdef.mp4", "privacy_level": "PUBLIC_TO_EVERYONE"}, {"publish_id": "p1"}),
+        ("get_publish_status", {"publish_id": "p1"}, {"status": "PUBLISH_COMPLETE"}),
+    ],
+)
+async def test_tk_success_envelope_respects_runtime_error_contract(
+    tk_http, monkeypatch, tool_name, arguments, data,
+):
+    from packages.core.ai.runtime.streams import (
+        runtime_tool_call_error,
+        runtime_tool_call_outcome,
+        runtime_tool_path_memory_outcome,
+        runtime_tool_status_for_chat,
+    )
+    from packages.core.ai.tools.mcp_builtin import _mcp_tool_result_to_text
+
+    metadata = {"code": "ok", "message": "", "log_id": "test-request-id"}
+    provider_response = {"data": data, "error": metadata}
+    tk_http.response = _FakeResp(200, provider_response)
+
+    if tool_name == "post_video":
+        from unittest.mock import AsyncMock
+        from packages.core.services import tiktok_publish_review
+        from test_tiktok_mcp import CREATOR, MEDIA, approved_call_context
+
+        monkeypatch.setattr(tiktok_publish_review, "inspect_chat_video", AsyncMock(return_value=MEDIA))
+        monkeypatch.setattr(tk, "_signed_chat_video_url", AsyncMock(return_value="https://example.com/signed.mp4"))
+        tk_http.route = lambda _method, url: (
+            _FakeResp(200, {"data": CREATOR, "error": metadata})
+            if "creator_info" in url else _FakeResp(200, provider_response)
+        )
+        with approved_call_context(arguments):
+            out = await tk.call_tool(tool_name, arguments, _TOKEN)
+    else:
+        out = await tk.call_tool(tool_name, arguments, _TOKEN)
+    result = _mcp_tool_result_to_text(out)
+
+    assert out["isError"] is False
+    assert runtime_tool_status_for_chat(result) == "success"
+    assert runtime_tool_path_memory_outcome(result) == "success"
+    assert runtime_tool_call_error(result) is None
+    assert runtime_tool_call_outcome(f"mcp__tiktok__{tool_name}", result) == "success"
+    payload = json.loads(result)
+    assert not payload.get("error")
+    assert payload["data"] == data
+    assert payload["response_metadata"] == metadata
+    assert provider_response == {"data": data, "error": metadata}
+
+
+@pytest.mark.parametrize("code", [None, 0, "0", "ok", "OK"])
+async def test_tk_accepted_success_codes_keep_diagnostics_outside_error(tk_http, code):
+    metadata = {"code": code, "message": "", "log_id": "test-request-id"}
+    tk_http.response = _FakeResp(200, {"data": {"user": {}}, "error": metadata})
+
+    out = await tk.call_tool("get_user_info", {}, _TOKEN)
+    payload = json.loads(out["content"][0]["text"])
+
+    assert out["isError"] is False
+    assert not payload.get("error")
+    assert payload["response_metadata"] == metadata
+
+
 async def test_tk_list_videos_body(tk_http):
     tk_http.response = _FakeResp(200, {"data": {"videos": []}})
     await tk.call_tool("list_videos", {"max_count": 5}, _TOKEN)
@@ -440,6 +510,13 @@ async def test_tk_non_2xx_surfaces_as_error(tk_http):
 
 
 async def test_tk_http_200_business_error_surfaces_as_error(tk_http):
+    from packages.core.ai.runtime.streams import (
+        runtime_tool_call_error,
+        runtime_tool_path_memory_outcome,
+        runtime_tool_status_for_chat,
+    )
+    from packages.core.ai.tools.mcp_builtin import _mcp_error_result_to_text
+
     tk_http.response = _FakeResp(
         200,
         {"data": {}, "error": {"code": "scope_not_authorized", "message": "scope missing"}},
@@ -449,6 +526,10 @@ async def test_tk_http_200_business_error_surfaces_as_error(tk_http):
 
     assert out["isError"] is True
     assert "scope_not_authorized" in out["content"][0]["text"]
+    result = _mcp_error_result_to_text("tiktok", "get_user_info", out)
+    assert runtime_tool_status_for_chat(result) == "error"
+    assert runtime_tool_path_memory_outcome(result) == "failure"
+    assert runtime_tool_call_error(result) is not None
 
 
 async def test_tk_query_videos_csv_ids(tk_http):
@@ -461,33 +542,38 @@ async def test_tk_query_videos_csv_ids(tk_http):
 # ── TikTok: publish ──────────────────────────────────────────────────────────
 
 
-async def test_tk_post_video_pull_from_url(tk_http):
+async def test_tk_post_video_pull_from_url(tk_http, monkeypatch):
+    from unittest.mock import AsyncMock
+    from packages.core.services import tiktok_publish_review
+    from test_tiktok_mcp import CREATOR, MEDIA, approved_call_context
+
     tk_http.response = _FakeResp(200, {"data": {"publish_id": "p1"}})
-    await tk.call_tool(
-        "post_video",
-        {"video_url": "https://cdn.example.com/v.mp4", "title": "hi"},
-        _TOKEN,
-    )
+    monkeypatch.setattr(tiktok_publish_review, "inspect_chat_video", AsyncMock(return_value=MEDIA))
+    monkeypatch.setattr(tk, "_get_creator_info", AsyncMock(return_value=json.dumps({"data": CREATOR})))
+    monkeypatch.setattr(tk, "_signed_chat_video_url", AsyncMock(return_value="https://cdn.example.com/v.mp4"))
+    arguments = {"video_url": MEDIA["rel_path"], "title": "hi", "privacy_level": "PUBLIC_TO_EVERYONE"}
+    with approved_call_context(arguments):
+        result = await tk.call_tool("post_video", arguments, _TOKEN)
+    assert not result["isError"]
     call = _last(tk_http)
     path, _ = _split(call["url"])
     assert path.endswith("/v2/post/publish/video/init/")
     body = call["json"]
     assert body["source_info"] == {"source": "PULL_FROM_URL", "video_url": "https://cdn.example.com/v.mp4"}
-    # unaudited apps can only post privately — default must be SELF_ONLY
-    assert body["post_info"]["privacy_level"] == "SELF_ONLY"
+    assert body["post_info"]["privacy_level"] == "PUBLIC_TO_EVERYONE"
+    assert body["post_info"]["disable_comment"] is True
     assert body["post_info"]["title"] == "hi"
 
 
-async def test_tk_post_photo_urls_and_mode(tk_http):
+async def test_tk_post_photo_requires_matching_review(tk_http):
     tk_http.response = _FakeResp(200, {"data": {"publish_id": "p2"}})
-    await tk.call_tool(
+    result = await tk.call_tool(
         "post_photo",
         {"photo_urls": ["https://x/1.jpg", "https://x/2.jpg"], "title": "t"},
         _TOKEN,
     )
-    body = _last(tk_http)["json"]
-    assert body["media_type"] == "PHOTO" and body["post_mode"] == "DIRECT_POST"
-    assert body["source_info"]["photo_images"] == ["https://x/1.jpg", "https://x/2.jpg"]
+    assert result["isError"]
+    assert not tk_http.calls
 
 
 async def test_tk_get_publish_status(tk_http):

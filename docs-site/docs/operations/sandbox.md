@@ -52,6 +52,12 @@ The sandbox service itself is tuned with `SANDBOX_*` variables on the
 
 ## Operational Guidance
 
+The public native browser and Code Projects execution paths use self-hosted
+sandbox capabilities. The private Chrome extension/CLI runtime is not required
+or included. Missing sandbox configuration should be resolved for the dependent
+tool, not by disabling unrelated Workspace features. Commercial quota bypasses
+do not bypass sandbox resource limits, approval or tool scopes.
+
 - Only expose the sandbox endpoint inside the Docker network; nothing outside
   the stack should reach it.
 - Treat shell execution as a sensitive capability: pair it with agent tool

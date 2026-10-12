@@ -12,8 +12,11 @@ the installable content actually changed — so shipping a corrected config
 tells every workspace installed from it that an update exists, without anyone
 remembering to touch a number.
 
-Runs at API start, beside the other catalogue seeders. Idempotent: a
-redeploy of unchanged configs writes nothing and moves no version.
+Cloud K8s runs this from the deployment's one-shot Blueprint publisher after
+every runtime rollout is complete. Single-owner API deployments, including
+OSS and Compose, keep their startup compatibility path. Idempotent: unchanged
+configs write nothing and move no version.
+Archived listings stay withdrawn until an explicit publication action.
 """
 from __future__ import annotations
 
@@ -31,8 +34,12 @@ from packages.core.blueprints.freshness import (
     next_content_version,
 )
 from packages.core.blueprints.payload import detect_version
-from packages.core.blueprints.solo_company import get_solo_company_blueprints
+from packages.core.blueprints.catalogue import get_platform_blueprints
 from packages.core.models.blueprint import WorkspaceBlueprint
+from packages.core.services.blueprint_listing_settings import (
+    blueprint_listing_overrides,
+    lock_blueprint_listing_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +47,38 @@ logger = logging.getLogger(__name__)
 #: URL and stored reference that already names it.
 PLATFORM_BLUEPRINT_ID_PREFIX = "builtin:"
 
+RETIRED_PLATFORM_BLUEPRINT_SLUGS = (
+    "solo-creator-fundraising-room-v1",
+    "solo-creator-partnership-studio-v1",
+    "solo-video-account-studio-v1",
+    "solo-productized-service-os-v1",
+    "solo-digital-product-store-v1",
+    # Replaced by jr-ai-music-first-release-automatic-goals-v1.
+    "jr-music-release-beginner-v1",
+    "jr-ai-music-first-release-automatic-goals-v4",
+    # Single-request document helpers do not justify standalone Workspaces.
+    # Keep their source examples and existing installs, but withdraw listings.
+    "practical-meeting-notes-v1",
+    "practical-weekly-update-v1",
+    "practical-feedback-triage-v1",
+    "practical-support-replies-v1",
+    "practical-proposal-draft-v1",
+    "practical-sop-builder-v1",
+    "practical-job-application-v1",
+    "practical-content-repurpose-v1",
+    "practical-bilingual-editor-v1",
+    "practical-source-brief-v1",
+)
+
 PUBLISHED = BlueprintStatus.PUBLISHED.value
+LISTING_OVERRIDE_FIELDS = (
+    "title",
+    "summary",
+    "description",
+    "tags",
+    "cover_image_url",
+    "showcase_assets",
+)
 
 
 def platform_blueprint_id(slug: str) -> str:
@@ -140,14 +178,55 @@ def _manifest(payload: dict[str, Any]) -> dict[str, Any]:
     return manifest if isinstance(manifest, dict) else {}
 
 
-async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
-    """Upsert the platform's blueprints. Returns {slug: content_version}.
+def _payload_with_listing_overrides(
+    payload: dict[str, Any],
+    overrides: Any,
+) -> dict[str, Any]:
+    """Project durable Admin listing copy without changing runtime content."""
+    if not isinstance(overrides, dict) or not overrides:
+        return payload
+    manifest = dict(_manifest(payload))
+    manifest.update({
+        key: overrides[key]
+        for key in LISTING_OVERRIDE_FIELDS
+        if key in overrides
+    })
+    return {**payload, "manifest": manifest}
 
-    Caller commits.
+
+def _platform_blueprint_pricing(
+    slug: str,
+    overrides: Any,
+) -> dict[str, Any]:
+    """Resolve commerce fields without putting them in portable payloads."""
+    pricing: dict[str, Any] = {}
+    return pricing
+
+
+async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
+    """Publish current configs while preserving Admin-withdrawn listings.
+
+    Returns {slug: content_version}. Caller commits.
     """
     published: dict[str, str] = {}
+    listing_settings = await lock_blueprint_listing_settings(db)
+    listing_overrides = blueprint_listing_overrides(listing_settings.value)
 
-    for payload in get_solo_company_blueprints():
+    # Removing a config must also withdraw listings already seeded by older
+    # releases, including legacy ids. Keep their identity and purchase history.
+    retired_rows = (await db.execute(
+        select(WorkspaceBlueprint).where(
+            WorkspaceBlueprint.entity_id.is_(None),
+            WorkspaceBlueprint.slug.in_(RETIRED_PLATFORM_BLUEPRINT_SLUGS),
+        ).with_for_update()
+    )).scalars().all()
+    for row in retired_rows:
+        if row.status != BlueprintStatus.ARCHIVED.value or row.share_token is not None:
+            row.status = BlueprintStatus.ARCHIVED.value
+            row.share_token = None
+            logger.info("platform blueprint retired: %s (%s)", row.slug, row.id)
+
+    for payload in get_platform_blueprints():
         manifest = _manifest(payload)
         slug = str(manifest.get("slug") or "").strip()
         if not slug:
@@ -156,20 +235,22 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
 
         row_id = platform_blueprint_id(slug)
         row = (await db.execute(
-            select(WorkspaceBlueprint).where(WorkspaceBlueprint.id == row_id)
+            select(WorkspaceBlueprint)
+            .where(WorkspaceBlueprint.id == row_id)
+            .with_for_update()
         )).scalar_one_or_none()
         if row is None:
             # Before stable builtin:<slug> ids, official listings could be
             # published with a generated id. Creating the stable row beside
             # one of those collides with the platform-slug unique index and
-            # aborts the entire startup seed, leaving every later Blueprint
+            # aborts the publication, leaving every later Blueprint
             # payload stale. Reconcile that legacy row in place; its id may
             # still be referenced by installed workspaces and purchases.
             row = (await db.execute(
                 select(WorkspaceBlueprint).where(
                     WorkspaceBlueprint.entity_id.is_(None),
                     WorkspaceBlueprint.slug == slug,
-                )
+                ).with_for_update()
             )).scalars().first()
             if row is not None:
                 logger.info(
@@ -178,6 +259,15 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
                     row.id,
                 )
 
+        # Admin lifecycle changes are durable, including for legacy platform
+        # ids. A deployment must not republish or rewrite a withdrawn release
+        # merely because its config still ships in the catalogue.
+        if row is not None and row.status != BlueprintStatus.PUBLISHED.value:
+            continue
+
+        overrides = listing_overrides.get(slug)
+        payload = _payload_with_listing_overrides(payload, overrides)
+        manifest = _manifest(payload)
         version, fingerprint = next_content_version(
             current_version=getattr(row, "content_version", None) or FIRST_CONTENT_VERSION,
             stored_fingerprint=getattr(row, "content_fingerprint", None),
@@ -213,6 +303,7 @@ async def seed_platform_blueprints(db: AsyncSession) -> dict[str, str]:
             "status": PUBLISHED,
             "content_version": version,
             "content_fingerprint": fingerprint,
+            **_platform_blueprint_pricing(slug, overrides),
         }
 
         if row is None:

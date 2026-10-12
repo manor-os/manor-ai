@@ -18,7 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.database import async_session
 from packages.core.models.base import generate_ulid
-from packages.core.models.document import Document, DocumentFolder, DocumentGroupMember, VectorStatus
+from packages.core.models.document import (
+    Document,
+    DocumentFolder,
+    DocumentGroup,
+    DocumentGroupMember,
+    VectorStatus,
+)
 from packages.core.models.permission import (
     Classification,
     GrantStatus,
@@ -113,6 +119,14 @@ class KnowledgeReconcileResult:
     limited: bool = False
 
 
+@dataclass(frozen=True)
+class KnowledgeProjectionRepairResult:
+    """Summary of the bounded legacy workspace filing repair."""
+
+    repaired_documents: int = 0
+    skipped_shared_documents: int = 0
+
+
 @asynccontextmanager
 async def _knowledge_sync_session(db: AsyncSession | None):
     if db is not None:
@@ -141,6 +155,7 @@ async def sync_file_to_knowledge(
     classification: str | None = None,
     client_visible: bool | None = None,
     expected_content_sha256: str | None = None,
+    storage_admission_prevalidated: bool = False,
     db: AsyncSession | None = None,
     commit: bool = False,
 ) -> KnowledgeSyncResult:
@@ -187,19 +202,47 @@ async def sync_file_to_knowledge(
     size = file_stat.st_size
     ext = detected.extension
     mime_type = detected.mime_type
-    if not workspace_id:
-        from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
-        workspace_id = await infer_workspace_id_from_storage_path(
-            entity_id=entity_id,
-            rel_path=rel_path,
-        )
+    from packages.core.services.workspace_artifacts import (
+        infer_workspace_id_from_storage_path,
+        resolve_workspace_folder_binding,
+    )
+    target_workspace_id = await infer_workspace_id_from_storage_path(
+        entity_id=entity_id,
+        rel_path=rel_path,
+        db=db,
+    )
+    if folder_id:
+        if db is None:
+            async with async_session() as lookup_db:
+                folder_binding = await resolve_workspace_folder_binding(
+                    lookup_db, entity_id=entity_id, folder_id=folder_id,
+                )
+        else:
+            folder_binding = await resolve_workspace_folder_binding(
+                db, entity_id=entity_id, folder_id=folder_id,
+            )
+        if folder_binding:
+            target_workspace_id = folder_binding.workspace_id
+    if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+        return KnowledgeSyncResult(False, reason="workspace_scope_mismatch")
+    workspace_id = workspace_id or target_workspace_id
+    from packages.core.services.conversation_generated_files import (
+        ensure_conversation_generated_folder, is_default_chat_output_path,
+    )
+
+    chat_default = (
+        (source == "ai_generated" or (source == "agent" and tool_name == "subagent_text_artifact"))
+        and bool(conversation_id and user_id)
+        and not workspace_id and not task_id
+        and is_default_chat_output_path(rel_path)
+    )
     resolved_folder_id = folder_id
-    if resolved_folder_id is None:
-        if workspace_id:
+    if resolved_folder_id is None and not chat_default:
+        if target_workspace_id:
             from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
             resolved_folder_id = await ensure_workspace_document_folder(
                 entity_id=entity_id,
-                workspace_id=workspace_id,
+                workspace_id=target_workspace_id,
                 rel_path=rel_path,
                 db=db,
             )
@@ -210,19 +253,87 @@ async def sync_file_to_knowledge(
                     resolved_folder_id = await ensure_folder_path(
                         entity_id,
                         rel_dir,
+                        owner_id=user_id,
                         db=db,
                     )
                 else:
                     resolved_folder_id = await find_folder_path(
                         entity_id,
                         rel_dir,
+                        owner_id=user_id,
                         db=db,
                     )
 
     # Reconcile re-projects files already on disk, so it must never be blocked
-    # by the storage quota; every other source counts as adding to the KB.
-    skip_storage_check = source == "filesystem_reconcile"
+    # by the storage quota. A browser upload recovery intent is also one
+    # already-admitted logical attempt: its first request passed the route and
+    # persistence gates before the commit outcome became ambiguous. Only that
+    # caller may set ``storage_admission_prevalidated`` after validating the
+    # same owner, idempotency key, request fingerprint, and source path.
+    skip_storage_check = source == "filesystem_reconcile" or storage_admission_prevalidated
+    resolved_visibility = (
+        visibility
+        if visibility is not None
+        else "workspace" if target_workspace_id else "private"
+    )
     async with _knowledge_sync_session(db) as (sync_db, owns_session):
+        resolved_folder_id = folder_id
+        if resolved_folder_id is None:
+            resolved_folder_id = await _existing_valid_document_folder_id(
+                sync_db,
+                entity_id=entity_id,
+                fs_path=rel_path,
+            )
+        if resolved_folder_id and not target_workspace_id:
+            folder_binding = await resolve_workspace_folder_binding(
+                sync_db, entity_id=entity_id, folder_id=resolved_folder_id,
+            )
+            if folder_binding:
+                target_workspace_id = folder_binding.workspace_id
+        if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+            return KnowledgeSyncResult(False, reason="workspace_scope_mismatch")
+        workspace_id = workspace_id or target_workspace_id
+        if resolved_folder_id is None and chat_default and not target_workspace_id:
+            existing_document_id = (await sync_db.execute(select(Document.id).where(
+                Document.entity_id == entity_id,
+                Document.fs_path == rel_path,
+            ).limit(1))).scalar_one_or_none()
+            if existing_document_id is None:
+                resolved_folder_id = await ensure_conversation_generated_folder(
+                    sync_db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+        if resolved_folder_id is None:
+            if target_workspace_id:
+                from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+                resolved_folder_id = await ensure_workspace_document_folder(
+                    entity_id=entity_id,
+                    workspace_id=target_workspace_id,
+                    rel_path=rel_path,
+                    db=sync_db,
+                )
+            else:
+                rel_dir = os.path.dirname(rel_path)
+                if rel_dir and is_user_visible_folder_path(rel_dir):
+                    if source in _AUTO_CREATE_FOLDER_SOURCES:
+                        resolved_folder_id = await ensure_folder_path(
+                            entity_id,
+                            rel_dir,
+                            owner_id=user_id,
+                            db=sync_db,
+                        )
+                    else:
+                        resolved_folder_id = await find_folder_path(
+                            entity_id,
+                            rel_dir,
+                            owner_id=user_id,
+                            db=sync_db,
+                        )
+        # A Workspace-bound destination is shared with that Workspace even
+        # when a caller still supplies an older personal visibility hint.
+        resolved_visibility = "workspace" if target_workspace_id else (visibility or "private")
         try:
             upsert = await upsert_document_by_fs_path_result(
                 sync_db,
@@ -236,13 +347,17 @@ async def sync_file_to_knowledge(
                 created_by=created_by,
                 owner_id=user_id,
                 folder_id=resolved_folder_id,
-                visibility=visibility,
+                visibility=resolved_visibility,
                 classification=classification,
                 client_visible=client_visible,
                 skip_storage_check=skip_storage_check,
                 emit_created_event=False,
             )
             doc = upsert.document
+            if target_workspace_id and doc.visibility != "workspace":
+                # Reconciliation preserves most existing ACLs, but a file
+                # physically filed into Workspace Knowledge is Workspace-shared.
+                doc.visibility = "workspace"
         except StorageLimitExceeded:
             # Over the plan limit: the file stays on disk but is not added to the
             # knowledge index. Callers (e.g. the generate_file tool) surface this.
@@ -288,8 +403,6 @@ async def sync_file_to_knowledge(
             stale_meta.pop("content_text", None)
             stale_meta.pop("content", None)
             doc.metadata_ = stale_meta
-        if resolved_folder_id is None and is_storage_only_path(rel_path):
-            doc.folder_id = None
         if source in _FINAL_ARTIFACT_SOURCES or is_storage_only_path(rel_path):
             doc.metadata_ = merge_document_metadata(
                 doc.metadata_,
@@ -334,6 +447,126 @@ async def sync_file_to_knowledge(
             fs_path=getattr(doc, "fs_path", None),
             created=upsert.created,
         )
+
+
+async def _existing_valid_document_folder_id(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    fs_path: str,
+) -> str | None:
+    """Return an established logical folder for this physical file."""
+    return (await db.execute(
+        select(Document.folder_id)
+        .join(
+            DocumentFolder,
+            (DocumentFolder.id == Document.folder_id)
+            & (DocumentFolder.entity_id == Document.entity_id),
+        )
+        .where(
+            Document.entity_id == entity_id,
+            Document.fs_path == fs_path,
+            Document.is_trashed.is_(False),
+        )
+        .order_by(Document.updated_at.desc(), Document.id.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+
+
+async def repair_workspace_document_projection(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    document_ids: tuple[str, ...] | None = None,
+) -> KnowledgeProjectionRepairResult:
+    """File only uniquely-owned legacy workspace documents into their tree.
+
+    This is metadata-only: document IDs, filesystem paths, ACLs, and sharing
+    stay untouched.
+    """
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+
+    workspace = (await db.execute(
+        select(Workspace).where(
+            Workspace.id == workspace_id,
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+        ).with_for_update().limit(1)
+    )).scalar_one_or_none()
+    if workspace is None:
+        return KnowledgeProjectionRepairResult()
+
+    query = select(Document).where(
+            Document.entity_id == entity_id,
+            Document.is_trashed.is_(False),
+            Document.metadata_["origin"]["workspace_id"].astext == workspace_id,
+    )
+    if document_ids is not None:
+        query = query.where(Document.id.in_(document_ids))
+    candidates = list((await db.execute(query.order_by(Document.id).with_for_update())).scalars().all())
+    repaired = 0
+    skipped_shared = 0
+    for document in candidates:
+        existing_folder = await _existing_valid_document_folder_id_for_document(db, document)
+        if existing_folder and "/" not in document.name and "\\" not in document.name:
+            continue
+        membership_workspaces = set((await db.scalars(
+            select(DocumentGroup.workspace_id)
+            .join(DocumentGroupMember, DocumentGroupMember.group_id == DocumentGroup.id)
+            .where(DocumentGroupMember.document_id == document.id)
+        )).all())
+        has_document_acl = (await db.scalar(
+            select(ResourceGrant.id).where(
+                ResourceGrant.entity_id == entity_id,
+                ResourceGrant.resource_type == ResourceType.DOCUMENT,
+                ResourceGrant.resource_id == document.id,
+            ).limit(1)
+        )) is not None or (await db.scalar(
+            select(Share.id).where(
+                Share.entity_id == entity_id,
+                Share.resource_type == ResourceType.DOCUMENT,
+                Share.resource_id == document.id,
+            ).limit(1)
+        )) is not None
+        if membership_workspaces - {workspace_id} or has_document_acl:
+            skipped_shared += 1
+            continue
+        metadata = document.metadata_ if isinstance(document.metadata_, dict) else {}
+        legacy_path = normalize_rel_path(
+            str(metadata.get("blueprint_starter_path") or document.name or "")
+        )
+        if not legacy_path or legacy_path.startswith("../"):
+            continue
+        document.name = document.name.replace("\\", "/").rsplit("/", 1)[-1]
+        if not existing_folder:
+            document.folder_id = await ensure_workspace_document_folder(
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                rel_path=legacy_path,
+                db=db,
+            )
+        repaired += 1
+    if repaired:
+        await db.flush()
+    return KnowledgeProjectionRepairResult(
+        repaired_documents=repaired,
+        skipped_shared_documents=skipped_shared,
+    )
+
+
+async def _existing_valid_document_folder_id_for_document(
+    db: AsyncSession,
+    document: Document,
+) -> str | None:
+    if not document.folder_id:
+        return None
+    return (await db.execute(
+        select(DocumentFolder.id).where(
+            DocumentFolder.id == document.folder_id,
+            DocumentFolder.entity_id == document.entity_id,
+        ).limit(1)
+    )).scalar_one_or_none()
 
 
 async def reconcile_entity_filesystem(
@@ -456,6 +689,8 @@ async def bind_document_to_workspace(
     conversation_id: str | None = None,
     user_id: str | None = None,
     tool_name: str | None = None,
+    db: AsyncSession | None = None,
+    commit: bool = False,
 ) -> str | None:
     """Mark an existing document as produced or used in a workspace.
 
@@ -465,9 +700,9 @@ async def bind_document_to_workspace(
     """
     if not workspace_id:
         return None
-    async with async_session() as db:
+    async with _knowledge_sync_session(db) as (sync_db, owns_session):
         doc_id = await _mark_document_workspace_origin(
-            db,
+            sync_db,
             entity_id=entity_id,
             document_id=document_id,
             workspace_id=workspace_id,
@@ -478,8 +713,9 @@ async def bind_document_to_workspace(
             user_id=user_id,
             tool_name=tool_name,
         )
-        await db.commit()
-        if doc_id:
+        if owns_session or commit:
+            await sync_db.commit()
+        if doc_id and (owns_session or commit):
             await bump_tool_cache_version(entity_id, "documents")
         return doc_id
 
@@ -581,6 +817,7 @@ async def _ensure_folder_path_in_session(
             entity_id=entity_id,
             parent_id=parent_id,
             name=name,
+            owner_id=owner_id,
         )
         if not folder_id:
             folder_id = generate_ulid()
@@ -592,6 +829,7 @@ async def _ensure_folder_path_in_session(
                     name=name,
                     parent_id=parent_id,
                     owner_id=owner_id,
+                    visibility="private" if owner_id else "entity",
                 )
                 .on_conflict_do_nothing()
                 .returning(DocumentFolder.id)
@@ -603,6 +841,7 @@ async def _ensure_folder_path_in_session(
                     entity_id=entity_id,
                     parent_id=parent_id,
                     name=name,
+                    owner_id=owner_id,
                 )
             if not folder_id:
                 raise RuntimeError(f"Could not create or find Knowledge folder: {rel_path}")
@@ -627,12 +866,14 @@ async def _find_folder_id_at_position(
     entity_id: str,
     parent_id: str | None,
     name: str,
+    owner_id: str | None,
 ) -> str | None:
     result = await db.execute(
         select(DocumentFolder.id).where(
             DocumentFolder.entity_id == entity_id,
             DocumentFolder.name == name,
             DocumentFolder.parent_id == parent_id,
+            DocumentFolder.owner_id == owner_id,
         ).limit(1)
     )
     return result.scalar_one_or_none()
@@ -642,6 +883,7 @@ async def find_folder_path(
     entity_id: str,
     rel_path: str,
     *,
+    owner_id: str | None = None,
     db: AsyncSession | None = None,
 ) -> str | None:
     """Find an existing DocumentFolder chain without creating missing folders."""
@@ -650,6 +892,7 @@ async def find_folder_path(
             db,
             entity_id=entity_id,
             rel_path=rel_path,
+            owner_id=owner_id,
         )
         return folder.id if folder else None
     async with async_session() as owned_db:
@@ -657,6 +900,7 @@ async def find_folder_path(
             owned_db,
             entity_id=entity_id,
             rel_path=rel_path,
+            owner_id=owner_id,
         )
         return folder.id if folder else None
 
@@ -666,6 +910,7 @@ async def _find_folder_path_in_session(
     *,
     entity_id: str,
     rel_path: str,
+    owner_id: str | None = None,
 ) -> DocumentFolder | None:
     rel_path = normalize_rel_path(rel_path)
     if not rel_path or not is_user_visible_folder_path(rel_path):
@@ -679,11 +924,17 @@ async def _find_folder_path_in_session(
                 DocumentFolder.entity_id == entity_id,
                 DocumentFolder.name == name,
                 DocumentFolder.parent_id == parent_id,
-            ).limit(1)
+                *(
+                    (DocumentFolder.owner_id == owner_id,)
+                    if owner_id is not None
+                    else ()
+                ),
+            ).limit(2)
         )
-        folder = result.scalar_one_or_none()
-        if not folder:
+        matches = result.scalars().all()
+        if len(matches) != 1:
             return None
+        folder = matches[0]
         parent_id = folder.id
     return folder
 

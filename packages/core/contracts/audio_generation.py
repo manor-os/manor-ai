@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import NotRequired, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 
 NARRATION_VOICE_MODE_RANDOM_PER_TASK = "random_per_task"
+NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION = "random_per_conversation"
 NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE = "fixed_per_workspace"
 
 
@@ -56,12 +57,17 @@ class AudioGenerationFormat(StringValueEnum):
 
 
 class AudioGenerationStatus(StringValueEnum):
+    PENDING = "pending"
     COMPLETED = "completed"
     ERROR = "error"
+    # Optional audio (music) that could not be made: nothing was produced and
+    # the caller continues without it.
+    SKIPPED = "skipped"
 
 
 class AudioGenerationErrorCode(StringValueEnum):
     INVALID_REQUEST = "invalid_request"
+    MODEL_CHANGED_REINSPECT_REQUIRED = "audio_model_changed_reinspect_required"
     UNSUPPORTED_NONVOICE_AUDIO_MODEL = "unsupported_nonvoice_audio_model"
     PROVIDER_KEY_REQUIRED = "provider_key_required"
     NATIVE_MUSIC_KEY_REQUIRED = "native_music_key_required"
@@ -69,6 +75,7 @@ class AudioGenerationErrorCode(StringValueEnum):
     PROVIDER_BLOCKER = "provider_blocker"
     AUDIO_GENERATION_FAILED = "audio_generation_failed"
     NARRATION_VOICE_PROFILE_TASK_REQUIRED = "narration_voice_profile_task_required"
+    NARRATION_VOICE_PROFILE_CONVERSATION_REQUIRED = "narration_voice_profile_conversation_required"
     NARRATION_VOICE_PROFILE_WORKSPACE_REQUIRED = "narration_voice_profile_workspace_required"
     NARRATION_VOICE_PROFILE_UNSUPPORTED = "narration_voice_profile_unsupported"
     NARRATION_VOICE_PROFILE_INVALID = "narration_voice_profile_invalid"
@@ -79,6 +86,7 @@ class AudioGenerationProvider(StringValueEnum):
     GOOGLE = "google"
     OPENAI = "openai"
     ZYPHRA = "zyphra"
+    SUNO = "suno"
     UNKNOWN = "unknown"
 
     @classmethod
@@ -139,6 +147,7 @@ class AudioGenerationCompletedResult(TypedDict):
     duration_seconds: float | None
     requested_duration_seconds: float | None
     file_size: int
+    file: NotRequired[dict[str, Any]]
     narration_profile: NotRequired[dict[str, str | int]]
 
 
@@ -152,6 +161,7 @@ class AudioGenerationErrorResult(TypedDict):
     retryable: bool
     audio_generated: bool
     model: NotRequired[str]
+    expected_model: NotRequired[str]
     provider_status: NotRequired[int | None]
     attempts: NotRequired[int]
     format_related: NotRequired[bool]

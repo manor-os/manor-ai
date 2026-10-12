@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,6 +20,8 @@ from packages.core.ai.runtime import (
     runtime_strategist_user_prompt_v2,
     runtime_validation_retry_user_prompt,
 )
+from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+from packages.core.services.sensitive_data import sanitize_approval_credentials, sanitize_sensitive_payload
 from packages.core.strategist.context import StrategistContext
 from packages.core.strategist.proposal import Proposal
 
@@ -35,6 +37,15 @@ parts (services list, JSON schema) are still appended in code so an
 edited skill body can't break the contract."""
 
 
+class StrategistProposalGenerationError(RuntimeError):
+    """The review produced no valid Proposal; never a successful empty cohort."""
+
+    def __init__(self, message: str, *, code: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = sanitize_sensitive_payload(sanitize_approval_credentials(details or {}))
+
+
 # ── LLM call orchestration ───────────────────────────────────────────
 
 async def generate_proposal(
@@ -43,12 +54,13 @@ async def generate_proposal(
     review_id: str,
     db: Optional[AsyncSession] = None,
     briefing_markdown: Optional[str] = None,
+    user_id: str | None = None,
 ) -> Proposal:
     """Single Claude call → validated Proposal, with one repair retry.
 
     ``briefing_markdown`` (strategist_review_v2 only) swaps the legacy
     context sections for the deterministic ReviewBriefing markdown (M5/M6).
-    ``None`` keeps the legacy prompt byte-identical.
+    Both paths include the same authoritative execution snapshot.
 
     The optional DB session is used only to resolve the Strategist prompt
     Skill. That read phase is committed before the external model call so a
@@ -76,37 +88,99 @@ async def generate_proposal(
             briefing_markdown, ctx, review_id=review_id,
         )
 
-    raw = await _safe_runtime_completion(ctx, system_prompt, user_prompt)
+    current_prompt = user_prompt
+    for attempt in range(1, 3):
+        raw = await _safe_runtime_completion(ctx, system_prompt, current_prompt, user_id=user_id)
+        try:
+            proposal = _parse_proposal(raw, review_id=review_id)
+            _validate_execution_review(proposal, getattr(ctx, "execution_snapshot", {}) or {})
+            return proposal
+        except StrategistProposalGenerationError as exc:
+            details = {**exc.details, "review_id": review_id, "attempts": attempt}
+            logger.warning("Strategist Proposal validation failed: code=%s details=%s", exc.code, details)
+            if attempt == 2:
+                raise StrategistProposalGenerationError(str(exc), code=exc.code, details=details) from exc
+            current_prompt = runtime_validation_retry_user_prompt(
+                user_prompt,
+                json.dumps(tool_error_payload(
+                    tool_name="strategist_proposal", code=exc.code, message=str(exc), details=details,
+                ), ensure_ascii=False),
+            )
+    raise AssertionError("Bounded Proposal generation did not return")
 
-    if raw is None:
-        # No LLM available — produce a minimal "no new tasks" proposal
-        # so downstream code paths stay exercised in CI / dev.
-        logger.warning("Strategist: LLM unavailable, returning empty proposal")
-        return _fallback_proposal(ctx, review_id=review_id)
 
-    parsed = _parse_proposal(raw, review_id=review_id)
-    if parsed is not None:
-        return parsed
+def _validate_execution_review(proposal: Proposal, snapshot: dict[str, Any]) -> None:
+    """Validate model citations, never repair/infer another Task's evidence."""
+    if not snapshot:
+        # Historical readers and non-runtime callers have no snapshot to cite.
+        if proposal.execution_review is None:
+            return
+    errors: list[dict[str, Any]] = []
 
-    repair = runtime_validation_retry_user_prompt(
-        user_prompt,
-        "Return ONLY a valid JSON Proposal matching the schema above. No prose, no markdown.",
-    )
-    raw2 = await _safe_runtime_completion(ctx, system_prompt, repair)
-    if raw2:
-        parsed2 = _parse_proposal(raw2, review_id=review_id)
-        if parsed2 is not None:
-            return parsed2
+    def mismatch(path: list, expected: Any, message: str) -> None:
+        errors.append({"path": ["execution_review", *path],
+                       "type": "execution_evidence_mismatch", "message": message, "expected": expected})
 
-    logger.error("Strategist: produced invalid Proposal after one retry")
-    return _fallback_proposal(ctx, review_id=review_id)
+    review = proposal.execution_review
+    if snapshot.get("status") != "available":
+        mismatch([], None, "Execution snapshot unavailable; do not invent an execution review.")
+    elif review is None:
+        mismatch([], {"revision": snapshot["revision"], "references": []},
+                 "Cite the supplied execution snapshot. Use references=[] only when no Task informs this decision.")
+    else:
+        if review.revision != snapshot["revision"]:
+            mismatch(["revision"], snapshot["revision"], "Copy the exact supplied snapshot revision.")
+        facts = {row["task_id"]: row for row in snapshot.get("tasks", [])}
+        seen: set[str] = set()
+        for index, reference in enumerate(review.references):
+            path = ["references", index]
+            fact = facts.get(reference.task_id)
+            if fact is None:
+                mismatch([*path, "task_id"], sorted(facts), "Task is not in this Workspace execution snapshot.")
+                continue
+            if reference.task_id in seen:
+                mismatch([*path, "task_id"], "unique task_id", "Cite each Task once.")
+            seen.add(reference.task_id)
+            for key in ("plan_id", "observed_state"):
+                if getattr(reference, key) != fact.get(key):
+                    mismatch([*path, key], fact.get(key), f"{key} must come from this exact Task observation.")
+            blocker = fact.get("current_blocker") or {}
+            expected_ref = blocker.get("ref") if blocker.get("source_task_id") == reference.task_id else None
+            if reference.blocker_ref is not None and reference.blocker_ref != expected_ref:
+                mismatch([*path, "blocker_ref"], expected_ref, "Blocker must belong to this exact Task observation.")
+    if errors:
+        raise StrategistProposalGenerationError(
+            "The proposal cites execution evidence that does not match the supplied Task facts.",
+            code="proposal_execution_evidence_mismatch", details={"validation_errors": errors},
+        )
+
+
+def _is_transient_strategist_llm_error(exc: BaseException) -> bool:
+    """True when the Strategist LLM failed in a way Celery should retry.
+
+    Stream idle timeouts and provider stream errors keep their existing
+    transport retry semantics instead of becoming Proposal validation errors.
+    """
+    if isinstance(exc, TimeoutError):
+        return True
+    try:
+        from packages.core.ai.llm_client import LLMStreamProviderError
+    except Exception:
+        return False
+    return isinstance(exc, LLMStreamProviderError)
 
 
 async def _safe_runtime_completion(
     ctx: StrategistContext,
     system_prompt: str,
     user_prompt: str,
-) -> Optional[str]:
+    *,
+    user_id: str | None = None,
+) -> str:
+    from packages.core.ai.llm_client import CreditCheckUnavailableError, CreditExhaustedError
+    from packages.core.budget.enforcement import BudgetExceeded
+    from packages.core.services.credit_reservations import CreditReservationError
+
     try:
         workspace = getattr(ctx, "workspace", None)
         completion = await runtime_execute_strategist_completion(
@@ -114,16 +188,28 @@ async def _safe_runtime_completion(
             user_prompt,
             entity_id=getattr(workspace, "entity_id", None),
             workspace_id=getattr(workspace, "id", None),
+            user_id=user_id,
         )
         return completion.content
+    except (CreditExhaustedError, CreditCheckUnavailableError, CreditReservationError, BudgetExceeded):
+        raise
     except Exception as exc:
-        logger.warning("Strategist LLM call failed: %s", exc)
-        return None
+        if _is_transient_strategist_llm_error(exc):
+            raise
+        failure = StrategistProposalGenerationError(
+            "The Strategist model could not produce a proposal.", code="proposal_llm_unavailable",
+            details={"cause": str(exc)[:2000], "exception_type": type(exc).__name__},
+        )
+        logger.warning("Strategist LLM call failed: code=%s details=%s", failure.code, failure.details)
+        raise failure from exc
 
 
-def _parse_proposal(text: str, *, review_id: str) -> Optional[Proposal]:
-    if not text:
-        return None
+def _parse_proposal(text: str, *, review_id: str) -> Proposal:
+    if not isinstance(text, str) or not text.strip():
+        raise StrategistProposalGenerationError(
+            "The Strategist model returned no proposal content.", code="proposal_invalid_output",
+            details={"validation_errors": [{"path": [], "type": "empty_response", "message": "Expected a JSON Proposal object"}]},
+        )
     candidate = _strip_code_fence(text).strip()
     try:
         # Inject review_id if the LLM omitted it (very common).
@@ -131,9 +217,26 @@ def _parse_proposal(text: str, *, review_id: str) -> Optional[Proposal]:
         if isinstance(data, dict):
             data.setdefault("review_id", review_id)
         return Proposal.model_validate(data)
-    except (ValidationError, ValueError) as exc:
-        logger.debug("Strategist parse failed: %s", exc)
-        return None
+    except json.JSONDecodeError as exc:
+        details = {"validation_errors": [{
+            "path": [], "type": "invalid_json", "message": exc.msg,
+            "line": exc.lineno, "column": exc.colno, "position": exc.pos,
+        }]}
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_context=False, include_url=False)
+        details = {"validation_errors": [{
+            "path": list(error["loc"]), "type": error["type"], "message": error["msg"][:1000],
+        } for error in errors[:20]]}
+        if len(errors) > 20:
+            details["omitted_errors"] = len(errors) - 20
+    except (TypeError, ValueError, RecursionError) as exc:
+        details = {"validation_errors": [{
+            "path": [], "type": type(exc).__name__, "message": str(exc)[:1000],
+        }]}
+    raise StrategistProposalGenerationError(
+        "The Strategist response does not match the Proposal contract.",
+        code="proposal_invalid_output", details=details,
+    )
 
 
 def _strip_code_fence(text: str) -> str:
@@ -169,18 +272,3 @@ async def _load_skill_preamble(
     if skill and (skill.system_prompt or "").strip():
         return skill.system_prompt
     return None
-
-
-# ── Fallback ──────────────────────────────────────────────────────────
-
-def _fallback_proposal(ctx: StrategistContext, *, review_id: str) -> Proposal:
-    """Empty proposal for dev/CI when no LLM is reachable."""
-    return Proposal(
-        review_id=review_id,
-        summary=(
-            f"[fallback] Strategist could not reach the LLM for review "
-            f"{review_id}. No tasks proposed."
-        ),
-        tasks=[],
-        notes="LLM unavailable — propose tasks manually or configure a provider API key.",
-    )

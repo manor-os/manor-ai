@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from packages.core.ai.runtime.capabilities import (
@@ -31,6 +32,55 @@ STRATEGIST_TASK_CAPABILITY_IDS = (
     "manor.composite",
     "external.social",
 )
+
+
+def apply_workspace_service_task_requirements(task: Any, workspace: Any) -> bool:
+    """Copy an installed Workspace service's execution contract onto a Task.
+
+    Only the Workspace's persisted operating-model snapshot is authoritative.
+    A Blueprint slug in settings must never make an older installation inherit
+    requirements that were added to the Marketplace definition later.
+    """
+
+    operating_model = getattr(workspace, "operating_model", None)
+    if not isinstance(operating_model, dict):
+        return False
+    owner_service_key = str(getattr(task, "owner_service_key", "") or "").strip()
+    if not owner_service_key:
+        return False
+    service = next((
+        item
+        for item in (operating_model.get("services") or [])
+        if isinstance(item, dict)
+        and str(item.get("service_key") or item.get("key") or "").strip()
+        == owner_service_key
+    ), None)
+    if service is None:
+        return False
+
+    changed = False
+    required_skills = [
+        str(value).strip()
+        for value in (service.get("required_skills") or [])
+        if str(value or "").strip()
+    ]
+    if required_skills:
+        merged_skills = list(dict.fromkeys([
+            *list(getattr(task, "required_skills", None) or []),
+            *required_skills,
+        ]))
+        if merged_skills != list(getattr(task, "required_skills", None) or []):
+            task.required_skills = merged_skills
+            changed = True
+
+    completion_requirements = service.get("completion_requirements")
+    if isinstance(completion_requirements, dict) and completion_requirements:
+        details = dict(getattr(task, "details", None) or {})
+        if details.get("completion_requirements") != completion_requirements:
+            details["completion_requirements"] = deepcopy(completion_requirements)
+            task.details = details
+            changed = True
+    return changed
 
 
 def _as_clean_capability_ids(values: Any) -> tuple[str, ...]:
@@ -88,8 +138,8 @@ def task_runtime_capability_validation_errors(
     """Validate task-local BusinessCapability references.
 
     Task runtime requirements are intentionally capability ids, not tool names.
-    The actual tool expansion still happens through the runtime catalog and is
-    filtered by profile so a task cannot invent a new execution surface.
+    Catalog mapping is used to validate and diagnose the requirement, never
+    to grant tools to the selected Agent.
     """
 
     allowed = set(allowed_ids or ())
@@ -147,6 +197,7 @@ def task_runtime_capabilities_from_context(
     *,
     profile: RuntimeProfile | None = RuntimeProfile.BACKGROUND_WORKER,
     allowed_ids: tuple[str, ...] | set[str] | None = None,
+    strict: bool = False,
 ) -> tuple[str, ...]:
     if not isinstance(runtime_context, dict):
         return ()
@@ -156,6 +207,7 @@ def task_runtime_capabilities_from_context(
                 runtime_context.get(key),
                 profile=profile,
                 allowed_ids=allowed_ids,
+                strict=strict,
             )
             if normalized:
                 return normalized
@@ -167,6 +219,7 @@ def task_runtime_capability_tools(
     *,
     profile: RuntimeProfile | None = RuntimeProfile.BACKGROUND_WORKER,
 ) -> set[str]:
+    """Map requirements to catalog names for diagnostics, not authorization."""
     return tool_names_for_capability_ids(
         set(normalize_task_runtime_capability_ids(capability_ids, profile=profile)),
         profile=profile,

@@ -1,33 +1,48 @@
+import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
 /**
  * WorkspaceChat — interactive group chat for workspace operations.
  *
- * Default: messages go to Manor AI (master agent).
+ * Default: unadorned messages go to Manor AI with the current workspace scope.
+ * Channel bindings do not choose the operator chat's identity.
  * @mention: type "@" to open agent picker dropdown, routes message to that agent.
  * Also displays workspace events: proposals, agent updates, step events, goal alerts.
  */
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type CSSProperties } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import {
   ApiError,
   api,
   type WorkspaceAgentMapping,
   type WorkspaceChatEntrypoint,
+  type WorkspaceAppAction,
   type WorkspaceLedgerOverview,
 } from "../lib/api";
+import { invalidateAgentInitiativeQueries } from "../lib/agentInitiativeInvalidation";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
+import { uploadPendingInputFiles } from "../lib/pendingInputUploads";
+import {
+  createKeyedTrailingScheduler,
+  workspaceRealtimeRefreshPlan,
+  workspaceSetupRefetchInterval,
+  WORKFLOW_RUN_EVENT_COALESCE_MS,
+} from "../lib/workspaceLiveRefresh";
 import {
   manualSkillReferences,
   resolveManualSkillReferenceIds,
 } from "../lib/manualSkillRefs";
 import { MANOR_AGENT_NAME } from "../lib/constants";
-import type { Workspace, Agent } from "../lib/types";
+import type { Workspace, WorkspaceStaff, Agent } from "../lib/types";
 import { canManageWorkspace } from "../lib/permissions";
 import { useWebSocket } from "../lib/websocket";
 import { useAuthStore } from "../stores/auth";
+import { useDisplayPreferences } from "../stores/displayPreferences";
 import { useToastStore } from "../stores/toast";
 import { t } from "../lib/i18n";
 import { useChatAutoFollow } from "../lib/useChatAutoFollow";
+import { usePendingActionNotice } from "../lib/usePendingActionNotice";
+import { useWorkspaceAttentionSeen } from "../lib/useWorkspaceAttentionSeen";
 import { openDetail, closeDetail, useDetailStore } from "../stores/detail";
 import { openAgentEditModal } from "../stores/agentEditModal";
 import ChatMarkdown from "./ChatMarkdown";
@@ -51,16 +66,20 @@ import {
   WorkspaceSimulationRuntimeBar,
   useWorkspaceSimulationRuntime,
 } from "./WorkspaceSimulationRuntime";
-import AssistantMessageBlocks from "./AssistantMessageBlocks";
+import AssistantMessageBlocks, {
+  assistantPendingActionKindForMessage,
+} from "./AssistantMessageBlocks";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
 import ChatMessageActions, {
   chatMessageActionText,
+  displayContentForAssistantMessage,
   isRetryableAssistantMessage,
   type ChatMessageFeedbackRating,
 } from "./chat/ChatMessageActions";
 import useChatMessageFeedback from "./chat/useChatMessageFeedback";
 import { chatFeedbackSubjectKey } from "../lib/chat-feedback-queue.mjs";
 import ChatTimestamp from "./chat/ChatTimestamp";
+import ConversationInitiativesButton from "./agents/ConversationInitiativesButton";
 import ChatScrollRail, {
   type ChatScrollRailMarker,
 } from "./chat/ChatScrollRail";
@@ -73,6 +92,12 @@ import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
 import { agentAvatarSeed } from "./ui/AgentAvatar";
 import UserAvatar from "./ui/UserAvatar";
 import WorkspaceIconTile from "./ui/WorkspaceIcon";
+import WorkspaceConnectionNotice from "./workspaces/WorkspaceConnectionNotice";
+import WorkspaceAppView from "./workspaces/WorkspaceAppView";
+import FeatureDiscoveryHint, { FeatureDiscoveryBadge } from "./ui/FeatureDiscoveryHint";
+import useFeatureDiscovery from "./useFeatureDiscovery";
+import { FEATURE_DISCOVERIES } from "../lib/featureDiscovery";
+import BlueprintGuideDialog, { workspaceUsageGuide } from "./blueprints/BlueprintGuideDialog";
 import WorkspaceStatsQuickAccess from "./workspaces/WorkspaceStatsQuickAccess";
 import WorkspaceLedgerConfigurationDialog from "./workspaces/WorkspaceLedgerConfigurationDialog";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
@@ -92,6 +117,7 @@ import ChatInputFooter, {
   manualSkillLabel,
   stripManualSkillTokens,
   stripWorkflowInvokeToken,
+  workflowInvokeMessage,
   type AttachedItem,
   type ChatComposerSendContext,
   type ManualSkillItem,
@@ -113,6 +139,10 @@ import WorkspaceWorkflowRunHost, {
   workflowHostOwnedMessageIds,
 } from "./workflows/WorkspaceWorkflowRunHost";
 import {
+  workflowRunStatusPresentation,
+  type WorkflowRunStatus,
+} from "./workflows/workflowRunDisplay";
+import {
   IconBrain,
   IconChatBubble,
   IconCheck,
@@ -120,6 +150,9 @@ import {
   IconDocument,
   IconEdit,
   IconFlow,
+  IconHelp,
+  IconPanelRight,
+  IconPanelRightClose,
   IconPause,
   IconPlay,
   IconPlus,
@@ -128,21 +161,27 @@ import {
   IconSparkles,
   IconTimeline,
   IconTrash,
+  IconUsers,
+  IconWarning,
 } from "./icons";
 import {
   formatRuntimeQueueStatus,
+  formatByokProviderErrorMessage,
+  formatFilePermissionErrorMessage,
   isRedundantApprovalResolutionReceipt,
   hitlActionTranscriptText,
   nextTypewriterSlice,
   pendingHITLIds,
   parseToolCalls,
   TYPEWRITER_TICK_MS,
+  LLM_CONFIGURATION_ERROR_MESSAGE,
   type ChatMessage,
   type ResponseSurfaceSubmissionReceipt,
   type ResponseSurfaceSubmissionResult,
   type SubAgentEvent,
   type ToolCall,
 } from "../lib/chatStream";
+import { hasNewerNonGreetingMessage } from "../lib/agentGreetingPlayback";
 import {
   collectResponseSurfaceSubmissionFailureMessageIds,
   collectResponseSurfaceSubmissionReceipts,
@@ -154,16 +193,21 @@ import {
 } from "../lib/responseSurface";
 import {
   ChatStreamCompletionStatus,
+  recoverRuntimeChatSession,
   useChatStreamStore,
 } from "../stores/chatStream";
+import { answerRuntimeHumanInput } from "../stores/chatStream";
+import { RuntimeHumanInputCard } from "./ui/RuntimeHumanInputCard";
 import {
   formatUserFacingStructuredText,
   formatUserFacingText,
 } from "../lib/taskDisplay";
 import { relativeTime } from "../lib/format";
+import { hasActiveWorkspaceChatStream } from "../lib/workspaceChatStream";
 import Chip from "./ui/Chip";
 import StatusBadge from "./ui/StatusBadge";
 import {
+  proposalApprovalView,
   proposalApprovedRowIds,
   proposalBasisView,
   proposalImpactExplainer,
@@ -220,6 +264,17 @@ interface WsMessage {
   resolved_by_user_avatar_url?: string | null;
 }
 
+function workspaceMessageAuthorUserId(msg: WsMessage): string | null {
+  const value = msg.author_user_id || msg.meta?.author_user_id;
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function isCurrentWorkspaceUserMessage(msg: WsMessage, currentUserId?: string | null): boolean {
+  return msg.author_kind === "user"
+    && Boolean(currentUserId)
+    && workspaceMessageAuthorUserId(msg) === currentUserId;
+}
+
 enum ChatFeedbackTargetKind {
   RESPONSE = "response",
   TASK_COMPLETION = "task_completion",
@@ -269,6 +324,19 @@ type WorkspaceAutonomyGoalEditorOrigin =
   | { kind: "edit"; goalId: string };
 
 /* ── Helpers ── */
+
+type WorkspaceAppDisplayMode = "split" | "app" | "chat";
+const WORKSPACE_APP_DISPLAY_KEY = "workspace-chat-app-display";
+
+function readWorkspaceAppDisplay(): WorkspaceAppDisplayMode {
+  try {
+    const saved = window.localStorage.getItem(WORKSPACE_APP_DISPLAY_KEY);
+    if (saved === "app" || saved === "chat" || saved === "split") return saved;
+  } catch {
+    // The first visit uses the split view when browser storage is unavailable.
+  }
+  return "split";
+}
 
 const AGENT_COLORS = [
   "#6d6fb2",
@@ -689,11 +757,40 @@ function isRunningStreamPlaceholder(msg: WsMessage) {
   );
 }
 
+export function workspaceMessageOwnsStream(
+  message: Pick<WorkspaceLocalMsg, "id" | "conversation_id">,
+  sessionMessages: WorkspaceLocalMsg[],
+  streaming: boolean,
+): boolean {
+  if (!streaming) return false;
+  // History filtering can hide the current turn once its persisted mirror
+  // arrives. It must not promote an older visible message to the live owner.
+  const active = sessionMessages.at(-1);
+  if (!active || active.role !== "assistant") return false;
+  if (message.conversation_id && active.conversation_id
+    && message.conversation_id !== active.conversation_id) return false;
+  return message === active || Boolean(message.id && message.id === active.id);
+}
+
 function isDuplicatePersistedUserMessage(
   persisted: WsMessage,
   local: WorkspaceLocalMsg,
 ) {
   if (persisted.author_kind !== "user" || local.role !== "user") return false;
+
+  if (local.conversation_id && persisted.conversation_id
+    && local.conversation_id !== persisted.conversation_id) return false;
+  const localAuthor = local.meta?.author_user_id;
+  const persistedAuthor = persisted.author_user_id || persisted.meta?.author_user_id;
+  if (localAuthor && persistedAuthor && localAuthor !== persistedAuthor) return false;
+  if (local.id && persisted.id === local.id) return true;
+  if (local.id && !local.id.startsWith("local-user-")) return false;
+  const clientMessageId = local.meta?.client_message_id;
+  if (clientMessageId) {
+    // Content, attachment labels and timestamps are projections, not identity.
+    // Do not let an earlier identical send hide this turn before its receipt.
+    return persisted.meta?.client_message_id === clientMessageId;
+  }
 
   const persistedText = normalizeMessageText(persisted.body);
   const localText = normalizeMessageText(local.content);
@@ -702,7 +799,19 @@ function isDuplicatePersistedUserMessage(
   const sameText =
     persistedText === localText ||
     localText.startsWith(`${persistedText} [Attached:`);
-  if (!sameText) return false;
+  const persistedWorkflowBindingId = String(
+    persisted.meta?.workflow_binding_id || "",
+  ).trim();
+  const localWorkflowBindingId = String(
+    local.meta?.workflow_binding_id || "",
+  ).trim();
+  const sameWorkflowInvocation = Boolean(
+    localWorkflowBindingId &&
+      persistedWorkflowBindingId === localWorkflowBindingId &&
+      persisted.meta?.workflow_route_source === "explicit" &&
+      local.meta?.workflow_route_source === "explicit",
+  );
+  if (!sameText && !sameWorkflowInvocation) return false;
 
   const persistedAt = messageTimestampMs(persisted.created_at);
   const localAt = messageTimestampMs(local.timestamp || "");
@@ -710,12 +819,15 @@ function isDuplicatePersistedUserMessage(
   return Math.abs(persistedAt - localAt) <= LOCAL_MESSAGE_DEDUPE_WINDOW_MS;
 }
 
-function isDuplicatePersistedAssistantMessage(
+export function isDuplicatePersistedAssistantMessage(
   persisted: WsMessage,
   local: WorkspaceLocalMsg,
 ) {
   if (persisted.author_kind === "user" || local.role !== "assistant") return false;
+  if (local.conversation_id && persisted.conversation_id
+    && local.conversation_id !== persisted.conversation_id) return false;
   if (local.id && persisted.id === local.id) return !isRunningStreamPlaceholder(persisted);
+  if (local.id && !local.id.startsWith("local-bot-")) return false;
 
   const persistedText = normalizeMessageText(persisted.body);
   const localText = normalizeMessageText(local.content);
@@ -731,6 +843,46 @@ function isDuplicatePersistedAssistantMessage(
 function shouldCollapseWorkspaceMessage(msg: WsMessage, isUser: boolean) {
   if (isUser) return true;
   return msg.message_kind !== "proposal" && !msg.pending_action;
+}
+
+function hasTerminalWorkspaceChatFailure(message: ChatMessage) {
+  return message.stream_error === true
+    || message.meta?.stream_error === true
+    || message.meta?.stream_status === "error"
+    || message.stop_reason === "error"
+    || message.meta?.stop_reason === "error"
+    || Boolean(message.meta?.error);
+}
+
+function isWorkspaceChatFailedTurn(message: ChatMessage, content: string) {
+  return message.role === "assistant" && (
+    hasTerminalWorkspaceChatFailure(message) || isRetryableAssistantMessage(message, content)
+  );
+}
+
+function workspaceChatFailureContent(message: ChatMessage, content: string) {
+  const preserveSpecialFailure = message.meta?.error === "llm_configuration_missing"
+    || message.meta?.error === "byok_provider_error"
+    || content.includes(LLM_CONFIGURATION_ERROR_MESSAGE)
+    || Boolean(formatByokProviderErrorMessage(content))
+    || Boolean(formatFilePermissionErrorMessage(content));
+  const terminalFailure = hasTerminalWorkspaceChatFailure(message) && !preserveSpecialFailure;
+  const displayed = displayContentForAssistantMessage(
+    terminalFailure ? { ...message, content: "", assistant_blocks: [] } : message,
+    terminalFailure ? "" : content,
+  );
+  if (displayed !== t("component.chat_message_actions.request_failed_summary")) return displayed;
+
+  const missingTitle = (message.assistant_blocks || []).some(
+    (block) => block.type === "process" && (block.steps || []).some(
+      (step) => step.status === "error" && /\btitle is required\b/i.test(step.result_preview || ""),
+    ),
+  ) || (message.tool_calls || []).some(
+    (tool) => tool.status === "error" && /\btitle is required\b/i.test(`${tool.result || ""}\n${tool.rawResult || ""}`),
+  );
+  return t(missingTitle
+    ? "component.workspace_chat.missing_title_failure"
+    : "component.workspace_chat.request_failed_reply");
 }
 
 function messageRefId(msg: WsMessage, refType: string) {
@@ -1123,8 +1275,25 @@ export default function WorkspaceChat({
   agentMappings,
   taskSession,
 }: WorkspaceChatProps) {
+  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const isTaskSession = Boolean(taskSession);
   const queryClient = useQueryClient();
+  const catalogScope = useCatalogScope();
+  const workflowRunInvalidationScheduler = useMemo(
+    () => createKeyedTrailingScheduler(
+      WORKFLOW_RUN_EVENT_COALESCE_MS,
+      (runId) => queryClient.invalidateQueries({
+        queryKey: ["workflow-run", runId],
+        exact: true,
+      }),
+    ),
+    [queryClient],
+  );
+
+  useEffect(
+    () => () => workflowRunInvalidationScheduler.cancelAll(),
+    [workflowRunInvalidationScheduler],
+  );
   const autonomousRunning = Boolean(
     workspace?.status === "active" && workspace.heartbeat_enabled,
   );
@@ -1151,12 +1320,44 @@ export default function WorkspaceChat({
   const toast = useToastStore();
   const navigate = useNavigate();
   const location = useLocation();
+  const attentionTargetKey = new URLSearchParams(location.search).get("attention") || "";
+  const locatedAttentionNavigationRef = useRef("");
+  const attentionTargetMessageId = attentionTargetKey && location.hash.startsWith("#workspace-chat-message-")
+    ? location.hash.slice("#workspace-chat-message-".length) : "";
+  const attentionMessageQuery = useQuery({
+    queryKey: ["workspace-attention-message", workspaceId, attentionTargetMessageId],
+    queryFn: ({ signal }) => api.workspaces.chat.getMessage(workspaceId, attentionTargetMessageId, signal),
+    enabled: Boolean(attentionTargetMessageId),
+    staleTime: 0,
+  });
+  const [guideOpen, setGuideOpen] = useState(false);
+  useEffect(() => setGuideOpen(false), [workspaceId]);
+  const usageGuide = workspaceUsageGuide(workspace);
+  const dismissBlueprintGuide = () => {
+    setGuideOpen(false);
+    const nextParams = new URLSearchParams(location.search);
+    nextParams.delete("guide");
+    navigate({ pathname: location.pathname, search: nextParams.toString(), hash: location.hash }, { replace: true });
+  };
   const [agentsExpanded, setAgentsExpanded] = useState(false);
   const [promoteSimulationOpen, setPromoteSimulationOpen] = useState(false);
   const [ledgerConfiguration, setLedgerConfiguration] = useState<{
     initialContractIds: string[];
   } | null>(null);
   const [outputOpen, setOutputOpen] = useState(false);
+  const [appDisplayMode, setAppDisplayMode] = useState(readWorkspaceAppDisplay);
+  useEffect(() => {
+    if (attentionTargetKey) setAppDisplayMode("chat");
+  }, [attentionTargetKey]);
+  const appOpen = !threadRef && !isTaskSession && appDisplayMode !== "chat";
+  const changeAppDisplay = useCallback((mode: WorkspaceAppDisplayMode) => {
+    setAppDisplayMode(mode);
+    try {
+      window.localStorage.setItem(WORKSPACE_APP_DISPLAY_KEY, mode);
+    } catch {
+      // Keep the selection for this session when browser storage is unavailable.
+    }
+  }, []);
   const [selectedArtifact, setSelectedArtifact] =
     useState<OutputArtifact | null>(null);
   const [selectedArtifactAnchor, setSelectedArtifactAnchor] =
@@ -1178,6 +1379,15 @@ export default function WorkspaceChat({
   }`;
   let promoteSimulationToLive: (() => void) | undefined;
   const currentUser = useAuthStore((s) => s.user);
+  const [appUsed, setAppUsed] = useState(false);
+  const appDiscovery = useFeatureDiscovery({
+    feature: FEATURE_DISCOVERIES.workspaceApp,
+    userId: currentUser?.id,
+    enabled: Boolean(workspaceId && !threadRef && !isTaskSession),
+    active: !threadRef && !isTaskSession,
+    alreadyUsed: appUsed,
+    autoShow: false,
+  });
   const currentUserName =
     currentUser?.display_name ||
     [currentUser?.first_name, currentUser?.last_name]
@@ -1187,6 +1397,49 @@ export default function WorkspaceChat({
     t("component.workspace_chat.you");
   const currentUserAvatar = currentUser?.avatar_url;
   const isWorkspaceMainChat = !threadRef;
+  const shouldWatchBlueprintSetup = Boolean(
+    isWorkspaceMainChat &&
+      new URLSearchParams(location.search).get("setup") === "1",
+  );
+  const {
+    data: blueprintSetupStatus,
+    isLoading: blueprintSetupLoading,
+    isError: blueprintSetupError,
+    refetch: refetchBlueprintSetup,
+  } = useQuery({
+    queryKey: ["workspace-setup-status", workspaceId],
+    queryFn: ({ signal }) => api.workspaces.setupStatus(workspaceId, signal),
+    enabled: shouldWatchBlueprintSetup,
+    staleTime: 10_000,
+    refetchInterval: (query) => {
+      const current = query.state.data;
+      return workspaceSetupRefetchInterval({
+        enabled: shouldWatchBlueprintSetup,
+        ready: current?.ready,
+        hasSetupJob: current?.incomplete_checks.some(
+          (check) => Boolean(check.setup_job_id),
+        ),
+        automaticSetupState: current?.automatic_setup_state,
+      });
+    },
+    refetchIntervalInBackground: false,
+  });
+  const showBlueprintAssetInitialization = Boolean(
+    shouldWatchBlueprintSetup &&
+      blueprintSetupStatus &&
+      blueprintSetupStatus.status !== "not_required" &&
+      !blueprintSetupStatus.ready &&
+      blueprintSetupStatus.incomplete_checks.some((check) =>
+        Boolean(check.setup_job_id),
+      ),
+  );
+  const blueprintAssetInitializationFailed =
+    blueprintSetupStatus?.automatic_setup_state === "failed";
+  const blueprintAssetInitializationRetrying =
+    blueprintSetupStatus?.automatic_setup_state === "retrying";
+  const manualBlueprintSetupChecks = isSimple && shouldWatchBlueprintSetup && !blueprintSetupStatus?.ready
+    ? (blueprintSetupStatus?.incomplete_checks || []).filter((check) => !check.setup_job_id)
+    : [];
   const showSimulationRuntime = Boolean(
     isWorkspaceMainChat &&
       ((workspace?.settings as Record<string, any> | undefined)?.sandbox === true ||
@@ -1195,12 +1448,8 @@ export default function WorkspaceChat({
   // Pausing a Workspace stops autonomous runtime, not direct user chat.
   // Simulation remains read-only until it is promoted to a live Workspace.
   const composerDisabled = showSimulationRuntime;
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const chatBodyRef = useRef<HTMLDivElement>(null);
-  const { autoFollowRef, handleAutoFollowScroll } = useChatAutoFollow();
-  const didInitialScrollRef = useRef(false);
-  const initialPendingActionIdsRef = useRef<Set<string>>(new Set());
-  const hasInitialMessagesPageRef = useRef(false);
+  const workspaceChatHistoryStageRef = useRef<HTMLDivElement>(null);
+  const workspaceChatFloatingLayerRef = useRef<HTMLDivElement>(null);
   const realtimeAgentGreetingIdsRef = useRef<Set<string>>(new Set());
   const strategistActivityWorkspaceIdRef = useRef(workspaceId);
   strategistActivityWorkspaceIdRef.current = workspaceId;
@@ -1212,17 +1461,23 @@ export default function WorkspaceChat({
     Map<string, { startedAt: number; attempt: number }>
   >(new Map());
   const agentGreetingPlaybackStartedRef = useRef(false);
-  const streamScrollFrameRef = useRef<number | null>(null);
-  const lastStreamScrollAtRef = useRef(0);
   const composerEditorRef = useRef<HTMLDivElement>(null);
   const draftScope = threadRef
     ? `${workspaceId}:${threadRef.kind}:${threadRef.id}`
     : workspaceId;
   const streamSessionKey = `workspace-chat:${draftScope}`;
+  const {
+    chatBodyRef, chatContentRef, followBottom, pauseAutoFollow,
+    resumeAutoFollow, scrollToPosition, scrollToMessage, preserveHistoryAnchor,
+  } = useChatAutoFollow(streamSessionKey);
   const [input, setInput] = useState(() => loadWorkspaceChatDraft(draftScope));
   const [composerSeed, setComposerSeed] = useState<{
     key: string;
     attachments: AttachedItem[];
+  } | null>(null);
+  const [appWorkflowSeed, setAppWorkflowSeed] = useState<{
+    key: string;
+    workflow: WorkflowInvokeItem;
   } | null>(null);
   const [chatMode, setChatMode] = useState<ChatBoxMode>("auto");
   const [chatModePayload, setChatModePayload] = useState<ChatModePayload>(() =>
@@ -1236,7 +1491,27 @@ export default function WorkspaceChat({
   const conversationId = currentSession?.convId;
   const runtimeQueueStatus = currentSession?.runtimeQueue
     ? formatRuntimeQueueStatus(currentSession.runtimeQueue)
-    : null;
+    : currentSession?.runtimeStatus === "queued"
+      ? t("component.chat_runtime_queue.waiting")
+      : undefined;
+  const runtimeHumanInput =
+    currentSession?.runtimeHumanInput && !currentSession.runtimeHumanInput.answered
+      ? currentSession.runtimeHumanInput
+      : undefined;
+  const [runtimeInputBusy, setRuntimeInputBusy] = useState(false);
+  const submitRuntimeHumanInput = useCallback(
+    async (answer: string, fields?: Record<string, string>, choice?: string) => {
+      const sessionKey = currentSession?.key;
+      if (!sessionKey) return;
+      setRuntimeInputBusy(true);
+      try {
+        await answerRuntimeHumanInput(sessionKey, answer, fields, choice);
+      } finally {
+        setRuntimeInputBusy(false);
+      }
+    },
+    [currentSession?.key],
+  );
   const startStream = useChatStreamStore((s) => s.startStream);
   const stopStream = useChatStreamStore((s) => s.stopStream);
   const setSessionMessages = useChatStreamStore((s) => s.setSessionMessages);
@@ -1246,16 +1521,37 @@ export default function WorkspaceChat({
     streamingRef.current = streaming;
   }, [streaming]);
 
-  useEffect(() => {
-    didInitialScrollRef.current = false;
-    initialPendingActionIdsRef.current = new Set();
-    hasInitialMessagesPageRef.current = false;
-    lastStreamScrollAtRef.current = 0;
-    if (streamScrollFrameRef.current != null) {
-      window.cancelAnimationFrame(streamScrollFrameRef.current);
-      streamScrollFrameRef.current = null;
+  useLayoutEffect(() => {
+    const stage = workspaceChatHistoryStageRef.current;
+    const layer = workspaceChatFloatingLayerRef.current;
+    if (isTaskSession || !stage || !layer) return undefined;
+
+    let previousHeight = -1;
+    const updateFloatingClearance = () => {
+      const height = Math.ceil(layer.getBoundingClientRect().height);
+      if (height === previousHeight) return;
+      previousHeight = height;
+      stage.style.setProperty(
+        "--workspace-chat-floating-height",
+        `${height}px`,
+      );
+      followBottom();
+    };
+
+    updateFloatingClearance();
+    if (typeof ResizeObserver === "undefined") {
+      return () => {
+        stage.style.removeProperty("--workspace-chat-floating-height");
+      };
     }
-  }, [streamSessionKey]);
+
+    const observer = new ResizeObserver(updateFloatingClearance);
+    observer.observe(layer);
+    return () => {
+      observer.disconnect();
+      stage.style.removeProperty("--workspace-chat-floating-height");
+    };
+  }, [followBottom, isTaskSession]);
 
   const setInputDraft = useCallback(
     (value: string) => {
@@ -1279,28 +1575,67 @@ export default function WorkspaceChat({
     setOutputOpen(false);
     setSelectedArtifact(null);
     setSelectedArtifactAnchor(null);
-  }, [workspaceId, threadRef?.kind, threadRef?.id]);
+  }, [workspaceId, threadRef?.kind, threadRef?.id, isTaskSession]);
 
   // @mention state
   const [mentionAgent, setMentionAgent] = useState<AgentInfo | null>(null);
 
+  // Fetch the latest workspace chat page; older pages are loaded on demand.
+  const workspaceMessagesQuery = useQuery({
+    queryKey: [
+      "workspace-chat",
+      workspaceId,
+      threadRef?.kind || "main",
+      threadRef?.id || "",
+    ],
+    queryFn: ({ signal }) =>
+      api.workspaces.chat.listMessagesPage(
+        workspaceId,
+        {
+          limit: WORKSPACE_CHAT_PAGE_SIZE,
+          thread_ref_kind: threadRef?.kind,
+          thread_ref_id: threadRef?.id,
+        },
+        signal,
+      ),
+    refetchInterval: (query) => !streaming && hasActiveWorkspaceChatStream(
+      query.state.data?.items || [],
+      query.state.data?.conversation_id,
+      query.state.data?.has_active_runtime_run,
+    ) ? 10_000 : false,
+  });
+
+  const { data: workspaceMessagesPage, isLoading: workspaceMessagesLoading } = workspaceMessagesQuery;
+  useWorkspaceAttentionSeen(workspaceId, workspaceMessagesPage?.unseen_action_keys, workspaceChatHistoryStageRef, queryClient);
+
   // The workspace endpoint owns both membership and display identity. This
   // includes public template agents that are intentionally absent from the
   // entity-wide agent list.
+  const appViewQuery = useQuery({
+    queryKey: ["workspace-app-view", workspaceId, "runtime"],
+    queryFn: ({ signal }) => api.workspaces.appView(workspaceId, { includeCatalog: false, signal }),
+    enabled: Boolean(workspaceId && appOpen && !outputOpen && !threadRef && !isTaskSession),
+    refetchInterval: appOpen && !outputOpen ? 30_000 : false,
+    refetchIntervalInBackground: false,
+  });
+  // Start secondary reads after the visible Chat/App requests settle. Errors
+  // also release this gate so a failed panel cannot block the remaining UI.
+  const supportingQueriesEnabled = !workspaceMessagesQuery.isPending
+    && (!appOpen || outputOpen || threadRef || isTaskSession || !appViewQuery.isPending);
   const { data: fetchedMappings, isLoading: fetchedMappingsLoading } = useQuery({
     queryKey: ["workspace-agents", workspaceId],
     queryFn: () => api.workspaces.agents.list(workspaceId),
-    enabled: !!workspaceId,
+    enabled: Boolean(workspaceId && supportingQueriesEnabled),
   });
   const { data: workflowEntrypoints = [] } = useQuery({
     queryKey: ["workspace-chat-entrypoints", workspaceId],
     queryFn: () => api.workspaces.chat.listEntrypoints(workspaceId),
-    enabled: Boolean(workspaceId),
+    enabled: Boolean(workspaceId && supportingQueriesEnabled),
   });
   const { data: workspaceStaff } = useQuery({
     queryKey: ["workspace-staff", workspaceId],
     queryFn: () => api.workspaces.staff.list(workspaceId),
-    enabled: Boolean(workspaceId && !threadRef),
+    enabled: Boolean(workspaceId && !threadRef && supportingQueriesEnabled),
     staleTime: 30_000,
   });
   const workflowInvokeOptions = useMemo<WorkflowInvokeItem[]>(
@@ -1309,10 +1644,12 @@ export default function WorkspaceChat({
         bindingId: entrypoint.binding_id,
         workflowId: entrypoint.workflow_id,
         title: entrypoint.title,
+        workspace_id: workspaceId,
+        workspace_name: workspaceName,
         description: entrypoint.description,
         placeholder: entrypoint.placeholder,
       })),
-    [workflowEntrypoints],
+    [workflowEntrypoints, workspaceId, workspaceName],
   );
   const canToggleWorkspace = Boolean(
     workspace
@@ -1338,7 +1675,7 @@ export default function WorkspaceChat({
   const workspaceAutonomyGoalsQuery = useQuery({
     queryKey: ["workspace-goals", workspaceId, "active"],
     queryFn: () => api.goals.list({ workspace_id: workspaceId, status: "active", limit: 20 }),
-    enabled: Boolean(canToggleWorkspace),
+    enabled: Boolean(canToggleWorkspace && supportingQueriesEnabled),
     staleTime: 30_000,
   });
   const workspaceAutonomyGoals = (
@@ -1415,8 +1752,39 @@ export default function WorkspaceChat({
     subToAgent.forEach((a) => {
       if (!seen.has(a.id)) seen.set(a.id, a);
     });
+    for (const agent of appViewQuery.data?.agent_options || []) {
+      if (!seen.has(agent.id)) seen.set(agent.id, { id: agent.id, name: agent.name });
+    }
     return Array.from(seen.values());
-  }, [subToAgent]);
+  }, [subToAgent, appViewQuery.data?.agent_options]);
+  const humanMembers = useMemo<WorkspaceStaff[]>(() => {
+    const byUserId = new Map<string, WorkspaceStaff>();
+    for (const member of workspaceStaff || []) {
+      if (member.status && member.status !== "active") continue;
+      if (!member.user_id) continue;
+      byUserId.set(member.user_id, member);
+    }
+    if (currentUser?.id && !byUserId.has(currentUser.id)) {
+      byUserId.set(currentUser.id, {
+        id: `current-user-${currentUser.id}`,
+        workspace_id: workspaceId,
+        user_id: currentUser.id,
+        display_name: currentUserName,
+        email: currentUser.email,
+        avatar_url: currentUser.avatar_url,
+        role: "member",
+        status: "active",
+      });
+    }
+    return Array.from(byUserId.values()).sort((left, right) => {
+      if (left.user_id === currentUser?.id) return -1;
+      if (right.user_id === currentUser?.id) return 1;
+      return String(left.display_name || left.email || "").localeCompare(
+        String(right.display_name || right.email || ""),
+      );
+    });
+  }, [currentUser, currentUserName, workspaceId, workspaceStaff]);
+  const workspaceParticipantCount = humanMembers.length + agentList.length;
 
   const mentionOptions = useMemo<MentionOption[]>(
     () =>
@@ -1426,8 +1794,10 @@ export default function WorkspaceChat({
         name: agent.name,
         avatarUrl: agent.avatar_url,
         avatarSeed: agentAvatarSeed(agent),
+        workspace_id: workspaceId,
+        workspace_name: workspaceName,
       })),
-    [agentList],
+    [agentList, workspaceId, workspaceName],
   );
   const selectedMentions = useMemo<MentionOption[]>(
     () =>
@@ -1570,9 +1940,16 @@ export default function WorkspaceChat({
     nextCursor: null as string | null,
   });
   const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
+  const olderPageRequestRef = useRef<symbol | null>(null);
   const workspaceLifecycleTransitionIdRef = useRef<string | null>(null);
-  const suppressNextAutoScrollRef = useRef(false);
 
+  useLayoutEffect(() => {
+    setLoadingOlderMessages(false);
+    return () => { olderPageRequestRef.current = null; };
+  }, [streamSessionKey]);
+
+  // Stream admission/recovery can fill in conversationId for the same history.
+  // Only switching Workspace or thread changes the timeline's scope.
   useEffect(() => {
     workspaceLifecycleTransitionIdRef.current = null;
     realtimeAgentGreetingIdsRef.current = new Set();
@@ -1585,33 +1962,17 @@ export default function WorkspaceChat({
     setWorkspaceHistoryState({ hasMore: false, nextCursor: null });
     setLoadingOlderMessages(false);
     setVoiceConversationId(null);
-  }, [conversationId, workspaceId, threadRef?.kind, threadRef?.id]);
+  }, [workspaceId, threadRef?.kind, threadRef?.id]);
 
-  // Fetch the latest workspace chat page; older pages are loaded on demand.
-  const { data: workspaceMessagesPage, isLoading: workspaceMessagesLoading } = useQuery({
-    queryKey: [
-      "workspace-chat",
-      workspaceId,
-      threadRef?.kind || "main",
-      threadRef?.id || "",
-    ],
-    queryFn: () =>
-      api.workspaces.chat.listMessagesPage(workspaceId, {
-        limit: WORKSPACE_CHAT_PAGE_SIZE,
-        thread_ref_kind: threadRef?.kind,
-        thread_ref_id: threadRef?.id,
-      }),
-  });
 
   useEffect(() => {
     if (!workspaceMessagesPage) return;
-    const items = workspaceMessagesPage.items || [];
-    if (!hasInitialMessagesPageRef.current) {
-      initialPendingActionIdsRef.current = new Set(
-        items.filter(isOpenPendingAction).map((message) => message.id),
-      );
-      hasInitialMessagesPageRef.current = true;
+    if (workspaceMessagesPage.conversation_id) {
+      void recoverRuntimeChatSession(
+        workspaceMessagesPage.conversation_id, [], streamSessionKey,
+      ).catch(() => {});
     }
+    const items = workspaceMessagesPage.items || [];
     setWsMessages((prev) =>
       mergeWorkspaceMessages(
         // When the server says this page carries every open action card, any
@@ -1629,19 +1990,25 @@ export default function WorkspaceChat({
       hasMore: Boolean(workspaceMessagesPage.has_more),
       nextCursor: workspaceMessagesPage.next_cursor || null,
     });
-  }, [workspaceMessagesPage]);
+  }, [workspaceMessagesPage, streamSessionKey]);
+
+  useEffect(() => {
+    if (attentionMessageQuery.data && workspaceMessagesPage) {
+      setWsMessages((current) => mergeWorkspaceMessages(current, [attentionMessageQuery.data]));
+    }
+  }, [attentionMessageQuery.data, workspaceMessagesPage]);
 
   const handleLoadOlderMessages = useCallback(async () => {
     if (
       !workspaceHistoryState.hasMore ||
       !workspaceHistoryState.nextCursor ||
-      loadingOlderMessages
+      loadingOlderMessages || olderPageRequestRef.current
     ) {
       return;
     }
-    const container = chatBodyRef.current;
-    const previousHeight = container?.scrollHeight || 0;
-    const previousTop = container?.scrollTop || 0;
+    pauseAutoFollow();
+    const request = Symbol();
+    olderPageRequestRef.current = request;
     setLoadingOlderMessages(true);
     try {
       const page = await api.workspaces.chat.listMessagesPage(workspaceId, {
@@ -1650,7 +2017,8 @@ export default function WorkspaceChat({
         thread_ref_id: threadRef?.id,
         before: workspaceHistoryState.nextCursor,
       });
-      suppressNextAutoScrollRef.current = true;
+      if (olderPageRequestRef.current !== request) return;
+      preserveHistoryAnchor();
       setWsMessages((prev) =>
         mergeWorkspaceMessages(page.items || [], prev),
       );
@@ -1658,21 +2026,18 @@ export default function WorkspaceChat({
         hasMore: Boolean(page.has_more),
         nextCursor: page.next_cursor || null,
       });
-      window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => {
-          const nextContainer = chatBodyRef.current;
-          if (!nextContainer) return;
-          const heightDelta = nextContainer.scrollHeight - previousHeight;
-          nextContainer.scrollTop = previousTop + heightDelta;
-        });
-      });
     } catch {
       // request() already reports API failures; keep the timeline stable.
     } finally {
-      setLoadingOlderMessages(false);
+      if (olderPageRequestRef.current === request) {
+        olderPageRequestRef.current = null;
+        setLoadingOlderMessages(false);
+      }
     }
   }, [
     loadingOlderMessages,
+    pauseAutoFollow,
+    preserveHistoryAnchor,
     threadRef?.id,
     threadRef?.kind,
     workspaceHistoryState.hasMore,
@@ -1690,6 +2055,13 @@ export default function WorkspaceChat({
   }, [wsMessages, conversationId]);
   const voiceScopeConversationId = voiceConversationId || wsConversationId;
   const activeConversationId = conversationId || wsConversationId || undefined;
+  const remoteRunInFlight = !streaming && hasActiveWorkspaceChatStream(
+    workspaceMessagesPage?.items || [],
+    workspaceMessagesPage?.conversation_id,
+    workspaceMessagesPage?.has_active_runtime_run,
+  );
+  const initiativeConversationId =
+    conversationId || workspaceMessagesPage?.conversation_id || undefined;
 
   const feedbackConversationScope = useMemo(() => {
     const ids = new Set<string>();
@@ -1830,6 +2202,7 @@ export default function WorkspaceChat({
       );
       void queryClient.invalidateQueries({ queryKey: ["workspaces"] });
       void queryClient.invalidateQueries({ queryKey: ["workspace", targetWorkspaceId] });
+      void queryClient.invalidateQueries({ queryKey: ["workspace-app-view", targetWorkspaceId] });
       void queryClient.invalidateQueries({ queryKey: ["workspace-heartbeat", targetWorkspaceId] });
       void queryClient.invalidateQueries({ queryKey: ["workspace-activity", targetWorkspaceId] });
       void queryClient.invalidateQueries({ queryKey: ["workspace-chat", targetWorkspaceId] });
@@ -2110,24 +2483,39 @@ export default function WorkspaceChat({
               );
             }
           }
-          queryClient.invalidateQueries({
-            queryKey: ["workspace-chat", workspaceId],
-          });
-          const changedRunId = workflowRunIdForMessage(
-            (wsMessages as WsMessage[]).find((message) => message.id === data.message_id)
-              || {
-                id: String(data.message_id || ""),
-                meta: { workflow_run_id: data.workflow_run_id },
-              },
+          const loadedMessage = (wsMessages as WsMessage[]).find(
+            (message) => message.id === data.message_id,
           );
-          if (changedRunId) {
-            queryClient.invalidateQueries({
-              queryKey: ["workflow-run", changedRunId],
+          const changedRunId = workflowRunIdForMessage(
+            loadedMessage || {
+              id: String(data.message_id || ""),
+              meta: { workflow_run_id: data.workflow_run_id },
+            },
+          );
+          const refreshPlan = workspaceRealtimeRefreshPlan({
+            messageKind: typeof data.message_kind === "string"
+              ? data.message_kind
+              : null,
+            isKnownMessage: Boolean(loadedMessage),
+            workflowRunId: changedRunId,
+          });
+          if (refreshPlan.invalidateChat) {
+            void queryClient.invalidateQueries({
+              queryKey: ["workspace-chat", workspaceId],
             });
+          }
+          if (refreshPlan.workflowRunId) {
+            workflowRunInvalidationScheduler.schedule(refreshPlan.workflowRunId);
           }
         }
       },
-      [isWorkspaceMainChat, workspaceId, queryClient, wsMessages],
+      [
+        isWorkspaceMainChat,
+        workspaceId,
+        queryClient,
+        workflowRunInvalidationScheduler,
+        wsMessages,
+      ],
     ),
     onTyping: handleTyping,
   });
@@ -2596,7 +2984,7 @@ export default function WorkspaceChat({
   );
   const visibleSortedMessages = useMemo(
     () => sorted.filter((msg) => (
-      !hostOwnedWorkflowMessageIds.has(msg.id)
+      (!hostOwnedWorkflowMessageIds.has(msg.id) || msg.id === attentionTargetMessageId)
       && !isResponseSurfaceSubmissionMessage(msg, responseSurfaceSubmissionReceipts)
       && !responseSurfaceSubmissionFailureMessageIds.has(msg.id)
     ))
@@ -2609,12 +2997,34 @@ export default function WorkspaceChat({
         }),
       ),
     [
+      attentionTargetMessageId,
       hostOwnedWorkflowMessageIds,
       responseSurfaceSubmissionFailureMessageIds,
       responseSurfaceSubmissionReceipts,
       sorted,
     ],
   );
+  useLayoutEffect(() => {
+    if (
+      !agentGreetingPlayback ||
+      !hasNewerNonGreetingMessage(
+        visibleSortedMessages,
+        agentGreetingPlayback.messageIds,
+      )
+    ) {
+      return;
+    }
+
+    agentGreetingPlayback.messageIds.forEach((messageId) => {
+      markAgentGreetingMessagePlayed(
+        workspaceId,
+        messageId,
+        agentGreetingPlayback.expectedTotal,
+      );
+    });
+    setAgentGreetingPlayback(null);
+  }, [agentGreetingPlayback, visibleSortedMessages, workspaceId]);
+
   const hiddenAgentGreetingIds = useMemo(
     () => new Set(
       agentGreetingPlayback?.messageIds.slice(agentGreetingPlayback.activeIndex + 1) || [],
@@ -2649,67 +3059,6 @@ export default function WorkspaceChat({
     ),
     [hostOwnedWorkflowMessageIds, sorted],
   );
-  const latestPendingAction = pendingActions[pendingActions.length - 1];
-  const latestPendingActionId = latestPendingAction?.id;
-  const latestPendingActionIsLatest = Boolean(
-    latestPendingActionId
-    && visibleSortedMessages[visibleSortedMessages.length - 1]?.id === latestPendingActionId,
-  );
-
-  // Auto-scroll: initial load jumps to the latest message; streaming follows at a calmer pace.
-  useLayoutEffect(() => {
-    if (wsMessages.length === 0 && localMsgs.length === 0) return;
-    const scrollToBottom = () => {
-      const container = chatBodyRef.current;
-      if (container) {
-        // This surface uses smooth scrolling for user-initiated jumps. Avoid
-        // animating through a long history while the workspace first opens.
-        const previousScrollBehavior = container.style.scrollBehavior;
-        container.style.scrollBehavior = "auto";
-        container.scrollTop = container.scrollHeight;
-        container.style.scrollBehavior = previousScrollBehavior;
-        return;
-      }
-      bottomRef.current?.scrollIntoView({ behavior: "auto", block: "end" });
-    };
-
-    if (suppressNextAutoScrollRef.current) {
-      suppressNextAutoScrollRef.current = false;
-      return;
-    }
-
-    if (!didInitialScrollRef.current) {
-      didInitialScrollRef.current = true;
-      scrollToBottom();
-      return;
-    }
-
-    // Respect the user's scroll position: only follow new content while they
-    // are at the bottom (they resume following by scrolling back down).
-    if (!autoFollowRef.current) return;
-
-    if (!streaming && !activeAgentGreetingId) {
-      if (!latestPendingActionIsLatest) scrollToBottom();
-      return;
-    }
-
-    const now = Date.now();
-    if (now - lastStreamScrollAtRef.current < 240) return;
-    lastStreamScrollAtRef.current = now;
-    if (streamScrollFrameRef.current != null) return;
-    streamScrollFrameRef.current = window.requestAnimationFrame(() => {
-      streamScrollFrameRef.current = null;
-      scrollToBottom();
-    });
-  }, [
-    wsMessages.length,
-    localMsgs.length,
-    streaming,
-    activeAgentGreetingId,
-    agentGreetingPlayback?.visibleCharacters,
-    latestPendingActionIsLatest,
-    autoFollowRef,
-  ]);
 
   // Resolve pending action
   const resolvingActionIdsRef = useRef(new Set<string>());
@@ -2729,13 +3078,7 @@ export default function WorkspaceChat({
       files?: File[];
     }) => {
       const uploadedAttachments = files?.length
-        ? await Promise.all(files.map(async (file) => {
-            const document = await api.documents.upload(file);
-            if (!document?.id) {
-              throw new Error(`Failed to upload ${file.name}`);
-            }
-            return { name: file.name, id: document.id, type: "knowledge" };
-          }))
+        ? await uploadPendingInputFiles({ workspaceId, messageId: msgId }, files)
         : [];
       const existingAttachments = Array.isArray(payload?.attachments)
         ? payload.attachments
@@ -2777,6 +3120,16 @@ export default function WorkspaceChat({
         queryKey: ["workspace-chat", workspaceId],
       });
       queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+      // The resolve response is post-commit. Refresh the current workspace's
+      // actual setup state now instead of waiting for the connection poll;
+      // realtime action-resolved events can arrive before the commit.
+      queryClient.invalidateQueries({ queryKey: ["workspace", workspaceId], exact: true });
+      queryClient.invalidateQueries({ queryKey: ["workspace-app-view", workspaceId] });
+      queryClient.invalidateQueries({ queryKey: ["workspace-setup-status", workspaceId], exact: true });
+      queryClient.invalidateQueries({
+        queryKey: ["workspace-connection-status", currentUser?.entity_id, currentUser?.id, workspaceId],
+        exact: true,
+      });
       queryClient.invalidateQueries({
         queryKey: ["workspace-simulation-run", workspaceId],
       });
@@ -2829,10 +3182,27 @@ export default function WorkspaceChat({
     },
     [resolveMutation],
   );
+  const handleWorkflowResolve = useCallback(
+    async (
+      msgId: string,
+      choice: string,
+      note?: string,
+      payload?: Record<string, unknown>,
+      files?: File[],
+    ) => {
+      if (resolvingActionIdsRef.current.has(msgId)) return;
+      resolvingActionIdsRef.current.add(msgId);
+      // The floating card needs the actual request lifetime, including errors.
+      await resolveMutation.mutateAsync({ msgId, choice, note, payload, files });
+    },
+    [resolveMutation],
+  );
   /* ── Tool-call HITL (metadata channel) ──
    *
-   * These cards have no `pending_action` row, so `/messages/{id}/resolve`
-   * cannot see them — that endpoint keys off `Message.pending_action`.
+   * These cards normally have no `pending_action` row, so `/messages/{id}/resolve`
+   * cannot see them — that endpoint keys off `Message.pending_action`. (The one
+   * kind that has both, the workspace-operation review, is rendered from its
+   * `pending_action` row instead; see `hitlCards` in the message renderer.)
    * The runtime resolves them the way FloatingChat/EmbeddedChat do: reply
    * into the chat stream with a structured `{hitl_id, action}` body, which
    * `/chat/stream` hands to `resolve_chat_approval_turn` before the model
@@ -2844,7 +3214,7 @@ export default function WorkspaceChat({
   const handleHitlAction = useCallback(
     async (hitlId: string, action: string) => {
       if (!hitlId || streamingRef.current) return;
-      autoFollowRef.current = true;
+      resumeAutoFollow();
       const now = new Date().toISOString();
       const initialMessages: WorkspaceLocalMsg[] = [
         {
@@ -2878,9 +3248,14 @@ export default function WorkspaceChat({
       } catch {
         // startStream owns user-visible error state in the shared session.
       }
+      await invalidateAgentInitiativeQueries(queryClient);
       await queryClient.invalidateQueries({
         queryKey: ["workspace-chat", workspaceId],
       });
+      if (!threadRef) {
+        void queryClient.invalidateQueries({ queryKey: ["workspace-app-view", workspaceId] });
+        void queryClient.invalidateQueries({ queryKey: ["workspace-chat-entrypoints", workspaceId] });
+      }
       window.dispatchEvent(
         new CustomEvent("manor:workspace-actions-refresh", {
           detail: { workspaceId },
@@ -2888,7 +3263,7 @@ export default function WorkspaceChat({
       );
     },
     [
-      autoFollowRef,
+      resumeAutoFollow,
       queryClient,
       startStream,
       streamSessionKey,
@@ -3007,7 +3382,7 @@ export default function WorkspaceChat({
     return match || null;
   }
 
-  const requestChatMode = chatMode === "auto" ? undefined : chatMode;
+  const requestChatMode = isSimple || chatMode === "auto" ? undefined : chatMode;
 
   const handleChatModeChange = useCallback((mode: ChatBoxMode) => {
     setChatMode(mode);
@@ -3029,21 +3404,29 @@ export default function WorkspaceChat({
       sendContext?: ChatComposerSendContext,
       sendOptions: {
         responseSurfaceSubmission?: ResponseSurfaceSubmissionReceipt;
+        appAgentId?: string;
       } = {},
     ) => {
-      if (streamingRef.current) return false;
+      if (streamingRef.current || remoteRunInFlight) {
+        return false;
+      }
       const isResponseSurfaceSubmission = Boolean(sendOptions.responseSurfaceSubmission);
 
       // Sending is an explicit jump back to the newest message.
-      autoFollowRef.current = true;
+      resumeAutoFollow();
 
-      // Resolve @mention if typed inline
-      const resolvedAgent = isTaskSession
+      // Resolve explicit @mentions for this turn only; an unmentioned turn
+      // returns to Manor AI regardless of channel bindings or earlier replies.
+      const appAgent = sendOptions.appAgentId
+        ? agentList.find((agent) => agent.id === sendOptions.appAgentId)
+        : null;
+      if (sendOptions.appAgentId && !appAgent) return false;
+      const mentionedAgent = isSimple || isTaskSession || appAgent
         ? null
         : isResponseSurfaceSubmission
           ? null
           : resolveInlineMention(rawText);
-      const effectiveManualSkills = workflow || isResponseSurfaceSubmission ? [] : manualSkills;
+      const effectiveManualSkills = isSimple || workflow || isResponseSurfaceSubmission ? [] : manualSkills;
       const requestedManualSkillRefs =
         effectiveManualSkills.length > 0
           ? manualSkillReferences(effectiveManualSkills)
@@ -3051,11 +3434,9 @@ export default function WorkspaceChat({
       let manualSkillRefs = requestedManualSkillRefs;
       if (requestedManualSkillRefs?.some((reference) => reference.kind === "slug")) {
         try {
-          const availableSkills = await queryClient.fetchQuery({
-            queryKey: ["skills", "chat-manual-skill-resolution", "platform"],
-            queryFn: () => api.skills.list({ include_platform: true }),
-            staleTime: 60_000,
-          });
+          const availableSkills = await queryClient.fetchQuery(
+            skillListQueryOptions(catalogScope, { include_platform: true }),
+          );
           manualSkillRefs = resolveManualSkillReferenceIds(
             requestedManualSkillRefs,
             availableSkills,
@@ -3074,8 +3455,8 @@ export default function WorkspaceChat({
       ).trim();
 
       // The mention is a routing control, not part of the message body.
-      if (resolvedAgent) {
-        text = stripWorkspaceAgentMention(text, resolvedAgent.name);
+      if (mentionedAgent) {
+        text = stripWorkspaceAgentMention(text, mentionedAgent.name);
       }
       if (
         !text &&
@@ -3088,7 +3469,11 @@ export default function WorkspaceChat({
       const now = new Date().toISOString();
       // `% Flow` is an explicit invocation and takes precedence over agent and
       // Skill routing when users combine control tokens in one draft.
-      const targetAgent = workflow ? null : resolvedAgent;
+      // Ordinary Workspace chat defaults to scoped Manor AI. Only an explicit
+      // mention selects a specialist; channel bindings belong to their gateway.
+      const targetAgent = workflow || isTaskSession
+        ? null
+        : appAgent || mentionedAgent;
       const starterBindingId = workflow?.bindingId || "";
       const targetName = isTaskSession
         ? taskSession?.hostName || MANOR_AGENT_NAME
@@ -3102,16 +3487,13 @@ export default function WorkspaceChat({
         setMentionAgent(null);
       }
 
-      // Display content reflects attached file names
+      const workflowMessage = workflow ? workflowInvokeMessage(workflow) : "";
+      const clientMessageId = crypto.randomUUID();
+      // Keep content as user text; the shared renderer owns attachment/Skill
+      // chips from structured fields, independent of the current UI language.
       const displayContent = [
-        text,
-        attachments.length > 0
-          ? `[${t("component.workspace_chat.attached")}: ${attachments.map((f) => f.name).join(", ")}]`
-          : "",
-        effectiveManualSkills.length > 0
-          ? `[${t("component.chat_input_footer.skill")}: ${effectiveManualSkills.map(manualSkillLabel).join(", ")}]`
-          : "",
-        workflow
+        text || workflowMessage,
+        workflow && text
           ? `[${t("nav.flows")}: ${workflow.title}]`
           : "",
       ]
@@ -3122,21 +3504,35 @@ export default function WorkspaceChat({
       // closing/reopening the workspace panel while the request is running.
       const initialMessages: WorkspaceLocalMsg[] = [
         {
-          id: `local-user-${Date.now()}`,
+          id: `local-user-${clientMessageId}`,
+          conversation_id: activeConversationId,
           role: "user",
           content: displayContent,
           timestamp: now,
           attachments: attachments.map((attachment) => ({
             name: attachment.name,
             document_id: attachment.id,
+            fsPath: attachment.fsPath,
             type: attachment.type,
             fileType: attachment.fileType,
             mimeType: attachment.mimeType || attachment.file?.type,
             previewUrl: attachment.previewUrl,
           })),
-          meta: sendOptions.responseSurfaceSubmission
-            ? responseSurfaceSubmissionMeta(sendOptions.responseSurfaceSubmission)
-            : undefined,
+          manualSkills: effectiveManualSkills.map((skill) => ({
+            id: skill.id,
+            name: manualSkillLabel(skill),
+            slug: skill.slug || undefined,
+          })),
+          meta: {
+            client_message_id: clientMessageId,
+            author_user_id: currentUser?.id,
+            ...(starterBindingId ? {
+                workflow_binding_id: starterBindingId,
+                workflow_route_source: "explicit",
+              } : sendOptions.responseSurfaceSubmission
+              ? responseSurfaceSubmissionMeta(sendOptions.responseSurfaceSubmission)
+              : {}),
+          },
         },
         {
           id: `local-bot-${Date.now()}`,
@@ -3168,9 +3564,10 @@ export default function WorkspaceChat({
               ? api.workspaces.chat.streamEntrypoint(
                   workspaceId,
                   starterBindingId,
-                  text || "Use the attached context to run this workflow.",
+                  text || workflowMessage,
                   activeConversationId,
                   {
+                    clientMessageId,
                     files: localFiles.length > 0 ? localFiles : undefined,
                     documentIds: documentIds.length > 0 ? documentIds : undefined,
                     localWorkerId: sendContext?.localWorkerId,
@@ -3182,6 +3579,7 @@ export default function WorkspaceChat({
                 "Use the manually selected skill with the current conversation context.",
               activeConversationId,
               {
+                clientMessageId,
                 workspaceId,
                 workspaceContext: true,
                 agentId: targetAgent?.id,
@@ -3229,9 +3627,14 @@ export default function WorkspaceChat({
         };
       }
 
+      await invalidateAgentInitiativeQueries(queryClient);
       await queryClient.invalidateQueries({
         queryKey: ["workspace-chat", workspaceId],
       });
+      if (!threadRef) {
+        void queryClient.invalidateQueries({ queryKey: ["workspace-app-view", workspaceId] });
+        void queryClient.invalidateQueries({ queryKey: ["workspace-chat-entrypoints", workspaceId] });
+      }
       // The agent may have written artifacts during this turn (not only when
       // the user attached files), so refresh file/knowledge views every turn.
       await queryClient.invalidateQueries({
@@ -3242,6 +3645,11 @@ export default function WorkspaceChat({
     },
     [
       activeConversationId,
+      resumeAutoFollow,
+      catalogScope,
+      isSimple,
+      remoteRunInFlight,
+      currentUser?.id,
       localMsgs,
       workspaceId,
       threadRef,
@@ -3320,17 +3728,6 @@ export default function WorkspaceChat({
     wsConversationId,
   ]);
 
-  useEffect(() => {
-    if (!latestPendingActionId) return;
-    if (initialPendingActionIdsRef.current.has(latestPendingActionId)) return;
-    const frame = window.requestAnimationFrame(() => {
-      document.getElementById(
-        `workspace-chat-message-${latestPendingActionId}`,
-      )?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [latestPendingActionId]);
-
   // The COUNT comes from the server, never from `pendingActions.length`. This
   // list is whatever the client has accumulated, and it drifts above the truth
   // the moment a card is answered: the answered card leaves the pinned set, so
@@ -3339,8 +3736,41 @@ export default function WorkspaceChat({
   // numbers. Fall back to the local length only before the first page lands.
   const openActionCount =
     workspaceMessagesPage?.open_action_count ?? pendingActions.length;
+  const pendingActionNotice = usePendingActionNotice(
+    `${currentUser?.id || ""}:${streamSessionKey}`,
+    pendingActions.map((message) => message.id),
+  );
+  useEffect(() => {
+    if (!attentionTargetKey || !attentionTargetMessageId || !workspaceMessagesPage) return;
+    const navigationKey = `${workspaceId}:${location.key}:${attentionTargetKey}`;
+    if (locatedAttentionNavigationRef.current === navigationKey) return;
+    pauseAutoFollow();
+    let frame = 0;
+    let located = false;
+    const locate = () => {
+      if (located) return;
+      const message = document.getElementById(`workspace-chat-message-${attentionTargetMessageId}`);
+      const card = Array.from(message?.querySelectorAll<HTMLElement>("[data-workspace-attention-key]") || [])
+        .find((node) => node.dataset.workspaceAttentionKey === attentionTargetKey) || message;
+      if (!card || card.getClientRects().length === 0) return;
+      located = true;
+      observer.disconnect();
+      frame = window.requestAnimationFrame(() => {
+        locatedAttentionNavigationRef.current = navigationKey;
+        card.tabIndex = -1;
+        card.focus({ preventScroll: true });
+        scrollToMessage(card, "auto");
+        pendingActionNotice.highlight(attentionTargetMessageId);
+      });
+    };
+    const observer = new MutationObserver(locate);
+    if (workspaceChatHistoryStageRef.current) observer.observe(workspaceChatHistoryStageRef.current, { childList: true, subtree: true, attributes: true });
+    locate();
+    return () => { observer.disconnect(); window.cancelAnimationFrame(frame); };
+  }, [workspaceId, location.key, attentionTargetKey, attentionTargetMessageId, workspaceMessagesPage, pendingActionNotice.highlight, pauseAutoFollow, scrollToMessage]);
+
   const showPendingActionsBanner =
-    autonomousRunning && openActionCount > 0 && pendingActions.length > 0;
+    autonomousRunning && openActionCount > 0 && pendingActions.length > 0 && !pendingActionNotice.hidden;
   // Jump to the OLDEST open action, not the newest. `sorted` is ascending, so
   // the newest sits nearest the bottom where the reader already is, while the
   // one that has waited longest is buried far above — the only one that
@@ -3359,8 +3789,11 @@ export default function WorkspaceChat({
     const el = document.getElementById(
       `workspace-chat-message-${oldestPendingAction.id}`,
     );
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [oldestPendingAction]);
+    if (!el) return;
+    el.focus({ preventScroll: true });
+    scrollToMessage(el);
+    pendingActionNotice.highlight(oldestPendingAction.id);
+  }, [oldestPendingAction, pendingActionNotice.highlight, scrollToMessage]);
 
   const visibleLocalMsgs = useMemo(
     () =>
@@ -3383,10 +3816,11 @@ export default function WorkspaceChat({
     ],
   );
   const activeWorkspaceMessage = useMemo(
-    () => streaming
-      ? [...visibleLocalMsgs].reverse().find((message) => message.role === "assistant") || null
-      : null,
-    [streaming, visibleLocalMsgs],
+    () => {
+      const last = localMsgs.at(-1);
+      return last && workspaceMessageOwnsStream(last, localMsgs, streaming) ? last : null;
+    },
+    [streaming, localMsgs],
   );
   const activeWorkspaceActivity = useMemo(
     () => inferAgentActivity(activeWorkspaceMessage),
@@ -3398,10 +3832,15 @@ export default function WorkspaceChat({
   );
   const timelinePersistedMessages = useMemo(
     () =>
-      hasVisibleLocalAssistant
-        ? presentedVisibleSortedMessages.filter((msg) => !isRunningStreamPlaceholder(msg))
-        : presentedVisibleSortedMessages,
-    [hasVisibleLocalAssistant, presentedVisibleSortedMessages],
+      presentedVisibleSortedMessages.filter((msg) => {
+        if (hasVisibleLocalAssistant && isRunningStreamPlaceholder(msg)) return false;
+        const persisted = msg.meta?.strategist_activity?.state;
+        const state = isStrategistActivityTerminalState(persisted)
+          ? persisted
+          : realtimeStrategistActivityById.get(msg.id)?.state || persisted;
+        return state !== "completed" && state !== "skipped";
+      }),
+    [hasVisibleLocalAssistant, presentedVisibleSortedMessages, realtimeStrategistActivityById],
   );
 
   const timelineItems = useMemo(() => {
@@ -3497,7 +3936,7 @@ export default function WorkspaceChat({
               ...item.msg,
               tool_calls: (item.msg.tool_calls || []) as ToolCall[],
             },
-            streaming && item.localIndex === visibleLocalMsgs.length - 1,
+            workspaceMessageOwnsStream(item.msg, localMsgs, streaming),
           );
         }
       } else {
@@ -3525,7 +3964,7 @@ export default function WorkspaceChat({
                 fsPath: reference.fsPath,
               })),
             },
-            streaming,
+            workspaceMessageOwnsStream(item.msg, localMsgs, streaming),
           );
         }
       }
@@ -3540,7 +3979,7 @@ export default function WorkspaceChat({
     selectedArtifact,
     selectedArtifactAnchor,
     streaming,
-    visibleLocalMsgs.length,
+    localMsgs,
   ]);
 
   const workspaceThreadLoading = workspaceMessagesLoading && timelineItems.length === 0;
@@ -3607,9 +4046,14 @@ export default function WorkspaceChat({
         const agent = msg.author_subscription_id
           ? subToAgent.get(msg.author_subscription_id)
           : null;
+        const authorUserId = workspaceMessageAuthorUserId(msg);
         const fallbackTitle =
           msg.author_kind === "user"
-            ? msg.author_user_name || currentUserName || "You"
+            ? isCurrentWorkspaceUserMessage(msg, currentUser?.id)
+              ? currentUserName
+              : authorUserId
+                ? msg.author_user_name || msg.author_user_email || t("component.workspace_chat.unknown_participant")
+                : t("component.workspace_chat.unknown_participant")
             : msg.author_kind === "system"
               ? systemSenderName(msg)
               : agent?.name || MANOR_AGENT_NAME;
@@ -3710,18 +4154,26 @@ export default function WorkspaceChat({
             {taskSession.objective && (
               <p className="task-session-chat-summary-objective">{taskSession.objective}</p>
             )}
-            <span
-              className={`task-session-chat-context-trigger ${
-                taskSession.hostAvailable === false
-                  ? "task-session-chat-context-trigger--unavailable"
-                  : ""
-              }`}
-            >
-              {t(taskSession.hostAvailable === false
-                ? "page.task_detail.session_host_unavailable"
-                : "page.task_detail.session_plan_label")}
-              <span className="task-session-chat-context-chevron" aria-hidden="true" />
-            </span>
+            <div className="task-session-chat-summary-actions">
+              <ConversationInitiativesButton
+                conversationId={initiativeConversationId}
+                fallbackTitle={taskSession.objective || workspaceName}
+                openDirectly
+                stopClickPropagation
+              />
+              <span
+                className={`task-session-chat-context-trigger ${
+                  taskSession.hostAvailable === false
+                    ? "task-session-chat-context-trigger--unavailable"
+                    : ""
+                }`}
+              >
+                {t(taskSession.hostAvailable === false
+                  ? "page.task_detail.session_host_unavailable"
+                  : "page.task_detail.session_plan_label")}
+                <span className="task-session-chat-context-chevron" aria-hidden="true" />
+              </span>
+            </div>
           </summary>
           <div className="task-session-chat-context">
             {taskSession.hostAvailable === false && (
@@ -3838,9 +4290,93 @@ export default function WorkspaceChat({
               >
                 {workspaceName || t("component.workspace_chat.workspace_chat")}
               </h2>
-              <span className="chat-model-badge">
-                {agentList.length + 1} {t("component.workspace_chat.members")}
-              </span>
+              <AnchoredPopover
+                align="left"
+                width={320}
+                ariaLabel={t("component.workspace_chat.participants")}
+                panelClassName="workspace-chat-members-popover"
+                trigger={(
+                  <button
+                    type="button"
+                    className="chat-model-badge workspace-chat-members-trigger"
+                    aria-label={t("component.workspace_chat.participant_count", {
+                      count: workspaceParticipantCount,
+                    })}
+                  >
+                    <IconUsers size={12} />
+                    <span>
+                      {workspaceParticipantCount} {t("component.workspace_chat.members")}
+                    </span>
+                  </button>
+                )}
+              >
+                <div className="workspace-chat-members-panel">
+                  <div className="workspace-chat-members-heading">
+                    <strong>{t("component.workspace_chat.participants")}</strong>
+                    <span>{workspaceParticipantCount}</span>
+                  </div>
+                  <div className="workspace-chat-members-section">
+                    <span className="workspace-chat-members-section-label">
+                      {t("component.workspace_chat.team_members")}
+                    </span>
+                    <div className="workspace-chat-members-list" role="list">
+                      {humanMembers.map((member) => {
+                        const name = member.display_name || member.email || t("page.users.role_member");
+                        return (
+                          <div
+                            className="workspace-chat-member-row"
+                            role="listitem"
+                            key={member.user_id || member.id}
+                          >
+                            <UserAvatar
+                              name={name}
+                              avatarUrl={member.avatar_url}
+                              type="user"
+                              size={30}
+                            />
+                            <span className="workspace-chat-member-copy">
+                              <strong>{name}</strong>
+                              <small>
+                                {member.user_id === currentUser?.id
+                                  ? t("component.workspace_chat.you")
+                                  : member.role || t("page.users.role_member")}
+                              </small>
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {agentList.length > 0 && (
+                    <div className="workspace-chat-members-section">
+                      <span className="workspace-chat-members-section-label">
+                        {t("component.workspace_chat.ai_agents")}
+                      </span>
+                      <div className="workspace-chat-members-list" role="list">
+                        {agentList.map((agent) => (
+                          <div
+                            className="workspace-chat-member-row"
+                            role="listitem"
+                            key={agent.id}
+                          >
+                            <UserAvatar
+                              name={agent.name}
+                              avatarUrl={agent.avatar_url}
+                              type="agent"
+                              seed={agentAvatarSeed(agent)}
+                              size={30}
+                            />
+                            <span className="workspace-chat-member-copy">
+                              <strong>{agent.name}</strong>
+                              <small>{t("component.workspace_chat.ai_agent")}</small>
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </AnchoredPopover>
             </div>
             {streaming ? (
               <div
@@ -3853,7 +4389,7 @@ export default function WorkspaceChat({
               >
                 <AgentActivityOrb activity={activeWorkspaceActivity} />
               </div>
-            ) : (
+            ) : !isSimple && (
               <div
                 style={{
                   display: "flex",
@@ -3862,13 +4398,35 @@ export default function WorkspaceChat({
                 }}
               >
                 <span className="workspace-chat-subtitle">
-                  {t("component.workspace_chat.type_to_mention_an_agent")}</span>
+                  {t("component.workspace_chat.talking_with_host", {
+                    agent: mentionAgent?.name || MANOR_AGENT_NAME,
+                  })}</span>
               </div>
             )}
           </div>
         </div>
-        {!threadRef && (
-          <div className="workspace-chat-header-actions">
+        <div className="workspace-chat-header-actions">
+          {usageGuide && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setGuideOpen(true)}
+              ariaLabel={t("page.blueprint_detail.workspace_usage_guide", { name: workspaceName || workspace?.name || "Workspace" })}
+              title={t("page.blueprint_detail.workspace_usage_guide", { name: workspaceName || workspace?.name || "Workspace" })}
+              style={{ width: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+            >
+              <IconHelp size={18} />
+            </Button>
+          )}
+          <WorkspaceConnectionNotice workspaceId={workspaceId} variant="icon" />
+          {!isSimple && threadRef && !isTaskSession && (
+            <ConversationInitiativesButton
+              conversationId={initiativeConversationId}
+              fallbackTitle={workspaceName}
+            />
+          )}
+          {!isSimple && !threadRef && (
+            <>
             {canToggleWorkspace && !showSimulationRuntime && (
               <AnchoredPopover
                 align="right"
@@ -4026,14 +4584,63 @@ export default function WorkspaceChat({
             )}
             <WorkspaceStatsQuickAccess
               workspaceId={workspaceId}
+              workspace={workspace}
               workspaceName={workspaceName}
+              initiativeConversationId={initiativeConversationId}
+              enabled={supportingQueriesEnabled}
+              canManage={Boolean(workspace && canManageWorkspace(currentUser, workspaceStaff || []))}
             />
-          </div>
-        )}
+            </>
+          )}
+          {!threadRef && (
+            <>
+              {appDiscovery.badgeVisible && (
+                <FeatureDiscoveryBadge
+                  label={t("component.feature_discovery.new")}
+                  onClick={appDiscovery.reveal}
+                  expanded={appDiscovery.open}
+                  controls="workspace-app-feature-discovery"
+                />
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                className="workspace-app-pane-toggle"
+                onClick={() => {
+                  setAppUsed(true);
+                  setOutputOpen(false);
+                  changeAppDisplay(!appOpen || outputOpen ? "split" : "chat");
+                }}
+                ariaLabel={t(appOpen && !outputOpen ? "component.workspace_app_view.hide_app" : "component.workspace_app_view.open_app")}
+                ariaPressed={appOpen && !outputOpen}
+                title={t(appOpen && !outputOpen ? "component.workspace_app_view.hide_app" : "component.workspace_app_view.open_app")}
+                style={{ width: 30, padding: 0, display: "inline-flex", alignItems: "center", justifyContent: "center" }}
+              >
+                {appOpen && !outputOpen ? <IconPanelRightClose size={17} /> : <IconPanelRight size={17} />}
+              </Button>
+            </>
+          )}
+        </div>
       </div>
       )}
 
-      {/* ── Agent chips (display only — DM via @mention) ── */}
+      {!isTaskSession && !threadRef && appDiscovery.open && (
+        <FeatureDiscoveryHint
+          id="workspace-app-feature-discovery"
+          title={t("component.feature_discovery.workspace_app_title")}
+          description={t("component.feature_discovery.workspace_app_description")}
+          actionLabel={t("component.feature_discovery.explore_workspace_app")}
+          laterLabel={t("component.feature_discovery.later")}
+          onAction={() => {
+            setAppUsed(true);
+            setOutputOpen(false);
+            changeAppDisplay("split");
+          }}
+          onDismiss={appDiscovery.dismiss}
+        />
+      )}
+
+      {/* ── Agent chips (simple: team visibility; professional: quick view) ── */}
       {!isTaskSession && (workspaceAgentsLoading ? (
         <div className="embedded-agents-row" aria-hidden="true">
           <SkeletonLine width={112} height={24} radius={999} />
@@ -4046,13 +4653,8 @@ export default function WorkspaceChat({
             <ManorAvatar size={14} />
             {MANOR_AGENT_NAME}
           </span>
-          {(agentsExpanded ? agentList : agentList.slice(0, 5)).map((agent) => (
-            <button
-              key={agent.id}
-              type="button"
-              className="agent-chip"
-              onClick={() => openAgentQuickView(agent)}
-            >
+          {(agentsExpanded ? agentList : agentList.slice(0, 5)).map((agent) => {
+            const content = <>
               <UserAvatar
                 name={agent.name}
                 avatarUrl={agent.avatar_url}
@@ -4061,8 +4663,22 @@ export default function WorkspaceChat({
                 size={14}
               />
               {agent.name}
-            </button>
-          ))}
+            </>;
+            return isSimple ? (
+              <span key={agent.id} className="agent-chip" style={{ cursor: "default" }}>
+                {content}
+              </span>
+            ) : (
+              <button
+                key={agent.id}
+                type="button"
+                className="agent-chip"
+                onClick={() => openAgentQuickView(agent)}
+              >
+                {content}
+              </button>
+            );
+          })}
           {agentList.length > 5 && (
             <button
               type="button"
@@ -4085,20 +4701,29 @@ export default function WorkspaceChat({
       )}
 
 
-      {/* ── Messages ── */}
-      <div className="embedded-chat-body-wrap workspace-chat-body-wrap chat-scroll-rail-host">
+      {/* ── Messages and floating run status ── */}
+      <div
+        ref={workspaceChatHistoryStageRef}
+        className={`workspace-chat-history-stage${
+          isTaskSession ? "" : " workspace-chat-history-stage--floating"
+        }`}
+      >
+        <div className="embedded-chat-body-wrap workspace-chat-body-wrap chat-scroll-rail-host">
         <div
           ref={chatBodyRef}
-          onScroll={handleAutoFollowScroll}
+          tabIndex={0}
           className={`embedded-chat-body ${
-            timelineItems.length === 0 && !showSimulationRuntime
+            timelineItems.length === 0 &&
+            !showSimulationRuntime &&
+            !showBlueprintAssetInitialization
               ? "embedded-chat-body--empty workspace-chat-body--empty"
               : ""
           }`}
         >
+        <div ref={chatContentRef} className="chat-scroll-content">
         {showPendingActionsBanner && (
           <div className="workspace-pending-actions-banner">
-            <div>
+            <div className="workspace-pending-actions-content">
               <div className="workspace-pending-actions-title">
                 {pendingActionsLabel(openActionCount)}
               </div>
@@ -4121,11 +4746,24 @@ export default function WorkspaceChat({
             >
               {t("component.workspace_chat.jump_to_oldest_action")}
             </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="workspace-pending-actions-dismiss"
+              style={{ width: 32, height: 32, padding: 0 }}
+              ariaLabel={t("component.workspace_chat.dismiss_pending_notice")}
+              title={t("component.workspace_chat.dismiss_pending_notice")}
+              onClick={pendingActionNotice.dismiss}
+            >
+              <IconClose size={14} />
+            </Button>
           </div>
         )}
         {workspaceThreadLoading ? (
           <ChatMessagesSkeleton rows={5} />
-        ) : timelineItems.length === 0 && !showSimulationRuntime && (
+        ) : timelineItems.length === 0 &&
+          !showSimulationRuntime &&
+          !showBlueprintAssetInitialization && (
           <div
             style={{
               display: "flex",
@@ -4163,7 +4801,9 @@ export default function WorkspaceChat({
                     : t("page.task_detail.session_ready_copy", {
                         agent: taskSession?.hostName || MANOR_AGENT_NAME,
                       })
-                  : `${t("component.workspace_chat.talk_to")}${MANOR_AGENT_NAME} ${t("component.workspace_chat.or_mention_a_specific_agent")}`}
+                  : isSimple
+                    ? t("component.chat_input_footer.simple_placeholder")
+                    : `${t("component.workspace_chat.talk_to")}${MANOR_AGENT_NAME} ${t("component.workspace_chat.or_mention_a_specific_agent")}`}
               </p>
             </div>
           </div>
@@ -4191,6 +4831,7 @@ export default function WorkspaceChat({
                 markerId={item.key}
                 msgs={item.msgs}
                 subToAgent={subToAgent}
+                simple={isSimple}
               />
             );
           }
@@ -4242,15 +4883,18 @@ export default function WorkspaceChat({
               <WsMessageRow
                 key={item.key}
                 markerId={item.key}
+                workspaceId={workspaceId}
+                highlighted={pendingActionNotice.highlightedMessageId === item.msg.id}
                 msg={item.msg}
+                attentionKeys={workspaceMessagesPage?.unseen_action_keys?.[item.msg.id]}
+                workflowHistoryContext={hostOwnedWorkflowMessageIds.has(item.msg.id)}
                 subToAgent={subToAgent}
                 currentUserName={currentUserName}
                 currentUserAvatar={currentUserAvatar}
                 currentUserId={currentUser?.id || null}
                 onResolve={handleResolve}
                 onHitlAction={handleHitlAction}
-                streaming={streaming}
-                workspacePaused={workspace?.status === "paused"}
+                streaming={workspaceMessageOwnsStream(item.msg, localMsgs, streaming)}
                 presentingAgentGreeting={item.msg.id === activeAgentGreetingId}
                 actionResetToken={actionResetTokens[item.msg.id] || 0}
                 onFeedback={handleTaskCompletionFeedback}
@@ -4263,7 +4907,7 @@ export default function WorkspaceChat({
                 onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                 responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                 onConfigureLedgers={
-                  canToggleWorkspace && !threadRef
+                  !isSimple && canToggleWorkspace && !threadRef
                     ? openLedgerConfiguration
                     : undefined
                 }
@@ -4280,14 +4924,18 @@ export default function WorkspaceChat({
               : [];
           const localCodingNotice =
             msg.role === "assistant" ? maybeLocalCodingRunNoticeForTools(localTools) : null;
-          const bubbleContent = localCodingNotice || msg.content;
-          const isStreamingAssistant =
-            streaming &&
-            item.localIndex === visibleLocalMsgs.length - 1 &&
-            msg.role === "assistant";
+          const rawBubbleContent = localCodingNotice || msg.content;
+          const isStreamingAssistant = workspaceMessageOwnsStream(msg, localMsgs, streaming);
+          const retryableLocalAssistant = isWorkspaceChatFailedTurn(
+            msg,
+            rawBubbleContent,
+          );
+          const bubbleContent = retryableLocalAssistant
+            ? workspaceChatFailureContent(msg, rawBubbleContent)
+            : rawBubbleContent;
           const renderedBubbleDisplay = parseUserMessageDisplay(
-            { ...msg, content: bubbleContent },
-            { streaming: isStreamingAssistant },
+            msg,
+            { content: bubbleContent, streaming: isStreamingAssistant },
           );
           const renderedBubbleContent = renderedBubbleDisplay.cleanContent;
           const messageDisplay = localCodingNotice
@@ -4296,21 +4944,27 @@ export default function WorkspaceChat({
                 streaming: isStreamingAssistant,
               })
             : renderedBubbleDisplay;
-          const retryableLocalAssistant = isRetryableAssistantMessage(
-            msg,
-            renderedBubbleContent,
-          );
+          const messageQueueStatus = msg.role === "assistant" && isStreamingAssistant && !runtimeHumanInput
+            ? runtimeQueueStatus : undefined;
           const localAssistantBlocks =
             msg.role === "assistant" &&
             !retryableLocalAssistant &&
-            Array.isArray(msg.assistant_blocks) &&
-            msg.assistant_blocks.length > 0;
+            (Boolean(messageQueueStatus) || (isStreamingAssistant && !runtimeHumanInput && localTools.length === 0) || (Array.isArray(msg.assistant_blocks) &&
+            msg.assistant_blocks.length > 0));
+          const showFallbackProcess = !retryableLocalAssistant && !localAssistantBlocks && localTools.length > 0;
           const actionCopyText = msg.role === "user"
             ? String(bubbleContent || "")
-            : formatUserFacingStructuredText(
-              chatMessageActionText(msg, bubbleContent),
-            );
+            : retryableLocalAssistant
+              ? renderedBubbleContent
+              : formatUserFacingStructuredText(
+                  chatMessageActionText(msg, bubbleContent, isStreamingAssistant),
+                );
           const visibleMessageFileReferences = messageDisplay.references;
+          const showMessageBubble = !showFallbackProcess || Boolean(
+            renderedBubbleContent ||
+              visibleMessageFileReferences.length > 0 ||
+              (isStreamingAssistant && (runtimeQueueStatus || runtimeHumanInput)),
+          );
           const messageArtifacts =
             msg.role === "assistant"
               ? filterMessageArtifactsAlreadyRepresented(
@@ -4377,32 +5031,29 @@ export default function WorkspaceChat({
                     ? t("page.chat_history.you")
                     : msg.agentName || MANOR_AGENT_NAME}
                 </span>
-                <div
+                {showFallbackProcess && (
+                  <ToolCallList
+                    tools={localTools}
+                    hideDetails={isSimple}
+                    keyPrefix={item.key}
+                    subAgentRuns={delegatedRuns}
+                    streaming={isStreamingAssistant}
+                  />
+                )}
+                {showMessageBubble && (
+                  <div
                   className={`chat-bubble ${msg.role === "user" ? "chat-bubble--user" : "chat-bubble--bot"} ${
-                    msg.role === "assistant" && isStreamingAssistant && !renderedBubbleContent
+                    msg.role === "assistant" && isStreamingAssistant && !renderedBubbleContent && !localAssistantBlocks
                       ? "chat-bubble--activity"
                       : ""
                   }`}
                 >
-                  {!localAssistantBlocks && localTools.length > 0 && (
-                    <ToolCallList
-                      tools={localTools}
-                      keyPrefix={item.key}
-                      subAgentRuns={delegatedRuns}
+                  {isStreamingAssistant && runtimeHumanInput && (
+                    <RuntimeHumanInputCard
+                      input={runtimeHumanInput}
+                      onSubmit={submitRuntimeHumanInput}
+                      busy={runtimeInputBusy}
                     />
-                  )}
-                  {isStreamingAssistant && runtimeQueueStatus && (
-                    <div
-                      className="chat-runtime-queue-status"
-                      role="status"
-                      aria-live="polite"
-                    >
-                      <span
-                        className="chat-runtime-queue-status-dot"
-                        aria-hidden="true"
-                      />
-                      <span>{runtimeQueueStatus}</span>
-                    </div>
                   )}
                   {localAssistantBlocks ? (
                     <AssistantMessageBlocks
@@ -4410,14 +5061,18 @@ export default function WorkspaceChat({
                       content={renderedBubbleContent}
                       keyPrefix={item.key}
                       streaming={isStreamingAssistant}
+                      hideProcess={isSimple}
                       minimal
                       collapseLongFinal
+                      queueStatus={messageQueueStatus}
                       subAgentRuns={delegatedRuns}
                       onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                       sourceMessageId={msg.id || ""}
+                      pendingActionKind={assistantPendingActionKindForMessage(msg)}
+                      hitlRequests={msg.hitl_requests}
                       responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                       onConfigureWorkspaceLedgers={
-                        canToggleWorkspace && !threadRef
+                        !isSimple && canToggleWorkspace && !threadRef
                           ? openLedgerConfiguration
                           : undefined
                       }
@@ -4441,7 +5096,8 @@ export default function WorkspaceChat({
                     inlineFileCards
                     returnTo={messageReturnTo}
                   />
-                </div>
+                  </div>
+                )}
                 {msg.role === "assistant" && (
                   <ArtifactSummaryCards
                     artifacts={messageArtifacts}
@@ -4494,53 +5150,139 @@ export default function WorkspaceChat({
           );
         })}
 
-        <div ref={bottomRef} />
+        {isSimple && shouldWatchBlueprintSetup && (blueprintSetupLoading || blueprintSetupError) && (
+          <div className="workspace-chat-setup-status" role={blueprintSetupError ? "alert" : "status"}>
+            <span className="workspace-chat-setup-status-copy">
+              {t(blueprintSetupError
+                ? "page.workspace_detail.blueprint_setup_check_failed"
+                : "page.workspace_detail.checking_blueprint_setup")}
+            </span>
+            {blueprintSetupError && (
+              <Button variant="ghost" size="sm" onClick={() => void refetchBlueprintSetup()}>
+                {t("page.workspace_detail.check_setup_again")}
+              </Button>
+            )}
+          </div>
+        )}
+        {manualBlueprintSetupChecks.map((check, index) => {
+          const kind = check.todo_kind || check.kind || "";
+          const tab = kind === "channel" ? "channels"
+            : ["mcp_server", "mcp_configuration", "missing_skill"].includes(kind) ? "capabilities"
+            : kind === "missing_agent" ? "agents"
+            : kind === "knowledge_pack_content" ? "documents" : "settings";
+          const destination = ["missing_integration", "browser_session"].includes(kind)
+            ? "/integrations"
+            : `/workspaces/${encodeURIComponent(workspaceId)}?tab=${tab}&setup=1`;
+          return (
+            <div className="workspace-chat-setup-status" role="status" key={String(check.key || index)}>
+              <span className="workspace-chat-setup-status-copy">
+                <strong>{t("page.workspace_detail.blueprint_setup_title")}</strong>
+                <span>{String(check.reason || t("page.workspace_detail.setup_item_incomplete"))}</span>
+              </span>
+              <Link className="workspace-chat-setup-status-action" to={destination}>
+                {t("page.workspace_detail.review_setup")}
+              </Link>
+            </div>
+          );
+        })}
+
+        {showBlueprintAssetInitialization && (
+          <div
+            className={`workspace-chat-setup-status${
+              blueprintAssetInitializationFailed
+                ? " workspace-chat-setup-status--failed"
+                : ""
+            }`}
+            role={blueprintAssetInitializationFailed ? "alert" : "status"}
+            aria-live={blueprintAssetInitializationFailed ? "assertive" : "polite"}
+          >
+            <span className="workspace-chat-setup-status-icon" aria-hidden="true">
+              {blueprintAssetInitializationFailed ? (
+                <IconWarning size={18} />
+              ) : (
+                <LoadingSpinner size={18} />
+              )}
+            </span>
+            <span className="workspace-chat-setup-status-copy">
+              <strong>{t(
+                blueprintAssetInitializationFailed
+                  ? "component.workspace_chat.assets_initialization_failed"
+                  : blueprintAssetInitializationRetrying
+                    ? "component.workspace_chat.assets_initialization_retrying"
+                    : "component.workspace_chat.assets_initializing",
+              )}</strong>
+              <span>{t(
+                blueprintAssetInitializationFailed
+                  ? "component.workspace_chat.assets_initialization_failed_desc"
+                  : blueprintAssetInitializationRetrying
+                    ? "component.workspace_chat.assets_initialization_retrying_desc"
+                    : "component.workspace_chat.assets_initializing_desc",
+              )}</span>
+            </span>
+            {blueprintAssetInitializationFailed && (
+              <Link
+                className="workspace-chat-setup-status-action"
+                to={`/workspaces/${encodeURIComponent(workspaceId)}?tab=automations`}
+              >
+                {t("component.workspace_chat.review_setup_automation")}
+              </Link>
+            )}
+          </div>
+        )}
+
+        </div>
         </div>
         <ChatScrollRail
           containerRef={chatBodyRef}
           markers={chatScrollRailMarkers}
+          onNavigate={scrollToPosition}
         />
+        </div>
+
+        {!isTaskSession && (
+          <div
+            ref={workspaceChatFloatingLayerRef}
+            className="workspace-chat-floating-layer"
+          >
+            {/* Live typing indicator for other members. */}
+            {typingLabel && (
+              <div className="workspace-chat-typing">
+                <span className="chat-typing-dots">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+                <span>{typingLabel}</span>
+              </div>
+            )}
+
+            {/* Persistent feature tip — visible even in active chats so users keep
+                discovering what the workspace can do. */}
+            {!isSimple && <div className="chat-tip-bar">
+              <InlineTips
+                surface="workspace_chat"
+                context={{ hasAgents: agentList.length > 0 }}
+                placement="composer"
+              />
+            </div>}
+
+            <WorkspaceWorkflowRunHost
+              workspaceId={workspaceId}
+              groups={workflowRunGroups}
+              attentionKeys={workspaceMessagesPage?.unseen_action_keys}
+              onResolveMessage={handleWorkflowResolve}
+              resolveLoading={resolveMutation.isPending}
+              resolveError={resolveMutation.error}
+              resolveMessageId={resolveMutation.variables?.msgId || null}
+              onRunChange={resolveMutation.reset}
+            />
+          </div>
+        )}
       </div>
-
-      {/* Live typing indicator for other members. */}
-      {!isTaskSession && typingLabel && (
-        <div className="workspace-chat-typing">
-          <span className="chat-typing-dots">
-            <span />
-            <span />
-            <span />
-          </span>
-          <span>{typingLabel}</span>
-        </div>
-      )}
-
-      {/* Persistent feature tip — visible even in active chats so users keep
-          discovering what the workspace can do. */}
-      {!isTaskSession && (
-        <div className="chat-tip-bar">
-          <InlineTips
-            surface="workspace_chat"
-            context={{ hasAgents: agentList.length > 0 }}
-            placement="composer"
-          />
-        </div>
-      )}
-
-      {!isTaskSession && (
-        <WorkspaceWorkflowRunHost
-          workspaceId={workspaceId}
-          workspacePaused={workspace?.status === "paused"}
-          groups={workflowRunGroups}
-          onResolveMessage={handleResolve}
-          resolveLoading={resolveMutation.isPending}
-          resolveError={resolveMutation.error}
-          resolveMessageId={resolveMutation.variables?.msgId || null}
-          onRunChange={resolveMutation.reset}
-        />
-      )}
 
       {/* ── Footer / Input (shared composer with attach + voice + #) ── */}
       <ChatInputFooter
+        attachments="documents"
         voiceScope={{ workspaceId, conversationId: voiceScopeConversationId, threadRefKind: threadRef?.kind, threadRefId: threadRef?.id }}
         onVoiceConversation={(id) => {
           setVoiceConversationId(id);
@@ -4550,7 +5292,8 @@ export default function WorkspaceChat({
         onChange={handleInputChange}
         enterToSend
         streaming={streaming}
-        disabled={composerDisabled || taskSession?.hostAvailable === false}
+        showStopButton={!runtimeHumanInput}
+        disabled={composerDisabled || remoteRunInFlight || taskSession?.hostAvailable === false}
         onSend={(text, attachments, manualSkills, context) => {
           void handleSend(text, attachments, manualSkills, null, context);
         }}
@@ -4559,7 +5302,7 @@ export default function WorkspaceChat({
         }}
         onStop={handleStopRequest}
         topSlot={
-          !isTaskSession && timelineItems.length > 0 ? (
+          !isSimple && !isTaskSession && timelineItems.length > 0 ? (
               <ChatModeTemplateGallery
                 mode={chatMode}
                 disabled={streaming || composerDisabled}
@@ -4592,6 +5335,7 @@ export default function WorkspaceChat({
             />
           ) : undefined
         }
+        approvalSlot={<ApprovalModeTrigger scope={{ kind: "workspace", id: workspaceId }} />}
         modeSlot={
           !isTaskSession ? (
             <ChatModeToolbar
@@ -4605,7 +5349,9 @@ export default function WorkspaceChat({
         }
         replaceActionButtons={isTaskSession || chatMode !== "auto"}
         placeholder={
-          isTaskSession
+          remoteRunInFlight
+            ? t("lib.api.conversation_run_active")
+            : isTaskSession
             ? taskSession?.hostAvailable === false
               ? t("page.task_detail.session_host_unavailable_copy")
               : t("page.task_detail.session_reply_placeholder", {
@@ -4614,10 +5360,12 @@ export default function WorkspaceChat({
             : composerDisabled
               ? t("page.workspace_detail.workspace_paused")
               : mentionAgent
-                ? `Message ${mentionAgent.name}... / skill, % flow`
+                ? t("component.chat_input_footer.message_mentioned_agent_placeholder", { agent: mentionAgent.name })
                 : requestChatMode
                   ? getChatModeInputPlaceholder(chatMode, chatModePayload)
-                  : `Message ${MANOR_AGENT_NAME}... @ mention, # attach, / skill, % flow`
+                  : t("component.chat_input_footer.message_agent_placeholder", {
+                      agent: MANOR_AGENT_NAME,
+                    })
         }
         mentions={isTaskSession ? [] : mentionOptions}
         workflows={isTaskSession ? [] : workflowInvokeOptions}
@@ -4627,16 +5375,46 @@ export default function WorkspaceChat({
         editorRef={composerEditorRef}
         seedAttachments={composerSeed?.attachments}
         seedAttachmentsKey={composerSeed?.key}
+        seedWorkflow={appWorkflowSeed?.workflow}
+        seedWorkflowKey={appWorkflowSeed?.key}
       />
     </div>
   );
+
+  const showAppView = !isTaskSession && !threadRef && appOpen && !outputOpen;
+  const appPaneAvailable = !isTaskSession && !threadRef && !outputOpen;
+  const prepareAppWorkflowChat = (action: WorkspaceAppAction) => {
+    const workflow = workflowInvokeOptions.find((item) => item.bindingId === action.binding_id);
+    if (!workflow) return;
+    setAppWorkflowSeed({ key: crypto.randomUUID(), workflow });
+    changeAppDisplay("chat");
+    window.requestAnimationFrame(() => composerEditorRef.current?.focus());
+  };
+  const launchAppAction = async (action: WorkspaceAppAction, request: string, files: File[] = []) => {
+    const prompt = [action.prompt || action.title, request].filter(Boolean).join("\n\n");
+    const attachments: AttachedItem[] = files.map((file) => ({ name: file.name, type: "file", file, mimeType: file.type }));
+    const completed = await handleSend(prompt, attachments, [], null, undefined, { appAgentId: action.agent_id });
+    if (completed !== true) throw new Error(t("component.workspace_app_view.start_error"));
+    const session = useChatStreamStore.getState().sessions[streamSessionKey];
+    const assistant = [...(session?.messages || [])].reverse().find((message) => message.role === "assistant");
+    return {
+      content: assistant?.content || "",
+      files: (assistant?.attachments || []).flatMap((file) => file.document_id
+        ? [{ id: file.document_id, name: file.name }]
+        : []),
+    };
+  };
 
   return (
     <div
       className={`embedded-chat-workbench workspace-chat-workbench ${
         isTaskSession ? "workspace-chat-workbench--task-session" : ""
       } ${
-        outputOpen ? "embedded-chat-workbench--output-open" : ""
+        outputOpen || showAppView ? "embedded-chat-workbench--output-open" : ""
+      } ${
+        showAppView ? "workspace-chat-workbench--app-open" : ""
+      } ${
+        showAppView && appDisplayMode === "app" ? "workspace-chat-workbench--app-only" : ""
       }`}
     >
       <ResizablePaneGroup
@@ -4645,7 +5423,8 @@ export default function WorkspaceChat({
             id: "chat",
             label: workspaceName || t("component.workspace_chat.workspace_chat"),
             initialSize: 2,
-            minSize: outputOpen ? 420 : undefined,
+            minSize: outputOpen ? 420 : showAppView ? 340 : undefined,
+            collapsed: appPaneAvailable && appDisplayMode === "app",
             className: "embedded-chat-pane workspace-chat-pane",
             children: chatSurface,
           },
@@ -4667,9 +5446,42 @@ export default function WorkspaceChat({
                   ),
                 },
               ]
+            : appPaneAvailable
+            ? [
+                {
+                  id: "app",
+                  label: t("component.workspace_app_view.title"),
+                  initialSize: 1,
+                  minSize: 300,
+                  collapsed: appDisplayMode === "chat",
+                  className: "embedded-chat-pane workspace-chat-app-pane",
+                  children: (
+                    <WorkspaceAppView
+                      view={appViewQuery.data}
+                      loading={appViewQuery.isLoading}
+                      error={appViewQuery.isError}
+                      busy={streaming || remoteRunInFlight}
+                      canStart={Boolean(appViewQuery.data?.can_start) && !composerDisabled}
+                      onRetry={() => { void appViewQuery.refetch(); }}
+                      onUse={() => setAppUsed(true)}
+                      onAction={launchAppAction}
+                      canUseWorkflowChat={(action) => !isSimple && workflowInvokeOptions.some((item) => item.bindingId === action.binding_id)}
+                      onOpenWorkflow={prepareAppWorkflowChat}
+                      onEdit={() => {
+                        setAppUsed(true);
+                        setInputDraft(t("component.workspace_app_view.edit_prompt"));
+                        changeAppDisplay("chat");
+                        window.requestAnimationFrame(() => composerEditorRef.current?.focus());
+                      }}
+                      onClose={() => changeAppDisplay("chat")}
+                    />
+                  ),
+                },
+              ]
             : []),
         ]}
-        storageKey="workspace-chat-output-panes"
+        storageKey={appPaneAvailable ? "workspace-chat-app-panes-v2" : "workspace-chat-output-panes"}
+        onPaneCollapse={appPaneAvailable && appDisplayMode === "split" ? (id) => changeAppDisplay(id === "app" ? "chat" : "app") : undefined}
         className="embedded-chat-output-panes workspace-chat-output-panes"
       />
       <WorkspaceLedgerConfigurationDialog
@@ -4678,6 +5490,12 @@ export default function WorkspaceChat({
         initialContractIds={ledgerConfiguration?.initialContractIds || []}
         onClose={() => setLedgerConfiguration(null)}
         onConfigured={handleLedgersConfigured}
+      />
+      <BlueprintGuideDialog
+        open={Boolean(!isTaskSession && usageGuide && (guideOpen || new URLSearchParams(location.search).get("guide") === "1"))}
+        guide={usageGuide}
+        workspaceName={workspaceName || workspace?.name || "Workspace"}
+        onClose={dismissBlueprintGuide}
       />
       <ConfirmDialog
         open={Boolean(autonomyGoalToDelete)}
@@ -4717,6 +5535,10 @@ export default function WorkspaceChat({
  *  stops rendering must fail a test, not ship. */
 export function WsMessageRow({
   markerId,
+  workspaceId,
+  highlighted = false,
+  attentionKeys,
+  workflowHistoryContext = false,
   msg,
   subToAgent,
   currentUserName,
@@ -4725,7 +5547,6 @@ export function WsMessageRow({
   onResolve,
   onHitlAction,
   streaming,
-  workspacePaused,
   presentingAgentGreeting,
   actionResetToken,
   onFeedback,
@@ -4738,6 +5559,11 @@ export function WsMessageRow({
   onConfigureLedgers,
 }: {
   markerId?: string;
+  workspaceId: string;
+  highlighted?: boolean;
+  attentionKeys?: Record<string, string>;
+  /** A located workflow message shows its original body; the run host owns controls. */
+  workflowHistoryContext?: boolean;
   msg: WsMessage;
   subToAgent: Map<string, AgentInfo>;
   currentUserName: string;
@@ -4754,7 +5580,6 @@ export function WsMessageRow({
    *  `handleHitlAction`. */
   onHitlAction?: (hitlId: string, action: string) => void;
   streaming?: boolean;
-  workspacePaused: boolean;
   presentingAgentGreeting?: boolean;
   actionResetToken?: number;
   onFeedback: (
@@ -4779,15 +5604,16 @@ export function WsMessageRow({
   onConfigureLedgers?: (overview: WorkspaceLedgerOverview) => void;
 }) {
   const location = useLocation();
+  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const isExternalCustomer = isExternalCustomerMessage(msg);
   const isUser = msg.author_kind === "user" && !isExternalCustomer;
-  const authorUserId = msg.author_user_id || msg.meta?.author_user_id || null;
-  const isCurrentUser = isUser && (!authorUserId || authorUserId === currentUserId);
+  const authorUserId = workspaceMessageAuthorUserId(msg);
+  const isCurrentUser = isUser && isCurrentWorkspaceUserMessage(msg, currentUserId);
   const userSenderName = isCurrentUser
     ? t("component.workspace_chat.you")
-    : msg.author_user_name ||
-      msg.author_user_email ||
-      t("page.users.role_member");
+    : authorUserId
+      ? msg.author_user_name || msg.author_user_email || t("component.workspace_chat.unknown_participant")
+      : t("component.workspace_chat.unknown_participant");
   const agent = msg.author_subscription_id
     ? subToAgent.get(msg.author_subscription_id)
     : null;
@@ -4820,19 +5646,24 @@ export function WsMessageRow({
     role: isUser ? "user" : "assistant",
     content: String(msg.body || ""),
     tool_calls: visibleTools,
+    assistant_blocks: msg.assistant_blocks as ChatMessage["assistant_blocks"],
     attachments: messageAttachments,
+    meta: msg.meta,
     stop_reason: String(msg.meta?.stop_reason || "") || undefined,
-    stream_error: msg.meta?.stream_status === "error",
+    stream_error: msg.meta?.stream_error === true || msg.meta?.stream_status === "error",
   };
-  const retryableAssistant = !isUser && isRetryableAssistantMessage(
+  const retryableAssistant = !isUser && isWorkspaceChatFailedTurn(
     baseWorkspaceChatMessage,
     bodyContent,
   );
+  const displayBodyContent = retryableAssistant
+    ? workspaceChatFailureContent(baseWorkspaceChatMessage, bodyContent)
+    : bodyContent;
   const hasAssistantBlocks =
     !isUser &&
     !retryableAssistant &&
-    Array.isArray(msg.assistant_blocks) &&
-    msg.assistant_blocks.length > 0;
+    ((Array.isArray(msg.assistant_blocks) && msg.assistant_blocks.length > 0)
+      || (msg.message_kind === "text" && Boolean(displayBodyContent) && visibleTools.length === 0));
   const workspaceChatMessage: ChatMessage = {
     ...baseWorkspaceChatMessage,
     assistant_blocks: hasAssistantBlocks
@@ -4841,7 +5672,7 @@ export function WsMessageRow({
   };
   const messageReturnTo = `${location.pathname}${location.search}#workspace-chat-message-${msg.id}`;
   const renderedBodyDisplay = parseUserMessageDisplay(
-    { ...workspaceChatMessage, content: bodyContent },
+    { ...workspaceChatMessage, content: displayBodyContent },
     { streaming: Boolean(streaming) },
   );
   const renderedBodyContent = renderedBodyDisplay.cleanContent;
@@ -4874,6 +5705,8 @@ export function WsMessageRow({
   );
   const actionCopyText = isUser || isExternalCustomer
     ? String(bodyContent || "")
+    : retryableAssistant
+      ? renderedBodyContent
     : formatUserFacingStructuredText(
         chatMessageActionText(
           {
@@ -4882,6 +5715,7 @@ export function WsMessageRow({
             assistant_blocks: msg.assistant_blocks,
           },
           bodyContent,
+          Boolean(streaming),
         ),
       );
   const canRateMessage = Boolean(
@@ -4907,6 +5741,19 @@ export function WsMessageRow({
       linkedTaskRefs.some((ref) => ref.status === "proposed"),
   );
   const displayPendingAction = workflowStarterAction(msg);
+  const pendingAttentionKey = attentionKeys?.[String(msg.pending_action?.approval_request_id || msg.pending_action?.approval_token || msg.id)];
+  const inputQuestion = displayPendingAction?.kind === PendingActionKind.HUMAN_INPUT
+    ? String(displayPendingAction.payload?.question || displayPendingAction.prompt || "").trim()
+    : "";
+  const inputBody = renderedBodyContent.trim().replace(
+    /^🙋\s*[^:\n]+? needs a human input:\s*/i,
+    "",
+  );
+  const redundantInputBody = Boolean(
+    !msg.resolved_at &&
+    inputQuestion &&
+    inputBody.replace(/\s+/g, " ") === inputQuestion.replace(/\s+/g, " "),
+  );
   const structuredProposalPayload = structuredProposal(msg);
   const resolvedByName =
     msg.resolved_by_user_id && msg.resolved_by_user_id !== currentUserId
@@ -4947,7 +5794,7 @@ export function WsMessageRow({
       !msg.resolved_at,
   );
   const toggleProposalRow = (rowId: string) => {
-    if (workspacePaused || proposalSelectionLocked) return;
+    if (proposalSelectionLocked) return;
     setProposalSelectedRowIds((previous) => {
       const next = new Set(previous);
       if (next.has(rowId)) next.delete(rowId); else next.add(rowId);
@@ -4956,15 +5803,49 @@ export function WsMessageRow({
   };
   // Every entry needs an id: it is what the resolve reply is keyed on, so a
   // card without one would render buttons that can never resolve anything.
+  //
+  // A workspace-operation review is persisted twice on one message: in
+  // `meta.hitl_requests` (the channel the personal-chat surfaces read) and as
+  // the durable `pending_action` row this surface's own resolve endpoint keys
+  // off. Both describe the same reviewed version, so drop the hitl copy here and let the
+  // `pending_action` card below (diff, validation, blocked Approve) be the one
+  // card — otherwise the operator sees two Approve/Reject pairs for one
+  // decision, one of which is happy to approve a draft that fails validation.
+  const pendingReviewToken =
+    msg.pending_action?.kind === PendingActionKind.WORKSPACE_OPERATION_REVIEW
+      ? String(msg.pending_action.approval_token || msg.pending_action.draft_id || "")
+      : "";
   const hitlCards = (
     Array.isArray(msg.hitl_requests) ? msg.hitl_requests : []
-  ).filter((hitl) => hitl && typeof hitl === "object" && hitl.id);
+  ).filter(
+    (hitl) =>
+      hitl &&
+      typeof hitl === "object" &&
+      hitl.id &&
+      !(pendingReviewToken && String(hitl.id) === pendingReviewToken),
+  );
+  const showFallbackProcess = !retryableAssistant && !hasAssistantBlocks && visibleTools.length > 0;
+  const hasNonProcessBubbleContent = Boolean(
+    renderedBodyContent ||
+      msg.message_kind === "workflow_activity" ||
+      presentingAgentGreeting ||
+      visibleFileReferences.length > 0 ||
+      msg.meta?.workflow_result ||
+      Array.isArray(msg.meta?.simulation_artifacts) ||
+      hitlCards.length > 0 ||
+      (!inlineProposalDecision && (msg.pending_action?.kind || (msg.resolved_at && msg.resolution))) ||
+      showCompletionTaskLink ||
+      visibleTaskRefs.length > 0,
+  );
+  const showMessageBubble = !showFallbackProcess || hasNonProcessBubbleContent;
 
   return (
     <div
       id={`workspace-chat-message-${msg.id}`}
+      data-workspace-attention-key={workflowHistoryContext ? pendingAttentionKey : undefined}
       data-chat-scroll-marker-id={markerId || msg.id}
-      className={`chat-message-row chat-message-shell ${isCurrentUser ? "chat-message-row--user" : ""}`}
+      tabIndex={-1}
+      className={`chat-message-row chat-message-shell ${isCurrentUser ? "chat-message-row--user" : ""} ${highlighted ? "workspace-chat-message--highlighted" : ""}`}
     >
       {isUser ? (
         <UserAvatar
@@ -5014,15 +5895,27 @@ export function WsMessageRow({
           {!isUser &&
             msg.message_kind !== "text" &&
             msg.message_kind !== "agent_update" &&
-            msg.message_kind !== "external_message" && (
+            msg.message_kind !== "external_message" &&
+            (msg.message_kind !== "hitl_request" ||
+              Boolean(msg.pending_action?.kind && !msg.resolved_at) ||
+              (msg.hitl_requests || []).some((request) => !request.resolved)) && (
               <KindBadge kind={msg.message_kind} />
             )}
           {isExternalCustomer && (
             <KindBadge kind="external_message" />
           )}
         </div>
-
-        <div
+        {showFallbackProcess && (
+          <ToolCallList
+            tools={visibleTools}
+            hideDetails={isSimple}
+            keyPrefix={`ws-${msg.id}`}
+            subAgentRuns={delegatedRuns}
+            streaming={Boolean(streaming)}
+          />
+        )}
+        {showMessageBubble && (
+          <div
           className={`chat-bubble ${isCurrentUser ? "chat-bubble--user" : "chat-bubble--bot"} ${!isUser && msg.message_kind === "proposal" ? "chat-bubble--proposal" : ""}`}
           aria-busy={presentingAgentGreeting || undefined}
           style={
@@ -5045,28 +5938,20 @@ export function WsMessageRow({
                   : undefined
           }
         >
-          {!hasAssistantBlocks && visibleTools.length > 0 && (
-            <ToolCallList
-              tools={visibleTools}
-              keyPrefix={`ws-${msg.id}`}
-              subAgentRuns={delegatedRuns}
-            />
-          )}
-
           {hasAssistantBlocks && (
             <AssistantMessageBlocks
               blocks={msg.assistant_blocks}
               content={renderedBodyContent}
               keyPrefix={`ws-${msg.id}`}
+              streaming={Boolean(streaming)}
+              hideProcess={isSimple}
               minimal
               collapseLongFinal={collapseBody}
               subAgentRuns={delegatedRuns}
               onResponseSurfaceSubmit={onResponseSurfaceSubmit}
               sourceMessageId={msg.id}
-              hasPendingAction={Boolean(
-                hitlCards.some((hitl) => !hitl.resolved) ||
-                (msg.pending_action?.kind && !msg.resolved_at)
-              )}
+              pendingActionKind={assistantPendingActionKindForMessage(msg)}
+              hitlRequests={msg.hitl_requests}
               responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
               onConfigureWorkspaceLedgers={onConfigureLedgers}
             />
@@ -5079,13 +5964,14 @@ export function WsMessageRow({
           {!hasAssistantBlocks &&
             msg.message_kind !== "workflow_activity" &&
             renderedBodyContent &&
+            !redundantInputBody &&
             // An open approval renders a clean action card below; suppress the
             // raw governance body so internal keys/payloads never leak. Proposal
             // approvals are the exception: ProposalMessageContent reads their
             // typed payload and gives the operator the rationale before approval.
-            // Keep the body for human_input too — there the body IS the question.
+            // The input card owns its question; keep distinct body context.
             !(
-              msg.pending_action?.kind &&
+              !workflowHistoryContext && msg.pending_action?.kind &&
               msg.pending_action.kind !== PendingActionKind.HUMAN_INPUT &&
               !(
                 msg.message_kind === "proposal" &&
@@ -5094,16 +5980,18 @@ export function WsMessageRow({
               !msg.resolved_at
             ) && (
             msg.message_kind === "proposal" && !isUser ? (
-              <ProposalMessageContent
-                content={formatUserFacingStructuredText(renderedBodyContent)}
-                structured={structuredProposalPayload}
-                action={displayPendingAction}
-                resolution={msg.resolution}
-                resolvedByName={resolvedByName}
-                selectedRowIds={proposalRowsRenderedInline ? proposalSelectedRowIds : undefined}
-                onToggleRow={proposalRowsRenderedInline ? toggleProposalRow : undefined}
-                selectionDisabled={workspacePaused || proposalSelectionLocked}
-              />
+              <div data-workspace-attention-key={pendingAttentionKey}>
+                <ProposalMessageContent
+                  content={formatUserFacingStructuredText(renderedBodyContent)}
+                  structured={structuredProposalPayload}
+                  action={displayPendingAction}
+                  resolution={msg.resolution}
+                  resolvedByName={resolvedByName}
+                  selectedRowIds={proposalRowsRenderedInline ? proposalSelectedRowIds : undefined}
+                  onToggleRow={proposalRowsRenderedInline ? toggleProposalRow : undefined}
+                  selectionDisabled={proposalSelectionLocked}
+                />
+              </div>
             ) : (
               <ExpandableWorkspaceMarkdown
                 content={isUser ? renderedBodyContent : formatUserFacingStructuredText(renderedBodyContent)}
@@ -5149,6 +6037,7 @@ export function WsMessageRow({
               {hitlCards.map((hitl) => (
                 <div
                   key={String(hitl.id)}
+                  data-workspace-attention-key={attentionKeys?.[String(hitl.id)]}
                   className={`chat-hitl-card ${hitl.type === "approval" ? "chat-hitl-card--approval" : ""}`}
                 >
                   {hitl.type === "approval" ? (
@@ -5170,6 +6059,7 @@ export function WsMessageRow({
                     <p className="chat-hitl-prompt">{hitl.prompt}</p>
                   )}
                   <ChatActionCard
+                    workspaceId={workspaceId}
                     action={{
                       kind:
                         hitl.type === "approval" ? "approve" : "human_input",
@@ -5182,7 +6072,7 @@ export function WsMessageRow({
                         : null
                     }
                     currentUserName={currentUserName}
-                    disabled={workspacePaused || Boolean(streaming) || Boolean(hitl.resolved)}
+                    disabled={Boolean(streaming) || Boolean(hitl.resolved)}
                     onResolve={(choice) =>
                       onHitlAction?.(String(hitl.id), choice)
                     }
@@ -5193,32 +6083,40 @@ export function WsMessageRow({
           )}
 
           {/* Persisted actions use their own endpoint; only their own
-              submission and Workspace pause state should lock them. */}
-          {!inlineProposalDecision &&
+              submission locks them. A paused workspace stops the autonomous
+              loop, not the operator: cards stay answerable while paused. */}
+          {!workflowHistoryContext && !inlineProposalDecision &&
             ((msg.pending_action && msg.pending_action.kind) ||
               (msg.resolved_at && msg.resolution)) && (
-              <ChatActionCard
-                action={displayPendingAction || { kind: "unknown" }}
-                resolved={!!msg.resolved_at && !canRetryFailedProposalApproval}
-                resolution={
-                  canRetryFailedProposalApproval ? null : msg.resolution
-                }
-                resolvedByName={resolvedByName}
-                currentUserName={currentUserName}
-                resetToken={actionResetToken}
-                proposalSelectedRowIds={
-                  proposalRowsRenderedInline ? proposalSelectedRowIds : undefined
-                }
-                onProposalSelectedRowIdsChange={
-                  proposalRowsRenderedInline ? setProposalSelectedRowIds : undefined
-                }
-                proposalRowsRenderedElsewhere={proposalRowsRenderedInline}
-                disabled={workspacePaused}
-                onResolve={(choice, note, payload, files) => {
-                  if (proposalRowsRenderedInline) setProposalSelectionLocked(true);
-                  onResolve(msg.id, choice, note, payload, files)
-                }}
-              />
+              <div data-workspace-attention-key={pendingAttentionKey}>
+                <ChatActionCard
+                  workspaceId={workspaceId}
+                  action={displayPendingAction || { kind: "unknown" }}
+                  hasTaskReference={Boolean(
+                    displayPendingAction?.task_id && visibleTaskRefs.slice(0, 5).some(
+                      ({ ref }) => ref.id === String(displayPendingAction.task_id).trim(),
+                    )
+                  )}
+                  resolved={!!msg.resolved_at && !canRetryFailedProposalApproval}
+                  resolution={
+                    canRetryFailedProposalApproval ? null : msg.resolution
+                  }
+                  resolvedByName={resolvedByName}
+                  currentUserName={currentUserName}
+                  resetToken={actionResetToken}
+                  proposalSelectedRowIds={
+                    proposalRowsRenderedInline ? proposalSelectedRowIds : undefined
+                  }
+                  onProposalSelectedRowIdsChange={
+                    proposalRowsRenderedInline ? setProposalSelectedRowIds : undefined
+                  }
+                  proposalRowsRenderedElsewhere={proposalRowsRenderedInline}
+                  onResolve={(choice, note, payload, files) => {
+                    if (proposalRowsRenderedInline) setProposalSelectionLocked(true);
+                    onResolve(msg.id, choice, note, payload, files)
+                  }}
+                />
+              </div>
             )}
 
           {showCompletionTaskLink && (
@@ -5258,7 +6156,8 @@ export function WsMessageRow({
               </div>
             </div>
           )}
-        </div>
+          </div>
+        )}
         {!isUser && (
           <ArtifactSummaryCards
             artifacts={messageArtifacts}
@@ -5317,12 +6216,14 @@ function WorkflowActivityContent({
   msg: WsMessage;
   subToAgent: Map<string, AgentInfo>;
 }) {
+  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const meta = msg.meta || {};
   const steps = Array.isArray(meta.workflow_steps)
     ? meta.workflow_steps.filter((step: unknown) => step && typeof step === "object")
     : [];
   const status = String(meta.workflow_status || "queued").toLowerCase();
   const businessOutcome = String(meta.workflow_business_outcome || "in_progress").toLowerCase();
+  const statusPresentation = workflowRunStatusPresentation({ status: status as WorkflowRunStatus, businessOutcome });
   const attemptNumber = Math.max(1, Number(meta.workflow_attempt_number || 1));
   const currentStepId = String(meta.workflow_current_step_id || "");
   const currentStep = steps.find(
@@ -5337,7 +6238,7 @@ function WorkflowActivityContent({
   ).length;
 
   return (
-    <div className="workspace-workflow-activity" data-status={status}>
+    <div className="workspace-workflow-activity" data-status={statusPresentation.iconStatus}>
       <div className="workspace-workflow-activity-header">
         <span className="workspace-workflow-activity-icon" aria-hidden="true">
           <IconFlow size={15} />
@@ -5345,7 +6246,9 @@ function WorkflowActivityContent({
         <strong>{String(meta.workflow_title || t("component.workspace_chat.workflow"))}</strong>
         <span className="workspace-workflow-activity-status">
           <span aria-hidden="true" />
-          {formatUserFacingText(status)}
+          {statusPresentation.labelKey === status
+            ? formatUserFacingText(status)
+            : t(`component.workflow_run.status.${statusPresentation.labelKey}`)}
         </span>
       </div>
 
@@ -5355,12 +6258,12 @@ function WorkflowActivityContent({
             outcome: formatUserFacingText(businessOutcome),
           })}
         </span>
-        <span className="mono">
+        {!isSimple && <span className="mono">
           {t("component.workspace_chat.workflow_attempt", { count: attemptNumber })}
-        </span>
+        </span>}
       </div>
 
-      {(currentStep || currentAgent) && (
+      {!isSimple && (currentStep || currentAgent) && (
         <div className="workspace-workflow-activity-current">
           <AgentMiniAvatar agent={currentAgent} size={18} />
           <span>
@@ -5370,7 +6273,7 @@ function WorkflowActivityContent({
         </div>
       )}
 
-      {steps.length > 0 && (
+      {!isSimple && steps.length > 0 && (
         <div
           className="workspace-workflow-activity-steps"
           aria-label={t("component.workspace_chat.activity_steps", { count: steps.length })}
@@ -5405,6 +6308,10 @@ function WorkflowActivityContent({
 }
 
 function activityRunTitle(msgs: WsMessage[]): string {
+  for (const m of msgs) {
+    const title = m.meta?.task_title;
+    if (typeof title === "string" && title.trim()) return title.trim();
+  }
   for (const m of msgs) {
     const match = (m.body || "").match(/for task:\s*\*?(.+?)\*?\s*$/im);
     if (match) return match[1].trim();
@@ -5481,18 +6388,25 @@ function WsActivityRun({
   markerId,
   msgs,
   subToAgent,
+  simple = false,
 }: {
   markerId?: string;
   msgs: WsMessage[];
   subToAgent: Map<string, AgentInfo>;
+  simple?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const stepMsgs = msgs.filter((m) => m.message_kind === "step_event");
   const failed = stepMsgs.filter((m) => /failed|✗/i.test(m.body || "")).length;
-  // Prefer the planned step count announced by "Plan started — N step(s)";
-  // fall back to however many step receipts we've actually seen.
+  // New receipts carry the count independently of their display language.
+  // Keep the English text fallback for historical messages.
   let total = stepMsgs.length;
   for (const m of msgs) {
+    const stepCount = m.meta?.step_count;
+    if (typeof stepCount === "number" && Number.isInteger(stepCount) && stepCount >= 0) {
+      total = Math.max(total, stepCount);
+      continue;
+    }
     const declared = (m.body || "").match(/—\s*(\d+)\s*step/i);
     if (declared) total = Math.max(total, parseInt(declared[1], 10));
   }
@@ -5527,7 +6441,7 @@ function WsActivityRun({
     >
       <div className="ws-activity-run">
         <div className="ws-activity-line ws-activity-run-bar">
-          <button
+          {!simple && <button
             type="button"
             className="ws-activity-run-chevron"
             onClick={() => setExpanded((v) => !v)}
@@ -5535,7 +6449,7 @@ function WsActivityRun({
             aria-label={expanded ? t("chat.show_less") : t("chat.show_more")}
           >
             <span aria-hidden>{expanded ? "▾" : "▸"}</span>
-          </button>
+          </button>}
           <span className="ws-activity-run-avatars">
             {stackAgents.map((a, i) => (
               <span className="ws-activity-run-avatar" key={a?.id || i}>
@@ -5563,7 +6477,7 @@ function WsActivityRun({
             {formatTime(last.created_at)}
           </span>
         </div>
-        {expanded && (
+        {!simple && expanded && (
           <div className="ws-activity-run-detail">
             {detailMsgs.map((m, idx) => {
               const stepAgent = msgAgent(m, subToAgent);
@@ -5779,6 +6693,8 @@ function WsActivityLine({
 type StructuredProposal = {
   summary?: string | null;
   notes?: string | null;
+  /** Server-recorded approval outcome and the policy that authorized it. */
+  approval?: unknown;
   tasks?: unknown;
   /** Non-task cohort members (changes / experiments). */
   items?: unknown;
@@ -5921,6 +6837,7 @@ function ProposalMessageContent({
     ? action!.task_ids.map((id: unknown) => String(id || ""))
     : [];
   const actionItems = Array.isArray(action?.items) ? action!.items : [];
+  const actionItemIds = actionItems.map((item: { item_id?: unknown }) => String(item.item_id || ""));
   const structuredTaskRowIds = structuredTasks.map(
     (task, index) => task.task_id || actionTaskIds[index] || `proposal-task-${index}`,
   );
@@ -5934,19 +6851,22 @@ function ProposalMessageContent({
       `proposal-item-${index}`,
   );
   const approvedRowIds = proposalApprovedRowIds(resolution, [
-    ...structuredTaskRowIds,
-    ...legacyTaskRowIds,
-    ...itemRowIds,
+    ...actionTaskIds,
+    ...actionItemIds,
   ]);
+  const approvalView = proposalApprovalView(structured?.approval, resolution);
   const footnotes = Array.isArray(structured?.footnotes)
-    ? structured!.footnotes.map((line) => formatUserFacingText(String(line))).filter(Boolean)
+    ? structured!.footnotes
+      .map((line) => formatUserFacingText(String(line)))
+      .filter((line) => line && line !== approvalView?.reason)
     : [];
   const structuredEmpty =
     Boolean(structured) &&
     !proposal?.summary &&
     !structuredTasks.length &&
     !structuredItems.length &&
-    !(proposal?.notes.length || 0);
+    !(proposal?.notes.length || 0) &&
+    !approvalView;
   if (!proposal || structuredEmpty) {
     return (
       <ExpandableWorkspaceMarkdown
@@ -5959,6 +6879,18 @@ function ProposalMessageContent({
 
   return (
     <div className="workspace-proposal-card">
+      {approvalView && (
+        <div className="workspace-proposal-section" data-proposal-approval={approvalView.status}>
+          <div className="workspace-proposal-task-title-row">
+            <Chip size="sm" variant={approvalView.status === "rejected" ? "red" : "slate"}>
+              {approvalView.label}
+            </Chip>
+          </div>
+          {approvalView.reason && (
+            <p className="workspace-proposal-footnote">{approvalView.reason}</p>
+          )}
+        </div>
+      )}
       {proposal.summary && (
         <div className="workspace-proposal-summary">
           <div className="workspace-proposal-section-title">
@@ -5981,8 +6913,8 @@ function ProposalMessageContent({
               const impact = proposalImpactLabel(task);
               const basis = proposalBasisView(task);
               const rowId = structuredTaskRowIds[index];
-              const isSelectable = Boolean(selectedRowIds && onToggleRow);
-              const isSelected = selectedRowIds?.has(rowId) ?? true;
+              const isSelectable = Boolean(selectedRowIds && onToggleRow && actionTaskIds.includes(rowId));
+              const isSelected = !isSelectable || (selectedRowIds?.has(rowId) ?? true);
               return (
                 <div
                   className={`workspace-proposal-task ${isSelectable ? "is-selectable" : ""} ${!isSelected ? "is-unselected" : ""}`}
@@ -6003,7 +6935,7 @@ function ProposalMessageContent({
                       <span className="workspace-proposal-task-title">
                         {formatUserFacingText(task.title)}
                       </span>
-                      {approvedRowIds && (
+                      {approvedRowIds && actionTaskIds.includes(rowId) && (
                         <ProposalDecisionStatus
                           approved={approvedRowIds.has(structuredTaskRowIds[index])}
                           by={resolvedByName}
@@ -6065,8 +6997,8 @@ function ProposalMessageContent({
             })}
             {legacyTasks.map((task, index) => {
               const rowId = legacyTaskRowIds[index];
-              const isSelectable = Boolean(selectedRowIds && onToggleRow);
-              const isSelected = selectedRowIds?.has(rowId) ?? true;
+              const isSelectable = Boolean(selectedRowIds && onToggleRow && actionTaskIds.includes(rowId));
+              const isSelected = !isSelectable || (selectedRowIds?.has(rowId) ?? true);
               return (
                 <div
                   className={`workspace-proposal-task ${isSelectable ? "is-selectable" : ""} ${!isSelected ? "is-unselected" : ""}`}
@@ -6087,7 +7019,7 @@ function ProposalMessageContent({
                   <div className="workspace-proposal-task-body">
                     <div className="workspace-proposal-task-title-row">
                       <span className="workspace-proposal-task-title">{task.title}</span>
-                      {approvedRowIds && (
+                      {approvedRowIds && actionTaskIds.includes(rowId) && (
                         <ProposalDecisionStatus
                           approved={approvedRowIds.has(legacyTaskRowIds[index])}
                           by={resolvedByName}
@@ -6133,7 +7065,7 @@ function ProposalMessageContent({
                   <div className="workspace-proposal-task-title-row">
                     <Chip size="sm" variant="slate">{item.kind}</Chip>
                     <span className="workspace-proposal-task-title">{item.summary}</span>
-                    {approvedRowIds && (
+                    {approvedRowIds && actionItemIds.includes(itemRowIds[index]) && (
                       <ProposalDecisionStatus
                         approved={approvedRowIds.has(itemRowIds[index])}
                         by={resolvedByName}

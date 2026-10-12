@@ -14,6 +14,7 @@ built, and let the caller decide whether to surface the gaps.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -119,6 +120,11 @@ async def provision_custom_agent(
         raise ValueError("agent_name is required")
     if not spec.system_prompt.strip():
         raise ValueError("system_prompt is required")
+    if any((item.get("config") or {}).get("skill_acquisition") for item in spec.missing_skill_specs if isinstance(item, dict)):
+        from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+
+        # Take the topology fence before any Agent/Skill row locks or writes.
+        await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
 
     warnings: List[str] = []
     capabilities = sorted({
@@ -276,6 +282,7 @@ async def provision_custom_agent(
             workspace_id=spec.workspace_id,
             source_blueprint_id=spec.source_blueprint_id,
             binding_config=base_skill_binding_config,
+            requester_user_id=requester_user_id,
         )
     )
     bound_skills.extend(ref for ref in reused_skills if ref not in bound_skills)
@@ -441,7 +448,9 @@ async def _bind_tools(
     try:
         from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
 
-        registered_names = set(runtime_registered_tool_names())
+        registered_names = set(
+            runtime_registered_tool_names(include_undiscoverable=True)
+        )
     except Exception:
         registered_names = set()
     bound: List[str] = []
@@ -737,6 +746,7 @@ async def _execute_skill_reuse_selector_completion(
     entity_id: str,
     requested_skill: Dict[str, Any],
     candidates: List[Dict[str, Any]],
+    user_id: str | None = None,
 ) -> str:
     """Ask the LLM whether an existing skill should satisfy a missing spec."""
     from packages.core.ai.runtime.completions import runtime_execute_text_completion
@@ -766,6 +776,7 @@ async def _execute_skill_reuse_selector_completion(
             {"role": "user", "content": json.dumps(user, ensure_ascii=False, default=str)},
         ],
         entity_id=entity_id,
+        user_id=user_id,
         source=RUNTIME_SKILL_MATCHER_SOURCE,
         temperature=0.1,
         max_tokens=500,
@@ -780,6 +791,7 @@ async def _select_existing_skill_for_missing_spec(
     spec: Dict[str, Any],
     category: Optional[str],
     warnings: List[str],
+    requester_user_id: str | None = None,
 ) -> tuple[Skill, dict[str, Any]] | None:
     """Use an LLM to pick an existing skill before creating a new one."""
     from packages.core.services.skill_bundle import extract_json_object
@@ -802,6 +814,17 @@ async def _select_existing_skill_for_missing_spec(
         if not is_placeholder_skill_identifier(row.name)
         and not is_placeholder_skill_identifier(row.slug)
     ]
+    if requester_user_id:
+        from packages.core.models.permission import ResourceType
+        from packages.core.services.resource_access import ResourceDescriptor, readable_resource_ids
+
+        visible = await readable_resource_ids(
+            db,
+            descriptors=[ResourceDescriptor.from_row(row, ResourceType.SKILL) for row in candidates if row.entity_id == entity_id],
+            entity_id=entity_id,
+            user_id=requester_user_id,
+        )
+        candidates = [row for row in candidates if row.entity_id is None or row.id in visible]
     if not candidates:
         return None
 
@@ -831,6 +854,7 @@ async def _select_existing_skill_for_missing_spec(
             entity_id=entity_id,
             requested_skill=requested,
             candidates=candidate_payload,
+            user_id=requester_user_id,
         )
         decision = extract_json_object(raw)
     except Exception as exc:
@@ -877,6 +901,7 @@ async def _create_and_bind_missing_skills(
     workspace_id: Optional[str] = None,
     source_blueprint_id: Optional[str] = None,
     binding_config: dict[str, Any] | None = None,
+    requester_user_id: str | None = None,
 ) -> Tuple[List[str], List[str], List[str]]:
     created: List[str] = []
     reused: List[str] = []
@@ -939,7 +964,17 @@ async def _create_and_bind_missing_skills(
             )
             if linked_skill is not None else None
         )
-        if existing is None and not (
+        acquired = bool((ms.get("config") or {}).get("skill_acquisition"))
+        acquired_created = False
+        if existing is None and acquired and not component_key:
+            acquired_row, acquired_created = await materialize_acquired_skill(
+                db, entity_id=entity_id, requester_user_id=requester_user_id,
+                spec=ms, category=category,
+            )
+            existing = (acquired_row, {
+                "type": "acquired_skill" if acquired_created else "exact_acquired_skill",
+            })
+        if existing is None and not acquired and not (
             source_blueprint_id and workspace_id and component_key
         ):
             existing = await _select_existing_skill_for_missing_spec(
@@ -948,6 +983,7 @@ async def _create_and_bind_missing_skills(
                 spec=ms,
                 category=category,
                 warnings=warnings,
+                requester_user_id=requester_user_id,
             )
         if existing is not None:
             existing_skill, match = existing
@@ -962,17 +998,16 @@ async def _create_and_bind_missing_skills(
                     "match": match,
                 },
             )
-            reused.append(_skill_ref(existing_skill))
+            (created if acquired_created else reused).append(_skill_ref(existing_skill))
             resolved_requested_refs.extend(
                 ref for ref in (ms.get("slug"), ms.get("name"))
                 if isinstance(ref, str) and ref.strip()
             )
             continue
 
-        from packages.core.services.skill_service import create_skill
-
-        skill_row = await create_skill(
+        skill_row = await _create_provisioned_skill(
             db,
+            verify_bundle=acquired,
             entity_id=entity_id,
             name=name,
             system_prompt=prompt,
@@ -980,8 +1015,8 @@ async def _create_and_bind_missing_skills(
             display_name=name,
             description=(ms.get("description") or "Auto-created skill")[:1000],
             tools=list(ms.get("tools") or []),
-            input_schema={},
-            output_format="text",
+            input_schema=dict(ms.get("input_schema") or {}),
+            output_format=str(ms.get("output_format") or "text"),
             category=category,
             tags=[category, "auto_created"] if category else ["auto_created"],
             is_public=False,
@@ -989,9 +1024,14 @@ async def _create_and_bind_missing_skills(
             workspace_id=(workspace_id if component_key else None),
             config={
                 **dict(ms.get("config") or {}),
-                "auto_generated": True,
+                "auto_generated": not acquired or (ms.get("config") or {}).get("skill_acquisition", {}).get("outcome") == "generated_after_verified_no_match",
                 "source": (
-                    "blueprint" if component_key else "auto_workspace_setup"
+                    "blueprint" if component_key else
+                    (ms.get("config") or {}).get("source", "auto_workspace_setup")
+                ),
+                **(
+                    {"source_refs": list(ms.get("source_refs") or [])}
+                    if ms.get("source_refs") else {}
                 ),
                 **(
                     {
@@ -1033,7 +1073,7 @@ async def _create_and_bind_missing_skills(
             config={
                 **(binding_config or {}),
                 "requested_skill": _requested_skill_binding_context(ms),
-                "match": {"type": "generated_from_missing_skill_spec"},
+                "match": {"type": "acquired_skill" if acquired else "generated_from_missing_skill_spec"},
             },
         )
         created.append(_skill_ref(skill_row))
@@ -1042,6 +1082,114 @@ async def _create_and_bind_missing_skills(
             if isinstance(ref, str) and ref.strip()
         )
     return created, reused, resolved_requested_refs
+
+
+async def materialize_acquired_skill(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    requester_user_id: str | None,
+    spec: dict[str, Any],
+    category: str | None = None,
+    workspace_id: str | None = None,
+) -> tuple[Skill, bool]:
+    """Materialize fixed reviewed content without creating any Agent binding.
+
+    No semantic search or provider call occurs here. Callers own authorization,
+    transaction commit and cleanup of newly created files on an outer rollback.
+    Runtime callers take the entity lifecycle lock before narrower scope locks;
+    the same transaction may safely acquire that lock again here.
+    """
+    from packages.core.models.permission import Visibility
+    from packages.core.services.reusable_resource_locks import lock_reusable_resource_lifecycle
+
+    name = str(spec.get("name") or "").strip()
+    prompt = str(spec.get("system_prompt") or "").strip()
+    config = dict(spec.get("config") or {})
+    acquisition = config.get("skill_acquisition")
+    if not name or not prompt or not isinstance(acquisition, dict) or not acquisition:
+        raise ValueError("Acquired Skill requires fixed name, instructions and acquisition evidence")
+    identity_config = {key: value for key, value in config.items() if key != "skill_acquisition"}
+    acquisition_key = hashlib.sha256(json.dumps({
+        "name": name, "prompt": prompt, "tools": spec.get("tools") or [],
+        "config": identity_config,
+        "input_schema": spec.get("input_schema") or {},
+        "output_format": spec.get("output_format") or "text",
+    }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    acquired_row = (await db.execute(select(Skill).where(
+        Skill.entity_id == entity_id,
+        Skill.workspace_id == workspace_id,
+        Skill.status == "active",
+        Skill.config["skill_acquisition_key"].as_string() == acquisition_key,
+        Skill.system_prompt == prompt,
+        Skill.tools == list(spec.get("tools") or []),
+        Skill.input_schema == dict(spec.get("input_schema") or {}),
+        Skill.output_format == str(spec.get("output_format") or "text"),
+        Skill.config.contains(identity_config),
+    ).limit(1))).scalar_one_or_none()
+    if acquired_row is not None and requester_user_id:
+        from packages.core.models.permission import ResourceType
+        from packages.core.services.resource_access import ResourceDescriptor, readable_resource_ids
+
+        visible = await readable_resource_ids(
+            db,
+            descriptors=[ResourceDescriptor.from_row(acquired_row, ResourceType.SKILL)],
+            entity_id=entity_id, user_id=requester_user_id,
+        )
+        if acquired_row.id not in visible:
+            acquired_row = None
+    if acquired_row is not None:
+        return acquired_row, False
+    row = await _create_provisioned_skill(
+        db, verify_bundle=True, entity_id=entity_id, workspace_id=workspace_id,
+        visibility=Visibility.WORKSPACE if workspace_id else Visibility.ENTITY,
+        name=name, system_prompt=prompt, slug=(spec.get("slug") or "").strip() or None,
+        display_name=name, description=(spec.get("description") or "Auto-created skill")[:1000],
+        tools=list(spec.get("tools") or []), input_schema=dict(spec.get("input_schema") or {}),
+        output_format=str(spec.get("output_format") or "text"), category=category,
+        tags=[category, "auto_created"] if category else ["auto_created"],
+        is_public=False, version=str(spec.get("version") or "1.0.0"),
+        config={
+            **config,
+            "auto_generated": acquisition.get("outcome") == "generated_after_verified_no_match",
+            "source": config.get("source", "auto_workspace_setup"),
+            "skill_acquisition_key": acquisition_key,
+            **({"source_refs": list(spec["source_refs"])} if spec.get("source_refs") else {}),
+        },
+    )
+    return row, True
+
+
+async def _create_provisioned_skill(db, *, verify_bundle: bool, **kwargs):
+    """A packaged acquired Skill cannot become active with missing files."""
+    from packages.core.services.skill_service import create_skill, _delete_skill_files_best_effort
+
+    config = kwargs.get("config") or {}
+    expected = dict(config.get("extra_files") or {})
+    for path, content in (config.get("scripts") or {}).items():
+        expected[path if "/" in path else f"scripts/{path}"] = content
+    if config.get("requirements"):
+        expected["requirements.txt"] = config["requirements"]
+    if not verify_bundle or not expected:
+        return await create_skill(db, **kwargs)
+
+    from packages.core.services.skill_file_storage import load_skill_extra_files
+
+    skill = None
+    try:
+        async with db.begin_nested():
+            skill = await create_skill(db, **kwargs)
+            stored = load_skill_extra_files(
+                skill.entity_id, skill.id, skill_dir=(skill.config or {}).get("minio_dir"),
+            )
+            if stored != expected:
+                raise ValueError("Acquired Skill bundle storage is incomplete; retry setup")
+        return skill
+    except BaseException:
+        if skill is not None:
+            _delete_skill_files_best_effort(skill, dict(skill.config or {}), context="acquired Skill rollback")
+        raise
 
 
 def _merge_agent_skill_binding_config(
@@ -1109,6 +1257,7 @@ def _requested_skill_binding_context(spec: Dict[str, Any]) -> dict[str, Any]:
             "slug": spec.get("slug"),
             "description": spec.get("description"),
             "tools": list(spec.get("tools") or []),
+            "source_refs": list(spec.get("source_refs") or []),
         }.items()
         if value not in (None, "", [], {})
     }

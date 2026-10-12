@@ -27,15 +27,15 @@ def _nonnegative_int_env(name: str, default: int) -> int:
 
 KNOWLEDGE_CONTENT_CACHE_TTL_SECONDS = _nonnegative_int_env(
     "KNOWLEDGE_CONTENT_CACHE_TTL_SECONDS",
-    172_800,
+    604_800,
 )
 KNOWLEDGE_THUMBNAIL_CACHE_TTL_SECONDS = _nonnegative_int_env(
     "KNOWLEDGE_THUMBNAIL_CACHE_TTL_SECONDS",
-    172_800,
+    604_800,
 )
 KNOWLEDGE_DOWNLOAD_CACHE_TTL_SECONDS = _nonnegative_int_env(
     "KNOWLEDGE_DOWNLOAD_CACHE_TTL_SECONDS",
-    172_800,
+    604_800,
 )
 KNOWLEDGE_CACHE_MAX_ENTRY_BYTES = _nonnegative_int_env(
     "KNOWLEDGE_CACHE_MAX_ENTRY_BYTES",

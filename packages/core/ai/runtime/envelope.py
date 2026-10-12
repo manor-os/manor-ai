@@ -162,6 +162,9 @@ class RuntimeEnvelope:
     file_context_mounts: tuple[str, ...] = ()
     subagent_names: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Armed only by the group runtime for this live turn. Never replayed from
+    # message metadata or inferred from model-supplied tool arguments.
+    room_file_tool_names: tuple[str, ...] = ()
     discovered_tool_grants: RuntimeDiscoveredToolGrants = field(
         default_factory=RuntimeDiscoveredToolGrants,
         compare=False,
@@ -169,10 +172,13 @@ class RuntimeEnvelope:
     )
 
     def effective_allowed_tool_names(self) -> set[str]:
-        return (
-            set(self.allowed_tool_names)
-            | set(self.discovered_tool_grants.tool_names)
-        ) - set(self.blocked_tool_names)
+        granted = set(self.allowed_tool_names) | set(self.discovered_tool_grants.tool_names)
+        blocked = set(self.blocked_tool_names)
+        if "sandbox" in granted and "sandbox" not in blocked:
+            from packages.core.ai.runtime.composite_tools import SANDBOX_LEGACY_TOOL_BY_ACTION
+
+            granted.update(SANDBOX_LEGACY_TOOL_BY_ACTION.values())
+        return granted - blocked
 
     def to_trace_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -199,6 +205,7 @@ class RuntimeEnvelope:
 
     def to_message_meta(self) -> dict[str, Any]:
         data = self.to_trace_dict()
+        data.pop("room_file_tool_names", None)
         # Discovery grants are capability state for the active run, not a
         # persisted permission that a later turn may replay.
         data.pop("discovered_tool_names", None)
@@ -223,6 +230,7 @@ class RuntimeEnvelope:
                 "runtime_middleware",
                 "runtime_resolver_middleware",
                 "runtime_skill_descriptors",
+                "workspace_operation_skills",
                 "runtime_subagents",
             }
         })

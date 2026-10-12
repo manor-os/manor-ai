@@ -1,8 +1,8 @@
 """Cleanup for hidden chat attachment uploads.
 
-Chat image attachments are saved under ``uploads/chat`` so media tools can
-reuse them by minting short-lived provider URLs. They are runtime inputs, not
-Knowledge documents, so this module only cleans that hidden folder.
+Chat attachments are saved under ``uploads/chat`` so tools can reuse them by
+minting short-lived provider URLs. Unprojected files are runtime inputs, while
+files registered in Workspace Knowledge remain durable Document sources.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import time
 from typing import Iterable
 from urllib.parse import unquote, urlsplit
 
+from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.knowledge_visibility import normalize_rel_path
 
 logger = logging.getLogger(__name__)
@@ -71,17 +72,14 @@ def local_upload_rel_path(value: object, entity_id: str) -> str | None:
         return None
 
     raw = value.strip()
-    parsed = urlsplit(raw)
-    path = parsed.path if parsed.scheme else raw
-    path = unquote(path)
-
-    if path.startswith("/api/v1/fs/"):
-        parts = path.split("/", 5)
-        if len(parts) < 6 or parts[4] != entity_id:
+    file_ref = parse_file_reference(raw)
+    if file_ref is not None and file_ref.entity_id:
+        if file_ref.entity_id != entity_id:
             return None
-        rel = normalize_rel_path(parts[5])
+        rel = file_ref.fs_path
     else:
-        rel = normalize_rel_path(path)
+        parsed = urlsplit(raw)
+        rel = normalize_rel_path(unquote(parsed.path if parsed.scheme else raw))
 
     if rel.startswith(CHAT_UPLOAD_PREFIX):
         return rel
@@ -111,6 +109,36 @@ async def load_active_media_upload_refs() -> set[tuple[str, str]]:
     return refs
 
 
+async def load_workspace_knowledge_upload_refs() -> set[tuple[str, str]]:
+    """Load chat-upload files that remain durable Workspace Knowledge sources."""
+    from packages.core.database import create_worker_session
+    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+    from sqlalchemy import select
+
+    async with create_worker_session()() as db:
+        rows = (await db.execute(
+            select(Document.entity_id, Document.fs_path)
+            .join(
+                DocumentGroupMember,
+                DocumentGroupMember.document_id == Document.id,
+            )
+            .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+            .where(
+                Document.source == "chat_upload",
+                Document.is_trashed.is_(False),
+                Document.fs_path.like(f"{CHAT_UPLOAD_PREFIX}%"),
+                DocumentGroup.entity_id == Document.entity_id,
+                DocumentGroup.workspace_id.isnot(None),
+            )
+            .distinct()
+        )).all()
+    return {
+        (str(entity_id), normalize_rel_path(str(fs_path)))
+        for entity_id, fs_path in rows
+        if entity_id and fs_path
+    }
+
+
 async def cleanup_expired_chat_uploads() -> dict:
     """Cleanup entry point for scheduled workers."""
     from packages.core.config import get_settings
@@ -123,6 +151,7 @@ async def cleanup_expired_chat_uploads() -> dict:
 
     retention_days = max(1, int(settings.MANOR_CHAT_UPLOAD_RETENTION_DAYS or 30))
     active_refs = await load_active_media_upload_refs()
+    active_refs.update(await load_workspace_knowledge_upload_refs())
     report = cleanup_chat_uploads_on_disk(
         settings.MANOR_FS_ROOT,
         retention_days=retention_days,

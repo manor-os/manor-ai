@@ -82,6 +82,7 @@ def test_legacy_catalog_ids_normalize_to_supported_vercel_wire_ids():
     assert vercel_catalog_model_type("image", "openai/gpt-5-image-mini") == "image"
     assert vercel_model_id("kwaivgi/kling-v3.0-std") == "klingai/kling-v3.0-t2v"
     assert vercel_catalog_model_type("video", "kwaivgi/kling-v3.0-std") == "video"
+    assert vercel_catalog_model_type("video", "bytedance/seedance-v1.0-pro-fast") == "video"
 
 
 def test_historical_alibaba_id_normalizes_back_to_openrouter_namespace():

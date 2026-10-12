@@ -1,13 +1,9 @@
 import { type CSSProperties, type ReactNode } from "react";
 
 /**
- * The rounded message bubble shared by the Manor AI chat and Support
- * panels — one source of truth for padding, the asymmetric corner radius,
- * the teal "mine" / slate "other" colours, border and soft shadow.
- *
- * The Manor AI chat passes `className="chat-bubble chat-bubble--user|bot"`
- * so its markdown / meta-chip child styles (scoped under those classes in
- * index.css) keep working; the inline style here owns the box look itself.
+ * Shared message container. Full-size chat surfaces use the `.chat-bubble`
+ * styles in index.css; compact panels without that class retain their own
+ * inline fallback. This keeps group and Embedded Chat replies identical.
  */
 export default function MessageBubble({
   role,
@@ -22,10 +18,11 @@ export default function MessageBubble({
   children: ReactNode;
 }) {
   const mine = role === "user";
+  const usesChatBubbleCss = className?.split(/\s+/).includes("chat-bubble") ?? false;
   return (
     <div
       className={className}
-      style={{
+      style={usesChatBubbleCss ? style : {
         padding: mine
           ? "var(--message-bubble-user-padding, 10px 14px)"
           : "var(--message-bubble-other-padding, 10px 14px)",

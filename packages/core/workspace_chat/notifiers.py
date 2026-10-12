@@ -7,30 +7,38 @@ constructing Message rows directly. Each notifier encapsulates:
   * the canonical body format
   * any pending_action card shape
 
-All notifiers are best-effort: a chat write failure must NEVER block
-the underlying operation (a step doesn't fail because we couldn't
-post a receipt). They handle their own DB session + log on failure.
+Callers without a session retain the historical best-effort behavior. Step
+terminal/HITL callers pass their transaction so execution state and its visible
+receipt commit or roll back together.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 from decimal import Decimal
-from urllib.parse import quote
 from typing import Any, Optional
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import ExecutionPlanStatus
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.constants.task import TaskStatus
 from packages.core.contracts.envelope import step_result_output_text
 from packages.core.database import async_session
+from packages.core.i18n import t
 from packages.core.services.chat_feedback import (
     ChatFeedbackTargetKind,
     lock_completion_feedback_subject,
 )
-from packages.core.services.generated_file_refs import canonical_document_id
+from packages.core.services.generated_file_refs import (
+    ArtifactReferenceFactory,
+    canonical_document_id,
+    dedupe_generated_file_refs,
+    entity_fs_open_url,
+    generated_file_ref_url_keys,
+)
 from packages.core.workspace_chat import service as chat
 
 logger = logging.getLogger(__name__)
@@ -55,19 +63,21 @@ async def notify_plan_started(
     step_count: int,
     execution_mode: str,
     steps: Optional[list[dict]] = None,
+    locale: str | None = None,
 ) -> None:
     if not workspace_id:
         return
-    headline = (
-        f"▶ **Plan started** — {step_count} step(s)"
-        + (f" for task: *{task_title}*" if task_title else "")
-    )
+    headline = t("task.execution.plan_started", locale=locale or "en", step_count=step_count)
+    if task_title:
+        headline += " " + t("task.execution.plan_for_task", locale=locale or "en", task_title=task_title)
     if execution_mode != "live":
         headline += f"  `[{execution_mode}]`"
 
     body = headline
     if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
+
+    metadata = {"step_count": step_count, "task_title": task_title}
 
     # Plan thread (full DAG)
     await _safe_post(
@@ -75,6 +85,7 @@ async def notify_plan_started(
         body=body, message_kind="agent_update", author_kind="agent",
         thread_ref_kind="plan", thread_ref_id=plan_id,
         refs=_plan_refs(plan_id, task_id),
+        meta=metadata,
     )
 
     # Main workspace chat (headline only)
@@ -82,6 +93,7 @@ async def notify_plan_started(
         entity_id=entity_id, workspace_id=workspace_id,
         body=headline, message_kind="agent_update", author_kind="agent",
         refs=_plan_refs(plan_id, task_id),
+        meta=metadata,
     )
 
 
@@ -95,6 +107,7 @@ async def notify_plan_completed(
     cost_usd: Optional[float],
     task_title: Optional[str] = None,
     steps: Optional[list[dict]] = None,
+    locale: str | None = None,
 ) -> None:
     if not workspace_id:
         return
@@ -105,6 +118,7 @@ async def notify_plan_completed(
         cost_usd=cost_usd,
         steps=steps or [],
         entity_id=entity_id,
+        locale=locale,
     )
     completion_artifacts = _unique_artifacts(
         artifact
@@ -116,7 +130,7 @@ async def notify_plan_completed(
     attachments = _artifacts_as_attachments(completion_artifacts, entity_id=entity_id)
     headline = body
     if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
 
     # Plan thread (full DAG)
     await _safe_post(
@@ -158,17 +172,18 @@ async def notify_plan_needs_attention(
     task_title: Optional[str] = None,
     issue: Optional[str] = None,
     steps: Optional[list[dict]] = None,
+    locale: str | None = None,
 ) -> None:
     """Announce a mechanically finished plan whose task was not accepted."""
     if not workspace_id:
         return
-    subject = task_title or f"Plan {plan_id[:8]}"
-    headline = f"**Task needs attention — {subject}**"
+    subject = task_title or t("task.execution.plan_label", locale=locale or "en", plan_id=plan_id[:8])
+    headline = t("task.execution.plan_needs_attention", locale=locale or "en", subject=subject)
     if issue:
         headline += f"\n\n{issue}"
     body = headline
     if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
 
     await _safe_post(
         entity_id=entity_id, workspace_id=workspace_id,
@@ -192,15 +207,16 @@ async def notify_plan_failed(
     error: Optional[dict],
     task_title: Optional[str] = None,
     steps: Optional[list[dict]] = None,
+    locale: str | None = None,
 ) -> None:
     if not workspace_id:
         return
-    msg = (error or {}).get("message") or "unknown error"
-    subject = task_title or f"Plan {plan_id[:8]}"
-    headline = f"✗ **Task failed — {subject}**\n\nReason: {msg}"
+    msg = (error or {}).get("message") or t("task.execution.unknown_error", locale=locale or "en")
+    subject = task_title or t("task.execution.plan_label", locale=locale or "en", plan_id=plan_id[:8])
+    headline = t("task.execution.plan_failed", locale=locale or "en", subject=subject, error=msg)
     body = headline
     if steps:
-        body += "\n\n" + _render_dag(steps, entity_id=entity_id)
+        body += "\n\n" + _render_dag(steps, entity_id=entity_id, locale=locale)
 
     # Plan thread (full DAG)
     await _safe_post(
@@ -235,17 +251,22 @@ async def notify_step_done(
     agent_name: Optional[str] = None,
     result_summary: Optional[str] = None,
     result: Optional[dict] = None,
+    locale: str | None = None,
+    db: AsyncSession | None = None,
 ) -> None:
     if not workspace_id:
         return
     # Human-readable step name
     label = description or step_key.replace("_", " ").title()
     # Agent attribution
-    agent_part = f" by **{agent_name}**" if agent_name else ""
+    agent_part = t("task.execution.by_agent", locale=locale or "en", agent_name=agent_name) if agent_name else ""
     # Duration
-    time_part = f" in {_fmt_duration(duration_seconds)}" if duration_seconds and duration_seconds >= 1 else ""
+    time_part = (
+        t("task.execution.in_duration", locale=locale or "en", duration=_fmt_duration(duration_seconds))
+        if duration_seconds and duration_seconds >= 1 else ""
+    )
 
-    summary = result_summary or summarize_result_for_chat(result, max_chars=1600)
+    summary = result_summary or summarize_result_for_chat(result, max_chars=1600, locale=locale)
     artifacts = extract_artifacts_for_chat(result)
     body = _render_step_completion_summary(
         label=label,
@@ -255,11 +276,13 @@ async def notify_step_done(
         artifacts=artifacts,
         max_summary_chars=1600,
         entity_id=entity_id,
+        locale=locale,
     )
     attachments = _artifacts_as_attachments(artifacts, entity_id=entity_id)
 
     # 1. Detailed message in the plan thread (for drill-down)
-    await _safe_post(
+    await _post_step_event(
+        db=db,
         entity_id=entity_id, workspace_id=workspace_id,
         body=body, message_kind="step_event",
         author_kind="agent", author_subscription_id=subscription_id,
@@ -282,8 +305,10 @@ async def notify_step_done(
         artifacts=artifacts,
         max_summary_chars=1000,
         entity_id=entity_id,
+        locale=locale,
     )
-    await _safe_post(
+    await _post_step_event(
+        db=db,
         entity_id=entity_id, workspace_id=workspace_id,
         body=main_body, message_kind="step_event",
         author_kind="agent", author_subscription_id=subscription_id,
@@ -305,15 +330,18 @@ async def notify_step_failed(
     error: Optional[dict],
     will_retry: bool,
     subscription_id: Optional[str] = None,
+    locale: str | None = None,
+    db: AsyncSession | None = None,
 ) -> None:
     if not workspace_id:
         return
-    msg = (error or {}).get("message") or "unknown error"
-    suffix = " — will retry" if will_retry else ""
-    body = f"✗ Step `{step_key}` failed: {msg}{suffix}"
+    msg = (error or {}).get("message") or t("task.execution.unknown_error", locale=locale or "en")
+    suffix = t("task.execution.will_retry", locale=locale or "en") if will_retry else ""
+    body = t("task.execution.step_failed", locale=locale or "en", step_key=step_key, error=msg, retry=suffix)
 
     # Plan thread (detailed)
-    await _safe_post(
+    await _post_step_event(
+        db=db,
         entity_id=entity_id, workspace_id=workspace_id,
         body=body, message_kind="step_event",
         author_kind="agent", author_subscription_id=subscription_id,
@@ -328,7 +356,8 @@ async def notify_step_failed(
         return
 
     # Main workspace chat (visible)
-    await _safe_post(
+    await _post_step_event(
+        db=db,
         entity_id=entity_id, workspace_id=workspace_id,
         body=body, message_kind="step_event",
         author_kind="agent", author_subscription_id=subscription_id,
@@ -350,6 +379,8 @@ async def notify_step_needs_human(
     subscription_id: Optional[str] = None,
     pending_action: Optional[dict] = None,
     approval_request_id: Optional[str] = None,
+    locale: str | None = None,
+    db: AsyncSession | None = None,
 ) -> None:
     """Lease-level HITL prompt — interactive message with a
     pending_action so the user can resolve it from the chat.
@@ -377,7 +408,9 @@ async def notify_step_needs_human(
         merged_action = {**pending_action, "step_id": step_id, "plan_id": plan_id}
         # Use the structured title as the message body when present;
         # otherwise fall back to the prompt text.
-        title = merged_action.get("title") or prompt or f"Need your input on `{step_key}`"
+        title = merged_action.get("title") or prompt or t(
+            "task.execution.needs_input_title", locale=locale or "en", step_key=step_key,
+        )
         body = title
     else:
         merged_action = {
@@ -390,12 +423,13 @@ async def notify_step_needs_human(
                 "required": ["response"],
             },
         }
-        body = f"⚠ Need your input on step `{step_key}`:\n\n{prompt}"
+        body = t("task.execution.needs_input_body", locale=locale or "en", step_key=step_key, prompt=prompt)
 
     if approval_request_id:
         merged_action["approval_request_id"] = approval_request_id
 
-    await _safe_post(
+    await _post_step_event(
+        db=db,
         entity_id=entity_id, workspace_id=workspace_id,
         body=body,
         message_kind="hitl_request",
@@ -514,35 +548,22 @@ async def notify_agent_greeting(
         logger.warning("workspace_chat post failed", exc_info=True)
 
 
-def summarize_result_for_chat(result: Any, *, max_chars: int = 1200) -> Optional[str]:
+def summarize_result_for_chat(
+    result: Any, *, max_chars: int = 1200, locale: str | None = None,
+) -> Optional[str]:
     """Best-effort user-facing summary from worker/LLM step output."""
-    text = _extract_result_text(result)
+    text = _extract_result_text(result, locale=locale)
     if not text:
         return None
     return _clip_text(_strip_boilerplate_completion_headings(text), max_chars)
 
 
-def _artifact_identity(kind: Any, value: Any) -> str:
-    """What makes two artifacts the same file.
-
-    One step result names the same file several ways — `fs_path`, `path`,
-    a leading slash, a workspace prefix — and comparing the raw strings let
-    every spelling through as a separate line. Paths compare by their
-    normalised form so the duplicates collapse.
-    """
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    if str(kind or "") != "file":
-        return text
-    return text.replace("\\", "/").lstrip("/").rstrip("/").casefold()
-
-
 def extract_artifacts_for_chat(result: Any) -> list[dict]:
     """Return user-visible files/URLs produced by a step result."""
     artifacts: list[dict] = []
+    factory = ArtifactReferenceFactory()
 
-    def add(kind: str, value: Any, *, name: Optional[str] = None) -> None:
+    def add(kind: str, value: Any, *, name: Optional[str] = None, fs_path: str = "") -> None:
         if not isinstance(value, str):
             return
         value = value.strip()
@@ -550,11 +571,10 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
             return
         if kind == "document" and not canonical_document_id(value):
             return
-        key = (kind, _artifact_identity(kind, value))
-        if any((a.get("kind"), _artifact_identity(a.get("kind"), a.get("value"))) == key
-               for a in artifacts):
-            return
-        artifacts.append({"kind": kind, "value": value, "name": name})
+        artifact = {"kind": kind, "value": value, "name": name}
+        if kind == "document" and fs_path:
+            artifact["fs_path"] = fs_path
+        artifacts.append(artifact)
 
     def walk(obj: Any) -> None:
         if not isinstance(obj, dict):
@@ -574,33 +594,40 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
                 return None
             return location.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
 
+        identity = factory.inspect(obj)
+        path_identity = factory.inspect({
+            key: obj.get(key) for key in ("fs_path", "path", "file_path", "output_path")
+        })
         doc = obj.get("document")
         if isinstance(doc, dict):
-            doc_name = label_for(doc)
-            if canonical_document_id(doc.get("id")):
-                add("document", doc.get("id"), name=doc_name)
-            else:
-                add("file", doc.get("fs_path") or doc.get("path") or doc_name, name=doc_name)
-                add("url", doc.get("file_url") or doc.get("url"), name=doc_name)
+            child = {**doc, "document_id": doc.get("document_id") or doc.get("id")}
+            child_identity = factory.inspect(child)
+            if (
+                child_identity.document_id
+                and not child_identity.fs_path
+                and path_identity.fs_path
+                and identity.document_id in {"", child_identity.document_id}
+            ):
+                # The nested Document describes this parent's materialized file;
+                # retain that explicit association, not a filename heuristic.
+                child["fs_path"] = path_identity.fs_path
+            walk(child)
 
-        document_id = canonical_document_id(obj.get("document_id"))
         object_name = label_for(obj)
-        if document_id:
-            # A Document is the canonical user-facing handle. Do not also
-            # render its filesystem provenance as a second, raw-path artifact.
-            add("document", document_id, name=object_name)
+        if identity.document_id:
+            add("document", identity.document_id, name=object_name, fs_path=identity.fs_path)
+        elif path_identity.fs_path:
+            # Address fields on one file record are alternatives, not outputs.
+            # The shared factory selects fs_path before relative path aliases.
+            add("file", path_identity.fs_path, name=object_name)
 
+        reference_url_keys = generated_file_ref_url_keys(obj)
         for key, kind in (
-            ("fs_path", "file"),
-            ("path", "file"),
-            ("file_path", "file"),
-            ("output_path", "file"),
-            # ("name", "file") used to be here. A name is not a location:
-            # it produced a second "file" artifact for every file that also
-            # had a path, so the same MP4 was listed twice — once as
-            # `final/two_minute_rule.mp4` and once as `two_minute_rule.mp4`
-            # — and the bare one could never be opened. The name still rides
-            # along as the label of the real entry below.
+            ("open_url", "url"),
+            ("openUrl", "url"),
+            ("viewer_url", "url"),
+            ("previewUrl", "url"),
+            ("preview_url", "url"),
             ("file_url", "url"),
             ("document_url", "url"),
             ("image_url", "url"),
@@ -609,7 +636,12 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
             ("url", "url"),
             ("job_id", "job"),
         ):
-            if document_id and kind in {"file", "url"}:
+            if key in {"previewUrl", "preview_url"} and key not in reference_url_keys:
+                continue
+            if kind == "url" and (
+                identity.document_id
+                or (path_identity.fs_path and key not in {"image_url", "video_url"})
+            ):
                 continue
             add(kind, obj.get(key), name=object_name)
 
@@ -628,19 +660,7 @@ def extract_artifacts_for_chat(result: Any) -> list[dict]:
 
     parsed = _parse_json_if_string(result)
     walk(parsed)
-    document_names = {
-        str(artifact.get("name") or "").strip().casefold()
-        for artifact in artifacts
-        if artifact.get("kind") == "document" and artifact.get("name")
-    }
-    canonical = [
-        artifact
-        for artifact in artifacts
-        if artifact.get("kind") == "document"
-        or not artifact.get("name")
-        or str(artifact.get("name") or "").strip().casefold() not in document_names
-    ]
-    return canonical[:8]
+    return _unique_artifacts(artifacts)[:8]
 
 
 def _render_plan_completion_summary(
@@ -651,30 +671,31 @@ def _render_plan_completion_summary(
     cost_usd: Optional[float],
     steps: list[dict],
     entity_id: str = "",
+    locale: str | None = None,
 ) -> str:
     done_steps = [s for s in steps if s.get("status") == "done"]
     failed_steps = [s for s in steps if s.get("status") in {"failed", "skipped", "cancelled"}]
     total = len(steps)
-    subject = task_title or f"Plan {plan_id[:8]}"
+    subject = task_title or t("task.execution.plan_label", locale=locale or "en", plan_id=plan_id[:8])
 
     meta: list[str] = []
     if total:
-        meta.append(f"{len(done_steps)}/{total} steps")
+        meta.append(t("task.execution.completed_step_count", locale=locale or "en", done=len(done_steps), total=total))
     if duration_seconds is not None:
-        meta.append(f"finished in {_fmt_duration(duration_seconds)}")
+        meta.append(t("task.execution.completed_duration", locale=locale or "en", duration=_fmt_duration(duration_seconds)))
     if cost_usd is not None:
-        meta.append(f"cost ${cost_usd:.3f}")
+        meta.append(t("task.execution.completed_cost", locale=locale or "en", cost=cost_usd))
 
-    lines = [f"✅ **Task complete — {subject}**"]
+    lines = [t("task.execution.plan_completed", locale=locale or "en", subject=subject)]
     if meta:
         lines.append("")
-        lines.append("Completed " + ", ".join(meta) + ".")
+        lines.append(t("task.execution.completed_meta", locale=locale or "en", details=", ".join(meta)))
 
     if done_steps:
         lines.append("")
-        lines.append("**What was completed**")
+        lines.append(t("task.execution.what_completed", locale=locale or "en"))
         for step in done_steps[:8]:
-            label = _step_label(step)
+            label = _step_label(step, locale=locale)
             summary = _clip_text(_as_text(step.get("result_summary")), 360)
             if summary:
                 lines.append(f"- **{label}:** {summary}")
@@ -689,19 +710,21 @@ def _render_plan_completion_summary(
     )
     if artifacts:
         lines.append("")
-        lines.append("**Files and outputs saved**")
+        lines.append(t("task.execution.files_saved", locale=locale or "en"))
         lines.extend(
-            f"- {_format_artifact(artifact, entity_id=entity_id)}"
+            f"- {_format_artifact(artifact, entity_id=entity_id, locale=locale)}"
             for artifact in artifacts[:8]
         )
 
     if failed_steps:
         lines.append("")
-        lines.append("**Needs attention**")
+        lines.append(t("task.execution.needs_attention", locale=locale or "en"))
         for step in failed_steps[:5]:
             err = step.get("error") if isinstance(step.get("error"), dict) else {}
-            msg = _as_text((err or {}).get("message") or (err or {}).get("type")) or str(step.get("status"))
-            lines.append(f"- **{_step_label(step)}:** {msg}")
+            status = str(step.get("status"))
+            status_key = "task.execution.step_skipped" if status == "skipped" else f"task.status.{status}"
+            msg = _as_text((err or {}).get("message") or (err or {}).get("type")) or t(status_key, locale=locale or "en")
+            lines.append(f"- **{_step_label(step, locale=locale)}:** {msg}")
 
     return "\n".join(lines)
 
@@ -715,32 +738,34 @@ def _render_step_completion_summary(
     artifacts: list[dict],
     max_summary_chars: int,
     entity_id: str = "",
+    locale: str | None = None,
 ) -> str:
-    lines = [f"✅ **Completed: {label}**{agent_part}{time_part}"]
+    lines = [t("task.execution.step_completed", locale=locale or "en", label=label, agent_part=agent_part, time_part=time_part)]
+    artifacts = _unique_artifacts(artifacts)
 
     clean_summary = _clip_text(_as_text(summary), max_summary_chars)
     if clean_summary:
         lines.append("")
-        lines.append("**What was produced**")
+        lines.append(t("task.execution.what_produced", locale=locale or "en"))
         for item in _summary_bullets(clean_summary):
             lines.append(f"- {item}")
 
     if artifacts:
         lines.append("")
-        lines.append("**Files and outputs saved**")
+        lines.append(t("task.execution.files_saved", locale=locale or "en"))
         lines.extend(
-            f"- {_format_artifact(artifact, entity_id=entity_id)}"
+            f"- {_format_artifact(artifact, entity_id=entity_id, locale=locale)}"
             for artifact in artifacts[:6]
         )
 
     if not clean_summary and not artifacts:
         lines.append("")
-        lines.append("This step finished successfully.")
+        lines.append(t("task.execution.step_successful", locale=locale or "en"))
 
     return "\n".join(lines)
 
 
-def _extract_result_text(result: Any) -> Optional[str]:
+def _extract_result_text(result: Any, *, locale: str | None = None) -> Optional[str]:
     parsed = _parse_json_if_string(result)
     if isinstance(parsed, dict):
         outputs = parsed.get("outputs")
@@ -753,7 +778,7 @@ def _extract_result_text(result: Any) -> Optional[str]:
             if isinstance(value, str) and value.strip():
                 nested = _parse_json_if_string(value)
                 if isinstance(nested, dict) and nested is not value:
-                    nested_text = _extract_result_text(nested)
+                    nested_text = _extract_result_text(nested, locale=locale)
                     if nested_text:
                         return nested_text
                 return value.strip()
@@ -761,7 +786,7 @@ def _extract_result_text(result: Any) -> Optional[str]:
             doc = parsed["document"]
             name = doc.get("name") or doc.get("fs_path") or doc.get("id")
             if name:
-                return f"Saved document: {name}"
+                return t("task.execution.saved_document", locale=locale or "en", name=name)
         return None
     if isinstance(parsed, str) and parsed.strip():
         return parsed.strip()
@@ -805,7 +830,7 @@ def _strip_boilerplate_completion_headings(text: str) -> str:
     return "\n".join(lines).strip() or text.strip()
 
 
-def _format_artifact(artifact: dict, *, entity_id: str = "") -> str:
+def _format_artifact(artifact: dict, *, entity_id: str = "", locale: str | None = None) -> str:
     """Render one produced file as something the reader can open.
 
     This used to print the path inside backticks, which is inline code: a
@@ -817,6 +842,10 @@ def _format_artifact(artifact: dict, *, entity_id: str = "") -> str:
     kind = artifact.get("kind") or "output"
     value = _as_text(artifact.get("value")) or "output"
     name = _as_text(artifact.get("name")) or value.rstrip("/").rsplit("/", 1)[-1] or value
+    kind_label = (
+        t(f"task.execution.artifact_{kind}", locale=locale or "en")
+        if kind in {"document", "file", "url", "job", "output"} else kind.title()
+    )
 
     href = ""
     if kind == "document" and canonical_document_id(value):
@@ -824,14 +853,13 @@ def _format_artifact(artifact: dict, *, entity_id: str = "") -> str:
     elif kind == "url":
         href = value
     elif kind == "file" and entity_id:
-        path = value.replace("\\", "/").lstrip("/")
-        href = f"/api/v1/fs/{entity_id}/{quote(path)}"
+        href = entity_fs_open_url(entity_id, value)
 
     if href:
-        return f"{kind.title()}: [{name}]({href})"
+        return f"{kind_label}: [{name}]({href})"
     # No address to link — say the name plainly rather than dress a
     # non-address up as one.
-    return f"{kind.title()}: `{value}`"
+    return f"{kind_label}: `{value}`"
 
 
 def _artifacts_as_attachments(
@@ -840,10 +868,8 @@ def _artifacts_as_attachments(
     entity_id: str = "",
 ) -> list[dict]:
     """Persist produced files as the same structured chat contract used by direct turns."""
-    by_name: dict[str, dict] = {}
-    for artifact in artifacts or []:
-        if not isinstance(artifact, dict):
-            continue
+    attachments: list[dict] = []
+    for artifact in _unique_artifacts(artifacts or []):
         kind = _as_text(artifact.get("kind")) or "output"
         value = _as_text(artifact.get("value"))
         if not value or kind not in {"file", "document", "url"}:
@@ -855,41 +881,83 @@ def _artifacts_as_attachments(
             or value.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
             or value
         )
-        key = name.casefold()
-        attachment = by_name.setdefault(key, {"name": name, "type": "knowledge"})
+        attachment = {"name": name, "type": "knowledge"}
         if "." in name:
             attachment.setdefault("fileType", name.rsplit(".", 1)[-1].lower()[:20])
         if kind == "document":
             attachment["document_id"] = value
+            attachment["openUrl"] = f"/viewer/{value}"
         elif kind == "url":
-            attachment.setdefault("previewUrl", value)
-        elif entity_id:
-            path = value.replace("\\", "/").lstrip("/")
-            attachment.setdefault(
-                "previewUrl",
-                f"/api/v1/fs/{entity_id}/{quote(path)}",
-            )
-    return list(by_name.values())[:8]
+            attachment["previewUrl"] = value
+            attachment["openUrl"] = value
+        path = value if kind == "file" else _as_text(artifact.get("fs_path"))
+        if path:
+            attachment["fsPath"] = path
+            if address := entity_fs_open_url(entity_id, path):
+                attachment["previewUrl"] = address
+                attachment.setdefault("openUrl", address)
+        attachments.append(attachment)
+    def display_priority(attachment: dict) -> int:
+        if attachment.get("fileType") not in {"mp4", "mov", "webm", "m4v", "avi", "mkv", "mpeg", "mpg"}:
+            return 2
+        preview = re.search(
+            r"(?:^|[\s_.\/-])(?:preview|draft|raw|source|clean[-_ ]?master|clip|segment|shot|s\d{2})(?:$|[\s_.\/-])|预览|草稿|片段|素材",
+            attachment["name"], re.IGNORECASE,
+        )
+        return 1 if preview else 0
+
+    # Final videos must remain visible even when supporting files fill the cap.
+    # Reorder only this output projection, never the saved execution artifacts.
+    return sorted(attachments, key=display_priority)[:8]
 
 
 def _unique_artifacts(artifacts: Any) -> list[dict]:
-    out: list[dict] = []
-    seen: set[tuple[str, str]] = set()
+    """Use the same durable identities for step, plan, and attachment views."""
+    refs: list[dict] = []
     for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
         kind = _as_text(artifact.get("kind")) or "output"
         value = _as_text(artifact.get("value"))
         if not value:
             continue
+        ref = {**artifact, "kind": kind, "value": value}
+        if kind == "document":
+            if not canonical_document_id(value):
+                continue
+            ref["document_id"] = value
+        elif kind == "file":
+            ref["fs_path"] = value
+        elif kind == "url":
+            ref["url"] = value
+        refs.append(ref)
+
+    out: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    factory = ArtifactReferenceFactory()
+    for ref in dedupe_generated_file_refs(refs):
+        identity = factory.inspect(ref)
+        kind, value = ref["kind"], ref["value"]
+        if identity.document_id:
+            kind, value = "document", identity.document_id
+        elif identity.fs_path and kind == "file":
+            kind, value = "file", identity.fs_path
         key = (kind, value)
         if key in seen:
             continue
         seen.add(key)
-        out.append({"kind": kind, "value": value, "name": _as_text(artifact.get("name"))})
+        artifact = {"kind": kind, "value": value, "name": _as_text(ref.get("name"))}
+        if kind == "document" and identity.fs_path:
+            artifact["fs_path"] = identity.fs_path
+        out.append(artifact)
     return out
 
 
-def _step_label(step: dict) -> str:
-    return _as_text(step.get("description")) or _as_text(step.get("key")).replace("_", " ").title() or "Completed step"
+def _step_label(step: dict, *, locale: str | None = None) -> str:
+    return (
+        _as_text(step.get("description")) or _as_text(step.get("key")).replace("_", " ").title()
+        or t("task.execution.completed_step", locale=locale or "en")
+    )
 
 
 def _as_text(value: Any) -> str:
@@ -913,7 +981,7 @@ def _is_markdown_rule(line: str) -> bool:
     return set(line) <= {"-", "_", "*"} and len(line) >= 3
 
 
-def _render_dag(steps: list[dict], *, entity_id: str = "") -> str:
+def _render_dag(steps: list[dict], *, entity_id: str = "", locale: str | None = None) -> str:
     """Render a plan DAG as markdown for chat / task comments.
 
     Input: list of step dicts with keys:
@@ -943,12 +1011,12 @@ def _render_dag(steps: list[dict], *, entity_id: str = "") -> str:
     for i, layer in enumerate(layers):
         if len(layer) > 1:
             # Parallel steps
-            lines.append(f"**Layer {i + 1}** (parallel):")
+            lines.append(t("task.execution.parallel_layer", locale=locale or "en", layer=i + 1))
             for s in layer:
-                lines.append(_render_step(s, STATUS_ICONS, indent="  ", entity_id=entity_id))
+                lines.append(_render_step(s, STATUS_ICONS, indent="  ", entity_id=entity_id, locale=locale))
         else:
             s = layer[0]
-            lines.append(_render_step(s, STATUS_ICONS, indent="", entity_id=entity_id))
+            lines.append(_render_step(s, STATUS_ICONS, indent="", entity_id=entity_id, locale=locale))
 
         # Arrow to next layer
         if i < len(layers) - 1:
@@ -957,7 +1025,9 @@ def _render_dag(steps: list[dict], *, entity_id: str = "") -> str:
     return "\n".join(lines)
 
 
-def _render_step(s: dict, icons: dict, indent: str = "", *, entity_id: str = "") -> str:
+def _render_step(
+    s: dict, icons: dict, indent: str = "", *, entity_id: str = "", locale: str | None = None,
+) -> str:
     status = s.get("status") or "pending"
     icon = icons.get(status, "⬜")
     key = s.get("key", "?")
@@ -983,25 +1053,54 @@ def _render_step(s: dict, icons: dict, indent: str = "", *, entity_id: str = "")
         preview = _clip_text(s["result_summary"], 600)
         line += f"\n{indent}  ↳ {preview}"
 
-    artifacts = s.get("artifacts") or []
+    artifacts = _unique_artifacts(s.get("artifacts") or [])
     if status == "done" and artifacts:
         for artifact in artifacts[:3]:
             if isinstance(artifact, dict):
-                line += f"\n{indent}  ↳ {_format_artifact(artifact, entity_id=entity_id)}"
+                line += f"\n{indent}  ↳ {_format_artifact(artifact, entity_id=entity_id, locale=locale)}"
 
     return line
 
 
-async def _safe_post(**kwargs) -> None:
-    """Open own session + commit — workspace_chat writes never share
-    a transaction with the caller. A chat post failing must not roll
-    back the underlying step / measurement / plan write."""
+async def _safe_post(
+    *,
+    db: AsyncSession | None = None,
+    **kwargs,
+) -> None:
+    """Post best-effort, or atomically when the caller supplies ``db``."""
+
+    if db is not None:
+        message = await chat.post_message(db, publish_event=False, **kwargs)
+        chat.queue_workspace_chat_message_event_after_commit(
+            db,
+            entity_id=str(kwargs["entity_id"]),
+            workspace_id=str(kwargs["workspace_id"]),
+            message=message,
+        )
+        return
     try:
         async with async_session() as db:
             await chat.post_message(db, **kwargs)
             await db.commit()
     except Exception:
         logger.warning("workspace_chat post failed", exc_info=True)
+
+
+async def _post_step_event(
+    *,
+    db: AsyncSession | None,
+    **kwargs,
+) -> None:
+    """Persist dispatcher receipts in the caller's state transaction.
+
+    Other notifier callers keep the historical best-effort own-session path.
+    Dispatcher terminal/HITL transitions pass their session so the Message and
+    lease/step state either commit together or roll back together. Realtime is
+    queued only after that commit; clients can always recover from the durable
+    row by refetching.
+    """
+
+    await _safe_post(db=db, **kwargs)
 
 
 async def _safe_post_completion(

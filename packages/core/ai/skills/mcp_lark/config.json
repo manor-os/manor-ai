@@ -1,0 +1,29 @@
+{
+  "id": "mcp_lark",
+  "name": "mcp_lark",
+  "type": "runtime_guidance",
+  "description": "Operate a connected Lark user account or legacy Lark/Feishu app: read chats and messages, send and reply to text messages, read and write documents, and read or update Bitable records within the account's permissions.",
+  "category": "team-messaging",
+  "output_format": "guidance",
+  "tags": ["lark", "feishu", "飞书", "messaging", "documents", "bitable", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__lark__list_chats",
+    "mcp__lark__get_chat",
+    "mcp__lark__list_messages",
+    "mcp__lark__send_message",
+    "mcp__lark__reply_message",
+    "mcp__lark__get_document",
+    "mcp__lark__get_document_content",
+    "mcp__lark__create_document",
+    "mcp__lark__append_document_text",
+    "mcp__lark__list_bitable_tables",
+    "mcp__lark__list_bitable_fields",
+    "mcp__lark__list_bitable_records",
+    "mcp__lark__create_bitable_record",
+    "mcp__lark__update_bitable_record"
+  ],
+  "search": {
+    "terms": ["lark", "feishu", "chat message", "lark document", "feishu document", "bitable", "lark base table"],
+    "examples": ["read messages in my Lark chat", "send an approved Feishu message", "summarize a Lark document", "update a Bitable record"]
+  }
+}

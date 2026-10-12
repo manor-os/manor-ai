@@ -1,17 +1,12 @@
 """Agent conversation memory service."""
 from __future__ import annotations
 
-import json
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.ai.runtime import (
-    runtime_conversation_memory_text,
-    runtime_execute_conversation_memory_extraction_completion,
-)
 from packages.core.models.base import generate_ulid
 from packages.core.models.memory import AgentMemory
 from packages.core.services.agent_memory_files import (
@@ -99,6 +94,13 @@ async def add_memory(
 ) -> AgentMemory:
     """Add a memory entry."""
     prepared_content, prepared_metadata = _prepare_memory_content(content, metadata)
+    from packages.core.memory.dedup import find_duplicate
+    from packages.core.memory.policy import content_fingerprint
+    duplicate = await find_duplicate(db, entity_id=entity_id, content=prepared_content,
+        memory_type=memory_type, agent_id=agent_id, user_id=user_id, expires_at=expires_at)
+    if duplicate is not None:
+        return duplicate
+    prepared_metadata["content_fingerprint"] = content_fingerprint(prepared_content)
     mem = AgentMemory(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -175,13 +177,6 @@ async def _relevance_ranked_memories(
     from sqlalchemy import text
 
     try:
-        await sync_agent_memory_files(
-            db, entity_id=entity_id, agent_id=agent_id, user_id=user_id,
-        )
-    except Exception:
-        logger.debug("agent memory file sync skipped", exc_info=True)
-
-    try:
         from packages.core.services.embedding_service import generate_embedding
 
         embedding = await asyncio.wait_for(generate_embedding(query), timeout=10.0)
@@ -207,14 +202,12 @@ async def _relevance_ranked_memories(
         FROM agent_memories
         WHERE entity_id = :entity
           AND status = 'active'
+          AND workspace_id IS NULL
+          AND agent_id IS NOT DISTINCT FROM :agent
+          AND user_id IS NOT DISTINCT FROM :user
+          AND (expires_at IS NULL OR expires_at > now())
     """
-    params: dict = {"entity": entity_id, "vec": vec_str, "k": limit}
-    if agent_id is not None:
-        sql += " AND agent_id = :agent"
-        params["agent"] = agent_id
-    if user_id is not None:
-        sql += " AND user_id = :user"
-        params["user"] = user_id
+    params: dict = {"entity": entity_id, "vec": vec_str, "k": limit, "agent": agent_id, "user": user_id}
     sql += """
         ORDER BY (embedding IS NULL) ASC,
                  embedding <=> CAST(:vec AS vector) ASC NULLS LAST,
@@ -240,6 +233,7 @@ async def get_context_memories(
     user_id: str | None = None,
     max_tokens: int = 2000,
     query: str | None = None,
+    sync_files: bool = True,
 ) -> str:
     """Get relevant memories formatted for injection into system prompt.
 
@@ -255,6 +249,25 @@ async def get_context_memories(
     - [preference] Communication style: concise and direct
     - [context] Company is a property management firm with 50 units
     """
+    from packages.core.memory.manager import select_memory_records
+    from packages.core.memory.policy import content_fingerprint
+
+    if sync_files:
+        try:
+            await sync_agent_memory_files(
+                db, entity_id=entity_id, agent_id=agent_id, user_id=user_id, exact_scope=True,
+            )
+        except Exception:
+            logger.debug("agent memory file sync skipped", exc_info=True)
+
+    # This is prompt retrieval, not the administrative list API. Every dimension
+    # is exact, including NULL. Apply filters before LIMIT or relevance ranking.
+    scoped = select(AgentMemory).where(
+        AgentMemory.entity_id == entity_id, AgentMemory.workspace_id.is_(None),
+        AgentMemory.agent_id == agent_id, AgentMemory.user_id == user_id,
+        AgentMemory.status == "active",
+        or_(AgentMemory.expires_at.is_(None), AgentMemory.expires_at > func.now()),
+    )
     # Estimate ~4 chars per token
     max_chars = max_tokens * 4
 
@@ -274,9 +287,14 @@ async def get_context_memories(
             memories = None
     ranked_by_relevance = memories is not None
     if memories is None:
-        memories = await list_memories(
-            db, entity_id, agent_id=agent_id, user_id=user_id, limit=100
-        )
+        memories = list((await db.scalars(scoped.order_by(AgentMemory.importance.desc(), AgentMemory.id).limit(100))).all())
+    else:
+        # Recheck the current snapshot after asynchronous ranking, before any
+        # worker sees it (also protects alternative ranking adapters).
+        current = (await db.scalars(scoped.where(AgentMemory.id.in_([m.id for m in memories]))
+                                   .execution_options(populate_existing=True))).all()
+        by_id = {m.id: m for m in current}
+        memories = [by_id[m.id] for m in memories if m.id in by_id]
 
     # Filter expired
     now = datetime.now(timezone.utc)
@@ -285,6 +303,21 @@ async def get_context_memories(
     if not ranked_by_relevance:
         # Sort by importance DESC (already sorted from query, but ensure)
         active.sort(key=lambda m: m.importance, reverse=True)
+
+    records = [{"id": m.id, "content": m.content, "scope": m.memory_type,
+                "revision": content_fingerprint(m.content)} for m in active]
+    selected = await select_memory_records(
+        records, query=query, entity_id=entity_id, agent_id=agent_id, user_id=user_id,
+    )
+    current = (await db.scalars(scoped.where(
+        AgentMemory.id.in_([r["id"] for r in selected]),
+        or_(AgentMemory.expires_at.is_(None), AgentMemory.expires_at > datetime.now(timezone.utc)),
+    )
+                               .execution_options(populate_existing=True))).all()
+    by_id = {m.id: m for m in current}
+    active = [by_id[r["id"]] for r in selected if r["id"] in by_id
+              and content_fingerprint(by_id[r["id"]].content) == r["revision"]
+              and by_id[r["id"]].memory_type == r["scope"]]
 
     lines = ["## Your Memory"]
     omitted = 0
@@ -343,6 +376,8 @@ async def update_memory(
         )
         kwargs["content"] = prepared_content
         kwargs["metadata_"] = prepared_metadata
+        from packages.core.memory.policy import content_fingerprint
+        kwargs["metadata_"]["content_fingerprint"] = content_fingerprint(prepared_content)
 
     for key, value in kwargs.items():
         if key in allowed:
@@ -393,66 +428,34 @@ async def archive_memory(db: AsyncSession, memory_id: str, entity_id: str) -> bo
 
 
 async def extract_memories_from_conversation(
-    db: AsyncSession,
-    entity_id: str,
-    conversation_id: str,
-    *,
-    agent_id: str | None = None,
-    user_id: str | None = None,
-) -> list[AgentMemory]:
-    """Use LLM to extract memorable facts from a conversation.
+    db: AsyncSession, entity_id: str, conversation_id: str, *,
+    agent_id: str | None = None, user_id: str | None = None,
+):
+    """Return reviewable candidates through the shared chat admission service.
 
-    1. Load recent messages from conversation
-    2. Ask LLM: "Extract key facts, preferences, and context worth remembering"
-    3. Parse response into individual memory entries
-    4. Store new memories
+    The caller supplies the authenticated user, never an inferred owner. This
+    legacy API now has the same evidence and approval rules as scheduled Chat
+    and compact; explicit manual add_memory remains a direct operator edit.
     """
-    from packages.core.services.conversation_records import list_messages
+    from types import SimpleNamespace
+    from packages.core.memory.compaction import MemoryScopeDenied, prepare_chat_memory
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.runtime_learning import AgentLearningCandidate
 
-    messages = await list_messages(db, conversation_id, limit=50)
-    if not messages:
-        return []
-
-    conv_text = runtime_conversation_memory_text(messages)
-
-    if len(conv_text) < 50:  # too short to extract memories
-        return []
-
-    completion = await runtime_execute_conversation_memory_extraction_completion(
-        entity_id=entity_id,
-        conversation_text=conv_text,
-    )
-    content = completion.content
-
-    if not content:
-        return []
-
-    # Parse JSON response
-    try:
-        start = content.find("[")
-        end = content.rfind("]") + 1
-        if start >= 0 and end > start:
-            items = json.loads(content[start:end])
-        else:
-            return []
-    except (json.JSONDecodeError, ValueError):
-        return []
-
-    # Create memory entries
-    new_memories: list[AgentMemory] = []
-    for item in items[:10]:  # cap at 10 per conversation
-        if not isinstance(item, dict) or "content" not in item:
-            continue
-        mem = await add_memory(
-            db,
-            entity_id,
-            content=item["content"],
-            memory_type=item.get("type", "fact"),
-            agent_id=agent_id,
-            user_id=user_id,
-            importance=min(max(int(item.get("importance", 5)), 1), 10),
-            source=f"conversation:{conversation_id}",
-        )
-        new_memories.append(mem)
-
-    return new_memories
+    conversation = await db.scalar(select(Conversation).where(
+        Conversation.id == conversation_id, Conversation.entity_id == entity_id,
+    ))
+    if not user_id or conversation is None:
+        raise MemoryScopeDenied("Memory extraction requires an authorized conversation actor")
+    if agent_id is not None and agent_id != conversation.agent_id:
+        raise MemoryScopeDenied("Memory extraction agent differs from the conversation")
+    ctx = SimpleNamespace(entity_id=entity_id, user_id=user_id, agent_id=conversation.agent_id,
+                          workspace_id=conversation.workspace_id, conversation_id=conversation.id)
+    messages = (await db.scalars(select(Message).where(
+        Message.conversation_id == conversation_id, Message.role == "user",
+        Message.author_kind == "user", Message.message_kind == "text", Message.content.is_not(None),
+    ).order_by(Message.created_at.desc(), Message.id.desc()).limit(50))).all()
+    result = await prepare_chat_memory(ctx, [], source="conversation_extract", source_message_ids=[m.id for m in messages])
+    return list((await db.scalars(select(AgentLearningCandidate).where(
+        AgentLearningCandidate.entity_id == entity_id, AgentLearningCandidate.id.in_(result["candidate_ids"]),
+    ))).all())

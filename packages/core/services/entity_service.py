@@ -89,6 +89,15 @@ async def update_entity(db: AsyncSession, entity_id: str, **fields) -> Optional[
     entity = entity.scalar_one_or_none()
     if not entity:
         return None
+    if 'settings' in fields:
+        current = dict(entity.settings or {})
+        requested = dict(fields['settings'] or {})
+        if 'approval_defaults' in requested and requested['approval_defaults'] != current.get('approval_defaults'):
+            from packages.core.governance.approval_policy_service import ProtectedApprovalSettingsError
+            raise ProtectedApprovalSettingsError('Use execution and approval settings')
+        if 'approval_defaults' in current:
+            requested['approval_defaults'] = current['approval_defaults']
+        fields['settings'] = requested
     for k, v in fields.items():
         if hasattr(entity, k) and v is not None:
             setattr(entity, k, v)
@@ -191,6 +200,8 @@ async def create_workspace(
             setattr(ws, k, v)
     db.add(ws)
     await db.flush()
+    from packages.core.governance.approval_policy_service import initialize_workspace_approval
+    await initialize_workspace_approval(db, ws)
     from packages.core.services.workspace_artifacts import ensure_workspace_artifact_folder
     await ensure_workspace_artifact_folder(db, ws)
     return ws
@@ -284,6 +295,9 @@ async def soft_delete_workspace(
     if not ws:
         return False
     ws.deleted_at = datetime.now(timezone.utc)
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+    await db.execute(update(WorkspaceCollaboration).where(WorkspaceCollaboration.workspace_id == ws.id)
+        .values(status="revoked", snapshot={}))
     from sqlalchemy import delete as sa_delete
     from packages.core.services.scheduler_service import delete_workspace_automations
     from packages.core.models.workflow import WorkflowActionGrant
@@ -459,7 +473,7 @@ async def purge_workspace(
     *,
     expected_deleted_at: datetime | None = None,
 ) -> bool:
-    """Hard-delete a workspace and cascade-clean ALL related rows.
+    """Hard-delete Workspace runtime rows while retaining Entity Knowledge.
 
     Called by the nightly purge task once the grace window elapses, or
     by tests / admin tools that need an immediate hard delete. Bypasses
@@ -499,6 +513,7 @@ async def purge_workspace(
         ResourceGrant,
         ResourceGrantPending,
         ResourceType,
+        Share,
         SubjectType,
         Visibility,
     )
@@ -514,9 +529,12 @@ async def purge_workspace(
         RuntimeRun,
         RuntimeRunStatus,
         SandboxInstance,
+        SandboxRequesterKind,
         SandboxReservation,
     )
+    from packages.core.models.agent_delegation_session import AgentDelegationSession
     from packages.core.models.task import Task, TaskLog, Conversation, Message
+    from packages.core.models.task_coordinator import TaskCoordinatorRun
     from packages.core.models.task_template import TaskTemplate
     from packages.core.models.goal import Goal, GoalMeasurement, GoalTaskLink
     from packages.core.models.scheduler import (
@@ -549,7 +567,13 @@ async def purge_workspace(
         RuntimeEventLog,
     )
     from packages.core.models.usage import TokenUsageLog, ToolCallLog
-    from packages.core.models.document import DocumentGroup, Channel
+    from packages.core.models.document import (
+        Document,
+        DocumentFolder,
+        DocumentGroup,
+        DocumentGroupMember,
+        Channel,
+    )
     from packages.core.models.channel import (
         Announcement,
         ChannelConfig,
@@ -581,6 +605,10 @@ async def purge_workspace(
         return False
 
     await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
+    # Collection admission and entity deletion lock Entity before Workspace.
+    # Acquire this before the Workspace lock so pending-provider purge checks
+    # cannot invert the credit-admission lock order.
+    await db.execute(sa_select(Entity.id).where(Entity.id == entity_id).with_for_update())
     ws = (await db.execute(
         sa_select(Workspace)
         .where(Workspace.id == workspace_id)
@@ -592,6 +620,12 @@ async def purge_workspace(
     if expected_deleted_at is not None and ws.deleted_at != expected_deleted_at:
         # The candidate was restored or deleted again after the nightly sweep
         # loaded it. Leave the current state alone and reconsider it next run.
+        return False
+
+    # Provider work remains billable after a Workspace is deleted. Keep its
+    # identity and credit reservation until the recovery sweep has settled it.
+    from packages.core.services.apify_collections import guard_collection_purge
+    if not await guard_collection_purge(db, entity_id=ws.entity_id, workspace_id=workspace_id):
         return False
 
     # Lock provenance rows before definition rows. Marketplace writers use the
@@ -1604,22 +1638,33 @@ async def purge_workspace(
             RuntimeRun.root_run_id.in_(workspace_runtime_root_ids),
         )
     )
+    # Task workers reserve sandboxes without a RuntimeRun: their tickets are
+    # keyed by requester (kind "task", id = the Task). Resolve them through the
+    # Workspace's tasks so they are purged with the run-based tickets.
+    workspace_task_ids = sa_select(Task.id).where(Task.workspace_id == workspace_id)
     workspace_reservation_ids = sa_select(SandboxReservation.id).where(
         sa_or_(
             SandboxReservation.runtime_run_id.in_(workspace_runtime_run_ids),
             SandboxReservation.root_run_id.in_(workspace_runtime_root_ids),
+            sa_and_(
+                SandboxReservation.requester_kind == SandboxRequesterKind.TASK.value,
+                SandboxReservation.requester_id.in_(workspace_task_ids),
+            ),
         )
     )
     await db.execute(sa_delete(SandboxInstance).where(
         sa_or_(
             SandboxInstance.runtime_run_id.in_(workspace_runtime_run_ids),
             SandboxInstance.root_run_id.in_(workspace_runtime_root_ids),
+            SandboxInstance.reservation_id.in_(workspace_reservation_ids),
         )
     ))
     await db.execute(sa_delete(RuntimeOutboxEvent).where(
         sa_or_(
             RuntimeOutboxEvent.aggregate_id.in_(workspace_runtime_run_ids),
             RuntimeOutboxEvent.aggregate_id.in_(workspace_reservation_ids),
+            RuntimeOutboxEvent.aggregate_id.in_(workspace_task_ids),
+            RuntimeOutboxEvent.aggregate_id.in_(plan_ids_q),
         )
     ))
     await db.execute(sa_delete(SandboxReservation).where(
@@ -1634,6 +1679,9 @@ async def purge_workspace(
             RuntimeRun.id.in_(workspace_runtime_run_ids),
             RuntimeRun.root_run_id.in_(workspace_runtime_root_ids),
         )
+    ))
+    await db.execute(sa_delete(AgentDelegationSession).where(
+        AgentDelegationSession.workspace_id == workspace_id,
     ))
     await db.execute(sa_delete(WorkspaceOperationDraft).where(
         WorkspaceOperationDraft.workspace_id == workspace_id,
@@ -1655,7 +1703,6 @@ async def purge_workspace(
     )))
 
     workspace_goal_ids = sa_select(Goal.id).where(Goal.workspace_id == workspace_id)
-    workspace_task_ids = sa_select(Task.id).where(Task.workspace_id == workspace_id)
     workspace_scheduled_job_ids = sa_select(ScheduledJob.job_id).where(
         ScheduledJob.workspace_id == workspace_id,
     )
@@ -1686,8 +1733,109 @@ async def purge_workspace(
         WorkspaceStat.workspace_id == workspace_id,
     ))
 
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
+    for model in (WorkspaceCollaborationEntry, WorkspaceCollaboration):
+        await db.execute(sa_delete(model).where(model.workspace_id == workspace_id))
+
+    # Resident grants and private-scope tombstones are runtime data, never
+    # retained after their owning Workspace is irreversibly purged.
+    from packages.core.models.webchat_resident import WebchatResidentBinding
+    await db.execute(sa_delete(WebchatResidentBinding).where(
+        WebchatResidentBinding.workspace_id == workspace_id,
+    ))
+
+    # Knowledge Documents and folders are Entity-owned. Preserve a
+    # members-only source's existing restriction before its source identity is
+    # removed: a legacy entity-visible artifact root must still fail closed,
+    # and a group-only document must not widen to the whole Entity.
+    from packages.core.services.workspace_access import (
+        WORKSPACE_ACCESS_MODE_MEMBERS_ONLY,
+        workspace_access_mode,
+    )
+    workspace_document_group_ids = list((await db.execute(
+        sa_select(DocumentGroup.id)
+        .where(DocumentGroup.workspace_id == workspace_id)
+        .order_by(DocumentGroup.id)
+        .with_for_update()
+    )).scalars().all())
+    if workspace_access_mode(ws) == WORKSPACE_ACCESS_MODE_MEMBERS_ONLY:
+        artifact_folder_id = str(ws.artifact_folder_id or "").strip()
+        if artifact_folder_id:
+            artifact_folder = (await db.execute(
+                sa_select(DocumentFolder)
+                .where(
+                    DocumentFolder.id == artifact_folder_id,
+                    DocumentFolder.entity_id == ws.entity_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if artifact_folder is not None and artifact_folder.visibility == Visibility.ENTITY:
+                artifact_folder.visibility = Visibility.WORKSPACE
+
+        source_document_conditions = []
+        if artifact_folder_id:
+            artifact_folder_tree = sa_select(DocumentFolder.id).where(
+                DocumentFolder.id == artifact_folder_id,
+                DocumentFolder.entity_id == ws.entity_id,
+            ).cte("workspace_artifact_folder_tree", recursive=True)
+            artifact_folder_tree = artifact_folder_tree.union(
+                sa_select(DocumentFolder.id).join(
+                    artifact_folder_tree,
+                    DocumentFolder.parent_id == artifact_folder_tree.c.id,
+                ).where(DocumentFolder.entity_id == ws.entity_id)
+            )
+            source_document_conditions.append(Document.folder_id.in_(
+                sa_select(artifact_folder_tree.c.id),
+            ))
+        if workspace_document_group_ids:
+            source_document_conditions.append(Document.id.in_(
+                sa_select(DocumentGroupMember.document_id).where(
+                    DocumentGroupMember.group_id.in_(workspace_document_group_ids),
+                ),
+            ))
+        if source_document_conditions:
+            from packages.core.services.document_access import (
+                document_workspace_ids_batched,
+            )
+
+            source_documents = list((await db.execute(
+                sa_select(Document)
+                .where(
+                    Document.entity_id == ws.entity_id,
+                    sa_or_(*source_document_conditions),
+                    Document.visibility == Visibility.ENTITY,
+                )
+                .order_by(Document.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )).scalars().all())
+            workspace_ids_by_document = await document_workspace_ids_batched(
+                db,
+                source_documents,
+            )
+            for document in source_documents:
+                remaining_workspace_ids = workspace_ids_by_document.get(
+                    str(document.id),
+                    set(),
+                )
+                remaining_workspace_ids.discard(workspace_id)
+                if not remaining_workspace_ids:
+                    document.visibility = Visibility.WORKSPACE
+
+    # Source groups must be removed with their links first because
+    # DocumentGroupMember has no database FK back to the source group.
+    await db.execute(sa_delete(DocumentGroupMember).where(
+        DocumentGroupMember.group_id.in_(workspace_document_group_ids),
+    ))
+    for model in (ResourceGrant, ResourceGrantPending, Share):
+        await db.execute(sa_delete(model).where(
+            model.resource_type == ResourceType.DOCUMENT_GROUP,
+            model.resource_id.in_(workspace_document_group_ids),
+        ))
+
     for model in [
-        Task, Conversation, ExecutionPlan,
+        TaskCoordinatorRun, Task, Conversation, ExecutionPlan,
         GovernancePolicy, GovernanceRevision, AgentExecution,
         WorkspaceStaff, AgentSubscription, WorkspaceActivity,
         Goal, ScheduledJob, AgentMemory,
@@ -1698,11 +1846,16 @@ async def purge_workspace(
         await db.execute(sa_delete(model).where(model.workspace_id == workspace_id))
 
     # ── Level 3: Workspace itself ──
-    from packages.core.services.workspace_artifact_purge import (
-        purge_workspace_artifacts,
-    )
-
-    await purge_workspace_artifacts(db, ws)
+    # Knowledge Documents, folders, source files, versions, and their ACLs
+    # remain Entity-owned after a Workspace lifecycle ends. Terminal Entity
+    # deletion uses purge_entity_knowledge instead.
+    # Journals are runtime recovery state, not portable configuration. Match
+    # the explicit owner only; a similar path is not Workspace ownership.
+    from packages.core.models.runtime_file_commit import RuntimeFileCommit
+    await db.execute(sa_delete(RuntimeFileCommit).where(
+        RuntimeFileCommit.entity_id == ws.entity_id,
+        RuntimeFileCommit.owner["workspace_id"].astext == workspace_id,
+    ))
     await db.delete(ws)
     await db.flush()
     return True

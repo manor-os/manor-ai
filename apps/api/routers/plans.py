@@ -20,8 +20,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Response
+from pydantic import BaseModel, JsonValue
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,10 +31,16 @@ from apps.api.deps import (
     require_workspace_readable,
     require_workspace_writable,
 )
-from packages.core.constants.task import TaskLogType, TaskStatus
+from packages.core.constants.task import TaskLogType, TaskRuntimeKind, TaskStatus
 from packages.core.constants.execution import (
+    COORDINATOR_PARENT_STEP_PARAM_KEY,
     ExecutionPlanStatus,
-    ExecutionStepStatus,
+    PLAN_TERMINAL_STATUSES,
+    is_coordinator_child_params,
+)
+from packages.core.dispatcher.effect_safety import (
+    retry_effect_block_detail,
+    task_execution_effect_block_detail,
 )
 from packages.core.constants.task_actors import TaskActor
 from packages.core.database import get_db
@@ -48,15 +54,25 @@ from packages.core.plans import (
     get_plan,
     list_plan_steps,
 )
+from packages.core.plans.step_reset import (
+    never_ran_downstream,
+    reset_never_ran_downstream_steps,
+    reset_step_to_retry_ready,
+)
 from packages.core.plans.planner import (
     CapabilityError,
     PlannerError,
     TaskPlanClaimHeldError,
+    TaskPlanOwnedByCoordinatorError,
     plan_task_and_commit,
     task_plan_admission_error,
 )
 from packages.core.plans.schema import Plan
-from packages.core.plans.service import ActiveTaskPlanError, PlanContractError
+from packages.core.plans.service import (
+    ActiveTaskPlanError,
+    PlanContractError,
+    TaskEffectReplayBlockedError,
+)
 from packages.core.services.task_service import add_task_log
 from packages.core.services.workflow_run_execution_claim import (
     TaskPlanExecutionClaimLost,
@@ -69,11 +85,13 @@ from packages.core.services.task_retry_service import (
     RETRYABLE_EXECUTION_STEP_STATUSES,
     TASK_RECOVERY_RETRY_DETAIL,
     WAITING_HUMAN_RETRY_DETAIL,
+    TaskRetryError,
     has_pending_task_recovery,
     has_waiting_human_decision,
     is_plan_dispatch_recovery,
     plan_retry_block_detail,
     _persisted_plan_replan_context,
+    require_workspace_plan_resume_dispatch,
 )
 
 
@@ -119,7 +137,7 @@ class StepResponse(BaseModel):
     action_key: Optional[str]
     integration_id: Optional[str]
     params: dict
-    result: Optional[dict]
+    result: JsonValue | None
     depends_on: list[str]
     step_status: str
     risk_level: str
@@ -145,6 +163,14 @@ class PlanCreateRequest(BaseModel):
 
 class PlanFromTaskRequest(BaseModel):
     execution_mode: str = "live"
+
+
+class TaskPlanAdmissionResponse(BaseModel):
+    submission_id: str
+    task_id: str
+    status: str
+    plan_id: Optional[str]
+    runtime: str = "task_coordinator_v3"
 
 
 class RetryRequest(BaseModel):
@@ -300,6 +326,35 @@ def _reject_replanned_plan_retry(plan: ExecutionPlan) -> None:
         )
 
 
+def _reject_task_coordinator_step_retry(plan: ExecutionPlan) -> None:
+    from packages.core.plans.coordinator import (
+        TASK_COORDINATOR_PLAN_VERSION,
+        TASK_COORDINATOR_PLAN_VERSION_KEY,
+    )
+
+    state = plan.dispatcher_state if isinstance(plan.dispatcher_state, dict) else {}
+    if state.get(TASK_COORDINATOR_PLAN_VERSION_KEY) == TASK_COORDINATOR_PLAN_VERSION:
+        raise HTTPException(
+            409,
+            "This Plan is owned by the Task coordinator; retry the Task or "
+            "let its coordinator replan instead of resetting a Step directly.",
+        )
+
+
+def _reject_task_coordinator_plan_cancel(plan: ExecutionPlan) -> None:
+    from packages.core.plans.coordinator import (
+        TASK_COORDINATOR_PLAN_VERSION,
+        TASK_COORDINATOR_PLAN_VERSION_KEY,
+    )
+
+    state = plan.dispatcher_state if isinstance(plan.dispatcher_state, dict) else {}
+    if state.get(TASK_COORDINATOR_PLAN_VERSION_KEY) == TASK_COORDINATOR_PLAN_VERSION:
+        raise HTTPException(
+            409,
+            "This Plan is owned by the Task coordinator; cancel the Task instead.",
+        )
+
+
 async def _lock_plan_mutation_origin(
     db: AsyncSession,
     *,
@@ -345,17 +400,18 @@ async def _lock_plan_mutation_origin(
         )).scalar_one_or_none()
         if task is None:
             return None
-        return (await db.execute(
+        task_plans = list((await db.execute(
             select(ExecutionPlan)
             .where(
-                ExecutionPlan.id == plan_id,
                 ExecutionPlan.entity_id == user.entity_id,
                 ExecutionPlan.task_id == task.id,
                 ExecutionPlan.workspace_id == plan_scope.workspace_id,
             )
+            .order_by(ExecutionPlan.id)
             .with_for_update()
             .execution_options(populate_existing=True)
-        )).scalar_one_or_none()
+        )).scalars().all())
+        return next((candidate for candidate in task_plans if candidate.id == plan_id), None)
 
     return (await db.execute(
         select(ExecutionPlan)
@@ -370,12 +426,81 @@ async def _lock_plan_mutation_origin(
     )).scalar_one_or_none()
 
 
+async def _require_authoritative_task_plan_retry(
+    db: AsyncSession,
+    plan: ExecutionPlan,
+) -> None:
+    """Reject stale history before a retry can create a second active Plan."""
+
+    if not plan.task_id:
+        return
+    task_plans = list((await db.execute(
+        select(ExecutionPlan)
+        .where(
+            ExecutionPlan.task_id == plan.task_id,
+            ExecutionPlan.entity_id == plan.entity_id,
+            ExecutionPlan.workspace_id == plan.workspace_id,
+        )
+        .order_by(ExecutionPlan.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalars().all())
+    latest = max(
+        task_plans,
+        key=lambda candidate: (candidate.created_at, candidate.id),
+        default=None,
+    )
+    terminal_statuses = {status.value for status in PLAN_TERMINAL_STATUSES}
+    active_others = [
+        candidate
+        for candidate in task_plans
+        if candidate.id != plan.id and candidate.status not in terminal_statuses
+    ]
+    if latest is None or latest.id != plan.id or active_others:
+        raise HTTPException(
+            409,
+            "Only the Task's latest Plan can be retried, and no other Plan may be active.",
+        )
+
+    # A historical Plan is not an execution-engine capability. Re-enter the
+    # same closed Task factory used by first starts and Task-level retry, then
+    # verify that every persisted subscription pin still belongs to the exact
+    # current service selection before any Step is reset.
+    task = (await db.execute(
+        select(Task).where(
+            Task.id == plan.task_id,
+            Task.entity_id == plan.entity_id,
+            Task.workspace_id == plan.workspace_id,
+        ).execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if task is None:
+        raise HTTPException(409, "The Plan's Task no longer exists in this Workspace.")
+    steps = list((await db.execute(
+        select(ExecutionStep)
+        .where(ExecutionStep.plan_id == plan.id)
+        .order_by(ExecutionStep.created_at, ExecutionStep.id)
+        .execution_options(populate_existing=True)
+    )).scalars().all())
+    from packages.core.services.task_execution import resolve_task_execution
+
+    execution = await resolve_task_execution(db, task)
+    try:
+        require_workspace_plan_resume_dispatch(
+            task=task,
+            plan=plan,
+            steps=steps,
+            execution=execution,
+        )
+    except TaskRetryError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
+
 async def _validate_manual_plan_scope(
     db: AsyncSession,
     *,
     user: User,
     request: PlanCreateRequest,
-) -> None:
+):
     """Authorize and bind every caller-supplied Plan owner reference."""
     await _lock_writable_workspace_for_plan(
         db,
@@ -384,6 +509,7 @@ async def _validate_manual_plan_scope(
     )
 
     task: Task | None = None
+    rejected_receipt = None
     if request.task_id:
         task = (await db.execute(
             select(Task)
@@ -398,7 +524,25 @@ async def _validate_manual_plan_scope(
             raise HTTPException(404, "task not found")
         if task.workspace_id != request.workspace_id:
             raise HTTPException(400, "task workspace does not match plan workspace")
-        _require_task_plan_entry(task)
+        if task.status == TaskStatus.BLOCKED.value and task.workspace_id:
+            from packages.core.models.task_plan_submission import (
+                TaskPlanSubmissionKind,
+                TaskPlanSubmissionState,
+            )
+            from packages.core.services.task_plan_submission import latest_task_plan_submission
+
+            candidate = await latest_task_plan_submission(db, task_id=task.id)
+            if (
+                candidate is not None
+                and candidate.request_kind == TaskPlanSubmissionKind.MANUAL.value
+                and candidate.state == TaskPlanSubmissionState.REJECTED.value
+                and candidate.plan_id is None
+            ):
+                rejected_receipt = candidate
+            else:
+                _require_task_plan_entry(task)
+        else:
+            _require_task_plan_entry(task)
 
     subscription: AgentSubscription | None = None
     if request.agent_subscription_id:
@@ -422,39 +566,55 @@ async def _validate_manual_plan_scope(
             raise HTTPException(400, "agent subscription is not active")
 
     if task is not None:
-        allowed_service_keys = {
-            str(service_key)
-            for service_key in (
-                task.owner_service_key,
-                *(task.delegate_service_keys or []),
+        coordinator = None
+        if task.workspace_id:
+            from packages.core.services.task_execution import resolve_task_execution
+
+            execution = await resolve_task_execution(db, task)
+            coordinator = execution.coordinator
+            if (
+                execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN
+                or coordinator is None
+            ):
+                raise HTTPException(
+                    409,
+                    f"Task runtime {execution.runtime_kind.value!r} cannot create "
+                    "a new Plan",
+                )
+            allowed_service_keys = coordinator.service_keys
+        else:
+            # Preserve the legacy entity-level Plan boundary. Coordinator
+            # factory/fold is a Workspace Task invariant.
+            allowed_service_keys = frozenset(
+                str(service_key)
+                for service_key in (
+                    task.owner_service_key,
+                    *(task.delegate_service_keys or []),
+                )
+                if service_key
             )
-            if service_key
-        }
         requested_service_keys = {
             str(step.service_key)
             for step in request.plan.steps
             if step.service_key
         }
-        enforce_assignment_scope = bool(
-            task.workspace_id or allowed_service_keys
-        )
-        if (
-            enforce_assignment_scope
-            and not requested_service_keys.issubset(allowed_service_keys)
-        ):
+        if not requested_service_keys.issubset(allowed_service_keys):
             raise HTTPException(
                 400,
                 "plan service keys exceed the task owner/delegate scope",
             )
         if (
-            enforce_assignment_scope
-            and subscription is not None
-            and subscription.service_key not in allowed_service_keys
+            coordinator is not None
+            and
+            subscription is not None
+            and subscription.id != coordinator.root.subscription_id
         ):
             raise HTTPException(
                 400,
-                "agent subscription exceeds the task owner/delegate scope",
+                "agent subscription does not match the Task runtime's "
+                "coordinator root",
             )
+    return rejected_receipt
 
 
 def _require_task_plan_entry(task: Task) -> None:
@@ -478,11 +638,9 @@ async def _lock_writable_workspace_for_plan(
         workspace_id=normalized_workspace_id,
         entity_id=user.entity_id,
     )
-    if (
-        workspace is None
-        or workspace.deleted_at is not None
-        or workspace.status != "active"
-    ):
+    from packages.core.services.workspace_autonomy import workspace_allows_manual_work
+
+    if not workspace_allows_manual_work(workspace):
         raise HTTPException(403, "You do not have write access to this workspace")
     await require_workspace_writable(db, user, normalized_workspace_id)
 
@@ -564,14 +722,23 @@ async def _maybe_replan_stale_plan(
     )
     if replan_context is None:
         return False
+    effect_block = await task_execution_effect_block_detail(db, plan.task_id)
+    if effect_block:
+        raise HTTPException(409, effect_block)
     if has_waiting_human:
         raise HTTPException(409, WAITING_HUMAN_RETRY_DETAIL)
 
-    if not (task.owner_subscription_id or task.owner_service_key):
+    from packages.core.services.task_execution import (
+        resolve_task_execution,
+        stage_task_execution_intent,
+    )
+
+    execution = await resolve_task_execution(db, task)
+    if execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN:
         raise HTTPException(
             409,
-            "Stored execution plan needs structural replanning and has no Planner "
-            "owner; assign an owner or create a fresh Plan before retrying.",
+            "Stored execution plan needs structural replanning, but the Task "
+            "does not have an executable coordinated Workspace service scope.",
         )
 
     detail = str(replan_context["contract_gaps"])
@@ -607,6 +774,11 @@ async def _maybe_replan_stale_plan(
         reset_step_ids=[],
         note=note,
     )
+    # Persist the replacement-planning intent in the same transaction as the
+    # old Plan's terminal state and Task replan context.  A broker outage can
+    # delay delivery, but cannot strand a committed replan between those two
+    # state changes.
+    await stage_task_execution_intent(db, task, execution)
     return True
 
 
@@ -614,51 +786,14 @@ async def _dispatch_task_replan(
     db: AsyncSession,
     plan: ExecutionPlan,
 ) -> bool:
-    dispatched = False
-    try:
-        from packages.core.tasks.ai_tasks import plan_and_run_task
+    """Report a replan whose durable Task intent was staged before commit.
 
-        if not plan.task_id:
-            return False
-        plan_and_run_task.delay(plan.task_id)
-        dispatched = True
-    except Exception as dispatch_error:  # noqa: BLE001
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "task %s contract replan dispatch failed", plan.task_id, exc_info=True,
-        )
-        try:
-            task = (await db.execute(
-                select(Task).where(
-                    Task.id == plan.task_id,
-                    Task.entity_id == plan.entity_id,
-                )
-            )).scalar_one_or_none()
-            if task is not None:
-                from packages.core.services.task_retry_service import (
-                    TaskRetryResult,
-                    mark_task_retry_dispatch_failed,
-                )
-
-                await mark_task_retry_dispatch_failed(
-                    db,
-                    result=TaskRetryResult(
-                        task=task,
-                        mode="plan_contract_replan",
-                        plan_id=plan.id,
-                        reset_steps=0,
-                        dispatch=("plan_new", task.id),
-                    ),
-                    error=dispatch_error,
-                )
-                await db.commit()
-        except Exception:  # noqa: BLE001
-            await db.rollback()
-            logging.getLogger(__name__).exception(
-                "task %s contract replan dispatch recovery failed",
-                plan.task_id,
-            )
+    The name is retained for API response compatibility.  Broker publication
+    belongs exclusively to the Runtime outbox; doing it here after commit
+    would recreate the delivery-loss window the outbox closes.
+    """
+    if not plan.task_id:
+        return False
     if plan.task_id:
         from packages.core.services.realtime import broadcast_task_runtime_update
 
@@ -669,7 +804,7 @@ async def _dispatch_task_replan(
             plan_id=plan.id,
             event="task_replan_dispatched",
         )
-    return dispatched
+    return True
 
 
 def _reset_step_for_retry(
@@ -679,8 +814,9 @@ def _reset_step_for_retry(
     note: str | None = None,
     preserve_result: bool = False,
 ) -> None:
-    step.step_status = ExecutionStepStatus.PENDING.value
-    step.current_lease_id = None
+    from packages.core.plans.step_reset import renew_step_approval_intent
+    renew_step_approval_intent(step)
+    reset_step_to_retry_ready(step)
     step.error = None
     step.finished_at = None
     step.started_at = None
@@ -698,6 +834,15 @@ def _reset_step_for_retry(
         }
 
 
+def _is_coordinator_child_step(step: ExecutionStep) -> bool:
+    return is_coordinator_child_params(step.params)
+
+
+def _never_ran_downstream(step: ExecutionStep) -> bool:
+    """Skipped, or failed at the executor's boundary gate without running."""
+    return never_ran_downstream(step)
+
+
 def _reset_skipped_downstream_steps_for_retry(
     steps: list[ExecutionStep],
     *,
@@ -705,41 +850,17 @@ def _reset_skipped_downstream_steps_for_retry(
     user: User,
     note: str | None = None,
 ) -> list[ExecutionStep]:
-    """Reset skipped descendants unblocked by the retried step.
+    """Reset never-ran descendants unblocked by the retried step.
 
-    A single-step retry often targets the first failed step in a dependency
-    chain. Downstream steps may already be terminal ``skipped`` from the earlier
-    failed run, so the executor will never revisit them unless we revive the
-    skipped chain here.
+    The algorithm lives in ``packages.core.plans.step_reset`` — the supervisor's
+    step re-run revives the same chain — and this surface adds the operator
+    note to every revived step.
     """
-    done_or_retried = {
-        step.step_key
-        for step in steps
-        if step.step_status == ExecutionStepStatus.DONE or step.step_key in retried_step_keys
-    }
-    revived_keys = set(retried_step_keys)
-    reset: list[ExecutionStep] = []
-
-    changed = True
-    while changed:
-        changed = False
-        for step in steps:
-            if step.step_key in done_or_retried or step.step_status != ExecutionStepStatus.SKIPPED:
-                continue
-            deps = [str(dep) for dep in (step.depends_on or []) if dep]
-            if not deps:
-                continue
-            if not any(dep in revived_keys for dep in deps):
-                continue
-            if not all(dep in done_or_retried for dep in deps):
-                continue
-            _reset_step_for_retry(step, user=user, note=note)
-            reset.append(step)
-            done_or_retried.add(step.step_key)
-            revived_keys.add(step.step_key)
-            changed = True
-
-    return reset
+    return reset_never_ran_downstream_steps(
+        steps,
+        retried_step_keys=retried_step_keys,
+        reset_step=lambda step: _reset_step_for_retry(step, user=user, note=note),
+    )
 
 
 def _revive_plan_for_retry(plan: ExecutionPlan) -> None:
@@ -757,36 +878,17 @@ async def _dispatch_plan(
     reason: str,
     is_retry: bool = True,
 ) -> bool:
-    dispatched = False
-    try:
-        from packages.core.tasks.ai_tasks import run_plan
-        run_plan.delay(plan.id)
-        dispatched = True
-    except Exception:  # noqa: BLE001
-        import logging
-        logging.getLogger(__name__).warning(
-            "Plan %s dispatch failed", plan.id, exc_info=True,
-        )
-        try:
-            from packages.core.services.task_retry_service import (
-                mark_plan_continuation_dispatch_failed,
-            )
+    del user_id, is_retry  # retained for private-call compatibility
+    from packages.core.plans.wakeup import hint_pending_plan_cycle
 
-            await mark_plan_continuation_dispatch_failed(
-                db,
-                plan_id=plan.id,
-                user_id=user_id,
-                reason=reason,
-                is_retry=is_retry,
-            )
-            await db.commit()
-            await db.refresh(plan)
-        except Exception:  # noqa: BLE001
-            await db.rollback()
-            logging.getLogger(__name__).exception(
-                "Plan %s dispatch recovery failed",
-                plan.id,
-            )
+    # ``True`` means the durable intent exists. The CONTROL publication below
+    # is only a latency hint; its helper logs broker failure and deliberately
+    # leaves Plan/Task business state unchanged for the outbox sweep to recover.
+    dispatched = await hint_pending_plan_cycle(
+        db,
+        plan.id,
+        reason=reason,
+    )
     if plan.task_id:
         from packages.core.services.realtime import broadcast_task_runtime_update
 
@@ -810,6 +912,12 @@ async def _record_retry_on_task(
     note: str | None = None,
 ) -> None:
     """Mirror execution-layer retry onto the business Task timeline."""
+    from packages.core.services.task_execution_origin import (
+        record_manual_plan_execution,
+        record_manual_task_execution,
+    )
+
+    record_manual_plan_execution(plan, user_id=user.id, action=mode)
     if not plan.task_id:
         return
     task = (await db.execute(
@@ -839,6 +947,7 @@ async def _record_retry_on_task(
     task.completed_at = None
     task.actual_output = None
     task.details = details
+    record_manual_task_execution(task, user_id=user.id, action=mode)
 
     await add_task_log(
         db,
@@ -977,14 +1086,122 @@ async def steps(
     ]
 
 
-@router.post("", response_model=PlanResponse, status_code=201)
+def _to_task_plan_admission(submission) -> TaskPlanAdmissionResponse:
+    return TaskPlanAdmissionResponse(
+        submission_id=submission.id,
+        task_id=submission.task_id,
+        status=submission.state,
+        plan_id=submission.plan_id,
+    )
+
+
+@router.post(
+    "", response_model=PlanResponse | TaskPlanAdmissionResponse, status_code=201,
+    responses={202: {"model": TaskPlanAdmissionResponse, "description": "Workspace Task Plan request accepted"}},
+)
 async def create_manual(
     req: PlanCreateRequest,
+    response: Response,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a hand-authored Plan through the same contract gate as Planner."""
-    await _validate_manual_plan_scope(db, user=user, request=req)
+    """Submit a Workspace Task DAG to V3; keep taskless/legacy Plan creation."""
+    rejected_receipt = await _validate_manual_plan_scope(db, user=user, request=req)
+    if req.task_id and req.workspace_id:
+        from packages.core.models.task_plan_submission import TaskPlanSubmissionKind
+        from packages.core.services.task_plan_submission import (
+            TaskPlanSubmissionConflict,
+            manual_task_plan_fingerprint,
+            submit_task_plan_request,
+        )
+
+        task = (await db.execute(
+            select(Task).where(Task.id == req.task_id, Task.entity_id == user.entity_id)
+            .execution_options(populate_existing=True)
+        )).scalar_one()
+        if rejected_receipt is not None:
+            if rejected_receipt.request_fingerprint == manual_task_plan_fingerprint(
+                execution_mode=req.execution_mode,
+                approval_required=req.approval_required,
+                plan=req.plan,
+            ):
+                raise HTTPException(
+                    409, "This manual Plan was rejected: "
+                    + str(rejected_receipt.rejection_reason or "correct the DAG before resubmitting"),
+                )
+            # Retry and replacement submission must commit together. A
+            # separate /tasks/{id}/retry could wake the automatic Planner
+            # before the corrected authored DAG reaches this endpoint.
+            existing_plan = (await db.execute(
+                select(ExecutionPlan.id).where(
+                    ExecutionPlan.task_id == task.id,
+                    ExecutionPlan.entity_id == task.entity_id,
+                ).limit(1)
+            )).scalar_one_or_none()
+            if existing_plan is not None:
+                raise HTTPException(409, "A Task with a saved Plan cannot replace a rejected manual DAG")
+            from packages.core.models.task_coordinator import TaskCoordinatorRun
+
+            run = (await db.execute(
+                select(TaskCoordinatorRun).where(TaskCoordinatorRun.task_id == task.id)
+                .with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            expiry = run.claim_expires_at if run is not None else None
+            if expiry is not None and expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            if run is None or run.current_plan_id or (
+                run.claim_token and expiry is not None and expiry > datetime.now(timezone.utc)
+            ):
+                raise HTTPException(409, "Task coordinator must be safely stopped before replacing its DAG")
+            from packages.core.services.task_retry_service import prepare_task_retry
+
+            try:
+                retry_result = await prepare_task_retry(
+                    db, task=task, user_id=user.id,
+                    user_label=user.display_name or user.email,
+                    note="Replace rejected manual Plan DAG",
+                )
+            except TaskRetryError as exc:
+                raise HTTPException(exc.status_code, exc.detail) from exc
+            task = retry_result.task
+            from packages.core.constants.pending_actions import PendingActionKind
+            from packages.core.services.task_chat_hitl import resolve_task_hitl
+
+            await resolve_task_hitl(
+                db, task=task, kind=PendingActionKind.TASK_RECOVERY,
+                choice="retry", user_id=user.id,
+                note="Replace rejected manual Plan DAG",
+            )
+            from packages.core.services.task_coordinator_wakeup import ensure_task_coordinator_run
+
+            if retry_result.dispatch.coordinator is None:
+                raise HTTPException(409, "Task has no active coordinator service scope")
+            try:
+                await ensure_task_coordinator_run(
+                    db, task=task, selection=retry_result.dispatch.coordinator,
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+        try:
+            submission = await submit_task_plan_request(
+                db,
+                task=task,
+                requested_by_user_id=user.id,
+                kind=TaskPlanSubmissionKind.MANUAL,
+                execution_mode=req.execution_mode,
+                approval_required=req.approval_required,
+                plan=req.plan,
+                source_submission_id=(rejected_receipt.id if rejected_receipt is not None else None),
+            )
+        except TaskPlanSubmissionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except PlanContractError as exc:
+            raise HTTPException(400, f"plan contract failed: {exc}") from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await db.commit()
+        response.status_code = 202
+        return _to_task_plan_admission(submission)
     try:
         plan_row = await create_plan_from_dag(
             db,
@@ -999,8 +1216,21 @@ async def create_manual(
         )
     except PlanContractError as exc:
         raise HTTPException(400, f"plan contract failed: {exc}") from exc
+    except TaskEffectReplayBlockedError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except ActiveTaskPlanError as exc:
         raise HTTPException(409, str(exc)) from exc
+    from packages.core.services.task_execution_origin import (
+        record_manual_plan_execution,
+        record_manual_task_execution,
+    )
+
+    record_manual_plan_execution(plan_row, user_id=user.id, action="plan_create")
+    if plan_row.task_id:
+        task = await db.get(Task, plan_row.task_id)
+        record_manual_task_execution(task, user_id=user.id, action="plan_create")
     await db.commit()
     await _maybe_dispatch(
         db,
@@ -1012,14 +1242,47 @@ async def create_manual(
     return _to_plan(plan_row)
 
 
-@router.post("/from-task/{task_id}", response_model=PlanResponse, status_code=201)
+@router.post(
+    "/from-task/{task_id}", response_model=PlanResponse | TaskPlanAdmissionResponse,
+    status_code=201,
+    responses={202: {"model": TaskPlanAdmissionResponse, "description": "Workspace Task Planner request accepted"}},
+)
 async def create_from_task(
     task_id: str,
     req: PlanFromTaskRequest,
+    response: Response,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Invoke the Planner for a task, persist, optionally dispatch."""
+    """Admit a V3 Workspace Task Planner request; preserve entity legacy Plans."""
+    scope = (await db.execute(
+        select(Task.id, Task.workspace_id).where(Task.id == task_id, Task.entity_id == user.entity_id)
+    )).one_or_none()
+    if scope is None:
+        raise HTTPException(404, "task not found")
+    if scope.workspace_id:
+        from packages.core.models.task_plan_submission import TaskPlanSubmissionKind
+        from packages.core.services.task_plan_submission import (
+            TaskPlanSubmissionConflict,
+            submit_task_plan_request,
+        )
+
+        task = await _lock_task_for_plan(db, user=user, task_id=task_id)
+        try:
+            submission = await submit_task_plan_request(
+                db,
+                task=task,
+                requested_by_user_id=user.id,
+                kind=TaskPlanSubmissionKind.PLANNER,
+                execution_mode=req.execution_mode,
+            )
+        except TaskPlanSubmissionConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await db.commit()
+        response.status_code = 202
+        return _to_task_plan_admission(submission)
     await _authorize_task_for_planner(db, user=user, task_id=task_id)
 
     async def _revalidate_write_access(plan_row: ExecutionPlan) -> None:
@@ -1039,15 +1302,20 @@ async def create_from_task(
             db,
             task_id,
             execution_mode=req.execution_mode,
+            manual_user_id=user.id,
             before_provider=_resolve_billing_scope,
             before_commit=_revalidate_write_access,
         )
     except CapabilityError as exc:
         raise HTTPException(400, f"planner capability validation failed: {exc}") from exc
+    except TaskPlanOwnedByCoordinatorError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except PlannerError as exc:
         raise HTTPException(400, f"planner failed: {exc}") from exc
     except PlanContractError as exc:
         raise HTTPException(400, f"plan contract failed: {exc}") from exc
+    except TaskEffectReplayBlockedError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ActiveTaskPlanError as exc:
         # The Plan commit is the durable boundary; dispatch happens after it.
         # If the request/worker died in that gap, a client retry must reuse and
@@ -1061,6 +1329,26 @@ async def create_from_task(
         ):
             raise HTTPException(409, str(exc)) from exc
         await _revalidate_write_access(plan_row)
+        from packages.core.services.task_execution_origin import (
+            record_manual_plan_execution,
+            record_manual_task_execution,
+        )
+
+        plan_row = await _lock_plan_mutation_origin(db, plan_id=plan_row.id, user=user)
+        if plan_row is None:
+            raise HTTPException(404, "plan not found")
+        record_manual_plan_execution(plan_row, user_id=user.id, action="plan_dispatch")
+        if plan_row.task_id:
+            task = await db.get(Task, plan_row.task_id)
+            record_manual_task_execution(task, user_id=user.id, action="plan_dispatch")
+        from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+        await stage_plan_cycle_wake(
+            db,
+            plan_row.id,
+            reason="manual_existing_plan_dispatch",
+        )
+        await db.commit()
     except TaskPlanClaimHeldError as exc:
         raise HTTPException(409, str(exc)) from exc
     except TaskPlanExecutionClaimLost as exc:
@@ -1098,10 +1386,19 @@ async def approve(
         raise HTTPException(409, f"plan status is {p.status}, not pending_approval")
     p.status = ExecutionPlanStatus.DRAFT.value  # executor flips draft → running on first cycle
     p.approval_required = False
+    from packages.core.services.task_execution_origin import (
+        record_manual_plan_execution,
+        record_manual_task_execution,
+    )
+
+    record_manual_plan_execution(p, user_id=user.id, action="plan_approval")
+    task = None
     if p.task_id:
         task = (await db.execute(
             select(Task).where(Task.id == p.task_id, Task.entity_id == p.entity_id)
         )).scalar_one_or_none()
+        if task is not None:
+            record_manual_task_execution(task, user_id=user.id, action="plan_approval")
         if task and task.status == TaskStatus.WAITING_ON_CUSTOMER:
             from packages.core.services.task_state_machine import apply_task_status_transition
 
@@ -1117,15 +1414,55 @@ async def approve(
                 created_by=user.display_name or user.email,
                 metadata={"plan_id": p.id, "approval_required": False},
             )
+    from packages.core.plans.coordinator import (
+        TASK_COORDINATOR_PLAN_VERSION,
+        TASK_COORDINATOR_PLAN_VERSION_KEY,
+        TASK_COORDINATOR_RUN_ID_KEY,
+    )
+
+    state = p.dispatcher_state if isinstance(p.dispatcher_state, dict) else {}
+    v3_plan = state.get(TASK_COORDINATOR_PLAN_VERSION_KEY) == TASK_COORDINATOR_PLAN_VERSION
+    if v3_plan:
+        from packages.core.models.task_coordinator import TaskCoordinatorPhase, TaskCoordinatorRun
+        from packages.core.services.task_coordinator_wakeup import stage_task_coordinator_wake
+        from packages.core.services.task_execution import task_execution_intent_generation
+
+        run = (await db.execute(
+            select(TaskCoordinatorRun).where(
+                TaskCoordinatorRun.id == state.get(TASK_COORDINATOR_RUN_ID_KEY),
+                TaskCoordinatorRun.task_id == p.task_id,
+                TaskCoordinatorRun.current_plan_id == p.id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if run is None or run.phase in TaskCoordinatorPhase.terminal():
+            raise HTTPException(409, "Task coordinator is no longer waiting for this Plan")
+        if task is None or task.status != TaskStatus.IN_PROGRESS.value:
+            raise HTTPException(409, "Task did not resume for this Plan approval")
+        run.lifecycle_generation = task_execution_intent_generation(task)
+        run.phase = TaskCoordinatorPhase.READY.value
+        run.state_version += 1
+        if await stage_task_coordinator_wake(
+            db, task_id=p.task_id, reason="plan_approved",
+        ) is None:
+            raise HTTPException(409, "Task coordinator cannot resume this Plan")
+    else:
+        from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+        await stage_plan_cycle_wake(
+            db,
+            p.id,
+            reason="plan_approved",
+        )
     await db.commit()
     await db.refresh(p)
-    await _maybe_dispatch(
-        db,
-        p,
-        user_id=user.id,
-        reason="plan_approval_dispatch_failed",
-        force=True,
-    )
+    if not v3_plan:
+        await _maybe_dispatch(
+            db,
+            p,
+            user_id=user.id,
+            reason="plan_approval_dispatch_failed",
+            force=True,
+        )
     return _to_plan(p)
 
 
@@ -1142,8 +1479,10 @@ async def cancel(
     )
     if not p:
         raise HTTPException(404, "plan not found")
+    _reject_task_coordinator_plan_cancel(p)
     cancelled = await cancel_plan(db, plan_id, reason="cancelled via API")
     await db.commit()
+    await db.refresh(cancelled or p)
     return _to_plan(cancelled or p)
 
 
@@ -1167,6 +1506,8 @@ async def retry_failed_steps(
     if not p:
         raise HTTPException(404, "plan not found")
     _reject_replanned_plan_retry(p)
+    _reject_task_coordinator_step_retry(p)
+    await _require_authoritative_task_plan_retry(db, p)
 
     note = (req.note if req else None) or None
     steps = await list_plan_steps(db, plan_id)
@@ -1194,6 +1535,13 @@ async def retry_failed_steps(
             reset_step_ids=[],
             note=note,
         )
+        from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+        await stage_plan_cycle_wake(
+            db,
+            p.id,
+            reason="plan_dispatch_retry",
+        )
         await db.commit()
         await db.refresh(p)
         dispatched = await _dispatch_plan(
@@ -1207,6 +1555,14 @@ async def retry_failed_steps(
             reset_steps=0,
             dispatched=dispatched,
         )
+    retryable_steps = [
+        step
+        for step in steps
+        if step.step_status in RETRYABLE_EXECUTION_STEP_STATUSES
+    ]
+    effect_block = await retry_effect_block_detail(db, retryable_steps)
+    if effect_block:
+        raise HTTPException(409, effect_block)
     if await _maybe_replan_stale_plan(
         db,
         p,
@@ -1224,11 +1580,31 @@ async def retry_failed_steps(
         )
     reset_steps = 0
     reset_step_ids: list[str] = []
-    for step in steps:
-        if step.step_status in RETRYABLE_EXECUTION_STEP_STATUSES:
+    retried_parent_keys = {
+        step.step_key
+        for step in retryable_steps
+        if not _is_coordinator_child_step(step)
+    }
+    for step in retryable_steps:
+        # A coordinator child is admitted only with its parent. Preserve its
+        # durable result/checkpoint/evidence; the stable parent handler owns
+        # the actual claim and nested retry.
+        if _is_coordinator_child_step(step):
+            parent_key = str(
+                (step.params or {}).get(COORDINATOR_PARENT_STEP_PARAM_KEY) or ""
+            )
+            if parent_key not in retried_parent_keys:
+                continue
+            _reset_step_for_retry(
+                step,
+                user=user,
+                note=note,
+                preserve_result=True,
+            )
+        else:
             _reset_step_for_retry(step, user=user, note=note)
-            reset_steps += 1
-            reset_step_ids.append(step.id)
+        reset_steps += 1
+        reset_step_ids.append(step.id)
 
     if reset_steps == 0:
         raise HTTPException(409, "plan has no retryable failed, cancelled, skipped, or paused steps")
@@ -1241,6 +1617,13 @@ async def retry_failed_steps(
         mode="plan_failed_steps",
         reset_step_ids=reset_step_ids,
         note=note,
+    )
+    from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+    await stage_plan_cycle_wake(
+        db,
+        p.id,
+        reason="plan_failed_steps_retried",
     )
     await db.commit()
     await db.refresh(p)
@@ -1276,6 +1659,8 @@ async def retry_step(
     if not p:
         raise HTTPException(404, "plan not found")
     _reject_replanned_plan_retry(p)
+    _reject_task_coordinator_step_retry(p)
+    await _require_authoritative_task_plan_retry(db, p)
     if await has_pending_task_recovery(db, p):
         raise HTTPException(409, TASK_RECOVERY_RETRY_DETAIL)
     retry_block_detail = plan_retry_block_detail(
@@ -1288,6 +1673,11 @@ async def retry_step(
     step = next((candidate for candidate in steps if candidate.id == step_id), None)
     if step is None:
         raise HTTPException(404, "step not found")
+    if _is_coordinator_child_step(step):
+        raise HTTPException(
+            409,
+            "Coordinator child Steps can only be resumed by their parent coordinator",
+        )
     if step.step_status not in RETRYABLE_EXECUTION_STEP_STATUSES:
         raise HTTPException(409, f"step status is {step.step_status} and cannot be retried")
 
@@ -1295,6 +1685,30 @@ async def retry_step(
     has_waiting_human = has_waiting_human_decision(steps)
     if has_waiting_human:
         raise HTTPException(409, WAITING_HUMAN_RETRY_DETAIL)
+    logical_steps = [
+        candidate for candidate in steps if not _is_coordinator_child_step(candidate)
+    ]
+    downstream_candidates: list[ExecutionStep] = []
+    reset_never_ran_downstream_steps(
+        logical_steps,
+        retried_step_keys={step.step_key},
+        reset_step=downstream_candidates.append,
+    )
+    owned_children = [
+        candidate
+        for candidate in steps
+        if _is_coordinator_child_step(candidate)
+        and str(
+            (candidate.params or {}).get(COORDINATOR_PARENT_STEP_PARAM_KEY) or ""
+        ) == step.step_key
+        and candidate.step_status in RETRYABLE_EXECUTION_STEP_STATUSES
+    ]
+    effect_block = await retry_effect_block_detail(
+        db,
+        [step, *owned_children, *downstream_candidates],
+    )
+    if effect_block:
+        raise HTTPException(409, effect_block)
     if await _maybe_replan_stale_plan(
         db,
         p,
@@ -1323,13 +1737,24 @@ async def retry_step(
             dispatched=dispatched,
         )
     _reset_step_for_retry(step, user=user, note=note)
+    for child in owned_children:
+        _reset_step_for_retry(
+            child,
+            user=user,
+            note=note,
+            preserve_result=True,
+        )
     downstream_steps = _reset_skipped_downstream_steps_for_retry(
-        steps,
+        logical_steps,
         retried_step_keys={step.step_key},
         user=user,
         note=note,
     )
-    reset_step_ids = [step.id, *(downstream.id for downstream in downstream_steps)]
+    reset_step_ids = [
+        step.id,
+        *(child.id for child in owned_children),
+        *(downstream.id for downstream in downstream_steps),
+    ]
     _revive_plan_for_retry(p)
     await _record_retry_on_task(
         db,
@@ -1338,6 +1763,13 @@ async def retry_step(
         mode="plan_step",
         reset_step_ids=reset_step_ids,
         note=note,
+    )
+    from packages.core.plans.wakeup import stage_plan_cycle_wake
+
+    await stage_plan_cycle_wake(
+        db,
+        p.id,
+        reason="plan_step_retried",
     )
     await db.commit()
     await db.refresh(p)

@@ -8,7 +8,8 @@ so routers stop hand-rolling their own entity checks.
 The decision order is fixed and identical for every resource type::
 
     entity mismatch          -> deny
-    entity owner/admin       -> allow  (firm-wide override)
+    entity owner/admin       -> allow for entity resources; workspace-scoped
+                                resources also require global Workspace read
     resource owner           -> allow
     explicit ResourceGrant   -> allow if it carries the capability
     visibility band          -> private / workspace / entity / public
@@ -43,6 +44,7 @@ from packages.core.permissions import resolve_effective_user_role_name
 from packages.core.models.workspace import WorkspaceStaff
 from packages.core.services.workspace_access import (
     is_entity_admin_role,
+    user_can_read_all_workspaces,
     user_can_read_workspace_id,
     user_readable_workspace_ids,
     user_can_write_workspace_id,
@@ -284,7 +286,13 @@ async def _user_can_access_resource_with_resolved_role(
         return False
 
     if is_entity_admin_role(resolved_role):
-        return True
+        if not descriptor.workspace_id or await user_can_read_all_workspaces(
+            db,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=resolved_role,
+        ):
+            return True
     if descriptor.owner_user_id and descriptor.owner_user_id == user_id:
         return True
 
@@ -330,7 +338,17 @@ async def _user_can_access_resource_with_resolved_role(
         if reading:
             if visibility == Visibility.PUBLIC:
                 return True
-            return str(resolved_role or "") in ENTITY_READ_ROLES
+            if str(resolved_role or "") not in ENTITY_READ_ROLES:
+                return False
+            if descriptor.workspace_id:
+                return await user_can_read_workspace_id(
+                    db,
+                    workspace_id=descriptor.workspace_id,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    role=resolved_role,
+                )
+            return True
         # Writing an entity-wide resource is deliberately narrow: scoped to a
         # workspace it follows that workspace's write rule, otherwise only the
         # owner or an entity admin qualifies — both already returned above.
@@ -374,13 +392,21 @@ async def readable_resource_ids(
     resolved_role = await resolve_user_role(
         db, user_id=user_id, entity_id=entity_id, role=role
     )
-    if is_entity_admin_role(resolved_role):
+    if is_entity_admin_role(resolved_role) and await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+    ):
         return {descriptor.resource_id for descriptor in candidates}
 
     visible: set[str] = {
         descriptor.resource_id
         for descriptor in candidates
-        if descriptor.owner_user_id == user_id
+        if (
+            descriptor.owner_user_id == user_id
+            or (is_entity_admin_role(resolved_role) and not descriptor.workspace_id)
+        )
     }
     remaining = [
         descriptor
@@ -438,7 +464,7 @@ async def readable_resource_ids(
         for descriptor in remaining
         if (
             (descriptor.visibility or Visibility.ENTITY)
-            == Visibility.WORKSPACE
+            in {Visibility.WORKSPACE, Visibility.ENTITY}
             and descriptor.workspace_id
             and (descriptor.resource_type, descriptor.resource_id)
             not in granted_pairs
@@ -462,6 +488,10 @@ async def readable_resource_ids(
         elif (
             visibility == Visibility.ENTITY
             and str(resolved_role or "") in ENTITY_READ_ROLES
+            and (
+                not descriptor.workspace_id
+                or str(descriptor.workspace_id) in readable_workspaces
+            )
         ):
             visible.add(descriptor.resource_id)
         elif (

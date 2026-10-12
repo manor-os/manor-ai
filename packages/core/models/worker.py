@@ -116,6 +116,7 @@ class WorkLease(Base, TimestampMixin):
         Index("ix_leases_worker_status", "worker_id", "status"),
         Index("ix_leases_expiry_scan", "status", "lease_until"),
         Index("ix_leases_step_status", "step_id", "status"),
+        Index("ix_leases_plan_status", "plan_id", "status"),
         # ``uq_one_active_lease_per_step`` is a partial unique index
         # created in the migration — SQLAlchemy can't declare WHERE
         # clauses on UniqueConstraint cleanly, so we leave it
@@ -139,7 +140,8 @@ class WorkLease(Base, TimestampMixin):
     extended_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, default=0)
 
     status: Mapped[str] = mapped_column(String(20), nullable=False)
-    # 'active' | 'completed' | 'failed' | 'expired' | 'released' | 'needs_human'
+    # 'active' | 'completed' | 'failed' | 'expired' | 'released' |
+    # 'needs_human' | 'suspended'
 
     budget_limit_usd: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2))
     budget_spent_usd: Mapped[Decimal] = mapped_column(
@@ -154,10 +156,10 @@ class WorkLease(Base, TimestampMixin):
     # Who currently holds the RIGHT TO EXECUTE this lease. Deliberately not
     # ``worker_id``: that names the logical worker the lease was issued to, and
     # a broker re-delivery hands the *same* worker_id to a *second* process, so
-    # it cannot tell two deliveries apart. ``execution_claim_id`` is minted per
-    # ``execute_lease_inproc`` invocation and taken with a single conditional
-    # UPDATE, which is what makes "exactly one of them runs" a database fact
-    # rather than a check-then-act race.
+    # it cannot tell two deliveries apart. Internal workers claim this per
+    # ``execute_lease_inproc`` invocation with a conditional UPDATE. External
+    # workers that negotiate attempt-token fencing receive the same value in
+    # their LeaseDTO and must echo it on every lifecycle mutation.
     # See packages/core/workers/execution_claim.py.
     execution_claim_id: Mapped[Optional[str]] = mapped_column(String(26))
     execution_claimed_at: Mapped[Optional[datetime]] = mapped_column(

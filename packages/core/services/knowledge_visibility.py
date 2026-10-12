@@ -111,7 +111,7 @@ def is_user_visible_path(path: str) -> bool:
         return False
     if any(part in ANYWHERE_HIDDEN_DIR_NAMES for part in parts):
         return False
-    if any(part in SYSTEM_FILES or part in SYSTEM_DIRS for part in parts):
+    if parts[0] in SYSTEM_FILES or any(part in SYSTEM_DIRS for part in parts):
         return False
     if PPTX_INTERMEDIATE_SVG_RE.match(parts[-1]):
         return False

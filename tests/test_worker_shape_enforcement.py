@@ -3,10 +3,16 @@ from packages.core.workers.internal import enforce_output_shape
 
 
 def test_enforce_reshapes_drifted_result_to_success():
-    raw = {"files": [{"name": "RULES.md", "path": "Workspaces/Demo/RULES.md"}]}
+    # The historical governance payload used `path` for several workspace files.
+    raw = {"files": [
+        {"name": name, "path": f"Workspaces/15秒短剧创作工作室/documents/{name}"}
+        for name in ("RULES.md", "LEARNINGS.md", "MEMORY.md")
+    ]}
     result = enforce_output_shape("ArtifactResult", raw)
     assert isinstance(result, Success)
-    assert result.data["files"][0]["fs_path"] == "Workspaces/Demo/RULES.md"
+    assert [item["fs_path"] for item in result.data["files"]] == [
+        item["path"] for item in raw["files"]
+    ]
 
 
 def test_enforce_genuine_empty_becomes_failure():

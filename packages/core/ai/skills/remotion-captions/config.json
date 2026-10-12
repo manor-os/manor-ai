@@ -1,0 +1,23 @@
+{
+  "id": "remotion-captions",
+  "name": "remotion-captions",
+  "display_name": "Remotion Captions",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Transcribe, display, and animate captions.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "captions",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["subtitles", "srt", "word highlight", "karaoke captions", "speech to text", "whisper", "tiktok style captions"],
+    "examples": ["animated word by word captions remotion", "transcribe audio to caption data", "subtitle layout for video composition", "karaoke highlight captions video"]
+  }
+}

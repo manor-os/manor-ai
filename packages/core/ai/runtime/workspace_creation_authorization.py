@@ -26,6 +26,9 @@ _MAX_CONTEXT_CHARS = 12_000
 class WorkspaceCreationAuthorizationStatus(str, Enum):
     NOT_AUTHORIZED = "not_authorized"
     AUTHORIZED = "authorized"
+    # Turn metadata only: the classifier is running beside the turn. Never a
+    # classifier verdict (``from_payload`` rejects it).
+    DEFERRED = "deferred"
 
 
 @dataclass(frozen=True)
@@ -59,6 +62,8 @@ class WorkspaceCreationAuthorizationDecision:
                 "Workspace creation authorization confidence must be between 0 and 1"
             )
         status = WorkspaceCreationAuthorizationStatus(str(payload["status"]).strip())
+        if status is WorkspaceCreationAuthorizationStatus.DEFERRED:
+            raise ValueError("Workspace creation authorization must be a verdict")
         if (
             status is WorkspaceCreationAuthorizationStatus.AUTHORIZED
             and confidence < WORKSPACE_CREATION_AUTHORIZATION_CONFIDENCE_THRESHOLD
@@ -140,6 +145,8 @@ async def classify_workspace_creation_authorization(
             ),
             timeout=WORKSPACE_CREATION_AUTHORIZATION_TIMEOUT_SECONDS,
         )
+        if (result.usage or {}).get("error"):
+            return WorkspaceCreationAuthorizationDecision.not_authorized()
         payload = json.loads(str(result.content or ""))
         return WorkspaceCreationAuthorizationDecision.from_payload(payload)
     except Exception:

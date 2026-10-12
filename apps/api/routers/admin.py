@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -146,7 +146,11 @@ async def put_settings(
     db: AsyncSession = Depends(get_db),
 ):
     """Partial merge into entity settings (flat dict)."""
-    settings = await update_entity_settings(db, user.entity_id, body)
+    from packages.core.governance.approval_policy_service import ProtectedApprovalSettingsError
+    try:
+        settings = await update_entity_settings(db, user.entity_id, body)
+    except ProtectedApprovalSettingsError as exc:
+        raise HTTPException(422, str(exc)) from exc
     return {**settings, "settings": settings}
 
 
@@ -169,5 +173,9 @@ async def put_preferences(
     db: AsyncSession = Depends(get_db),
 ):
     """Partial merge into user preferences (flat dict)."""
-    preferences = await update_user_preferences(db, user.id, body)
+    from packages.core.governance.approval_policy_service import ProtectedApprovalSettingsError
+    try:
+        preferences = await update_user_preferences(db, user.id, body)
+    except ProtectedApprovalSettingsError as exc:
+        raise HTTPException(422, str(exc)) from exc
     return {**preferences, "preferences": preferences}

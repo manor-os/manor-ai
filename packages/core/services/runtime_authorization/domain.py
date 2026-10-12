@@ -27,6 +27,7 @@ class AuthorizationRule(str, Enum):
     ENTITY_MEMBERSHIP = "permission.entity.membership"
     RUNTIME_IDENTITY_MISMATCH = "permission.runtime.identity_mismatch"
     WORKSPACE_SCOPE = "permission.workspace.scope"
+    WORKSPACE_INTEGRATION_DISABLED = "permission.workspace.integration_disabled"
     WORKSPACE_ACTOR_REQUIRED = "permission.workspace.actor_required"
     WORKSPACE_EXTERNAL_WRITE = "permission.workspace.external_write"
     WORKSPACE_READ = "permission.workspace.read"
@@ -36,6 +37,7 @@ class AuthorizationRule(str, Enum):
     AGENT_TOOL_BINDING = "permission.agent_tool_binding"
     EXTERNAL_TOOL_BINDING = "permission.external_tool_binding"
     EXTERNAL_SUPPORT_REPLY = "permission.external_support_reply"
+    EXTERNAL_RESIDENT_DRAFT = "permission.external_resident_draft"
     SYSTEM_WORKER = "permission.system_worker"
     DISPATCHER_WORKER = "permission.dispatcher_worker"
     STRATEGIST_PROPOSAL = "permission.strategist_proposal"
@@ -193,6 +195,7 @@ class RuntimeAuthorizationRequest:
     conversation_id: str | None = None
     task_id: str | None = None
     runtime_surface: str | None = None
+    agent_subscription_id: str | None = None
 
     @classmethod
     def create(
@@ -212,6 +215,7 @@ class RuntimeAuthorizationRequest:
         conversation_id: str | None = None,
         task_id: str | None = None,
         runtime_surface: Any = None,
+        agent_subscription_id: str | None = None,
     ) -> "RuntimeAuthorizationRequest":
         raw_principal_kind = getattr(principal_kind, "value", principal_kind)
         return cls(
@@ -230,6 +234,7 @@ class RuntimeAuthorizationRequest:
             ),
             conversation_id=str(conversation_id or "").strip() or None,
             task_id=str(task_id or "").strip() or None,
+            agent_subscription_id=str(agent_subscription_id or "").strip() or None,
             runtime_surface=(
                 str(getattr(runtime_surface, "value", runtime_surface) or "").strip() or None
             ),

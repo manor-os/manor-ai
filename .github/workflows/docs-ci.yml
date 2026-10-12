@@ -1,8 +1,7 @@
 name: Docs CI
 
-# Build the Docusaurus site on PRs that touch it, so broken links and bad
-# markdown fail at review time instead of at deploy time
-# (docusaurus.config.js sets onBrokenLinks: "throw").
+# The blocking docs build lives in ci.yml, where the required PR gate can
+# consume its result. Keep this workflow for the advisory translation signal.
 on:
   pull_request:
     branches: [dev, main]
@@ -18,24 +17,6 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build docs site
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: docs-site/package-lock.json
-
-      - name: Install and build docs
-        working-directory: docs-site
-        run: |
-          npm ci
-          npm run build
-
   # Advisory: flag English doc changes that lack a matching zh-Hans update.
   # Untranslated pages fall back to English at runtime, so this warns rather
   # than blocks — but every warning is a page drifting out of sync.

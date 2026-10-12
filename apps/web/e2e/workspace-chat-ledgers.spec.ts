@@ -63,6 +63,12 @@ test("Workspace Chat renders live Ledger tool results before history hydration",
 
     await page.setViewportSize({ width: 1180, height: 820 });
     await page.goto(`/chat?workspace=${workspaceId}`);
+    const guide = page.getByRole("dialog", { name: /使用指南|Getting started|User Guide/ });
+    await guide.waitFor({ state: "visible", timeout: 10_000 }).catch(() => undefined);
+    if (await guide.isVisible()) await guide.getByRole("button", { name: /开始|Start/ }).click();
+    const skipTour = page.getByRole("button", { name: /^(跳过|Skip)$/ });
+    await skipTour.waitFor({ state: "visible", timeout: 5_000 }).catch(() => undefined);
+    if (await skipTour.isVisible()) await skipTour.click();
 
     holdHistoryHydration = true;
     const prompt = [

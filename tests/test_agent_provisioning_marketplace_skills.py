@@ -149,6 +149,137 @@ async def test_runtime_requester_skill_discovery_and_invocation_enforce_resource
     assert denied_manual_private["code"] == "skill_not_allowed"
 
 
+async def test_workspace_manor_ai_uses_owner_chat_skill_scope(
+    db_session: AsyncSession,
+):
+    from packages.core.constants.agents import MANOR_AGENT_ID
+
+    entity_id = generate_ulid()
+    requester = User(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        email=f"workspace-manor-requester-{generate_ulid()}@example.com",
+        password_hash="test",
+        role="member",
+        status="active",
+    )
+    other_owner = User(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        email=f"workspace-manor-other-{generate_ulid()}@example.com",
+        password_hash="test",
+        role="member",
+        status="active",
+    )
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Workspace Manor Skill Scope",
+        status="active",
+    )
+    owner_skill = Skill(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        owner_user_id=requester.id,
+        visibility="private",
+        name="Requester Private Skill",
+        slug=f"requester-private-{generate_ulid()}",
+        system_prompt="Requester-only instructions.",
+        config={"execution_mode": "instructions_only"},
+        tools=[],
+        is_public=False,
+        status="active",
+    )
+    other_skill = Skill(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        owner_user_id=other_owner.id,
+        visibility="private",
+        name="Other Private Skill",
+        slug=f"other-private-{generate_ulid()}",
+        system_prompt="Other user's instructions.",
+        config={"execution_mode": "instructions_only"},
+        tools=[],
+        is_public=False,
+        status="active",
+    )
+    db_session.add_all([
+        requester,
+        other_owner,
+        workspace,
+        owner_skill,
+        other_skill,
+    ])
+    await db_session.commit()
+
+    envelope = RuntimeResolver().resolve_trace_envelope(
+        AIRuntimeRequest(
+            surface=ChatSurface.WORKSPACE_CHAT,
+            entity_id=entity_id,
+            user_id=requester.id,
+            agent_id=MANOR_AGENT_ID,
+            workspace_id=workspace.id,
+        ),
+        allowed_tool_names={"invoke_skill"},
+    )
+    custom_agent_id = generate_ulid()
+    custom_envelope = RuntimeResolver().resolve_trace_envelope(
+        AIRuntimeRequest(
+            surface=ChatSurface.WORKSPACE_CHAT,
+            entity_id=entity_id,
+            user_id=requester.id,
+            agent_id=custom_agent_id,
+            workspace_id=workspace.id,
+        ),
+        allowed_tool_names={"invoke_skill"},
+    )
+    descriptors = await resolve_skill_descriptors_for_envelope(
+        db_session,
+        envelope,
+        limit=100,
+    )
+    descriptor_ids = {descriptor.id for descriptor in descriptors}
+
+    assert owner_skill.id in descriptor_ids
+    assert other_skill.id not in descriptor_ids
+
+    invoked = await invoke_skill(
+        db_session,
+        owner_skill.id,
+        entity_id,
+        "Run the requester Skill.",
+        agent_id=MANOR_AGENT_ID,
+        user_id=requester.id,
+        workspace_id=workspace.id,
+        runtime_envelope=envelope,
+    )
+    denied_other = await invoke_skill(
+        db_session,
+        other_skill.id,
+        entity_id,
+        "Run the other user's Skill.",
+        agent_id=MANOR_AGENT_ID,
+        user_id=requester.id,
+        workspace_id=workspace.id,
+        runtime_envelope=envelope,
+    )
+    denied_custom_agent = await invoke_skill(
+        db_session,
+        owner_skill.id,
+        entity_id,
+        "Run the requester Skill.",
+        agent_id=custom_agent_id,
+        user_id=requester.id,
+        workspace_id=workspace.id,
+        runtime_envelope=custom_envelope,
+    )
+
+    assert invoked["instructions_only"] is True
+    assert invoked["content"] == owner_skill.system_prompt
+    assert denied_other["code"] == "skill_not_allowed"
+    assert denied_custom_agent["code"] == "skill_not_allowed"
+
+
 async def test_runtime_requester_cannot_bind_another_users_private_skill_by_id(
     db_session: AsyncSession,
 ):
@@ -691,3 +822,36 @@ async def test_blueprint_components_are_idempotent_per_workspace_and_isolated_ac
     }
 
 
+
+
+@pytest.mark.asyncio
+async def test_missing_skill_spec_source_refs_land_on_skill_and_binding(db_session: AsyncSession, monkeypatch):
+    from packages.core.services import agent_provisioning_service as prov
+
+    async def no_reuse(db, *, entity_id, spec, category, warnings, requester_user_id=None):
+        return None
+
+    monkeypatch.setattr(prov, "_select_existing_skill_for_missing_spec", no_reuse)
+
+    entity_id = generate_ulid()
+    refs = [{"source_id": "S1", "kind": "document", "name": "chapter7.docx", "document_id": generate_ulid()}]
+    result = await provision_custom_agent(
+        db_session,
+        entity_id=entity_id,
+        spec=CustomAgentSpec(
+            agent_name="Execution Coach",
+            system_prompt="You are Execution Coach. Stay in scope.",
+            tool_bindings=[],
+            missing_skill_specs=[{
+                "name": "Work breakdown method",
+                "system_prompt": "Break real work into checkable AI tasks. " * 3,
+                "tools": ["rag"],
+                "source_ids": ["S1"],
+                "source_refs": refs,
+            }],
+        ),
+    )
+    skill = (await db_session.execute(select(Skill).where(Skill.name == "Work breakdown method"))).scalar_one()
+    assert skill.config["source_refs"] == refs
+    binding = (await db_session.execute(select(AgentSkillBinding).where(AgentSkillBinding.agent_id == result.agent_id))).scalar_one()
+    assert binding.config["requested_skill"]["source_refs"] == refs

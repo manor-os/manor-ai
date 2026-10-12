@@ -16,8 +16,10 @@
  *      On Cancel → redirect back to client with ?error=access_denied.
  */
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
+import { IconManorLogo } from "../components/icons";
+import CurrentEmailVerification from "../components/auth/CurrentEmailVerification";
 
 interface ClientInfo {
   client_id: string;
@@ -25,13 +27,11 @@ interface ClientInfo {
   description?: string | null;
   redirect_uris: string[];
   allowed_scopes: string[];
+  require_pkce?: boolean;
+  require_verified_email?: boolean;
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string) || "";
-
-function buildBackUrl(): string {
-  return window.location.pathname + window.location.search;
-}
 
 function redirectWithError(redirectUri: string, error: string, state: string | null) {
   if (!redirectUri) return;
@@ -83,19 +83,36 @@ function ArrowSwap() {
 }
 
 function ManorMark() {
-  // A simple "M" badge — matches the brand colour without needing an asset
   return (
-    <div className="w-10 h-10 rounded-lg bg-manor-600 text-white flex items-center justify-center font-semibold text-lg select-none shrink-0">
-      M
+    <div className="w-10 h-10 rounded-lg bg-black text-white flex items-center justify-center select-none shrink-0" aria-hidden="true">
+      <IconManorLogo size={30} />
     </div>
   );
 }
+
+const Frame = ({ children }: { children: React.ReactNode }) => (
+  <div className="min-h-screen flex items-center justify-center bg-stone-50 p-4 sm:p-6">
+    <div className="w-full max-w-md">
+      <div className="text-center mb-6 text-xs text-stone-400 select-none">
+        MANOR · IDENTITY
+      </div>
+      <div className="bg-white rounded-2xl shadow-[0_2px_24px_-8px_rgba(28,25,23,0.12)] ring-1 ring-stone-200 p-7 sm:p-9 text-stone-900">
+        {children}
+      </div>
+    </div>
+  </div>
+);
+
 
 // ── Page ──
 
 export default function OAuthAuthorize() {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
+  const location = useLocation();
+  // Capture the consent route for this render. Reading window.location inside
+  // a replayed effect can wrap the login URL into its own `next` parameter.
+  const backUrl = location.pathname + location.search;
   const { user } = useAuthStore();
 
   const clientId = searchParams.get("client_id") || "";
@@ -103,30 +120,41 @@ export default function OAuthAuthorize() {
   const state = searchParams.get("state");
   const scope = searchParams.get("scope") || "";
   const responseType = searchParams.get("response_type") || "code";
+  const codeChallenge = searchParams.get("code_challenge");
+  const codeChallengeMethod = searchParams.get("code_challenge_method");
 
   const [info, setInfo] = useState<ClientInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>("");
   const [submitting, setSubmitting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
+  const [emailVerified, setEmailVerified] = useState(false);
 
   // Validate required params up front
   const paramsError = useMemo(() => {
+    for (const key of searchParams.keys()) {
+      if (searchParams.getAll(key).length > 1) return "Duplicate sign-in parameter";
+    }
+    if (codeChallenge !== null || codeChallengeMethod !== null) {
+      if (codeChallengeMethod !== "S256" || !codeChallenge || !/^[A-Za-z0-9_-]{43}$/.test(codeChallenge)) {
+        return "A valid S256 sign-in challenge is required";
+      }
+    }
     if (!clientId) return "Missing client_id";
     if (!redirectUri) return "Missing redirect_uri";
     if (responseType !== "code") return "Only response_type=code is supported";
     return "";
-  }, [clientId, redirectUri, responseType]);
+  }, [clientId, redirectUri, responseType, codeChallenge, codeChallengeMethod, searchParams]);
 
   // If unauthenticated, bounce to login and come back
   useEffect(() => {
     if (paramsError) return;
     const token = localStorage.getItem("manor_token");
     if (!token) {
-      const next = encodeURIComponent(buildBackUrl());
+      const next = encodeURIComponent(backUrl);
       navigate(`/login?next=${next}`, { replace: true });
     }
-  }, [paramsError, navigate]);
+  }, [paramsError, navigate, backUrl]);
 
   // Load client info (with auto-retry on transient 502s during deploy)
   useEffect(() => {
@@ -140,6 +168,8 @@ export default function OAuthAuthorize() {
     let cancelled = false;
     (async () => {
       setLoading(true);
+      setInfo(null);
+      setEmailVerified(false);
       setError("");
       try {
         const r = await fetch(
@@ -178,6 +208,11 @@ export default function OAuthAuthorize() {
           setLoading(false);
           return;
         }
+        if (data.require_pkce && !codeChallenge) {
+          setError("This app requires an S256 sign-in challenge. Start sign-in again from the app.");
+          setLoading(false);
+          return;
+        }
         setInfo(data);
         setLoading(false);
       } catch (e: any) {
@@ -194,14 +229,16 @@ export default function OAuthAuthorize() {
     return () => {
       cancelled = true;
     };
-  }, [clientId, redirectUri, paramsError, retryCount]);
+  }, [clientId, redirectUri, paramsError, retryCount, codeChallenge]);
 
   async function handleApprove() {
+    if (paramsError || !info || (info.require_pkce && !codeChallenge)
+      || (info.require_verified_email && !emailVerified)) return;
     setSubmitting(true);
     setError("");
     const token = localStorage.getItem("manor_token");
     if (!token) {
-      const next = encodeURIComponent(buildBackUrl());
+      const next = encodeURIComponent(backUrl);
       navigate(`/login?next=${next}`, { replace: true });
       return;
     }
@@ -217,6 +254,7 @@ export default function OAuthAuthorize() {
           redirect_uri: redirectUri,
           scope,
           state,
+          ...(codeChallenge !== null ? { code_challenge: codeChallenge, code_challenge_method: codeChallengeMethod } : {}),
         }),
       });
       if (!r.ok) {
@@ -238,19 +276,6 @@ export default function OAuthAuthorize() {
   }
 
   // ── Render frames ──
-
-  const Frame = ({ children }: { children: React.ReactNode }) => (
-    <div className="min-h-screen flex items-center justify-center bg-stone-50 p-4 sm:p-6">
-      <div className="w-full max-w-md">
-        <div className="text-center mb-6 text-xs text-stone-400 select-none">
-          MANOR · IDENTITY
-        </div>
-        <div className="bg-white rounded-2xl shadow-[0_2px_24px_-8px_rgba(28,25,23,0.12)] ring-1 ring-stone-200 p-7 sm:p-9 text-stone-900">
-          {children}
-        </div>
-      </div>
-    </div>
-  );
 
   // — Error: missing/invalid params (no redirect possible)
   if (paramsError) {
@@ -350,6 +375,10 @@ export default function OAuthAuthorize() {
       )}
 
       {/* Permissions list */}
+      {info?.require_verified_email && (
+        <CurrentEmailVerification key={`${clientId}:${user?.id}:${user?.email}`} onVerified={setEmailVerified} />
+      )}
+
       <p className="text-xs font-medium uppercase tracking-wide text-stone-500 mb-2">
         This will allow {info?.name} to
       </p>
@@ -388,7 +417,7 @@ export default function OAuthAuthorize() {
         </button>
         <button
           type="button"
-          disabled={submitting}
+          disabled={submitting || !!(info?.require_verified_email && !emailVerified)}
           className="flex-1 px-4 py-2.5 rounded-lg bg-manor-600 text-white hover:bg-manor-500 text-sm font-semibold disabled:opacity-50 transition"
           onClick={handleApprove}
         >

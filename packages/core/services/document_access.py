@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 
@@ -20,7 +20,7 @@ from packages.core.models.permission import (
     Visibility,
 )
 from packages.core.models.staff import Staff
-from packages.core.models.user import User
+from packages.core.models.user import Entity, User
 from packages.core.permissions import Permission, user_staff_role_assignment
 from packages.core.services.actor_authorization import (
     AuthenticatedUserCredential,
@@ -29,7 +29,6 @@ from packages.core.services.actor_authorization import (
 )
 from packages.core.services.workspace_access import (
     ENTITY_WORKSPACE_READ_ROLES,
-    is_entity_admin_role,
     user_can_read_workspace_id,
 )
 
@@ -73,6 +72,22 @@ _DOCUMENT_OWNER_CAPABILITIES = {
     Capability.DELETE,
     Capability.GRANT_ACCESS,
 }
+_FOLDER_OWNER_CAPABILITIES = _DOCUMENT_OWNER_CAPABILITIES | {Capability.UPLOAD_TO}
+_WORKSPACE_DOCUMENT_CAPABILITIES = {
+    "owner": _DOCUMENT_OWNER_CAPABILITIES,
+    "editor": {
+        Capability.VIEW, Capability.COMMENT, Capability.EDIT,
+        Capability.DOWNLOAD,
+    },
+    "contributor": {Capability.VIEW, Capability.DOWNLOAD},
+    "viewer": {Capability.VIEW, Capability.DOWNLOAD},
+}
+_WORKSPACE_FOLDER_CAPABILITIES = {
+    "owner": _FOLDER_OWNER_CAPABILITIES,
+    "editor": _WORKSPACE_DOCUMENT_CAPABILITIES["editor"] | {Capability.UPLOAD_TO},
+    "contributor": _WORKSPACE_DOCUMENT_CAPABILITIES["contributor"] | {Capability.UPLOAD_TO},
+    "viewer": _WORKSPACE_DOCUMENT_CAPABILITIES["viewer"],
+}
 _QUARANTINED_STATUSES = {"quarantined", "rejected"}
 _CLASSIFICATION_RANK = {"public": 0, "internal": 1, "confidential": 2, "restricted": 3}
 _VISIBILITY_RANK = {"private": 0, "workspace": 1, "entity": 2, "public": 3}
@@ -80,6 +95,17 @@ _INTERNAL_FILTER_LIMIT = 2_000
 _INTERNAL_QUERY_LIMIT = 500
 _READABLE_LOCAL_SKIP_STATUSES = {VectorStatus.PROCESSING, VectorStatus.GENERATING}
 _PLACEHOLDER_UNAVAILABLE_STATUSES = {VectorStatus.FAILED, VectorStatus.SKIPPED}
+
+
+def _actor_global_flag(actor: ResolvedUserActor, attribute: str) -> bool:
+    """Read new actor flags while keeping lightweight legacy actors safe."""
+    return bool(
+        getattr(
+            actor,
+            attribute,
+            str(getattr(actor, "role", "") or "").strip().lower() == "owner",
+        )
+    )
 
 
 def _id_batches(values: set[str] | list[str], size: int = _INTERNAL_QUERY_LIMIT):
@@ -560,7 +586,133 @@ async def document_workspace_ids(db: AsyncSession, document: Document) -> set[st
     return workspace_ids_by_document.get(str(document.id), set())
 
 
+async def _workspace_roles_for_user(
+    db: AsyncSession, *, entity_id: str, user_id: str | None,
+) -> dict[str, str]:
+    if not user_id:
+        return {}
+    from packages.core.models.workspace import Workspace, WorkspaceStaff
+
+    rows = (await db.execute(
+        select(Workspace.id, WorkspaceStaff.role, WorkspaceStaff.expires_at)
+        .join(WorkspaceStaff, WorkspaceStaff.workspace_id == Workspace.id)
+        .where(
+            Workspace.entity_id == entity_id,
+            Workspace.deleted_at.is_(None),
+            WorkspaceStaff.user_id == user_id,
+            WorkspaceStaff.status == "active",
+        )
+        .order_by(
+            Workspace.id,
+            WorkspaceStaff.updated_at.desc(),
+            WorkspaceStaff.created_at.desc(),
+        )
+    )).all()
+    roles: dict[str, str] = {}
+    for workspace_id, role, expires_at in rows:
+        if _expires_after_now(expires_at):
+            roles.setdefault(str(workspace_id), str(role or "").strip().lower())
+    return roles
+
+
+async def workspace_document_capabilities_for_user(
+    db: AsyncSession, *, document: Document, user_id: str | None,
+    workspace_id: str | None = None,
+    _actor: ResolvedUserActor | None = None,
+) -> set[str]:
+    if not user_id or await document_entity_is_unavailable(db, document):
+        return set()
+    workspace_ids = await document_workspace_ids(db, document)
+    if workspace_id:
+        workspace_ids.intersection_update({workspace_id})
+    if not workspace_ids:
+        return set()
+    actor = _actor or await _resolve_current_actor_for_entity(
+        db, user_id=user_id, entity_id=document.entity_id,
+    )
+    if actor is None or actor.user_id != str(user_id) or actor.entity_id != str(document.entity_id):
+        return set()
+    roles = await _workspace_roles_for_user(
+        db, entity_id=document.entity_id, user_id=user_id,
+    )
+    capabilities: set[str] = set()
+    for workspace_id in workspace_ids:
+        capabilities.update(_WORKSPACE_DOCUMENT_CAPABILITIES.get(roles.get(workspace_id), set()))
+    return capabilities
+
+
+async def user_owns_workspace_document(
+    db: AsyncSession, *, document: Document, user_id: str | None,
+    _actor: ResolvedUserActor | None = None,
+) -> bool:
+    """An active Workspace owner manages every Document linked to that Workspace."""
+    capabilities = await workspace_document_capabilities_for_user(
+        db, document=document, user_id=user_id, _actor=_actor,
+    )
+    return Capability.GRANT_ACCESS in capabilities
+
+
+async def workspace_folder_capabilities_for_user(
+    db: AsyncSession, *, folder: DocumentFolder, user_id: str | None,
+    _actor: ResolvedUserActor | None = None,
+) -> set[str]:
+    if not user_id or await folder_entity_is_unavailable(db, folder):
+        return set()
+    scope = await resolve_folder_policy_lock_scope(
+        db, entity_id=folder.entity_id, folder_id=folder.id,
+    )
+    if not scope.workspace_ids:
+        return set()
+    actor = _actor or await _resolve_current_actor_for_entity(
+        db, user_id=user_id, entity_id=folder.entity_id,
+    )
+    if actor is None or actor.user_id != str(user_id) or actor.entity_id != str(folder.entity_id):
+        return set()
+    roles = await _workspace_roles_for_user(
+        db, entity_id=folder.entity_id, user_id=user_id,
+    )
+    capabilities: set[str] = set()
+    for workspace_id in scope.workspace_ids:
+        capabilities.update(_WORKSPACE_FOLDER_CAPABILITIES.get(roles.get(workspace_id), set()))
+    return capabilities
+
+
+async def user_owns_workspace_folder(
+    db: AsyncSession, *, folder: DocumentFolder, user_id: str | None,
+    _actor: ResolvedUserActor | None = None,
+) -> bool:
+    """Workspace ownership covers its artifact folder and descendants only."""
+    capabilities = await workspace_folder_capabilities_for_user(
+        db, folder=folder, user_id=user_id, _actor=_actor,
+    )
+    return Capability.GRANT_ACCESS in capabilities
+
+
+async def document_group_workspace_ids(db: AsyncSession, document: Document) -> set[str]:
+    """Workspace audiences explicitly selected through Knowledge groups."""
+    return set((await db.execute(
+        select(DocumentGroup.workspace_id)
+        .join(DocumentGroupMember, DocumentGroupMember.group_id == DocumentGroup.id)
+        .where(
+            DocumentGroupMember.document_id == document.id,
+            DocumentGroup.entity_id == document.entity_id,
+            DocumentGroup.workspace_id.isnot(None),
+        )
+    )).scalars())
+
+
 def _document_metadata_workspace_ids(document: Document) -> set[str]:
+    # origin.workspace_id records where work happened, not who owns a user's
+    # file. Ownerless legacy Workspace records may use it as their only binding.
+    # Projected Workspace chat uploads are a separate case: their hidden path
+    # and group projection are Workspace-owned even though they have an owner.
+    if getattr(document, "visibility", None) != Visibility.WORKSPACE:
+        return set()
+    if getattr(document, "owner_id", None) and not (
+        getattr(document, "source", None) == "chat_upload"
+        and str(getattr(document, "fs_path", None) or "").startswith("uploads/chat/")
+    ):
+        return set()
     raw_meta = getattr(document, "metadata_", None)
     meta = raw_meta if isinstance(raw_meta, dict) else {}
     origin = meta.get("origin") if isinstance(meta.get("origin"), dict) else {}
@@ -806,75 +958,49 @@ async def lock_folder_policy_boundaries(
     )
 
 
-async def folder_is_owned_by_deleted_workspace(
+async def knowledge_entity_is_unavailable(db: AsyncSession, entity_id: str) -> bool:
+    """Knowledge survives its source Workspace, but never its Entity."""
+    return (await db.scalar(select(Entity.id).where(
+        Entity.id == entity_id,
+        Entity.deleted_at.is_(None),
+    ))) is None
+
+
+async def folder_entity_is_unavailable(
     db: AsyncSession,
     folder: DocumentFolder,
     *,
     for_update: bool = False,
 ) -> bool:
-    """Return whether ``folder`` is inside a soft-deleted Workspace tree.
-
-    ``Workspace.artifact_folder_id`` is the durable ownership boundary for the
-    whole folder subtree. ACLs and public share tokens remain persisted during
-    the restore grace period, so every access surface must re-check this owner
-    instead of treating those rows as independent entity resources.
-    """
+    """Check Entity lifecycle while retaining existing policy-lock ordering."""
     if for_update:
-        _folders, workspaces = await lock_folder_policy_boundaries(
+        await lock_folder_policy_boundaries(
             db,
             entity_id=folder.entity_id,
             folder_ids={folder.id},
         )
-        return any(workspace.deleted_at is not None for workspace in workspaces)
-
-    scope = await resolve_folder_policy_lock_scope(
-        db,
-        entity_id=folder.entity_id,
-        folder_id=folder.id,
-    )
-    if not scope.workspace_ids:
-        return False
-    from packages.core.models.workspace import Workspace
-
-    workspaces = list((await db.execute(
-        select(Workspace).where(
-            Workspace.entity_id == folder.entity_id,
-            Workspace.id.in_(scope.workspace_ids),
-        ).execution_options(populate_existing=True)
-    )).scalars())
-    return any(workspace.deleted_at is not None for workspace in workspaces)
+    return await knowledge_entity_is_unavailable(db, folder.entity_id)
 
 
-async def document_is_owned_by_deleted_workspace(
+async def document_entity_is_unavailable(
     db: AsyncSession,
     document: Document,
     *,
     for_update: bool = False,
     lock_for_read: bool = False,
 ) -> bool:
-    """Return whether a document's owning Workspace is soft-deleted."""
+    """Check the durable Document's Entity, not its historical Workspace."""
     if for_update and lock_for_read:
         raise ValueError("Choose either a write lock or a read lock")
-    scope = await resolve_document_policy_lock_scope(db, document)
-    if not scope.workspace_ids:
-        return False
     if for_update or lock_for_read:
-        workspaces = await lock_workspace_policy_rows(
+        scope = await resolve_document_policy_lock_scope(db, document)
+        await lock_workspace_policy_rows(
             db,
             entity_id=document.entity_id,
             workspace_ids=scope.workspace_ids,
             read=lock_for_read,
         )
-    else:
-        from packages.core.models.workspace import Workspace
-
-        workspaces = list((await db.execute(
-            select(Workspace).where(
-                Workspace.entity_id == document.entity_id,
-                Workspace.id.in_(scope.workspace_ids),
-            ).execution_options(populate_existing=True)
-        )).scalars())
-    return any(workspace.deleted_at is not None for workspace in workspaces)
+    return await knowledge_entity_is_unavailable(db, document.entity_id)
 
 
 async def _grant_subject_ids_for_user(
@@ -1224,8 +1350,13 @@ async def user_has_document_capability(
 ) -> bool:
     if not document or not user_id:
         return False
-    if await document_is_owned_by_deleted_workspace(db, document):
+    if await document_entity_is_unavailable(db, document):
         return False
+    workspace_capabilities = await workspace_document_capabilities_for_user(
+        db, document=document, user_id=user_id,
+    )
+    if capabilities.intersection(workspace_capabilities):
+        return True
     granted = await document_grant_capabilities_for_user(
         db,
         document=document,
@@ -1250,8 +1381,13 @@ async def user_has_folder_capability(
             DocumentFolder.entity_id == entity_id,
         ).limit(1)
     )).scalar_one_or_none()
-    if folder is None or await folder_is_owned_by_deleted_workspace(db, folder):
+    if folder is None or await folder_entity_is_unavailable(db, folder):
         return False
+    workspace_capabilities = await workspace_folder_capabilities_for_user(
+        db, folder=folder, user_id=user_id,
+    )
+    if capabilities.intersection(workspace_capabilities):
+        return True
     granted = await folder_grant_capabilities_for_user(
         db,
         entity_id=entity_id,
@@ -1283,7 +1419,7 @@ async def user_can_read_folder(
     if not folder or folder.entity_id != entity_id:
         return False
 
-    if await folder_is_owned_by_deleted_workspace(db, folder):
+    if await folder_entity_is_unavailable(db, folder):
         return False
 
     # Preserve legacy/background callers that do not carry a user context.
@@ -1308,9 +1444,13 @@ async def user_can_read_folder(
             _actor=actor,
         )
     )
-    if is_entity_admin_role(resolved_role):
+    if _actor_global_flag(actor, "can_read_all_documents"):
         return True
     if getattr(folder, "owner_id", None) == user_id:
+        return True
+    if Capability.VIEW in await workspace_folder_capabilities_for_user(
+        db, folder=folder, user_id=user_id, _actor=actor,
+    ):
         return True
 
     if include_grants:
@@ -1355,6 +1495,9 @@ async def user_can_read_folder(
                 user_id=user_id,
                 role=resolved_role,
                 can_read_entity_workspaces=can_read_entity_workspaces,
+                can_read_all_workspaces=_actor_global_flag(
+                    actor, "can_read_all_workspaces"
+                ),
             ):
                 return True
         return False
@@ -1381,7 +1524,7 @@ async def effective_document_capabilities_for_user(
     """
     if not user_id:
         return set()
-    if await document_is_owned_by_deleted_workspace(db, document):
+    if await document_entity_is_unavailable(db, document):
         return set()
     actor = _actor or await _resolve_current_actor_for_entity(
         db, user_id=user_id, entity_id=document.entity_id,
@@ -1389,13 +1532,16 @@ async def effective_document_capabilities_for_user(
     if actor is None:
         return set()
     resolved_role = actor.role
-    if is_entity_admin_role(resolved_role) or document.owner_id == user_id:
+    if _actor_global_flag(actor, "can_manage_all_documents") or document.owner_id == user_id:
         return set(_DOCUMENT_OWNER_CAPABILITIES)
     granted = await document_grant_capabilities_for_user(
         db,
         document=document,
         user_id=user_id,
     )
+    granted.update(await workspace_document_capabilities_for_user(
+        db, document=document, user_id=user_id, _actor=actor,
+    ))
     if await user_can_read_document(
         db,
         document,
@@ -1423,7 +1569,7 @@ async def user_can_edit_document(
     """
     if document is None or document.entity_id != user.entity_id:
         return False
-    if await document_is_owned_by_deleted_workspace(db, document):
+    if await document_entity_is_unavailable(db, document):
         return False
     actor = await _resolve_current_actor_for_entity(
         db,
@@ -1433,7 +1579,7 @@ async def user_can_edit_document(
     if actor is None:
         return False
     resolved_role = actor.role
-    if is_entity_admin_role(resolved_role) or document.owner_id == user.id:
+    if _actor_global_flag(actor, "can_manage_all_documents") or document.owner_id == user.id:
         return True
     # Legacy rows sometimes stored the immutable user id in ``created_by``
     # before ``owner_id`` was introduced.  Email/display-name aliases are
@@ -1459,12 +1605,12 @@ async def user_can_share_document_externally(
 
     External publication is deliberately stricter than editing. Creator
     aliases retain edit compatibility, but external sharing follows the
-    canonical owner/admin or explicit capability contract used by document
+    canonical resource-owner/global-manager or explicit capability contract used by document
     share links.
     """
     if document is None or document.entity_id != user.entity_id:
         return False
-    if await document_is_owned_by_deleted_workspace(db, document):
+    if await document_entity_is_unavailable(db, document):
         return False
     actor = await _resolve_current_actor_for_entity(
         db,
@@ -1473,8 +1619,7 @@ async def user_can_share_document_externally(
     )
     if actor is None:
         return False
-    resolved_role = actor.role
-    if is_entity_admin_role(resolved_role) or document.owner_id == user.id:
+    if _actor_global_flag(actor, "can_manage_all_documents") or document.owner_id == user.id:
         return True
     return await user_has_document_capability(
         db,
@@ -1510,7 +1655,7 @@ async def user_can_read_document(
     if getattr(document, "classification", None) == "restricted" and actor_type != "user":
         return False
 
-    if await document_is_owned_by_deleted_workspace(db, document):
+    if await document_entity_is_unavailable(db, document):
         return False
 
     # Preserve legacy/background callers that do not carry a user context.
@@ -1547,14 +1692,40 @@ async def user_can_read_document(
         "restricted",
     }:
         return False
-    if is_entity_admin_role(resolved_role):
+    if _actor_global_flag(actor, "can_read_all_documents"):
         return True
     if document.owner_id and document.owner_id == user_id:
+        return True
+    if Capability.VIEW in await workspace_document_capabilities_for_user(
+        db, document=document, user_id=user_id, workspace_id=workspace_id,
+        _actor=actor,
+    ):
         return True
     if include_grants and await _has_read_grant(
         db, document=document, user_id=user_id, allow_redacted=allow_redacted,
     ):
         return True
+    visibility = getattr(document, "visibility", None) or Visibility.ENTITY
+    if visibility == Visibility.WORKSPACE:
+        # Explicitly filing a document in a Workspace Knowledge group shares
+        # that document, not its private parent folder.
+        group_workspace_ids = await document_group_workspace_ids(db, document)
+        if workspace_id:
+            group_workspace_ids.intersection_update({workspace_id})
+        if (
+            (resolved_role != "client" or effective_client_visible)
+            and (resolved_role == "client" or can_read_entity_documents)
+        ):
+            for group_workspace_id in group_workspace_ids:
+                if await user_can_read_workspace_id(
+                    db,
+                    workspace_id=group_workspace_id,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    role=resolved_role,
+                    can_read_entity_workspaces=can_read_entity_workspaces,
+                ):
+                    return True
     if not await user_can_read_folder_path(
         db,
         entity_id=document.entity_id,
@@ -1567,7 +1738,6 @@ async def user_can_read_document(
     ):
         return False
 
-    visibility = getattr(document, "visibility", None) or Visibility.ENTITY
     if visibility == Visibility.PRIVATE:
         return False
 
@@ -1645,7 +1815,8 @@ async def _workspace_containers_allow_read(
     """
     linked_workspace_ids = await document_workspace_ids(db, document)
     if not linked_workspace_ids:
-        return True
+        # A purged physical container does not widen its former audience.
+        return _document_physical_artifact_folder_id(document) is None
     for linked_workspace_id in linked_workspace_ids:
         if await user_can_read_workspace_id(
             db,
@@ -1682,13 +1853,34 @@ class DocumentAccessContext:
         role: str | None,
         can_read_entity_documents: bool | None = None,
         can_read_entity_workspaces: bool | None = None,
+        can_read_all_documents: bool | None = None,
+        can_manage_all_documents: bool | None = None,
+        can_read_all_workspaces: bool | None = None,
         identity_active: bool = True,
     ) -> None:
         self.entity_id = entity_id
         self.user_id = user_id
         self.role = role
         self.identity_active = identity_active
-        self.is_admin = is_entity_admin_role(role)
+        self.is_entity_owner = str(role or "").strip().lower() == "owner"
+        self.can_read_all_documents = (
+            self.is_entity_owner
+            if can_read_all_documents is None
+            else can_read_all_documents
+        )
+        self.can_manage_all_documents = (
+            self.is_entity_owner
+            if can_manage_all_documents is None
+            else can_manage_all_documents
+        )
+        self.can_read_all_workspaces = (
+            self.is_entity_owner
+            if can_read_all_workspaces is None
+            else can_read_all_workspaces
+        )
+        # Compatibility attribute used by API serializers. It now means the
+        # actor has the explicit global Knowledge-management override.
+        self.is_admin = self.can_manage_all_documents
         self.can_read_entity_documents = (
             str(role or "") in _ENTITY_DOCUMENT_READ_ROLES
             if can_read_entity_documents is None
@@ -1704,10 +1896,10 @@ class DocumentAccessContext:
         self._folder_caps: dict[str, set[str]] = {}
         self._chain_cache: dict[str, list[str]] = {}
         self._ws_readable: dict[str, bool] = {}
+        self._workspace_roles: dict[str, str] = {}
         self._workspace_by_artifact_folder_id: dict[str, str] = {}
-        self._deleted_workspace_artifact_folder_ids: set[str] = set()
         self._doc_group_links: dict[str, set[str]] = {}
-        self._deleted_provenance_workspace_ids: set[str] = set()
+        self.entity_available = True
 
     @classmethod
     async def load(
@@ -1730,7 +1922,8 @@ class DocumentAccessContext:
             if user_id
             else None
         )
-        identity_active = user_id is None or actor is not None
+        entity_available = not await knowledge_entity_is_unavailable(db, entity_id)
+        identity_active = entity_available and (user_id is None or actor is not None)
         if identity_active:
             (
                 resolved_role,
@@ -1753,18 +1946,32 @@ class DocumentAccessContext:
             role=resolved_role,
             can_read_entity_documents=can_read_entity_documents,
             can_read_entity_workspaces=can_read_entity_workspaces,
+            can_read_all_documents=(
+                _actor_global_flag(actor, "can_read_all_documents")
+                if actor is not None else user_id is None
+            ),
+            can_manage_all_documents=(
+                _actor_global_flag(actor, "can_manage_all_documents")
+                if actor is not None else user_id is None
+            ),
+            can_read_all_workspaces=(
+                _actor_global_flag(actor, "can_read_all_workspaces")
+                if actor is not None else user_id is None
+            ),
             identity_active=identity_active,
         )
-        # Every caller loads folder ownership because soft-deleted Workspace
-        # trees are a lifecycle hard stop, including for user-less background
-        # reads and entity admins. Inactive identities still fail closed before
-        # any ACL evaluation and need no grant/folder state.
+        ctx.entity_available = entity_available
+        # Folder policies and active Workspace audiences still apply to
+        # retained Knowledge. Unavailable identities need no grant state.
         if not identity_active:
             return ctx
+        ctx._workspace_roles = await _workspace_roles_for_user(
+            db, entity_id=entity_id, user_id=user_id,
+        )
 
         subject_ids = (
             set()
-            if ctx.is_admin
+            if ctx.can_read_all_documents
             else await _grant_subject_ids_for_user(
                 db,
                 entity_id=entity_id,
@@ -1821,12 +2028,7 @@ class DocumentAccessContext:
             ctx._workspace_by_artifact_folder_id = {
                 str(artifact_folder_id): str(workspace_id)
                 for workspace_id, artifact_folder_id, deleted_at in workspace_rows
-                if artifact_folder_id and deleted_at is None
-            }
-            ctx._deleted_workspace_artifact_folder_ids = {
-                str(artifact_folder_id)
-                for _workspace_id, artifact_folder_id, deleted_at in workspace_rows
-                if artifact_folder_id and deleted_at is not None
+                if artifact_folder_id
             }
 
         if subject_ids:
@@ -1919,17 +2121,17 @@ class DocumentAccessContext:
         """In-memory ``user_can_read_folder``."""
         if not folder or folder.entity_id != self.entity_id:
             return False
-        if set(self.folder_chain_ids(folder.id)).intersection(
-            self._deleted_workspace_artifact_folder_ids
-        ):
+        if not self.entity_available:
             return False
         if not self.user_id:
             return True
         if not self.identity_active:
             return False
-        if self.is_admin:
+        if self.can_read_all_documents:
             return True
         if getattr(folder, "owner_id", None) == self.user_id:
+            return True
+        if Capability.VIEW in self.workspace_folder_capabilities(folder):
             return True
         if self.folder_capabilities(getattr(folder, "id", None)).intersection(
             _FOLDER_READ_CAPABILITIES if allow_redacted else {Capability.VIEW}
@@ -1966,7 +2168,7 @@ class DocumentAccessContext:
         return True
 
     def folder_workspace_ids(self, folder_id: str | None) -> set[str]:
-        """Active Workspace owners found along a folder's ancestry."""
+        """Workspace containers found along a folder's ancestry."""
         return {
             workspace_id
             for chain_id in self.folder_chain_ids(folder_id)
@@ -2034,19 +2236,8 @@ class DocumentAccessContext:
             self._workspace_by_artifact_folder_id.update({
                 str(artifact_folder_id): str(workspace_id)
                 for workspace_id, artifact_folder_id, deleted_at in workspace_rows
-                if artifact_folder_id and deleted_at is None
+                if artifact_folder_id
             })
-            self._deleted_provenance_workspace_ids.update(
-                str(workspace_id)
-                for workspace_id, _artifact_folder_id, deleted_at in workspace_rows
-                if str(workspace_id) in provenance_workspace_ids
-                and deleted_at is not None
-            )
-            self._deleted_workspace_artifact_folder_ids.update(
-                str(artifact_folder_id)
-                for _workspace_id, artifact_folder_id, deleted_at in workspace_rows
-                if artifact_folder_id and deleted_at is not None
-            )
         if not self.user_id:
             return
         wanted = [
@@ -2076,6 +2267,10 @@ class DocumentAccessContext:
     def _workspace_ids_for(self, document: Document) -> set[str]:
         """``document_workspace_ids`` from the preloaded links + metadata."""
         workspace_ids = set(self._doc_group_links.get(document.id, set()))
+        for folder_id in self.folder_chain_ids(document.folder_id):
+            folder_workspace_id = self._workspace_by_artifact_folder_id.get(folder_id)
+            if folder_workspace_id:
+                workspace_ids.add(folder_workspace_id)
         workspace_ids.update(_document_metadata_workspace_ids(document))
         physical_artifact_folder_id = _document_physical_artifact_folder_id(document)
         if physical_artifact_folder_id:
@@ -2090,22 +2285,55 @@ class DocumentAccessContext:
         """Return the Workspace scope loaded for a Document in this batch."""
         return self._workspace_ids_for(document)
 
-    def _owned_by_deleted_workspace(self, document: Document) -> bool:
-        physical_artifact_folder_id = _document_physical_artifact_folder_id(document)
-        return bool(
-            _document_metadata_workspace_ids(document).intersection(
-                self._deleted_provenance_workspace_ids
-            )
-            or set(self.folder_chain_ids(document.folder_id)).intersection(
-                self._deleted_workspace_artifact_folder_ids
-            )
-            or physical_artifact_folder_id
-            in self._deleted_workspace_artifact_folder_ids
-        )
+    def workspace_document_capabilities(
+        self, document: Document, *, workspace_id: str | None = None,
+    ) -> set[str]:
+        if (
+            document.entity_id != self.entity_id
+            or not self.identity_active
+            or self._entity_is_unavailable(document)
+        ):
+            return set()
+        capabilities: set[str] = set()
+        workspace_ids = self._workspace_ids_for(document)
+        if workspace_id:
+            workspace_ids.intersection_update({workspace_id})
+        for linked_workspace_id in workspace_ids:
+            capabilities.update(_WORKSPACE_DOCUMENT_CAPABILITIES.get(
+                self._workspace_roles.get(linked_workspace_id), set(),
+            ))
+        return capabilities
 
-    def document_owned_by_deleted_workspace(self, document: Document) -> bool:
-        """Return whether the preloaded document belongs to a deleted Workspace."""
-        return self._owned_by_deleted_workspace(document)
+    def workspace_folder_capabilities(self, folder: DocumentFolder) -> set[str]:
+        if (
+            folder.entity_id != self.entity_id
+            or not self.identity_active
+            or not self.entity_available
+        ):
+            return set()
+        capabilities: set[str] = set()
+        for workspace_id in self.folder_workspace_ids(folder.id):
+            capabilities.update(_WORKSPACE_FOLDER_CAPABILITIES.get(
+                self._workspace_roles.get(workspace_id), set(),
+            ))
+        return capabilities
+
+    def owns_workspace_document(self, document: Document) -> bool:
+        return Capability.GRANT_ACCESS in self.workspace_document_capabilities(document)
+
+    def owns_workspace_folder(self, folder: DocumentFolder) -> bool:
+        return Capability.GRANT_ACCESS in self.workspace_folder_capabilities(folder)
+
+    def document_group_workspace_ids(self, document: Document) -> set[str]:
+        """Return explicit Workspace group links loaded for a Document."""
+        return set(self._doc_group_links.get(document.id, set()))
+
+    def _entity_is_unavailable(self, document: Document) -> bool:
+        return document.entity_id != self.entity_id or not self.entity_available
+
+    def document_entity_is_unavailable(self, document: Document) -> bool:
+        """Return whether the preloaded document's Entity is unavailable."""
+        return self._entity_is_unavailable(document)
 
     async def _workspace_readable(self, db: AsyncSession, workspace_id: str) -> bool:
         if self.user_id and not self.identity_active:
@@ -2119,6 +2347,7 @@ class DocumentAccessContext:
                 user_id=self.user_id,
                 role=self.role,
                 can_read_entity_workspaces=self.can_read_entity_workspaces,
+                can_read_all_workspaces=self.can_read_all_workspaces,
             )
             self._ws_readable[workspace_id] = cached
         return cached
@@ -2144,7 +2373,7 @@ class DocumentAccessContext:
             return False
         if getattr(document, "classification", None) == "restricted" and actor_type != "user":
             return False
-        if self._owned_by_deleted_workspace(document):
+        if self._entity_is_unavailable(document):
             return False
         if not self.user_id:
             return actor_type == "user"
@@ -2160,21 +2389,36 @@ class DocumentAccessContext:
             "restricted",
         }:
             return False
-        if self.is_admin:
+        if self.can_read_all_documents:
             return True
         if document.owner_id and document.owner_id == self.user_id:
+            return True
+        if Capability.VIEW in self.workspace_document_capabilities(
+            document, workspace_id=workspace_id,
+        ):
             return True
         granted = set(self._doc_caps.get(document.id, set()))
         granted.update(self.folder_capabilities(document.folder_id))
         readable = _DOCUMENT_READ_CAPABILITIES if allow_redacted else {Capability.VIEW}
         if granted.intersection(readable):
             return True
+        visibility = getattr(document, "visibility", None) or Visibility.ENTITY
+        if visibility == Visibility.WORKSPACE:
+            group_workspace_ids = set(self._doc_group_links.get(document.id, set()))
+            if workspace_id:
+                group_workspace_ids.intersection_update({workspace_id})
+            if (
+                (self.role != "client" or effective_client_visible)
+                and (self.role == "client" or self.can_read_entity_documents)
+            ):
+                for group_workspace_id in group_workspace_ids:
+                    if await self._workspace_readable(db, group_workspace_id):
+                        return True
         if not await self.folder_path_readable(
             db, document.folder_id, allow_redacted=allow_redacted,
         ):
             return False
 
-        visibility = getattr(document, "visibility", None) or Visibility.ENTITY
         if visibility == Visibility.PRIVATE:
             return False
 
@@ -2203,7 +2447,7 @@ class DocumentAccessContext:
                 return True
             linked_workspace_ids = self._workspace_ids_for(document)
             if not linked_workspace_ids:
-                return True
+                return _document_physical_artifact_folder_id(document) is None
             for linked_workspace_id in linked_workspace_ids:
                 if await self._workspace_readable(db, linked_workspace_id):
                     return True
@@ -2219,12 +2463,13 @@ class DocumentAccessContext:
         """In-memory ``effective_document_capabilities_for_user``."""
         if not self.user_id:
             return set()
-        if self._owned_by_deleted_workspace(document):
+        if self._entity_is_unavailable(document):
             return set()
-        if self.is_admin or document.owner_id == self.user_id:
+        if self.can_manage_all_documents or document.owner_id == self.user_id:
             return set(_DOCUMENT_OWNER_CAPABILITIES)
         granted = set(self._doc_caps.get(document.id, set()))
         granted.update(self.folder_capabilities(document.folder_id))
+        granted.update(self.workspace_document_capabilities(document))
         if await self.can_read_document(db, document, allow_redacted=False):
             granted.add(Capability.VIEW)
         return granted
@@ -2306,8 +2551,12 @@ async def _document_folders_by_paths(
     *,
     entity_id: str,
     paths: set[str],
-) -> dict[str, DocumentFolder]:
-    """Resolve exact logical folder paths without loading the entity tree."""
+) -> dict[str, list[DocumentFolder]]:
+    """Resolve logical paths and stable artifact-folder paths within one Entity."""
+    from packages.core.services.workspace_artifacts import (
+        artifact_folder_id_from_entity_storage_path,
+    )
+
     path_parts = {
         path: tuple(part for part in path.split("/") if part)
         for path in paths
@@ -2316,20 +2565,39 @@ async def _document_folders_by_paths(
     if not path_parts:
         return {}
 
-    folder_by_prefix: dict[tuple[str, ...], DocumentFolder] = {}
+    folders_by_prefix: dict[tuple[str, ...], list[DocumentFolder]] = {}
+    # Artifact storage uses the retained folder ID, not its display name or a
+    # live Workspace row. Seed that exact root, then walk child names normally.
+    artifact_prefixes = {
+        parts[:3]
+        for path, parts in path_parts.items()
+        if artifact_folder_id_from_entity_storage_path(path)
+    }
+    prefixes_by_id = {parts[2]: parts for parts in artifact_prefixes}
+    root_ids = sorted(prefixes_by_id)
+    for start in range(0, len(root_ids), 200):
+        roots = (await db.execute(select(DocumentFolder).where(
+            DocumentFolder.entity_id == entity_id,
+            DocumentFolder.id.in_(root_ids[start:start + 200]),
+        ))).scalars().all()
+        for root in roots:
+            folders_by_prefix[prefixes_by_id[root.id]] = [root]
+
     max_depth = max(len(parts) for parts in path_parts.values())
     for depth in range(max_depth):
-        needed: dict[tuple[str | None, str], tuple[str, ...]] = {}
+        needed: dict[tuple[str | None, str], set[tuple[str, ...]]] = {}
         for parts in path_parts.values():
             if len(parts) <= depth:
                 continue
-            parent_prefix = parts[:depth]
-            if depth and parent_prefix not in folder_by_prefix:
+            if depth < 3 and parts[:3] in artifact_prefixes:
                 continue
-            parent_id = (
-                folder_by_prefix[parent_prefix].id if parent_prefix else None
-            )
-            needed[(parent_id, parts[depth])] = parts[: depth + 1]
+            parent_prefix = parts[:depth]
+            if depth and parent_prefix not in folders_by_prefix:
+                continue
+            parents = folders_by_prefix[parent_prefix] if parent_prefix else [None]
+            for parent in parents:
+                parent_id = parent.id if parent is not None else None
+                needed.setdefault((parent_id, parts[depth]), set()).add(parts[: depth + 1])
         pairs = list(needed)
         for start in range(0, len(pairs), 200):
             batch = pairs[start:start + 200]
@@ -2354,15 +2622,119 @@ async def _document_folders_by_paths(
                 )
             )).scalars().all()
             for folder in rows:
-                prefix = needed.get((folder.parent_id, str(folder.name)))
-                if prefix is not None:
-                    folder_by_prefix[prefix] = folder
+                for prefix in needed.get((folder.parent_id, str(folder.name)), ()):
+                    folders_by_prefix.setdefault(prefix, []).append(folder)
 
     return {
-        path: folder_by_prefix[parts]
+        path: folders_by_prefix[parts]
         for path, parts in path_parts.items()
-        if parts in folder_by_prefix
+        if parts in folders_by_prefix
     }
+
+
+async def _system_agent_unreadable_paths(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    wanted: set[str],
+    wanted_dirs: set[str],
+    workspace_id: str | None,
+) -> set[str]:
+    """Fail-closed rule for an agent turn that has no User behind it.
+
+    Strategist-proposal and scheduler-created Tasks execute without a User
+    (``resolve_task_execution_user_id`` returns ``None`` on trusted system
+    provenance). Their writes land in the Workspace artifact store, so denying
+    every read left a task unable to open what the previous task produced,
+    and ``read_file`` reported that denial as "File not found".
+
+    This is not a generic user-less bypass. The turn may read its Workspace's
+    artifact store, plus an exact root upload that a Human Input fulfillment
+    bound exclusively to this Workspace without relocating its bytes. Projected
+    Documents must still be non-private, non-restricted, non-quarantined and
+    in an available Entity. The executing Workspace must remain active.
+    """
+    from packages.core.models.workspace import Workspace
+    from packages.core.services.knowledge_visibility import normalize_rel_path
+    from packages.core.services.workspace_artifacts import (
+        artifact_folder_id_from_entity_storage_path,
+    )
+
+    all_wanted = wanted | wanted_dirs
+    scope = str(workspace_id or "").strip()
+    if not scope or await knowledge_entity_is_unavailable(db, entity_id):
+        return all_wanted
+    own_folder_id = (
+        await db.execute(
+            select(Workspace.artifact_folder_id).where(
+                Workspace.id == scope,
+                Workspace.entity_id == entity_id,
+                Workspace.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    own_folder_id = str(own_folder_id or "").strip()
+    if not own_folder_id:
+        return all_wanted
+
+    in_store = {
+        path
+        for path in all_wanted
+        if artifact_folder_id_from_entity_storage_path(path) == own_folder_id
+    }
+    blocked = set(all_wanted - in_store)
+
+    rows = list((
+        await db.execute(
+            select(Document).where(
+                Document.entity_id == entity_id,
+                Document.fs_path.in_(wanted),
+                Document.is_trashed == False,  # noqa: E712
+            )
+        )
+    ).scalars().all())
+    legacy_uploads = [
+        document for document in rows
+        if normalize_rel_path(document.fs_path) in blocked
+        and document.source == "upload"
+        and document.folder_id == own_folder_id
+        and isinstance(document.metadata_, dict)
+        and isinstance(document.metadata_.get("origin"), dict)
+        and document.metadata_["origin"].get("workspace_id") == scope
+        and document.metadata_["origin"].get("tool_name") == "hitl_upload"
+    ]
+    if legacy_uploads:
+        memberships = await document_workspace_ids_batched(db, legacy_uploads)
+        for document in legacy_uploads:
+            if memberships.get(str(document.id)) == {scope}:
+                blocked.discard(normalize_rel_path(document.fs_path))
+    for document in rows:
+        path = normalize_rel_path(document.fs_path)
+        if path in blocked:
+            continue
+        if getattr(document, "quarantine_status", None) in _QUARANTINED_STATUSES:
+            blocked.add(path)
+            continue
+        visibility = getattr(document, "visibility", None) or Visibility.ENTITY
+        if visibility == Visibility.PRIVATE:
+            blocked.add(path)
+            continue
+        provenance_scopes = _document_metadata_workspace_ids(document)
+        if provenance_scopes and scope not in provenance_scopes:
+            # Stored in this store but recorded as another Workspace's work.
+            blocked.add(path)
+            continue
+        classification, _visibility, _client_visible = await effective_document_folder_policy(
+            db, document
+        )
+        if classification == "restricted" or (
+            getattr(document, "classification", None) == "restricted"
+        ):
+            blocked.add(path)
+            continue
+        if await document_entity_is_unavailable(db, document):
+            blocked.add(path)
+    return blocked
 
 
 async def unreadable_document_paths(
@@ -2405,7 +2777,13 @@ async def unreadable_document_paths(
     if not all_wanted:
         return set()
     if not user_id and actor_type != "user":
-        return all_wanted
+        return await _system_agent_unreadable_paths(
+            db,
+            entity_id=entity_id,
+            wanted=wanted,
+            wanted_dirs=wanted_dirs,
+            workspace_id=current_workspace_id,
+        )
 
     rows = list((
         await db.execute(
@@ -2425,7 +2803,7 @@ async def unreadable_document_paths(
         str(folder_id)
         for folder_id in (
             *(document.folder_id for document in rows),
-            *(folder.id for folder in folders_by_path.values()),
+            *(folder.id for folders in folders_by_path.values() for folder in folders),
         )
         if folder_id
     }
@@ -2438,6 +2816,8 @@ async def unreadable_document_paths(
         document_ids={str(document.id) for document in rows},
         _actor=_actor,
     )
+    if not ctx.entity_available:
+        return all_wanted
     await ctx.preload_documents(db, rows)
 
     blocked: set[str] = set()
@@ -2470,17 +2850,14 @@ async def unreadable_document_paths(
     def _path_has_deleted_workspace_owner(
         path: str,
         documents: list[Document],
-        folder: DocumentFolder | None,
+        folders: list[DocumentFolder],
     ) -> bool:
+        # Knowledge Documents and logical folders have their own lifecycle.
+        # Unprojected bytes still cannot outlive their execution boundary.
+        if documents or folders:
+            return False
         artifact_folder_id = artifact_folder_id_from_entity_storage_path(path)
-        return bool(
-            artifact_folder_id in deleted_workspace_artifact_folder_ids
-            or any(ctx._owned_by_deleted_workspace(document) for document in documents)
-            or folder is not None
-            and set(ctx.folder_chain_ids(folder.id)).intersection(
-                ctx._deleted_workspace_artifact_folder_ids
-            )
-        )
+        return artifact_folder_id in deleted_workspace_artifact_folder_ids
 
     if not user_id:
         return {
@@ -2489,14 +2866,14 @@ async def unreadable_document_paths(
             if _path_has_deleted_workspace_owner(
                 path,
                 documents_by_path.get(path, []),
-                folders_by_path.get(path),
+                folders_by_path.get(path, []),
             )
         }
 
     async def _workspace_scope_allows_path(
         path: str,
         documents: list[Document],
-        folder: DocumentFolder | None,
+        folders: list[DocumentFolder],
     ) -> bool:
         if not current_workspace_id:
             return True
@@ -2505,11 +2882,20 @@ async def unreadable_document_paths(
 
         artifact_folder_id = artifact_folder_id_from_entity_storage_path(path)
         if artifact_folder_id:
-            if (
-                workspace_by_artifact_folder_id.get(artifact_folder_id)
-                != current_workspace_id
-            ):
-                return False
+            owner_workspace_id = workspace_by_artifact_folder_id.get(artifact_folder_id)
+            if owner_workspace_id != current_workspace_id:
+                # An explicit group link admits only this existing file into
+                # the execution scope, never its directory or sibling files.
+                # The Document ACL is still checked below after scope admission.
+                if (
+                    path in wanted_dirs
+                    or not documents
+                    or any(
+                        current_workspace_id not in ctx.document_group_workspace_ids(document)
+                        for document in documents
+                    )
+                ):
+                    return False
 
         linked_workspace_ids: set[str] = set()
         for document in documents:
@@ -2518,7 +2904,7 @@ async def unreadable_document_paths(
                 linked_workspace_id = ctx._workspace_by_artifact_folder_id.get(folder_id)
                 if linked_workspace_id:
                     linked_workspace_ids.add(linked_workspace_id)
-        if folder is not None:
+        for folder in folders:
             for folder_id in ctx.folder_chain_ids(folder.id):
                 linked_workspace_id = ctx._workspace_by_artifact_folder_id.get(folder_id)
                 if linked_workspace_id:
@@ -2527,11 +2913,11 @@ async def unreadable_document_paths(
 
     for path in all_wanted:
         documents = documents_by_path.get(path, [])
-        folder = folders_by_path.get(path)
-        if _path_has_deleted_workspace_owner(path, documents, folder):
+        folders = folders_by_path.get(path, [])
+        if _path_has_deleted_workspace_owner(path, documents, folders):
             blocked.add(path)
             continue
-        if not await _workspace_scope_allows_path(path, documents, folder):
+        if not await _workspace_scope_allows_path(path, documents, folders):
             blocked.add(path)
             continue
         if documents:
@@ -2547,18 +2933,17 @@ async def unreadable_document_paths(
                     break
             continue
 
-        # Entity admins may traverse legacy/unprojected entity files, but a
-        # projected Document must still pass the actor-specific hard stops
-        # above. In particular, an admin-backed agent is not a side door
-        # around Restricted or quarantined Knowledge content.
-        if ctx.is_admin:
-            continue
-
         artifact_folder_id = artifact_folder_id_from_entity_storage_path(path)
-        if artifact_folder_id:
+        if artifact_folder_id and not folders:
             workspace_id = workspace_by_artifact_folder_id.get(artifact_folder_id)
             if not workspace_id or not await ctx._workspace_readable(db, workspace_id):
                 blocked.add(path)
+            continue
+
+        # Global Knowledge read is independent of Workspace access. It may
+        # traverse legacy/unprojected entity files, but not unprojected bytes
+        # inside a Workspace whose ACL does not admit this actor.
+        if ctx.can_read_all_documents:
             continue
 
         if path not in wanted_dirs:
@@ -2566,9 +2951,23 @@ async def unreadable_document_paths(
             # directory, not arbitrary unprojected bytes found underneath it.
             blocked.add(path)
             continue
-        if folder is None or not await ctx.folder_path_readable(db, folder.id):
+        if not folders or not any([
+            await ctx.folder_path_readable(db, folder.id) for folder in folders
+        ]):
             blocked.add(path)
     return blocked
+
+
+async def _public_workspace_is_available(
+    db: AsyncSession, *, entity_id: str, workspace_id: str,
+) -> bool:
+    from packages.core.models.workspace import Workspace
+
+    return await db.scalar(select(Workspace.id).where(
+        Workspace.id == workspace_id,
+        Workspace.entity_id == entity_id,
+        Workspace.deleted_at.is_(None),
+    )) is not None
 
 
 async def document_is_client_visible(
@@ -2587,9 +2986,13 @@ async def document_is_client_visible(
 
     if not document or document.entity_id != entity_id:
         return False
+    if workspace_id and not await _public_workspace_is_available(
+        db, entity_id=entity_id, workspace_id=workspace_id,
+    ):
+        return False
     if getattr(document, "quarantine_status", None) in _QUARANTINED_STATUSES:
         return False
-    if await document_is_owned_by_deleted_workspace(db, document):
+    if await document_entity_is_unavailable(db, document):
         return False
     classification, visibility, client_visible = await effective_document_folder_policy(
         db, document
@@ -2652,6 +3055,10 @@ async def public_agent_visible_document_ids_batched(
     ]
     if not workspace or not candidates:
         return set()
+    if not await _public_workspace_is_available(
+        db, entity_id=entity_id, workspace_id=workspace,
+    ):
+        return set()
 
     ctx = await DocumentAccessContext.load(
         db,
@@ -2670,7 +3077,7 @@ async def public_agent_visible_document_ids_batched(
     for document in candidates:
         if getattr(document, "quarantine_status", None) in _QUARANTINED_STATUSES:
             continue
-        if ctx.document_owned_by_deleted_workspace(document):
+        if ctx.document_entity_is_unavailable(document):
             continue
         classification, visibility, client_visible = ctx.effective_document_policy(document)
         if not client_visible or classification in {"confidential", "restricted"}:
@@ -2697,7 +3104,13 @@ async def get_visible_document(
     """Load a full-content-readable document; metadata-only callers opt in to redacted access."""
     from packages.core.services.document_service import get_document
 
-    document = await get_document(db, doc_id, entity_id)
+    document = await get_document(
+        db,
+        doc_id,
+        entity_id,
+        allow_workspace_chat_upload=True,
+        workspace_id=workspace_id,
+    )
     if await user_can_read_document(
         db,
         document,
@@ -2826,7 +3239,17 @@ async def list_visible_documents(
     actor_type: str = "user",
     name_search: str | None = None,
     folder_id: str | None = None,
-    folder_ids: set[str] | None = None,
+    folder_ids: Sequence[str] | None = None,
+    workspace_ids: Sequence[str] | None = None,
+    file_types: Sequence[str] | None = None,
+    sources: Sequence[str] | None = None,
+    vector_statuses: Sequence[str] | None = None,
+    created_after: str | datetime | None = None,
+    created_before: str | datetime | None = None,
+    updated_after: str | datetime | None = None,
+    updated_before: str | datetime | None = None,
+    file_size_min: int | None = None,
+    file_size_max: int | None = None,
     include_generated_assets: bool = True,
     limit: int | None = 100,
     offset: int = 0,
@@ -2839,6 +3262,11 @@ async def list_visible_documents(
     visible_page: list[Document] = []
     visible_total = 0
     raw_offset = 0
+    requested_workspace_ids = {
+        str(value) for value in (workspace_ids or ()) if value
+    }
+    if workspace_id:
+        requested_workspace_ids.add(str(workspace_id))
     while True:
         candidates, raw_total = await list_documents(
             db,
@@ -2847,6 +3275,16 @@ async def list_visible_documents(
             folder_id=folder_id,
             folder_ids=folder_ids,
             workspace_id=workspace_id,
+            workspace_ids=workspace_ids,
+            file_types=file_types,
+            sources=sources,
+            vector_statuses=vector_statuses,
+            created_after=created_after,
+            created_before=created_before,
+            updated_after=updated_after,
+            updated_before=updated_before,
+            file_size_min=file_size_min,
+            file_size_max=file_size_max,
             include_generated_assets=include_generated_assets,
             limit=_INTERNAL_FILTER_LIMIT,
             offset=raw_offset,
@@ -2869,6 +3307,10 @@ async def list_visible_documents(
             role=role,
         )
         for document in candidates:
+            if requested_workspace_ids and not ctx.document_workspace_ids(
+                document
+            ).intersection(requested_workspace_ids):
+                continue
             if not await ctx.can_read_document(
                 db,
                 document,
@@ -2929,6 +3371,8 @@ async def visible_storage_usage(
             role=role,
         )
         for document in docs:
+            if workspace_id and workspace_id not in ctx.document_workspace_ids(document):
+                continue
             if await ctx.can_read_document(
                 db,
                 document,
@@ -2988,6 +3432,8 @@ async def visible_document_counts_by_folder(
                 )
                 readable_documents = []
                 for document in docs:
+                    if workspace_id and workspace_id not in ctx.document_workspace_ids(document):
+                        continue
                     if await ctx.can_read_document(
                         db,
                         document,

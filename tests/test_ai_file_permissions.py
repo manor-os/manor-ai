@@ -19,8 +19,7 @@ from packages.core.ai.tools.bash_tool import (
     _visible_read_paths,
     _visible_mutation_paths,
 )
-from packages.core.ai.tools.document_tools import GENERATE_DOCUMENT_FILE_SCHEMA
-from packages.core.ai.tools.file_tools import DELETE_FILE_SCHEMA, EDIT_FILE_SCHEMA, WRITE_FILE_SCHEMA
+from packages.core.ai.tools.file_tools import DELETE_FILE_SCHEMA, PATCH_FILE_SCHEMA
 from packages.core.ai.tools.generate_file_tool import GENERATE_FILE_SCHEMA
 from packages.core.ai.tools.manor_tool import MANOR_SCHEMA
 from packages.core.ai.tools.sandbox_tools import _SANDBOX_SAVE_RESULT_SCHEMA
@@ -394,7 +393,7 @@ def test_mutating_file_tools_receive_the_runtime_envelope():
         "bash",
         "manor",
     }.issubset(RUNTIME_ENVELOPE_AWARE_TOOLS)
-    assert "write_file" not in RUNTIME_LLM_METADATA_AWARE_TOOLS
+    assert "patch_file" not in RUNTIME_LLM_METADATA_AWARE_TOOLS
 
 
 def test_file_approval_reply_classifier_is_conservative():
@@ -529,6 +528,10 @@ async def test_autonomous_agent_file_write_keeps_runtime_principal_and_workspace
     from packages.core.ai.runtime.profiles import RuntimeProfile
     from packages.core.ai.runtime.surfaces import ChatSurface
     from packages.core.governance import service as governance_service
+    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_policy import ApprovalScope, evaluate_policy
+    from packages.core.governance.approval_policy_service import build_policy_chain
+    from packages.core.governance.policy import PolicyDecision
     from packages.core.services import runtime_authorization
     from packages.core.services.runtime_authorization import PermissionDecision
 
@@ -549,9 +552,24 @@ async def test_autonomous_agent_file_write_keeps_runtime_principal_and_workspace
         authorization_calls.append(kwargs)
         return PermissionDecision.allow("agent_tool_binding")
 
-    async def auto_approve(_db, **kwargs):
+    chain = build_policy_chain(
+        scope=ApprovalScope(kind="workspace", id="ws_1", entity_id="ent_1"),
+        root={"revision": 1, "policy": {"mode": "risk_based", "rules": []}},
+        local={"root_entity_id": "ent_1", "revision": 1, "policy": {"mode": None, "rules": []}},
+    )
+
+    async def check_policy(_db, **kwargs):
         policy_calls.append(kwargs)
-        return True
+        facts = action_facts(**{key: kwargs[key] for key in (
+            "action_key", "resource_id", "resource_ids", "resource_kind",
+            "risk_level", "capability_id", "operation",
+        )})
+        decision = evaluate_policy(chain, facts)
+        return PolicyDecision(
+            allowed=decision.outcome == "allow", pause_for_hitl=decision.outcome == "ask",
+            reason=decision.reason_code, matched_rule=decision.rule_id,
+            explanation=decision.model_dump(),
+        )
 
     monkeypatch.setattr(database, "async_session", FakeSession)
     settings = get_settings()
@@ -559,7 +577,7 @@ async def test_autonomous_agent_file_write_keeps_runtime_principal_and_workspace
     monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
     monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
     monkeypatch.setattr(runtime_authorization, "authorize_runtime_action", authorize)
-    monkeypatch.setattr(governance_service, "workspace_policy_auto_approves", auto_approve)
+    monkeypatch.setattr(governance_service, "check_step_policy", check_policy)
 
     envelope = RuntimeEnvelope(
         surface=ChatSurface.SCHEDULED_AGENT_RUN,
@@ -591,6 +609,7 @@ async def test_autonomous_agent_file_write_keeps_runtime_principal_and_workspace
         tool_name="write_file",
         action="write",
         paths=[artifact_path],
+        execution_id="runtime:task_1:call:write-report",
     )
 
     assert blocked is None
@@ -611,14 +630,13 @@ async def test_autonomous_agent_file_write_keeps_runtime_principal_and_workspace
             "runtime_surface": ChatSurface.SCHEDULED_AGENT_RUN,
         }
     ]
-    assert policy_calls == [
-        {
-            "workspace_id": "ws_1",
-            "action_key": "workspace.file.write",
-            "resource_id": artifact_path,
-            "capability_id": "file.write",
-        }
-    ]
+    assert policy_calls == [{
+        "entity_id": "ent_1", "user_id": None, "workspace_id": "ws_1",
+        "kind": "action", "action_key": "workspace.file.create",
+        "resource_id": artifact_path, "resource_ids": (artifact_path,),
+        "resource_kind": "file", "risk_level": "medium", "capability_id": "file.write",
+        "operation": "write", "task_id": "task_1",
+    }]
 
 
 @pytest.mark.asyncio
@@ -695,7 +713,7 @@ async def test_autonomous_file_write_does_not_bypass_authorization_or_safe_polic
         paths=[artifact_path],
     ))
     assert held["error"] == "file_permission_denied"
-    assert "no conversation_id" in held["reason"]
+    assert "persisted execution identity" in held["reason"]
 
 
 @pytest.mark.asyncio
@@ -761,6 +779,277 @@ async def test_autonomous_agent_cannot_create_outside_workspace_artifact_root(
         paths=["Workspaces/_by_id/folder_1/escaped.md"],
     ))
     assert symlink_denied["mode"] == "entity_file_acl_denied"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_agent_can_edit_existing_file_inside_workspace_artifact_root(
+    monkeypatch,
+    tmp_path,
+):
+    from packages.core.config import get_settings
+
+    class FakeSession:
+        async def scalar(self, _statement):
+            return "folder_1"
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    rel_path = "Workspaces/_by_id/folder_1/documents/report.md"
+    target = tmp_path / "ent_1" / rel_path
+    target.parent.mkdir(parents=True)
+    target.write_text("old pack", encoding="utf-8")
+
+    denied = await _resource_file_acl_denial(
+        FakeSession(),
+        runtime_envelope=None,
+        entity_id="ent_1",
+        user_id=None,
+        workspace_id="ws_1",
+        action="edit",
+        tool_name="patch_file",
+        paths=[rel_path],
+    )
+    assert denied is None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_agent_cannot_delete_existing_workspace_artifact_without_user(
+    monkeypatch,
+    tmp_path,
+):
+    from packages.core.config import get_settings
+
+    class FakeSession:
+        async def scalar(self, _statement):
+            return "folder_1"
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    rel_path = "Workspaces/_by_id/folder_1/documents/report.md"
+    target = tmp_path / "ent_1" / rel_path
+    target.parent.mkdir(parents=True)
+    target.write_text("old pack", encoding="utf-8")
+
+    denied = json.loads(await _resource_file_acl_denial(
+        FakeSession(),
+        runtime_envelope=None,
+        entity_id="ent_1",
+        user_id=None,
+        workspace_id="ws_1",
+        action="delete",
+        tool_name="delete_file",
+        paths=[rel_path],
+    ) or "{}")
+    assert denied["mode"] == "entity_file_acl_denied"
+    assert "authenticated user" in denied["reason"]
+
+
+@pytest.mark.asyncio
+async def test_task_worker_locate_finds_existing_workspace_root_document(
+    monkeypatch,
+    tmp_path,
+):
+    from packages.core.ai.tools.file_tools import _locate_entity_file
+    from packages.core.config import get_settings
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    entity_id = "ent_1"
+    entity_root = tmp_path / entity_id
+    rel_path = "Workspaces/_by_id/folder_1/documents/report.md"
+    target = entity_root / rel_path
+    target.parent.mkdir(parents=True)
+    target.write_text("pack", encoding="utf-8")
+    calls = []
+
+    async def fake_resolve(**kwargs):
+        calls.append(kwargs)
+        base = "Workspaces/_by_id/folder_1"
+        task_id = str(kwargs.get("task_id") or "").strip()
+        if task_id and task_id.isalnum():
+            return f"{base}/tasks/{task_id}"
+        return base
+
+    monkeypatch.setattr(
+        "packages.core.services.generated_media_naming.resolve_workspace_artifact_base_dir",
+        fake_resolve,
+    )
+    found, candidates = await _locate_entity_file(
+        entity_id=entity_id,
+        entity_root=str(entity_root),
+        path="documents/report.md",
+        workspace_id="ws_1",
+        task_id="TASK01",
+    )
+    assert len(calls) == 1
+    assert found == str(target)
+    assert candidates == []
+
+
+def test_safe_path_strips_workspace_prefix_only(tmp_path):
+    from packages.core.ai.tools.file_tools import _safe_path
+
+    entity_root = tmp_path / "ent_1"
+    (entity_root / "documents").mkdir(parents=True)
+    target = entity_root / "documents" / "foo.md"
+    target.write_text("ok", encoding="utf-8")
+    resolved = _safe_path(str(entity_root), "/workspace/documents/foo.md")
+    assert resolved == str(target.resolve())
+    assert _safe_path(str(entity_root), "/etc/passwd") is None
+
+
+@pytest.mark.asyncio
+async def test_task_worker_patch_scope_uses_existing_workspace_root_document(
+    monkeypatch,
+    tmp_path,
+):
+    from packages.core import database
+    from packages.core.ai.runtime.approval_classifier import (
+        resolve_runtime_workspace_file_scope,
+    )
+    from packages.core.ai.runtime.approvals import (
+        RuntimeApprovalAction,
+        RuntimeApprovalDecision,
+        RuntimeApprovalRequest,
+    )
+    from packages.core.ai.runtime.authorization_receipts import (
+        RuntimeToolAuthorizationReceiptFactory,
+    )
+    from packages.core.ai.runtime.tool_effect_classification import (
+        RuntimeToolClassification,
+        WorkspaceFileExistence,
+    )
+    from packages.core.config import get_settings
+
+    class ScalarResult:
+        def scalar_one_or_none(self):
+            return "folder_1"
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return ScalarResult()
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(database, "async_session", FakeSession)
+    rel_path = "Workspaces/_by_id/folder_1/documents/report.md"
+    target = tmp_path / "ent_1" / rel_path
+    target.parent.mkdir(parents=True)
+    target.write_text("old pack", encoding="utf-8")
+
+    scope = await resolve_runtime_workspace_file_scope(
+        tool_name="patch_file",
+        arguments={"path": rel_path},
+        entity_id="ent_1",
+        workspace_id="ws_1",
+        task_id="TASK01",
+    )
+    assert scope is not None
+    assert scope.existence is WorkspaceFileExistence.EXISTS
+    assert scope.artifact_base_dir == "Workspaces/_by_id/folder_1"
+    short_scope = await resolve_runtime_workspace_file_scope(
+        tool_name="patch_file",
+        arguments={"path": "documents/report.md"},
+        entity_id="ent_1",
+        workspace_id="ws_1",
+        task_id="TASK01",
+    )
+    assert short_scope is not None
+    assert short_scope.existence is WorkspaceFileExistence.EXISTS
+    assert short_scope.artifact_base_dir == "Workspaces/_by_id/folder_1"
+
+    classification = RuntimeToolClassification.action_call(
+        RuntimeApprovalAction(
+            kind="action",
+            action_key="workspace.file.modify",
+            risk_level="medium",
+            title="patch document",
+            resource_kind="file",
+            operation="modify",
+            resource_id=rel_path,
+        )
+    )
+    receipt = RuntimeToolAuthorizationReceiptFactory.create(
+        decision=RuntimeApprovalDecision.allow(classification),
+        request=RuntimeApprovalRequest(
+            tool_name="patch_file",
+            arguments={"path": rel_path},
+            entity_id="ent_1",
+            user_id="",
+            workspace_id="ws_1",
+            task_id="TASK01",
+            workspace_file_scope=scope,
+        ),
+    )
+    assert receipt is not None
+    assert receipt.authorizes_workspace_file_mutation(
+        capability_id="file.write",
+        action_key="workspace.file.modify",
+        paths=[rel_path],
+        entity_id="ent_1",
+        user_id=None,
+        workspace_id="ws_1",
+        conversation_id=None,
+        task_id="TASK01",
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_worker_create_scope_stays_on_task_folder(
+    monkeypatch,
+    tmp_path,
+):
+    from packages.core import database
+    from packages.core.ai.runtime.approval_classifier import (
+        resolve_runtime_workspace_file_scope,
+    )
+    from packages.core.ai.runtime.tool_effect_classification import (
+        WorkspaceFileExistence,
+    )
+    from packages.core.config import get_settings
+
+    class ScalarResult:
+        def scalar_one_or_none(self):
+            return "folder_1"
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return ScalarResult()
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    monkeypatch.setattr(database, "async_session", FakeSession)
+    (tmp_path / "ent_1" / "Workspaces" / "_by_id" / "folder_1" / "documents").mkdir(
+        parents=True
+    )
+
+    scope = await resolve_runtime_workspace_file_scope(
+        tool_name="write_file",
+        arguments={"path": "documents/new-pack.md", "content": "draft"},
+        entity_id="ent_1",
+        workspace_id="ws_1",
+        task_id="TASK01",
+    )
+    assert scope is not None
+    assert scope.existence is WorkspaceFileExistence.MISSING
+    assert scope.artifact_base_dir == "Workspaces/_by_id/folder_1/tasks/TASK01"
 
 
 @pytest.mark.asyncio
@@ -940,7 +1229,7 @@ async def test_registered_generate_file_task_authorizes_inner_materializer_once(
         if invocation == 1:
             assert blocked is None
             return "materialized"
-        return blocked or "unexpected-existing-write"
+        return blocked or "materialized-existing"
 
     result = await runtime_execute_registered_tool(
         tool_name="generate_file",
@@ -986,7 +1275,7 @@ async def test_registered_generate_file_task_authorizes_inner_materializer_once(
         runtime_envelope=envelope,
     )
 
-    assert json.loads(retry_result)["mode"] == "entity_file_acl_denied"
+    assert retry_result == "materialized-existing"
     assert len(authorization_calls) == 2
     assert [call["tool_name"] for call in authorization_calls] == [
         "generate_file",
@@ -1062,6 +1351,80 @@ async def test_runtime_approval_receipt_uses_the_guarded_classification_once():
     assert receipt is not None
     assert receipt.action_key == "workspace.file.create"
     assert receipt.resource_ids == ("documents/cram-pack.md",)
+
+
+@pytest.mark.asyncio
+async def test_runtime_receipt_never_records_a_task_binding_key_as_the_conversation():
+    """A task worker authorizes sandbox-bound tools under a synthetic key.
+
+    The inner file mutation is checked against the real conversation (none for
+    a task worker), so a receipt that recorded the key would mismatch every
+    save. The factory must translate the key back to "no conversation".
+    """
+    from packages.core.ai.runtime.approvals import (
+        RuntimeApprovalAction,
+        RuntimeApprovalMiddleware,
+        RuntimeApprovalRequest,
+    )
+    from packages.core.ai.runtime.authorization_receipts import (
+        RuntimeToolAuthorizationReceiptFactory,
+    )
+    from packages.core.ai.runtime.sandbox import runtime_task_binding_key
+    from packages.core.ai.runtime.tool_effect_classification import (
+        RuntimeToolClassification,
+    )
+
+    class Adapter:
+        classification = RuntimeToolClassification.action_call(
+            RuntimeApprovalAction(
+                kind="action",
+                action_key="workspace.file.create",
+                risk_level="medium",
+                title="save sandbox result",
+                resource_kind="file",
+                operation="create",
+                resource_id="artifacts/report.xlsx",
+            )
+        )
+
+        def classify_request(self, request):
+            return self.classification
+
+        async def guard_request(self, request):
+            return None
+
+    middleware = RuntimeApprovalMiddleware(policy_adapter=Adapter())
+    task_id = "01M1R1C8VRNMTDMN3AB1MZ8YJK"
+    request = RuntimeApprovalRequest(
+        tool_name="sandbox",
+        arguments={"action": "save_result", "params": {"path": "report.xlsx"}},
+        entity_id="ent_1",
+        user_id="user_1",
+        workspace_id="ws_1",
+        conversation_id=runtime_task_binding_key(task_id),
+        task_id=task_id,
+    )
+
+    decision = await middleware.guard_request(request)
+    receipt = RuntimeToolAuthorizationReceiptFactory.create(decision=decision, request=request)
+
+    assert receipt is not None
+    assert receipt.conversation_id is None
+    assert receipt.task_id == task_id
+
+    real_conversation = RuntimeApprovalRequest(
+        tool_name="sandbox",
+        arguments={"action": "save_result", "params": {"path": "report.xlsx"}},
+        entity_id="ent_1",
+        user_id="user_1",
+        workspace_id="ws_1",
+        conversation_id="01M1R1C8VRNMTDMN3AB1MZ8YJZ",
+        task_id=task_id,
+    )
+    decision = await middleware.guard_request(real_conversation)
+    receipt = RuntimeToolAuthorizationReceiptFactory.create(decision=decision, request=real_conversation)
+    assert receipt is not None
+    assert receipt.conversation_id == "01M1R1C8VRNMTDMN3AB1MZ8YJZ"
 
 
 def test_runtime_receipt_factory_models_code_bundle_as_a_typed_resource_tree():
@@ -1175,9 +1538,8 @@ def test_runtime_receipt_factory_projects_media_outputs_from_typed_contracts():
     assert receipt is not None
     assert receipt.resource_ids == (
         "runs/topic/audio/normalized",
-        "technical",
+        "artifacts",
         "runs/topic/timeline",
-        "subtitles",
     )
     assert all(
         resource.match_kind is WorkspaceFileResourceMatchKind.TREE
@@ -1446,7 +1808,10 @@ async def test_generate_file_workspace_image_asset_uses_workspace_storage_root(
     )
 
     assert receipt is not None
-    assert receipt.resource_ids == ("brand/stickman-character.png",)
+    assert receipt.resource_ids == tuple(
+        f"Workspaces/_by_id/folder_1/brand/stickman-character.{extension}"
+        for extension in ("png", "jpg", "webp")
+    )
     assert receipt.authorizes_workspace_file_commit(
         entity_id="ent_1",
         path="Workspaces/_by_id/folder_1/brand/stickman-character.png",
@@ -1638,11 +2003,29 @@ def test_runtime_receipt_factory_limits_unnamed_generation_to_artifact_kind_tree
     [
         (
             "technical/stickman-narrator-setup-sample.mp3",
-            "Workspaces/_by_id/folder_1/tasks/task_1/audio/puck/"
+            "Workspaces/_by_id/folder_1/tasks/task_1/technical/puck/"
             "stickman-narrator-setup-sample.mp3",
             "Workspaces/_by_id/folder_1/tasks/task_1/documents/"
             "stickman-narrator-setup-sample.mp3",
+            "technical",
+        ),
+        (
+            "episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/audio/puck/episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/documents/episode.mp3",
             "audio",
+        ),
+        (
+            "production/runs/one/episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/production/runs/one/puck/episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/production/runs/two/puck/episode.mp3",
+            "production/runs/one",
+        ),
+        (
+            "Workspaces/_by_id/folder_1/tasks/task_1/production/runs/one/episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/production/runs/one/puck/episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/production/runs/two/puck/episode.mp3",
+            "Workspaces/_by_id/folder_1/tasks/task_1/production/runs/one",
         ),
         (
             "runs/topic/audio/segment-001.wav",
@@ -2030,7 +2413,6 @@ async def test_runtime_approval_classifies_existing_workspace_artifact_without_t
         / "Workspaces"
         / "_by_id"
         / "folder_1"
-        / "documents"
         / "existing.md"
     )
     existing.parent.mkdir(parents=True)
@@ -2610,6 +2992,7 @@ async def test_exact_workspace_receipt_does_not_bypass_existing_document_acl(
 )
 @pytest.mark.asyncio
 async def test_inactive_or_deleted_file_actor_is_rejected(
+    db_session,
     monkeypatch,
     tmp_path,
     status,
@@ -2618,11 +3001,13 @@ async def test_inactive_or_deleted_file_actor_is_rejected(
 ):
     from datetime import datetime, timezone
 
-    from packages.core import database
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
     from packages.core.config import get_settings
     from packages.core.models.user import User, UserMembership
     from packages.core.services import filesystem_access
 
+    session_factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
     entity_id = f"ent_actor_{status}_{int(deleted)}"
     settings = get_settings()
     monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
@@ -2636,7 +3021,7 @@ async def test_inactive_or_deleted_file_actor_is_rejected(
     )
     if deleted:
         actor.deleted_at = datetime.now(timezone.utc)
-    async with database.async_session() as db:
+    async with session_factory() as db:
         db.add(actor)
         await db.flush()
         actor_id = actor.id
@@ -2658,7 +3043,7 @@ async def test_inactive_or_deleted_file_actor_is_rejected(
         "require_path_write_access",
         unexpected_acl,
     )
-    async with database.async_session() as db:
+    async with session_factory() as db:
         denied = await _resource_file_acl_denial(
             db,
             runtime_envelope=None,
@@ -2867,9 +3252,11 @@ async def test_workspace_runtime_cannot_mutate_another_workspace_artifact(
         name="workspace-b-notes.md",
         fs_path=generic_other_path,
         file_type="md",
-        source="upload",
-        visibility="entity",
-        owner_id=actor.id,
+        source="agent",
+        # An ownerless legacy Workspace record uses origin.workspace_id as its
+        # binding; a user-owned entity upload does not.
+        visibility="workspace",
+        owner_id=None,
         metadata_={"origin": {"workspace_id": workspace_b.id}},
     ))
     await db_session.flush()
@@ -4498,7 +4885,23 @@ async def test_bash_rejects_mutation_globs_before_acl_lookup(tmp_path):
     assert json.loads(brace_expanded)["error"] == "file_permission_denied"
 
 
+@pytest.fixture
+def knowledge_sync_sessions(db_session, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from packages.core.services import knowledge_sync
+
+    # Recovery owns independent transactions. Bind its imported factory to
+    # this test's engine instead of reusing pooled connections from an old loop.
+    monkeypatch.setattr(
+        knowledge_sync,
+        "async_session",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+
+
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("knowledge_sync_sessions")
 async def test_bash_move_recovery_preserves_document_identity_and_security(
     db_session,
     tmp_path,
@@ -4563,6 +4966,7 @@ async def test_bash_move_recovery_preserves_document_identity_and_security(
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("knowledge_sync_sessions")
 async def test_bash_copy_recovery_is_idempotent_and_preserves_security(
     db_session,
     tmp_path,
@@ -4745,10 +5149,8 @@ async def test_post_bash_mv_into_directory_uses_child_path(monkeypatch, tmp_path
 def test_mutating_file_tool_schemas_accept_approval_token():
     schemas = [
         BASH_SCHEMA,
-        WRITE_FILE_SCHEMA,
-        EDIT_FILE_SCHEMA,
+        PATCH_FILE_SCHEMA,
         DELETE_FILE_SCHEMA,
-        GENERATE_DOCUMENT_FILE_SCHEMA,
         GENERATE_FILE_SCHEMA,
         _SANDBOX_SAVE_RESULT_SCHEMA,
         SAVE_SANDBOX_FILE_SCHEMA,

@@ -49,32 +49,8 @@ class BlueprintStatus(str, Enum):
         return [member.value for member in cls]
 
 
-class BlueprintPurchaseStatus(str, Enum):
-    """Canonical entitlement states for a paid Blueprint purchase."""
-
-    PENDING = "pending"
-    REFUND_PENDING = "refund_pending"
-    COMPLETED = "completed"
-    DISPUTED = "disputed"
-    REFUNDED = "refunded"
 
 
-class BlueprintCheckoutAttemptStatus(str, Enum):
-    """Immutable Stripe Checkout attempt lifecycle."""
-
-    PENDING = "pending"
-    EXPIRED = "expired"
-    COMPLETED = "completed"
-    REFUND_PENDING = "refund_pending"
-    REFUNDED = "refunded"
-
-
-class BlueprintCheckoutRefundStatus(str, Enum):
-    """Durable compensating-refund job lifecycle."""
-
-    PENDING = "pending"
-    PROCESSING = "processing"
-    SUCCEEDED = "succeeded"
 
 
 #: The states from which a blueprint may be edited or submitted — i.e. not
@@ -132,6 +108,7 @@ DERIVED_WORKSPACE_SCHEDULE_PREFIXES: tuple[str, ...] = (
 )
 
 DERIVED_ONLY_SCHEDULE_EXECUTION_TYPES: frozenset[str] = frozenset({
+    "agent_initiative",
     "outcome_evaluation",
     "chat_insight_extraction",
     "goal_measurement",

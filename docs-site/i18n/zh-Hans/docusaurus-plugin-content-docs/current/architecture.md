@@ -69,8 +69,8 @@ TypeScript 构建的 React 18 单页应用。在 Docker 中它通过 web 代理�
   作用域限定。
 - 工具访问受 Agent 设置和
   [人工审批（HITL）治理](concepts/hitl-governance.md)约束。
-- 一切都以实体为作用域（OSS 模式下每个部署为单租户），
-  实体内部再由工作区级权限管控。
+- 数据和凭据以 Entity 为作用域，内部再由工作区级权限管控。
+  一个自托管运营主体可管理多个 Entity，不合并其数据或权限。
 
 ## 数据存储 {#data-stores}
 

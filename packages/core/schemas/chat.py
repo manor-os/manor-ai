@@ -1,7 +1,7 @@
 """Chat request/response schemas — shared between routers and services."""
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class ChatRequest(BaseModel):
@@ -53,7 +53,9 @@ class ConversationResponse(BaseModel):
     entity_id: str
     user_id: str | None = None
     agent_id: str | None = None
+    agent_subscription_id: str | None = None
     workspace_id: str | None = None
+    scope: str = "channel"
     title: str | None = None
     summary: str | None = None
     channel: str = "web"
@@ -65,6 +67,13 @@ class ConversationResponse(BaseModel):
 
 class RenameConversationRequest(BaseModel):
     title: str
+
+
+class CreateAgentDraftRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    agent_id: str
+    title: str | None = None
 
 
 class CreateShareRequest(BaseModel):

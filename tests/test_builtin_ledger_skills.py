@@ -5,11 +5,6 @@ from types import SimpleNamespace
 import pytest
 
 from packages.core.ai.runtime.profiles import RuntimeProfile
-from packages.core.ai.runtime.skill_invocation_policy import (
-    PRIMARY_SOURCE,
-    REQUIRED_BEFORE_ANSWER,
-    SkillInvocationPolicy,
-)
 from packages.core.ai.runtime.skills import (
     resolve_skill_descriptors,
     runtime_filter_skills_for_installed_ledgers,
@@ -74,21 +69,10 @@ def test_builtin_ledger_skill_declares_its_contract_and_tools(slug: str) -> None
         "visualize_workspace_ledgers",
     }
 
-    policy = SkillInvocationPolicy.from_config(config["invocation_policy"])
-    assert policy.mode == REQUIRED_BEFORE_ANSWER
-    assert policy.result_authority == PRIMARY_SOURCE
-    assert "regardless of language" in policy.semantic_trigger
-
-
-def test_relationship_skill_is_general_and_has_contact_storage_rules() -> None:
-    prompt = (ROOT / "relationship-ledger/SKILL.md").read_text(encoding="utf-8")
-
-    assert "contact_points" in prompt
-    assert "suppression_scope" in prompt
-    assert "all_channels" in prompt
-    assert "shallow-merges" in prompt
-    assert "creator_crm_v1" not in prompt
-    assert "creator-crm" not in prompt
+    assert "invocation_policy" not in config
+    assert config["capability_companion"] == {
+        "tool_names": [read_tool, record_tool]
+    }
 
 
 def _skill(slug: str, contract_id: str | None) -> SimpleNamespace:
@@ -190,7 +174,10 @@ async def test_builtin_ledger_skill_config_is_seeded(db_session) -> None:
         assert seeded[slug].is_public is True
         assert seeded[slug].config["ledger_contracts"] == [contract_id]
         assert seeded[slug].config["execution_mode"] == "instructions_only"
-        assert seeded[slug].config["invocation_policy"]["mode"] == REQUIRED_BEFORE_ANSWER
+        assert "invocation_policy" not in seeded[slug].config
+        assert seeded[slug].config["capability_companion"] == {
+            "tool_names": [_read_tool, _record_tool]
+        }
 
 
 @pytest.mark.asyncio
@@ -234,6 +221,17 @@ async def test_runtime_loads_only_the_installed_ledger_skill(db_session) -> None
     relationship_slugs = {descriptor.slug for descriptor in relationship_descriptors}
     assert "relationship-ledger" in relationship_slugs
     assert not ({"finance-ledger", "recruiting-ledger", "content-ledger"} & relationship_slugs)
+    relationship_descriptor = next(
+        descriptor
+        for descriptor in relationship_descriptors
+        if descriptor.slug == "relationship-ledger"
+    )
+    assert relationship_descriptor.metadata["capability_companion"] == {
+        "tool_names": [
+            "read_relationship_ledger",
+            "record_relationship_ledger",
+        ]
+    }
 
     no_ledger_descriptors = await resolve_skill_descriptors(
         db_session,

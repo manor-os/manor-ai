@@ -17,6 +17,7 @@ class ManorReadCapability(StrEnum):
     AGENTS = Permission.AGENTS_READ.value
     ENTITY = Permission.ENTITY_READ.value
     INTEGRATIONS = Permission.INTEGRATIONS_READ.value
+    CRM = "crm.read"
     PEOPLE = Permission.USERS_READ.value
     BILLING = Permission.ADMIN_BILLING.value
     SETTINGS = Permission.ADMIN_SETTINGS.value
@@ -32,7 +33,6 @@ class ManorReadCapabilityFactory:
         "list_tasks": ManorReadCapability.TASKS,
         "get_task_details": ManorReadCapability.TASKS,
         "list_task_categories": ManorReadCapability.TASKS,
-        "get_task_health": ManorReadCapability.TASKS,
         "list_documents": ManorReadCapability.DOCUMENTS,
         "search_documents": ManorReadCapability.DOCUMENTS,
         "list_workspace_artifacts": ManorReadCapability.DOCUMENTS,
@@ -40,23 +40,19 @@ class ManorReadCapabilityFactory:
         "list_document_folders": ManorReadCapability.DOCUMENTS,
         "list_document_groups": ManorReadCapability.DOCUMENTS,
         "list_agents": ManorReadCapability.AGENTS,
-        "get_agent": ManorReadCapability.AGENTS,
-        "list_agent_tools": ManorReadCapability.AGENTS,
         "get_dashboard_summary": ManorReadCapability.ENTITY,
-        "get_system_health": ManorReadCapability.SETTINGS,
-        "list_token_usage": ManorReadCapability.BILLING,
         "list_workspaces": ManorReadCapability.WORKSPACES,
         "get_workspace": ManorReadCapability.WORKSPACES,
         "get_workspace_daily_summary": ManorReadCapability.WORKSPACES,
         "get_operating_model": ManorReadCapability.WORKSPACES,
         "get_workspace_agents": ManorReadCapability.WORKSPACES,
         "get_goal_status": ManorReadCapability.WORKSPACES,
+        "get_stat_status": ManorReadCapability.WORKSPACES,
         "get_workspace_activity": ManorReadCapability.WORKSPACES,
         "get_workspace_dashboard": ManorReadCapability.WORKSPACES,
         "get_entity_info": ManorReadCapability.ENTITY,
         "list_integrations": ManorReadCapability.INTEGRATIONS,
         "list_ready_integrations": ManorReadCapability.INTEGRATIONS,
-        "list_users": ManorReadCapability.PEOPLE,
         "list_skills": ManorReadCapability.DISCOVERY,
         "get_skill": ManorReadCapability.DISCOVERY,
         "list_scheduled_jobs": ManorReadCapability.SETTINGS,
@@ -66,8 +62,17 @@ class ManorReadCapabilityFactory:
         "list_staff": ManorReadCapability.PEOPLE,
         "get_staff": ManorReadCapability.PEOPLE,
         "list_roles": ManorReadCapability.PEOPLE,
-        "list_clients": ManorReadCapability.PEOPLE,
-        "get_client": ManorReadCapability.PEOPLE,
+        "list_clients": ManorReadCapability.CRM,
+        "get_client": ManorReadCapability.CRM,
+        "get_crm_overview": ManorReadCapability.CRM,
+        "list_client_contacts": ManorReadCapability.CRM,
+        "list_client_activities": ManorReadCapability.CRM,
+        "list_client_opportunities": ManorReadCapability.CRM,
+        "list_client_followups": ManorReadCapability.CRM,
+        "list_crm_opportunities": ManorReadCapability.CRM,
+        "list_crm_followups": ManorReadCapability.CRM,
+        "list_client_deliveries": ManorReadCapability.CRM,
+        "list_client_relationships": ManorReadCapability.CRM,
         "list_orders": ManorReadCapability.PEOPLE,
         "get_order": ManorReadCapability.PEOPLE,
     }

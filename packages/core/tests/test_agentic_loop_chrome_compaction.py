@@ -2,39 +2,192 @@ import base64
 import importlib
 import json
 import logging
+from unittest.mock import patch
 
 import pytest
 
 from packages.core.ai.agentic_loop import _compact_tool_result_for_context
 from packages.core.ai.agentic_loop import _build_minimal_chrome_blocker_result
+from packages.core.ai.agentic_loop import agentic_loop
 from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
 
 
-@pytest.mark.asyncio
-async def test_chrome_screenshot_is_ephemeral_multimodal_input(monkeypatch):
-    screenshot_data_url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
-    llm_calls = 0
-    second_call_messages = []
-    callback_results = []
+def test_upload_candidate_keeps_executable_selector_verbatim():
+    from packages.core.ai.agentic_loop import _compact_chrome_candidate_with_keys
 
-    async def fake_completion(messages, tools, **kwargs):
-        nonlocal llm_calls, second_call_messages
+    selector = " > ".join(["div:nth-of-type(2)"] * 24 + ['input[type="file"]'])
+    candidate = {"selector": selector, "label": "Upload", "supported": True}
+    result = _compact_chrome_candidate_with_keys(
+        candidate,
+        ("selector", "label", "supported"),
+        string_chars=80,
+    )
+    assert result["selector"] == selector
+
+
+def test_minimal_upload_candidate_prefers_ref_and_keeps_fallback_lossless():
+    from packages.core.ai.agentic_loop import _compact_minimal_chrome_candidate_for_list
+
+    selector = " > ".join(["div:nth-of-type(2)"] * 24 + ['input[type="file"]'])
+    without_ref = {"ref": None, "selector": selector, "supported": True}
+    fallback = _compact_minimal_chrome_candidate_for_list("upload_candidates", without_ref)
+    assert fallback["selector"] == selector
+
+    with_ref = {**without_ref, "ref": "e9", "node_id": "e9"}
+    preferred = _compact_minimal_chrome_candidate_for_list("upload_candidates", with_ref)
+    assert preferred["ref"] == "e9"
+    assert "selector" not in preferred
+
+
+def test_read_page_recompaction_never_emits_partial_upload_selector():
+    selector = " > ".join(["div:nth-of-type(2)"] * 24 + ['input[type="file"]'])
+    payload = {
+        "ok": True,
+        "status": "read_page",
+        "snapshot_id": "snap-upload",
+        "tabId": 42,
+        "url": "https://example.test/compose",
+        "pageContent": "Many background posts. " * 3500,
+        "upload_candidates": [{
+            "ref": None,
+            "node_id": None,
+            "selector": selector,
+            "supported": True,
+            "label": "Video upload",
+        }],
+        "semantic_refs": [
+            {"ref": f"e{index}", "label": f"Background {index}", "selector": f"#background-{index}"}
+            for index in range(50)
+        ],
+    }
+    first = _compact_tool_result_for_context("mcp__chrome__read_page", json.dumps(payload))
+    for budget in (4000, 1800):
+        compacted = _compact_tool_result_for_context("mcp__chrome__read_page", first, max_chars=budget)
+        assert len(compacted) <= budget
+        parsed = json.loads(compacted)
+        candidates = parsed.get("upload_candidates", [])
+        assert all(item.get("selector") == selector for item in candidates)
+        assert candidates or parsed["_tool_result_truncated"]["omitted_executable_candidates"] > 0
+
+
+def test_upload_summary_preserves_frame_and_shadow_fallback_locators():
+    from packages.core.ai.agentic_loop import _compact_chrome_candidate_summary
+
+    selector = " > ".join(["div:nth-of-type(2)"] * 24 + ['input[type="file"]'])
+    frame_selector = " > ".join(["section:nth-child(3)"] * 15 + ["iframe"])
+    shadow_host = " > ".join(["main:nth-child(2)"] * 15 + ["upload-widget"])
+    candidate = {
+        "ref": None, "selector": selector, "frame_selector": frame_selector,
+        "shadow_host": shadow_host, "label": "Upload",
+    }
+    summary = _compact_chrome_candidate_summary({"upload_candidates": [candidate]})
+    assert summary["upload_candidates"][0]["selector"] == selector
+    assert summary["upload_candidates"][0]["frame_selector"] == frame_selector
+    assert summary["upload_candidates"][0]["shadow_host"] == shadow_host
+
+
+def test_oversized_upload_locator_is_omitted_whole_with_recovery_hint():
+    selector = " > ".join(["div:nth-of-type(2)"] * 160 + ['input[type="file"]'])
+    payload = {
+        "ok": True, "status": "read_page", "snapshot_id": "snap-upload",
+        "pageContent": "Background content. " * 4000,
+        "upload_candidates": [{"ref": None, "selector": selector, "supported": True}],
+    }
+    first = _compact_tool_result_for_context("mcp__chrome__read_page", json.dumps(payload))
+    compacted = _compact_tool_result_for_context("mcp__chrome__read_page", first, max_chars=1000)
+    assert len(compacted) <= 1000
+    result = json.loads(compacted)
+    assert "upload_candidates" not in result or not result["upload_candidates"]
+    assert result["_tool_result_truncated"]["omitted_executable_candidates"] == 1
+    assert result["next_required_tool"] == "mcp__chrome__read_page"
+
+
+@pytest.mark.parametrize("container", ["target_resolution", "state_hint", "action"])
+def test_nested_action_locators_survive_context_compaction(container):
+    from packages.core.ai.agentic_loop import _compact_chrome_action_semantics
+
+    selector = " > ".join(["section:nth-child(3)"] * 30 + ['input[type="file"]'])
+    target = {
+        "selector": selector, "frame_selector": "iframe[data-editor]",
+        "shadow_host": "media-upload", "shadow_selector": selector,
+    }
+    assert _compact_chrome_action_semantics({"target": target})["target"] == target
+    payload = {
+        "ok": False, "status": "read_page_required", "snapshot_id": "snap-upload",
+        "reason": "selector_not_unique", "pageContent": "Background content. " * 4000,
+        container: {"target": target},
+    }
+    first = _compact_tool_result_for_context("mcp__chrome__click_element", json.dumps(payload))
+    for budget in (4000, 2200):
+        compacted = _compact_tool_result_for_context("mcp__chrome__click_element", first, max_chars=budget)
+        result = json.loads(compacted)
+        assert len(compacted) <= budget
+        if container in result:
+            assert result[container]["target"] == target
+        else:
+            assert result["next_required_tool"] == "mcp__chrome__read_page"
+    assert json.loads(first)[container]["target"]["selector"] == selector
+
+
+@pytest.mark.parametrize("container", ["target_resolution", "state_hint", "action"])
+def test_oversized_nested_locator_requires_fresh_observation_when_omitted(container):
+    selector = " > ".join(["section:nth-child(3)"] * 160 + ['input[type="file"]'])
+    payload = {
+        "ok": False, "status": "read_page_required", "reason": "selector_not_unique",
+        container: {"target": {"selector": selector}},
+        "pageContent": "Background content. " * 4000,
+    }
+    result = json.loads(_compact_tool_result_for_context(
+        "mcp__chrome__click_element", json.dumps(payload), max_chars=1000,
+    ))
+    assert container not in result
+    assert result["next_required_tool"] == "mcp__chrome__read_page"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_rounds", [3, 4])
+async def test_latest_chrome_screenshot_survives_handoff_without_persisting_pixels(monkeypatch, max_rounds):
+    screenshot_urls = [
+        "data:image/png;base64," + base64.b64encode(b"\x89PNG\r\n\x1a\n" + label).decode()
+        for label in (b"first capture", b"latest capture")
+    ]
+    llm_calls = 0
+    observed_messages = []
+    callback_results = []
+    captures = 0
+
+    async def fake_completion(messages, tools=None, **kwargs):
+        nonlocal llm_calls
         llm_calls += 1
-        if llm_calls == 1:
+        observed_messages.append(messages)
+        if llm_calls <= 2:
             return (
                 "",
-                [{"id": "shot-1", "name": "mcp__chrome__screenshot", "arguments": {"tabId": 42}}],
+                [{"id": f"shot-{llm_calls}", "name": "mcp__chrome__screenshot", "arguments": {"tabId": 42}}],
                 {"prompt": 1, "completion": 1, "total": 2},
             )
-        second_call_messages = messages
+        if llm_calls == 3:
+            return (
+                "",
+                [{"id": "handoff", "name": "mcp__chrome__finalize_tabs", "arguments": {}}],
+                {"prompt": 1, "completion": 1, "total": 2},
+            )
         return "I can see the page.", None, {"prompt": 1, "completion": 1, "total": 2}
 
+    async def fake_text_completion(messages, **kwargs):
+        content, _, usage = await fake_completion(messages, **kwargs)
+        return content, usage
+
     async def fake_executor(name, args):
+        nonlocal captures
+        if name == "mcp__chrome__finalize_tabs":
+            return json.dumps({"ok": True, "status": "finalized", "kept_tab_ids": [42]})
+        captures += 1
         return json.dumps(
             {
                 "ok": True,
                 "tabId": 42,
-                "screenshot": {"dataUrl": screenshot_data_url},
+                "screenshot": {"dataUrl": screenshot_urls[captures - 1]},
             }
         )
 
@@ -43,6 +196,8 @@ async def test_chrome_screenshot_is_ephemeral_multimodal_input(monkeypatch):
 
     loop_module = importlib.import_module("packages.core.ai.agentic_loop")
     monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", fake_completion)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_text_completion", fake_text_completion)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", fake_text_completion)
     completions_module = importlib.import_module("packages.core.ai.runtime.completions")
     billing_module = importlib.import_module("packages.core.ai.runtime.billing")
 
@@ -60,29 +215,33 @@ async def test_chrome_screenshot_is_ephemeral_multimodal_input(monkeypatch):
             {
                 "type": "function",
                 "function": {
-                    "name": "mcp__chrome__screenshot",
+                    "name": name,
                     "parameters": {"type": "object"},
                 },
             }
+            for name in ("mcp__chrome__screenshot", "mcp__chrome__finalize_tabs")
         ],
         entity_id="entity-1",
         agent_id=None,
         tool_executor=fake_executor,
         on_tool_end=on_tool_end,
-        max_rounds=3,
+        max_rounds=max_rounds,
     )
 
-    image_blocks = [
-        block
-        for message in second_call_messages
-        if message.get("role") == "user" and isinstance(message.get("content"), list)
-        for block in message["content"]
-        if isinstance(block, dict) and block.get("type") == "image_url"
-    ]
-    assert image_blocks[0]["image_url"]["url"] == screenshot_data_url
-    assert "untrusted browser screenshot" in json.dumps(second_call_messages, ensure_ascii=False).lower()
-    assert screenshot_data_url not in json.dumps(result.messages, ensure_ascii=False)
-    assert all(screenshot_data_url not in callback for callback in callback_results)
+    assert llm_calls == 4
+    for messages, expected in zip(observed_messages[1:], [screenshot_urls[0], screenshot_urls[1], screenshot_urls[1]], strict=True):
+        image_urls = [
+            block["image_url"]["url"]
+            for message in messages
+            if message.get("role") == "user" and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if isinstance(block, dict) and block.get("type") == "image_url"
+        ]
+        assert image_urls == [expected]
+        assert "untrusted browser screenshot" in json.dumps(messages, ensure_ascii=False).lower()
+    for screenshot_url in screenshot_urls:
+        assert screenshot_url not in json.dumps(result.messages, ensure_ascii=False)
+        assert all(screenshot_url not in callback for callback in callback_results)
 
 
 @pytest.mark.asyncio
@@ -889,8 +1048,11 @@ def test_chrome_read_page_compaction_retains_late_page_content_action():
     parsed = json.loads(compacted)
 
     assert len(compacted) <= loop_module.CHROME_TOOL_RESULT_MAX_CHARS
-    assert any(item.get("ref") == "e27" for item in parsed["semantic_refs"])
-    assert "Create post" in parsed["pageContent"]
+    # The text excerpt may shrink as link evidence is retained. The late
+    # action still needs its complete semantic identity for the next call.
+    action = next(item for item in parsed["semantic_refs"] if item.get("ref") == "e27")
+    assert action["label"] == "Create post"
+    assert action["href"] == "/preload/sharebox/"
 
 
 def test_chrome_minimal_compaction_retains_dialog_semantic_refs():
@@ -2097,3 +2259,372 @@ def test_chrome_ultra_minimal_compaction_preserves_one_actionable_ref():
             "label": "Add a title that describes your video...",
         }
     ]
+
+
+def test_chrome_ultra_minimal_observation_keeps_active_editor_controls_and_states():
+    loop = importlib.import_module("packages.core.ai.agentic_loop")
+    fields = [
+        {"ref": "e-title", "role": "textbox", "label": "Title", "value": "Untitled", "required": True},
+        {"ref": "e-body", "role": "textbox", "label": "Description", "value": ""},
+        {"ref": "e-choice", "role": "radio", "label": "Internal audience", "checked": False},
+        {"ref": "e-next", "role": "button", "label": "Next", "disabled": True},
+    ]
+    controls = [
+        {**item, "scope_id": "active-editor", "dialog_label": "Details", "frame_id": 7,
+         "selector": " > ".join(["div.editor"] * 100)}
+        for item in fields
+    ]
+    payload = {
+        "ok": True, "status": "read_page", "snapshot_id": "snap-editor", "tabId": 42,
+        "semantic_refs": [
+            *[{"ref": f"background-{i}", "role": "link", "label": "Help " * 100} for i in range(50)],
+            *controls,
+        ],
+        "input_candidates": controls[:2],
+        "dialog_candidates": [{"label": "Details", "field_refs": ["e-title", "e-body"],
+                               "submit_refs": ["e-next"]}],
+        "next_actions": [{"tool": "fill_or_select", "ref": "e-body", "label": "Description"}],
+    }
+    compacted = loop._build_ultra_minimal_chrome_action_result(
+        "mcp__chrome__read_page", payload, digest="digest",
+    )
+    refs = {item["ref"]: item for item in compacted.get("semantic_refs", [])}
+    assert set(refs).issuperset(item["ref"] for item in fields)
+    assert refs["e-title"]["value"] == "Untitled"
+    assert refs["e-title"]["required"] is True
+    assert refs["e-choice"]["checked"] is False
+    assert refs["e-next"]["disabled"] is True
+    assert all(refs[item["ref"]]["frame_id"] == 7 for item in fields)
+    assert compacted["snapshot_id"] == "snap-editor"
+    assert compacted["_tool_result_truncated"]["omitted_semantic_refs"] > 0
+    assert len(json.dumps(compacted, ensure_ascii=False)) <= 12_000
+    assert all("selector" not in refs[item["ref"]] for item in fields)
+
+
+def test_chrome_compaction_log_counts_top_level_refs_without_candidate_summary(caplog):
+    loop = importlib.import_module("packages.core.ai.agentic_loop")
+    result = json.dumps({"semantic_refs": [{"ref": "e-title", "role": "textbox"}]})
+    with caplog.at_level(logging.INFO, logger=loop.__name__):
+        loop._log_chrome_context_compaction("mcp__chrome__read_page", "original", result)
+    assert "candidate_refs=['e-title']" in caplog.text
+
+
+def _chrome_loop_schema(name: str) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": name,
+            "parameters": {"type": "object"},
+        },
+    }
+
+
+def _chrome_loop_tool_names(tools: list[dict]) -> list[str]:
+    return [str((schema.get("function") or {}).get("name") or "") for schema in tools]
+
+
+def test_chrome_task_ledger_after_successful_finalize_ignores_leftover_next_tool() -> None:
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    messages = [
+        {"role": "user", "content": "Finish the SauceDemo checkout."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "finalize-1",
+                "type": "function",
+                "function": {"name": "mcp__chrome__finalize_tabs", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "finalize-1",
+            "content": json.dumps({
+                "ok": True,
+                "status": "finalized",
+                "next_required_tool": "mcp__chrome__read_page",
+                "tabId": 42,
+            }),
+        },
+    ]
+
+    ledger_text = loop_module._chrome_task_ledger_from_messages(messages)
+    ledger = json.loads(ledger_text.split("[Chrome task ledger]\n", 1)[1])
+
+    assert ledger["stage"] == "finalized"
+    assert ledger["next"] == "answer_from_last_observation"
+    assert ledger["tab_id"] == 42
+
+
+def test_chrome_task_ledger_failed_finalize_keeps_next_required_tool() -> None:
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    messages = [
+        {"role": "user", "content": "Finish the SauceDemo checkout."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "finalize-1",
+                "type": "function",
+                "function": {"name": "mcp__chrome__finalize_tabs", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "finalize-1",
+            "content": json.dumps({
+                "ok": False,
+                "error": "tab_not_found",
+                "next_required_tool": "mcp__chrome__read_page",
+            }),
+        },
+    ]
+
+    ledger_text = loop_module._chrome_task_ledger_from_messages(messages)
+    ledger = json.loads(ledger_text.split("[Chrome task ledger]\n", 1)[1])
+
+    assert ledger["stage"] == "finalized"
+    assert ledger["next"] == "mcp__chrome__read_page"
+
+
+@pytest.mark.asyncio
+async def test_chrome_tools_are_hidden_after_successful_finalize_tabs():
+    seen_tool_names: list[list[str]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        seen_tool_names.append(_chrome_loop_tool_names(tools))
+        if len(seen_tool_names) == 1:
+            return (
+                "",
+                [{"id": "fin-1", "name": "mcp__chrome__finalize_tabs", "arguments": {}}],
+                {"total": 1},
+            )
+        return "Finished browser task.", None, {"total": 1}
+
+    async def fake_executor(name, args):
+        assert name == "mcp__chrome__finalize_tabs"
+        return json.dumps({"ok": True, "status": "finalized", "tabId": 42})
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        fake_completion,
+    ):
+        result = await agentic_loop(
+            system_prompt="Use Chrome tools when needed.",
+            user_message="Finish the browser task.",
+            tools=[
+                _chrome_loop_schema("mcp__chrome__read_page"),
+                _chrome_loop_schema("mcp__chrome__click_element"),
+                _chrome_loop_schema("mcp__chrome__finalize_tabs"),
+                _chrome_loop_schema("search_tools"),
+            ],
+            tool_executor=fake_executor,
+            max_rounds=4,
+        )
+
+    assert result.content == "Finished browser task."
+    assert any(name.startswith("mcp__chrome__") for name in seen_tool_names[0])
+    assert all(not name.startswith("mcp__chrome__") for name in seen_tool_names[1])
+    assert "search_tools" in seen_tool_names[1]
+
+
+@pytest.mark.asyncio
+async def test_search_tools_cannot_reinject_chrome_after_finalize():
+    seen_tool_names: list[list[str]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        seen_tool_names.append(_chrome_loop_tool_names(tools))
+        round_number = len(seen_tool_names)
+        if round_number == 1:
+            return (
+                "",
+                [{"id": "fin-1", "name": "mcp__chrome__finalize_tabs", "arguments": {}}],
+                {"total": 1},
+            )
+        if round_number == 2:
+            return (
+                "",
+                [{"id": "search-1", "name": "search_tools", "arguments": {"query": "chrome"}}],
+                {"total": 1},
+            )
+        return "The checkout is complete.", None, {"total": 1}
+
+    async def fake_executor(name, args):
+        if name == "mcp__chrome__finalize_tabs":
+            return json.dumps({"ok": True, "status": "finalized"})
+        if name == "search_tools":
+            return json.dumps({
+                "loaded_tools": ["mcp__chrome__read_page"],
+                "matches": [{
+                    "name": "mcp__chrome__read_page",
+                    "available": True,
+                    "schema": _chrome_loop_schema("mcp__chrome__read_page"),
+                }],
+            })
+        raise AssertionError(f"Unexpected tool: {name}")
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        fake_completion,
+    ):
+        await agentic_loop(
+            system_prompt="Use Chrome tools when needed.",
+            user_message="Finish the browser task.",
+            tools=[
+                _chrome_loop_schema("mcp__chrome__finalize_tabs"),
+                _chrome_loop_schema("search_tools"),
+            ],
+            tool_executor=fake_executor,
+            max_rounds=4,
+        )
+
+    assert len(seen_tool_names) == 3
+    assert all(not name.startswith("mcp__chrome__") for name in seen_tool_names[1])
+    assert all(not name.startswith("mcp__chrome__") for name in seen_tool_names[2])
+    assert "search_tools" in seen_tool_names[2]
+
+
+@pytest.mark.asyncio
+async def test_invoke_skill_tabs_finalized_hides_chrome_on_next_round():
+    seen_tool_names: list[list[str]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        seen_tool_names.append(_chrome_loop_tool_names(tools))
+        if len(seen_tool_names) == 1:
+            return (
+                "",
+                [{"id": "skill-1", "name": "invoke_skill", "arguments": {"skill": "chrome"}}],
+                {"total": 1},
+            )
+        return "Skill finished.", None, {"total": 1}
+
+    async def fake_executor(name, args):
+        assert name == "invoke_skill"
+        return json.dumps({
+            "ok": True,
+            "chrome_outcome": {"evidence": [{"tabs_finalized": True}]},
+        })
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        fake_completion,
+    ):
+        await agentic_loop(
+            system_prompt="Use Chrome tools when needed.",
+            user_message="Run the Chrome skill.",
+            tools=[
+                _chrome_loop_schema("invoke_skill"),
+                _chrome_loop_schema("mcp__chrome__read_page"),
+                _chrome_loop_schema("mcp__chrome__finalize_tabs"),
+            ],
+            tool_executor=fake_executor,
+            max_rounds=4,
+        )
+
+    assert "mcp__chrome__read_page" in seen_tool_names[0]
+    assert all(not name.startswith("mcp__chrome__") for name in seen_tool_names[1])
+    assert "invoke_skill" in seen_tool_names[1]
+
+
+def test_failed_finalize_result_does_not_count_as_tabs_finalized() -> None:
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    failed = json.dumps({"ok": False, "error": "tab_not_found"})
+    assert loop_module._chrome_tool_result_tabs_finalized(
+        "mcp__chrome__finalize_tabs",
+        failed,
+    ) is False
+    assert loop_module._chrome_tabs_finalized_in_run(
+        [
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "fin-1",
+                    "type": "function",
+                    "function": {"name": "mcp__chrome__finalize_tabs"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "fin-1", "content": failed},
+        ]
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_failed_finalize_keeps_chrome_tools():
+    seen_tool_names: list[list[str]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        seen_tool_names.append(_chrome_loop_tool_names(tools))
+        return "Continue from the failed finalize.", None, {"total": 1}
+
+    async def fake_executor(name, args):
+        raise AssertionError(f"Unexpected tool: {name}")
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        fake_completion,
+    ):
+        await agentic_loop(
+            system_prompt="Use Chrome tools when needed.",
+            user_message="Retry the browser task.",
+            initial_messages=[
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "fin-1",
+                        "type": "function",
+                        "function": {"name": "mcp__chrome__finalize_tabs", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "fin-1",
+                    "content": json.dumps({"ok": False, "error": "tab_not_found"}),
+                },
+            ],
+            tools=[
+                _chrome_loop_schema("mcp__chrome__read_page"),
+                _chrome_loop_schema("mcp__chrome__finalize_tabs"),
+                _chrome_loop_schema("search_tools"),
+            ],
+            tool_executor=fake_executor,
+            max_rounds=2,
+        )
+
+    assert seen_tool_names
+    assert "mcp__chrome__finalize_tabs" in seen_tool_names[0]
+    assert "mcp__chrome__read_page" in seen_tool_names[0]
+
+
+@pytest.mark.asyncio
+async def test_chrome_runtime_metadata_finalized_hides_chrome_on_first_round():
+    seen_tool_names: list[list[str]] = []
+
+    async def fake_completion(messages, tools, **kwargs):
+        seen_tool_names.append(_chrome_loop_tool_names(tools))
+        return "Already finished.", None, {"total": 1}
+
+    async def fake_executor(name, args):
+        raise AssertionError(f"Unexpected tool: {name}")
+
+    with patch(
+        "packages.core.ai.agentic_loop.runtime_execute_agentic_round_tool_completion",
+        fake_completion,
+    ):
+        await agentic_loop(
+            system_prompt="Use Chrome tools when needed.",
+            user_message="Continue the browser task.",
+            tools=[
+                _chrome_loop_schema("mcp__chrome__read_page"),
+                _chrome_loop_schema("mcp__chrome__finalize_tabs"),
+                _chrome_loop_schema("search_tools"),
+            ],
+            tool_executor=fake_executor,
+            metadata={"chrome_runtime_contract_v1": {"finalized": True}},
+            max_rounds=2,
+        )
+
+    assert seen_tool_names
+    assert all(not name.startswith("mcp__chrome__") for name in seen_tool_names[0])
+    assert "search_tools" in seen_tool_names[0]

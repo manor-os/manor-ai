@@ -198,3 +198,91 @@ def test_genuine_skill_binding_is_not_coerced_to_mcp():
     assert b["capability_type"] == "skill"
     assert b.get("skill_key") == "weekly_report_writer"
     assert "integration_key" not in b
+
+
+# ── owner_scope defaulting (prod card "发布 X post") ──────────────────────────
+#
+# The model drafted one MCP binding — ``integration_key='x'``,
+# ``allowed_tools=['create_tweet']`` — and no owner at all. Every prompt that
+# describes ``capability_binding.upsert`` names ``capability_type`` and
+# ``integration_key`` and stopped there, so the model did too. The draft then
+# failed validation with ``capability_bindings[8].owner_scope binding must be
+# owned by …`` and the review card greyed out Approve with nothing the operator
+# could do. On the draft path a missing owner means the workspace agent.
+
+
+def _x_patch(**binding) -> dict:
+    payload = {
+        "binding": {
+            "capability_type": "mcp",
+            "integration_key": "x",
+            "allowed_tools": ["create_tweet"],
+            **binding,
+        }
+    }
+    return {"op": "capability_binding.upsert", "payload": payload}
+
+
+def _only_binding(state: dict) -> dict:
+    bindings = state.get("capability_bindings") or []
+    assert len(bindings) == 1, bindings
+    return bindings[0]
+
+
+def test_omitted_owner_scope_defaults_to_workspace_agent_and_validates():
+    b = _only_binding(_apply_single_patch({}, _x_patch()))
+    assert b["owner_scope"] == "workspace_agent"
+    assert "unscoped" not in b["binding_key"]
+    assert validate_runtime_capability_binding(b, path="capability_bindings[0]") == []
+
+
+def test_omitted_owner_scope_defaults_in_bindings_list_shape_too():
+    # ``payload.bindings=[...]`` bypasses ``_binding_from_upsert_patch``; the
+    # default has to apply on the shared upsert path, not the alias merge.
+    patch = {
+        "op": "capability_binding.upsert",
+        "payload": {"bindings": [
+            {"capability_type": "mcp", "integration_key": "x", "scope": "workspace"},
+            {"capability_type": "mcp", "integration_key": "chrome"},
+        ]},
+    }
+    bindings = _apply_single_patch({}, patch).get("capability_bindings") or []
+    assert [b["owner_scope"] for b in bindings] == ["workspace_agent", "workspace_agent"]
+    assert all("scope" not in b for b in bindings)
+    assert len({b["binding_key"] for b in bindings}) == 2
+
+
+def test_owner_scope_synonyms_map_to_runtime_scopes():
+    for spelling in ("workspace", "Workspace-Agent", "master", "global"):
+        b = _only_binding(_apply_single_patch({}, _x_patch(owner_scope=spelling)))
+        assert b["owner_scope"] == "workspace_agent", spelling
+    b = _only_binding(_apply_single_patch({}, _x_patch(owner="workspace")))
+    assert b["owner_scope"] == "workspace_agent"
+    assert "owner" not in b
+
+
+def test_owner_identifiers_imply_their_scope():
+    b = _only_binding(_apply_single_patch({}, _x_patch(service_key="marketing")))
+    assert b["owner_scope"] == "service"
+    assert validate_runtime_capability_binding(
+        b, path="capability_bindings[0]", service_keys={"marketing"},
+    ) == []
+    b = _only_binding(_apply_single_patch({}, _x_patch(agent_id="agent_1")))
+    assert b["owner_scope"] == "agent"
+    b = _only_binding(_apply_single_patch({}, _x_patch(task_id="task_1")))
+    assert b["owner_scope"] == "task"
+
+
+def test_unknown_explicit_owner_scope_is_left_for_validation():
+    # A value that is not a known scope or synonym is not guessed at: the
+    # validator must still reject it so the model is told to fix the draft.
+    b = _only_binding(_apply_single_patch({}, _x_patch(owner_scope="x_marketing_team")))
+    assert b["owner_scope"] == "x_marketing_team"
+    errors = validate_runtime_capability_binding(b, path="capability_bindings[0]")
+    assert [e["path"] for e in errors] == ["capability_bindings[0].owner_scope"]
+
+
+def test_explicit_valid_owner_scope_is_untouched():
+    b = _only_binding(_apply_single_patch({}, _x_patch(owner_scope="service", service_key="marketing")))
+    assert b["owner_scope"] == "service"
+    assert b["service_key"] == "marketing"

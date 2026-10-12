@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from sqlalchemy import delete, desc, select, text
+from sqlalchemy import Integer, cast, delete, desc, func, literal, select, text, update
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -520,6 +520,56 @@ async def start_user_session_compat(
         )
 
 
+async def _touch_live_leased_heartbeat(
+    db: AsyncSession, *, session_id: str, entity_id: str, user_id: str,
+    lease_id: str, now: datetime,
+) -> bool:
+    """Renew one live claim after the lifecycle lock, without a cleanup scan.
+
+    Scope and expiration are checked in SQL, not cached. The caller already
+    holds the same scope lock as start/close/cleanup. Missing or expired leases
+    fall through to that existing lifecycle path; they cannot be recreated.
+    """
+    live_lease = select(UserSessionLease.id).where(
+        UserSessionLease.id == lease_id,
+        UserSessionLease.session_id == session_id,
+        UserSessionLease.entity_id == entity_id,
+        UserSessionLease.user_id == user_id,
+        UserSessionLease.expires_at > now,
+    ).exists()
+    row = (await db.execute(
+        update(UserSessionLog).where(
+            UserSessionLog.id == session_id,
+            UserSessionLog.entity_id == entity_id,
+            UserSessionLog.user_id == user_id,
+            live_lease,
+        ).values(
+            status="active", ended_at=None, last_seen_at=now,
+            duration_seconds=cast(func.greatest(0, func.floor(
+                func.extract("epoch", literal(now) - UserSessionLog.started_at),
+            )), Integer),
+            heartbeat_count=func.coalesce(UserSessionLog.heartbeat_count, 0) + 1,
+        ).returning(UserSessionLog).execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if row is None:
+        return False
+    renewed = (await db.execute(
+        update(UserSessionLease).where(
+            UserSessionLease.id == lease_id,
+            UserSessionLease.session_id == session_id,
+            UserSessionLease.entity_id == entity_id,
+            UserSessionLease.user_id == user_id,
+            UserSessionLease.expires_at > now,
+        ).values(expires_at=_session_lease_expiry(now)).returning(UserSessionLease.id)
+    )).scalar_one_or_none()
+    if renewed is None:
+        # An out-of-contract writer changed the claim despite the scope lock.
+        # Abort the caller's transaction instead of returning a success that
+        # could commit a half-renewed usage session.
+        raise RuntimeError("Session lease changed during heartbeat")
+    return True
+
+
 async def touch_user_session(
     db: AsyncSession,
     *,
@@ -544,6 +594,13 @@ async def touch_user_session(
             user_id=user_id,
         )
     now = datetime.now(timezone.utc)
+    bind = db.get_bind()
+    if lease_id and viewing is None and bind is not None and bind.dialect.name == "postgresql":
+        if await _touch_live_leased_heartbeat(
+            db, session_id=session_id, entity_id=entity_id, user_id=user_id,
+            lease_id=lease_id, now=now,
+        ):
+            return True
     if lease_id:
         await _prune_expired_session_leases(
             db,

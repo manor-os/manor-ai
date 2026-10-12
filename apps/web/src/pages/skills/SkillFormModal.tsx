@@ -1,3 +1,4 @@
+import { invalidateCatalogQueries } from "../../lib/catalogInvalidation";
 import { useEffect, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import Modal from "../../components/ui/Modal";
@@ -58,6 +59,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
   const [category, setCategory] = useState("");
   const [tools, setTools] = useState("");
   const [outputFormat, setOutputFormat] = useState("text");
+  const [executionType, setExecutionType] = useState("");
 
   // ── Bundle files (scripts/, references/, requirements.txt) ──
   const [bundleFiles, setBundleFiles] = useState<BundleFile[]>([]);
@@ -75,6 +77,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
       setCategory((skill.category as string) || "");
       setTools(Array.isArray(skill.tools) ? (skill.tools as string[]).join(", ") : "");
       setOutputFormat((skill.output_format as string) || "text");
+      setExecutionType((skill.config?.type as string) || "");
       setBundleFiles([]);
       setFilesLoaded(false);
       setFilesLoading(true);
@@ -107,6 +110,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
       setCategory("");
       setTools("");
       setOutputFormat("text");
+      setExecutionType("");
       setBundleFiles([]);
       setFilesLoading(false);
       setFilesLoaded(true);
@@ -116,7 +120,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
   const createMutation = useMutation({
     mutationFn: (data: Record<string, unknown>) => api.skills.create(data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      invalidateCatalogQueries(queryClient, "skills");
       toast.success(t("page.skills.skill_created"));
       onClose();
     },
@@ -127,7 +131,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
     mutationFn: ({ id, data }: { id: string; data: Record<string, unknown> }) =>
       api.skills.update(id, data),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      invalidateCatalogQueries(queryClient, "skills");
       onClose();
     },
     onError: (e: any) => toast.error(e?.message || t("page.skills.failed_update_skill")),
@@ -143,6 +147,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
       tools: tools.split(",").map((x) => x.trim()).filter(Boolean),
       output_format: outputFormat,
     };
+    if (!skill || executionType !== (skill.config?.type || "")) payload.type = executionType;
     // Bundle files use replace semantics — only send them when they actually
     // loaded, otherwise a failed load would wipe the bundle on save.
     if (filesLoaded && (skill ? true : bundleFiles.length > 0)) {
@@ -226,7 +231,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
                 toast.error(e?.message || t("page.skills.failed_create_skill"));
                 throw e;
               }
-              queryClient.invalidateQueries({ queryKey: ["skills"] });
+              invalidateCatalogQueries(queryClient, "skills");
               toast.success(t("page.skills.skill_created"));
               onClose();
             }}
@@ -246,7 +251,7 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
                 toast.error(e?.message || t("page.skills.failed_update_skill"));
                 throw e;
               }
-              queryClient.invalidateQueries({ queryKey: ["skills"] });
+              invalidateCatalogQueries(queryClient, "skills");
               toast.success(t("page.skills.skill_updated"));
               onClose();
             }}
@@ -279,6 +284,15 @@ export function SkillFormModal({ skill, open, onClose }: SkillFormModalProps) {
             onChange={setBundleFiles}
             loading={filesLoading}
           />
+          <div>
+            <label htmlFor="skill-execution-type" className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">Execution method</label>
+            <select id="skill-execution-type" value={executionType} onChange={(event) => setExecutionType(event.target.value)} className="manor-input">
+              <option value="">Automatic</option>
+              <option value="prompt">Agent follows instructions</option>
+              <option value="runtime_guidance">Agent follows runtime guidance</option>
+              <option value="sandbox">Run bundled scripts</option>
+            </select>
+          </div>
           <Input
             label={t("page.skill_form.tools_csv")}
             value={tools}

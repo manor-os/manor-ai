@@ -42,8 +42,11 @@ the audit trail off).
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Awaitable, Callable, Sequence
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.notification_types import (
     NotificationChannel,
@@ -387,12 +390,14 @@ async def dispatch_persisted_notification(
     delivered_target_keys: set[str] | None = None,
     before_external_target: Callable[[], Awaitable[bool]] | None = None,
     on_target_delivered: Callable[[str], Awaitable[None]] | None = None,
+    db: AsyncSession | None = None,
 ) -> None:
     """Fan out an already committed Notification without creating another."""
     from packages.core.database import async_session
     from packages.core.services.notification_routing import (
         resolve_channel_targets,
     )
+    from packages.core.services.channel_credentials import use_channel_credential_session
 
     severity = payload.get("severity")
     actions = payload.get("actions")
@@ -446,9 +451,9 @@ async def dispatch_persisted_notification(
         if not explicit_external_channels:
             return
 
-    async with async_session() as db:
+    async with (nullcontext(db) if db is not None else async_session()) as routing_db:
         targets = await resolve_channel_targets(
-            db,
+            routing_db,
             entity_id=entity_id,
             user_id=user_id,
             kind=type,
@@ -481,9 +486,9 @@ async def dispatch_persisted_notification(
                 + ", ".join(missing_channel_types)
             )
 
-    # Phase 2: dispatch external channels. Each gets its own short-lived
-    # session so a single adapter failure (or slow network) doesn't hold
-    # the others up — and the in-app row is already durable.
+    # Phase 2: dispatch external channels sequentially. A supplied coordinator
+    # session retains the current target's authorization locks until its receipt
+    # commits; the next target is authorized again. The in-app row is durable.
     #
     # When actions are present we let the adapter format the prompt — it
     # may use native UI (Telegram inline keyboard, WhatsApp quick replies)
@@ -530,6 +535,7 @@ async def dispatch_persisted_notification(
                     text=rendered,
                     entity_id=entity_id,
                     user_id=user_id,
+                    **({"db": db} if db is not None else {}),
                 )
                 if not delivered:
                     delivery_errors.append(
@@ -538,17 +544,21 @@ async def dispatch_persisted_notification(
                 else:
                     await mark_target_delivered(target_key)
             continue
-        delivered = await _deliver_via_channel_gateway(
-            channel_contact_id=choice.contact.id,
-            text=rendered,
-            notification_id=notification_id,
-            entity_id=entity_id,
-            user_id=user_id,
-            actions=actions,
-            callback_kind=callback_kind,
-            callback_payload=callback_payload,
-            expires_in_seconds=expires_in_seconds,
-        )
+        # Authorization, adapter credential reads and receipts share the same
+        # transaction; nested sessions would wait on our own admission slot.
+        with use_channel_credential_session(db) if db is not None else nullcontext():
+            delivered = await _deliver_via_channel_gateway(
+                channel_contact_id=choice.contact.id,
+                text=rendered,
+                notification_id=notification_id,
+                entity_id=entity_id,
+                user_id=user_id,
+                actions=actions,
+                callback_kind=callback_kind,
+                callback_payload=callback_payload,
+                expires_in_seconds=expires_in_seconds,
+                **({"db": db} if db is not None else {}),
+            )
         if not delivered:
             delivery_errors.append(
                 f"notification channel delivery failed for {choice.channel_type}"
@@ -567,6 +577,7 @@ async def _deliver_via_registered_email(
     text: str,
     entity_id: str,
     user_id: str,
+    db: AsyncSession | None = None,
 ) -> bool:
     """Send an email notification to the user's registered email address.
 
@@ -581,7 +592,7 @@ async def _deliver_via_registered_email(
         from packages.core.services.email_service import send_notification_email
 
         sent = await send_notification_email(to_address, title, text)
-        async with async_session() as db:
+        async with (nullcontext(db) if db is not None else async_session()) as db:
             db.add(MessageLog(
                 entity_id=entity_id,
                 direction="outbound",
@@ -615,10 +626,11 @@ async def _deliver_via_channel_gateway(
     callback_kind: str | None = None,
     callback_payload: dict | None = None,
     expires_in_seconds: int | None = None,
+    db: AsyncSession | None = None,
 ) -> bool:
     """Send one rendered notification through channel outbound delivery.
 
-    Loads the contact in a fresh session and hands it to
+    Loads the contact in the coordinator session (or an owned session) and hands it to
     ``send_outbound_to_contact`` which writes a MessageLog + invokes the
     matching channel adapter. Failures here are swallowed and logged so a
     broken provider can't take down the rest of the notification fan-out.
@@ -641,7 +653,7 @@ async def _deliver_via_channel_gateway(
     )
 
     try:
-        async with async_session() as db:
+        async with (nullcontext(db) if db is not None else async_session()) as db:
             contact = (await db.execute(
                 select(ChannelContact)
                 .join(

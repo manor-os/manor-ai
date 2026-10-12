@@ -1,0 +1,7 @@
+# Spreadsheet creation, editing, and data analysis.
+openpyxl>=3.1
+pandas>=2.2
+
+# OOXML validation helpers bundled with this skill.
+defusedxml>=0.7
+lxml>=5.0

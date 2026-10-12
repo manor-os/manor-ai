@@ -56,14 +56,28 @@ Workspace created/configured in Manor
 3. Create or update the real Workspace configuration. Do not start with a
    free-form Blueprint JSON unless the task is explicitly a migration.
 4. Export with `export_workspace()` and run the portable payload validator.
+   For HTTP tooling, use `POST /api/v1/workspaces/{id}/export-blueprint-payload`
+   with the portable export options. It returns validated configuration without
+   creating a Marketplace draft. Reserve `POST .../export-blueprint` for
+   intentional Marketplace authoring or tests of that persistence contract.
 5. Inspect the exported payload for source-row IDs, secrets, runtime state, and
    unsupported sections. Fail closed on any of them.
 6. Install the payload into an isolated Workspace in both simulation and live
    modes when both modes are in scope. Record install todos and materialized
    IDs; an install with blocking todos is not equivalent.
+   For same-account verification through `POST /api/v1/blueprints/install-payload`,
+   pass `workspace_source: {workspace_id, export_options}` alongside `payload`.
+   The server rechecks source access and exports the current configuration under
+   lifecycle/authorization locks; the complete payload must still match. A stale
+   or edited export returns 409 before creating a Workspace. Cloud does not
+   require a raw-import subscription for this verified source; ordinary Workspace
+   capacity and setup gates still apply. Arbitrary JSON imports retain their
+   existing subscription gate, and Marketplace installs retain their identity
+   and purchase checks.
 7. Export the installed Workspace again. Normalize only generated identifiers,
-   install timestamps, sandbox/provenance fields, and workspace-specific job
-   suffixes. Compare the runtime-projected sections, including Workflow graphs,
+   install timestamps, sandbox/provenance fields, workspace-specific job
+   suffixes, and generated local Skill aliases backed by the same exact external
+   source identity. Embedded and legacy slug-only bindings remain exact. Compare the runtime-projected sections, including Workflow graphs,
    Automation triggers, artifact contracts, and approval scopes. Verify
    one-shot install declarations
    (`contract.variables`, unresolved channel/session requirements,
@@ -82,12 +96,46 @@ Workspace created/configured in Manor
      source.json installed.json
    ```
 
-9. Add or update a regression test for every parity rule. At minimum run the
-   relevant `tests/test_blueprint_v11_e2e.py`, exporter/installer tests, and
+9. Verify each affected parity rule with existing regression coverage; add or
+   extend tests only for a coverage gap, following the repository
+   [testing policy](../../testing.md). At minimum run the relevant
+   `tests/test_blueprint_v11_e2e.py`, exporter/installer tests, and
    `git diff --check`.
 10. Only after the runtime projection round-trip and the separate one-shot
     install checks pass may the Blueprint be published, seeded as built-in
     content, or used as an upgrade source.
+
+## Verification resource lifecycle
+
+Use [verify_roundtrip.py](scripts/verify_roundtrip.py) for HTTP export, source-verified
+payload install, and re-export; see `--help`. It preserves the supplied source Workspace,
+records its newly installed Workspace in a run directory, and attempts cleanup
+on both success and failure. Retain the run directory until cleanup succeeds;
+retry pending cleanup with the same API origin and account. A lost install
+response is an uncertain outcome, not permission to install again or discover
+deletion targets by name. Resolve the exact receipt before declaring cleanup
+complete. Install todos and one-shot declarations still need their separate
+evidence; semantic comparison alone is not full acceptance.
+
+For variable personalization, the verifier uses the repository's canonical
+installer resolver, including supplied values, defaults and JSON types. Run it
+with the repository Python environment. It saves the resolved comparison input
+as `expected-payload.json` while sending the original export to source-verified
+installation; real configuration differences still fail comparison.
+
+When explicitly testing persisted Marketplace export, durably record every newly
+created Blueprint and Workspace ID as it is returned. In `finally`, delete only
+those Blueprint IDs through `DELETE /api/v1/blueprints/{id}`, then delete the
+temporary Workspaces through their existing DELETE API. Keep failed IDs for
+independent retry. Refreezing a pre-existing draft does not make it test-owned.
+Published or purchased assets require their normal lifecycle; never bypass its
+guards to force cleanup.
+
+Workspace DELETE is soft deletion; the recovery window and normal purge remain
+in force. Blueprint source provenance is not lifecycle ownership: deleting a
+Workspace must not cascade to independent authored/published Blueprints, and
+same-title or same-slug searches must not select cleanup targets. Verification
+journals belong outside portable payloads and Workspace configuration.
 
 ## Failure policy
 

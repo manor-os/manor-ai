@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
     ExecutionStepStatus,
+    without_rolled_up_coordinator_children,
 )
 from packages.core.budget import get_budget_status
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
@@ -254,7 +255,7 @@ async def _load_recent_plans(db: AsyncSession, workspace: Workspace, since: date
 
 
 async def _load_recent_steps(db: AsyncSession, workspace: Workspace, since: datetime) -> list[ExecutionStep]:
-    return list((await db.execute(
+    steps = list((await db.execute(
         select(ExecutionStep).where(
             ExecutionStep.workspace_id == workspace.id,
             ExecutionStep.entity_id == workspace.entity_id,
@@ -265,6 +266,11 @@ async def _load_recent_steps(db: AsyncSession, workspace: Workspace, since: date
             ),
         ).order_by(ExecutionStep.created_at.desc())
     )).scalars().all())
+    # Coordinator children are persisted so their transcript and cumulative
+    # usage survive retries.  Their parent already owns the roll-up exposed to
+    # workspace evaluation, so treating them as ordinary steps double-counts
+    # cost and inflates execution/governance health metrics.
+    return without_rolled_up_coordinator_children(steps)
 
 
 async def _load_recent_evidence(db: AsyncSession, workspace: Workspace, since: datetime) -> list[RuntimeEvidence]:

@@ -1,5 +1,7 @@
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
+import { preserveSelectedOption, taskBoardQueryEnabled, taskListQueryEnabled, taskRowsForActiveView } from "../lib/taskViewQueries";
 import { useState, useEffect, useCallback, useRef, useMemo, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../lib/api";
 import { useToastStore } from "../stores/toast";
@@ -31,6 +33,8 @@ import { TaskType } from "../lib/taskTypes";
 import TaskPropertiesPanel, { filterWorkspaceScopedAgents } from "../components/task/TaskPropertiesPanel";
 import TaskLogItem from "../components/task/TaskLogItem";
 import TaskRecoveryPanel from "../components/task/TaskRecoveryPanel";
+import { useTaskInputResolution } from "../components/task/useTaskInputResolution";
+import { currentTaskBlocker, taskBlockerView } from "../lib/taskBlocker";
 import ChatMarkdown from "../components/ChatMarkdown";
 import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
 import {
@@ -41,11 +45,13 @@ import {
 } from "../lib/fileReferences";
 import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
-import { inferRuntimeRuleFromText, shouldFallbackToWildcardRule } from "../lib/runtimeRules";
+import { inferRuntimeRuleFromText } from "../lib/runtimeRules";
 import { formatTaskDescriptionForDisplay, formatTaskOutputSummary, formatUserFacingLabel, formatUserFacingStructuredText, formatUserFacingText, friendlyPersonName } from "../lib/taskDisplay";
 import {
   canResumeLegacyAgentInput,
   hasPendingPlanDecision,
+  pendingTaskInputRequests,
+  needsEffectReconciliation,
   resumablePlanInputStep,
 } from "../lib/taskHitl";
 import {
@@ -131,6 +137,7 @@ const STATUS_OPTIONS = [
 ];
 
 const TASK_POLL_INTERVAL_MS = 60_000;
+const TASK_BOARD_PAGE_SIZE = 50;
 const ENTITY_LEVEL_WORKSPACE_FILTER = "__entity__";
 const LARGE_BOARD_COLUMN_THRESHOLD = 24;
 const LARGE_BOARD_GROUP_PREVIEW_COUNT = 3;
@@ -149,6 +156,27 @@ function hasLiveTasks(value: unknown): boolean {
           .flatMap(([, group]) => Array.isArray(group) ? group : [])
       : [];
   return tasks.some((task: any) => LIVE_TASK_STATUSES.has(String(task?.status || "")));
+}
+
+type TaskBoardPage = Awaited<ReturnType<typeof api.tasks.board>>;
+
+function nextTaskBoardOffset(page: TaskBoardPage, offset: number): number | undefined {
+  const nextOffset = offset + TASK_BOARD_PAGE_SIZE;
+  return Object.values(page._counts).some((count) => count > nextOffset) ? nextOffset : undefined;
+}
+
+function mergeTaskBoardPages(pages: TaskBoardPage[] | undefined): TaskBoardPage | undefined {
+  if (!pages?.length) return undefined;
+  // A task may change status between page requests. Keep only its latest copy.
+  const byId = new Map<string, Task>();
+  for (const page of pages) {
+    for (const [status, tasks] of Object.entries(page)) {
+      if (status !== "_counts" && Array.isArray(tasks)) for (const task of tasks) byId.set(task.id, task);
+    }
+  }
+  const board = { _counts: pages[pages.length - 1]._counts } as TaskBoardPage;
+  for (const task of byId.values()) (board[task.status] ??= []).push(task);
+  return board;
 }
 
 type TaskDependencyInfo = {
@@ -686,12 +714,12 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
   const pcfg = PRIORITY_CONFIG[task.priority] ?? PRIORITY_CONFIG[3];
   const overdue = isDeadlineOverdue(task.deadline, task.status);
   const isMaster = isMasterAgent(task.agent_id, task.agent_type);
-  const isAI = !!task.agent_id || isMaster;
+  const isAI = !!task.owner_agent_id || !!task.agent_id || isMaster;
   const assigneeName = friendlyPersonName(
-    task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME : task.agent_id ? t("page.tasks.ai_agent") : ""),
+    task.owner_agent_name || task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME : task.agent_id ? t("page.tasks.ai_agent") : ""),
     "",
   ) || null;
-  const assigneeAvatar = task.agent_avatar || task.assignee_avatar || null;
+  const assigneeAvatar = task.owner_agent_avatar || task.agent_avatar || task.assignee_avatar || null;
   const hasChecklist = !compact && (task.details as any)?.checklist_total > 0;
   const checkDone = (task.details as any)?.checklist_done || 0;
   const checkTotal = (task.details as any)?.checklist_total || 0;
@@ -700,7 +728,8 @@ function BoardTaskCard({ task, onClick, onOpenFull, agents, dimmed, compact, wsN
   const scopeName = wsName || task.workspace_name || (!task.workspace_id ? "Entity-level" : "");
   const scopeIsEntityLevel = !task.workspace_id;
   const statusConfig = TASK_STATUSES[task.status];
-  const statusLabel = statusConfig?.label || formatUserFacingLabel(task.status);
+  const blocker = currentTaskBlocker(task);
+  const statusLabel = blocker ? taskBlockerView(blocker).label : statusConfig?.label || formatUserFacingLabel(task.status);
 
   return (
     <div
@@ -905,6 +934,7 @@ function compareTaskListFallback(a: Task, b: Task): number {
 }
 
 function taskListOwnerName(task: Task, currentUser?: any, agentById?: Map<string, any>): string {
+  if (task.owner_agent_name) return task.owner_agent_name;
   const isMaster = isMasterAgent(task.agent_id, task.agent_type);
   const agentId = task.agent_id || (isMaster ? MANOR_AGENT_ID : "");
   const agent = agentId && agentById ? agentById.get(agentId) : null;
@@ -1379,6 +1409,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
     initialData: initialTask,
   });
   const task: Task = (liveTask as Task) || initialTask;
+  const inputResolution = useTaskInputResolution(task);
   const workspaceAgentIds = task.workspace_id
     ? workspaceAssignableAgents?.agent_ids || []
     : undefined;
@@ -1398,6 +1429,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
     enabled: !!latestPlan?.id,
   });
   const pendingPlanInputStep = resumablePlanInputStep(latestPlan, planSteps);
+  const pendingInputCards = pendingTaskInputRequests(task, latestPlan, planSteps);
   const canRespondToInput = Boolean(pendingPlanInputStep)
     || canResumeLegacyAgentInput(task, latestPlan, taskPlansResolved);
   const RECOVERY_EVENT_TYPES = new Set([
@@ -1407,6 +1439,7 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
     "ai_needs_replan",
   ]);
   const hasTaskRecoveryOrigin = Boolean(latestPlan)
+    || Boolean(currentTaskBlocker(task))
     || canRespondToInput
     || (logs as any[]).some((log: any) => RECOVERY_EVENT_TYPES.has(log?.log_type));
   const hasPendingTypedDecision = hasPendingPlanDecision(
@@ -1415,6 +1448,9 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
   );
   const planDecisionStateResolved = taskPlansResolved
     && (!latestPlan || planStepsResolved);
+  const reviewEffectsHref = needsEffectReconciliation(task, latestPlan)
+    ? `/chat?workspace=${encodeURIComponent(task.workspace_id!)}`
+    : undefined;
 
   useEffect(() => {
     if (typeof window === "undefined" || !window.location.hash) return;
@@ -1503,11 +1539,11 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
   const pcfg = PRIORITY_CONFIG[task.priority] ?? PRIORITY_CONFIG[3];
   const isMaster = isMasterAgent(task.agent_id, task.agent_type);
   const assigneeLabel = friendlyPersonName(
-    task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME : task.agent_id ? t("page.tasks.ai_agent") : task.assignee_id),
+    task.owner_agent_name || task.agent_name || task.assignee_name || (isMaster ? MANOR_AGENT_NAME : task.agent_id ? t("page.tasks.ai_agent") : task.assignee_id),
     "",
   );
-  const assigneeAvatar: string | null = task.agent_avatar || task.assignee_avatar || null;
-  const isAI = !!task.agent_id || isMaster;
+  const assigneeAvatar: string | null = task.owner_agent_avatar || task.agent_avatar || task.assignee_avatar || null;
+  const isAI = !!task.owner_agent_id || !!task.agent_id || isMaster;
   const comments = (logs as any[]).filter((l: any) => !l.log_type.startsWith("ai_"));
 
   return (
@@ -1603,18 +1639,24 @@ function InlineTaskDetail({ task: initialTask, agents, statusTransitions, return
         </button>
 
         {planDecisionStateResolved && hasTaskRecoveryOrigin && (
-          task.status !== "waiting_on_customer"
+          pendingInputCards.length > 0
+          || task.status !== "waiting_on_customer"
           || !hasPendingTypedDecision
           || canRespondToInput
         ) && (
           <TaskRecoveryPanel
             key={`${task.id}:${task.status}`}
+            task={task}
             status={task.status}
             logs={logs}
             comment={comment}
             inputStepId={pendingPlanInputStep?.id}
             inputPrompt={String(pendingPlanInputStep?.human_input_prompt || "")}
-            isPending={retryMut.isPending || hitlMut.isPending}
+            inputRequests={pendingInputCards}
+            inputResetToken={inputResolution.resetToken}
+            onResolveInput={inputResolution.resolve}
+            reviewEffectsHref={reviewEffectsHref}
+            isPending={retryMut.isPending || hitlMut.isPending || inputResolution.isPending}
             variant="compact"
             onRetry={(note) => retryMut.mutate(note)}
             onRespond={canRespondToInput
@@ -1797,6 +1839,11 @@ function KanbanColumn({
   totalCount,
   filtersActive,
   workspaceScoped,
+  hasRemoteMore,
+  loadingMore,
+  loadMoreError,
+  onLoadMore,
+  countIsPartial,
 }: {
   status: BoardColumnKey;
   tasks: Task[];
@@ -1817,6 +1864,11 @@ function KanbanColumn({
   totalCount?: number;
   filtersActive?: boolean;
   workspaceScoped?: boolean;
+  hasRemoteMore?: boolean;
+  loadingMore?: boolean;
+  loadMoreError?: boolean;
+  onLoadMore?: () => void;
+  countIsPartial?: boolean;
 }) {
   const meta = COLUMN_META[status] ?? { label: status, dot: "#a8a29e", headerBg: "rgba(168,162,158,0.08)", statuses: [], Icon: IconCircleDot };
   const canCollapse = _COLLAPSIBLE.has(status);
@@ -1901,7 +1953,7 @@ function KanbanColumn({
   useEffect(() => {
     setVisibleCount(PAGE_SIZE);
     setStandaloneExpanded(false);
-  }, [status, showAllDone, filtersActive, tasks.length]);
+  }, [status, showAllDone, filtersActive]);
 
   useEffect(() => {
     if (doneBoardManaged) {
@@ -1996,7 +2048,7 @@ function KanbanColumn({
           {!collapsed && <h3 className="task-board-column-title">{meta.label}</h3>}
         </div>
         <div className="task-board-column-header-meta">
-          <span className="task-board-column-count">{totalCount ?? tasks.length}</span>
+          <span className="task-board-column-count">{totalCount ?? tasks.length}{countIsPartial ? "+" : ""}</span>
           {canCollapse && (
             <span className="task-board-column-toggle" aria-hidden="true">
               {collapsed ? <IconChevronRight size={12} /> : <IconChevronDown size={12} />}
@@ -2178,6 +2230,23 @@ function KanbanColumn({
               Show {displayTasks.length - visibleCount} more
             </button>
           )}
+          {hasRemoteMore && (
+            <div className="task-board-pagination">
+              {loadMoreError && <span role="alert">{t("page.tasks.load_more_failed")}</span>}
+              <Button
+                variant="outline"
+                size="sm"
+                loading={loadingMore}
+                ariaBusy={loadingMore}
+                onClick={() => {
+                  setVisibleCount((count) => Math.max(count, displayTasks.length) + TASK_BOARD_PAGE_SIZE);
+                  onLoadMore?.();
+                }}
+              >
+                {t(loadMoreError ? "page.tasks.retry_load_more" : "page.tasks.load_more_tasks")}
+              </Button>
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -2258,17 +2327,18 @@ function TaskListView({
           const isMaster = isMasterAgent(task.agent_id, task.agent_type);
           const agentId = task.agent_id || (isMaster ? MANOR_AGENT_ID : "");
           const agent = agentId ? agentById.get(agentId) : null;
-          const isAI = Boolean(task.agent_id || isMaster);
-          const ownerName = isAI
+          const isAI = Boolean(task.owner_agent_id || task.agent_id || isMaster);
+          const ownerName = task.owner_agent_name || (isAI
             ? task.agent_name || agent?.name || (isMaster ? MANOR_AGENT_NAME : t("page.tasks.ai_agent"))
             : task.assignee_name
               || (task.assignee_id === currentUser?.id ? currentUser?.display_name || currentUser?.email : "")
-              || "Unassigned";
-          const ownerAvatar = isAI
+              || "Unassigned");
+          const ownerAvatar = task.owner_agent_avatar || (isAI
             ? task.agent_avatar || agent?.avatar_url || null
-            : task.assignee_avatar || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null) || null;
+            : task.assignee_avatar || (task.assignee_id === currentUser?.id ? currentUser?.avatar_url : null) || null);
           const workspaceName = taskListWorkspaceName(task, wsMap);
-          const statusLabel = TASK_STATUSES[task.status]?.label || formatUserFacingLabel(task.status);
+          const blocker = currentTaskBlocker(task);
+          const statusLabel = blocker ? taskBlockerView(blocker).label : TASK_STATUSES[task.status]?.label || formatUserFacingLabel(task.status);
           const due = taskDueText(task);
           return (
             <div
@@ -2320,6 +2390,7 @@ function TaskListView({
 /* ── main component ─────────────────────────────────────── */
 
 export default function Tasks() {
+  const catalogScope = useCatalogScope();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const drawerTaskId = searchParams.get("task") || "";
@@ -2573,11 +2644,16 @@ export default function Tasks() {
     setDraggingBoardColumn(null);
   }, []);
 
-  const { data: board, isLoading: boardLoading } = useQuery({
-    queryKey: ["taskBoard", wsFilter],
-    queryFn: () => api.tasks.board(apiWorkspaceFilter),
-    refetchInterval: (query) => hasLiveTasks(query.state.data) ? TASK_POLL_INTERVAL_MS : false,
+  const boardQuery = useInfiniteQuery({
+    queryKey: ["taskBoard", wsFilter, "pages"],
+    initialPageParam: 0,
+    queryFn: ({ pageParam, signal }) => api.tasks.board(apiWorkspaceFilter, pageParam, TASK_BOARD_PAGE_SIZE, signal),
+    getNextPageParam: (lastPage: TaskBoardPage, _pages: TaskBoardPage[], lastOffset: number) => nextTaskBoardOffset(lastPage, lastOffset),
+    refetchInterval: (query) => query.state.data?.pages.some(hasLiveTasks) ? TASK_POLL_INTERVAL_MS : false,
+    enabled: taskBoardQueryEnabled(view, boardMode),
   });
+  const boardLoading = boardQuery.isLoading;
+  const board = useMemo(() => mergeTaskBoardPages(boardQuery.data?.pages), [boardQuery.data]);
 
   const { data: taskConstants } = useQuery({
     queryKey: ["task-constants"],
@@ -2588,6 +2664,7 @@ export default function Tasks() {
     queryKey: ["tasks", "all", wsFilter],
     queryFn: () => api.tasks.list({ limit: 200, workspace_id: apiWorkspaceFilter }),
     refetchInterval: (query) => hasLiveTasks(query.state.data) ? TASK_POLL_INTERVAL_MS : false,
+    enabled: taskListQueryEnabled(view, boardMode),
   });
 
   const { data: workspaces } = useQuery({
@@ -2612,8 +2689,7 @@ export default function Tasks() {
   });
 
   const { data: agentsList } = useQuery({
-    queryKey: ["agents-list"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
   const {
     data: formWorkspaceAssignableAgents,
@@ -2924,15 +3000,14 @@ export default function Tasks() {
 
     if (requirement) {
       runtimeContext.instructions = requirement;
-      const inferred = inferRuntimeRuleFromText(requirement, shouldFallbackToWildcardRule(requirement));
-      if (inferred.patterns.length > 0) {
+      const inferred = inferRuntimeRuleFromText(requirement);
+      if (inferred.selectors.length > 0) {
         runtimeContext.rules = [{
           rule_key: `task_create_${Date.now()}`,
           rule_type: inferred.rule_type,
           description: requirement,
-          severity: inferred.field === "never_allow_actions" ? "high" : "medium",
-          action_patterns: inferred.patterns,
-          capability_patterns: inferred.capabilityPatterns,
+          severity: inferred.effect === "deny" ? "high" : "medium",
+          approval_selectors: inferred.selectors,
           source: "task_create",
           enabled: true,
         }];
@@ -3090,7 +3165,12 @@ export default function Tasks() {
 
   /* ── derived data ─────────────────────────────────── */
 
-  const allTasks: Task[] = taskList?.items ?? [];
+  const boardRows = useMemo<Task[]>(() => board
+    ? Object.entries(board)
+      .filter(([status, tasks]) => status !== "_counts" && Array.isArray(tasks))
+      .flatMap(([, tasks]) => tasks as Task[])
+    : [], [board]);
+  const allTasks = taskRowsForActiveView(view, boardMode, taskList?.items, boardRows);
   const selectedTaskForDrawer = selectedTask?.id === drawerTaskId ? selectedTask : null;
   const activeDetail = drawerTaskId ? (taskDetail ?? selectedTaskForDrawer) : null;
   const taskDrawerReturnTo = useMemo(() => {
@@ -3106,6 +3186,7 @@ export default function Tasks() {
     }
     return map;
   }, [agentsList]);
+  const ownerOptionCache = useRef(new Map<TaskOwnerFilter, TaskFilterOption<TaskOwnerFilter>>());
   const ownerFilterOptions = useMemo<TaskFilterOption<TaskOwnerFilter>[]>(() => {
     const ownerMap = new Map<TaskOwnerFilter, { label: string; icon: ReactNode; count: number }>();
     const addOwner = (key: TaskOwnerFilter, label: string, icon: ReactNode) => {
@@ -3152,17 +3233,24 @@ export default function Tasks() {
       }
     }
 
-    return [
+    const rawOptions: TaskFilterOption<TaskOwnerFilter>[] = [
       { key: "all", label: t("page.workspaces.filter_all"), icon: <IconUsers size={14} style={{ color: "#a8a29e" }} /> },
       ...Array.from(ownerMap.entries())
         .sort(([, a], [, b]) => b.count - a.count || a.label.localeCompare(b.label))
         .map(([key, value]) => ({
           key,
-          label: value.count > 0 ? `${value.label} (${value.count})` : value.label,
+          label: value.label,
           icon: value.icon,
         })),
     ];
-  }, [agentById, allTasks, currentUser?.avatar_url, currentUser?.display_name, currentUser?.email, currentUser?.id, wsFilter]);
+    for (const option of rawOptions) ownerOptionCache.current.set(option.key, option);
+    return preserveSelectedOption(rawOptions, ownerFilter, ownerOptionCache.current.get(ownerFilter)).map((option) => {
+      const count = ownerMap.get(option.key)?.count;
+      return taskListQueryEnabled(view, boardMode) && count && count > 0
+        ? { ...option, label: `${option.label} (${count})` }
+        : option;
+    });
+  }, [agentById, allTasks, boardMode, currentUser?.avatar_url, currentUser?.display_name, currentUser?.email, currentUser?.id, ownerFilter, view, wsFilter]);
   useEffect(() => {
     if (ownerFilter !== "all" && !ownerFilterOptions.some((option) => option.key === ownerFilter)) {
       setOwnerFilter("all");
@@ -3190,6 +3278,14 @@ export default function Tasks() {
     || ownerFilter !== "all"
     || dueFilter !== "all"
     || !!statusFocus;
+  // Status and workspace counts are authoritative; other filters run on loaded rows.
+  const boardRowFiltersActive = !!searchQuery.trim()
+    || wsFilter === ENTITY_LEVEL_WORKSPACE_FILTER
+    || priorityFilter !== null
+    || ownerFilter !== "all"
+    || dueFilter !== "all"
+    || statusFilter === "overdue"
+    || statusFocus === "overdue";
   const taskMatchesFilters = useCallback((task: Task) => {
     if (!matchesWorkspaceFilter(task, wsFilter)) return false;
     if (statusFocus && !matchesStatusFocus(task, statusFocus)) return false;
@@ -3329,16 +3425,11 @@ export default function Tasks() {
   // Workspace health strip data
   const wsTaskCounts: Record<string, number> = {};
   let entityLevelTaskCount = 0;
-  if (board) {
-    const boardTasks = Object.entries(board)
-      .filter(([key]) => key !== "_counts")
-      .flatMap(([, tasks]) => Array.isArray(tasks) ? tasks : []) as Task[];
-    for (const t of boardTasks) {
-      if (t.workspace_id) {
-        wsTaskCounts[t.workspace_id] = (wsTaskCounts[t.workspace_id] ?? 0) + 1;
-      } else {
-        entityLevelTaskCount += 1;
-      }
+  for (const task of allTasks) {
+    if (task.workspace_id) {
+      wsTaskCounts[task.workspace_id] = (wsTaskCounts[task.workspace_id] ?? 0) + 1;
+    } else {
+      entityLevelTaskCount += 1;
     }
   }
 
@@ -3348,16 +3439,19 @@ export default function Tasks() {
     : board
       ? Object.entries(board).filter(([k]) => k !== "_counts").reduce((sum, [, tasks]) => sum + (tasks as Task[]).length, 0)
       : 0;
+  const activeTaskTotal = taskBoardQueryEnabled(view, boardMode)
+    ? totalBoardTasks
+    : taskList?.total;
   const workspaceFilterOptions: TaskFilterOption[] = [
-    { key: "all", label: `${t("page.workspaces.filter_all")} (${totalBoardTasks})`, icon: <IconLayers size={14} style={{ color: "#a8a29e" }} /> },
+    { key: "all", label: `${t("page.workspaces.filter_all")}${activeTaskTotal === undefined ? "" : ` (${activeTaskTotal})`}`, icon: <IconLayers size={14} style={{ color: "#a8a29e" }} /> },
     {
       key: ENTITY_LEVEL_WORKSPACE_FILTER,
-      label: entityLevelTaskCount > 0 ? `Entity-level (${entityLevelTaskCount})` : "Entity-level",
+      label: taskListQueryEnabled(view, boardMode) && entityLevelTaskCount > 0 ? `Entity-level (${entityLevelTaskCount})` : "Entity-level",
       icon: <IconBuilding size={14} style={{ color: "#78716c" }} />,
     },
     ...(workspaces ?? []).map((ws: Workspace) => {
       const count = wsTaskCounts[ws.id] ?? 0;
-      return { key: ws.id, label: count > 0 ? `${ws.name} (${count})` : ws.name, icon: <IconWorkspace size={14} style={{ color: "#57534e" }} /> };
+      return { key: ws.id, label: taskListQueryEnabled(view, boardMode) && count > 0 ? `${ws.name} (${count})` : ws.name, icon: <IconWorkspace size={14} style={{ color: "#57534e" }} /> };
     }),
   ];
   const priorityFilterOptions: TaskFilterOption[] = [
@@ -3369,11 +3463,15 @@ export default function Tasks() {
     })),
   ];
 
-  const activeTaskCount = (boardCounts.in_progress || 0) + (boardCounts.scheduled || 0);
-  const attentionTaskCount = COLUMN_META.review.statuses.reduce(
-    (sum, status) => sum + (boardCounts[status] || 0),
-    0,
-  );
+  const activeTaskCount = taskBoardQueryEnabled(view, boardMode)
+    ? (boardCounts.in_progress || 0) + (boardCounts.scheduled || 0)
+    : 0;
+  const attentionTaskCount = taskBoardQueryEnabled(view, boardMode)
+    ? COLUMN_META.review.statuses.reduce(
+      (sum, status) => sum + (boardCounts[status] || 0),
+      0,
+    )
+    : 0;
   const completedTasks = board
     ? COLUMN_META.done.statuses
         .flatMap((status) => ((board[status] ?? []) as Task[]))
@@ -3381,7 +3479,7 @@ export default function Tasks() {
         .sort(compareDoneTasks)
     : [];
   const taskSummary = [
-    `${totalBoardTasks || allTasks.length} ${t("page.tasks.tasks")}`,
+    activeTaskTotal === undefined ? null : `${activeTaskTotal} ${t("page.tasks.tasks")}`,
     activeTaskCount > 0 ? `${activeTaskCount} ${t("status.in_progress")}` : null,
     attentionTaskCount > 0 ? `${attentionTaskCount} ${t("page.tasks.needs_attention")}` : null,
   ].filter(Boolean).join(" · ");
@@ -3557,6 +3655,29 @@ export default function Tasks() {
         </div>
 
         {/* View content */}
+        {view === "board" && boardMode === "kanban" && board && (
+          <div className="task-board-pagination" role="status">
+            <span>{t("page.tasks.loaded_task_count", {
+              loaded: Object.values(board).reduce((sum, tasks) => sum + (Array.isArray(tasks) ? tasks.length : 0), 0),
+              total: totalBoardTasks,
+            })}{boardRowFiltersActive && boardQuery.hasNextPage ? ` ${t("page.tasks.partial_filter_results")}` : ""}</span>
+            <Button variant="ghost" size="sm" loading={boardQuery.isFetching} onClick={() => void boardQuery.refetch()}>
+              {t("page.tasks.refresh_tasks")}
+            </Button>
+            {statusFilter === "done" && boardQuery.hasNextPage && (
+              <Button variant="outline" size="sm" loading={boardQuery.isFetching} onClick={() => void boardQuery.fetchNextPage({ cancelRefetch: false })}>
+                {t(boardQuery.isFetchNextPageError ? "page.tasks.retry_load_more" : "page.tasks.load_more_tasks")}
+              </Button>
+            )}
+            {boardQuery.isError && <span role="alert">{t("page.tasks.load_more_failed")}</span>}
+          </div>
+        )}
+        {view === "board" && boardMode === "kanban" && boardQuery.isError && !board && (
+          <div className="task-board-pagination" role="alert">
+            <span>{t("page.tasks.load_more_failed")}</span>
+            <Button variant="outline" size="sm" loading={boardQuery.isFetching} onClick={() => void boardQuery.refetch()}>{t("page.tasks.retry_load_more")}</Button>
+          </div>
+        )}
         <div
           key={`${view}-${view === "board" ? boardMode : ""}`}
           className={`tasks-page-content tasks-page-content--${view}${view === "board" ? ` tasks-page-content--board-${boardMode}` : ""}`}
@@ -3615,15 +3736,26 @@ export default function Tasks() {
                   // Merge tasks from all statuses in this column group
                   let tasks = (colMeta.statuses.flatMap((s) => (board[s] ?? []) as Task[]));
                   // Real total from _counts (before client-side filters)
-                  const colTotal = colMeta.statuses.reduce((sum, s) => sum + (boardCounts[s] || 0), 0);
+                  const countedStatuses = colMeta.statuses.filter((status) =>
+                    (!statusFocus || statusFocus === "overdue" || status === statusFocus)
+                    && (statusFilter === "all" || statusFilter === "overdue" || COLUMN_META[statusFilter].statuses.includes(status)),
+                  );
+                  const colTotal = countedStatuses.reduce((sum, s) => sum + (boardCounts[s] || 0), 0);
+                  const loadedThrough = Number(boardQuery.data?.pageParams.at(-1) ?? 0) + TASK_BOARD_PAGE_SIZE;
+                  const columnHasMore = Boolean(boardQuery.hasNextPage && countedStatuses.some((status) => (boardCounts[status] || 0) > loadedThrough));
                   tasks = tasks.filter(taskMatchesFilters);
                   const dropStatus = colMeta.statuses[0];
                   return (
                   <KanbanColumn
-                    key={colKey}
+                    key={`${colKey}-${wsFilter || "all"}`}
                     status={colKey}
                     tasks={tasks}
-                    totalCount={hasTaskFilters ? tasks.length : colTotal || undefined}
+                    totalCount={boardRowFiltersActive ? tasks.length : colTotal}
+                    countIsPartial={boardRowFiltersActive && columnHasMore}
+                    hasRemoteMore={columnHasMore}
+                    loadingMore={boardQuery.isFetching}
+                    loadMoreError={boardQuery.isFetchNextPageError}
+                    onLoadMore={() => void boardQuery.fetchNextPage({ cancelRefetch: false })}
                     filtersActive={boardContentFiltersActive}
                     workspaceScoped={Boolean(apiWorkspaceFilter)}
                     agents={agentsList as any[]}
@@ -3648,7 +3780,7 @@ export default function Tasks() {
                 })}
               </div>
               )
-            ) : (
+            ) : boardQuery.isError ? null : (
               <EmptyState title={t("page.tasks.no_tasks_found")} description={t("page.tasks.create_to_get_started")} />
             )
           )}
@@ -3667,7 +3799,7 @@ export default function Tasks() {
             ) : (
               <TaskListView
                 tasks={filteredListTasks}
-                totalCount={hasTaskFilters ? filteredListTasks.length : totalBoardTasks || allTasks.length}
+                totalCount={hasTaskFilters ? filteredListTasks.length : taskList?.total ?? 0}
                 sort={taskListSort}
                 onSortChange={handleTaskListSortChange}
                 currentUser={currentUser}

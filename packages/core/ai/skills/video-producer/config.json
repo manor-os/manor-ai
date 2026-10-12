@@ -1,0 +1,34 @@
+{
+  "id": "video-producer",
+  "name": "video-producer",
+  "display_name": "Video Producer",
+  "type": "runtime_guidance",
+  "description": "Produce one finished video of any length: anchor frame from references, clips chained frame to frame, then narration, music, exact subtitles and titles mixed into a single MP4.",
+  "category": "media",
+  "output_format": "json",
+  "tags": [
+    "video",
+    "long-video",
+    "clips",
+    "merge",
+    "runtime-guidance",
+    "builtin"
+  ],
+  "tools": [
+    "generate_image",
+    "plan_video_segments",
+    "generate_video",
+    "wait_media_jobs",
+    "render_frame_samples",
+    "merge_videos",
+    "generate_file",
+    "normalize_audio_loudness",
+    "transcribe_video",
+    "compose_video_timeline"
+  ],
+  "max_rounds": 100,
+  "search": {
+    "terms": ["long video", "ai video", "voiceover video", "subtitles", "music", "last frame continuity", "film", "short film", "clip stitching", "video from brief"],
+    "examples": ["make two minute video from brief", "produce narrated video with subtitles music", "long ai video consistent characters", "generate video clips and stitch together"]
+  }
+}

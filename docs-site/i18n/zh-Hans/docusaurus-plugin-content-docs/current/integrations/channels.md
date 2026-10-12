@@ -4,6 +4,10 @@ title: 消息渠道
 
 # 消息渠道
 
+浏览器语音和 Twilio 语音遵循与 Chat 相同的 Entity BYOK 模型策略。除了模型，
+还需配置语音供应商；只有平台密钥不代表自托管语音健康。SMTP 未配置时出站
+邮件不可用，但本地文档、签署和协作仍可用。健康/准备检查不会授予渠道或工具权限。
+
 渠道将外部会话——WhatsApp 上的客户、团队的 Slack、一个收件箱——
 连接到 Agent 运行时。入站消息会被路由到正确的工作区和 Agent，可以创建
 任务，回复则通过同一渠道发回。
@@ -14,7 +18,7 @@ title: 消息渠道
 | --- | --- | --- |
 | Telegram | Webhook **或**长轮询 | `TELEGRAM_MODE=webhook\|polling\|auto`；`auto` 在 `PUBLIC_BASE_URL` 为 HTTPS 时使用 webhook，否则使用轮询——因此在没有公网 URL 的笔记本上 Telegram 也能工作。 |
 | WhatsApp Business | Meta Cloud API webhook | 通过 Meta Embedded Signup 连接客户自有 WABA 和业务号码。 |
-| SMS / 语音（Twilio） | Webhook + Media Streams | 语音通话通过 websocket 将音频流式传输给实时语音 Agent（Deepgram STT + TTS——参见[配置](../configuration#channel-integrations)）。 |
+| SMS / 语音（Twilio） | Webhook + Media Streams | 语音通话通过 WebSocket 使用原生 OpenAI Realtime。在 Account → Models 中配置 Entity 的 **Primary AI** BYOK——参见[配置](../configuration#live-voice-calls)。 |
 | 微信公众号 | 固定回调地址 | 通过公众号 API 收发客服消息和模板消息。请在明文模式下配置，并使用 Integration 健康详情中显示的完整地址：`https://<公网域名>/api/v1/channels/wechat/callback?config_id=<ChannelConfig ID>`。 |
 | 微信个人号 | `wechat-runner` 回调 | `wechat-runner` 服务桥接一个个人号形式的微信会话（在 `http://localhost:8801/qr.png` 扫码）。 |
 | Facebook 主页 / Messenger | HMAC 验证的 webhook | 生产环境权限需要通过 Meta 应用审核。 |

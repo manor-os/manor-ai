@@ -21,6 +21,8 @@ server keys.
 from __future__ import annotations
 
 import json
+import inspect
+import re
 from pathlib import Path
 
 from packages.core.ai.mcp import get_module
@@ -28,12 +30,15 @@ from packages.core.ai.tools.mcp_builtin import _SERVER_TOOL_SCHEMAS
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SKILLS_ROOT = _REPO_ROOT / "packages" / "core" / "ai" / "skills"
+_MARKETPLACE_SKILLS_ROOT = (
+    _REPO_ROOT / "packages" / "core" / "ai" / "marketplace_skills"
+)
 
 # Servers that intentionally advertise an EMPTY deferred-tool list while
 # a richer in-process module exists (hidden capability, surfaced through
 # other channels). Anything listed here must keep its advertised list
 # empty — otherwise the allowlist rots into a bypass of the guard.
-_INTENTIONALLY_EMPTY = {"local_browser"}
+_INTENTIONALLY_EMPTY: set[str] = set()
 
 
 # ── 1. Deferred MCP schemas ─────────────────────────────────────────────────
@@ -139,35 +144,29 @@ def test_manor_search_only_surfaces_implemented_actions() -> None:
     from packages.core.ai.tools.manor_tool import (
         _ALL_ACTIONS,
         _IMPLEMENTED_ACTIONS,
-        _search_actions,
+        manor_action_manifests,
     )
 
     # Sanity: the implemented set is derived from the dispatcher source and
     # must stay within the catalog (no ghost branches).
     assert set(_IMPLEMENTED_ACTIONS) <= set(_ALL_ACTIONS)
 
-    # Exhaustive: probing search with every catalog action's own name and
-    # description must never surface an unimplemented action.
-    for name, desc in _ALL_ACTIONS.items():
-        for query in (name, name.replace("_", " "), desc):
-            for hit in _search_actions(query, max_results=100):
-                assert hit["action"] in _IMPLEMENTED_ACTIONS, (
-                    f"manor action=search surfaced {hit['action']!r} (query {query!r}) "
-                    "but _dispatch_action has no branch for it"
-                )
+    # The common Runtime catalog only receives executable composite entries.
+    for hit in manor_action_manifests():
+        assert hit["invoke_with"]["arguments"]["action"] in _IMPLEMENTED_ACTIONS
 
 
 def test_known_manor_stubs_stay_out_of_search_results() -> None:
     from packages.core.ai.tools.manor_tool import (
         _IMPLEMENTED_ACTIONS,
-        _search_actions,
+        manor_action_manifests,
     )
 
     for stub in sorted(_KNOWN_MANOR_STUBS):
         if stub in _IMPLEMENTED_ACTIONS:
             # Stub gained a real dispatch branch — surfacing it is now correct.
             continue
-        surfaced = {hit["action"] for hit in _search_actions(stub, max_results=100)}
+        surfaced = {hit["invoke_with"]["arguments"]["action"] for hit in manor_action_manifests()}
         assert stub not in surfaced, (
             f"known stub {stub!r} is back in manor search results without a "
             "dispatch branch"
@@ -187,7 +186,320 @@ def test_code_tool_catalog_matches_dispatch_table() -> None:
     )
 
 
-# ── 4. Built-in skill packs ────────────────────────────────────────────────
+# ── 4. Registered schemas and packaged Skill declarations ─────────────────
+
+def test_registered_tool_schemas_and_handlers_are_self_consistent() -> None:
+    from packages.core.ai.runtime.tool_registry import (
+        runtime_ensure_tool_registry_initialized,
+    )
+
+    pool = runtime_ensure_tool_registry_initialized()
+    problems: list[str] = []
+    for name in pool.registered_tool_names(include_undiscoverable=True):
+        entry = pool.get(name) or {}
+        schema = entry.get("schema") or {}
+        function = schema.get("function") if isinstance(schema, dict) else None
+        if not isinstance(function, dict):
+            problems.append(f"{name}: missing function schema")
+            continue
+        if function.get("name") != name:
+            problems.append(
+                f"{name}: schema advertises {function.get('name')!r}"
+            )
+        if not str(function.get("description") or "").strip():
+            problems.append(f"{name}: missing agent-visible description")
+        if not callable(entry.get("handler")):
+            problems.append(f"{name}: registered without an executable handler")
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            problems.append(f"{name}: missing parameters schema")
+            continue
+        properties = parameters.get("properties") or {}
+        for required in parameters.get("required") or []:
+            if required not in properties:
+                problems.append(
+                    f"{name}: required parameter {required!r} is not described"
+                )
+        signature = inspect.signature(entry["handler"])
+        accepts_extra = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        if not accepts_extra:
+            unknown = sorted(set(properties) - set(signature.parameters))
+            if unknown:
+                problems.append(
+                    f"{name}: schema advertises parameters the handler cannot accept: "
+                    f"{unknown}"
+                )
+    assert not problems, "invalid registered tool contracts:\n" + "\n".join(problems)
+
+
+def test_every_business_capability_tool_has_an_executable_runtime_surface() -> None:
+    from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
+    from packages.core.ai.runtime.channel_tools import (
+        RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME,
+        runtime_channel_attachment_tool_schema,
+    )
+    from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
+
+    registered = set(
+        runtime_registered_tool_names(include_undiscoverable=True)
+    )
+    contextual = {
+        runtime_channel_attachment_tool_schema()["function"]["name"]
+    }
+    assert contextual == {RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME}
+    problems = [
+        f"{capability_id}: {tool_name}"
+        for capability_id, capability in CORE_CAPABILITIES.items()
+        for tool_name in capability.tool_names
+        if tool_name not in registered and tool_name not in contextual
+    ]
+    assert not problems, (
+        "business capabilities reference tools with no runtime surface:\n"
+        + "\n".join(problems)
+    )
+
+
+def _packaged_skill_tool_declarations() -> list[tuple[Path, list[str]]]:
+    from packages.core.services.builtin_skill_loader import (
+        _DEFAULT_SKILL_TOOLS,
+        _builtin_skill_dirs,
+    )
+
+    declarations: list[tuple[Path, list[str]]] = []
+    for skill_dir in _builtin_skill_dirs():
+        if not (skill_dir / "SKILL.md").is_file():
+            continue
+        config_path = skill_dir / "config.json"
+        config = (
+            json.loads(config_path.read_text(encoding="utf-8"))
+            if config_path.is_file()
+            else {}
+        )
+        tools = list(config.get("tools") or [])
+        if config.get("type") != "runtime_guidance" and not tools:
+            tools = list(_DEFAULT_SKILL_TOOLS)
+        declarations.append((config_path, tools))
+        companion = config.get("capability_companion") or {}
+        if isinstance(companion, dict) and companion.get("tool_names"):
+            declarations.append(
+                (config_path, list(companion["tool_names"]))
+            )
+
+    return declarations
+
+
+def test_all_packaged_skill_tools_are_registered_and_executable() -> None:
+    from packages.core.ai.runtime.tool_registry import (
+        runtime_ensure_tool_registry_initialized,
+    )
+
+    pool = runtime_ensure_tool_registry_initialized()
+    registered = set(
+        pool.registered_tool_names(include_undiscoverable=True)
+    )
+    problems: list[str] = []
+    for source, tools in _packaged_skill_tool_declarations():
+        if len(tools) != len(set(tools)):
+            problems.append(f"{source}: duplicate tool declarations")
+        for tool_name in tools:
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                problems.append(f"{source}: invalid tool name {tool_name!r}")
+                continue
+            if tool_name not in registered:
+                problems.append(
+                    f"{source}: declares unregistered tool {tool_name!r}"
+                )
+                continue
+            if not callable((pool.get(tool_name) or {}).get("handler")):
+                problems.append(
+                    f"{source}: tool {tool_name!r} has no executable handler"
+                )
+    assert not problems, "packaged Skill/tool drift:\n" + "\n".join(problems)
+
+
+def _integration_skill_tool_reference_problems(
+    *,
+    source: Path,
+    skill_name: str,
+    config: dict,
+    skill_text: str,
+    registered: set[str],
+) -> list[str]:
+    from packages.core.ai.runtime.integration_skill_registry import (
+        integration_provider_keys_for_skill,
+    )
+
+    declared = set(config.get("tools") or [])
+    provider_keys = set(integration_provider_keys_for_skill(skill_name))
+    explicit_prefixes = {
+        str(prefix)
+        for prefix in config.get("discoverable_tool_prefixes") or []
+    }
+    discoverable_prefixes = explicit_prefixes | {
+        f"mcp__{provider}__" for provider in provider_keys
+    }
+    owned_prefixes = discoverable_prefixes | {
+        tool_name.rsplit("__", 1)[0] + "__"
+        for tool_name in declared
+        if tool_name.startswith("mcp__")
+    }
+    problems: list[str] = []
+    short_names = set(re.findall(r"`([a-z][a-z0-9_]+)`", skill_text))
+    matched_by_short_name: dict[str, set[str]] = {}
+    for short_name in short_names:
+        matches = {
+            name
+            for name in registered
+            if name.endswith(f"__{short_name}")
+            and any(name.startswith(prefix) for prefix in owned_prefixes)
+        }
+        matched_by_short_name[short_name] = matches
+        for tool_name in matches:
+            if tool_name in declared or any(
+                tool_name.startswith(prefix)
+                for prefix in discoverable_prefixes
+            ):
+                continue
+            problems.append(
+                f"{source}: documents {tool_name!r} without declaring "
+                "it or an owning discovery prefix"
+            )
+
+    # Short names are also used for fields, statuses, and error reasons. Treat
+    # only action-oriented, provider-prefixed aliases as concrete calls; this
+    # catches invented names such as ``stripe_api_read`` without misclassifying
+    # values such as Chrome's ``chrome_connection`` receipt field.
+    action_reference_pattern = re.compile(
+        r"(?:\b(?:call|run|invoke|use|using|via|with)\s+(?:the\s+)?)"
+        r"`([a-z][a-z0-9_]+)`"
+        r"|^\s*\d+\.\s*`([a-z][a-z0-9_]+)`"
+        r"|`([a-z][a-z0-9_]+)`\s+(?:tool|operation)\b",
+        re.IGNORECASE,
+    )
+    for line_number, line in enumerate(skill_text.splitlines(), start=1):
+        for match in action_reference_pattern.finditer(line):
+            short_name = next(group for group in match.groups() if group)
+            if matched_by_short_name.get(short_name):
+                continue
+            if not any(
+                short_name.startswith(f"{provider_key}_")
+                for provider_key in provider_keys
+            ):
+                continue
+            problems.append(
+                f"{source}:{line_number}: documents unknown provider tool "
+                f"alias {short_name!r}"
+            )
+    return problems
+
+
+def test_documented_integration_skill_tools_are_declared_or_discoverable() -> None:
+    """Backticked provider actions must resolve through the child Skill contract."""
+
+    from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
+
+    registered = set(
+        runtime_registered_tool_names(include_undiscoverable=True)
+    )
+    problems: list[str] = []
+    for config_path in sorted(_SKILLS_ROOT.glob("*/config.json")):
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        if config.get("type") != "runtime_guidance":
+            continue
+        for skill_md in sorted(config_path.parent.rglob("*.md")):
+            problems.extend(_integration_skill_tool_reference_problems(
+                source=skill_md,
+                skill_name=config_path.parent.name,
+                config=config,
+                skill_text=skill_md.read_text(encoding="utf-8"),
+                registered=registered,
+            ))
+    assert not problems, "integration Skill description/tool drift:\n" + "\n".join(problems)
+
+
+def test_integration_skill_tool_audit_rejects_fictional_provider_alias() -> None:
+    problems = _integration_skill_tool_reference_problems(
+        source=Path("mcp_stripe/SKILL.md"),
+        skill_name="mcp_stripe",
+        config={
+            "tools": ["mcp__stripe__list_payment_intents"],
+            "type": "runtime_guidance",
+        },
+        skill_text="Re-check with `stripe_api_read` before retrying.",
+        registered={"mcp__stripe__list_payment_intents"},
+    )
+
+    assert problems == [
+        "mcp_stripe/SKILL.md:1: documents unknown provider tool alias "
+        "'stripe_api_read'"
+    ]
+
+
+def test_fully_qualified_tool_names_in_skill_docs_are_registered() -> None:
+    """A Skill must not teach the model a concrete tool name that does not exist."""
+
+    from packages.core.ai.runtime.tool_registry import runtime_registered_tool_names
+
+    registered = set(
+        runtime_registered_tool_names(include_undiscoverable=True)
+    )
+    skill_docs = sorted(_SKILLS_ROOT.rglob("*.md")) + sorted(
+        _MARKETPLACE_SKILLS_ROOT.rglob("*.md")
+    )
+    problems: list[str] = []
+    for skill_md in skill_docs:
+        referenced = set(re.findall(
+            r"\bmcp__[a-z0-9_]+__[a-z0-9_]+\b",
+            skill_md.read_text(encoding="utf-8"),
+        ))
+        for tool_name in sorted(referenced - registered):
+            problems.append(f"{skill_md}: documents unknown tool {tool_name!r}")
+    assert not problems, "fictional fully qualified Skill tools:\n" + "\n".join(problems)
+
+
+def test_automation_tool_surfaces_share_one_complete_catalog() -> None:
+    from packages.core.ai.runtime.approvals import _ACTION_KEY_CAPABILITY_ALIASES
+    from packages.core.ai.runtime.capabilities import CORE_CAPABILITIES
+    from packages.core.ai.runtime.tool_visibility import (
+        _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS,
+    )
+    from packages.core.ai.tools.cron_tools import get_tools as get_cron_tools
+    from packages.core.ai.tools.manor_tool import _ALL_ACTIONS
+
+    cron_tools = get_cron_tools()
+    cron_tool_names = {
+        schema["function"]["name"] for schema, _handler in cron_tools
+    }
+    tool_names = cron_tool_names | {"query_entity_agents"}
+    assert set(CORE_CAPABILITIES["automation.manage"].tool_names) == tool_names
+    assert set(
+        _WORKSPACE_AGENT_CONTEXTUAL_CAPABILITY_TOOLS["automation.manage"]
+    ) == tool_names
+    assert {
+        name
+        for name, capability_id in _ACTION_KEY_CAPABILITY_ALIASES.items()
+        if capability_id == "automation.manage"
+    } == tool_names
+
+    create_schema = next(
+        schema["function"]
+        for schema, _handler in cron_tools
+        if schema["function"]["name"] == "create_scheduled_job"
+    )
+    assert "calling Agent" in create_schema["description"]
+    assert "query_entity_agents" in create_schema["description"]
+    assert "auto-generates" not in create_schema["description"]
+    assert "agent_id" in create_schema["parameters"]["properties"]
+    assert "list_agents" in _ALL_ACTIONS[
+        "create_scheduled_job"
+    ]
+
+
+# ── 5. Built-in skill packs ────────────────────────────────────────────────
 
 def _remote_transport_server_keys() -> set[str]:
     """Server keys served by a vendor-hosted remote MCP (transport != builtin).

@@ -9,25 +9,39 @@ tests pin the security-critical behavior BEFORE any gate is rewired onto it:
     for the #289 / #317 loops), cross-plane by construction;
   * one open request per subject (dedup — the fix for badge inflation);
   * a terminal origin expires its open requests (the orphan-card fix);
-  * a standing grant ("Always") is honored uniformly and never overrides a hard
-    block.
+  * versioned exact rules apply uniformly to future operations while pending
+    requests and deny rules remain authoritative.
 """
-import pytest
+import asyncio
 
-from packages.core.constants.approvals import AuthorizeScope
+import pytest
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from packages.core.constants.approvals import (
+    ApprovalConsumeOutcome,
+    ApprovalStatus,
+)
 from packages.core.governance import WorkspacePolicy, get_policy, update_policy
+from packages.core.governance.approval_policy import ApprovalPolicyOverride
+from packages.core.governance.approval_policy_service import account_defaults
 from packages.core.governance.approvals import (
+    ApprovalConsumptionError,
     ApprovalOrigin,
     ApprovalSubject,
+    claim_approval_consumption,
     consume_approval,
     count_open_requests,
     grant_approval,
     grant_open_request_for_step,
     resolve_origin_requests,
 )
+from packages.core.ledger import event_types as ledger_et
 from packages.core.models.base import generate_ulid
-from packages.core.models.user import User, UserMembership
+from packages.core.models.hitl_request import HitlRequest
+from packages.core.models.user import Entity, User, UserMembership
 from packages.core.models.workspace import Workspace, WorkspaceStaff
+from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.services.runtime_authorization import (
     AuthorizationRule,
     PermissionDecision,
@@ -45,25 +59,34 @@ async def resolve_approval(*args, **kwargs):
     return await _resolve(*args, **kwargs)
 
 
-async def _ws(db):
+async def _ws(db, *, user_id: str = "op"):
     entity_id = generate_ulid()
     workspace_id = generate_ulid()
+    db.add(Entity(id=entity_id, name="Approval test", settings={"approval_defaults": account_defaults()}))
     db.add(User(
-        id="op",
+        id=user_id,
         entity_id=entity_id,
         email=f"op-{entity_id}@example.com",
         password_hash="x",
         role="owner",
     ))
     db.add(UserMembership(
-        user_id="op",
+        user_id=user_id,
         entity_id=entity_id,
         role="owner",
         status="active",
     ))
     db.add(Workspace(id=workspace_id, entity_id=entity_id, name="Gov WS", operating_model={}))
     await db.flush()
+    await update_policy(db, entity_id=entity_id, workspace_id=workspace_id, policy=WorkspacePolicy())
     return entity_id, workspace_id
+
+
+def _policy(*rules):
+    return WorkspacePolicy(approval=ApprovalPolicyOverride(rules=[
+        {"id": f"rule-{index}", "effect": effect, "selector": {"kind": "action", "action_key": action}}
+        for index, (effect, action) in enumerate(rules)
+    ]))
 
 
 def _subject(entity_id, workspace_id, **kw):
@@ -86,16 +109,59 @@ def _step_origin(**kw):
 async def test_low_risk_no_rule_allows(db_session):
     e, w = await _ws(db_session)
     d = await resolve_approval(
-        db_session, subject=_subject(e, w, risk_level="low"), origin=_step_origin(),
+        db_session, subject=_subject(e, w, action_key="workspace.file.modify", risk_level="low"), origin=_step_origin(),
     )
     assert d.outcome == "allow"
+
+
+@pytest.mark.asyncio
+async def test_explicit_proposal_review_suspends_standing_grant_but_accepts_one_time(db_session):
+    e, w = await _ws(db_session)
+    await update_policy(
+        db_session, entity_id=e, workspace_id=w,
+        policy=_policy(("allow", "workspace.proposal.task")),
+        changed_by="op",
+    )
+    subject = _subject(
+        e, w, action_key="workspace.proposal.task", capability_id=None,
+        resource_kind="proposal", resource_id=generate_ulid(), requires_approval=True,
+    )
+    origin = ApprovalOrigin(kind="operation", context={"plane": "strategist_proposal"})
+    kwargs = dict(
+        subject=subject, origin=origin, require_explicit_approval=True,
+        intrinsic_rule="proposal.review", intrinsic_approval_preauthorized=True,
+        policy_hitl_preauthorized=True,
+    )
+    decision = await resolve_approval(db_session, **kwargs)
+    assert decision.outcome == "needs_human"
+    assert decision.request is not None
+    await grant_approval(db_session, decision.request, by_user_id="op", via="proposal_card")
+    granted = await resolve_approval(db_session, **kwargs)
+    assert granted.outcome == "allow"
+    assert granted.request.id == decision.request.id
+
+
+@pytest.mark.asyncio
+async def test_explicit_proposal_review_does_not_override_policy_deny(db_session):
+    e, w = await _ws(db_session)
+    await update_policy(
+        db_session, entity_id=e, workspace_id=w,
+        policy=_policy(("deny", "social_post.publish")),
+        changed_by="op",
+    )
+    decision = await resolve_approval(
+        db_session, subject=_subject(e, w), origin=_step_origin(),
+        require_explicit_approval=True,
+    )
+    assert decision.outcome == "deny"
+    assert decision.request is None
 
 
 @pytest.mark.asyncio
 async def test_hard_block_denies_and_mints_no_request(db_session):
     e, w = await _ws(db_session)
     await update_policy(db_session, entity_id=e, workspace_id=w,
-                        policy=WorkspacePolicy(never_allow_capabilities=["external.social"]),
+                        policy=_policy(("deny", "social_post.publish")),
                         changed_by="t")
     d = await resolve_approval(db_session, subject=_subject(e, w, risk_level="high"), origin=_step_origin())
     assert d.outcome == "deny"
@@ -125,7 +191,7 @@ async def test_requires_approval_flag_needs_human(db_session):
 async def test_policy_hitl_needs_human(db_session):
     e, w = await _ws(db_session)
     await update_policy(db_session, entity_id=e, workspace_id=w,
-                        policy=WorkspacePolicy(hitl_required_capabilities=["external.social"]),
+                        policy=_policy(("ask", "social_post.publish")),
                         changed_by="t")
     d = await resolve_approval(db_session, subject=_subject(e, w, risk_level="medium"), origin=_step_origin())
     assert d.outcome == "needs_human"
@@ -135,7 +201,7 @@ async def test_policy_hitl_needs_human(db_session):
 async def test_policy_auto_approve_allows_high_risk(db_session):
     e, w = await _ws(db_session)
     await update_policy(db_session, entity_id=e, workspace_id=w,
-                        policy=WorkspacePolicy(auto_approve_capabilities=["external.social"]),
+                        policy=_policy(("allow", "social_post.publish")),
                         changed_by="t")
     d = await resolve_approval(db_session, subject=_subject(e, w, risk_level="high"), origin=_step_origin())
     assert d.outcome == "allow"
@@ -154,7 +220,7 @@ async def test_policy_auto_approve_cannot_waive_platform_scoped_baseline(db_sess
     same auto_approve mechanism, this is the one carve-out."""
     e, w = await _ws(db_session)
     await update_policy(db_session, entity_id=e, workspace_id=w,
-                        policy=WorkspacePolicy(auto_approve_actions=["*"]),
+                        policy=_policy(("allow", "social_post.publish")),
                         changed_by="t")
     d = await resolve_approval(
         db_session,
@@ -194,9 +260,85 @@ async def test_grant_makes_the_same_subject_pass__289_317(db_session):
     # The gate consumes at the point of irreversible proceed…
     await consume_approval(db_session, d2.request)
     assert d2.request.status == "consumed"
-    # …after which a THIRD resolve re-requests (the grant was one-time).
+    # The same operation cannot be executed again after consuming its grant.
     d3 = await resolve_approval(db_session, subject=subject, origin=_step_origin(step_id=step))
-    assert d3.outcome == "needs_human"
+    assert d3.outcome == "deny"
+    # A new execution intent gets a new source identity and its own decision.
+    d4 = await resolve_approval(db_session, subject=subject, origin=_step_origin())
+    assert d4.outcome == "needs_human"
+
+
+@pytest.mark.asyncio
+async def test_approval_consumption_has_one_winner_under_concurrency(db_session):
+    """Two stale GRANTED snapshots authorize at most one provider effect."""
+
+    operator_id = generate_ulid()
+    entity_id, workspace_id = await _ws(db_session, user_id=operator_id)
+    decision = await resolve_approval(
+        db_session,
+        subject=_subject(entity_id, workspace_id, risk_level="high"),
+        origin=_step_origin(),
+    )
+    await grant_approval(
+        db_session,
+        decision.request,
+        by_user_id=operator_id,
+        via="chat_card",
+    )
+    request_id = decision.request.id
+    await db_session.commit()
+
+    sessions = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    provider_effects: list[str] = []
+    async with sessions() as first, sessions() as second:
+        await first.execute(text("SET LOCAL lock_timeout = '2s'"))
+        await second.execute(text("SET LOCAL lock_timeout = '2s'"))
+        first_snapshot = await first.get(HitlRequest, request_id)
+        second_snapshot = await second.get(HitlRequest, request_id)
+        assert first_snapshot is not None and second_snapshot is not None
+        assert first_snapshot.status == ApprovalStatus.GRANTED.value
+        assert second_snapshot.status == ApprovalStatus.GRANTED.value
+
+        async def claim_and_run_provider(session, request):
+            outcome = await claim_approval_consumption(session, request)
+            await session.commit()
+            if outcome is ApprovalConsumeOutcome.CONSUMED:
+                provider_effects.append(request.id)
+            return outcome
+
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(
+                claim_and_run_provider(first, first_snapshot),
+                claim_and_run_provider(second, second_snapshot),
+            ),
+            timeout=5,
+        )
+
+    assert sorted(outcomes) == sorted((
+        ApprovalConsumeOutcome.CONSUMED,
+        ApprovalConsumeOutcome.ALREADY_CONSUMED,
+    ))
+    assert provider_effects == [request_id]
+    assert await db_session.scalar(
+        select(HitlRequest.status).where(HitlRequest.id == request_id)
+    ) == ApprovalStatus.CONSUMED.value
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(WorkspaceEvent)
+        .where(
+            WorkspaceEvent.entity_id == entity_id,
+            WorkspaceEvent.event_type == ledger_et.APPROVAL_CONSUMED,
+        )
+    ) == 1
+
+    # The compatibility wrapper still returns the request for a successful
+    # first spend, but a replay is explicit and fail-closed rather than a
+    # silent no-op that a caller could mistake for authorization.
+    stale_snapshot = await db_session.get(HitlRequest, request_id)
+    assert stale_snapshot is not None
+    with pytest.raises(ApprovalConsumptionError) as exc_info:
+        await consume_approval(db_session, stale_snapshot)
+    assert exc_info.value.outcome is ApprovalConsumeOutcome.ALREADY_CONSUMED
 
 
 @pytest.mark.asyncio
@@ -227,81 +369,39 @@ async def test_terminal_origin_expires_open_requests(db_session):
 
 
 @pytest.mark.asyncio
-async def test_standing_grant_is_unified_and_sticks(db_session):
-    """'Always approve' = a standing grant written to the ONE store both planes
-    honor (workspace policy auto-approve). Future subjects allow with no card.
-
-    Subject is this module's default, ``social_post.publish`` — a publish-class
-    capability. There is no tier that withholds "Always" from it: the user is
-    the authority on what they want standing.
-    """
+async def test_retired_standing_grant_cannot_mutate_pending_or_policy(db_session):
     e, w = await _ws(db_session)
     subject = _subject(e, w, risk_level="high")
-    d1 = await resolve_approval(db_session, subject=subject, origin=_step_origin())
-    await grant_approval(db_session, d1.request, by_user_id="op", via="always", standing=True)
-    # a DIFFERENT step, same subject capability → allowed with no new request
-    d2 = await resolve_approval(db_session, subject=subject, origin=_step_origin())
-    assert d2.outcome == "allow"
-    assert await count_open_requests(db_session, workspace_id=w) == 0
-    # The promotion is recorded ON the row: asked at action scope, answered at
-    # tool scope. Without this the two buttons remain indistinguishable in the
-    # audit trail.
-    assert d1.request.payload["scope"] == AuthorizeScope.TOOL.value
-    assert d1.request.payload["scope_promoted_from"] == AuthorizeScope.ACTION.value
+    decision = await resolve_approval(db_session, subject=subject, origin=_step_origin())
+    before = await get_policy(db_session, w)
+    with pytest.raises(ValueError, match="versioned"):
+        await grant_approval(db_session, decision.request, by_user_id="op", via="always", standing=True)
+    assert decision.request.status == "pending"
+    assert await get_policy(db_session, w) == before
+    assert await count_open_requests(db_session, workspace_id=w) == 1
 
 
 @pytest.mark.asyncio
-async def test_the_user_is_the_authority_on_what_becomes_standing(db_session):
-    """"Always" on a publish-class capability produces a real standing grant.
+async def test_versioned_exact_rule_applies_to_future_operations_without_resolving_pending(db_session):
+    from packages.core.governance.approval_policy import ApprovalScope, PolicyDraft
+    from packages.core.governance.approval_policy_service import read_approval_settings, update_approval_policy
 
-    A tier that made publish/email/message approvable-once-but-never-blanket
-    shipped and was rejected: "Always" means the user wants always, and the
-    system does not get to second-guess the person who owns the account.
-    ``never_allow`` remains the only hard block — and even that is theirs to
-    edit through the governance API.
-
-    Both consent-scope branches are exercised, because the withheld tier
-    covered both: a subject WITH an action key writes the action, and a
-    subject with only a capability writes the capability.
-    """
     e, w = await _ws(db_session)
-
-    # ── action-key subject: social_post.publish ──
-    subject = _subject(e, w, risk_level="high")  # social_post.publish
-    d1 = await resolve_approval(db_session, subject=subject, origin=_step_origin())
-    assert d1.outcome == "needs_human"
-
-    await grant_approval(
-        db_session, d1.request, by_user_id="op", via="always", standing=True,
-    )
-    # Nothing was withheld and nothing was booked as withheld.
-    assert d1.request.status == "granted"
-    assert "standing_grant_refused" not in (d1.request.payload or {})
-    assert d1.request.payload["scope"] == AuthorizeScope.TOOL.value
-    assert d1.request.payload["scope_promoted_from"] == AuthorizeScope.ACTION.value
-
-    policy = await get_policy(db_session, w)
-    assert "social_post.publish" in policy.auto_approve_actions
-
-    # ...so the next identical publish sails through with no new card.
-    d2 = await resolve_approval(db_session, subject=subject, origin=_step_origin())
-    assert d2.outcome == "allow"
-    assert await count_open_requests(db_session, workspace_id=w) == 0
-
-    # ── capability-only subject: external.email ──
-    cap_subject = _subject(
-        e, w, risk_level="high", action_key=None, capability_id="external.email",
-    )
-    d3 = await resolve_approval(db_session, subject=cap_subject, origin=_step_origin())
-    assert d3.outcome == "needs_human"
-    await grant_approval(
-        db_session, d3.request, by_user_id="op", via="always", standing=True,
-    )
-    policy = await get_policy(db_session, w)
-    assert "external.email" in policy.auto_approve_capabilities
-
-    d4 = await resolve_approval(db_session, subject=cap_subject, origin=_step_origin())
-    assert d4.outcome == "allow"
+    subject = _subject(e, w, risk_level="high")
+    origin = _step_origin()
+    pending = await resolve_approval(db_session, subject=subject, origin=origin)
+    scope = ApprovalScope(kind="workspace", id=w, entity_id=e)
+    actor = await db_session.get(User, "op")
+    snapshot = await read_approval_settings(db_session, scope, actor)
+    await update_approval_policy(db_session, scope, PolicyDraft(mode=None, user_rules=[{
+        "effect": "allow", "selector": {"kind": "action", "action_key": "social_post.publish"},
+    }]), snapshot["version"], actor)
+    still_pending = await resolve_approval(db_session, subject=subject, origin=origin)
+    assert still_pending.outcome == "needs_human"
+    assert still_pending.request.id == pending.request.id
+    future = await resolve_approval(db_session, subject=subject, origin=_step_origin())
+    assert future.outcome == "allow"
+    assert await count_open_requests(db_session, workspace_id=w) == 1
 
 
 @pytest.mark.asyncio
@@ -422,10 +522,43 @@ async def test_standing_grant_cannot_override_hard_block(db_session):
     """A standing grant never beats never_allow — hard blocks stay hard."""
     e, w = await _ws(db_session)
     await update_policy(db_session, entity_id=e, workspace_id=w,
-                        policy=WorkspacePolicy(
-                            never_allow_capabilities=["external.social"],
-                            auto_approve_capabilities=["external.social"],  # even if both set
-                        ),
+                        policy=_policy(("deny", "social_post.publish"), ("allow", "social_post.publish")),
                         changed_by="t")
     d = await resolve_approval(db_session, subject=_subject(e, w, risk_level="high"), origin=_step_origin())
     assert d.outcome == "deny"
+
+
+@pytest.mark.asyncio
+async def test_explicit_retry_intent_is_durable_and_does_not_reuse_consumed_grant(db_session):
+    from apps.api.routers.plans import _reset_step_for_retry
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.plans.step_reset import reset_step_to_retry_ready, step_approval_operation_id
+
+    entity_id, workspace_id = await _ws(db_session)
+    plan = ExecutionPlan(id=generate_ulid(), entity_id=entity_id, workspace_id=workspace_id,
+        status="paused", execution_mode="live", approval_required=False, plan_dag={"steps": []})
+    step = ExecutionStep(id=generate_ulid(), plan_id=plan.id, entity_id=entity_id, workspace_id=workspace_id,
+        step_key="publish", kind="action", action_key="social_post.publish", risk_level="high",
+        params={}, depends_on=[], step_status="failed", attempt_count=1)
+    db_session.add_all([plan, step])
+    await db_session.flush()
+    original = step_approval_operation_id(step)
+    db_session.add(HitlRequest(entity_id=entity_id, workspace_id=workspace_id,
+        action_key="social_post.publish", resource_id=None, capability_id="external.social", risk_level="high",
+        origin_kind="step", origin_step_id=step.id, origin_plan_id=plan.id, status="consumed",
+        dedup_key=f"operation:{original}", context={"operation_id": original, "args_hash": "same"}))
+    await db_session.flush()
+    reset_step_to_retry_ready(step)
+    denied = await resolve_approval(db_session, subject=_subject(entity_id, workspace_id, risk_level="high"),
+        origin=_step_origin(step_id=step.id, plan_id=plan.id, operation_id=step_approval_operation_id(step), args_hash="same"))
+    assert denied.outcome == "deny"
+    _reset_step_for_retry(step, user=await db_session.get(User, "op"))
+    await db_session.commit()
+    await db_session.refresh(step)
+    assert step.approval_operation_revision == 1
+    assert step_approval_operation_id(step) == f"{original}:intent:1"
+    reviewed = await resolve_approval(db_session, subject=_subject(entity_id, workspace_id, risk_level="high"),
+        origin=_step_origin(step_id=step.id, plan_id=plan.id, operation_id=step_approval_operation_id(step), args_hash="same"))
+    assert reviewed.outcome == "needs_human"
+    assert reviewed.request.status == "pending"
+    assert reviewed.request.context["operation_id"] == f"{original}:intent:1"

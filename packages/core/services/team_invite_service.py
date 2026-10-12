@@ -7,6 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.i18n import SUPPORTED_LOCALES, get_locale
 from packages.core.models.base import generate_ulid
 from packages.core.models.staff import Staff, StaffRole
 from packages.core.models.user import OAuthAccount, User
@@ -330,6 +331,7 @@ async def accept_team_invite_with_oauth(
     avatar_url: str | None = None,
     access_token: str | None = None,
     refresh_token: str | None = None,
+    locale: str | None = None,
 ) -> TeamInviteAcceptResult:
     staff = await _load_invited_staff(db, token=token, email=email)
     user = await _user_for_staff_email(db, staff)
@@ -364,6 +366,7 @@ async def accept_team_invite_with_oauth(
         await db.flush()
         return TeamInviteAcceptResult(user=user, staff=staff)
 
+    initial_locale = (locale or get_locale()).strip().lower().replace("_", "-").split("-", 1)[0]
     user = User(
         id=generate_ulid(),
         entity_id=staff.entity_id,
@@ -373,6 +376,7 @@ async def accept_team_invite_with_oauth(
         last_name=last_name,
         avatar_url=avatar_url,
         password_hash="oauth_no_password",
+        locale=initial_locale if initial_locale in SUPPORTED_LOCALES else "en",
         role=await _legacy_role_for_staff(db, staff),
         status="active",
     )

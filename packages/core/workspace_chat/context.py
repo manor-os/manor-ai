@@ -15,7 +15,9 @@ from packages.core.constants.execution import (
     ExecutionStepStatus,
 )
 
+import json
 import logging
+import re
 import time
 from typing import Any, Optional
 
@@ -78,6 +80,74 @@ def _normalize_task_status_filter(status: str | None) -> str | None:
         return None
     lowered = text.lower().replace("-", " ").replace("_", " ")
     return _TASK_STATUS_ALIASES.get(text.lower()) or _TASK_STATUS_ALIASES.get(lowered) or text
+
+
+_QUERY_STOPWORDS = {
+    "a", "an", "the", "and", "or", "of", "to", "for", "with", "from",
+    "in", "on", "at", "by", "is", "are", "this", "that", "all", "any",
+}
+
+
+def _query_matches(q: str, *texts: str | None) -> bool:
+    """Match an exact substring first, then any meaningful query token.
+
+    Chat often sends a bag of keywords ("rights distribution royalty")
+    rather than a title substring. Requiring the whole string caused
+    workspace_search(goals|tasks) to return "No results found."
+    """
+    needle = (q or "").strip().lower()
+    if not needle:
+        return True
+    haystack = " ".join(text or "" for text in texts).lower()
+    if needle in haystack:
+        return True
+    tokens = [
+        token
+        for token in needle.replace("/", " ").replace("|", " ").replace(",", " ").split()
+        if len(token) >= 3 and token not in _QUERY_STOPWORDS
+    ]
+    if not tokens:
+        return False
+    return any(token in haystack for token in tokens)
+
+
+def _clip_text(text: str, limit: int) -> str:
+    compact = " ".join((text or "").split())
+    if len(compact) <= limit:
+        return compact
+    if limit <= 1:
+        return compact[:limit]
+    return compact[: limit - 1] + "…"
+
+
+def _commitment_answer_text(response: Any) -> str:
+    if not isinstance(response, dict):
+        return ""
+    text = response.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    attachments = response.get("attachments")
+    if not isinstance(attachments, list) or not attachments:
+        return text
+    parts: list[str] = []
+    for item in attachments:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        doc_id = str(item.get("id") or item.get("document_id") or "").strip()
+        path = str(item.get("fs_path") or "").strip()
+        if not name and not doc_id:
+            continue
+        label = name or doc_id
+        extras = []
+        if doc_id:
+            extras.append(f"id={doc_id}")
+        if path:
+            extras.append(f"path={path}")
+        parts.append(f"{label} ({', '.join(extras)})" if extras else label)
+    if not parts:
+        return text
+    suffix = "attachments: " + ", ".join(parts)
+    return f"{text} | {suffix}" if text else suffix
 
 
 def _cache_key(entity_id: str, workspace_id: str) -> str:
@@ -200,6 +270,18 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
     else:
         parts.append("Tasks: none")
 
+    human_queue = await _format_human_queue(
+        db, workspace_id, entity_id, question_limit=80, answer_limit=220, limit=4,
+    )
+    if human_queue:
+        parts.append(
+            "Need Input (user-confirmed facts; do not reset them to unknown "
+            "because uploaded files omit them). Do not interview in chat or "
+            "ask the user to send a next-step message; Strategy and Goals drive "
+            "remaining work:\n"
+            + human_queue
+        )
+
     # Agents
     subs = (await db.execute(
         select(
@@ -229,12 +311,13 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         service_lines: list[str] = []
         for sub in subs[:8]:
             agent_name = agents_by_id.get(sub.agent_id) or sub.name or "Unknown"
-            service_key = sub.service_key or "general"
+            # No invented key: delegation matches only a real service_key.
+            key_part = f"service_key={sub.service_key} " if sub.service_key else ""
             service_lines.append(
-                f"  - service_key={service_key} agent=\"{agent_name}\" subscription_id={sub.id}"
+                f"  - {key_part}agent=\"{agent_name}\" subscription_id={sub.id}"
             )
         if len(subs) > len(service_lines):
-            service_lines.append("  - use workspace_search(category='agents') for the full list")
+            service_lines.append("  - use manor Workspace search with category='agents' for the full list")
         parts.append(f"Agents/services ({len(subs)}):\n" + "\n".join(service_lines))
     else:
         parts.append("Agents: none assigned")
@@ -257,8 +340,8 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         if knowledge_policy.get("auto_search") is not False:
             parts.append(
                 "Knowledge runtime: before answering or executing document-dependent requests, "
-                "search workspace Knowledge Nets with rag(workspace_id=...) or a specific net via "
-                "rag(net_ids=[...]), and cite source names."
+                "inventory attached Knowledge documents with list_documents or search_documents "
+                "(directly or through manor) and cite source names."
             )
         if knowledge_policy.get("strict_mode") is True or mode == "strict":
             parts.append(
@@ -297,6 +380,17 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
     if op_rules:
         parts.append(f"Operating rules: {len(op_rules)}")
 
+    from packages.core.services.workspace_integration_scope import disabled_workspace_providers
+
+    disabled_providers = sorted(disabled_workspace_providers(ws.operating_model))
+    if disabled_providers:
+        parts.append(
+            "Workspace-disabled integrations: " + ", ".join(disabled_providers)
+            + ". These providers are excluded from this workspace's tools and setup "
+            "requirements. Do not request reconnection unless the user explicitly "
+            "asks to enable one again; shared accounts and Agent definitions remain unchanged."
+        )
+
     try:
         from packages.core.governance import get_policy
 
@@ -305,19 +399,8 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         # PostgreSQL's aborted-transaction state.
         async with db.begin_nested():
             policy = await get_policy(db, workspace_id)
-        guardrails: list[str] = []
-        if policy.never_allow_actions:
-            guardrails.append(f"never allow {_compact_patterns(policy.never_allow_actions)}")
-        if policy.hitl_required_actions:
-            guardrails.append(f"approval required for {_compact_patterns(policy.hitl_required_actions)}")
-        if policy.auto_approve_actions:
-            guardrails.append(f"auto-approved exceptions {_compact_patterns(policy.auto_approve_actions)}")
-        if policy.never_allow_capabilities:
-            guardrails.append(f"never allow capabilities {_compact_patterns(policy.never_allow_capabilities)}")
-        if policy.hitl_required_capabilities:
-            guardrails.append(f"approval required for capabilities {_compact_patterns(policy.hitl_required_capabilities)}")
-        if policy.auto_approve_capabilities:
-            guardrails.append(f"auto-approved capability exceptions {_compact_patterns(policy.auto_approve_capabilities)}")
+        from packages.core.governance.approval_projection import approval_summary
+        guardrails = approval_summary(policy)
         if policy.max_risk_level != "high":
             guardrails.append(f"max risk {policy.max_risk_level}")
         if guardrails:
@@ -326,9 +409,10 @@ async def _build_summary(db: AsyncSession, workspace_id: str, entity_id: str) ->
         logger.debug("Workspace governance summary failed", exc_info=True)
 
     parts.append(
-        "\nUse workspace_search to look up goals, tasks, agents, knowledge, artifacts/files, plans, rules, "
-        "runtime evidence, or learning candidates. Use workspace_agent for persistent workspace changes "
-        "such as tasks, rules, or knowledge bindings."
+        "\nUse manor(action='workspace') with its search action to look up goals, tasks, agents, "
+        "knowledge, artifacts/files, plans, rules, runtime evidence, learning candidates, "
+        "or Need Input answers (category='humans'). "
+        "Use the same gateway for persistent workspace changes such as tasks, rules, or knowledge bindings."
     )
 
     return "\n".join(parts)
@@ -352,6 +436,17 @@ async def workspace_search(
     """Search workspace data by category. Returns formatted text for the LLM."""
     q = (query or "").strip().lower()
     cat = (category or "all").strip().lower()
+    from packages.core.contracts.workspace_search import WORKSPACE_SEARCH_CATEGORIES
+    from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+
+    if cat not in WORKSPACE_SEARCH_CATEGORIES:
+        return json.dumps(tool_error_payload(
+            tool_name="workspace_search", code="unsupported_search_category",
+            message="This category is not supported by Workspace inventory search. This is not an empty search result or evidence of missing capability.",
+            details={"field": "category", "supported_categories": list(WORKSPACE_SEARCH_CATEGORIES),
+                     "capability_availability": "not_established", "action_executed": False,
+                     "discovery_tool": "search_tools"},
+        ))
     status_filter = _normalize_task_status_filter(status)
 
     from packages.core.models.workspace import Workspace
@@ -409,7 +504,7 @@ async def workspace_search(
         ))
 
     if cat in ("artifacts", "files", "generated_files", "all"):
-        results.append(await _search_artifacts(db, workspace_id, entity_id, q, limit))
+        results.append(await _search_artifacts(db, workspace_id, entity_id, q, limit, user_id=user_id))
 
     if cat in ("plans", "all"):
         results.append(await _search_plans(db, workspace_id, entity_id, q, limit))
@@ -422,6 +517,9 @@ async def workspace_search(
 
     if cat in ("runtime", "evidence", "learning", "all"):
         results.append(await _search_runtime_learning(db, workspace_id, entity_id, q, limit))
+
+    if cat in ("humans", "all"):
+        results.append(await _search_humans(db, workspace_id, entity_id, q, limit))
 
     text = "\n\n".join(r for r in results if r)
     return text or "No results found."
@@ -441,13 +539,14 @@ async def _search_goals(db: AsyncSession, ws_id: str, entity_id: str, q: str, li
         return ""
     lines = ["## Goals"]
     for g in rows:
-        if q and q not in (g.title or "").lower() and q not in (g.metric_key or "").lower():
+        if not _query_matches(q, g.title, g.metric_key, g.goal_key, g.description):
             continue
         current = float(g.current_value or 0)
         target = float(g.target_value or 1)
         pct = min(100, int((current / target) * 100)) if target > 0 else 0
         lines.append(
-            f"- **{g.title}**: {current:,.0f} / {target:,.0f} ({pct}%) — {g.pace_status or 'unknown'}"
+            f"- goal_id={g.id} goal_key={g.goal_key} **{g.title}**: "
+            f"{current:,.0f} / {target:,.0f} ({pct}%) — {g.pace_status or 'unknown'}"
             + (f"\n  {g.description}" if g.description else "")
             + (f"\n  Cadence: {g.measurement_cadence}" if g.measurement_cadence else "")
             + (f" | Deadline: {g.deadline}" if g.deadline else "")
@@ -473,7 +572,7 @@ async def _search_tasks(
         return ""
     lines = ["## Tasks"]
     for t in rows:
-        if q and q not in (t.title or "").lower() and q not in (t.description or "").lower():
+        if not _query_matches(q, t.title, t.description):
             continue
         line = f"- task_id={t.id} [{t.status}] **{t.title}**"
         if t.owner_service_key:
@@ -575,8 +674,8 @@ async def _search_knowledge(
         return ""
     lines = ["## Knowledge Base"]
     lines.append(
-        "Use rag(workspace_id=...) for content-level lookup across these workspace Knowledge Nets, "
-        "or rag(net_ids=[...]) for one net, and cite the document names you used."
+        "These workspace Knowledge Nets are available. Inventory files with "
+        "list_documents or search_documents and cite the document names you used."
     )
     for g in groups:
         group_matches = bool(q and q in (g.name or "").lower())
@@ -691,9 +790,13 @@ async def _search_knowledge(
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
-async def _search_artifacts(db: AsyncSession, ws_id: str, entity_id: str, q: str, limit: int) -> str:
+async def _search_artifacts(
+    db: AsyncSession, ws_id: str, entity_id: str, q: str, limit: int, *,
+    user_id: str | None = None,
+) -> str:
     from packages.core.ai.runtime.document_actions import runtime_document_markdown_link
     from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+    from packages.core.services.document_access import user_can_read_document
     from packages.core.services.document_metadata import metadata_artifact, metadata_origin
 
     workspace_file_membership = (
@@ -718,12 +821,17 @@ async def _search_artifacts(db: AsyncSession, ws_id: str, entity_id: str, q: str
             Document.is_trashed == False,  # noqa: E712
             workspace_origin,
         )
-        .order_by(Document.created_at.desc())
-        .limit(limit)
+        .order_by(Document.created_at.desc(), Document.id.desc())
     )
     if q:
         like = f"%{q}%"
+        document_ids = [
+            value.upper() for value in re.findall(
+                r"(?<![a-z0-9])[0-9a-hjkmnp-tv-z]{26}(?![a-z0-9])", q,
+            )
+        ]
         stmt = stmt.where(or_(
+            Document.id.in_(document_ids),
             Document.name.ilike(like),
             Document.file_type.ilike(like),
             Document.mime_type.ilike(like),
@@ -732,7 +840,25 @@ async def _search_artifacts(db: AsyncSession, ws_id: str, entity_id: str, q: str
             Document.file_url.ilike(like),
             Document.metadata_.cast(String).ilike(like),
         ))
-    rows = list((await db.execute(stmt)).scalars().all())
+    rows = []
+    if user_id:
+        batch_size = max(limit, 20)
+        offset = 0
+        while len(rows) < limit:
+            batch = list((await db.execute(stmt.offset(offset).limit(batch_size))).scalars().all())
+            for doc in batch:
+                if await user_can_read_document(
+                    db, doc, entity_id=entity_id, user_id=user_id,
+                    workspace_id=ws_id, actor_type="agent",
+                ):
+                    rows.append(doc)
+                    if len(rows) >= limit:
+                        break
+            if len(batch) < batch_size:
+                break
+            offset += batch_size
+    else:
+        rows = list((await db.execute(stmt.limit(limit))).scalars().all())
     if not rows:
         return ""
 
@@ -788,6 +914,7 @@ async def _search_plans(db: AsyncSession, ws_id: str, entity_id: str, q: str, li
 async def _search_rules(db: AsyncSession, ws_id: str, entity_id: str, q: str) -> str:
     from packages.core.models.workspace import Workspace
     from packages.core.governance import get_policy
+    from packages.core.services.workspace_setup_service import _infer_rule_enforcement
     ws = (await db.execute(select(Workspace).where(
         Workspace.id == ws_id,
         Workspace.entity_id == entity_id,
@@ -797,39 +924,52 @@ async def _search_rules(db: AsyncSession, ws_id: str, entity_id: str, q: str) ->
         return ""
     rules = (ws.operating_model or {}).get("rules") or []
     lines = ["## Rules"]
+    query = q.casefold()
     for r in rules:
         if isinstance(r, str):
-            desc = r
-            rule_key = ""
-            severity = "?"
+            source = {"description": r[:400], "runtime_enforced": False}
+            searchable = r
         elif isinstance(r, dict):
-            desc = r.get("description", "")
-            rule_key = r.get("rule_key") or ""
-            severity = r.get("severity", "?")
+            # Keep the source identity beside its executable effect. Descriptions
+            # (e.g. "no controversial topics") are not runtime conditions, and a
+            # stored runtime_enforced flag can outlive a rule's executable type.
+            enforcement = _infer_rule_enforcement(r)
+            source = {
+                key: r[key]
+                for key in (
+                    "rule_key", "rule_type", "severity", "scope",
+                    "action_patterns", "capability_patterns",
+                )
+                if key in r
+            }
+            source["description"] = str(r.get("description") or "")[:400]
+            source["runtime_enforced"] = bool(enforcement)
+            if enforcement:
+                source["policy_effect"] = enforcement
+            searchable = json.dumps({**r, "policy_effect": enforcement}, ensure_ascii=False)
         else:
             continue
-        if q and q not in desc.lower() and q not in rule_key.lower():
+        if query and query not in searchable.casefold():
             continue
-        lines.append(f"- [{severity}] {desc[:200]}")
+        lines.append("- " + json.dumps(source, ensure_ascii=False))
     policy = await get_policy(db, ws_id)
-    policy_lines: list[str] = []
-    if policy.never_allow_actions:
-        policy_lines.append("Never allow: " + ", ".join(policy.never_allow_actions))
-    if policy.hitl_required_actions:
-        policy_lines.append("Approval required: " + ", ".join(policy.hitl_required_actions))
-    if policy.auto_approve_actions:
-        policy_lines.append("Auto-approved exceptions: " + ", ".join(policy.auto_approve_actions))
-    if policy.never_allow_capabilities:
-        policy_lines.append("Never allow capabilities: " + ", ".join(policy.never_allow_capabilities))
-    if policy.hitl_required_capabilities:
-        policy_lines.append("Approval required capabilities: " + ", ".join(policy.hitl_required_capabilities))
-    if policy.auto_approve_capabilities:
-        policy_lines.append("Auto-approved capability exceptions: " + ", ".join(policy.auto_approve_capabilities))
+    from packages.core.governance.approval_projection import approval_summary
+    policy_lines = approval_summary(policy)
     if policy.max_risk_level != "high":
         policy_lines.append(f"Max risk level: {policy.max_risk_level}")
     if policy_lines:
         lines.append("Runtime guardrails:")
         lines.extend(f"- {line}" for line in policy_lines)
+        lines.append(
+            "Hard blocks win over approval and auto-approval entries. Descriptions "
+            "do not narrow action/capability patterns. An approval_required rule "
+            "allows execution after human approval even if its description says "
+            "never or do not; that prose is not an additional hard block. Call "
+            "the intended tool and follow its approval workflow; all current "
+            "hard blocks and other runtime gates still apply. Before changing a restriction, "
+            "use operation action=get_current to inspect the full source rules and "
+            "live policy; change the blocking rule, not an already-approval-required rule."
+        )
     return "\n".join(lines) if len(lines) > 1 else ""
 
 
@@ -900,3 +1040,93 @@ async def _search_runtime_learning(db: AsyncSession, ws_id: str, entity_id: str,
         candidates=candidates,
         max_items=limit,
     )
+
+
+async def _load_human_commitments(
+    db: AsyncSession, ws_id: str, entity_id: str, *, limit: int,
+):
+    from packages.core.models.participant import HumanCommitment
+
+    waiting = list((await db.execute(
+        select(HumanCommitment).where(
+            HumanCommitment.entity_id == entity_id,
+            HumanCommitment.workspace_id == ws_id,
+            HumanCommitment.status == "waiting",
+        ).order_by(HumanCommitment.requested_at.asc())
+    )).scalars().all())
+    fulfilled = list((await db.execute(
+        select(HumanCommitment).where(
+            HumanCommitment.entity_id == entity_id,
+            HumanCommitment.workspace_id == ws_id,
+            HumanCommitment.status == "fulfilled",
+        ).order_by(
+            HumanCommitment.fulfilled_at.desc().nullslast(),
+            HumanCommitment.requested_at.desc(),
+        ).limit(max(limit, 1))
+    )).scalars().all())
+    return waiting, fulfilled
+
+
+def _format_commitment_line(
+    commitment, *, question_limit: int, answer_limit: int,
+) -> str:
+    question = _clip_text(
+        commitment.expected_input or f"{commitment.request_kind} request",
+        question_limit,
+    )
+    if commitment.status == "waiting":
+        return f"- [waiting {commitment.request_kind}] {question}"
+    answer = _clip_text(_commitment_answer_text(commitment.response), answer_limit)
+    if answer:
+        return f"- [fulfilled {commitment.request_kind}] {question} → {answer}"
+    return f"- [fulfilled {commitment.request_kind}] {question}"
+
+
+async def _format_human_queue(
+    db: AsyncSession,
+    ws_id: str,
+    entity_id: str,
+    *,
+    question_limit: int,
+    answer_limit: int,
+    limit: int,
+) -> str:
+    waiting, fulfilled = await _load_human_commitments(
+        db, ws_id, entity_id, limit=limit,
+    )
+    lines: list[str] = []
+    for commitment in fulfilled:
+        if not _commitment_answer_text(commitment.response) and not commitment.expected_input:
+            continue
+        lines.append(_format_commitment_line(
+            commitment, question_limit=question_limit, answer_limit=answer_limit,
+        ))
+        if len(lines) >= limit:
+            return "\n".join(lines)
+    for commitment in waiting:
+        lines.append(_format_commitment_line(
+            commitment, question_limit=question_limit, answer_limit=answer_limit,
+        ))
+        if len(lines) >= limit:
+            break
+    return "\n".join(lines)
+
+
+async def _search_humans(
+    db: AsyncSession, ws_id: str, entity_id: str, q: str, limit: int,
+) -> str:
+    waiting, fulfilled = await _load_human_commitments(
+        db, ws_id, entity_id, limit=limit,
+    )
+    lines = ["## Need Input"]
+    for commitment in [*waiting, *fulfilled]:
+        question = commitment.expected_input or ""
+        answer = _commitment_answer_text(commitment.response)
+        if not _query_matches(q, question, answer, commitment.request_kind, commitment.status):
+            continue
+        lines.append(_format_commitment_line(
+            commitment, question_limit=200, answer_limit=800,
+        ))
+        if len(lines) > limit:
+            break
+    return "\n".join(lines) if len(lines) > 1 else ""

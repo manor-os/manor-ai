@@ -52,17 +52,20 @@ def blueprint_delivery_source(
     return blueprint.payload or {}, blueprint.content_version
 
 
-def blueprint_delivery_requires_paid_plan(
+def blueprint_delivery_is_paid(
     blueprint: Any,
     purchase: Any | None,
 ) -> bool:
-    """Return whether the content selected for delivery is paid content.
+    """Return whether the selected Blueprint delivery is paid content.
 
     A published release follows its current listing price. An archived or
     unpublished fallback follows the immutable purchase receipt instead, so a
-    later seller repricing cannot turn a historical paid snapshot into a
-    subscription-free delivery path.
+    later seller repricing cannot turn a historical paid snapshot into a free
+    delivery path. A completed purchase owns this entitlement independently of
+    an optional Manor subscription.
     """
+    if not is_cloud():
+        return False
     if purchase is not None and blueprint.status != BlueprintStatus.PUBLISHED:
         return int(purchase.amount_cents or 0) > 0
     return int(blueprint.price_cents or 0) > 0
@@ -97,11 +100,12 @@ async def require_paid_marketplace_plan(
     entity_id: str,
     blueprint_id: str | None = None,
 ) -> None:
-    """Fail closed for paid Blueprint operations without a paid Manor plan.
+    """Fail closed for unverified raw Blueprint imports without a paid plan.
 
-    Cloud raw imports use this gate too because their origin is not
-    server-verifiable. OSS keeps its existing Blueprint behavior and never
-    points users at a subscription flow that does not exist.
+    Canonical Marketplace purchases do not use this gate. Cloud raw imports do
+    because their origin is not server-verifiable. OSS keeps its existing
+    Blueprint behavior and never points users at a subscription flow that does
+    not exist.
     """
     if not is_cloud():
         return

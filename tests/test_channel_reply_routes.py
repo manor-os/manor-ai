@@ -72,36 +72,31 @@ async def test_external_reply_governance_is_scoped_to_channel_account(
     assert captured["resource_id"] == "gmail-account-2"
 
 
-def test_external_reply_standing_grant_does_not_cross_channel_accounts() -> None:
-    from packages.core.governance.approval_scope import approval_scope_key
-    from packages.core.governance.policy import WorkspacePolicy, decide
+def test_external_reply_saved_rule_does_not_cross_channel_accounts() -> None:
+    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_policy import ApprovalScope, evaluate_policy
+    from packages.core.governance.approval_policy_service import build_policy_chain
 
-    action_key = "external_message.send"
-    first_account_scope = approval_scope_key(action_key, "gmail-account-1")
-    assert first_account_scope is not None
-    policy = WorkspacePolicy(
-        auto_approve_actions=[first_account_scope],
-        hitl_required_actions=[action_key],
+    chain = build_policy_chain(
+        scope=ApprovalScope(kind="account", id="entity", entity_id="entity"),
+        root={"revision": 1, "policy": {"mode": "risk_based", "rules": [{
+            "id": "first-account-reply", "effect": "allow", "selector": {
+                "kind": "resource", "action_key": "external_message.send",
+                "account_id": "gmail-account-1", "resource_kind": "contact",
+                "resource_ids": ["recipient"],
+            },
+        }]}},
     )
 
-    first = decide(
-        policy,
-        kind="action",
-        action_key=action_key,
-        resource_id="gmail-account-1",
-        risk_level="high",
-    )
-    second = decide(
-        policy,
-        kind="action",
-        action_key=action_key,
-        resource_id="gmail-account-2",
-        risk_level="high",
-    )
+    def decision(account_id: str, recipient: str = "recipient"):
+        return evaluate_policy(chain, action_facts(
+            action_key="external_message.send", account_id=account_id,
+            resource_kind="contact", resource_id=recipient, risk_level="high",
+        ))
 
-    assert first.allowed is True
-    assert second.allowed is False
-    assert second.pause_for_hitl is True
+    assert decision("gmail-account-1").outcome == "allow"
+    assert decision("gmail-account-2").outcome == "ask"
+    assert decision("gmail-account-1", "other-recipient").outcome == "ask"
 
 
 @pytest.mark.asyncio
@@ -848,6 +843,96 @@ async def test_contact_subscription_route_can_override_channel_workspace(
             runtime_workspace_id=contact_workspace.id,
         ),
         workspace_id=contact_workspace.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_twilio_voice_route_ignores_contact_subscription_pin(
+    db_session,
+) -> None:
+    entity_id = generate_ulid()
+    owner_user_id = generate_ulid()
+    bound_workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Voice binding",
+        status="active",
+    )
+    pinned_workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Historical contact pin",
+        status="active",
+    )
+    bound_subscription = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_id="voice-agent",
+        workspace_id=bound_workspace.id,
+        status="active",
+    )
+    pinned_subscription = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_id="stale-contact-agent",
+        workspace_id=pinned_workspace.id,
+        status="active",
+    )
+    config = ChannelConfig(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        owner_user_id=owner_user_id,
+        workspace_id=bound_workspace.id,
+        channel_type="twilio_voice",
+        provider="twilio",
+        status="active",
+    )
+    binding = Channel(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        user_id=owner_user_id,
+        workspace_id=bound_workspace.id,
+        type="twilio_voice",
+        name="Twilio Voice",
+        config={"channel_config_id": config.id},
+        agent_id=bound_subscription.agent_id,
+        agent_subscription_id=bound_subscription.id,
+        status="active",
+    )
+    contact = ChannelContact(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        channel_config_id=config.id,
+        channel_type="twilio_voice",
+        source_id="+14155550199",
+        agent_subscription_id=pinned_subscription.id,
+        status="active",
+    )
+    db_session.add_all([
+        bound_workspace,
+        pinned_workspace,
+        bound_subscription,
+        pinned_subscription,
+        config,
+        binding,
+        contact,
+    ])
+    await db_session.commit()
+
+    assert await channel_reply_route_is_active(
+        entity_id=entity_id,
+        cc_id=config.id,
+        channel_type="twilio_voice",
+        channel_binding_id=binding.id,
+        channel_contact_id=contact.id,
+        agent_id=bound_subscription.agent_id,
+        agent_subscription_id=bound_subscription.id,
+        route_snapshot=build_channel_reply_route_snapshot(
+            config_workspace_id=bound_workspace.id,
+            binding_workspace_id=bound_workspace.id,
+            runtime_workspace_id=bound_workspace.id,
+        ),
+        workspace_id=bound_workspace.id,
     )
 
 

@@ -49,6 +49,7 @@ from packages.core.services.agent_subscription_service import (
 )
 from packages.core.services.channel_agent_runtime import (
     ChannelAgentRunResult,
+    append_channel_transcript,
     run_channel_agent_turn,
 )
 from packages.core.services.channel_bindings import (
@@ -85,6 +86,19 @@ from packages.core.services.channel_reply_approvals import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _authorize_resident_reply(conversation_id: str) -> None:
+    """Recheck private authority after model/routing waits, before exposure."""
+    from packages.core.services.webchat_resident import (
+        authorize_private_persistence,
+        current_runtime_scope,
+    )
+
+    if current_runtime_scope() is None:
+        return
+    async with async_session() as db:
+        await authorize_private_persistence(db, conversation_id)
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -324,17 +338,70 @@ async def dispatch_inbound(
                 conversation_key=conversation_key,
             )
 
-            await add_channel_inbound_message(
-                db,
-                conversation_id=conv.id,
-                channel_type=channel_type,
-                sender_id=sender_id,
-                sender_name=sender_name,
-                chat_id=chat_id,
-                content=content,
-                attachments=attachments,
+            message_attachments = attachments
+            runtime_attachment_context = ""
+            if channel_type == "email" and attachments:
+                if workspace_id and binding.user_id:
+                    from packages.core.services.email_attachments import (
+                        persist_inbound_workspace_email_attachments,
+                    )
+
+                    message_attachments, runtime_attachment_context = (
+                        await persist_inbound_workspace_email_attachments(
+                            attachments=attachments,
+                            entity_id=entity_id,
+                            workspace_id=workspace_id,
+                            user_id=binding.user_id,
+                            conversation_id=conv.id,
+                        )
+                    )
+                else:
+                    message_attachments = [
+                        {
+                            "filename": str(item.get("filename") or "attachment"),
+                            "status": "error",
+                            "error": "Email channel is not bound to a writable Workspace.",
+                        }
+                        for item in attachments
+                        if isinstance(item, dict)
+                    ]
+                    runtime_attachment_context = (
+                        "<email_attachments>Attachments were received but could not be "
+                        "saved because this email channel is not bound to a writable "
+                        "Workspace.</email_attachments>"
+                    )
+
+            origin_message = None
+            origin_message_id = (
+                str((runtime_metadata or {}).get("voice_origin_message_id") or "").strip()
+                if (runtime_metadata or {}).get("voice_session_mode") == "chat_gateway"
+                else ""
             )
-            history = await load_recent_channel_messages(db, conv.id)
+            if origin_message_id:
+                from packages.core.services.voice.work_queue import (
+                    load_valid_voice_origin_message,
+                )
+
+                origin_message = await load_valid_voice_origin_message(
+                    db,
+                    message_id=origin_message_id,
+                    conversation_id=conv.id,
+                    content=content,
+                )
+            if origin_message is None:
+                origin_message = await add_channel_inbound_message(
+                    db,
+                    conversation_id=conv.id,
+                    channel_type=channel_type,
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    chat_id=chat_id,
+                    content=content,
+                    attachments=message_attachments,
+                )
+            history = await load_recent_channel_messages(
+                db, conv.id, exclude_message_id=origin_message.id,
+            )
             await db.commit()
 
         # Short-circuit: ``/start <token>`` is the end-user channel-link
@@ -470,23 +537,49 @@ async def dispatch_inbound(
         # whatever the channel's equivalent is) while the agent thinks.
         adapter = ADAPTERS.get(channel_type)
         target = chat_id or sender_id
+        runtime_message = content
+        if runtime_attachment_context:
+            runtime_message = "\n\n".join(
+                value for value in (content, runtime_attachment_context) if value
+            )
+        agent_runtime_metadata = dict(runtime_metadata or {})
+        if channel_type == "email":
+            from packages.core.ai.runtime.file_context import (
+                RUNTIME_ATTACHMENT_CONTEXT_METADATA_KEY,
+            )
+            from packages.core.services.email_attachments import (
+                inbound_email_skill_reference_context,
+            )
+
+            agent_runtime_metadata[RUNTIME_ATTACHMENT_CONTEXT_METADATA_KEY] = (
+                inbound_email_skill_reference_context(message_attachments or [])
+            )
         async def _do_run() -> Optional[ChannelAgentRunResult]:
             return await run_channel_agent_turn(
                 entity_id=entity_id, agent_id=agent_id,
                 user_id=binding.user_id,
                 conversation_id=conv.id,
-                current_message=content,
+                current_message=runtime_message,
                 history=history,
                 sender_ctx=sender_ctx,
                 subscription=sub,
                 reply_route=reply_route,
-                runtime_metadata=runtime_metadata,
+                runtime_metadata=agent_runtime_metadata,
+                origin_message_id=origin_message.id,
             )
         if adapter is not None:
             async with adapter.typing_indicator(cc, target):
                 run_result = await _do_run()
         else:
             run_result = await _do_run()
+        if run_result and run_result.stop_reason in {"cancelled", "canceled"}:
+            return {
+                "status": "cancelled",
+                "agent_id": agent_id,
+                "agent_subscription_id": sub.id,
+                "workspace_id": workspace_id,
+                "conversation_id": conv.id,
+            }
         if not run_result or not run_result.content:
             return {
                 "status": "no_reply",
@@ -497,6 +590,7 @@ async def dispatch_inbound(
             }
         reply_text = run_result.content
 
+        await _authorize_resident_reply(conv.id)
         approval_hold = await maybe_hold_external_reply_for_approval(
             entity_id=entity_id,
             workspace_id=workspace_id,
@@ -569,6 +663,9 @@ async def dispatch_inbound(
             run_result.runtime_envelope,
             message_id=assistant_message_id,
         )
+        await append_channel_transcript(
+            run_result, user_message_id=origin_message.id, assistant_message_id=assistant_message_id,
+        )
 
         route_is_active = await channel_reply_route_is_active(**reply_route)
         if not route_is_active:
@@ -585,6 +682,7 @@ async def dispatch_inbound(
         # and conversation history are still persisted above, but routing it
         # through the text adapter would create a deferred log and then mark
         # it sent even though no audio was delivered.
+        await _authorize_resident_reply(conv.id)
         sent = True
         if deliver_reply:
             sent = await send_channel_text_reply(

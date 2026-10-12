@@ -432,8 +432,14 @@ async def test_consolidator_reports_commitments_and_contributions(db_session):
     fulfilled = await open_commitment(
         db_session, entity_id=entity_id, workspace_id=workspace.id,
         request_kind="input", source_kind="chat", source_id="msg_y",
+        expected_input="Confirm the legal artist name and track title.",
     )
-    await resolve_commitment(db_session, fulfilled, status="fulfilled")
+    await resolve_commitment(
+        db_session,
+        fulfilled,
+        status="fulfilled",
+        response={"text": "Legal/artist name: Alex Chen. Title: Tonight."},
+    )
     await record_contribution(
         db_session,
         entity_id=entity_id, workspace_id=workspace.id,
@@ -456,13 +462,21 @@ async def test_consolidator_reports_commitments_and_contributions(db_session):
 
     assert report.metrics["active_human_commitments"] == 2
     assert report.metrics["blocking_commitments"] == 1
+    assert report.metrics["fulfilled_operator_answers"] == 1
     assert report.metrics["contributions_since_last_review"] == 1
     assert report.coverage.sources["open_commitments"] == 2
+    assert report.coverage.sources["fulfilled_commitments"] == 1
     assert "human_commitments" not in report.coverage.sources
 
     waiting = [o for o in report.observations if o.type == "blocking_input_waiting"]
     assert len(waiting) == 1
     assert waiting[0].evidence_refs == [f"human_commitment:{blocking.id}"]
+
+    answers = [o for o in report.observations if o.type == "operator_input_recorded"]
+    assert len(answers) == 1
+    assert "Alex Chen" in answers[0].description
+    assert "Tonight" in answers[0].description
+    assert answers[0].evidence_refs == [f"human_commitment:{fulfilled.id}"]
 
 
 # ── M9.5 API — human queue + own profile ──────────────────────────────

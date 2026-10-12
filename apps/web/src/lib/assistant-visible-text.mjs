@@ -72,3 +72,18 @@ export function visibleAssistantText(value) {
     : withoutProtocol;
   return visible.replace(MANOR_FINAL_RESPONSE_TAG_RE, "").trim();
 }
+
+/** Reconcile a completed legacy snapshot only when its last final confirms the body. */
+export function hasAppendedCanonicalFinal(content, finalParts, streaming, hasRunningProcess) {
+  return Boolean(content) && !streaming && !hasRunningProcess &&
+    finalParts.length > 1 && finalParts[finalParts.length - 1].trim() === content;
+}
+
+export function hasRunningAssistantProcess(blocks) {
+  return blocks.some((block) => block?.type === "process" && (
+    block.status === "running" || block.status === "pending" ||
+    (Array.isArray(block.steps) && block.steps.some(
+      (step) => step?.status === "running" || step?.status === "pending",
+    ))
+  ));
+}

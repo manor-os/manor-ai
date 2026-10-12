@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ email_locale }}">
 
 <head>
     <meta charset="UTF-8">
@@ -75,7 +75,7 @@
                 <img src="{{ app_url }}/email-logo.png" width="32" height="32" alt="Manor AI" class="logo-icon" style="display:block;border:0;outline:none;text-decoration:none;border-radius:8px;">
                 <div class="brand-name">Manor AI</div>
             </div>
-            <a href="{{ app_url }}" target="_blank" class="header-link">View in a web browser</a>
+            <a href="{{ app_url }}" target="_blank" class="header-link">{{ browser_link }}</a>
         </header>
 
         <section class="content-section">
@@ -86,9 +86,9 @@
 
         <footer class="footer">
             <div class="section-content">
-                <p class="footer-title">Empowering Progress, Simplifying Success</p>
+                <p class="footer-title">{{ footer_title }}</p>
                 <p class="footer-info">
-                    All rights reserved &copy; Manor AI {{ year }}
+                    {{ rights_reserved }} &copy; Manor AI {{ year }}
                 </p>
             </div>
         </footer>

@@ -148,7 +148,12 @@ class AgentCapabilityCatalog:
             "integrations": [dict(item) for item in self.integrations],
         }
 
-    def resolve(self, catalog_ids: Iterable[object]) -> AgentCapabilityPlan:
+    def resolve(
+        self,
+        catalog_ids: Iterable[object],
+        *,
+        required_tools: Iterable[object] = (),
+    ) -> AgentCapabilityPlan:
         selected_ids = _unique_strings(catalog_ids)
         if len(selected_ids) > AGENT_CAPABILITY_SELECTION_LIMIT:
             raise AgentCapabilitySelectionError(
@@ -173,6 +178,25 @@ class AgentCapabilityCatalog:
             if value and value not in tool_names:
                 tool_names.append(value)
 
+        def add_mcp_action(candidate: AgentCapabilityCandidate, action: str) -> None:
+            server_key = str(candidate.metadata.get("server_key") or candidate.ref)
+            if not action:
+                mcp_actions[server_key] = None
+            elif server_key not in mcp_actions:
+                mcp_actions[server_key] = {action}
+            elif mcp_actions[server_key] is not None:
+                mcp_actions[server_key].add(action)
+
+        def record_setup(candidate: AgentCapabilityCandidate) -> None:
+            if candidate.readiness is AgentCapabilityPlanStatus.SETUP_REQUIRED:
+                setup_key = str(candidate.metadata.get("server_key") or candidate.catalog_id)
+                setup_by_key[setup_key] = {
+                    "catalog_id": candidate.catalog_id,
+                    "provider": candidate.metadata.get("server_key"),
+                    "reason": candidate.metadata.get("setup_required_reason") or "connection required",
+                    "setup_kind": candidate.metadata.get("setup_kind"),
+                }
+
         for catalog_id in selected_ids:
             candidate = candidates_by_id[catalog_id]
             if candidate.kind is AgentCapabilityKind.TOOL:
@@ -186,24 +210,61 @@ class AgentCapabilityCatalog:
                 if candidate.ref not in skill_ids:
                     skill_ids.append(candidate.ref)
             elif candidate.kind is AgentCapabilityKind.MCP_ACTION:
-                server_key = str(candidate.metadata.get("server_key") or candidate.ref)
-                action = str(candidate.metadata.get("action") or "").strip()
-                if not action:
-                    mcp_actions[server_key] = None
-                elif server_key not in mcp_actions:
-                    mcp_actions[server_key] = {action}
-                elif mcp_actions[server_key] is not None:
-                    assert isinstance(mcp_actions[server_key], set)
-                    mcp_actions[server_key].add(action)
+                add_mcp_action(candidate, str(candidate.metadata.get("action") or "").strip())
 
-            if candidate.readiness is AgentCapabilityPlanStatus.SETUP_REQUIRED:
-                setup_key = str(candidate.metadata.get("server_key") or candidate.catalog_id)
-                setup_by_key[setup_key] = {
-                    "catalog_id": candidate.catalog_id,
-                    "provider": candidate.metadata.get("server_key"),
-                    "reason": candidate.metadata.get("setup_required_reason") or "connection required",
-                    "setup_kind": candidate.metadata.get("setup_kind"),
+            record_setup(candidate)
+
+        # A newly selected Skill includes only its exact, currently visible
+        # dependencies. This is a configuration plan, not a runtime grant or a
+        # repair of previously saved Agent bindings/revocations.
+        native_tools = {
+            candidate.ref: candidate for candidate in self.candidates
+            if candidate.kind is AgentCapabilityKind.TOOL
+            and not candidate.ref.startswith("mcp__")
+        }
+        mcp_tools: dict[str, list[tuple[AgentCapabilityCandidate, str]]] = {}
+        for candidate in self.candidates:
+            if candidate.kind is not AgentCapabilityKind.MCP_ACTION:
+                continue
+            provider = canonical_provider_key(candidate.metadata.get("server_key") or candidate.ref)
+            for operation in candidate.actions:
+                tool_name = str(operation.get("tool_name") or "").strip()
+                action = str(operation.get("name") or "").strip()
+                parts = tool_name.split("__", 2)
+                if (
+                    len(parts) == 3 and parts[0] == "mcp"
+                    and canonical_provider_key(parts[1]) == provider
+                    and action == parts[2] and action
+                    and candidate.metadata.get("action", action) == action
+                ):
+                    mcp_tools.setdefault(tool_name, []).append((candidate, action))
+
+        def add_dependency(dependency: str, skill: AgentCapabilityCandidate | None = None) -> None:
+            native = native_tools.get(dependency)
+            operations = mcp_tools.get(dependency, [])
+            if native is not None:
+                add_tool(native.ref)
+                record_setup(native)
+            elif len(operations) == 1:
+                candidate, action = operations[0]
+                add_mcp_action(candidate, action)
+                record_setup(candidate)
+            else:
+                source_key = skill.catalog_id if skill is not None else "required_tools"
+                setup_by_key[f"{source_key}:{dependency}"] = {
+                    **({"catalog_id": skill.catalog_id, "skill_id": skill.ref} if skill else {"source": "required_tools"}),
+                    "dependency": dependency,
+                    "reason": f"Skill dependency is unknown or inaccessible: {dependency}",
+                    "setup_kind": "skill_dependency_unavailable",
                 }
+
+        for catalog_id in selected_ids:
+            skill = candidates_by_id[catalog_id]
+            if skill.kind is AgentCapabilityKind.SKILL:
+                for dependency in _unique_strings(skill.metadata.get("declared_tools") or ()):
+                    add_dependency(dependency, skill)
+        for dependency in _unique_strings(required_tools):
+            add_dependency(dependency)
 
         if skill_ids:
             invoke_skill = next(
@@ -377,6 +438,7 @@ class AgentCapabilityCatalogFactory:
         entity_id: str,
         user_id: str,
         profile: RuntimeProfile = RuntimeProfile.WORKSPACE_OPERATOR,
+        initialize: bool = True,
     ) -> AgentCapabilityCatalog:
         from packages.core.ai.runtime import runtime_tool_is_eager_for_profile
         from packages.core.ai.runtime.capabilities import (
@@ -384,6 +446,7 @@ class AgentCapabilityCatalogFactory:
             tool_names_for_capability_ids,
         )
         from packages.core.ai.runtime.tool_registry import runtime_registered_tool_schemas
+        from packages.core.ai.runtime.tool_visibility import runtime_tool_is_catalog_bindable
         from packages.core.services.agent_service import ensure_runtime_tool_definitions
         from packages.core.services.builtin_skill_loader import seed_builtin_skills
         from packages.core.services.integration_operation_catalog import (
@@ -395,8 +458,9 @@ class AgentCapabilityCatalogFactory:
             supported_integration_provider_keys,
         )
 
-        await ensure_runtime_tool_definitions(db)
-        await seed_builtin_skills(db)
+        if initialize:
+            await ensure_runtime_tool_definitions(db)
+            await seed_builtin_skills(db)
         registered_schemas = dict(runtime_registered_tool_schemas())
         tool_rows = list((await db.execute(
             select(ToolDefinition).where(ToolDefinition.status == "active")
@@ -407,7 +471,7 @@ class AgentCapabilityCatalogFactory:
         bindable_tool_names: set[str] = set()
         for tool in sorted(tool_rows, key=lambda item: item.name):
             name = str(tool.name or "").strip()
-            if not name or name.startswith("mcp__") or name.startswith("ws_"):
+            if not runtime_tool_is_catalog_bindable(name):
                 continue
             schema = registered_schemas.get(name)
             if not isinstance(schema, dict):
@@ -528,11 +592,12 @@ class AgentCapabilityCatalogFactory:
             # catalog may enter it; actor/account discovery stays in the scoped
             # candidate snapshot and later AgentMCPBinding allowlist.
             public_editor_operations[server.server_key] = public_operations
-        await _ensure_integration_tool_definitions(
-            db,
-            servers=mcp_rows,
-            operations_by_server=public_editor_operations,
-        )
+        if initialize:
+            await _ensure_integration_tool_definitions(
+                db,
+                servers=mcp_rows,
+                operations_by_server=public_editor_operations,
+            )
 
         skills_out: list[dict[str, Any]] = []
         skills_by_provider: dict[str, list[dict[str, Any]]] = {}
@@ -577,7 +642,7 @@ class AgentCapabilityCatalogFactory:
                 description=str(skill.description or ""),
                 readiness=skill_status,
                 actions=tuple({"name": name} for name in (skill.tools or [])),
-                metadata={"slug": skill.slug, **first_setup},
+                metadata={"slug": skill.slug, "declared_tools": tuple(skill.tools or ()), **first_setup},
             ))
             for provider in required_providers:
                 skills_by_provider.setdefault(canonical_provider_key(provider), []).append({
@@ -680,6 +745,16 @@ async def materialize_agent_capability_plan(
     plan: AgentCapabilityPlan,
 ) -> dict[str, list[str]]:
     """Bind a previously validated plan in the caller-owned transaction."""
+
+    missing_dependencies = [
+        str(item.get("dependency") or "") for item in plan.setup_required
+        if item.get("setup_kind") == "skill_dependency_unavailable"
+    ]
+    if missing_dependencies:
+        raise AgentCapabilitySelectionError(
+            "Skill dependencies are unknown or inaccessible: "
+            + ", ".join(dict.fromkeys(missing_dependencies))
+        )
 
     from packages.core.services.agent_provisioning_service import (
         AgentMCPBindingUpdateMode,

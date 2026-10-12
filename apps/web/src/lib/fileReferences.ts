@@ -120,6 +120,7 @@ const GENERATED_FILE_URL_KEYS = [
   "open_url", "openUrl", "viewer_url", "viewerUrl", "result_url", "file_url",
   "download_url", "document_url", "artifact_url", "output_url", "public_url", "url",
 ] as const;
+const GENERATED_FILE_PREVIEW_URL_KEYS = ["previewUrl", "preview_url"] as const;
 
 function generatedFileText(record: GeneratedFileRecord, keys: readonly string[]): string {
   for (const key of keys) {
@@ -135,6 +136,149 @@ function decodePathPart(value: string): string {
   } catch {
     return value;
   }
+}
+
+// ── The file-address contract (mirrors packages/core/services/file_refs.py) ──
+
+/** The one FileRef shape every producer returns (snake_case on the wire). */
+export interface FileRef {
+  name: string;
+  fs_path?: string;
+  document_id?: string;
+  open_url?: string;
+  markdown_link?: string;
+  mime?: string;
+  size?: number;
+  sha256?: string;
+  /** Legacy/auxiliary fields older rows still carry. */
+  file_type?: string;
+  preview_url?: string;
+  url?: string;
+}
+
+/** What a file address names; existence and access are not implied. */
+export type ParsedFileReference =
+  | { kind: "fs"; entity: string; fs_path: string }
+  | { kind: "document"; document_id: string };
+
+const INTERNAL_FILE_TARGET_RE =
+  /^(?:sandbox:|file:|\/(?:skill|tmp|mnt)(?:\/|$)|\$SANDBOX_OUTPUT_DIR|(?:\$?sandbox[_-]output)(?:\/|$))/i;
+const SANDBOX_ENTITY_MOUNT = "/workspace/";
+
+/** A sandbox-internal location: never an address the user can open. */
+export function isInternalFileTarget(value: unknown): boolean {
+  return INTERNAL_FILE_TARGET_RE.test(String(value ?? "").trim());
+}
+
+/** Python's `urllib.parse.unquote`: decode %XX runs once, invalid UTF-8 → U+FFFD. */
+function unquoteOnce(value: string): string {
+  return value.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => {
+    const bytes = Uint8Array.from(run.match(/%[0-9A-Fa-f]{2}/g)!, (hex) => parseInt(hex.slice(1), 16));
+    return new TextDecoder().decode(bytes);
+  });
+}
+
+/** Python's `urlsplit` reduced to what the parse rules read. */
+function splitUrl(text: string): { scheme: string; netloc: string; path: string } {
+  let rest = text;
+  let scheme = "";
+  const schemeMatch = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(rest);
+  if (schemeMatch) {
+    scheme = schemeMatch[1].toLowerCase();
+    rest = rest.slice(schemeMatch[0].length);
+  }
+  let netloc = "";
+  if (rest.startsWith("//")) {
+    const end = rest.slice(2).search(/[/?#]/);
+    netloc = end < 0 ? rest.slice(2) : rest.slice(2, 2 + end);
+    rest = end < 0 ? "" : rest.slice(2 + end);
+  }
+  return { scheme, netloc, path: rest.split(/[?#]/, 1)[0] };
+}
+
+function platformFsScope(path: string, allowRelative: boolean): string | null {
+  if (path.startsWith("/api/v1/fs/")) return path.slice("/api/v1/fs/".length);
+  if (allowRelative && path.startsWith("api/v1/fs/")) return path.slice("api/v1/fs/".length);
+  return null;
+}
+
+/** `_platform_fs_parts`: entity + normalized path of a `/api/v1/fs/` URL. */
+function platformFsParts(value: unknown): [string, string] | null {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const scoped = platformFsScope(splitUrl(text).path, true);
+  if (scoped === null) return null;
+  const slash = scoped.indexOf("/");
+  if (slash <= 0 || slash === scoped.length - 1) return null;
+  const path = normalizedRelativeFilePath(unquoteOnce(scoped.slice(slash + 1)));
+  return path ? [unquoteOnce(scoped.slice(0, slash)), path] : null;
+}
+
+/**
+ * Decode any file address the platform hands out — the single parser.
+ *
+ * Accepts `/api/v1/fs/<entity>/<path>` (absolute URLs too; encoded or with raw
+ * spaces; decoded exactly once), `/viewer/<id>`, `/documents/<id>` and
+ * `/workspace/<rel>` (the sandbox mount; no entity). Sandbox-internal targets
+ * (`sandbox:`, `file:`, `/skill/`, `/tmp/`, `/mnt/`) are never an address.
+ */
+export function parseFileReference(value: unknown): ParsedFileReference | null {
+  let text = String(value ?? "").trim();
+  if (text.startsWith("<") && text.endsWith(">")) text = text.slice(1, -1).trim();
+  if (!text || isInternalFileTarget(text)) return null;
+  const { scheme, netloc, path } = splitUrl(text);
+  if (scheme && scheme !== "http" && scheme !== "https") return null;
+  const scoped = platformFsScope(path, !scheme);
+  if (scoped !== null) {
+    const slash = scoped.indexOf("/");
+    const entity = slash < 0 ? "" : unquoteOnce(scoped.slice(0, slash));
+    if (!entity || entity === "public") return null;
+    const fsPath = canonicalGeneratedFilePath(unquoteOnce(scoped.slice(slash + 1)));
+    return fsPath ? { kind: "fs", entity, fs_path: fsPath } : null;
+  }
+  const documentMatch = path.match(/^\/(?:viewer|documents)\/([^/?#]+)\/?$/);
+  if (documentMatch) {
+    const documentId = unquoteOnce(documentMatch[1]);
+    return viewerPathForDocumentId(documentId) ? { kind: "document", document_id: documentId } : null;
+  }
+  if (scheme || netloc) return null;
+  if (text.startsWith(SANDBOX_ENTITY_MOUNT) || text.startsWith(SANDBOX_ENTITY_MOUNT.slice(1))) {
+    const fsPath = canonicalGeneratedFilePath(text.split("workspace/").slice(1).join("workspace/"));
+    return fsPath ? { kind: "fs", entity: "", fs_path: fsPath } : null;
+  }
+  return null;
+}
+
+const FILE_REF_KEYS = {
+  name: ["name", "filename", "file_name", "original_name", "title"],
+  fs_path: ["fs_path", "fsPath", "path"],
+  // Only the canonical key: an `id`/`documentId` may name something else.
+  document_id: ["document_id"],
+  open_url: ["open_url", "openUrl", "viewer_url", "viewerUrl"],
+  markdown_link: ["markdown_link", "markdownLink"],
+  mime: ["mime", "mime_type", "mimeType"],
+  sha256: ["sha256"],
+  file_type: ["file_type", "fileType"],
+  preview_url: ["preview_url", "previewUrl", "file_url", "document_url"],
+  url: ["url", "public_url", "file_url", "document_url"],
+} as const;
+
+/**
+ * Read one FileRef from a persisted attachment / artifact record: snake_case
+ * first (the contract), then the legacy camelCase keys older rows carry.
+ * Open it with `generatedFileOpenReference`, whose precedence is
+ * document_id → open_url → fs_path → preview_url.
+ */
+export function normalizeFileRef(raw: unknown): FileRef {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return { name: "" };
+  const record = raw as GeneratedFileRecord;
+  const ref: FileRef = { name: "" };
+  for (const [field, keys] of Object.entries(FILE_REF_KEYS) as [keyof typeof FILE_REF_KEYS, readonly string[]][]) {
+    const value = generatedFileText(record, keys);
+    if (value || field === "name") ref[field] = value;
+  }
+  if (typeof record.size === "number" && Number.isFinite(record.size)) ref.size = record.size;
+  return ref;
 }
 
 /** Historical viewer links encoded a filename instead of a Document key.
@@ -162,15 +306,26 @@ export function legacyViewerFileCandidates(reference: string): string[] {
 }
 
 function platformFsPath(value: unknown): string {
-  const text = String(value ?? "").trim();
-  if (!text) return "";
-  try {
-    const url = new URL(text, "http://manor.local");
-    const match = url.pathname.match(/^\/api\/v1\/fs\/[^/]+\/(.+)$/);
-    return match?.[1] ? decodePathPart(match[1]).replace(/^\/+/, "") : "";
-  } catch {
-    return "";
+  return platformFsParts(value)?.[1] || "";
+}
+
+function normalizedRelativeFilePath(text: string): string {
+  const rawPath = text.replace(/\\/g, "/");
+  if (/^(?:~\/|\/(?:Users|Volumes|home|root|private|tmp|var|etc)\/|[A-Za-z]:\/)/i.test(rawPath)) return "";
+  const isAbsoluteRoute = rawPath.startsWith("/");
+  const parts: string[] = [];
+  for (const part of rawPath.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (!parts.length) return "";
+      parts.pop();
+    } else {
+      parts.push(part);
+    }
   }
+  const path = parts.join("/");
+  if (isAbsoluteRoute && /^(?:viewer|api\/v1|documents)\//i.test(path)) return "";
+  return path;
 }
 
 function canonicalGeneratedFilePath(value: unknown): string {
@@ -178,14 +333,17 @@ function canonicalGeneratedFilePath(value: unknown): string {
   if (!text) return "";
   const platformPath = platformFsPath(text);
   if (platformPath) return platformPath;
-  if (/^(?:https?:|data:|blob:)/i.test(text)) return "";
-  const rawPath = decodePathPart(text.split(/[?#]/, 1)[0] || text).replace(/\\/g, "/");
-  if (/^(?:~\/|\/(?:Users|Volumes|private|tmp|var|etc)\/|[A-Za-z]:\/)/i.test(rawPath)) return "";
-  const isAbsoluteRoute = rawPath.startsWith("/");
-  const decoded = rawPath.replace(/^\/+/, "");
-  if (!decoded || decoded === "." || decoded === ".." || decoded.startsWith("../")) return "";
-  if (isAbsoluteRoute && /^(?:viewer|api\/v1|documents)\//i.test(decoded)) return "";
-  return decoded.replace(/\/\.\//g, "/");
+  if (/^(?:[A-Za-z][A-Za-z\d+.-]*:|\/\/)/.test(text)) return "";
+  // Only URLs are decoded. Literal filenames may contain #, ?, and %20.
+  return normalizedRelativeFilePath(text);
+}
+
+function generatedFileUrlKeys(record: GeneratedFileRecord): readonly string[] {
+  return generatedFileDocumentId(record)
+    || GENERATED_FILE_PATH_KEYS.some(key => canonicalGeneratedFilePath(record[key]))
+    || generatedFileText(record, GENERATED_FILE_URL_KEYS)
+    ? GENERATED_FILE_URL_KEYS
+    : GENERATED_FILE_PREVIEW_URL_KEYS;
 }
 
 export function generatedFileDocumentId(value: unknown): string {
@@ -202,7 +360,7 @@ export function generatedFileFsPath(value: unknown): string {
     const path = canonicalGeneratedFilePath(record[key]);
     if (path) return path;
   }
-  for (const key of GENERATED_FILE_URL_KEYS) {
+  for (const key of generatedFileUrlKeys(record)) {
     const path = platformFsPath(record[key]);
     if (path) return path;
   }
@@ -233,13 +391,13 @@ export function generatedFileOpenReference(value: unknown): string {
     }
     return explicit;
   }
-  for (const key of GENERATED_FILE_URL_KEYS) {
+  for (const key of generatedFileUrlKeys(record)) {
     const url = String(record[key] ?? "").trim();
     if (platformFsPath(url)) return url;
   }
   const fsPath = generatedFileFsPath(record);
   if (fsPath) return fsPath;
-  for (const key of GENERATED_FILE_URL_KEYS) {
+  for (const key of generatedFileUrlKeys(record)) {
     const url = String(record[key] ?? "").trim();
     if (/^(?:https?:|data:|blob:)/i.test(url)) return url;
   }
@@ -306,23 +464,27 @@ function linkedDestinationAliases(value: string): string[] {
   const reference = String(value || "").trim();
   const decodedReference = decodeFileReferenceHref(reference)
     || decodeRouteReferenceHref(reference);
-  const normalized = normalizedLinkedDestination(decodedReference || value);
+  const source = decodedReference || reference;
+  const platformPath = platformFsPath(source);
+  const literalPath = platformPath ? "" : canonicalGeneratedFilePath(source);
+  // URL-normalizing a raw path would alias "report .md" with "report%20.md".
+  if (literalPath) return [`fs:${literalPath}`];
+  const normalized = normalizedLinkedDestination(source);
   if (!normalized) return [];
 
   const aliases = [`open:${normalized}`];
   try {
     const parsed = new URL(normalized, "https://manor.invalid");
     const viewerMatch = parsed.pathname.match(/^\/viewer\/([^/]+)\/?$/i);
-    if (viewerMatch?.[1]) {
-      aliases.push(`document:${decodePathPart(viewerMatch[1])}`);
+    const documentId = viewerMatch?.[1] ? decodePathPart(viewerMatch[1]) : "";
+    if (source.startsWith("/viewer/") && viewerPathForDocumentId(documentId)) {
+      aliases.push(`document:${documentId}`);
     }
   } catch {
     // The exact normalized address remains a usable alias below.
   }
 
-  const fsPath = platformFsPath(normalized)
-    || canonicalGeneratedFilePath(normalized);
-  if (fsPath) aliases.push(`fs:${fsPath}`);
+  if (platformPath) aliases.push(`fs:${platformPath}`);
   return Array.from(new Set(aliases));
 }
 
@@ -335,7 +497,7 @@ function generatedFileLinkAliases(value: unknown): string[] {
   if (documentId) aliases.push(`document:${documentId}`);
   if (fsPath) aliases.push(`fs:${fsPath}`);
 
-  for (const key of GENERATED_FILE_URL_KEYS) {
+  for (const key of generatedFileUrlKeys(record)) {
     aliases.push(...linkedDestinationAliases(String(record[key] ?? "")));
   }
   for (const key of GENERATED_FILE_PATH_KEYS) {
@@ -712,13 +874,16 @@ export function fileReferenceTypeLabel(
  * A card is a promise that clicking opens the file, so it needs an address:
  *
  *   - `manor-file:` — already an encoded reference
- *   - `/viewer/<id>` — a document route
- *   - `/api/v1/fs/<entity>/<path>` — an entity filesystem path
+ *   - any address `parseFileReference` accepts with a destination:
+ *     `/viewer/<id>`, `/documents/<id>`, `/api/v1/fs/<entity>/<path>`
+ *   - a legacy `/viewer/<encoded filename>` (resolved by a bounded lookup)
  *   - an absolute http(s) URL whose path ends in a file
  *   - a bare 26-char ULID document id
  *
  * A bare `report.pdf`, or a relative `daily/report.pdf`, is a NAME. It may not
  * exist, may be one of several, and cannot be resolved without guessing.
+ * Sandbox-internal targets (`sandbox:`, `file:`, `/skill/`, `/tmp/`, `/mnt/`)
+ * were never delivered and are never openable.
  */
 export function isOpenableFileReference(value: unknown): boolean {
   if (typeof value !== "string") return false;
@@ -726,8 +891,10 @@ export function isOpenableFileReference(value: unknown): boolean {
   if (!trimmed) return false;
 
   if (decodeFileReferenceHref(trimmed)) return true;
-  if (/^\/viewer\/[^/]+/.test(trimmed)) return true;
-  if (/^\/api\/v1\/fs\/[^/]+\/.+/.test(trimmed)) return true;
+  if (isInternalFileTarget(trimmed)) return false;
+  const parsed = parseFileReference(trimmed);
+  if (parsed) return parsed.kind === "document" || Boolean(parsed.entity);
+  if (legacyViewerFileCandidates(trimmed).length) return true;
   if (/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(trimmed)) return true;
 
   if (/^https?:\/\//i.test(trimmed)) {
@@ -801,10 +968,13 @@ function processOutsideInlineCode(segment: string): string {
  * path label with the basename.
  */
 function normalizeOpenableMarkdownFileLink(markdown: string): string {
-  if (markdown.startsWith("!")) return markdown;
-  const match = MARKDOWN_LINK_PARTS_RE.exec(markdown);
+  const match = MARKDOWN_LINK_PARTS_RE.exec(markdown.replace(/^!/, ""));
   if (!match) return markdown;
   const [, rawLabel, rawDestination] = match;
+  const target = rawDestination.replace(MARKDOWN_LINK_TITLE_RE, "").trim().replace(/^<([\s\S]*)>$/, "$1").trim();
+  // A sandbox-internal file was never delivered: keep its words, drop the link.
+  if (isInternalFileTarget(target)) return rawLabel.trim() || fileNameFromReference(target);
+  if (markdown.startsWith("!")) return markdown;
   if (MARKDOWN_LINK_TITLE_RE.test(rawDestination)) return markdown;
   const unwrapped = rawDestination.trim().replace(/^<([\s\S]*)>$/, "$1");
   const reference = unwrapped.replace(/\s+/gu, " ").trim();
@@ -833,7 +1003,7 @@ function processOutsideMarkdownLinks(segment: string): string {
 }
 
 export function linkifyFileReferencesInMarkdown(source: string): string {
-  if (!source || !FILE_LIKE_RE.test(source)) return source;
+  if (!source || (!FILE_LIKE_RE.test(source) && !/\]\(\s*<?(?:sandbox:|file:|\/(?:skill|tmp|mnt)\/)/i.test(source))) return source;
   return source
     .split(FENCED_CODE_RE)
     .map((part) => {

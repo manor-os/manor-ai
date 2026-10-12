@@ -13,7 +13,7 @@ live in one row (``work_leases``) behind one conditional ``UPDATE ... RETURNING`
 
     UPDATE work_leases SET execution_claim_id = <mine>
      WHERE id = <lease> AND status = 'active'
-       AND (claim is free OR the holder's heartbeat has lapsed)
+       AND (claim is free OR already mine)
     RETURNING id
 
 Postgres serialises concurrent updates of the same row and re-evaluates the
@@ -21,15 +21,12 @@ WHERE clause after the lock is granted, so of N simultaneous deliveries exactly
 one gets a row back. Everyone else exits as a clean no-op without touching the
 step.
 
-**When is a held claim reclaimable?** Only when the holder's heartbeat has
-lapsed — never on a guessed time window. The heartbeat thread
-(``packages/core/workers/internal.py``) advances ``last_heartbeat_at`` and
-``lease_until`` in a single statement every interval, so a live holder always
-has ``lease_until`` in the future and a dead one does not. ``lease_until`` is
-therefore the heartbeat's own liveness deadline, carried per row with that
-lease's own TTL rather than a constant hard-coded here: a claim is stale
-exactly when the heartbeat that was maintaining it stopped for longer than the
-TTL it was maintaining.
+**When is a held claim reclaimable?** Never on the same active lease.  A dead
+holder may have crossed external I/O after writing a durable pending intent;
+letting a successor steal that lease would replay the action before the expiry
+sweeper can reconcile it.  The heartbeat advances ``lease_until`` while live.
+Once it stops, ``Dispatcher.expire_leases`` closes the old lease, parks any
+captured effect for a human, and only allows a fresh lease for clean work.
 """
 from __future__ import annotations
 
@@ -53,7 +50,6 @@ _CLAIM_SQL = text(
        AND (
              execution_claim_id IS NULL          -- nobody is executing it
           OR execution_claim_id = :claim_id      -- idempotent re-claim by me
-          OR lease_until <= :now                 -- holder's heartbeat lapsed
        )
     RETURNING id
     """

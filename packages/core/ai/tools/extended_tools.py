@@ -32,10 +32,10 @@ from packages.core.contracts.audio_generation import (
     AudioGenerationStatus,
     GenerateFileKind,
     NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE,
+    NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION,
     NARRATION_VOICE_MODE_RANDOM_PER_TASK,
     normalize_audio_generation_purpose,
 )
-from packages.core.services.workspace_layout import WorkspaceArtifactDir
 from packages.core.services.workspace_audio_defaults import (
     DEFAULT_WORKSPACE_AUDIO_LANGUAGE,
     normalize_workspace_audio_language,
@@ -45,6 +45,8 @@ from packages.core.services.model_gateway import (
     resolve_official_model_route as _resolve_official_model_route,
 )
 from packages.core.services.model_provider_handlers import vercel_catalog_model_type
+from packages.core.services.file_refs import file_ref, parse_file_reference
+from packages.core.services.generated_file_refs import entity_fs_open_url, parse_entity_fs_url
 from packages.core.services.audio_conversion import (
     SUPPORTED_AUDIO_ARTIFACT_FORMATS,
     transcode_audio_bytes,
@@ -66,26 +68,13 @@ from packages.core.services.voice.speech_request import begin_speech_provider_re
 
 logger = logging.getLogger(__name__)
 
-# Pre-compiled regexes for HTML→markdown conversion
-_RE_SCRIPT_STYLE = re.compile(
-    r"<(script|style|nav|footer|header|noscript)[^>]*>.*?</\1>",
-    re.DOTALL | re.IGNORECASE,
+# HTML→markdown and PDF→text conversion live in the shared service so that
+# services (workspace draft link sources) can reuse them without importing
+# tool modules; the private names stay for in-module callers.
+from packages.core.services.web_text import (  # noqa: E402
+    extract_pdf_text as _extract_pdf_text,
+    html_to_text as _html_to_text,
 )
-_RE_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-_RE_HEADINGS = {i: re.compile(rf"<h{i}[^>]*>(.*?)</h{i}>", re.DOTALL | re.IGNORECASE) for i in range(1, 7)}
-_RE_BOLD = re.compile(r"<(b|strong)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
-_RE_ITALIC = re.compile(r"<(i|em)[^>]*>(.*?)</\1>", re.DOTALL | re.IGNORECASE)
-_RE_CODE_BLOCK = re.compile(r"<pre[^>]*><code[^>]*>(.*?)</code></pre>", re.DOTALL | re.IGNORECASE)
-_RE_CODE_INLINE = re.compile(r"<code[^>]*>(.*?)</code>", re.DOTALL | re.IGNORECASE)
-_RE_LINK = re.compile(r'<a[^>]+href="([^"]*)"[^>]*>(.*?)</a>', re.DOTALL | re.IGNORECASE)
-_RE_IMG = re.compile(r'<img[^>]+alt="([^"]*)"[^>]+src="([^"]*)"[^>]*/?\s*>', re.IGNORECASE)
-_RE_LI = re.compile(r"<li[^>]*>(.*?)</li>", re.DOTALL | re.IGNORECASE)
-_RE_BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
-_RE_P_OPEN = re.compile(r"<p[^>]*>", re.IGNORECASE)
-_RE_P_CLOSE = re.compile(r"</p>", re.IGNORECASE)
-_RE_HR = re.compile(r"<hr[^>]*/?>", re.IGNORECASE)
-_RE_TAG = re.compile(r"<[^>]+>")
-_RE_BLANK_LINES = re.compile(r"\n{3,}")
 
 # ── web_fetch ────────────────────────────────────────────────────────────────
 
@@ -96,7 +85,7 @@ WEB_FETCH_SCHEMA = {
         "description": (
             "Fetch a URL with a static HTTP request and return clean text or markdown. "
             "Supports HTML pages (converted to markdown) and PDF files (text extracted). "
-            "Does not run JavaScript; use browse_web for JavaScript-rendered sites or SPAs."
+            "Does not run JavaScript."
         ),
         "parameters": {
             "type": "object",
@@ -137,32 +126,6 @@ def _bounded_int(value: Any, default: int, maximum: int, minimum: int = 0) -> in
     return max(minimum, min(parsed, maximum))
 
 
-def _html_to_text(html: str, as_markdown: bool = True) -> str:
-    """Convert HTML to clean text or markdown using pre-compiled regexes."""
-    text = _RE_SCRIPT_STYLE.sub("", html)
-    text = _RE_COMMENT.sub("", text)
-
-    if as_markdown:
-        for i in range(1, 7):
-            text = _RE_HEADINGS[i].sub(rf"\n{'#' * i} \1\n", text)
-        text = _RE_BOLD.sub(r"**\2**", text)
-        text = _RE_ITALIC.sub(r"*\2*", text)
-        text = _RE_CODE_BLOCK.sub(r"\n```\n\1\n```\n", text)
-        text = _RE_CODE_INLINE.sub(r"`\1`", text)
-        text = _RE_LINK.sub(r"[\2](\1)", text)
-        text = _RE_IMG.sub(r"![\1](\2)", text)
-        text = _RE_LI.sub(r"\n- \1", text)
-        text = _RE_BR.sub("\n", text)
-        text = _RE_P_OPEN.sub("\n\n", text)
-        text = _RE_P_CLOSE.sub("", text)
-        text = _RE_HR.sub("\n---\n", text)
-
-    text = _RE_TAG.sub("", text)
-    text = unescape(text)
-    text = _RE_BLANK_LINES.sub("\n\n", text)
-    return text.strip()
-
-
 def _looks_like_dynamic_shell(raw_html: str, extracted_text: str) -> bool:
     """Detect SPA shells where static HTML is not the real page content."""
     raw_l = raw_html[:20_000].lower()
@@ -186,25 +149,6 @@ def _looks_like_dynamic_shell(raw_html: str, extracted_text: str) -> bool:
         )
     )
     return text_is_short and script_count > 0 and (has_app_mount or has_bundled_asset or mostly_bootstrap)
-
-
-def _extract_pdf_text(content: bytes, max_pages: int = 50) -> str:
-    """Extract text from PDF bytes."""
-    try:
-        import io
-        from pypdf import PdfReader
-
-        reader = PdfReader(io.BytesIO(content))
-        pages = []
-        for i, page in enumerate(reader.pages[:max_pages]):
-            page_text = page.extract_text() or ""
-            if page_text.strip():
-                pages.append(f"--- Page {i + 1} ---\n{page_text.strip()}")
-        return "\n\n".join(pages) if pages else "(no text extracted from PDF)"
-    except ImportError:
-        return "(pypdf not installed — cannot extract PDF text)"
-    except Exception as e:
-        return f"(PDF extraction failed: {e})"
 
 
 async def _web_fetch_handler(entity_id: str = "", **kwargs: Any) -> str:
@@ -235,7 +179,7 @@ async def _web_fetch_handler(entity_id: str = "", **kwargs: Any) -> str:
                 if _looks_like_dynamic_shell(raw, text):
                     dynamic_page_hint = (
                         "This looks like a JavaScript-rendered page or SPA shell. "
-                        "Use search_tools to load browse_web, then call browse_web for rendered visible content."
+                        "web_fetch cannot execute JavaScript."
                     )
             else:
                 text = raw
@@ -275,11 +219,35 @@ async def _web_fetch_handler(entity_id: str = "", **kwargs: Any) -> str:
             "hint": hint,
             "content": content_out or "(empty response)",
         }
+        if content_out:
+            from packages.core.ai.runtime.artifacts import runtime_record_web_source_slice
+
+            runtime_record_web_source_slice(
+                url=result.url,
+                content=content_out,
+                offset=offset,
+                source_sha256=source_sha256,
+                complete_source=offset == 0 and next_offset is None,
+            )
         if dynamic_page_hint:
             payload["dynamic_page_hint"] = dynamic_page_hint
         return json.dumps(payload, ensure_ascii=False)
 
     except Exception as e:
+        import httpx
+
+        if isinstance(e, httpx.HTTPStatusError) and e.response is not None and e.response.status_code == 403:
+            return json.dumps(
+                {
+                    "error": f"Failed to fetch {url}: HTTP 403",
+                    "status_code": 403,
+                    "reason": "website_access_denied",
+                    "hint": (
+                        "The host refused a static HTTP fetch. Do not retry this URL in a browser; "
+                        "use already-known specs."
+                    ),
+                }
+            )
         return json.dumps({"error": f"Failed to fetch {url}: {e}"})
 
 
@@ -434,6 +402,7 @@ def _platform_native_media_key(provider: str) -> str:
         ),
         "kwaivgi": ("KLING_API_KEY", "KLINGAI_API_KEY"),
         "zyphra": ("ZYPHRA_API_KEY",),
+        "suno": ("SUNO_API_KEY",),
     }
     for env_name in envs_by_provider.get((provider or "").lower(), ()):
         value = (os.getenv(env_name) or "").strip()
@@ -600,6 +569,19 @@ async def _resolve_primary_byok_media_credentials(
         return "", "", False
 
 
+def _selectable_media_model(model: str, kind: str) -> bool:
+    """Whether ``model`` is a model the Account can select for ``kind``.
+
+    ``expected_model`` exists to catch an Account selection that changed
+    between inspection and generation, so it is always a Catalog ID. Anything
+    else (another media kind's model, a bare provider ID) is a caller's guess,
+    not a selection that changed.
+    """
+    from packages.core.constants.models import CATALOG
+
+    return any(str(entry.get("id") or "") == model for entry in CATALOG.get(kind) or [])
+
+
 def _catalog_provider(model: str) -> str:
     return (model or "").split("/", 1)[0].strip().lower() if "/" in (model or "") else ""
 
@@ -620,8 +602,10 @@ def _native_media_model(model: str, *, kind: str, provider: str) -> str:
     }
     video_map = {
         # Volcengine Ark exposes Doubao model IDs, not Manor's catalog labels.
+        "bytedance/seedance-2.5": "doubao-seedance-2-5-260628",
         "bytedance/seedance-2.0": "doubao-seedance-2-0-260128",
         "bytedance/seedance-2.0-fast": "doubao-seedance-2-0-fast-260128",
+        "bytedance/seedance-v1.0-pro-fast": "seedance-1-0-pro-fast-251015",
         "kwaivgi/kling-v3.0-std": "kling-v3.0-std",
         "kwaivgi/kling-v3.0-pro": "kling-v3.0-pro",
     }
@@ -759,10 +743,15 @@ def _wav_from_pcm16(pcm_bytes: bytes, *, sample_rate: int = 24000, channels: int
 
 
 def _fs_path_from_result_url(url: str, entity_id: str) -> str | None:
-    prefix = f"/api/v1/fs/{entity_id}/"
-    if url.startswith(prefix):
-        return url[len(prefix) :]
-    return None
+    parsed = parse_file_reference(url, entity_id=entity_id)
+    if parsed is None or parsed.entity_id != entity_id or not parsed.fs_path:
+        return None
+    return parsed.fs_path
+
+
+def _audio_file_ref(audio_url: str, entity_id: str) -> dict[str, Any]:
+    fs_path = _fs_path_from_result_url(audio_url, entity_id)
+    return {"file": file_ref(entity_id=entity_id, fs_path=fs_path)} if fs_path else {}
 
 
 def _image_result_payload(
@@ -792,6 +781,7 @@ def _image_result_payload(
         # under that exact key removes the model-side translation/guess that
         # previously dropped the leading `images/` directory.
         payload["workspace_path"] = fs_path
+        payload["file"] = file_ref(entity_id=entity_id, fs_path=fs_path)
     return payload
 
 
@@ -979,6 +969,12 @@ async def _generated_image_result_payload(
     saved_to_knowledge: bool,
     include_fs_path: bool,
 ) -> dict[str, Any]:
+    if image_url.startswith("group-document:"):
+        return {
+            "document_id": image_url.removeprefix("group-document:"),
+            "prompt": prompt, "size": size, "model": model,
+            "saved_to_knowledge": True, "pending_group_share": True,
+        }
     if workspace_asset_key and workspace_id:
         await _remember_workspace_reusable_image(
             entity_id=entity_id,
@@ -1024,6 +1020,7 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 async def _deliver_image_to_sandbox(
     *,
     conversation_id: str | None,
+    sandbox_binding_key: str | None = None,
     sandbox_path: str,
     image_bytes: bytes,
 ) -> bool:
@@ -1033,8 +1030,13 @@ async def _deliver_image_to_sandbox(
     sandbox immediately, instead of waiting for the read-only entity-FS mount
     to propagate. Any failure is logged and swallowed so it never breaks image
     generation; the entity-FS copy still exists as a fallback.
+
+    The sandbox is registered under its binding key, which for a task-worker
+    run (no conversation) is the synthetic key rather than an empty
+    conversation. The key is used for this lookup only.
     """
-    if not conversation_id or not sandbox_path or not image_bytes:
+    binding_key = sandbox_binding_key or conversation_id
+    if not binding_key or not sandbox_path or not image_bytes:
         return False
     try:
         import base64 as _b64
@@ -1043,7 +1045,7 @@ async def _deliver_image_to_sandbox(
         from packages.core.config import get_settings
         from packages.core.services.sandbox_sdk import SandboxClient
 
-        ctx = await runtime_load_sandbox_context(conversation_id)
+        ctx = await runtime_load_sandbox_context(binding_key)
         sandbox_id = (ctx or {}).get("sandbox_id") if isinstance(ctx, dict) else None
         if not sandbox_id:
             return False
@@ -1086,11 +1088,16 @@ async def _save_generated_image_bytes(
     task_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
+    sandbox_binding_key: str | None = None,
     save_to_knowledge: bool = True,
     sandbox_path: str | None = None,
     workspace_shared: bool = False,
 ) -> str:
-    """Persist an AI-generated image and optionally register it as a document."""
+    """Persist an AI-generated image and optionally register it as a document.
+
+    ``sandbox_binding_key`` scopes the sandbox delivery lookup only; every
+    persistence argument below keeps the run's real ``conversation_id``.
+    """
     import base64
 
     if not entity_id:
@@ -1098,51 +1105,58 @@ async def _save_generated_image_bytes(
 
     ext = _image_mime_to_ext(mime)
 
-    from packages.core.ai.runtime.file_actions import runtime_write_entity_file_atomic
-    from packages.core.services.entity_fs import get_entity_root
-    from packages.core.services.generated_media_naming import (
-        build_generated_media_target,
-        resolve_workspace_artifact_base_dir,
-        scope_workspace_artifact_path,
-        workspace_artifact_default_dir,
-    )
+    from packages.core.services.room_generation_scope import current_room_generation_scope
 
-    entity_root = get_entity_root(entity_id)
-    workspace_base_dir = await resolve_workspace_artifact_base_dir(
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        task_id=None if workspace_shared else task_id,
-    )
-    target = build_generated_media_target(
-        prompt=prompt,
-        desired_name=scope_workspace_artifact_path(
-            output_name,
-            workspace_base_dir,
-            preserve_leaf_default=True,
-        ),
-        ext=ext,
-        fallback="generated-image",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.IMAGES.value),
-        entity_root=entity_root,
-    )
-    filename = target.filename
-    filepath = runtime_write_entity_file_atomic(
-        entity_id,
-        target.rel_path,
-        image_bytes,
-        expected_size=len(image_bytes),
-        allow_empty=False,
-    )
+    group_scope = current_room_generation_scope()
+    if group_scope is not None:
+        from packages.core.services.room_file_mutation_tools import store_room_generated_bytes
 
-    image_url = f"/api/v1/fs/{entity_id}/{target.rel_path}"
-    logger.info("Generated image saved: %s (%d bytes)", filepath, len(image_bytes))
-
-    if sandbox_path:
-        await _deliver_image_to_sandbox(
-            conversation_id=conversation_id,
-            sandbox_path=sandbox_path,
-            image_bytes=image_bytes,
+        filename = os.path.basename(output_name) if output_name else f"generated-image{ext}"
+        if not filename.lower().endswith(ext):
+            filename += ext
+        saved = await store_room_generated_bytes(
+            scope=group_scope, name=filename, content=image_bytes,
+            mime_type=mime or "image/png", entity_id=entity_id,
         )
+        image_url = f"group-document:{saved.document_id}"
+    else:
+        from packages.core.ai.runtime.file_actions import runtime_write_entity_file_atomic
+        from packages.core.ai.runtime.media_outputs import runtime_generated_media_target
+        from packages.core.services.entity_fs import get_entity_root
+        from packages.core.services.generated_media_naming import (
+            resolve_workspace_artifact_base_dir,
+        )
+
+        entity_root = get_entity_root(entity_id)
+        workspace_base_dir = await resolve_workspace_artifact_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=None if workspace_shared else task_id,
+        )
+        target = runtime_generated_media_target(
+            kind="image", entity_id=entity_id, workspace_base_dir=workspace_base_dir,
+            prompt=prompt, output_name=output_name, ext=ext, entity_root=entity_root,
+        )
+        filename = target.filename
+        filepath = runtime_write_entity_file_atomic(
+            entity_id,
+            target.rel_path,
+            image_bytes,
+            expected_size=len(image_bytes),
+            allow_empty=False,
+            require_missing=True,
+        )
+
+        image_url = entity_fs_open_url(entity_id, target.rel_path)
+        logger.info("Generated image saved: %s (%d bytes)", filepath, len(image_bytes))
+
+        if sandbox_path:
+            await _deliver_image_to_sandbox(
+                conversation_id=conversation_id,
+                sandbox_binding_key=sandbox_binding_key,
+                sandbox_path=sandbox_path,
+                image_bytes=image_bytes,
+            )
 
     prompt_toks = int((usage or {}).get("prompt_tokens") or 0)
     completion_toks = int((usage or {}).get("completion_tokens") or 0)
@@ -1164,8 +1178,14 @@ async def _save_generated_image_bytes(
         model=model,
         cost_usd=cost_usd,
         units=1,
+        workspace_id=workspace_id,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
         byok=is_byok,
     )
+
+    if group_scope is not None:
+        return image_url
 
     if not save_to_knowledge:
         logger.info("Generated image kept out of Knowledge: %s", image_url)
@@ -1175,12 +1195,19 @@ async def _save_generated_image_bytes(
         from packages.core.database import create_worker_session
         from packages.core.services.document_service import upsert_document_by_fs_path
         from packages.core.services.document_metadata import merge_document_metadata
+        from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
 
+        target_workspace_id = await infer_workspace_id_from_storage_path(
+            entity_id=entity_id, rel_path=target.rel_path,
+        )
+        if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+            raise ValueError("Generated image belongs to another Workspace")
         factory = create_worker_session()
         async with factory() as db:
             folder_id = await _ensure_generated_media_document_folder(
                 entity_id=entity_id,
-                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_id=target_workspace_id,
                 rel_path=target.rel_path,
                 rel_dir=target.rel_dir,
             )
@@ -1194,6 +1221,8 @@ async def _save_generated_image_bytes(
                 mime_type=mime or "image/png",
                 source="ai_generated",
                 created_by=user_id or None,
+                owner_id=user_id or None,
+                visibility="workspace" if target_workspace_id else "private",
                 folder_id=folder_id,
             )
             doc.source = "ai_generated"
@@ -1235,6 +1264,7 @@ async def _save_generated_image_bytes(
 async def _ensure_generated_media_document_folder(
     *,
     entity_id: str,
+    user_id: str,
     workspace_id: str | None,
     rel_path: str,
     rel_dir: str,
@@ -1252,7 +1282,7 @@ async def _ensure_generated_media_document_folder(
 
     from packages.core.services.knowledge_sync import ensure_folder_path
 
-    return await ensure_folder_path(entity_id, rel_dir)
+    return await ensure_folder_path(entity_id, rel_dir, owner_id=user_id or None)
 
 
 async def _resolve_user_audio_model(
@@ -1315,6 +1345,7 @@ def _default_openrouter_voice(model: str) -> str:
 
 
 _TASK_NARRATOR_PROFILE_KEY = "stickman_narrator_profile"
+_CONVERSATION_NARRATOR_PROFILE_KEY = "stickman_narrator_profile"
 _WORKSPACE_NARRATOR_PROFILE_KEY = "stickman_narrator_profile"
 _TASK_NARRATOR_CONCRETE_VOICE_CHOICES: dict[str, tuple[str, ...]] = {
     "google": (
@@ -1359,7 +1390,7 @@ def _task_narrator_model_provider(model: str) -> str:
 
 
 class _NarrationProfileError(RuntimeError):
-    """A task-scoped narrator profile cannot be created or trusted."""
+    """A scoped narrator profile cannot be created or trusted."""
 
     def __init__(self, *, code: AudioGenerationErrorCode, detail: str) -> None:
         self.code = code
@@ -1409,15 +1440,9 @@ def _validated_task_narrator_profile(value: object) -> dict[str, str | int]:
 
 def _task_narrator_audio_output_name(output_name: str, voice: str) -> str:
     """Place task-scoped narration segments under their concrete voice folder."""
-    voice_slug = re.sub(r"[^a-z0-9]+", "-", str(voice or "").strip().lower()).strip("-")
-    if not voice_slug:
-        raise ValueError("Task narrator voice must produce a non-empty storage folder name.")
-    normalized = str(output_name or "").replace("\\", "/").strip("/")
-    filename = normalized.rsplit("/", 1)[-1].strip()
-    if normalized.startswith("runs/") and "/" in normalized:
-        parent = normalized.rsplit("/", 1)[0]
-        return f"{parent}/{voice_slug}/{filename}" if filename else f"{parent}/{voice_slug}/"
-    return f"audio/{voice_slug}/{filename}" if filename else f"audio/{voice_slug}/"
+    from packages.core.services.generated_media_naming import narrator_audio_output_name
+
+    return narrator_audio_output_name(output_name, voice)
 
 
 async def _resolve_task_narrator_profile(
@@ -1481,6 +1506,75 @@ async def _resolve_task_narrator_profile(
         }
         details[_TASK_NARRATOR_PROFILE_KEY] = profile
         task.details = details
+        await db.commit()
+        return profile
+
+
+async def _resolve_conversation_narrator_profile(
+    *,
+    entity_id: str,
+    conversation_id: str,
+    candidate_model: str,
+    voice_instructions: str,
+) -> dict[str, str | int]:
+    """Create or reuse one concrete narrator for a standalone Chat run."""
+
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.task import Conversation
+
+    conversation_text = str(conversation_id or "").strip()
+    entity_text = str(entity_id or "").strip()
+    if not conversation_text or not entity_text:
+        raise _NarrationProfileError(
+            code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_CONVERSATION_REQUIRED,
+            detail="Conversation-scoped narration requires a valid conversation ID and entity ID.",
+        )
+
+    async with async_session() as db:
+        conversation = (
+            await db.execute(
+                select(Conversation)
+                .where(
+                    Conversation.id == conversation_text,
+                    Conversation.entity_id == entity_text,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if conversation is None:
+            raise _NarrationProfileError(
+                code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_CONVERSATION_REQUIRED,
+                detail="Conversation-scoped narration could not find its owning conversation.",
+            )
+
+        metadata = dict(conversation.meta or {})
+        existing = metadata.get(_CONVERSATION_NARRATOR_PROFILE_KEY)
+        if existing is not None:
+            return _validated_task_narrator_profile(existing)
+
+        model = str(candidate_model or "").strip()
+        provider = _task_narrator_model_provider(model)
+        voices = _TASK_NARRATOR_CONCRETE_VOICE_CHOICES.get(provider, ())
+        if not model or not voices:
+            raise _NarrationProfileError(
+                code=AudioGenerationErrorCode.NARRATION_VOICE_PROFILE_UNSUPPORTED,
+                detail=(
+                    f"{model or 'The selected model'} cannot select a concrete "
+                    "conversation-scoped narrator. Choose a supported Google or OpenAI TTS model."
+                ),
+            )
+
+        profile: dict[str, str | int] = {
+            "version": 1,
+            "provider": provider,
+            "model": model,
+            "voice": secrets.choice(voices),
+            "voice_instructions": str(voice_instructions or "").strip(),
+        }
+        metadata[_CONVERSATION_NARRATOR_PROFILE_KEY] = profile
+        conversation.meta = metadata
         await db.commit()
         return profile
 
@@ -1655,6 +1749,7 @@ async def _save_generated_audio_bytes(
     task_id: str | None = None,
     agent_id: str | None = None,
     conversation_id: str | None = None,
+    bill_media: bool = True,
 ) -> str:
     """Persist generated audio and register it as a Knowledge document."""
     import base64
@@ -1666,65 +1761,90 @@ async def _save_generated_audio_bytes(
 
     ext = _audio_format_to_ext(audio_format)
 
-    from packages.core.ai.runtime.file_actions import runtime_write_entity_file_atomic
-    from packages.core.services.entity_fs import get_entity_root
-    from packages.core.services.generated_media_naming import (
-        build_generated_media_target,
-        resolve_workspace_artifact_base_dir,
-        scope_workspace_artifact_path,
-        workspace_artifact_default_dir,
-    )
+    from packages.core.services.room_generation_scope import current_room_generation_scope
 
-    entity_root = get_entity_root(entity_id)
-    workspace_base_dir = await resolve_workspace_artifact_base_dir(
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        task_id=task_id,
-    )
-    target = build_generated_media_target(
-        prompt=prompt,
-        desired_name=scope_workspace_artifact_path(
-            output_name,
-            workspace_base_dir,
-            preserve_leaf_default=True,
-        ),
-        ext=ext,
-        fallback="generated-audio",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.AUDIO.value),
-        entity_root=entity_root,
-    )
-    filename = target.filename
-    filepath = runtime_write_entity_file_atomic(
-        entity_id,
-        target.rel_path,
-        audio_bytes,
-        expected_size=len(audio_bytes),
-        allow_empty=False,
-    )
+    group_scope = current_room_generation_scope()
+    if group_scope is not None:
+        from packages.core.services.room_file_mutation_tools import store_room_generated_bytes
 
-    audio_url = f"/api/v1/fs/{entity_id}/{target.rel_path}"
-    logger.info("Generated audio saved: %s (%d bytes)", filepath, len(audio_bytes))
+        filename = os.path.basename(output_name) if output_name else f"generated-audio{ext}"
+        if not filename.lower().endswith(ext):
+            filename += ext
+        saved = await store_room_generated_bytes(
+            scope=group_scope, name=filename, content=audio_bytes,
+            mime_type=mime, entity_id=entity_id,
+        )
+        audio_url = f"group-document:{saved.document_id}"
+    else:
+        from packages.core.ai.runtime.file_actions import runtime_write_entity_file_atomic
+        from packages.core.ai.runtime.media_outputs import runtime_generated_media_target
+        from packages.core.services.entity_fs import get_entity_root
+        from packages.core.services.generated_media_naming import (
+            resolve_workspace_artifact_base_dir,
+        )
 
-    await _bill_media(
-        entity_id=entity_id,
-        user_id=user_id,
-        kind="audio",
-        model=model,
-        cost_usd=_estimate_audio_cost(model, purpose=purpose),
-        units=1,
-        byok=is_byok,
-    )
+        entity_root = get_entity_root(entity_id)
+        workspace_base_dir = await resolve_workspace_artifact_base_dir(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+        )
+        target = runtime_generated_media_target(
+            kind="audio",
+            entity_id=entity_id,
+            workspace_base_dir=workspace_base_dir,
+            ext=ext,
+            prompt=prompt,
+            output_name=output_name,
+            entity_root=entity_root,
+        )
+        filename = target.filename
+        filepath = runtime_write_entity_file_atomic(
+            entity_id,
+            target.rel_path,
+            audio_bytes,
+            expected_size=len(audio_bytes),
+            allow_empty=False,
+            require_missing=True,
+        )
+
+        audio_url = entity_fs_open_url(entity_id, target.rel_path)
+        logger.info("Generated audio saved: %s (%d bytes)", filepath, len(audio_bytes))
+
+    if bill_media:
+        await _bill_media(
+            entity_id=entity_id,
+            user_id=user_id,
+            kind="audio",
+            model=model,
+            cost_usd=_estimate_audio_cost(model, purpose=purpose),
+            units=1,
+            workspace_id=workspace_id,
+            agent_id=agent_id,
+            conversation_id=conversation_id,
+            byok=is_byok,
+        )
+
+    if group_scope is not None:
+        return audio_url
 
     try:
         from packages.core.database import create_worker_session
         from packages.core.services.document_service import upsert_document_by_fs_path
         from packages.core.services.document_metadata import merge_document_metadata
+        from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
 
+        target_workspace_id = await infer_workspace_id_from_storage_path(
+            entity_id=entity_id, rel_path=target.rel_path,
+        )
+        if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+            raise ValueError("Generated audio belongs to another Workspace")
         factory = create_worker_session()
         async with factory() as db:
             folder_id = await _ensure_generated_media_document_folder(
                 entity_id=entity_id,
-                workspace_id=workspace_id,
+                user_id=user_id,
+                workspace_id=target_workspace_id,
                 rel_path=target.rel_path,
                 rel_dir=target.rel_dir,
             )
@@ -1738,6 +1858,8 @@ async def _save_generated_audio_bytes(
                 mime_type=mime,
                 source="ai_generated",
                 created_by=user_id or None,
+                owner_id=user_id or None,
+                visibility="workspace" if target_workspace_id else "private",
                 folder_id=folder_id,
             )
             doc.source = "ai_generated"
@@ -2834,7 +2956,263 @@ def _audio_prompt_for_purpose(prompt: str, purpose: str, duration_seconds: float
     return clean_prompt
 
 
+def _media_job_lineage(task_id: str | None, kwargs: dict[str, Any]) -> dict[str, str]:
+    from packages.core.ai.runtime.media_job_scope import runtime_media_job_lineage
+
+    return runtime_media_job_lineage(task_id, kwargs)
+
+
+async def _start_suno_audio_job(
+    *,
+    entity_id: str,
+    user_id: str,
+    prompt: str,
+    model: str,
+    output_name: str,
+    instrumental: bool,
+    lyrics: str,
+    style: str,
+    title: str,
+    is_byok: bool,
+    workspace_id: str | None,
+    task_id: str | None,
+    agent_id: str | None,
+    conversation_id: str | None,
+    lineage: dict[str, str] | None = None,
+) -> str:
+    """Persist and reserve one Suno job before any provider I/O."""
+    if not entity_id:
+        return json.dumps(
+            _audio_error_payload(
+                code=AudioGenerationErrorCode.INVALID_REQUEST,
+                error="Suno Catalog generation requires an Entity workspace.",
+                purpose=AudioGenerationPurpose.MUSIC,
+                provider=AudioGenerationProvider.SUNO,
+                model=model,
+                role=AudioGenerationRole.AUDIO,
+            ),
+            ensure_ascii=False,
+        )
+
+    from packages.core.database import async_session
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.media_job import MediaJob
+    from packages.core.services.room_generation_scope import current_room_generation_scope
+
+    group_scope = current_room_generation_scope()
+
+    cost_usd = _estimate_audio_cost(model, purpose="music")
+    credits_estimate = 0
+    if not is_byok:
+        from packages.core.services.billing_service import cost_to_credits
+
+        credits_estimate = max(1, int(cost_to_credits(cost_usd)))
+
+    job_id = generate_ulid()
+    params = {
+        "provider": "suno",
+        "billing_mode": "byok" if is_byok else "platform",
+        "credential_source": "byok" if is_byok else "platform",
+        "instrumental": instrumental,
+        "lyrics": lyrics or None,
+        "style": style or None,
+        "title": title or None,
+        "output_name": output_name or None,
+        "workspace_id": workspace_id or None,
+        "task_id": task_id or None,
+        "provider_submit_state": "not_started",
+        **(lineage or {}),
+    }
+    try:
+        async with async_session() as db:
+            db.add(
+                MediaJob(
+                    id=job_id,
+                    entity_id=entity_id,
+                    user_id=user_id or None,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    room_agent_run_id=group_scope.run_id if group_scope else None,
+                    kind="audio",
+                    status="pending",
+                    prompt=prompt,
+                    model=model,
+                    params=params,
+                    cost_usd=0 if is_byok else cost_usd,
+                    credits=0 if is_byok else credits_estimate,
+                    byok=is_byok,
+                )
+            )
+            await db.flush()
+            if not is_byok:
+                from packages.core.services.credit_reservations import reserve_credits
+
+                await reserve_credits(
+                    db,
+                    entity_id=entity_id,
+                    amount_credits=credits_estimate,
+                    source_kind="media_job",
+                    source_id=job_id,
+                    reason="Suno music generation estimate",
+                    workspace_id=workspace_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id or None,
+                    metadata={
+                        "model": model,
+                        "provider": "suno",
+                        "tool_name": "generate_audio",
+                        "billing_mode": "platform",
+                        "cost_usd": cost_usd,
+                    },
+                )
+            await db.commit()
+    except Exception as exc:
+        from packages.core.services.credit_reservations import CreditReservationError
+
+        if isinstance(exc, CreditReservationError):
+            message = str(exc)
+        else:
+            logger.exception("Could not create Suno audio job")
+            message = "Could not create the Suno generation job."
+        return json.dumps(
+            _audio_error_payload(
+                code=AudioGenerationErrorCode.AUDIO_GENERATION_FAILED,
+                error=message,
+                purpose=AudioGenerationPurpose.MUSIC,
+                provider=AudioGenerationProvider.SUNO,
+                model=model,
+                role=AudioGenerationRole.AUDIO,
+            ),
+            ensure_ascii=False,
+        )
+
+    from packages.core.tasks.media_tasks import schedule_suno_audio_job
+
+    # A group job is dispatched only after its exact room approval receipt
+    # commits. Recovery can safely requeue a committed pending job later.
+    if group_scope is None:
+        schedule_suno_audio_job(job_id)
+    return json.dumps(
+        {
+            "kind": GenerateFileKind.AUDIO,
+            "status": AudioGenerationStatus.PENDING,
+            "provider": AudioGenerationProvider.SUNO,
+            "job_id": job_id,
+            "prompt": prompt,
+            "purpose": AudioGenerationPurpose.MUSIC,
+            "model": model,
+            "name": output_name,
+            "credits_estimate": credits_estimate,
+            "billing_mode": "byok" if is_byok else "platform",
+            "message": "Suno music generation started; Manor will wait for the durable audio artifact.",
+        },
+        ensure_ascii=False,
+    )
+
+
 async def _generate_audio_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    _deliver_audio: Callable[..., Awaitable[str]] | None = None,
+    **kwargs: Any,
+) -> str:
+    """Generate audio; music falls back to Manor's own library when live generation fails."""
+    result = await _generate_live_audio(
+        entity_id=entity_id, user_id=user_id, _deliver_audio=_deliver_audio, **kwargs,
+    )
+    if _deliver_audio is not None or normalize_audio_generation_purpose(kwargs.get("purpose")) != AudioGenerationPurpose.MUSIC:
+        return result
+    try:
+        payload = json.loads(result)
+    except (TypeError, ValueError):
+        return result
+    if not isinstance(payload, dict) or payload.get("status") != "error":
+        return result
+    library = await _music_from_library(entity_id, user_id, payload, **kwargs)
+    if library:
+        return library
+    if payload.get("code") in _MUSIC_REQUEST_ERRORS:
+        return result
+    # Music that cannot be made here (no key, provider down) is skipped, not an
+    # error: callers that treat any error as fatal would otherwise abandon the
+    # work the music was for. Nothing was produced, so a caller that requires
+    # music still sees no file.
+    return json.dumps({
+        "kind": GenerateFileKind.AUDIO,
+        "status": AudioGenerationStatus.SKIPPED,
+        "purpose": AudioGenerationPurpose.MUSIC,
+        "optional": True,
+        "skip_code": payload.get("code"),
+        "reason": (
+            f"{payload.get('error') or 'Music is unavailable.'} No music was produced; "
+            "continue without music."
+        ),
+    }, ensure_ascii=False, default=str)
+
+
+# Mistakes in the request itself stay errors so the caller can fix them.
+_MUSIC_REQUEST_ERRORS = frozenset({
+    AudioGenerationErrorCode.INVALID_REQUEST,
+    AudioGenerationErrorCode.MODEL_CHANGED_REINSPECT_REQUIRED,
+})
+
+
+async def _music_from_library(entity_id: str, user_id: str, live_failure: dict, **kwargs: Any) -> str | None:
+    """Save the best-matching library track where the requested music would go."""
+    from packages.core.services.music_library import LIBRARY_MODEL, pick_library_track
+
+    prompt = str(kwargs.get("prompt") or "").strip()
+    track = pick_library_track(prompt, kwargs.get("duration_seconds"))
+    if track is None:
+        return None
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    user_id = await _resolve_media_task_user_id(
+        _media_context_user_id(user_id, runtime_context.user_id),
+        entity_id,
+        kwargs.get("task_id") or runtime_context.task_id,
+    )
+    audio_bytes = track.path.read_bytes()
+    audio_format = track.path.suffix.lstrip(".").lower() or "mp3"
+    audio_url = await _save_generated_audio_bytes(
+        entity_id=entity_id,
+        user_id=user_id,
+        prompt=prompt,
+        model=LIBRARY_MODEL,
+        purpose=AudioGenerationPurpose.MUSIC.value,
+        audio_bytes=audio_bytes,
+        audio_format=audio_format,
+        is_byok=False,
+        output_name=str(kwargs.get("name") or ""),
+        workspace_id=str(kwargs.get("workspace_id") or runtime_context.workspace_id or "") or None,
+        task_id=str(kwargs.get("task_id") or runtime_context.task_id or "") or None,
+        conversation_id=str(kwargs.get("conversation_id") or runtime_context.conversation_id or "") or None,
+        bill_media=False,
+    )
+    return json.dumps({
+        "kind": GenerateFileKind.AUDIO,
+        "status": AudioGenerationStatus.COMPLETED,
+        "provider": "manor",
+        "source": "library",
+        "result_url": audio_url,
+        "audio_url": audio_url,
+        "fs_path": _fs_path_from_result_url(audio_url, entity_id),
+        **_audio_file_ref(audio_url, entity_id),
+        "prompt": prompt,
+        "purpose": AudioGenerationPurpose.MUSIC,
+        "model": LIBRARY_MODEL,
+        "format": audio_format,
+        "duration_seconds": track.duration_seconds,
+        "requested_duration_seconds": kwargs.get("duration_seconds"),
+        "file_size": len(audio_bytes),
+        "library_track_id": track.id,
+        "loopable": track.loopable,
+        "license": track.license,
+        "live_generation_error": live_failure.get("code") or live_failure.get("error"),
+    }, ensure_ascii=False, default=str)
+
+
+async def _generate_live_audio(
     entity_id: str = "",
     user_id: str = "",
     _deliver_audio: Callable[..., Awaitable[str]] | None = None,
@@ -2875,6 +3253,7 @@ async def _generate_audio_handler(
     model, role = await _resolve_user_audio_model(user_id, entity_id, purpose=purpose)
     if kwargs.get("model"):
         model = str(kwargs["model"]).strip()
+    expected_model = str(kwargs.get("expected_model") or "").strip()
     if not model:
         return json.dumps(
             _audio_error_payload(
@@ -2900,10 +3279,23 @@ async def _generate_audio_handler(
             == NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE
         ):
             narration_voice_mode = NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE
+    # A voice scope with nothing to pin it to (a standalone Flow has no
+    # Workspace, Task, or Conversation) means the account's narration voice,
+    # not a failed request.
+    scope_ids = {
+        NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE: workspace_id,
+        NARRATION_VOICE_MODE_RANDOM_PER_TASK: runtime_context.task_id or kwargs.get("task_id"),
+        NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION: (
+            runtime_context.conversation_id or kwargs.get("conversation_id")
+        ),
+    }
+    if narration_voice_mode in scope_ids and not str(scope_ids[narration_voice_mode] or "").strip():
+        narration_voice_mode = ""
     narration_profile: dict[str, str | int] | None = None
     if narration_voice_mode:
         if narration_voice_mode not in {
             NARRATION_VOICE_MODE_RANDOM_PER_TASK,
+            NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION,
             NARRATION_VOICE_MODE_FIXED_PER_WORKSPACE,
         }:
             return json.dumps(
@@ -2936,6 +3328,15 @@ async def _generate_audio_handler(
                     voice_instructions=voice_instructions,
                     preferred_voice=str(kwargs.get("voice") or ""),
                 )
+            elif narration_voice_mode == NARRATION_VOICE_MODE_RANDOM_PER_CONVERSATION:
+                narration_profile = await _resolve_conversation_narrator_profile(
+                    entity_id=entity_id,
+                    conversation_id=str(
+                        runtime_context.conversation_id or kwargs.get("conversation_id") or ""
+                    ),
+                    candidate_model=model,
+                    voice_instructions=voice_instructions,
+                )
             else:
                 narration_profile = await _resolve_task_narrator_profile(
                     entity_id=entity_id,
@@ -2957,6 +3358,23 @@ async def _generate_audio_handler(
             )
         model = str(narration_profile["model"])
         voice_instructions = str(narration_profile["voice_instructions"])
+    if expected_model and model != expected_model and not _selectable_media_model(expected_model, role.value):
+        # Another audio role's model (a narration voice passed to music), or a
+        # guess: not a selection that changed.
+        expected_model = ""
+    if expected_model and model != expected_model:
+        payload = _audio_error_payload(
+            code=AudioGenerationErrorCode.MODEL_CHANGED_REINSPECT_REQUIRED,
+            error=(
+                f"The effective {role.value} model changed from {expected_model} to "
+                f"{model}. Retry with expected_model={model} (or without expected_model) to use it."
+            ),
+            purpose=purpose,
+            model=model,
+            role=role,
+        )
+        payload["expected_model"] = expected_model
+        return json.dumps(payload, ensure_ascii=False)
     if purpose in {
         AudioGenerationPurpose.SPEECH,
         AudioGenerationPurpose.DIALOGUE,
@@ -3001,6 +3419,103 @@ async def _generate_audio_handler(
         entity_id,
         role=role,
     )
+    if provider == "suno":
+        if callable(_deliver_audio):
+            return json.dumps({"error": "The selected async audio model cannot use this delivery target."})
+        if purpose != AudioGenerationPurpose.MUSIC or role != AudioGenerationRole.AUDIO:
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.INVALID_REQUEST,
+                    error="Suno Catalog is available for purpose=music only.",
+                    purpose=purpose,
+                    provider=AudioGenerationProvider.SUNO,
+                    model=model,
+                    role=role,
+                ),
+                ensure_ascii=False,
+            )
+        instrumental = kwargs.get("instrumental", False)
+        if not isinstance(instrumental, bool):
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.INVALID_REQUEST,
+                    error="instrumental must be a boolean",
+                    purpose=purpose,
+                    provider=AudioGenerationProvider.SUNO,
+                    model=model,
+                    role=role,
+                ),
+                ensure_ascii=False,
+            )
+        if is_byok:
+            if not _is_native_key_for_provider(api_key, "suno"):
+                return json.dumps(
+                    _audio_error_payload(
+                        code=AudioGenerationErrorCode.PROVIDER_KEY_REQUIRED,
+                        error="The selected Suno model requires a native Suno API key.",
+                        purpose=purpose,
+                        provider=AudioGenerationProvider.SUNO,
+                        model=model,
+                        role=role,
+                    ),
+                    ensure_ascii=False,
+                )
+        else:
+            api_key, base_url_override = await _platform_native_media_credential_async("suno")
+        if not api_key:
+            missing_suno_key_error = (
+                "No Suno API key is configured. Add a native Suno key for Music & Score."
+            )
+            return json.dumps(
+                _audio_error_payload(
+                    code=AudioGenerationErrorCode.PROVIDER_KEY_REQUIRED,
+                    error=missing_suno_key_error,
+                    purpose=purpose,
+                    provider=AudioGenerationProvider.SUNO,
+                    model=model,
+                    role=role,
+                ),
+                ensure_ascii=False,
+            )
+        if entity_id and not is_byok:
+            await runtime_assert_credit_available(
+                entity_id,
+                source=RUNTIME_GENERATE_AUDIO_TOOL_SOURCE,
+            )
+        lyrics = str(kwargs.get("lyrics") or "").strip()
+        style = str(kwargs.get("style") or "").strip()
+        title = str(kwargs.get("title") or "").strip()
+        if lyrics or style:
+            style = style or prompt
+            if not instrumental and not lyrics:
+                return json.dumps(
+                    _audio_error_payload(
+                        code=AudioGenerationErrorCode.INVALID_REQUEST,
+                        error="Suno custom mode requires lyrics unless instrumental is true.",
+                        purpose=purpose,
+                        provider=AudioGenerationProvider.SUNO,
+                        model=model,
+                        role=role,
+                    ),
+                    ensure_ascii=False,
+                )
+        return await _start_suno_audio_job(
+            entity_id=entity_id,
+            user_id=user_id,
+            prompt=prompt,
+            model=model,
+            output_name=output_name,
+            instrumental=instrumental,
+            lyrics=lyrics,
+            style=style,
+            title=title,
+            is_byok=is_byok,
+            workspace_id=workspace_id or None,
+            task_id=runtime_context.task_id,
+            agent_id=runtime_context.agent_id,
+            conversation_id=runtime_context.conversation_id,
+            lineage=_media_job_lineage(runtime_context.task_id, kwargs),
+        )
     # A Primary chat key must not silently override an Official media
     # selection. Media BYOK is role-scoped: only an explicitly configured
     # Voice/Music key may bypass Manor's managed Vercel route. This keeps the
@@ -3128,11 +3643,6 @@ async def _generate_audio_handler(
         and not managed_vercel_voice
         and not native_music_provider
     ):
-        if not api_key or not api_key.startswith("sk-or-"):
-            env_openrouter_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
-            if env_openrouter_key:
-                api_key = env_openrouter_key
-                is_byok = False
         if not api_key or not api_key.startswith("sk-or-"):
             return json.dumps(
                 _audio_error_payload(
@@ -3314,7 +3824,17 @@ async def _generate_audio_handler(
             )
             storage_format = requested_artifact_format
         if narration_profile is not None:
-            output_name = _task_narrator_audio_output_name(output_name, voice)
+            from packages.core.services.generated_media_naming import (
+                workspace_execution_artifact_dir, workspace_artifact_default_dir,
+            )
+            narration_base = workspace_execution_artifact_dir(
+                "Workspaces/_by_id/scope" if workspace_id else "",
+                task_id=runtime_context.task_id,
+                workflow_run_id=runtime_context.workflow_run_id,
+                workflow_lineage_root_run_id=runtime_context.workflow_lineage_root_run_id,
+            )
+            if "/" in output_name or workspace_artifact_default_dir(narration_base, "audio") != narration_base:
+                output_name = _task_narrator_audio_output_name(output_name, voice)
         # Chat playback uses the same provider/credit path without creating a
         # Knowledge artifact. Only an internal Python callable can select it.
         deliver_audio = _deliver_audio if callable(_deliver_audio) else _save_generated_audio_bytes
@@ -3344,6 +3864,7 @@ async def _generate_audio_handler(
             "result_url": audio_url,
             "audio_url": audio_url,
             "fs_path": _fs_path_from_result_url(audio_url, entity_id),
+            **_audio_file_ref(audio_url, entity_id),
             "prompt": prompt,
             "purpose": purpose,
             "model": model,
@@ -3356,6 +3877,12 @@ async def _generate_audio_handler(
             "requested_duration_seconds": duration_seconds,
             "file_size": len(audio_bytes),
         }
+        if isinstance(audio_url, str) and audio_url.startswith("group-document:"):
+            payload.pop("result_url", None)
+            payload.pop("audio_url", None)
+            payload.pop("fs_path", None)
+            payload["document_id"] = audio_url.removeprefix("group-document:")
+            payload["pending_group_share"] = True
         if narration_profile is not None:
             payload["narration_profile"] = narration_profile
         return json.dumps(payload, ensure_ascii=False)
@@ -3632,6 +4159,16 @@ async def _download_image_bytes(url: str) -> tuple[bytes, str]:
 
 
 def _extract_openrouter_image(data: dict) -> tuple[str, dict]:
+    # GPT Image models use OpenRouter's dedicated /images endpoint, not chat.
+    generated = data.get("data")
+    if isinstance(generated, list) and generated and isinstance(generated[0], dict):
+        first = generated[0]
+        encoded = first.get("b64_json")
+        if isinstance(encoded, str) and encoded:
+            mime = first.get("media_type") or "image/png"
+            if mime not in {"image/png", "image/jpeg", "image/webp"}:
+                return "", {}
+            return f"data:{mime};base64,{encoded}", data.get("usage") or {}
     choice = data.get("choices", [{}])[0]
     message = choice.get("message", {})
     images = message.get("images", [])
@@ -3659,6 +4196,17 @@ def _coerce_image_reference_urls(
     refs: list[str] = []
 
     def add(value: Any) -> None:
+        if isinstance(value, dict):
+            # A file picked from Knowledge (a Flow "documents" input) is an
+            # object; its Knowledge path or URL is the reference.
+            value = next(
+                (
+                    value.get(key)
+                    for key in ("fs_path", "url", "result_url", "image_url", "path")
+                    if isinstance(value.get(key), str) and value.get(key).strip()
+                ),
+                "",
+            )
         text = str(value or "").strip()
         if text and text not in refs:
             refs.append(text)
@@ -3772,7 +4320,9 @@ GENERATE_IMAGE_SCHEMA = {
     "function": {
         "name": "generate_image",
         "description": (
-            "Generate an image from a text description using AI (GPT-5 Image). "
+            "Generate an image with the Account-selected image model. Before composing inputs, "
+            "call generate_file(kind='search', params={'media_kind':'image'}) to inspect its current model and schema; "
+            "pass selected_model.expected_model here to detect a changed selection. "
             "When the current chat contains attached image markers like "
             "[Image: name → /api/v1/fs/...] or [Image from KB: name → /api/v1/fs/...], "
             "pass those URLs in reference_url/reference_urls if the user asks to use the image as a reference. "
@@ -3782,6 +4332,7 @@ GENERATE_IMAGE_SCHEMA = {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string", "description": "Detailed description of the image to generate"},
+                "expected_model": {"type": "string", "description": "Model returned by generate_file(kind=search, params.media_kind=image); fail if Account selection changed."},
                 "name": {
                     "type": "string",
                     "description": "Optional user-visible filename or Knowledge-relative path, e.g. cafe-scene.png or 猫咪打工人动漫/images/场景.png.",
@@ -4114,10 +4665,27 @@ async def _generate_image_handler(
                 )
                 return json.dumps(payload)
 
+    model = await _resolve_user_image_model(user_id, entity_id, False)
+    expected_model = str(kwargs.get("expected_model") or "").strip()
+    if expected_model and model != expected_model and not _selectable_media_model(expected_model, "image"):
+        # Not an image model the Account could have selected: a guess, or
+        # another media kind's model, never a changed selection.
+        expected_model = ""
+    if expected_model and model != expected_model:
+        return json.dumps({
+            "error": (
+                f"The Account-selected image model changed from {expected_model} to {model}. "
+                f"Retry with expected_model={model} (or without expected_model) to use it."
+            ),
+            "error_code": "image_model_changed_reinspect_required",
+            "expected_model": expected_model,
+            "model": model,
+        })
     api_key, base_url_override, is_byok = await _resolve_user_media_credentials(user_id, entity_id, role="image")
-    model = await _resolve_user_image_model(user_id, entity_id, api_key.startswith("sk-or-"))
     if kwargs.get("model"):
         model = str(kwargs["model"]).strip()
+    if expected_model and model != expected_model:
+        return json.dumps({"error": "model override conflicts with expected_model", "error_code": "image_model_changed_reinspect_required", "expected_model": expected_model, "model": model})
     provider = _catalog_provider(model)
     managed_vercel_image = False
     vercel_auth_method = "api-key"
@@ -4240,9 +4808,10 @@ async def _generate_image_handler(
                 task_id=runtime_context.task_id,
                 agent_id=runtime_context.agent_id,
                 conversation_id=runtime_context.conversation_id,
+                sandbox_binding_key=runtime_context.sandbox_binding_key,
                 save_to_knowledge=save_to_knowledge,
                 sandbox_path=sandbox_path,
-                workspace_shared=bool(workspace_asset_key),
+                workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
             )
             return json.dumps(
                 await _generated_image_result_payload(
@@ -4270,19 +4839,31 @@ async def _generate_image_handler(
                         }
                     )
                 message_content = content_parts
+            endpoint = "https://openrouter.ai/api/v1/chat/completions"
+            request_payload = {"model": model, "messages": [{"role": "user", "content": message_content}]}
+            if model.lower().startswith("openai/gpt-image-"):
+                # https://openrouter.ai/docs/guides/overview/multimodal/image-generation
+                # Keep multimodal chat models on their existing route. There is
+                # no retry/fallback that could bill a second image generation.
+                endpoint = "https://openrouter.ai/api/v1/images"
+                request_payload = {"model": model, "prompt": prompt, "n": 1,
+                                   "quality": quality, "output_format": "png"}
+                if kwargs.get("size"):
+                    request_payload["size"] = str(kwargs["size"])
+                elif aspect_ratio:
+                    request_payload["aspect_ratio"] = aspect_ratio
+                if reference_urls:
+                    request_payload["input_references"] = content_parts[1:]
             async with httpx.AsyncClient(timeout=180.0) as client:
                 resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
+                    endpoint,
                     headers={
                         "Authorization": f"Bearer {api_key}",
                         "Content-Type": "application/json",
                         "HTTP-Referer": "https://manor.ai",
                         "X-Title": "Manor AI",
                     },
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": message_content}],
-                    },
+                    json=request_payload,
                 )
                 data, parse_err = _image_response_json(resp, provider="OpenRouter")
             if parse_err:
@@ -4300,7 +4881,7 @@ async def _generate_image_handler(
             if data_url.startswith("data:"):
                 header, b64_data = data_url.split(",", 1)
                 mime = header[5:].split(";", 1)[0] or "image/png"
-                image_bytes = base64.b64decode(b64_data)
+                image_bytes = base64.b64decode(b64_data, validate=True)
             elif data_url.startswith("http"):
                 image_bytes, mime = await _download_image_bytes(data_url)
             else:
@@ -4328,9 +4909,10 @@ async def _generate_image_handler(
                 task_id=runtime_context.task_id,
                 agent_id=runtime_context.agent_id,
                 conversation_id=runtime_context.conversation_id,
+                sandbox_binding_key=runtime_context.sandbox_binding_key,
                 save_to_knowledge=save_to_knowledge,
                 sandbox_path=sandbox_path,
-                workspace_shared=bool(workspace_asset_key),
+                workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
             )
             return json.dumps(
                 await _generated_image_result_payload(
@@ -4434,9 +5016,10 @@ async def _generate_image_handler(
                 task_id=runtime_context.task_id,
                 agent_id=runtime_context.agent_id,
                 conversation_id=runtime_context.conversation_id,
+                sandbox_binding_key=runtime_context.sandbox_binding_key,
                 save_to_knowledge=save_to_knowledge,
                 sandbox_path=sandbox_path,
-                workspace_shared=bool(workspace_asset_key),
+                workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
             )
             return json.dumps(
                 await _generated_image_result_payload(
@@ -4521,9 +5104,10 @@ async def _generate_image_handler(
                     task_id=runtime_context.task_id,
                     agent_id=runtime_context.agent_id,
                     conversation_id=runtime_context.conversation_id,
+                    sandbox_binding_key=runtime_context.sandbox_binding_key,
                     save_to_knowledge=save_to_knowledge,
                     sandbox_path=sandbox_path,
-                    workspace_shared=bool(workspace_asset_key),
+                    workspace_shared=bool(workspace_asset_key) or bool(kwargs.get("_workspace_shared_from_context")),
                 )
                 return json.dumps(
                     await _generated_image_result_payload(
@@ -4556,7 +5140,7 @@ async def _generate_image_handler(
         return json.dumps({"error": f"Image generation failed: {e}"})
 
 
-# ── generate_video ───────────────────────────────────────────────────────────
+# ── video planning and generation ───────────────────────────────────────────
 
 
 async def _resolve_user_video_model(
@@ -4579,15 +5163,261 @@ async def _resolve_user_video_model(
         return fallback
 
 
+PLAN_VIDEO_SEGMENTS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "plan_video_segments",
+        "description": (
+            "Resolve the Account-selected video model and inspect its mode-specific "
+            "duration schema. When no duration constraint is declared, plan with "
+            "common 10-second and 5-second clips. Returns deterministic provider "
+            "generation durations plus final segment durations that sum exactly to "
+            "the requested total. Call this before writing scenes, narration blocks, "
+            "or video prompts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "target_duration_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3600,
+                },
+                "generation_mode": {
+                    "type": "string",
+                    "enum": ["image_to_video", "text_to_video"],
+                    "default": "image_to_video",
+                },
+            },
+            "required": ["target_duration_seconds"],
+        },
+    },
+}
+
+_COMPATIBLE_VIDEO_SEGMENT_DURATION_SCHEMA = {
+    "type": "integer",
+    "enum": [5, 10],
+    "default": 5,
+}
+
+
+def _video_duration_schema(
+    model: str,
+    generation_mode: str,
+) -> dict[str, Any] | None:
+    from packages.core.constants.models import video_model_capabilities
+
+    mode = str(generation_mode or "image_to_video").strip().lower()
+    if mode not in {"image_to_video", "text_to_video"}:
+        mode = "image_to_video"
+    capabilities = video_model_capabilities(model)
+    generation_schema = capabilities.get("generation_schema")
+    duration_schemas = (
+        generation_schema.get("duration")
+        if isinstance(generation_schema, dict)
+        else None
+    )
+    duration_schema = (
+        duration_schemas.get(mode)
+        if isinstance(duration_schemas, dict)
+        else None
+    )
+    return dict(duration_schema) if isinstance(duration_schema, dict) else None
+
+
+def _plan_video_segment_durations(
+    total_duration_seconds: int,
+    supported_durations: list[int],
+) -> tuple[list[int], list[int]] | None:
+    """Return provider and final durations, minimizing overage then clip count."""
+    supported = sorted(
+        {
+            value
+            for value in supported_durations
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0
+        },
+        reverse=True,
+    )
+    if total_duration_seconds <= 0 or not supported:
+        return None
+
+    search_limit = total_duration_seconds + min(supported) - 1
+    plans: list[list[int] | None] = [None] * (search_limit + 1)
+    plans[0] = []
+    for total in range(1, search_limit + 1):
+        candidates = [
+            [*plans[total - duration], duration]
+            for duration in supported
+            if duration <= total and plans[total - duration] is not None
+        ]
+        if candidates:
+            plans[total] = min(
+                candidates,
+                key=lambda candidate: (
+                    len(candidate),
+                    tuple(-value for value in sorted(candidate, reverse=True)),
+                ),
+            )
+
+    generation_durations = next(
+        (
+            sorted(plans[generated_total], reverse=True)
+            for generated_total in range(total_duration_seconds, search_limit + 1)
+            if plans[generated_total] is not None
+        ),
+        None,
+    )
+    if generation_durations is None:
+        return None
+
+    segment_durations = list(generation_durations)
+    trim_seconds = sum(generation_durations) - total_duration_seconds
+    if trim_seconds:
+        longest_duration = max(generation_durations)
+        trim_index = next(
+            index
+            for index in range(len(generation_durations) - 1, -1, -1)
+            if generation_durations[index] == longest_duration
+            and generation_durations[index] > trim_seconds
+        )
+        segment_durations[trim_index] -= trim_seconds
+    return generation_durations, segment_durations
+
+
+def _supported_integer_video_durations(
+    duration_schema: dict[str, Any] | None,
+) -> list[int] | None:
+    """Read only the small integer duration Schema forms used by providers."""
+    if not isinstance(duration_schema, dict) or duration_schema.get("type") != "integer":
+        return None
+
+    enum = duration_schema.get("enum")
+    if isinstance(enum, list):
+        durations = sorted(
+            {
+                value
+                for value in enum
+                if isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+            },
+            reverse=True,
+        )
+        return durations or None
+
+    minimum = duration_schema.get("minimum")
+    maximum = duration_schema.get("maximum")
+    if (
+        isinstance(minimum, int)
+        and not isinstance(minimum, bool)
+        and isinstance(maximum, int)
+        and not isinstance(maximum, bool)
+        and 0 < minimum <= maximum
+    ):
+        return list(range(maximum, minimum - 1, -1))
+    return None
+
+
+async def _plan_video_segments_handler(
+    entity_id: str = "",
+    user_id: str = "",
+    **kwargs: Any,
+) -> str:
+    runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+    user_id = await _resolve_media_task_user_id(
+        _media_context_user_id(user_id, runtime_context.user_id),
+        entity_id,
+        kwargs.get("task_id") or runtime_context.task_id,
+    )
+    raw_total = kwargs.get("target_duration_seconds")
+    try:
+        numeric_total = float(raw_total)
+    except (TypeError, ValueError):
+        numeric_total = 0.0
+    if not numeric_total.is_integer() or not 1 <= numeric_total <= 3600:
+        return json.dumps({
+            "status": "blocked",
+            "error": "target_duration_seconds must be a whole number from 1 through 3600",
+        })
+
+    generation_mode = str(
+        kwargs.get("generation_mode") or "image_to_video"
+    ).strip().lower()
+    if generation_mode not in {"image_to_video", "text_to_video"}:
+        return json.dumps({
+            "status": "blocked",
+            "error": "generation_mode must be image_to_video or text_to_video",
+        })
+
+    model = await _resolve_user_video_model(user_id, entity_id)
+    model_duration_schema = _video_duration_schema(model, generation_mode)
+    model_supported_durations = _supported_integer_video_durations(
+        model_duration_schema
+    )
+    duration_schema_source = (
+        "model_schema"
+        if model_supported_durations is not None
+        else "compatibility_fallback"
+    )
+    duration_schema = dict(
+        model_duration_schema
+        if model_supported_durations is not None
+        else _COMPATIBLE_VIDEO_SEGMENT_DURATION_SCHEMA
+    )
+    supported_durations = (
+        model_supported_durations
+        or _supported_integer_video_durations(
+            _COMPATIBLE_VIDEO_SEGMENT_DURATION_SCHEMA
+        )
+        or []
+    )
+    total_duration = int(numeric_total)
+    duration_plan = _plan_video_segment_durations(
+        total_duration,
+        supported_durations,
+    )
+    if duration_plan is None:
+        return json.dumps({
+            "status": "blocked",
+            "model": model,
+            "generation_mode": generation_mode,
+            "duration_schema_source": duration_schema_source,
+            "duration_schema": duration_schema,
+            "target_duration_seconds": total_duration,
+            "error": (
+                "The available segment durations cannot cover the requested total. "
+                "Choose another target duration or video model."
+            ),
+        })
+    generation_durations, segment_durations = duration_plan
+    generated_duration = sum(generation_durations)
+    return json.dumps({
+        "status": "completed",
+        "model": model,
+        "generation_mode": generation_mode,
+        "duration_schema_source": duration_schema_source,
+        "duration_schema": duration_schema,
+        "generation_durations_seconds": generation_durations,
+        "segment_durations_seconds": segment_durations,
+        "segment_count": len(segment_durations),
+        "total_duration_seconds": sum(segment_durations),
+        "generated_duration_seconds": generated_duration,
+        "trim_seconds": generated_duration - sum(segment_durations),
+    })
+
+
 GENERATE_VIDEO_SCHEMA = {
     "type": "function",
     "function": {
         "name": "generate_video",
         "description": (
             "Generate one short video clip from a text prompt using the Account-selected video model. "
+            "Before composing inputs, call generate_file(kind='search', params={'media_kind':'video'}) "
+            "to inspect the current model, mode-specific schema, and limits; pass selected_model.expected_model here. "
             "This tool is for a single provider clip only, not a full long-form master. "
-            "For requested total runtimes over 15 seconds, create multiple clip jobs whose durations "
-            "sum exactly to the target, wait for them, then merge them. "
+            "For longer requested runtimes, call plan_video_segments, create clips with its provider "
+            "generation durations, wait for them, then trim and merge them using its final segment "
+            "durations. "
             "Supports image-to-video (first/last frame), reference images, and supported-model reference video/audio inputs. "
             "Starts generation in the background (30-90 seconds). "
             "After calling this, inform the user that generation has started. "
@@ -4600,11 +5430,13 @@ GENERATE_VIDEO_SCHEMA = {
             "- reference_urls: if user wants style/character/scene consistency from reference photos\n"
             "Choose based on user intent. If ambiguous and only one image, use first_frame_url. "
             "If multiple images with no specific instruction, use reference_urls. "
-            "Official Seedance reference limits: up to 9 image references, 3 video references, "
-            "and 3 audio references per clip. Audio references must be paired with at least one "
-            "image or video reference so the model has a visual subject/environment. Seedance "
+            "Seedance 2.0 allows up to 9 image, 3 video, and 3 audio references; "
+            "Seedance 2.5 allows up to 30 image, 10 video, and 10 audio references. "
+            "For 2.5, reference videos and reference audio each have a 30-second combined duration limit. "
+            "Seedance 2.0 audio references require an image or video reference; 2.5 allows audio alone. Seedance "
             "reference_video_urls, audio_reference_urls, and generate_audio require Manor's "
             "native Volcengine/Seedance route; do not use OpenRouter for those inputs. "
+            "Seedance 2.5 requires the native Volcengine route for every request. "
             "For Vercel and OpenRouter routes, local image references may be sent inline "
             "as Base64 data, so they do not normally need PUBLIC_BASE_URL. If an image "
             "cannot fit the provider's inline size limit, Manor falls back to a signed "
@@ -4635,7 +5467,7 @@ GENERATE_VIDEO_SCHEMA = {
                 "reference_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Reference image URLs for style/character consistency. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require externally reachable https:// URLs or PUBLIC_BASE_URL. Seedance supports up to 9.",
+                    "description": "Reference image URLs for style/character consistency. Vercel/OpenRouter can send local /api/v1/fs/... image files inline; other routes require externally reachable https:// URLs or PUBLIC_BASE_URL. Seedance 2.0 supports up to 9; 2.5 up to 30.",
                 },
                 "reference_url": {
                     "type": "string",
@@ -4644,7 +5476,7 @@ GENERATE_VIDEO_SCHEMA = {
                 "reference_video_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Official Seedance reference video URLs for motion/camera/action reference. Up to 3 provider-readable URLs. Requires native Volcengine/Seedance routing, not OpenRouter.",
+                    "description": "Official Seedance reference video URLs for motion/camera/action reference. 2.0 supports up to 3; 2.5 up to 10 provider-readable URLs. Requires native Volcengine/Seedance routing.",
                 },
                 "reference_video_url": {
                     "type": "string",
@@ -4661,12 +5493,12 @@ GENERATE_VIDEO_SCHEMA = {
                 },
                 "audio_reference_url": {
                     "type": "string",
-                    "description": "Official Seedance audio reference URL for music/dialogue/timing/lip-sync conditioning. Up to 3 audio refs total; pair with at least one image/video reference. Requires native Volcengine/Seedance routing, not OpenRouter.",
+                    "description": "Official Seedance audio reference URL for music/dialogue/timing/lip-sync conditioning. 2.0 supports up to 3 and requires visual reference; 2.5 supports up to 10 and allows audio alone. Requires native Volcengine/Seedance routing.",
                 },
                 "audio_reference_urls": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Official Seedance audio reference URLs. Up to 3 provider-readable URLs; must be paired with at least one image/video reference. Requires native Volcengine/Seedance routing.",
+                    "description": "Official Seedance audio reference URLs. 2.0 supports up to 3 with a visual reference; 2.5 up to 10 and allows audio alone. Requires native Volcengine/Seedance routing.",
                 },
                 "reference_audio_url": {
                     "type": "string",
@@ -4683,9 +5515,14 @@ GENERATE_VIDEO_SCHEMA = {
                 },
                 "duration": {
                     "type": "integer",
-                    "enum": [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                    "minimum": 4,
+                    "maximum": 30,
                     "default": 5,
-                    "description": "Single-clip duration in seconds. This is not total project duration. Choose one supported value; default 5.",
+                    "description": "Single-clip duration in seconds. Seedance 2.5 supports 4-30; other catalog models support at most 15. Default 5.",
+                },
+                "expected_model": {
+                    "type": "string",
+                    "description": "Model returned by generate_file(kind=search, params.media_kind=video) or plan_video_segments. Generation fails before credential or credit work if the Account-selected model changed.",
                 },
                 "frames": {
                     "type": "integer",
@@ -4770,7 +5607,9 @@ def _coerce_video_reference_urls(
 
 _INLINE_IMAGE_REFERENCE_RE = re.compile(
     r"\[(?:Image|Image from KB):[^\]\n]*?(?:→|->)\s*"
-    r"(?P<url>(?:/api/v1/fs/[^\]\s]+|https?://[^\]\s]+))\]",
+    # History may hold upload URLs written before they were percent-encoded,
+    # so a local URL runs to the closing bracket, spaces included.
+    r"(?P<url>(?:/api/v1/fs/[^\]\n]+?|https?://[^\]\s]+))\s*\]",
     re.IGNORECASE,
 )
 
@@ -4906,7 +5745,7 @@ def _reference_selected_by_user(source_text: Any, ref_url: Any) -> bool:
         if not needle:
             continue
         if (
-            needle.startswith("/api/v1/fs/") or needle.startswith("http://") or needle.startswith("https://")
+            parse_entity_fs_url(needle) is not None or needle.startswith(("http://", "https://"))
         ) and needle.lower() in lowered:
             return True
         if re.search(rf"#\s*{re.escape(needle)}(?=$|[\s,，。；;])", text, re.IGNORECASE):
@@ -5067,7 +5906,14 @@ def _apply_inline_video_references(
     return first_frame_url, last_frame_url, refs, inferred
 
 
-def _video_error_result(message: str, *, prompt: str = "", model: str = "") -> str:
+def _video_error_result(
+    message: str,
+    *,
+    prompt: str = "",
+    model: str = "",
+    error_code: str = "",
+    expected_model: str = "",
+) -> str:
     result: dict[str, Any] = {
         "kind": "video",
         "status": "failed",
@@ -5077,6 +5923,10 @@ def _video_error_result(message: str, *, prompt: str = "", model: str = "") -> s
         result["prompt"] = prompt
     if model:
         result["model"] = model
+    if error_code:
+        result["error_code"] = error_code
+    if expected_model:
+        result["expected_model"] = expected_model
     return json.dumps(result, ensure_ascii=False)
 
 
@@ -5338,6 +6188,7 @@ def _video_capability_error(
     audio_reference_urls: list[str] | None = None,
     audio_reference_url: str = "",
     generate_audio: Any = None,
+    duration: Any = None,
 ) -> str | None:
     from packages.core.constants.models import video_model_capabilities
 
@@ -5348,6 +6199,39 @@ def _video_capability_error(
     if audio_reference_url and audio_reference_url not in audio_refs:
         audio_refs.append(audio_reference_url)
     problems: list[str] = []
+    if duration is not None:
+        generation_mode = "image_to_video" if first_frame_url or last_frame_url else "text_to_video"
+        duration_schema = _video_duration_schema(model, generation_mode)
+        supported_durations = _supported_integer_video_durations(duration_schema)
+        raw_duration = duration
+        if isinstance(raw_duration, str):
+            duration_text = raw_duration.strip().lower()
+            for suffix in ("seconds", "second", "secs", "sec", "s"):
+                if duration_text.endswith(suffix):
+                    duration_text = duration_text[: -len(suffix)].strip()
+                    break
+            raw_duration = duration_text
+        try:
+            numeric_duration = float(raw_duration)
+            requested_duration = (
+                int(numeric_duration)
+                if numeric_duration.is_integer()
+                else None
+            )
+        except (TypeError, ValueError):
+            requested_duration = None
+        if (
+            supported_durations is not None
+            and requested_duration not in supported_durations
+        ):
+            supported_text = ", ".join(
+                str(value) for value in sorted(supported_durations)
+            )
+            problems.append(
+                f"{model} {generation_mode} duration schema allows only: "
+                f"{supported_text} seconds; received {duration}. Call "
+                "plan_video_segments before defining the shot plan."
+            )
     if caps.get("requires_first_frame") and not first_frame_url:
         problems.append(
             f"{model} is image-to-video only and requires a source image in "
@@ -5380,7 +6264,12 @@ def _video_capability_error(
         problems.append(
             f"{model} supports at most {max_audio_refs} reference audio file(s); received {len(audio_refs)}."
         )
-    if audio_refs and caps.get("audio_reference") and not (first_frame_url or last_frame_url or refs or video_refs):
+    if (
+        audio_refs
+        and caps.get("audio_reference")
+        and caps.get("audio_requires_visual_reference", True)
+        and not (first_frame_url or last_frame_url or refs or video_refs)
+    ):
         problems.append(
             f"{model} audio references should be paired with at least one image or video reference "
             "so the model has a visual subject/environment to condition."
@@ -5388,6 +6277,12 @@ def _video_capability_error(
     native_audio_requested = generate_audio is not None and _truthy_video_option(generate_audio)
     if native_audio_requested and not caps.get("native_audio"):
         problems.append(f"{model} does not support native video audio through this adapter.")
+    if (
+        model == "bytedance/seedance-2.5"
+        and (first_frame_url or last_frame_url)
+        and (refs or video_refs or audio_refs)
+    ):
+        problems.append("Seedance 2.5 first/last frames cannot be mixed with reference media.")
 
     if not problems:
         return None
@@ -5627,8 +6522,33 @@ async def _generate_video_handler(
         return _video_error_result("prompt is required")
 
     model = await _resolve_user_video_model(user_id, entity_id)
+    selected_model = model
     if kwargs.get("model"):
         model = str(kwargs["model"]).strip()
+    expected_model = str(kwargs.get("expected_model") or "").strip()
+    if (
+        expected_model
+        and selected_model != expected_model
+        and not _selectable_media_model(expected_model, "video")
+    ):
+        # Not a video model the Account could have selected: a guess, or
+        # another media kind's model, never a changed selection.
+        expected_model = ""
+    if expected_model and (selected_model != expected_model or model != expected_model):
+        mismatch = (
+            f"The Account-selected video model changed from {expected_model} to "
+            f"{selected_model}. Retry with expected_model={selected_model} (or without "
+            "expected_model) to start the clip with it."
+            if selected_model != expected_model
+            else f"model override {model} conflicts with expected_model {expected_model}."
+        )
+        return _video_error_result(
+            mismatch,
+            prompt=raw_prompt,
+            model=model,
+            error_code="video_model_changed_replan_required",
+            expected_model=expected_model,
+        )
     provider = _catalog_provider(model)
     from packages.core.tasks.media_tasks import (
         VIDEO_DURATION_MAX_SECONDS,
@@ -5641,16 +6561,17 @@ async def _generate_video_handler(
 
     raw_duration = kwargs.get("duration", 5)
     requested_duration = parse_video_duration(raw_duration)
-    duration = normalize_video_duration(raw_duration)
+    max_duration = 30 if model == "bytedance/seedance-2.5" else VIDEO_DURATION_MAX_SECONDS
+    duration = normalize_video_duration(raw_duration, model)
     duration_adjusted = requested_duration is not None and requested_duration != duration
-    if requested_duration is not None and requested_duration > VIDEO_DURATION_MAX_SECONDS:
+    if requested_duration is not None and requested_duration > max_duration:
         return _video_error_result(
             (
                 f"Single video generation supports only {VIDEO_DURATION_MIN_SECONDS}-"
-                f"{VIDEO_DURATION_MAX_SECONDS}s clips. Requested {requested_duration}s. "
+                f"{max_duration}s clips. Requested {requested_duration}s. "
                 "Do not start a shortened clip. Segment the total runtime into multiple "
-                "clip jobs whose durations sum exactly to the requested duration, call "
-                "wait_media_jobs, then merge_videos into one clean master."
+                "provider clip jobs from plan_video_segments, call wait_media_jobs, then "
+                "trim and merge them to the requested duration with merge_videos."
             ),
             prompt=prompt,
             model=model,
@@ -5658,6 +6579,18 @@ async def _generate_video_handler(
     requested_resolution = normalize_video_resolution(None, raw_resolution)
     resolution = normalize_video_resolution(model, raw_resolution)
     resolution_adjusted = requested_resolution != resolution
+    if model == "bytedance/seedance-2.5":
+        if seed is not None or camera_fixed is not None or frames is not None:
+            return _video_error_result(
+                "Seedance 2.5 API does not support seed, camera_fixed, or frames.",
+                prompt=raw_prompt, model=model,
+            )
+        if draft and resolution != "480p":
+            return _video_error_result(
+                "Seedance 2.5 draft requires 480p resolution.", prompt=raw_prompt, model=model,
+            )
+        if first_frame_url or last_frame_url or kwargs.get("aspect_ratio") is None:
+            aspect_ratio = "adaptive"
 
     missing_reference_error = _video_missing_reference_error(
         prompt=raw_prompt,
@@ -5679,6 +6612,10 @@ async def _generate_video_handler(
             prompt=raw_prompt,
             model=model,
         )
+    if model == "bytedance/seedance-2.5" and route_preference == "vercel":
+        return _video_error_result(
+            "Seedance 2.5 requires the native Volcengine API route.", prompt=raw_prompt, model=model,
+        )
 
     # Validate API key before reference preflight so OpenRouter fallback can
     # omit native-only Seedance reference inputs instead of failing on URLs the
@@ -5688,6 +6625,7 @@ async def _generate_video_handler(
     vercel_auth_method = "api-key"
     if route_preference == "vercel" or (
         route_preference == "auto"
+        and model != "bytedance/seedance-2.5"
         and not is_byok
         and os.getenv("DEPLOYMENT_MODE", "oss").strip().lower() == "cloud"
     ):
@@ -5796,6 +6734,11 @@ async def _generate_video_handler(
         api_key=api_key,
     )
     if not adapter:
+        if model == "bytedance/seedance-2.5":
+            return _video_error_result(
+                "Seedance 2.5 requires a native Volcengine API key and route.",
+                prompt=raw_prompt, model=model,
+            )
         return _video_error_result(
             (
                 f"No video adapter for {provider or 'this'} model. "
@@ -5832,6 +6775,7 @@ async def _generate_video_handler(
         reference_video_urls=reference_video_urls,
         audio_reference_urls=audio_reference_urls,
         generate_audio=generate_audio,
+        duration=raw_duration,
     )
     if capability_error:
         return _video_error_result(capability_error, prompt=raw_prompt, model=model)
@@ -5885,12 +6829,40 @@ async def _generate_video_handler(
     from packages.core.database import async_session
     from packages.core.models.media_job import MediaJob
     from packages.core.models.base import generate_ulid
+    from packages.core.ai.runtime.authorization_receipts import (
+        runtime_current_tool_authorization_receipt,
+    )
+    from packages.core.contracts.media_job_output import (
+        MEDIA_JOB_OUTPUT_CONTRACT_KEY,
+        MediaJobOutputContract,
+    )
 
     job_id = generate_ulid()
+    output_contract = None
+    receipt = runtime_current_tool_authorization_receipt()
+    if receipt is not None and receipt.media_output_plan is not None:
+        if (
+            receipt.entity_id != entity_id
+            or receipt.workspace_id != runtime_context.workspace_id
+            or receipt.task_id != runtime_context.task_id
+            or receipt.media_output_plan.kind != "video"
+        ):
+            return _video_error_result(
+                "Video output scope changed after authorization", prompt=raw_prompt, model=model,
+            )
+        output_contract = MediaJobOutputContract(
+            job_id=job_id,
+            entity_id=entity_id,
+            user_id=user_id or None,
+            workspace_id=runtime_context.workspace_id,
+            task_id=runtime_context.task_id,
+            plan=receipt.media_output_plan,
+        ).to_dict()
     try:
         snap = snapshot_video_reference_urls(
             entity_id=entity_id,
             job_id=job_id,
+            model=model,
             first_frame_url=first_frame_url or "",
             last_frame_url=last_frame_url or "",
             reference_urls=reference_urls,
@@ -5939,12 +6911,14 @@ async def _generate_video_handler(
             "route_preference": route_preference,
             "first_frame_url": first_frame_url or None,
             "last_frame_url": last_frame_url or None,
-            "reference_urls": reference_urls[:9] if reference_urls else None,
-            "reference_video_urls": reference_video_urls[:3] if reference_video_urls else None,
-            "audio_reference_urls": audio_reference_urls[:3] if audio_reference_urls else None,
+            "reference_urls": reference_urls if reference_urls else None,
+            "reference_video_urls": reference_video_urls if reference_video_urls else None,
+            "audio_reference_urls": audio_reference_urls if audio_reference_urls else None,
             "audio_reference_url": audio_reference_url or None,
             "seed": seed,
         }
+        if output_contract is not None:
+            video_params[MEDIA_JOB_OUTPUT_CONTRACT_KEY] = output_contract
         if route_provider == "vercel":
             video_params["vercel_auth_method"] = vercel_auth_method
         if duration_adjusted:
@@ -5957,6 +6931,8 @@ async def _generate_video_handler(
             video_params["workspace_id"] = runtime_context.workspace_id
         if runtime_context.task_id:
             video_params["task_id"] = runtime_context.task_id
+            # A parked Task agent loop is woken by this job's completion.
+            video_params.update(_media_job_lineage(runtime_context.task_id, kwargs))
         if inferred_inline_references:
             video_params["inferred_inline_references"] = inferred_inline_references
         if prompt != raw_prompt:
@@ -5985,12 +6961,16 @@ async def _generate_video_handler(
         if public_base_url:
             video_params["public_base_url"] = public_base_url
 
+        from packages.core.services.room_generation_scope import current_room_generation_scope
+
+        group_scope = current_room_generation_scope()
         job = MediaJob(
             id=job_id,
             entity_id=entity_id,
             user_id=user_id or None,
             agent_id=runtime_context.agent_id,
             conversation_id=conversation_id,
+            room_agent_run_id=group_scope.run_id if group_scope else None,
             kind="video",
             status="pending",
             prompt=prompt,
@@ -6037,7 +7017,8 @@ async def _generate_video_handler(
     # Schedule background processing
     from packages.core.tasks.media_tasks import schedule_video_job
 
-    schedule_video_job(job_id)
+    if group_scope is None:
+        schedule_video_job(job_id)
 
     message = f"Video generation started. {duration}s {resolution} video will be ready in 30-90 seconds."
     if duration_adjusted or resolution_adjusted:
@@ -6048,7 +7029,7 @@ async def _generate_video_handler(
             requested_bits.append(requested_resolution)
         message = (
             f"Requested {' '.join(requested_bits)}, but the selected video model supports "
-            f"{VIDEO_DURATION_MIN_SECONDS}-{VIDEO_DURATION_MAX_SECONDS}s and not every resolution. "
+            f"{VIDEO_DURATION_MIN_SECONDS}-{max_duration}s and not every resolution. "
             f"Starting a {duration}s {resolution} video instead."
         )
 
@@ -6070,11 +7051,11 @@ async def _generate_video_handler(
     if last_frame_url:
         result["last_frame_url"] = last_frame_url
     if reference_urls:
-        result["reference_urls"] = reference_urls[:9]
+        result["reference_urls"] = reference_urls
     if reference_video_urls:
-        result["reference_video_urls"] = reference_video_urls[:3]
+        result["reference_video_urls"] = reference_video_urls
     if audio_reference_urls:
-        result["audio_reference_urls"] = audio_reference_urls[:3]
+        result["audio_reference_urls"] = audio_reference_urls
         result["audio_reference_url"] = audio_reference_urls[0]
     if inferred_inline_references:
         result["inferred_inline_references"] = inferred_inline_references
@@ -6099,6 +7080,7 @@ def get_tools():
         (WEB_FETCH_SCHEMA, _web_fetch_handler),
         (EXTRACT_DATA_SCHEMA, _extract_data_handler),
         (GENERATE_IMAGE_SCHEMA, _generate_image_handler),
+        (PLAN_VIDEO_SEGMENTS_SCHEMA, _plan_video_segments_handler),
         (GENERATE_VIDEO_SCHEMA, _generate_video_handler),
         (TRANSCRIBE_AUDIO_SCHEMA, _transcribe_audio_handler),
     ]
@@ -6129,6 +7111,9 @@ async def _bill_media(
     model: str,
     cost_usd: float,
     units: int,
+    workspace_id: str | None = None,
+    agent_id: str | None = None,
+    conversation_id: str | None = None,
     byok: bool = False,
 ) -> None:
     """Record a media-generation call (image / video) against the
@@ -6150,7 +7135,10 @@ async def _bill_media(
                 model=model,
                 cost_usd=float(cost_usd),
                 units=units,
+                workspace_id=workspace_id,
                 user_id=user_id or None,
+                agent_id=agent_id,
+                conversation_id=conversation_id,
                 source=f"tool:{kind}",
                 byok=byok,
             )

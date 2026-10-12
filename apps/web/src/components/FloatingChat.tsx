@@ -1,3 +1,4 @@
+import ApprovalModeTrigger from "./approvals/ApprovalModeTrigger";
 /**
  * FloatingChat — a bottom-right floating chat button + slide-up panel.
  *
@@ -5,6 +6,8 @@
  * Supports: file attachments (local + knowledge base), voice-to-text input.
  */
 import {
+  lazy,
+  Suspense,
   useState,
   useRef,
   useEffect,
@@ -13,6 +16,8 @@ import {
   type MutableRefObject,
 } from "react";
 import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
+import { agentListQueryOptions, skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
+import { chatFlowEntrypointsQueryOptions, chatMentionUsersQueryOptions } from "../lib/chatCatalogQueries";
 import { useLocation } from "react-router-dom";
 import {
   api,
@@ -20,13 +25,16 @@ import {
   ConversationSurfaceKind,
   type GlobalChatFlowEntrypoint,
 } from "../lib/api";
+import { invalidateAgentInitiativeQueries } from "../lib/agentInitiativeInvalidation";
 import { invalidateKnowledgeQueries } from "../lib/knowledgeInvalidation";
+import { viewerPathForDocumentId } from "../lib/fileReferences";
 import {
   type ChatMessage,
   type ChatStreamSnapshot,
   type ResponseSurfaceSubmissionReceipt,
   type ResponseSurfaceSubmissionResult,
   type ToolCall,
+  hasActivePersistedChatStream,
   isInternalFilePermissionMessage,
   isRedundantApprovalResolutionReceipt,
   isTerminalStreamSnapshot,
@@ -38,6 +46,7 @@ import {
   hitlActionTranscriptText,
   parseToolCalls,
   useDebounced,
+  formatRuntimeQueueStatus,
   resolveGlobalWorkflowMessageAction,
 } from "../lib/chatStream";
 import {
@@ -52,14 +61,20 @@ import {
 import {
   ChatStreamCompletionStatus,
   hasLocallyStreamedConversation,
+  captureChatHistoryStreamFence,
+  chatHistoryStreamFenceIsCurrent,
   shouldIgnoreLocallyStoppedStreamUpdate,
   useChatStreamStore,
 } from "../stores/chatStream";
 import { useAuthStore } from "../stores/auth";
 import { useToastStore } from "../stores/toast";
+import { useWorkspaceFilter } from "../stores/workspace";
 import ChatMarkdown from "./ChatMarkdown";
 import WorkflowResultCard from "./WorkflowResultCard";
-import AssistantMessageBlocks from "./AssistantMessageBlocks";
+import AssistantMessageBlocks, {
+  assistantPendingActionKindForMessage,
+} from "./AssistantMessageBlocks";
+import { finishAiEditProgress, projectAiEditAssistantBlocks } from "../lib/aiEditProcess";
 import FloatingPanel from "./FloatingPanel";
 import PanelHeader from "./chat/PanelHeader";
 import MessageRow from "./chat/MessageRow";
@@ -78,7 +93,9 @@ import AgentActivityOrb, { inferAgentActivity } from "./ui/AgentActivityOrb";
 import UserAvatar from "./ui/UserAvatar";
 import ChatActionCard, { ApprovalSummary } from "./ui/ChatActionCard";
 import ApprovalActionBar from "./ui/ApprovalActionBar";
+import { isTikTokPublishApproval } from "./workflows/TikTokPublishReview";
 import { chatMessageAnchorId } from "../lib/chatMessageAnchor";
+import { priorMatchingEntries } from "../lib/chatHistoryScan";
 import { DEFAULT_APPROVAL_OPTIONS } from "../lib/approvalOptions";
 import SessionSwitcher from "./SessionSwitcher";
 import ToolCallList from "./ui/ToolCallList";
@@ -103,8 +120,6 @@ import WorkflowRunHost, {
 } from "./workflows/WorkflowRunHost";
 import { type ChatBoxMode } from "./ChatModeSelector";
 import ChatModeToolbar from "./ChatModeToolbar";
-import ChatModeTemplateGallery from "./ChatModeTemplateGallery";
-import { chatModeTemplateSamples } from "./EmbeddedChat";
 import WorkspaceRecommendationCard from "./WorkspaceRecommendationCard";
 import useWorkspaceRecommendationActions from "./useWorkspaceRecommendationActions";
 import { prepareTemplateRemix } from "./templateRemix";
@@ -160,11 +175,14 @@ import {
   isEditorLivePatchCommitAlreadyPreviewed,
   isSameAiEditConversationOwner,
   isSameEditorLiveTarget,
+  nativeFilePatchResultFromSseFrame,
+  recoverEditorLivePatchStreamTail,
   shouldAttachEditorLiveSourceDocument,
   shouldStreamEditorLiveDeltaPreview,
   stripEditorLiveEditBlocks,
   type AiEditConversationOwnerScope,
   type EditorLiveChatDetail,
+  type EditorNativeFilePatchResult,
 } from "../lib/editorLiveChat";
 import { decodeAuthTokenClaims, getAuthToken } from "../lib/authToken";
 import type { Agent, UserSummary } from "../lib/types";
@@ -172,6 +190,7 @@ import { useChatAutoFollow } from "../lib/useChatAutoFollow";
 import { t } from "../lib/i18n";
 import { getAgentDescription } from "../lib/localizedContent";
 
+const FloatingChatModeTemplateGallery = lazy(() => import("./FloatingChatModeTemplateGallery"));
 
 function toDisplayText(value: unknown): string {
   if (value == null) return "";
@@ -410,7 +429,7 @@ function makeEditorLiveProgressTool(
     arguments: stableJson(args),
     result: result ? stableJson(result) : undefined,
     status,
-    startedAt: status === "pending" ? Date.now() : undefined,
+    startedAt: Date.now(),
   };
 }
 
@@ -431,8 +450,16 @@ function withEditorLiveProgress(
   }
   const existing = [...(last.tool_calls || [])];
   const idx = existing.findIndex((candidate) => candidate.name === tool.name);
-  if (idx >= 0) existing[idx] = { ...existing[idx], ...tool };
-  else existing.push(tool);
+  const startedAt = tool.status === "pending" ? tool.startedAt
+    : existing[idx]?.startedAt ?? tool.startedAt;
+  const timedTool = {
+    ...tool,
+    startedAt,
+    duration: tool.status === "pending" || typeof startedAt !== "number" ? undefined
+      : `${Math.max(0, Date.now() - startedAt) / 1000}s`,
+  };
+  if (idx >= 0) existing[idx] = { ...existing[idx], ...timedTool };
+  else existing.push(timedTool);
   updated[updated.length - 1] = { ...last, tool_calls: existing };
   return updated;
 }
@@ -636,6 +663,9 @@ function pipeEditorLiveEditStream(
     return response;
   }
 
+  const conversationId = response.headers.get("X-Conversation-ID");
+  const isForeignFrame = (frame: unknown) => Boolean(conversationId && frame && typeof frame === "object"
+    && "conversation_id" in frame && frame.conversation_id && frame.conversation_id !== conversationId);
   const [chatBody, liveBody] = response.body.tee();
   const liveProcessing = (async () => {
     const reader = liveBody.getReader();
@@ -648,8 +678,12 @@ function pipeEditorLiveEditStream(
     let appliedPatchCount = 0;
     let patchFailureCount = 0;
     let sawStreamError = false;
+    let receivedTerminal = false;
     let lastAppliedPatch = "";
     let appliedGeneratedImageUrl = "";
+    let persistedNativePatchKey = "";
+    let reloadedNativePatchKey = "";
+    let nativePatchReloadError = "";
     let lastDeltaOperationIndex: number | null = null;
     const patchStream = createEditorLivePatchStream();
     // The caller reads once at turn start. Re-reading here could retarget a
@@ -665,7 +699,7 @@ function pipeEditorLiveEditStream(
     };
     signal?.addEventListener("abort", cancelLiveReader, { once: true });
     if (!isActive() || signal?.aborted) {
-      await reader.cancel();
+      void reader.cancel();
       signal?.removeEventListener("abort", cancelLiveReader);
       settleUnfinishedTurn();
       return;
@@ -705,6 +739,9 @@ function pipeEditorLiveEditStream(
     const finishLiveEdit = async (patch = "", sourceLabel = "assistant patch") => {
       if (completeNotified) return true;
       if (!isActive() || signal?.aborted) return false;
+      onProgress?.(makeEditorLiveProgressTool("verify_patch", "pending", {
+        file: detail.documentName || "current file",
+      }));
       const diff = buildEditorLiveDiff(
         baselineContent,
         workingContent,
@@ -753,6 +790,98 @@ function pipeEditorLiveEditStream(
       );
       onCompleteApplied?.();
       return true;
+    };
+
+    const finishNativeFilePatch = () => {
+      if (completeNotified || !persistedNativePatchKey || !reloadedNativePatchKey) return false;
+      if (!isActive() || signal?.aborted) return false;
+      completeNotified = true;
+      appliedRef.current = {
+        sessionKey,
+        turnId,
+        content: baselineContent,
+        phase: "complete",
+        operationCount: 1,
+        appliedPatchCount: 1,
+        basePatchCount: turnBasePatchCount,
+        abortController: appliedRef.current.abortController,
+      };
+      onProgress?.(
+        makeEditorLiveProgressTool(
+          "verify_patch",
+          "success",
+          { file: detail.documentName || "current file", stage: "persisted bytes reloaded" },
+          { status: "ok", source: "native patch_file" },
+        ),
+      );
+      onCompleteApplied?.();
+      return true;
+    };
+
+    const applyNativeFilePatchResult = async (result: EditorNativeFilePatchResult) => {
+      if (!detail.applyNativeFilePatch || !isActive() || signal?.aborted) return false;
+      const key = String(result.source_sha256 || `${result.document_id || ""}:${result.path}`);
+      if (key === persistedNativePatchKey) return key === reloadedNativePatchKey;
+      persistedNativePatchKey = key;
+      nativePatchReloadError = "";
+      onProgress?.(
+        makeEditorLiveProgressTool(
+          "apply_patch",
+          "pending",
+          { file: detail.documentName || result.path, patch: 1 },
+          { status: "persisted", source: "native patch_file" },
+        ),
+      );
+      try {
+        const accepted = await detail.applyNativeFilePatch(result, {
+          complete: true,
+          phase: AiEditApplyPhase.Complete,
+          source: "assistant-stream",
+          turnId,
+          turnBasePatchCount,
+          mode: "patch",
+          patchCount: 1,
+          sourceLabel: "native patch_file",
+          signal,
+        });
+        if (accepted === false) throw new Error("The editor rejected the persisted file reload.");
+        if (!isActive() || signal?.aborted) return false;
+        reloadedNativePatchKey = key;
+        appliedRef.current = {
+          sessionKey,
+          turnId,
+          content: baselineContent,
+          phase: "streaming",
+          operationCount: 1,
+          appliedPatchCount: 1,
+          basePatchCount: turnBasePatchCount,
+          abortController: appliedRef.current.abortController,
+        };
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "apply_patch",
+            "success",
+            { file: detail.documentName || result.path, patch: 1 },
+            { status: "ok", source: "native patch_file", path: result.path },
+          ),
+        );
+        return true;
+      } catch (error) {
+        nativePatchReloadError = error instanceof Error ? error.message : String(error);
+        onProgress?.(
+          makeEditorLiveProgressTool(
+            "verify_patch",
+            "error",
+            { file: detail.documentName || result.path, stage: "reload failed" },
+            {
+              status: "failed",
+              error: nativePatchReloadError,
+              recovery: "Reload the document to read the already-persisted native patch.",
+            },
+          ),
+        );
+        return false;
+      }
     };
 
     const applyGeneratedImageUrl = async (imageUrl: string) => {
@@ -1036,6 +1165,11 @@ function pipeEditorLiveEditStream(
       try {
         const result = applyEditorLivePatch(workingContent, event.patch);
         if (result.failed.length > 0 || result.content === lastPreviewContent) return;
+        if (lastDeltaOperationIndex !== event.operationIndex) {
+          onProgress?.(makeEditorLiveProgressTool("apply_patch", "pending", {
+            file: detail.documentName || "current file",
+          }));
+        }
         const accepted = await detail.adapter.preview(result.content, {
           complete: false,
           phase: AiEditApplyPhase.Preview,
@@ -1109,6 +1243,9 @@ function pipeEditorLiveEditStream(
       sawStreamError = false;
       lastAppliedPatch = "";
       appliedGeneratedImageUrl = "";
+      persistedNativePatchKey = "";
+      reloadedNativePatchKey = "";
+      nativePatchReloadError = "";
       lastDeltaOperationIndex = null;
       workingContent = baselineContent;
       lastPreviewContent = baselineContent;
@@ -1142,30 +1279,52 @@ function pipeEditorLiveEditStream(
       } catch {
         parsedFrame = null;
       }
+      if (isForeignFrame(parsedFrame)) return;
       if (currentEvent === "text_reset") {
         await resetPatchStreamAttempt();
         return;
       }
       if (currentEvent === "error") sawStreamError = true;
+      if (currentEvent === "error" || currentEvent === "stream_end") receivedTerminal = true;
+      if (currentEvent === "stream_end" && parsedFrame && typeof parsedFrame === "object") {
+        const terminal = parsedFrame as Record<string, unknown>;
+        if (terminal.error || ["error", "cancelled", "hitl_required", "needs_hitl"].includes(String(terminal.stop_reason || ""))) sawStreamError = true;
+      }
       const generatedImageUrl = generatedImageUrlFromSseFrame(parsedFrame);
       if (generatedImageUrl) await applyGeneratedImageUrl(generatedImageUrl);
+      const nativeFilePatchResult = nativeFilePatchResultFromSseFrame(parsedFrame);
+      if (nativeFilePatchResult) await applyNativeFilePatchResult(nativeFilePatchResult);
       const token = parseLiveEditStreamFrame(rawData, currentEvent);
-      if (!token) return;
-      assistantText += token;
-      await applyPatchStreamEvents(patchStream.push(token));
+      if (token) {
+        assistantText += token;
+        await applyPatchStreamEvents(patchStream.push(token));
+      }
+      if (currentEvent === "stream_end") {
+        const recoveredTail = recoverEditorLivePatchStreamTail(parsedFrame, assistantText);
+        if (recoveredTail) {
+          assistantText += recoveredTail;
+          await applyPatchStreamEvents(patchStream.push(recoveredTail));
+        }
+      }
     };
 
     try {
-      while (true) {
+      while (!receivedTerminal) {
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split("\n");
         buffer = lines.pop() || "";
-        for (const line of lines) await processSseLine(line);
+        for (const line of lines) {
+          await processSseLine(line);
+          if (receivedTerminal) break;
+        }
       }
       buffer += decoder.decode();
-      if (buffer) await processSseLine(buffer);
+      if (!receivedTerminal && buffer) await processSseLine(buffer);
+      // The host terminal event is sufficient even when HTTP stays open.
+      // Do not await tee cancellation: it settles only after both branches stop.
+      if (receivedTerminal) void reader.cancel();
       await deltaPreviewQueue.flush();
       const completePatchOperationCount = countCompleteEditorLivePatchOperations(assistantText);
       const hasCompletePatchProtocol = processedOperationCount > 0
@@ -1173,7 +1332,30 @@ function pipeEditorLiveEditStream(
       const hasGeneratedImageOnly = Boolean(appliedGeneratedImageUrl)
         && processedOperationCount === 0
         && !containsEditorLivePatchProtocol(assistantText);
-      if (sawStreamError) {
+      if (persistedNativePatchKey && reloadedNativePatchKey) {
+        finishNativeFilePatch();
+      } else if (persistedNativePatchKey) {
+        completeNotified = true;
+        appliedRef.current = {
+          ...appliedRef.current,
+          phase: "failed",
+          operationCount: 1,
+          appliedPatchCount: 1,
+        };
+        if (!nativePatchReloadError) {
+          onProgress?.(
+            makeEditorLiveProgressTool(
+              "verify_patch",
+              "error",
+              { file: detail.documentName || "current file", stage: "reload unavailable" },
+              {
+                status: "failed",
+                error: "The native patch was saved, but the editor could not reload it.",
+              },
+            ),
+          );
+        }
+      } else if (sawStreamError) {
         await deltaPreviewQueue.cancel();
         await rollbackFailedLiveEdit();
       } else if (
@@ -1240,14 +1422,15 @@ function pipeEditorLiveEditStream(
 
   // Project hidden protocol out of Chat as each model chunk arrives, while the
   // editor branch consumes the same tee concurrently. Keep the response body
-  // open until the editor catches up so input unlock and preview completion
-  // still share one terminal boundary.
+  // terminal event behind preview completion so input unlock and the process
+  // card settle together, including when the HTTP connection stays open.
   const chatProtocolDecoder = new TextDecoder();
   const chatProtocolEncoder = new TextEncoder();
   const chatSseProjector = createEditorLiveChatSseProjector();
   let chatSseBuffer = "";
+  let chatEvent = "";
 
-  const enqueueProjectedChatText = (
+  const enqueueProjectedChatText = async (
     decoded: string,
     controller: TransformStreamDefaultController<Uint8Array>,
     final = false,
@@ -1255,6 +1438,15 @@ function pipeEditorLiveEditStream(
     chatSseBuffer += decoded;
     const lines = chatSseBuffer.split("\n");
     chatSseBuffer = final ? "" : lines.pop() || "";
+    // Earlier deltas remain live; only terminal evidence waits for the editor.
+    for (const line of lines) {
+      if (line.startsWith("event: ")) chatEvent = line.slice(7).trim();
+      if (line.startsWith("data: ") && ["stream_end", "error"].includes(chatEvent)) {
+        let frame: unknown;
+        try { frame = JSON.parse(line.slice(6)); } catch { continue; }
+        if (!isForeignFrame(frame)) await liveProcessing;
+      }
+    }
     let projected = lines.map(chatSseProjector.projectLine).join("\n");
     if (!final && lines.length > 0) projected += "\n";
     if (final && projected && !projected.endsWith("\n")) projected += "\n";
@@ -1263,12 +1455,12 @@ function pipeEditorLiveEditStream(
 
   const synchronizedChatBody = chatBody.pipeThrough(
     new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
+      async transform(chunk, controller) {
         const decoded = chatProtocolDecoder.decode(chunk, { stream: true });
-        enqueueProjectedChatText(decoded, controller);
+        await enqueueProjectedChatText(decoded, controller);
       },
       async flush(controller) {
-        enqueueProjectedChatText(chatProtocolDecoder.decode(), controller, true);
+        await enqueueProjectedChatText(chatProtocolDecoder.decode(), controller, true);
         const pendingText = chatSseProjector.flush();
         if (pendingText) controller.enqueue(chatProtocolEncoder.encode(pendingText));
         await liveProcessing;
@@ -1367,9 +1559,22 @@ function extractApprovalPaths(content: unknown) {
 /* ------------------------------------------------------------------ */
 
 export default function FloatingChat() {
+  const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const queryClient = useQueryClient();
   const location = useLocation();
+  const activeWorkspaceId = useWorkspaceFilter((state) => state.activeWorkspaceId);
+  const routeWorkspaceId = useMemo(() => {
+    const match = location.pathname.match(/^\/workspaces\/([^/]+)(?:\/|$)/);
+    if (!match || match[1] === "new") return undefined;
+    try {
+      return decodeURIComponent(match[1]);
+    } catch {
+      return undefined;
+    }
+  }, [location.pathname]);
+  const flowWorkspaceId = routeWorkspaceId
+    || (activeWorkspaceId !== "all" ? activeWorkspaceId : undefined);
   const currentUserId = useAuthStore((s) => s.user?.id);
   const currentAuthToken = useAuthStore((s) => s.token);
   const currentAiEditOwner = useMemo<AiEditConversationOwnerScope | null>(() => {
@@ -1451,22 +1656,19 @@ export default function FloatingChat() {
   const lastSnapshotSeqRef = useRef<Record<string, number>>({});
   const snapshotRefetchedRef = useRef<string | undefined>(undefined);
   const followedRunPollsRef = useRef(0);
-  const lastAssistantMessage = [...messages]
-    .reverse()
-    .find((message) => message.role === "assistant");
   /* The meta path covers a reload that lands mid-turn: no snapshot has arrived
    * yet, but the stored row already says the turn is running. Without it the
    * watchdog can never arm and a lost terminal edge strands the checkpoint
    * as if it were the final answer. */
-  const lastAssistantStreamStatus = (
-    lastAssistantMessage?.meta as Record<string, unknown> | null | undefined
-  )?.stream_status;
   const remoteRunInFlight =
     !streaming &&
-    (followedRunActive ||
-      lastAssistantStreamStatus === "streaming" ||
-      lastAssistantStreamStatus === "running");
+    (followedRunActive || hasActivePersistedChatStream(messages));
   const assistantWorking = streaming || remoteRunInFlight;
+  const runtimeHumanInput = currentSession?.runtimeHumanInput && !currentSession.runtimeHumanInput.answered
+    ? currentSession.runtimeHumanInput : undefined;
+  const runtimeQueueStatus = currentSession?.runtimeQueue
+    ? formatRuntimeQueueStatus(currentSession.runtimeQueue)
+    : currentSession?.runtimeStatus === "queued" ? t("component.chat_runtime_queue.waiting") : undefined;
   const activeAssistantMessage = useMemo(
     () => assistantWorking
       ? [...messages].reverse().find((message) => message.role === "assistant") || null
@@ -1553,6 +1755,12 @@ export default function FloatingChat() {
   const visibleWorkflowMessages = useMemo(
     () => visibleWorkflowMessageEntries.map(({ message }) => message),
     [visibleWorkflowMessageEntries],
+  );
+  const priorUserMessages = useMemo(
+    () => priorMatchingEntries(messages, (message) =>
+      Boolean(message?.role === "user" && toDisplayText(message?.content).trim()),
+    ),
+    [messages],
   );
   const workflowMessageResolveMutation = useMutation({
     mutationFn: ({
@@ -1687,44 +1895,41 @@ export default function FloatingChat() {
   const audioChunksRef = useRef<BlobPart[]>([]);
   const audioStreamRef = useRef<MediaStream | null>(null);
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const composerEditorRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const attachMenuRef = useRef<HTMLDivElement>(null);
-  const { autoFollowRef, handleAutoFollowScroll } = useChatAutoFollow();
+  const { chatBodyRef, chatContentRef, resumeAutoFollow } = useChatAutoFollow(currentSessionKey, open);
 
-  const { data: workspaceUsers = [] } = useQuery({
-    queryKey: ["floating-chat-mention-users"],
-    queryFn: () => api.users.directory(),
-  });
+  const { data: workspaceUsers = [] } = useQuery(chatMentionUsersQueryOptions(catalogScope, open));
   const { data: allAgents = [] } = useQuery({
-    queryKey: ["floating-chat-mention-agents"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
+    enabled: open && !!catalogScope,
   });
-  const { data: globalFlowEntrypoints = [] } = useQuery({
-    queryKey: ["global-chat-flow-entrypoints"],
-    queryFn: () => api.chat.listFlowEntrypoints(),
-  });
+  const { data: globalFlowEntrypoints = [] } = useQuery(chatFlowEntrypointsQueryOptions(catalogScope, flowWorkspaceId, open));
   const workflowInvokeOptions = useMemo<WorkflowInvokeItem[]>(
     () =>
       globalFlowEntrypoints.map((entrypoint: GlobalChatFlowEntrypoint) => ({
         bindingId: entrypoint.binding_id,
         workflowId: entrypoint.workflow_id,
         title: entrypoint.title,
-        description: [entrypoint.workspace_name, entrypoint.description]
-          .filter(Boolean)
-          .join(" · "),
+        description: entrypoint.description,
+        workspace_id: entrypoint.workspace_id,
+        workspace_name: entrypoint.workspace_name,
         placeholder: entrypoint.placeholder,
       })),
     [globalFlowEntrypoints],
   );
 
   const mentionOptions = useMemo<MentionOption[]>(() => {
-    const agentOptions = (allAgents as Agent[]).map((agent) => ({
+    const agentOptions = (allAgents as Agent[]).filter((agent) => agent.status === "active").map((agent) => ({
       id: agent.id,
       type: "agent" as const,
       name: agent.name,
+      entity_id: agent.entity_id,
+      workspace_id: agent.workspace_id,
+      workspace_name: agent.workspace_name,
+      visibility: agent.visibility,
       subtitle:
         getAgentDescription(agent) ||
         agent.category ||
@@ -1831,23 +2036,32 @@ export default function FloatingChat() {
       }));
 
   const loadRecentMessages = useCallback(async (convId: string) => {
+    const historyStreamFence = captureChatHistoryStreamFence(convId);
+    if (!chatHistoryStreamFenceIsCurrent(historyStreamFence)) {
+      throw new Error("Chat history refresh superseded by a local stream");
+    }
     const page = await api.chat.getMessagesPage(convId, {
       silent: true,
       limit: 75,
     });
+    if (!chatHistoryStreamFenceIsCurrent(historyStreamFence)) {
+      throw new Error("Chat history refresh superseded by a local stream");
+    }
     return parseMessages(page.items || []);
   }, []);
 
   const handleOpenMessageReference = useCallback(
     async (refItem: ChatMessageDisplayReference) => {
-      const directUrl = refItem.openUrl || refItem.previewUrl || refItem.url;
+      // FileRef precedence: document_id → open_url → preview/url.
+      const directUrl = viewerPathForDocumentId(refItem.document_id)
+        || refItem.openUrl || refItem.previewUrl || refItem.url;
       if (directUrl) {
         window.open(directUrl, "_blank", "noopener,noreferrer");
         return;
       }
       if (!refItem.document_id) return;
       try {
-        const blobUrl = await api.documents.download(refItem.document_id);
+        const blobUrl = await api.documents.preview(refItem.document_id);
         window.open(blobUrl, "_blank", "noopener,noreferrer");
         window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
       } catch {
@@ -2189,30 +2403,6 @@ export default function FloatingChat() {
       }
     }
   }, [open, currentConvId, loadRecentMessages, setSessionMessages, streaming, streamingConvId]);
-
-  /* Auto-scroll — throttled during streaming to avoid queuing hundreds of scroll
-     animations, and only while the user hasn't scrolled away from the bottom. */
-  const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (scrollTimerRef.current) return; // already scheduled
-    scrollTimerRef.current = setTimeout(
-      () => {
-        scrollTimerRef.current = null;
-        if (!autoFollowRef.current) return;
-        messagesEndRef.current?.scrollIntoView({
-          behavior: "auto",
-          block: "end",
-        });
-      },
-      streaming ? 240 : 0,
-    );
-  }, [messages, streaming, autoFollowRef]);
-
-  /* Opening the panel or switching sessions is a user-initiated jump to the
-     latest message — resume following even if they had scrolled up before. */
-  useEffect(() => {
-    autoFollowRef.current = true;
-  }, [open, currentConvId, draftSessionKey, autoFollowRef]);
 
   useEffect(() => {
     if (!editorLiveSessionActive) return;
@@ -2800,11 +2990,9 @@ export default function FloatingChat() {
       let manualSkillRefs = requestedManualSkillRefs;
       if (requestedManualSkillRefs?.some((reference) => reference.kind === "slug")) {
         try {
-          const availableSkills = await queryClient.fetchQuery({
-            queryKey: ["skills", "chat-manual-skill-resolution", "platform"],
-            queryFn: () => api.skills.list({ include_platform: true }),
-            staleTime: 60_000,
-          });
+          const availableSkills = await queryClient.fetchQuery(
+            skillListQueryOptions(catalogScope, { include_platform: true }),
+          );
           manualSkillRefs = resolveManualSkillReferenceIds(
             requestedManualSkillRefs,
             availableSkills,
@@ -2836,10 +3024,12 @@ export default function FloatingChat() {
         sessionKey = createDraftSession();
         setDraftSessionKey(sessionKey);
       }
-      if (useChatStreamStore.getState().sessions[sessionKey]?.streaming) return false;
+      const existingSession = useChatStreamStore.getState().sessions[sessionKey];
+      if (existingSession?.streaming
+        || hasActivePersistedChatStream(existingSession?.messages || [])) return false;
 
       // Sending is an explicit jump back to the newest message.
-      autoFollowRef.current = true;
+      resumeAutoFollow();
 
       // Stop voice if active — also drains the recorder so any in-flight
       // chunks transcribe before send (the user can edit the result
@@ -2869,12 +3059,6 @@ export default function FloatingChat() {
           : "";
 
       const sentAttachments = [...attachmentSnapshot];
-      if (!isResponseSurfaceSubmission) {
-        setInput("");
-        setSelectedMentions([]);
-        setMentionedAgentId(undefined);
-        setAttachedFiles([]);
-      }
       const requestChatMode = sendOptions.responseSurfaceSubmission
         ? undefined
         : selectedWorkflow
@@ -2914,7 +3098,9 @@ export default function FloatingChat() {
         ? editorLiveOwnerRef.current
         : null;
       const isLiveEdit = Boolean(liveEditSessionDetail);
+      const liveEditReadStartedAt = Date.now();
       const liveEditContent = liveEditSessionDetail?.adapter.read();
+      const liveEditReadDuration = Date.now() - liveEditReadStartedAt;
       const liveEditTurnBasePatchCount = Math.max(
         0,
         liveEditSessionDetail?.adapter.getTurnPreviewState().changeCount || 0,
@@ -2941,7 +3127,7 @@ export default function FloatingChat() {
           : visibleRequest;
       const liveEditInitialTools = isLiveEdit
         ? [
-            makeEditorLiveProgressTool(
+            { ...makeEditorLiveProgressTool(
               "read_current_file",
               typeof liveEditContent === "string" ? "success" : "error",
               {
@@ -2954,7 +3140,7 @@ export default function FloatingChat() {
                     ? liveEditContent.length
                     : 0,
               },
-            ),
+            ), startedAt: liveEditReadStartedAt, duration: `${liveEditReadDuration / 1000}s` },
             makeEditorLiveProgressTool(
               "generate_patch",
               "pending",
@@ -3053,12 +3239,23 @@ export default function FloatingChat() {
             responseSurfaceSubmission: sendOptions.responseSurfaceSubmission,
           }
         : undefined;
-      if (retryRequest) savePendingChatRetry(retryRequest);
-
-      const sentAttachmentSnapshots = await Promise.all(
-        sentAttachments.map(createChatMessageAttachmentSnapshot),
-      );
+      let sentAttachmentSnapshots: Awaited<ReturnType<typeof createChatMessageAttachmentSnapshot>>[];
+      try {
+        sentAttachmentSnapshots = await Promise.all(
+          sentAttachments.map(createChatMessageAttachmentSnapshot),
+        );
+      } catch {
+        toast.error(t("lib.api.chat_failed"), t("component.chat_input_footer.file_prepare_failed"));
+        return false;
+      }
       if (!ownsLiveEditTurn()) return false;
+      if (retryRequest) savePendingChatRetry(retryRequest);
+      if (!isResponseSurfaceSubmission) {
+        setInput("");
+        setSelectedMentions([]);
+        setMentionedAgentId(undefined);
+        setAttachedFiles([]);
+      }
 
       const msgsBeforeSend = [
         ...messages,
@@ -3138,6 +3335,7 @@ export default function FloatingChat() {
                 {
                   files: localFiles.length > 0 ? localFiles : undefined,
                   documentIds: documentIds.length > 0 ? documentIds : undefined,
+                  workspaceId: flowWorkspaceId,
                   localWorkerId: sendContext?.localWorkerId,
                 },
               )
@@ -3169,6 +3367,10 @@ export default function FloatingChat() {
                         liveEditDetail?.supportsImageGeneration ||
                         liveEditDetail?.applyGeneratedImage,
                       ),
+                      supportsNativeFilePatch: Boolean(
+                        liveEditDetail?.supportsNativeFilePatch
+                        && liveEditDetail?.applyNativeFilePatch,
+                      ),
                       currentDocumentContent:
                         typeof liveEditContent === "string" ? liveEditContent : undefined,
                     }
@@ -3194,7 +3396,10 @@ export default function FloatingChat() {
               && !editorLiveAppliedRef.current.abortController?.signal.aborted,
             updateLiveEditProgress,
             closeCompletedLiveEdit,
-            adoptPendingLiveEditDetail,
+            () => {
+              setSessionMessages(sessionKey, (previous) => finishAiEditProgress(previous, now));
+              adoptPendingLiveEditDetail();
+            },
             liveEditContent || "",
             liveEditHadReviewablePreview,
             liveEditTurnBasePatchCount,
@@ -3247,6 +3452,7 @@ export default function FloatingChat() {
           };
         },
       );
+      await invalidateAgentInitiativeQueries(queryClient);
       if (!sendSucceeded) {
         const applied = editorLiveAppliedRef.current;
         const ownsFailedLiveEdit = Boolean(
@@ -3305,6 +3511,8 @@ export default function FloatingChat() {
     },
     [
       input,
+      catalogScope,
+      resumeAutoFollow,
       currentConvId,
       currentUserId,
       attachedFiles,
@@ -3321,6 +3529,7 @@ export default function FloatingChat() {
       resetChatModeAfterTurn,
       stopRecording,
       createDraftSession,
+      flowWorkspaceId,
       toast,
     ],
   );
@@ -3445,15 +3654,15 @@ export default function FloatingChat() {
 
   useEffect(() => {
     if (!editorLiveSessionActive) return;
-    const sourcePath = editorLiveInfo?.sourcePath;
-    if (!sourcePath || location.pathname === sourcePath) return;
+    const routePath = editorLiveInfo?.routePath;
+    if (!routePath || location.pathname === routePath) return;
     void (async () => {
       const cleaned = await closeEditorLiveSession();
       setOpen(!cleaned);
     })();
   }, [
     closeEditorLiveSession,
-    editorLiveInfo?.sourcePath,
+    editorLiveInfo?.routePath,
     editorLiveSessionActive,
     location.pathname,
   ]);
@@ -3587,6 +3796,10 @@ export default function FloatingChat() {
   /* ---- HITL action handler ---- */
   const handleHITLAction = useCallback(
     async (hitlId: string, action: string, review?: unknown) => {
+      const targetHitl = messages
+        .flatMap((message) => message.hitl_requests || [])
+        .find((hitl) => hitl.id === hitlId);
+      const requiresTikTokValidation = Boolean(targetHitl && isTikTokPublishApproval(targetHitl));
       const markResolved = (items: ChatMessage[]) =>
         items.map((msg) => ({
           ...msg,
@@ -3594,7 +3807,7 @@ export default function FloatingChat() {
             h.id === hitlId ? { ...h, resolved: true, resolution: action } : h,
           ),
         }));
-      const updatedMessages = markResolved(messages);
+      const updatedMessages = requiresTikTokValidation ? messages : markResolved(messages);
       setMessages(updatedMessages);
 
       const hitlMessage = JSON.stringify({
@@ -3607,7 +3820,9 @@ export default function FloatingChat() {
         ...updatedMessages,
         {
           role: "user" as const,
-          content: hitlActionTranscriptText(action),
+          content: requiresTikTokValidation && action === "approve"
+            ? "Submitted TikTok publishing confirmation."
+            : hitlActionTranscriptText(action),
           timestamp: now,
         },
         { role: "assistant" as const, content: "", timestamp: now },
@@ -3618,8 +3833,66 @@ export default function FloatingChat() {
         setDraftSessionKey(sessionKey);
       }
 
+      const activeEditorDetail = (
+        editorLiveSessionActive
+        && targetHitl?.tool === "patch_file"
+        && editorLiveDetailRef.current?.applyNativeFilePatch
+      )
+        ? {
+            ...editorLiveDetailRef.current,
+            ...(editorLiveDetailRef.current.getTurnMetadata?.() || {}),
+          }
+        : null;
+      const liveEditContent = activeEditorDetail?.adapter.read() || "";
+      const liveEditTurnId = activeEditorDetail
+        ? `approval-${Date.now()}-${Math.random().toString(36).slice(2)}`
+        : undefined;
+      const liveEditTurnBasePatchCount = Math.max(
+        0,
+        activeEditorDetail?.adapter.getTurnPreviewState().changeCount || 0,
+      );
+      if (activeEditorDetail && liveEditTurnId) {
+        editorLiveAppliedRef.current.abortController?.abort();
+        editorLiveAppliedRef.current = {
+          sessionKey,
+          turnId: liveEditTurnId,
+          content: liveEditContent,
+          phase: "pending",
+          operationCount: 0,
+          appliedPatchCount: 0,
+          basePatchCount: liveEditTurnBasePatchCount,
+          abortController: new AbortController(),
+        };
+      }
+
       await startStream(
-        () => api.chat.stream(hitlMessage, currentConvId),
+        async (streamSignal) => {
+          const response = await api.chat.stream(hitlMessage, currentConvId, {
+            signal: streamSignal,
+          });
+          if (!activeEditorDetail || !liveEditTurnId) return response;
+          return pipeEditorLiveEditStream(
+            response,
+            activeEditorDetail,
+            sessionKey,
+            liveEditTurnId,
+            editorLiveAppliedRef,
+            () => Boolean(
+              editorLiveDetailRef.current
+              && isSameEditorLiveTarget(editorLiveDetailRef.current, activeEditorDetail)
+              && editorLiveAppliedRef.current.turnId === liveEditTurnId
+              && !editorLiveAppliedRef.current.abortController?.signal.aborted
+            ),
+            (tool) => setSessionMessages(sessionKey, (previous) => (
+              withEditorLiveProgress(previous, tool)
+            )),
+            undefined,
+            undefined,
+            liveEditContent,
+            hasReviewableEditorLivePreview({ changeCount: liveEditTurnBasePatchCount }),
+            liveEditTurnBasePatchCount,
+          );
+        },
         currentConvId,
         msgsForHitl,
         (newConvId) => {
@@ -3629,16 +3902,29 @@ export default function FloatingChat() {
           }
         },
         sessionKey,
-      );
+      ).finally(async () => {
+        if (requiresTikTokValidation && currentConvId) {
+          try {
+            const refreshedMessages = await loadRecentMessages(currentConvId);
+            setSessionMessages(currentConvId, refreshedMessages);
+          } catch {
+            // Keep the approval pending when authoritative history is unavailable.
+          }
+        }
+      });
+      await invalidateAgentInitiativeQueries(queryClient);
       queryClient.invalidateQueries({ queryKey: ["conversations"] });
     },
     [
       currentConvId,
+      editorLiveSessionActive,
       queryClient,
       messages,
+      setSessionMessages,
       startStream,
       createDraftSession,
       setMessages,
+      loadRecentMessages,
     ],
   );
 
@@ -3659,6 +3945,14 @@ export default function FloatingChat() {
             }
           : undefined);
       if (!retryRequest?.message?.trim()) return;
+
+      // Retrying inside AI Edit must re-enter the editor-aware send pipeline.
+      // A plain chat retry drops editorContext, the patch-only tool surface,
+      // and the persisted-file reload callback.
+      if (editorLiveSessionActive) {
+        await handleSend(retryRequest.message, [], [], null);
+        return;
+      }
 
       const now = new Date().toISOString();
       const sessionKey =
@@ -3701,7 +3995,9 @@ export default function FloatingChat() {
             retryRequest.message,
             retryRequest.conversationId || currentConvId,
             {
+              files: fallbackUserMessage?.attachments?.flatMap((attachment) => attachment.file instanceof File ? [attachment.file] : []),
               documentIds: retryRequest.documentIds,
+              localWorkerId: retryRequest.localWorkerId,
               agentId: retryRequest.agentId,
               workspaceId: retryRequest.workspaceId,
               chatMode: retryRequest.chatMode,
@@ -3726,6 +4022,8 @@ export default function FloatingChat() {
     [
       currentConvId,
       createDraftSession,
+      editorLiveSessionActive,
+      handleSend,
       messages,
       queryClient,
       setMessages,
@@ -3808,7 +4106,6 @@ export default function FloatingChat() {
   const editorLiveExamples = editorLiveInfo?.examples?.length
     ? editorLiveInfo.examples
     : ["Rewrite", "Format", "Add content", "Fix layout"];
-
   /* ================================================================ */
   /*  Render                                                           */
   /* ================================================================ */
@@ -4065,16 +4362,16 @@ export default function FloatingChat() {
 
         {/* ── Messages ── */}
         <div
-          onScroll={handleAutoFollowScroll}
+          ref={chatBodyRef}
+          tabIndex={0}
           style={{
             flex: 1,
+            minHeight: 0,
             overflowY: "auto",
             padding: "12px 14px",
-            display: "flex",
-            flexDirection: "column",
-            gap: 10,
           }}
         >
+          <div ref={chatContentRef} className="chat-scroll-content" style={{ display: "flex", flexDirection: "column", gap: 10, minHeight: "100%" }}>
           {showConversationSkeleton ? (
             <ChatMessagesSkeleton rows={4} compact maxWidth="100%" />
           ) : messages.length === 0 && (
@@ -4175,10 +4472,16 @@ export default function FloatingChat() {
               ? stripEditorLiveEditBlocks(rawContent)
               : rawContent;
             const visibleTools = visibleToolCallsForMessage(msg);
+            const isLatestStreaming = assistantWorking && i === messages.length - 1;
+            const displayAssistantBlocks = msg.role === "assistant"
+              ? projectAiEditAssistantBlocks(msg, isLatestStreaming) : msg.assistant_blocks;
+            const messageQueueStatus = msg.role === "assistant" && isLatestStreaming && !runtimeHumanInput
+              ? runtimeQueueStatus : undefined;
             const hasAssistantBlocks =
               msg.role === "assistant" &&
-              Array.isArray(msg.assistant_blocks) &&
-              msg.assistant_blocks.length > 0;
+              (Boolean(messageQueueStatus) || (isLatestStreaming && !runtimeHumanInput && visibleTools.length === 0)
+                || (Boolean(content) && visibleTools.length === 0 && !isRetryableAssistantMessage(msg, content) && !isApprovalBoilerplateContent(msg))
+                || (Array.isArray(displayAssistantBlocks) && displayAssistantBlocks.length > 0));
             const localCodingNotice =
               msg.role === "assistant"
                 ? maybeLocalCodingRunNoticeForTools(visibleTools)
@@ -4189,10 +4492,9 @@ export default function FloatingChat() {
               msg.role === "assistant"
                 ? displayContentForAssistantMessage(msg, rawBubbleContent)
                 : rawBubbleContent;
-            const isLatestStreaming = assistantWorking && i === messages.length - 1;
             const renderedBubbleDisplay = parseUserMessageDisplay(
-              { ...msg, content: bubbleContent },
-              { streaming: isLatestStreaming },
+              msg,
+              { content: bubbleContent, streaming: isLatestStreaming },
             );
             const renderedBubbleContent = renderedBubbleDisplay.cleanContent;
             const assistantReferenceDisplay = localCodingNotice
@@ -4208,7 +4510,7 @@ export default function FloatingChat() {
               msg.stop_reason === "credit_exhausted";
             const actionCopyText = msg.role === "user"
               ? content
-              : chatMessageActionText(msg, rawBubbleContent);
+              : chatMessageActionText(msg, rawBubbleContent, isLatestStreaming);
             const showMessageActions = Boolean(
               !suppressApprovalBubble &&
                 !showCreditLimitNotice &&
@@ -4216,12 +4518,7 @@ export default function FloatingChat() {
             );
             const hasRetryTarget =
               Boolean(msg.retryRequest) ||
-              messages
-                .slice(0, i)
-                .some(
-                  (item) =>
-                    Boolean(item?.role === "user" && toDisplayText(item?.content).trim()),
-                );
+              priorUserMessages[i];
             const canRetryMessage =
               canRetryFromContent && hasRetryTarget;
             const workspaceRecommendation = msg.role === "assistant"
@@ -4243,6 +4540,7 @@ export default function FloatingChat() {
                       tools={visibleTools}
                       keyPrefix={i}
                       variant="inline"
+                      streaming={isLatestStreaming}
                     />
                   )}
 
@@ -4340,7 +4638,6 @@ export default function FloatingChat() {
                   {(() => {
                     if (
                       hasAssistantBlocks &&
-                      !canRetryFromContent &&
                       !suppressApprovalBubble &&
                       !showCreditLimitNotice
                     ) {
@@ -4350,12 +4647,15 @@ export default function FloatingChat() {
                           className="chat-bubble chat-bubble--bot"
                         >
                           <AssistantMessageBlocks
-                            blocks={msg.assistant_blocks}
+                            blocks={displayAssistantBlocks}
                             content={renderedBubbleContent}
                             keyPrefix={i}
                             streaming={assistantWorking && i === messages.length - 1}
                             onResponseSurfaceSubmit={handleResponseSurfaceSubmit}
                             sourceMessageId={msg.id || ""}
+                            pendingActionKind={assistantPendingActionKindForMessage(msg)}
+                            hitlRequests={msg.hitl_requests}
+                            queueStatus={messageQueueStatus}
                             responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                           />
                           <ChatMessageReferenceStrip
@@ -4371,11 +4671,8 @@ export default function FloatingChat() {
                     // Attachment-only turns still need a bubble for the file card.
                     if (!bubbleContent && (msg.attachments?.length ?? 0) === 0 && msg.role !== "user") return null;
                     const display = parseUserMessageDisplay(
-                      {
-                        ...msg,
-                        content: bubbleContent,
-                      },
-                      { streaming: isLatestStreaming },
+                      msg,
+                      { content: bubbleContent, streaming: isLatestStreaming },
                     );
                     const { cleanContent, chips, references } = display;
                     if (!cleanContent && chips.length === 0 && references.length === 0) return null;
@@ -4474,6 +4771,7 @@ export default function FloatingChat() {
                         onAdd={() => void handleWorkspaceRecommendationAdd(
                           workspaceRecommendation,
                           workspaceRecommendationKey,
+                          content,
                         )}
                         onContinue={() => dismissWorkspaceRecommendation(
                           workspaceRecommendationKey,
@@ -4533,7 +4831,7 @@ export default function FloatingChat() {
             );
           })}
 
-          <div ref={messagesEndRef} />
+          </div>
         </div>
 
         {/* Sticky approval bar (same component used by EmbeddedChat). The
@@ -4558,6 +4856,7 @@ export default function FloatingChat() {
         />
 
         <ChatInputFooter
+          attachments="documents"
           disabled={!open}
           voiceScope={{ conversationId: currentConvId || streamingConvId }}
           onVoiceConversation={(id) => {
@@ -4582,11 +4881,11 @@ export default function FloatingChat() {
           }
           onStop={handleStopRequest}
           topSlot={
-            messages.length > 0 && !editorLiveSessionActive ? (
-                <ChatModeTemplateGallery
+            open && chatMode !== "auto" && messages.length > 0 && !editorLiveSessionActive ? (
+              <Suspense fallback={null}>
+                <FloatingChatModeTemplateGallery
                   mode={chatMode}
                   disabled={streaming}
-                  samples={chatModeTemplateSamples(chatMode)}
                   onSelect={async (sample) => {
                     try {
                       const remix = await prepareTemplateRemix(sample);
@@ -4612,7 +4911,8 @@ export default function FloatingChat() {
                       );
                     }
                   }}
-              />
+                />
+              </Suspense>
             ) : undefined
           }
           placeholder={
@@ -4624,6 +4924,7 @@ export default function FloatingChat() {
               ? t("component.floating_chat.ask_manor_ai_mention_attach_skill")
               : t("component.floating_chat.message_manor_ai_mention_attach_skill")
           }
+          approvalSlot={<ApprovalModeTrigger scope={{ kind: "personal" }} />}
           modeSlot={
             editorLiveSessionActive ? undefined : (
               <ChatModeToolbar

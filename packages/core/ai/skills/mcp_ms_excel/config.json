@@ -23,5 +23,9 @@
     "mcp__ms_excel__calculate",
     "mcp__ms_excel__list_named_items",
     "mcp__ms_excel__get_named_item_range"
-  ]
+  ],
+  "search": {
+    "terms": ["spreadsheet", "xlsx", "microsoft 365", "cells", "formula", "pivot", "sharepoint workbook", "worksheet"],
+    "examples": ["read range from excel workbook onedrive", "write values into spreadsheet cells", "add new worksheet to workbook", "recalculate formulas in excel file"]
+  }
 }

@@ -42,6 +42,9 @@ _ARTIFACT_FIELDS = (
     "status",
 )
 _HISTORY_SUMMARY_KEY = "_workflow_history_summary"
+_HISTORY_SUMMARY_SCHEMA_VERSION = 2
+_PROCESSED_STEP_STATUSES = {"completed", "failed", "cancelled", "skipped"}
+_KNOWN_STEP_STATUSES = _PROCESSED_STEP_STATUSES | {"pending", "queued", "running", "paused"}
 WORKFLOW_IMPORT_SOURCE_TAG_PREFIX = "imported:"
 WORKFLOW_IMPORT_PROOF_TAG_PREFIX = "manor-import-proof:"
 
@@ -421,28 +424,209 @@ def _timestamp(value: Any) -> str | None:
     return str(value)
 
 
+def _loaded_run_value(run: Any, key: str, default: Any) -> Any:
+    """Read an already-loaded Run field without triggering an ORM lazy load."""
+    state = getattr(run, "__dict__", None)
+    if isinstance(state, dict) and key in state:
+        return state[key]
+    return default
+
+
+def _step_result_status(result: Any) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    if result.get("skipped") is True:
+        return "skipped"
+    status = str(result.get("status") or "").strip().lower()
+    if status in _KNOWN_STEP_STATUSES:
+        return status
+    if result.get("error") not in (None, ""):
+        return "failed"
+    return "completed"
+
+
+def workflow_execution_steps(
+    run: Any,
+    *,
+    activity_status: str | None = None,
+    existing_steps: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return reached nodes first, followed by visible nodes not yet reached.
+
+    The immutable definition snapshot remains the complete graph. This compact
+    projection uses trace sequence for execution order, folds node transitions
+    to their latest state, falls back to result receipts when trace detail is
+    intentionally deferred, and appends the remaining snapshot nodes in their
+    frozen definition order.
+    """
+    snapshot = _loaded_run_value(run, "definition_snapshot", {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    raw_nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), list) else []
+    if not raw_nodes and isinstance(existing_steps, list):
+        raw_nodes = existing_steps
+
+    nodes: list[dict[str, Any]] = []
+    for index, node in enumerate(raw_nodes):
+        if not isinstance(node, dict) or workflow_chat_projection_visibility(node) == "hidden":
+            continue
+        node_id = str(node.get("id") or "").strip()
+        if not node_id:
+            continue
+        nodes.append({**node, "id": node_id, "_fallback_order": index})
+    node_by_id = {node["id"]: node for node in nodes}
+    has_node_contract = bool(raw_nodes)
+
+    raw_trace = _loaded_run_value(run, "execution_trace", [])
+    trace = raw_trace if isinstance(raw_trace, list) else []
+    ordered_trace = sorted(
+        (
+            (entry, index)
+            for index, entry in enumerate(trace)
+            if isinstance(entry, dict)
+        ),
+        key=lambda item: (
+            item[0].get("sequence")
+            if isinstance(item[0].get("sequence"), (int, float))
+            else item[1] + 1,
+            item[1],
+        ),
+    )
+    trace_order: list[str] = []
+    latest_trace_by_id: dict[str, dict[str, Any]] = {}
+    trace_child_ids: dict[str, list[str]] = {}
+    for entry, _index in ordered_trace:
+        node_id = str(entry.get("node_id") or "").strip()
+        if not node_id or (has_node_contract and node_id not in node_by_id):
+            continue
+        if node_id not in latest_trace_by_id:
+            trace_order.append(node_id)
+        latest_trace_by_id[node_id] = entry
+        children = trace_child_ids.setdefault(node_id, [])
+        for child_id in entry.get("child_run_ids") or []:
+            _append_bounded_child_id(children, child_id)
+
+    raw_results = _loaded_run_value(run, "step_results", {})
+    results = raw_results if isinstance(raw_results, dict) else {}
+    result_ids = [
+        str(node_id)
+        for node_id, result in results.items()
+        if isinstance(result, dict)
+        and str(node_id).strip()
+        and (not has_node_contract or str(node_id) in node_by_id)
+    ]
+    existing_order = [
+        str(step.get("id") or "")
+        for step in (existing_steps or [])
+        if isinstance(step, dict)
+        and str(step.get("id") or "") in result_ids
+    ]
+    missing_result_ids = [node_id for node_id in result_ids if node_id not in latest_trace_by_id]
+    if not trace_order and existing_order:
+        ordered_ids = [
+            *existing_order,
+            *(node_id for node_id in missing_result_ids if node_id not in existing_order),
+        ]
+    elif str(_loaded_run_value(run, "retry_of_run_id", "") or "").strip():
+        snapshot_order = {
+            node["id"]: (
+                node.get("order")
+                if isinstance(node.get("order"), (int, float))
+                else node["_fallback_order"]
+            )
+            for node in nodes
+        }
+        missing_result_ids.sort(key=lambda node_id: snapshot_order.get(node_id, len(nodes)))
+        ordered_ids = [*missing_result_ids, *trace_order]
+    elif not trace_order and nodes:
+        result_id_set = set(missing_result_ids)
+        ordered_ids = [node["id"] for node in nodes if node["id"] in result_id_set]
+    else:
+        ordered_ids = [*trace_order, *missing_result_ids]
+
+    run_status = str(_loaded_run_value(run, "status", "") or "").strip().lower()
+    current_id = str(_loaded_run_value(run, "current_step_id", "") or "").strip()
+    if (
+        current_id
+        and current_id not in ordered_ids
+        and run_status != "completed"
+        and (not has_node_contract or current_id in node_by_id)
+    ):
+        ordered_ids.append(current_id)
+    ordered_id_set = set(ordered_ids)
+    ordered_ids.extend(
+        node["id"] for node in nodes if node["id"] not in ordered_id_set
+    )
+
+    existing_by_id = {
+        str(step.get("id") or ""): step
+        for step in (existing_steps or [])
+        if isinstance(step, dict) and step.get("id")
+    }
+    active_status = str(activity_status or run_status or "running").strip().lower()
+    projected: list[dict[str, Any]] = []
+    for node_id in ordered_ids:
+        node = node_by_id.get(node_id, {})
+        trace_entry = latest_trace_by_id.get(node_id, {})
+        result = results.get(node_id)
+        status = str(trace_entry.get("status") or "").strip().lower()
+        result_status = _step_result_status(result)
+        if result_status:
+            status = result_status
+        if node_id == current_id and result_status is None:
+            if active_status in _KNOWN_STEP_STATUSES:
+                status = active_status
+            elif run_status in _KNOWN_STEP_STATUSES:
+                status = run_status
+        if status not in _KNOWN_STEP_STATUSES:
+            status = "pending"
+
+        row = {
+            "id": node_id,
+            "name": str(
+                node.get("name")
+                or trace_entry.get("node_name")
+                or existing_by_id.get(node_id, {}).get("name")
+                or node_id
+            ),
+            "type": str(
+                node.get("type")
+                or trace_entry.get("node_type")
+                or existing_by_id.get(node_id, {}).get("type")
+                or ""
+            ),
+            "status": status,
+        }
+        child_run_ids = list(trace_child_ids.get(node_id, []))
+        if isinstance(result, dict):
+            _artifacts, result_child_ids = _discovered_refs(result)
+            for child_id in result_child_ids:
+                _append_bounded_child_id(child_run_ids, child_id)
+        if child_run_ids:
+            row["child_run_ids"] = child_run_ids
+        existing = existing_by_id.get(node_id)
+        if isinstance(existing, dict) and existing.get("subscription_id") is not None:
+            row["subscription_id"] = existing["subscription_id"]
+        projected.append(row)
+    return projected
+
+
+def workflow_execution_progress(steps: list[dict[str, Any]]) -> dict[str, int]:
+    """Derive processed and total counts from one complete visible projection."""
+    return {
+        "processed_count": sum(
+            1
+            for step in steps
+            if str(step.get("status") or "").lower() in _PROCESSED_STEP_STATUSES
+        ),
+        "total_count": len(steps),
+    }
+
+
 def update_workflow_history_summary(run: WorkflowRun) -> None:
     """Refresh the redacted, bounded summary used by Workflow History."""
-    snapshot = run.definition_snapshot if isinstance(run.definition_snapshot, dict) else {}
-    nodes = snapshot.get("nodes") if isinstance(snapshot.get("nodes"), list) else []
-    visible_node_ids = [
-        str(node.get("id") or "")
-        for node in nodes
-        if isinstance(node, dict)
-        and str(node.get("type") or "").lower() != "end"
-        and str(node.get("chat_projection") or "progress").lower() != "hidden"
-        and node.get("id")
-    ]
+    workflow_steps = workflow_execution_steps(run)
+    progress = workflow_execution_progress(workflow_steps)
     step_results = run.step_results if isinstance(run.step_results, dict) else {}
-    processed_count = 0
-    for node_id in visible_node_ids:
-        result = step_results.get(node_id)
-        if not isinstance(result, dict) or result.get("skipped"):
-            continue
-        if str(result.get("status") or "").lower() in {
-            "completed", "failed", "cancelled"
-        }:
-            processed_count += 1
 
     artifact_identities: set[bytes] = set()
     for entry in run.execution_trace or []:
@@ -467,9 +651,10 @@ def update_workflow_history_summary(run: WorkflowRun) -> None:
         or run.error
     )
     summary = {
+        "schema_version": _HISTORY_SUMMARY_SCHEMA_VERSION,
         "business_outcome": str(state.get("business_outcome") or ""),
-        "processed_count": processed_count,
-        "total_count": len(visible_node_ids),
+        **progress,
+        "workflow_steps": workflow_steps,
         "artifact_count": len(artifact_identities),
         "blocker": summarize_trace_value(blocker) if blocker not in (None, "") else None,
     }

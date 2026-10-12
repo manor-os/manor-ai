@@ -11,6 +11,15 @@ from urllib.parse import urlparse
 
 from packages.core.ai.runtime.approvals import RuntimeApprovalAction
 from packages.core.ai.runtime.bash_command_specs import BashCommandSpecFactory
+from packages.core.ai.runtime.chrome_tool_catalog import (
+    CHROME_MCP_TOOLS,
+    CHROME_READ_ACTIONS,
+    CHROME_READ_ONLY_CDP_METHODS,
+    canonical_chrome_tool_name,
+    chrome_key_sequence,
+    chrome_navigation_key,
+    normalize_chrome_call,
+)
 from packages.core.ai.runtime.tool_effect_classification import (
     RuntimeToolClassification,
     RuntimeToolClassificationRequest,
@@ -37,6 +46,7 @@ __all__ = [
     "bash_write_targets",
     "ChromeConfirmationDecision",
     "classify_chrome_confirmation",
+    "is_chrome_basic_call",
     "classify_runtime_tool",
     "classify_runtime_tool_action",
     "RuntimeToolClassification",
@@ -56,6 +66,14 @@ class ChromeConfirmationDecision:
     preapproved: bool = False
     destination: str = ""
     data_summary: str = ""
+
+
+@dataclass(frozen=True)
+class ChromeCallDecision:
+    kind: str
+    tool_name: str
+    confirmation: ChromeConfirmationDecision | None = None
+    reason: str = ""
 
 
 _CHROME_ACTION_INTENT_RE = re.compile(
@@ -96,8 +114,17 @@ _CHROME_PAGE_EFFECT_ACTIONS = {
     "send_cdp",
     "inject_script",
 }
+_CHROME_BASIC_MUTATION_ACTIONS = frozenset({
+    "open", "open_new_tab", "open_or_reuse", "name_session", "navigate",
+    "open_tabs", "back", "forward", "reload", "claim_tab", "finalize_tabs", "hover",
+    "fill_or_select", "scroll", "scroll_wheel", "click_element",
+    "press_key", "keyboard", "type_text", "click_point",
+    "close_tab", "close_tabs", "close_group_tabs", "set_cursor", "hide_cursor", "set_badge",
+    "download", "drag", "start_tab_recording", "switch_tab_recording_source",
+    "stop_tab_recording", "cancel_tab_recording",
+})
 _CHROME_EXTERNAL_COMMIT_RE = re.compile(
-    r"^(?:(?:publish|post|send|submit|upload|delete|remove|buy|purchase|checkout|pay|allow|share|verify|schedule)(?:\b|$)|"
+    r"^(?:(?:publish|publicar|post|send|submit|upload|delete|remove|buy|purchase|checkout|pay|allow|share|verify|schedule)(?:\b|$)|"
     r"(?:立即|确认|定时|计划|安排)?(?:发布|发表|发送|提交|上传|删除|移除|购买|结账|支付|允许|分享|验证))",
     re.IGNORECASE,
 )
@@ -111,10 +138,19 @@ def classify_chrome_confirmation(
 ) -> ChromeConfirmationDecision:
     args = arguments or {}
     action = _chrome_action_name(tool_name)
+    target = args.get("target")
+    target_values = (
+        tuple(target.get(key) for key in ("label", "aria_label", "name", "text"))
+        if isinstance(target, dict) else ()
+    )
     label = " ".join(
-        str(args.get(key) or "").strip()
-        for key in ("label", "target_label", "aria_label", "name", "text", "role")
-        if str(args.get(key) or "").strip()
+        value
+        for value in (
+            *(str(args.get(key) or "").strip()
+              for key in ("label", "target_label", "aria_label", "name")),
+            *(str(value or "").strip() for value in target_values),
+        )
+        if value
     )
     url = str(args.get("url") or args.get("target_url") or "").strip()
     destination = _chrome_destination(url)
@@ -154,6 +190,23 @@ def classify_chrome_confirmation(
         return ChromeConfirmationDecision("handoff_required", "unsupported_automation", destination=destination)
 
     sensitive_category = _chrome_sensitive_category(haystack)
+    if isinstance(target, dict):
+        autocomplete = set(str(target.get("autocomplete") or "").lower().split())
+        if str(target.get("type") or "").lower() == "password" or autocomplete & {"current-password", "new-password"}:
+            sensitive_category = "password"
+        elif "one-time-code" in autocomplete:
+            sensitive_category = "authentication_code"
+        elif any(token.startswith("cc-") for token in autocomplete):
+            sensitive_category = "payment"
+    role = str(target.get("role") or "").lower() if isinstance(target, dict) else ""
+    editing = action in {"fill_or_select", "type_text"} or (
+        action in {"click_element", "click_point", "keyboard", "press_key"}
+        and role in {"checkbox", "radio", "switch", "option", "combobox", "listbox"}
+    )
+    if editing and not sensitive_category and not explicitly_requested:
+        return ChromeConfirmationDecision("no_confirmation", "ordinary_page_action", destination=destination)
+    if isinstance(target, dict) and target.get("activation") in {"navigation", "popup"} and not explicitly_requested and not editing:
+        return ChromeConfirmationDecision("no_confirmation", "ordinary_page_action", destination=destination)
     if sensitive_category == "captcha":
         return ChromeConfirmationDecision("always_action_time", "captcha", destination=destination, data_summary="redacted captcha input")
     if re.search(r"\b(delete|remove|erase|revoke|unsubscribe)\b|删除|移除|撤销|注销", haystack, re.IGNORECASE):
@@ -193,27 +246,8 @@ def classify_chrome_confirmation(
             data_summary=f"redacted {sensitive_category.replace('_', ' ')} data",
         )
 
-    if _chrome_prepared_upload_launcher(action, label, args):
-        return ChromeConfirmationDecision("no_confirmation", "ordinary_page_action", destination=destination)
-    # YouTube Studio's "Upload videos" launcher only opens the staged upload
-    # flow. No file/path is present at this point, so classify the launcher
-    # separately; the subsequent file transfer and final Public control remain
-    # independently gated.
-    if (
-        destination == "studio.youtube.com"
-        and action in {"click", "click_element", "click_point", "computer"}
-        and re.fullmatch(
-            r"(?:upload\s+videos|上传视频)(?:\s+button)?",
-            label,
-            re.IGNORECASE,
-        )
-        and not any(args.get(key) for key in ("files", "paths", "file", "file_path"))
-    ):
-        return ChromeConfirmationDecision(
-            "preapproval_allowed",
-            "youtube_upload_start",
-            destination=destination,
-        )
+    if isinstance(target, dict) and (target.get("activation") == "form_submit" or target.get("submit_candidate") is True):
+        return ChromeConfirmationDecision("always_action_time", "representational_communication", destination=destination)
     if _CHROME_EXTERNAL_COMMIT_RE.search(label):
         return ChromeConfirmationDecision("always_action_time", "representational_communication", destination=destination)
     if re.search(r"\b(subscribe|enable notifications)\b|订阅|开启通知", haystack, re.IGNORECASE):
@@ -233,25 +267,96 @@ def classify_chrome_confirmation(
     return ChromeConfirmationDecision("no_confirmation", "ordinary_page_action", destination=destination)
 
 
-def _chrome_prepared_upload_launcher(action: str, label: str, args: dict[str, Any]) -> bool:
-    """Treat opening a declared upload-preparation flow as navigation, not publishing.
+def is_chrome_basic_call(
+    tool_name: str,
+    arguments: dict[str, Any] | None = None,
+) -> bool:
+    """Whether a known Chrome call is safe to treat as ordinary browser work."""
+    if tool_name == "search_tools":
+        return _is_verified_chrome_tool_discovery(arguments or {})
+    return classify_chrome_call(tool_name, arguments or {}).kind in {"read", "ordinary"}
 
-    The actual file selection is still separately gated as ``file_upload`` and
-    any final publish/save control remains an action-time confirmation. This
-    narrow exception prevents a harmless "Upload videos" launcher from being
-    mistaken for representational communication.
-    """
 
-    if action not in {"click", "click_element", "click_point", "computer"}:
-        return False
-    if not re.match(r"^(?:upload\b|上传)", label.strip(), re.IGNORECASE):
-        return False
+def classify_chrome_call(tool_name: str, arguments: dict[str, Any]) -> ChromeCallDecision:
+    """Classify a known operation once; missing evidence is not an approval."""
+    known_tool = canonical_chrome_tool_name(tool_name) in CHROME_MCP_TOOLS
+    tool_name, args = normalize_chrome_call(tool_name, arguments)
+    action = _chrome_action_name(tool_name)
+    if not known_tool or action == "computer":
+        return ChromeCallDecision("unsupported", tool_name, reason="chrome_unsupported_action")
     intent = args.get("operation_intent")
-    if not isinstance(intent, dict):
-        return False
-    resource = str(intent.get("resource") or "").strip().lower()
-    verb = str(intent.get("verb") or "").strip().lower()
-    return verb == "prepare" and re.search(r"(?:^|_)upload(?:_|$)", resource) is not None
+    effect = str(intent.get("effect") or "").strip().lower() if isinstance(intent, dict) else ""
+    if effect == "publish":
+        return ChromeCallDecision("confirmation", tool_name, ChromeConfirmationDecision("always_action_time", "publication"))
+    if effect not in {"", "prepare", "read", "draft", "navigation", "interact"}:
+        return ChromeCallDecision("unsupported", tool_name, reason="chrome_unsupported_effect")
+    if action == "send_cdp":
+        if isinstance(args.get("method"), str) and args["method"] in CHROME_READ_ONLY_CDP_METHODS:
+            return ChromeCallDecision("read", tool_name)
+        return ChromeCallDecision("unsupported", tool_name, reason="chrome_unsupported_cdp_method")
+    if action in CHROME_READ_ACTIONS:
+        return ChromeCallDecision("read", tool_name)
+    if action in {"clipboard_read", "get_tab_recording", "wait_download"}:
+        return ChromeCallDecision("read", tool_name)
+    if action == "inject_script":
+        return ChromeCallDecision("confirmation", tool_name, ChromeConfirmationDecision("always_action_time", "script_execution"))
+    if action == "download" and not args.get("url"):
+        return classify_chrome_call("mcp__chrome__click_element", args)
+    if action == "handle_js_dialog":
+        if args.get("accept") is False:
+            return ChromeCallDecision("ordinary", tool_name)
+        return ChromeCallDecision("confirmation", tool_name, ChromeConfirmationDecision("always_action_time", "browser_dialog"))
+    if action == "execute_cached_step":
+        child = args.get("_runtime_trusted_browser_cached_action")
+        if isinstance(child, str) and child in {"click_element", "fill_or_select"}:
+            return classify_chrome_call("mcp__chrome__" + child, args)
+        return ChromeCallDecision("observation_required", tool_name, reason="chrome_cached_target_observation_required")
+    if action in {"click_element", "click_point", "fill_or_select", "type_text", "press_key", "keyboard"}:
+        navigation = action in {"press_key", "keyboard"} and chrome_navigation_key(args)
+        if navigation and not any(args.get(key) is True for key in (
+            "requiresApproval", "requires_approval", "sideEffect", "side_effect", "sensitive",
+        )):
+            return ChromeCallDecision("ordinary", tool_name)
+        target = args.get("target")
+        if action in {"click_point", "type_text", "press_key", "keyboard"} and not navigation and not isinstance(target, dict):
+            return ChromeCallDecision("observation_required", tool_name, reason="chrome_target_observation_required")
+        if not navigation and not _chrome_action_has_semantic_target(args):
+            return ChromeCallDecision("observation_required", tool_name, reason="chrome_target_observation_required")
+        if action in {"press_key", "keyboard"} and not chrome_key_sequence(args):
+            return ChromeCallDecision("unsupported", tool_name, reason="chrome_unsupported_key")
+        if action in {"press_key", "keyboard"} and chrome_key_sequence(args)[-1:] in {("enter",), ("return",)}:
+            if isinstance(target, dict) and target.get("role") in {"textbox", "searchbox"} and target.get("tag") != "textarea":
+                return ChromeCallDecision("observation_required", tool_name, reason="chrome_explicit_submit_target_required")
+        if isinstance(target, dict) and (target.get("disabled") is True or (
+            action in {"fill_or_select", "type_text"} and target.get("read_only") is True
+        )):
+            return ChromeCallDecision("observation_required", tool_name, reason="chrome_target_not_editable")
+    decision = classify_chrome_confirmation(tool_name, args)
+    if decision.mode == "handoff_required":
+        return ChromeCallDecision("handoff", tool_name, decision)
+    if decision.mode != "no_confirmation":
+        return ChromeCallDecision("confirmation", tool_name, decision)
+    if action in _CHROME_BASIC_MUTATION_ACTIONS:
+        return ChromeCallDecision("ordinary", tool_name)
+    # These capabilities have their own effect or execution contract. An
+    # unmodeled call must never turn into ordinary_page_action.confirm.
+    return ChromeCallDecision("unsupported", tool_name, reason="chrome_action_contract_required")
+
+
+def _chrome_action_has_semantic_target(args: dict[str, Any]) -> bool:
+    target = args.get("target")
+    if isinstance(target, dict) and (
+        target.get("editable") is True
+        or str(target.get("role") or "").lower() in {"textbox", "combobox", "checkbox", "radio", "slider", "spinbutton", "switch"}
+    ):
+        return True
+    if any(str(args.get(key) or "").strip() for key in ("label", "target_label", "aria_label", "name")):
+        return True
+    target = args.get("target")
+    return isinstance(target, dict) and any(
+        str(target.get(key) or "").strip()
+        for key in ("label", "aria_label", "name", "text", "testId", "href")
+    )
 
 
 def _chrome_action_name(tool_name: str) -> str:
@@ -455,6 +560,7 @@ _OFFICIAL_REMOTE_MCP_DEFINITIONS = {
     for provider in OfficialRemoteMCPProvider
 }
 _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
+    "apify": frozenset({"quote_instagram_collection", "get_instagram_collection"}),
     "alpaca_market_data": frozenset({
         "get_bars", "get_latest_quote", "get_latest_trade", "get_news", "get_option_chain",
         "get_option_latest_quote", "get_option_snapshot", "get_snapshot",
@@ -475,7 +581,18 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
     "claude_code": frozenset({"check_path"}),
     "codex_cli": frozenset({"check_path"}),
     "elevenlabs": frozenset({"list_voices"}),
-    "email": frozenset({"get_message", "list_folders", "list_messages"}),
+    "suno": frozenset({"get_generation", "get_usage"}),
+    "email": frozenset({
+        "download_attachment",
+        "get_draft",
+        "get_message",
+        "get_thread",
+        "list_attachments",
+        "list_drafts",
+        "list_folders",
+        "list_messages",
+        "list_threads",
+    }),
     "facebook": frozenset({
         "get_instagram_account", "get_instagram_insights", "get_instagram_media", "get_live_video",
         "get_page", "get_page_insights", "get_post", "get_post_insights", "list_comments",
@@ -508,6 +625,10 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
     "linkedin": frozenset({
         "get_my_posts", "get_organization", "get_post_comments", "get_post_reactions", "get_post_stats",
         "get_profile", "list_org_posts", "list_organizations",
+    }),
+    "lark": frozenset({
+        "get_chat", "get_document", "get_document_content", "list_bitable_fields",
+        "list_bitable_records", "list_bitable_tables", "list_chats", "list_messages",
     }),
     "manor_mcp_minutes": frozenset({
         "chat_with_meeting", "get_action_items", "get_meeting_details", "get_meeting_stats",
@@ -589,9 +710,11 @@ _MCP_READ_ONLY_ACTIONS_BY_SERVER: dict[str, frozenset[str]] = {
 _MCP_MUTATION_ACTIONS = {
     "answer_callback_query",
     "append_block_children",
+    "append_document_text",
     "calculate",
     "categorize",
     "compose_music",
+    "generate_music",
     "generate_image",
     "generate_sound_effect",
     "generate_video",
@@ -605,6 +728,9 @@ _MCP_MUTATION_ACTIONS = {
     "text_to_speech",
 }
 _READ_ONLY_TOOLS = {
+    "read_context_archive",
+    "resident_maintenance_status",
+    "website_content",
     "analyze_audio",
     "browse_web",
     "check_youtube_publication_setup",
@@ -614,10 +740,14 @@ _READ_ONLY_TOOLS = {
     "get_current_time",
     "get_entity_info",
     "get_goal_status",
+    "get_stat_status",
     "get_task_details",
     "inspect_file_engine",
     "inspect_narration_recovery",
     "search_tools",
+    # Only an unwrappable or rejected call_tool is classified as itself; it
+    # executes nothing. A valid one is classified as the tool it calls.
+    "call_tool",
     "web_search",
     "web_event_search",
     "web_fetch",
@@ -628,25 +758,33 @@ _READ_ONLY_TOOLS = {
     "workspace_search",
     "workspace_list_knowledge",
     "sandbox_read_file",
+    "sandbox_status",
     "list_skills",
     "get_skill_details",
     "list_workflows",
     "list_workflow_definitions",
     "get_workflow",
     "validate_workflow",
+    "verify_file_collection",
     "list_workflow_runs",
     "get_workflow_run",
+    "get_agent_initiative",
+    "list_agent_initiatives",
+    "list_agent_initiative_runs",
     "list_agent_files",
     "list_documents",
     "list_sandbox_files",
     "list_scheduled_jobs",
     "list_workspace_flows",
+    "plan_video_segments",
     "probe_media",
+    "search_free_music",
     "query_agent_capabilities",
     "query_entity_agents",
     "query_scheduled_jobs",
     "rag",
     "read_agent_file",
+    "read_context_archive",
     "read_content_ledger",
     "read_finance_ledger",
     "read_recruiting_ledger",
@@ -660,12 +798,16 @@ _READ_ONLY_TOOLS = {
     "search_tasks",
     "take_screenshot",
     "transcribe_audio",
+    "transcribe_video",
     "validate_subtitles",
     "verify_stickman_final_media",
     "wait_media_jobs",
+    # Task agent loop only: parks the loop until a time; executes nothing.
+    "wait_until",
     "weather_search",
     "ws_get_draft",
     "ws_lint_draft",
+    "ws_read_source",
     "ws_search_blueprints",
     "ws_search_capabilities",
     "ws_search_entity_agents",
@@ -693,8 +835,15 @@ def _fixed_action(
 
 
 _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
+    "prepare_recording": _fixed_action("workspace.file.create", "medium", "prepare recording transcript", "file", "create"),
+    "prepare_creative_studio": _fixed_action("workspace.file.create", "medium", "freeze creative production inputs", "file", "create"),
+    "verify_creative_studio": _fixed_action("workspace.file.create", "medium", "verify creative files and render previews", "file", "create"),
+    "compose_creative_publication": _fixed_action("workspace.file.create", "medium", "compose native illustrated publication", "file", "create"),
+    "compose_creative_dub": _fixed_action("workspace.file.create", "medium", "compose translated video with actual narration", "file", "create"),
+    "render_recording": _fixed_action("workspace.file.create", "medium", "render recording deliverables", "file", "create"),
     "align_subtitles": _fixed_action("workspace.file.create", "medium", "create subtitle files", "file", "create"),
     "answer_task_blocker": _fixed_action("workspace.task.update", "medium", "answer task blocker", "workspace_task", "modify"),
+    "request_input": _fixed_action("human.input.request", "low", "ask the user a question", "conversation", "read", "human.input"),
     "build_narration_timeline": _fixed_action("workspace.file.create", "medium", "create narration timeline", "file", "create"),
     "code": _fixed_action("cli.exec", "medium", "run code", "cli", "execute", "cli.execute"),
     "compose_video_timeline": _fixed_action("workspace.file.create", "medium", "render video timeline", "file", "create"),
@@ -702,6 +851,7 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "dashboard_submit_module": _fixed_action("workspace.dashboard.module.update", "medium", "submit dashboard module", "workspace", "modify"),
     "generate_image": _fixed_action("workspace.file.create", "medium", "generate image", "file", "create"),
     "generate_video": _fixed_action("workspace.file.create", "medium", "generate video", "file", "create"),
+    "import_free_music": _fixed_action("workspace.file.create", "medium", "import licensed music", "file", "create"),
     "interact_with_page": _fixed_action("browser.interact", "low", "interact with browser page", "browser", "execute", "manor.composite"),
     "merge_videos": _fixed_action("workspace.file.create", "medium", "merge videos", "file", "create"),
     "normalize_audio_loudness": _fixed_action("workspace.file.create", "medium", "normalize audio", "file", "create"),
@@ -717,7 +867,8 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "record_youtube_publication": _fixed_action("workspace.knowledge.update", "medium", "record YouTube publication", "knowledge", "modify"),
     "record_youtube_workspace_metrics": _fixed_action("workspace.knowledge.update", "medium", "record YouTube metrics", "knowledge", "modify"),
     "render_frame_samples": _fixed_action("workspace.file.create", "medium", "render frame samples", "file", "create"),
-    "sandbox_destroy": _fixed_action("sandbox.destroy", "high", "destroy sandbox", "sandbox", "delete"),
+    "sandbox_cancel": _fixed_action("sandbox.cancel", "medium", "cancel sandbox command", "sandbox", "cancel"),
+    "sandbox_respond": _fixed_action("sandbox.respond", "low", "respond to sandbox command", "sandbox", "execute"),
     "send_channel_attachment": _fixed_action(
         "channel.reply",
         "high",
@@ -737,7 +888,7 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "ws_assign_staff": _fixed_action("workspace.operation.draft", "medium", "assign Workspace staff", "workspace_operation", "modify"),
     "ws_attach_knowledge": _fixed_action("workspace.operation.draft", "medium", "attach Workspace knowledge", "workspace_operation", "modify"),
     "ws_commit_basics": _fixed_action("workspace.operation.draft", "medium", "update Workspace draft", "workspace_operation", "modify"),
-    "ws_commit_creator_method": _fixed_action("workspace.operation.draft", "medium", "update Workspace creator method", "workspace_operation", "modify"),
+    "ws_configure_app_view": _fixed_action("workspace.operation.draft", "medium", "configure Workspace app view", "workspace_operation", "modify"),
     "ws_flag_missing_integration": _fixed_action("workspace.operation.draft", "medium", "update Workspace integration requirement", "workspace_operation", "modify"),
     "ws_mark_ready": _fixed_action("workspace.operation.draft", "medium", "mark Workspace draft ready", "workspace_operation", "modify"),
     "ws_propose_agent_mapping": _fixed_action("workspace.operation.draft", "medium", "update Workspace agent mapping", "workspace_operation", "modify"),
@@ -748,6 +899,8 @@ _FIXED_TOOL_ACTIONS: dict[str, RuntimeApprovalAction] = {
     "ws_propose_service": _fixed_action("workspace.operation.draft", "medium", "update Workspace service", "workspace_operation", "modify"),
     "ws_remove": _fixed_action("workspace.operation.draft", "medium", "remove Workspace draft item", "workspace_operation", "modify"),
     "ws_request_custom_agent": _fixed_action("workspace.operation.draft", "medium", "request custom Workspace agent", "workspace_operation", "modify"),
+    "ws_confirm_creation_preferences": _fixed_action("workspace.operation.draft", "medium", "confirm Workspace creation preferences", "workspace_operation", "modify"),
+    "ws_set_autonomy": _fixed_action("workspace.operation.draft", "medium", "update Workspace autonomy", "workspace_operation", "modify"),
     "ws_set_budget": _fixed_action("workspace.operation.draft", "medium", "update Workspace budget", "workspace_operation", "modify"),
     "ws_set_evaluation": _fixed_action("workspace.operation.draft", "medium", "update Workspace evaluation", "workspace_operation", "modify"),
 }
@@ -768,12 +921,29 @@ _SHELL_SEGMENT_SEPARATOR_RE = re.compile(r"(?:^|\s)(?:&&|\|\||;|\|)(?:\s|$)")
 _MANOR_ACTION_MAP = {
     "create_task": ("workspace.task.create", "medium", "create task", "workspace_task", "create"),
     "assign_task": ("workspace.task.update", "medium", "assign task", "workspace_task", "modify"),
-    "delete_task": ("workspace.task.delete", "high", "delete task", "workspace_task", "delete"),
     "start_workspace_draft": ("workspace.draft.start", "low", "start workspace setup", "workspace", "create"),
     "create_workspace": ("workspace.draft.start", "low", "start workspace setup", "workspace", "create"),
     "continue_workspace_draft": ("workspace.draft.update", "low", "update workspace setup", "workspace", "modify"),
     "create_client": ("workspace.client.create", "medium", "create client", "client", "create"),
     "delete_client": ("workspace.client.delete", "high", "delete client", "client", "delete"),
+    "update_client": ("workspace.client.update", "medium", "update client", "client", "modify"),
+    "prepare_client_delivery": ("workspace.client.delivery.prepare", "high", "prepare private Workspace invitation", "client", "create"),
+    "rotate_client_delivery": ("workspace.client.delivery.rotate", "high", "rotate private Workspace invitation", "client", "modify"),
+    "revoke_client_delivery": ("workspace.client.delivery.revoke", "high", "revoke private Workspace invitation", "client", "modify"),
+    "link_client_relationship": ("workspace.client.relationship.link", "medium", "link CRM relationship", "client", "modify"),
+    "unlink_client_relationship": ("workspace.client.relationship.unlink", "medium", "unlink CRM relationship", "client", "modify"),
+    "create_client_contact": ("workspace.client.contact.create", "medium", "create client contact", "client", "create"),
+    "update_client_contact": ("workspace.client.contact.update", "medium", "update client contact", "client", "modify"),
+    "delete_client_contact": ("workspace.client.contact.delete", "high", "delete client contact", "client", "delete"),
+    "create_client_activity": ("workspace.client.activity.create", "medium", "create client activity", "client", "create"),
+    "update_client_activity": ("workspace.client.activity.update", "medium", "update client activity", "client", "modify"),
+    "delete_client_activity": ("workspace.client.activity.delete", "high", "delete client activity", "client", "delete"),
+    "create_client_opportunity": ("workspace.client.opportunity.create", "medium", "create client opportunity", "client", "create"),
+    "update_client_opportunity": ("workspace.client.opportunity.update", "medium", "update client opportunity", "client", "modify"),
+    "delete_client_opportunity": ("workspace.client.opportunity.delete", "high", "delete client opportunity", "client", "delete"),
+    "create_client_followup": ("workspace.client.followup.create", "medium", "create client followup", "client", "create"),
+    "update_client_followup": ("workspace.client.followup.update", "medium", "update client followup", "client", "modify"),
+    "delete_client_followup": ("workspace.client.followup.delete", "high", "delete client followup", "client", "delete"),
     "create_order": ("workspace.order.create", "medium", "create order", "order", "create"),
     "create_skill": ("workspace.skill.create", "medium", "create skill", "skill", "create"),
     "delete_skill": ("workspace.skill.delete", "high", "delete skill", "skill", "delete"),
@@ -782,13 +952,62 @@ _MANOR_ACTION_MAP = {
     "toggle_scheduled_job": ("workspace.automation.update", "medium", "toggle automation", "automation", "modify"),
     "run_scheduled_job_now": ("workspace.automation.run", "medium", "run automation", "automation", "execute"),
     "delete_document": ("workspace.file.delete", "high", "delete workspace document", "file", "delete"),
-    "sync_file_to_knowledge": ("workspace.knowledge.update", "medium", "update workspace knowledge", "knowledge", "modify"),
 }
 _SCHEDULED_JOB_ACTION_MAP = {
     "create_scheduled_job": ("workspace.automation.create", "high", "create automation", "automation", "create"),
     "cancel_scheduled_job": ("workspace.automation.delete", "high", "cancel automation", "automation", "delete"),
     "toggle_scheduled_job": ("workspace.automation.update", "medium", "toggle automation", "automation", "modify"),
     "run_scheduled_job_now": ("workspace.automation.run", "medium", "run automation", "automation", "execute"),
+}
+_AGENT_INITIATIVE_ACTION_MAP = {
+    "create_agent_initiative": (
+        "workspace.automation.agent_initiative.create",
+        "high",
+        "create Agent Initiative",
+        "create",
+    ),
+    "update_agent_initiative": (
+        "workspace.automation.agent_initiative.update",
+        "medium",
+        "update Agent Initiative",
+        "modify",
+    ),
+    "mute_agent_initiative": (
+        "workspace.automation.agent_initiative.mute",
+        "medium",
+        "mute Agent Initiative",
+        "modify",
+    ),
+    "unmute_agent_initiative": (
+        "workspace.automation.agent_initiative.unmute",
+        "medium",
+        "unmute Agent Initiative",
+        "modify",
+    ),
+    "pause_agent_initiative": (
+        "workspace.automation.agent_initiative.pause",
+        "medium",
+        "pause Agent Initiative",
+        "modify",
+    ),
+    "resume_agent_initiative": (
+        "workspace.automation.agent_initiative.resume",
+        "medium",
+        "resume Agent Initiative",
+        "modify",
+    ),
+    "delete_agent_initiative": (
+        "workspace.automation.agent_initiative.delete",
+        "high",
+        "delete Agent Initiative",
+        "delete",
+    ),
+    "run_agent_initiative_now": (
+        "workspace.automation.agent_initiative.run",
+        "medium",
+        "run Agent Initiative",
+        "execute",
+    ),
 }
 _WORKSPACE_AGENT_ACTION_MAP = {
     "create_task": ("workspace.task.create", "medium", "create workspace task", "workspace_task", "create"),
@@ -801,6 +1020,9 @@ _WORKSPACE_AGENT_ACTION_MAP = {
     "delegate_service": ("workspace.service.delegate", "medium", "delegate workspace service agent", "workspace_service", "execute"),
     "operation": ("workspace.operation.update", "medium", "update workspace operation draft", "workspace_operation", "modify"),
     "request_strategist_review": ("workspace.strategist.run", "medium", "request strategist review", "workspace", "execute"),
+    "resolve_hitl": ("workspace.hitl.resolve", "medium", "resolve Workspace request", "workspace", "modify"),
+    "answer_task_blocker": ("workspace.task.update", "medium", "answer task blocker", "workspace_task", "modify"),
+    "update_goal_value": ("workspace.goal.update", "medium", "update goal", "goal", "modify"),
     "workspace_create_task": ("workspace.task.create", "medium", "create workspace task", "workspace_task", "create"),
     "workspace_update_task_runtime": ("workspace.task.update", "medium", "update task runtime requirements", "workspace_task", "modify"),
     "workspace_create_knowledge_folder": ("workspace.knowledge.update", "medium", "create workspace Knowledge Net", "knowledge", "create"),
@@ -841,10 +1063,40 @@ def _classify_known_runtime_tool_action(
     if name.startswith("mcp__"):
         return _classify_mcp_tool_action(name, args)
 
+    if name == "archive_file_collection":
+        return RuntimeApprovalAction(
+            "action", "workspace.file.create", "medium", "archive verified source media",
+            "file", "create",
+        )
+
+
+    if workspace_file_scope is not None and workspace_file_scope.media_output_plan is not None:
+        plan = workspace_file_scope.media_output_plan
+        return _classify_file_write(
+            path=plan.targets[0].rel_path.removeprefix(f"{plan.artifact_base_dir}/"), entity_id=entity_id,
+            title=f"generate {plan.kind}", default_key="workspace.file.create",
+            existence=WorkspaceFileExistence.MISSING,
+        )
+
+    if name in _AGENT_INITIATIVE_ACTION_MAP:
+        key, risk, title, operation = _AGENT_INITIATIVE_ACTION_MAP[name]
+        return RuntimeApprovalAction(
+            "action",
+            key,
+            risk,
+            title,
+            "agent_initiative",
+            operation,
+            str(args.get("initiative_id") or "").strip() or None,
+            "initiative.manage",
+        )
+
     fixed_action = _FIXED_TOOL_ACTIONS.get(name)
     if fixed_action is not None:
         return fixed_action
 
+    # Historical approval records still need classification. These retired
+    # names have no registered handler and cannot execute new file writes.
     if name == "generate_document_file":
         from packages.core.ai.runtime.authorization_receipts import (
             WorkspaceFileAuthorizationResourceFactory,
@@ -893,14 +1145,40 @@ def _classify_known_runtime_tool_action(
             title="write workspace file",
             existence=existence,
         )
-    if name in {"edit_file", "patch_file"}:
-        title = "patch workspace file" if name == "patch_file" else "edit workspace file"
-        return RuntimeApprovalAction("action", "workspace.file.modify", "medium", title, "file", "modify", str(args.get("path") or "") or None)
+    if name in {"edit_file", "patch_file", "replace_file"}:
+        title = {
+            "edit_file": "edit workspace file",
+            "patch_file": "patch workspace file",
+            "replace_file": "replace workspace file",
+        }[name]
+        path_argument = "target_path" if name == "replace_file" else "path"
+        return RuntimeApprovalAction("action", "workspace.file.modify", "medium", title, "file", "modify", str(args.get(path_argument) or "") or None)
     if name == "delete_file":
         return RuntimeApprovalAction("action", "workspace.file.delete", "high", "delete workspace file", "file", "delete", str(args.get("path") or "") or None)
+    if name == "code_project":
+        action = str(args.get("action") or "").strip()
+        if action in {"list", "get"}:
+            return None
+        project = str(args.get("project_id") or args.get("adopt_path") or args.get("name") or "") or None
+        if action == "create":
+            return RuntimeApprovalAction("action", "workspace.file.create", "medium", "create code project", "file", "create", project)
+        if args.get("delete") and not args.get("files"):
+            return RuntimeApprovalAction("action", "workspace.file.delete", "high", "delete code project files", "file", "delete", project)
+        # Create vs modify must equal what the file guard computes for the same
+        # targets, so the Workspace receipt authorizes the inner mutation.
+        return _classify_file_write(
+            path=project or "",
+            entity_id=entity_id,
+            title="write code project files",
+            existence=(
+                workspace_file_scope.existence
+                if workspace_file_scope is not None
+                else WorkspaceFileExistence.UNKNOWN
+            ),
+        )
 
     if name == "bash":
-        return _classify_bash_tool(args, entity_id=entity_id)
+        return _classify_bash_tool(args, entity_id=entity_id, workspace_file_scope=workspace_file_scope)
 
     if name in _SCHEDULED_JOB_ACTION_MAP:
         key, risk, title, resource_kind, operation = _SCHEDULED_JOB_ACTION_MAP[name]
@@ -990,7 +1268,7 @@ def _classify_known_runtime_tool_action(
         raw_params = args.get("params") or {}
         params = raw_params if isinstance(raw_params, dict) else {}
         action_name = str(args.get("action") or "").strip()
-        if action_name in {"search", "list_knowledge"}:
+        if action_name in {"search", "list_knowledge", "read_delegation_result"}:
             return None
         if action_name == "operation":
             return _classify_workspace_operation_action(params)
@@ -1091,10 +1369,43 @@ _ORCHESTRATOR_REASONS = {
     "invoke_skill": (
         "Every nested skill tool call re-enters the runtime authorization boundary."
     ),
+    "execute_planned_action": (
+        "Execute only the immutable action bound to the current Dispatcher lease. "
+        "Dispatcher owns its approval; the handler revalidates that lease before I/O."
+    ),
 }
 _CONTROL_REASONS = {
+    "resident_maintenance_draft": (
+        "Save a private draft for the verified resident in this conversation. "
+        "The handler validates resident scope; only a separate browser confirmation writes to PMS."
+    ),
     "submit_result": "Return a result to the current Runtime-owned orchestration loop.",
+    "update_task_plan": (
+        "Record the Task agent loop's own plan and acceptance criteria. "
+        "It is bookkeeping for this loop and executes nothing."
+    ),
+    "complete_task": (
+        "Submit the Task agent loop's final outcome to its host, which decides "
+        "and writes the Task's terminal state."
+    ),
+    "sandbox_destroy": (
+        "Release an ephemeral Runtime-owned sandbox, not a user file or resource. "
+        "The handler validates the current conversation and actor before cleanup."
+    ),
+    "update_goal_value": (
+        "Record a Goal measurement for the current Workspace run. "
+        "The handler validates entity and Workspace scope; this is not an external action."
+    ),
 }
+
+# Control tools a Runtime host arms for one concrete loop as dynamic
+# handlers. They have no durable catalog binding: the loop that armed them is
+# their only binding, and without a handler the call fails as unknown.
+RUNTIME_LOOP_CONTROL_TOOL_NAMES = frozenset({
+    "submit_result",
+    "update_task_plan",
+    "complete_task",
+})
 
 _NON_ACTION_CAPABILITY_BY_TOOL = {
     "invoke_skill": "skill.invoke",
@@ -1106,13 +1417,73 @@ _NON_ACTION_CAPABILITY_BY_TOOL = {
     "workspace_list_knowledge": "workspace.search",
     "rag": "workspace.search",
     "search_tools": "runtime.discovery",
+    "call_tool": "runtime.discovery",
     "list_skills": "runtime.discovery",
     "get_skill_details": "runtime.discovery",
+    "read_context_archive": "runtime.discovery",
     "web_search": "web.safe_search",
     "web_fetch": "web.safe_search",
     "browse_web": "web.safe_search",
     "sandbox_read_file": "sandbox.execute",
+    "sandbox_destroy": "sandbox.execute",
 }
+
+def runtime_policy_action_for_classification(
+    classification: RuntimeToolClassification,
+) -> tuple[RuntimeApprovalAction, str | None]:
+    """The action and impact the policy gate evaluates for one classification.
+
+    Shared by the execution gate and discovery so both judge a tool by the same
+    facts. A classification without an approval action (reads, controls) is
+    evaluated as its low-risk authorization action.
+    """
+
+    action = classification.action
+    if action is not None:
+        # A classified action that only reads (asking the user a question)
+        # is a read for the policy. Without this its impact was unknown, and
+        # unknown impact always asks: every question needed an approval.
+        return action, ("read" if action.operation == "read" else None)
+    authorization = classification.authorization
+    impact = "read" if classification.effect is RuntimeToolEffect.READ_ONLY else "reversible"
+    return RuntimeApprovalAction(
+        kind="action", action_key=authorization.action_key,
+        capability_id=authorization.capability_id,
+        risk_level="low", title=authorization.action_key,
+        resource_kind=authorization.resource_kind,
+        resource_id=authorization.resource_id,
+        operation="read" if impact == "read" else "modify",
+    ), impact
+
+
+def runtime_is_orchestration_tool(tool_name: str) -> bool:
+    """True for tools that route, discover, delegate or control a run, not do its work.
+
+    Derived from the classifier: orchestrator/control effects, the
+    ``runtime.discovery`` capability, loop-armed control tools, and the
+    human-input / delegation hand-offs. A Skill that declares only these has no
+    work tools of its own.
+    """
+
+    from packages.core.ai.runtime.human_input import REQUEST_INPUT_TOOL_NAME
+    from packages.core.ai.runtime.workspace_delegation_actions import DELEGATE_TO_AGENT_TOOL_NAME
+    from packages.core.constants.execution import DELEGATE_TO_SERVICE_TOOL_NAME
+
+    name = str(tool_name or "").strip()
+    if not name:
+        return False
+    if (
+        name in RUNTIME_LOOP_CONTROL_TOOL_NAMES
+        or _NON_ACTION_CAPABILITY_BY_TOOL.get(name) == "runtime.discovery"
+        or name in {REQUEST_INPUT_TOOL_NAME, DELEGATE_TO_AGENT_TOOL_NAME, DELEGATE_TO_SERVICE_TOOL_NAME}
+    ):
+        return True
+    try:
+        effect = classify_runtime_tool(name, {}).effect
+    except Exception:
+        return False
+    return effect in {RuntimeToolEffect.ORCHESTRATOR, RuntimeToolEffect.CONTROL}
+
 
 def _resolve_non_action_authorization(
     request: RuntimeToolClassificationRequest,
@@ -1127,7 +1498,15 @@ def _resolve_non_action_authorization(
     if access is None:
         raise ValueError(f"No non-action authorization mapping for {effect.value}")
 
-    capability_id = _NON_ACTION_CAPABILITY_BY_TOOL.get(request.tool_name)
+    authorization_tool_name = request.tool_name
+    if (
+        request.tool_name == "workspace_agent"
+        and str(request.arguments.get("action") or "").strip() == "operation"
+    ):
+        # The gateway and direct operation leaf need the same hard read gate.
+        # Runtime still validates the original tool's current binding.
+        authorization_tool_name = "workspace_operation"
+    capability_id = _NON_ACTION_CAPABILITY_BY_TOOL.get(authorization_tool_name)
     if request.tool_name == "manor":
         from packages.core.ai.runtime.manor_read_policy import (
             ManorReadCapabilityFactory,
@@ -1140,7 +1519,7 @@ def _resolve_non_action_authorization(
     if capability_id is None:
         from packages.core.ai.runtime.capabilities import capabilities_for_tool_names
 
-        matches = capabilities_for_tool_names({request.tool_name})
+        matches = capabilities_for_tool_names({authorization_tool_name})
         if matches:
             capability_id = sorted(capability.id for capability in matches)[0]
 
@@ -1149,11 +1528,48 @@ def _resolve_non_action_authorization(
     elif effect is RuntimeToolEffect.CONTROL:
         action_key = f"runtime.control.{request.tool_name}"
     else:
-        action_key = f"tool.{request.tool_name}.read"
+        action_key = f"tool.{authorization_tool_name}.read"
+    resource_kind = None
+    resource_id = None
+    if request.tool_name.startswith("mcp__chrome__"):
+        chrome_name, _ = normalize_chrome_call(request.tool_name, request.arguments)
+        action_key = f"tool.{chrome_name}.read"
+        resource_kind = "browser"
+        resource_id = "chrome"
+    if request.tool_name == "search_tools" and _is_verified_chrome_tool_discovery(
+        request.arguments
+    ):
+        resource_kind = "browser"
+        resource_id = "chrome"
     return RuntimeToolAuthorization(
         action_key=action_key,
         capability_id=capability_id,
         access=access,
+        resource_kind=resource_kind,
+        resource_id=resource_id,
+    )
+
+
+def _is_verified_chrome_tool_discovery(arguments: dict[str, Any]) -> bool:
+    """Identify only canonical discovery requests that can load Chrome tools."""
+    from packages.core.ai.runtime.tool_discovery import runtime_prepare_search_tools_request
+
+    request = runtime_prepare_search_tools_request(
+        mode=arguments.get("mode"),
+        query=arguments.get("query"),
+        queries=arguments.get("queries"),
+        provider_key=arguments.get("provider_key"),
+        exact_names=arguments.get("exact_names"),
+        max_results=arguments.get("max_results"),
+    )
+    if not request.ok:
+        return False
+    if request.mode == "provider":
+        return request.provider_key == "chrome"
+    return (
+        request.mode == "exact"
+        and bool(request.exact_names)
+        and all(name in CHROME_MCP_TOOLS for name in request.exact_names)
     )
 
 
@@ -1166,6 +1582,31 @@ def _runtime_tool_classifier() -> RuntimeToolClassifier:
         orchestrator_reasons=_ORCHESTRATOR_REASONS,
         control_reasons=_CONTROL_REASONS,
     )
+
+
+def _canonical_composite_tool_call(
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    """Project composite gateway calls onto their governed legacy action."""
+
+    from packages.core.ai.runtime.composite_tools import (
+        RuntimeCompositeToolCallFactory,
+    )
+
+    call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
+    return call.tool_name, call.arguments
+
+
+def _is_update_goal_value_call(
+    canonical_name: str,
+    canonical_arguments: dict[str, Any],
+) -> bool:
+    if canonical_name in {"update_goal_value", "record_stat_assessment"}:
+        return True
+    if canonical_name in {"workspace_agent", "manor"}:
+        return str(canonical_arguments.get("action") or "").strip() in {"update_goal_value", "record_stat_assessment"}
+    return False
 
 
 def classify_runtime_tool(
@@ -1187,14 +1628,20 @@ def classify_runtime_tool(
     calls all have no action object there.
     """
 
-    request = RuntimeToolClassificationRequest.create(
+    canonical_name, canonical_arguments = _canonical_composite_tool_call(
         tool_name,
         arguments,
+    )
+    request = RuntimeToolClassificationRequest.create(
+        canonical_name,
+        canonical_arguments,
         entity_id=entity_id,
         workspace_id=workspace_id,
         task_id=task_id,
         workspace_file_scope=workspace_file_scope,
     )
+    if _is_update_goal_value_call(canonical_name, canonical_arguments):
+        return RuntimeToolClassification.action_call(_FIXED_TOOL_ACTIONS["update_goal_value"])
     if declared_effect is not None:
         try:
             resolved_effect = MCPActionEffect(
@@ -1267,10 +1714,14 @@ def _runtime_tool_is_explicitly_read_only(
     tool_name: str,
     args: dict[str, Any],
 ) -> bool:
+    if tool_name.startswith("mcp__chrome__"):
+        return classify_chrome_call(tool_name, args).kind == "read"
     if tool_name in _READ_ONLY_TOOLS:
         return True
     if tool_name == "generate_file":
         return str(args.get("kind") or "").strip().lower().replace("-", "_") == "search"
+    if tool_name == "code_project":
+        return str(args.get("action") or "").strip() in {"list", "get"}
     if tool_name == "manor":
         from packages.core.ai.runtime.manor_read_policy import (
             ManorReadCapabilityFactory,
@@ -1279,52 +1730,72 @@ def _runtime_tool_is_explicitly_read_only(
         action = str(args.get("action") or "").strip()
         return ManorReadCapabilityFactory.supports(action)
     if tool_name == "workspace_agent":
-        return str(args.get("action") or "").strip() in {"search", "list_knowledge"}
+        action = str(args.get("action") or "").strip()
+        if action == "operation":
+            params = args.get("params")
+            return _runtime_tool_is_explicitly_read_only(
+                "workspace_operation", params if isinstance(params, dict) else {},
+            )
+        return action in {
+            "search",
+            "list_knowledge",
+            "get_goal_status",
+            "get_stat_status",
+            "visualize_ledgers",
+            "read_delegation_result",
+        }
     if tool_name == "workspace_operation":
         from packages.core.ai.runtime.workspace_operation_actions import (
-            _normalise_workspace_operation_action,
+            _resolve_workspace_operation_action,
         )
 
-        action = _normalise_workspace_operation_action(args.get("action"))
+        action = _resolve_workspace_operation_action(args)
         return bool(action and action in _WORKSPACE_OPERATION_READ_ACTIONS)
     if not tool_name.startswith("mcp__"):
         return False
     server, action = split_mcp_tool(tool_name)
     if not server or not action:
         return False
+    if server == "manor_pms":
+        return _manor_pms_action_effect(action) is MCPActionEffect.READ
     return action in _MCP_READ_ONLY_ACTIONS_BY_SERVER.get(server, frozenset())
 
 
-def _classify_workspace_operation_action(args: dict[str, Any]) -> RuntimeApprovalAction | None:
-    from packages.core.ai.runtime.workspace_operation_actions import _normalise_workspace_operation_action
+@lru_cache(maxsize=1)
+def _manor_pms_action_effects() -> dict[str, MCPActionEffect]:
+    """Use the shipped PMS contract for both discovery and approval policy."""
+    from packages.core.ai.mcp import manor_pms
 
-    action_name = _normalise_workspace_operation_action(args.get("action"))
+    return {
+        tool["name"]: (
+            MCPActionEffect.DESTRUCTIVE
+            if tool.get("annotations", {}).get("destructiveHint") is True
+            else MCPActionEffect.READ
+            if tool.get("annotations", {}).get("readOnlyHint") is True
+            else MCPActionEffect.WRITE
+        )
+        for tool in manor_pms.list_tools()
+    }
+
+
+def _manor_pms_action_effect(action: str) -> MCPActionEffect:
+    return _manor_pms_action_effects().get(action, MCPActionEffect.WRITE)
+
+
+def _classify_workspace_operation_action(args: dict[str, Any]) -> RuntimeApprovalAction | None:
+    from packages.core.ai.runtime.workspace_operation_actions import _resolve_workspace_operation_action
+
+    action_name = _resolve_workspace_operation_action(args)
     if action_name in _WORKSPACE_OPERATION_READ_ACTIONS:
         return None
-    if not action_name:
-        return RuntimeApprovalAction(
-            "action",
-            "workspace.operation.update",
-            "medium",
-            "update workspace operation draft",
-            "workspace_operation",
-            "modify",
-            str(args.get("draft_id") or "") or None,
-        )
     mapped = _WORKSPACE_OPERATION_ACTION_MAP.get(action_name)
     if mapped:
         key, risk, title, resource_kind, operation = mapped
         resource_id = str(args.get("draft_id") or "") or None
         return RuntimeApprovalAction("action", key, risk, title, resource_kind, operation, resource_id)
-    return RuntimeApprovalAction(
-        "action",
-        "workspace.operation.update",
-        "medium",
-        "update workspace operation draft",
-        "workspace_operation",
-        "modify",
-        str(args.get("draft_id") or "") or None,
-    )
+    # Unknown/missing leaf actions have no executable effect contract. They
+    # must remain UNKNOWN rather than borrowing a generic mutation's approval.
+    return None
 
 
 def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeApprovalAction | None:
@@ -1332,14 +1803,57 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
     if not server or not action:
         return None
 
+    if server == "apify" and action in {
+        "start_instagram_collection", "cancel_instagram_collection",
+    }:
+        return RuntimeMCPApprovalActionFactory.create(tool_name, MCPActionEffect.WRITE)
+
+    if server == "manor_pms":
+        effect = _manor_pms_action_effect(action)
+        if effect is MCPActionEffect.READ:
+            return None
+        return RuntimeMCPApprovalActionFactory.create(tool_name, effect)
+
     if server == "chrome":
+        # run_sequence is the host composite; its children cross this gate too.
+        canonical_name, _ = normalize_chrome_call(tool_name, args)
+        if tool_name not in CHROME_MCP_TOOLS and canonical_name not in CHROME_MCP_TOOLS and action != "run_sequence":
+            return None
         if action != "confirm_action":
+            intent = args.get("operation_intent")
+            if isinstance(intent, dict) and intent.get("effect") == "publish":
+                return RuntimeApprovalAction(
+                    "action", "chrome.publication.publish", "high", "publish Chrome content",
+                    "external_account", "publish", capability_id="manor.composite",
+                )
+            if action == "run_sequence":
+                return RuntimeApprovalAction(
+                    "action", "chrome.browser.interact", "low", "run Chrome sequence",
+                    "browser", "modify", capability_id="manor.composite",
+                )
+            # File selection keeps its existing provider-side confirmation
+            # contract.  It is not an ordinary browser action, but its risk
+            # level must not be upgraded solely by this basic-action policy.
+            if action in {"upload", "set_files", "upload_ref"}:
+                return RuntimeApprovalAction(
+                    "action", "chrome.browser.interact", "low", "interact with Chrome",
+                    "browser", "execute", capability_id="manor.composite",
+                )
+            decision = classify_chrome_call(tool_name, args)
+            if decision.kind in {"read", "ordinary"}:
+                return RuntimeApprovalAction(
+                    "action", "chrome.browser.interact", "low", "interact with Chrome",
+                    "browser", "read" if decision.kind == "read" else "modify",
+                    capability_id="manor.composite",
+                )
+            if decision.kind in {"unsupported", "observation_required"}:
+                return None
+            confirmation = decision.confirmation
+            if confirmation is None:
+                return None
             return RuntimeApprovalAction(
-                "action",
-                "chrome.browser.interact",
-                "low",
-                "interact with Chrome",
-                "browser",
+                "action", f"chrome.{confirmation.policy_category}.confirm", "high",
+                "confirm Chrome action", "external_account",
                 "execute",
                 capability_id="manor.composite",
             )
@@ -1423,6 +1937,15 @@ def _classify_mcp_tool_action(tool_name: str, args: dict[str, Any]) -> RuntimeAp
             return RuntimeApprovalAction("action", f"social_post.{suffix}", risk, f"{suffix} social content", "external_account", operation)
 
     if server in {"gmail", "outlook", "email"}:
+        if server == "email" and action == "save_attachment_to_workspace":
+            return RuntimeApprovalAction(
+                "action",
+                "workspace.knowledge.update",
+                "medium",
+                "save email attachment to Workspace Knowledge",
+                "knowledge",
+                "create",
+            )
         if action in _EMAIL_SEND_ACTIONS:
             return RuntimeApprovalAction("action", "email.send", "high", "send email", "external_account", "send")
         if action.startswith("delete_"):
@@ -1581,6 +2104,62 @@ def _workspace_task_artifact_existence(
     return WorkspaceFileExistence.MISSING
 
 
+def code_project_target_paths(root_path: str, arguments: dict[str, Any]) -> list[str]:
+    """Entity-relative targets of one code_project write, exactly as the handler guards them."""
+    from packages.core.ai.runtime.code_projects import clean_rel
+
+    if arguments.get("files"):
+        raw = [item.get("path") for item in arguments["files"] if isinstance(item, dict)]
+    else:
+        raw = list(arguments.get("delete") or [])
+    targets = []
+    for value in raw:
+        rel = clean_rel(value)
+        if rel:
+            targets.append(f"{root_path}/{rel}")
+    return targets
+
+
+async def _code_project_workspace_file_scope(
+    entity_id: str,
+    arguments: dict[str, Any],
+) -> RuntimeWorkspaceFileScope | None:
+    """Bind a code_project write to its project folder and exact target files."""
+    if str(arguments.get("action") or "").strip() != "write":
+        return None
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.code_project import CodeProject
+
+    project_id = str(arguments.get("project_id") or "").strip()
+    async with async_session() as db:
+        if not hasattr(db, "execute"):
+            return None
+        root_path = (await db.execute(
+            select(CodeProject.root_path).where(
+                CodeProject.id == project_id,
+                CodeProject.entity_id == entity_id,
+                CodeProject.archived_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
+    if not root_path:
+        return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
+    if not arguments.get("files"):
+        return RuntimeWorkspaceFileScope(WorkspaceFileExistence.EXISTS, root_path)
+    exists = [
+        _entity_file_exists(entity_id, target)
+        for target in code_project_target_paths(root_path, arguments)
+    ]
+    if any(item is True for item in exists):
+        existence = WorkspaceFileExistence.EXISTS
+    elif exists and all(item is False for item in exists):
+        existence = WorkspaceFileExistence.MISSING
+    else:
+        existence = WorkspaceFileExistence.UNKNOWN
+    return RuntimeWorkspaceFileScope(existence, root_path)
+
+
 async def resolve_runtime_workspace_file_scope(
     *,
     tool_name: str,
@@ -1599,9 +2178,25 @@ async def resolve_runtime_workspace_file_scope(
     effect.
     """
 
-    normalized_tool = str(tool_name or "").strip()
+    from packages.core.ai.runtime.composite_tools import (
+        RuntimeCompositeToolCallFactory,
+    )
+
+    canonical_call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
+    normalized_tool = canonical_call.tool_name
     normalized_workspace_id = str(workspace_id or "").strip()
     normalized_entity_id = str(entity_id or "").strip()
+    if normalized_tool == "code_project":
+        if not normalized_workspace_id or not normalized_entity_id:
+            return None
+        return await _code_project_workspace_file_scope(
+            normalized_entity_id,
+            canonical_call.arguments,
+        )
+    if normalized_tool == "bash":
+        command = str(canonical_call.arguments.get("command") or "")
+        if _base_command(command) not in BashCommandSpecFactory.LOCAL_ONLY_COMMANDS or not bash_write_targets(command):
+            return None
     from packages.core.ai.runtime.authorization_receipts import (
         WorkspaceFileAuthorizationResourceFactory,
     )
@@ -1610,18 +2205,27 @@ async def resolve_runtime_workspace_file_scope(
         not WorkspaceFileAuthorizationResourceFactory.supports_workspace_scope(
             normalized_tool
         )
-        or not normalized_workspace_id
         or not normalized_entity_id
     ):
         return None
+    if not normalized_workspace_id:
+        from packages.core.ai.runtime.media_outputs import prepare_runtime_media_output_plan
+        from packages.core.services.entity_fs import get_entity_root
+
+        media_plan = prepare_runtime_media_output_plan(
+            tool_name=normalized_tool, arguments=canonical_call.arguments,
+            artifact_base_dir="", entity_root=get_entity_root(normalized_entity_id),
+        )
+        return RuntimeWorkspaceFileScope(WorkspaceFileExistence.MISSING, "", media_plan) if media_plan else None
 
     from sqlalchemy import select
 
     from packages.core.database import async_session
     from packages.core.models.workspace import Workspace
     from packages.core.services.generated_media_naming import (
+        current_workspace_artifact_scope,
         scope_workspace_artifact_path,
-        workspace_task_artifact_dir,
+        workspace_execution_artifact_dir,
     )
     from packages.core.services.workspace_artifacts import (
         artifact_folder_id_from_entity_storage_path,
@@ -1646,7 +2250,7 @@ async def resolve_runtime_workspace_file_scope(
     if not artifact_folder_id:
         return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
 
-    args = arguments or {}
+    args = canonical_call.arguments
     raw_params = args.get("params")
     params = raw_params if isinstance(raw_params, dict) else {}
     generate_file_workspace_asset = (
@@ -1657,20 +2261,113 @@ async def resolve_runtime_workspace_file_scope(
     )
     workspace_base = workspace_artifact_storage_base(str(artifact_folder_id))
     workspace_shared = (
-        normalized_tool == "write_file"
+        normalized_tool in {"write_file", "generate_file"}
         and str(args.get("storage_scope") or "task").strip().lower() == "workspace"
     ) or bool(args.get("workspace_shared")) or (
         normalized_tool == "generate_image"
         and bool(args.get("workspace_asset_key"))
     ) or generate_file_workspace_asset
-    artifact_base = workspace_task_artifact_dir(
+    output_scope = current_workspace_artifact_scope(normalized_entity_id, normalized_workspace_id)
+    from packages.core.services.entity_fs import get_entity_root
+    artifact_base = workspace_execution_artifact_dir(
         workspace_base,
-        None if workspace_shared else task_id,
+        task_id=None if workspace_shared else task_id,
+        workflow_run_id=(output_scope.workflow_run_id if output_scope and not workspace_shared else None),
+        workflow_lineage_root_run_id=(output_scope.workflow_lineage_root_run_id if output_scope and not workspace_shared else None),
+        entity_root=get_entity_root(normalized_entity_id),
     )
+    if normalized_tool == "archive_file_collection":
+        collection = args.get("collection")
+        files = collection.get("files") if isinstance(collection, dict) else None
+        source_ids = [
+            str(item.get("document_id") or "").strip()
+            for item in files or []
+            if isinstance(item, dict) and item.get("role") in {"source_audio", "source_cover"}
+        ]
+        if len(source_ids) != 2 or len(set(source_ids)) != 2:
+            return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
+        from packages.core.models.document import Document
+        async with async_session() as db:
+            documents = list((await db.execute(select(Document).where(
+                Document.entity_id == normalized_entity_id,
+                Document.id.in_(source_ids),
+                Document.is_trashed.is_(False),
+            ))).scalars().all())
+        documents_by_id = {document.id: document for document in documents}
+        if set(documents_by_id) != set(source_ids):
+            return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
+        lineage = str(output_scope.workflow_lineage_root_run_id if output_scope else "").strip()
+        canonical_source_ids: dict[str, str] = {}
+        for role in ("source_audio", "source_cover"):
+            source_id = next(
+                str(item.get("document_id") or "").strip()
+                for item in files
+                if isinstance(item, dict) and item.get("role") == role
+            )
+            metadata = documents_by_id[source_id].metadata_
+            provenance = metadata.get("file_collection_archive") if isinstance(metadata, dict) else None
+            canonical_source_ids[role] = (
+                str(provenance.get("source_document_id") or "").strip()
+                if isinstance(provenance, dict)
+                and provenance.get("role") == role
+                and provenance.get("workflow_lineage_root_run_id") == lineage
+                else source_id
+            )
+        missing = set(canonical_source_ids.values()) - set(documents_by_id)
+        if missing:
+            async with async_session() as db:
+                originals = list((await db.execute(select(Document).where(
+                    Document.entity_id == normalized_entity_id,
+                    Document.id.in_(missing),
+                    Document.is_trashed.is_(False),
+                ))).scalars().all())
+            documents_by_id.update({document.id: document for document in originals})
+        if any(
+            documents_by_id.get(source_id) is None
+            or not str(documents_by_id[source_id].fs_path or "")
+            for source_id in canonical_source_ids.values()
+        ):
+            return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN)
+        from packages.core.services.file_collections import archive_file_collection_target_names
+        names = archive_file_collection_target_names({
+            role: str(documents_by_id[source_id].fs_path)
+            for role, source_id in canonical_source_ids.items()
+        })
+        return RuntimeWorkspaceFileScope(
+            WorkspaceFileExistence.MISSING,
+            artifact_base,
+            file_targets=tuple(f"{artifact_base}/{names[role]}" for role in ("source_audio", "source_cover")),
+        )
+    requested_output = str(
+        args.get("name") or args.get("output_name") or args.get("filename")
+        or args.get("output_directory") or args.get("path") or args.get("target_path")
+        or params.get("name") or params.get("output_name") or params.get("filename") or ""
+    ).strip()
+    requested_target = scope_workspace_artifact_path(requested_output, artifact_base)
+    if (
+        requested_target.startswith(workspace_base + "/")
+        and not requested_target.startswith(artifact_base + "/")
+    ):
+        # Explicit Workspace destinations (including ledgers and canonical
+        # sibling files) keep their identity even inside an execution archive.
+        # Authorization below still binds exact resources, never the home tree.
+        artifact_base = workspace_base
 
-    # Direct media tools choose a collision-safe filename only inside their
-    # handler.  Bind the directory now; the atomic commit guard binds the
-    # eventual child and guarantees CREATE cannot overwrite an existing file.
+    from packages.core.ai.runtime.media_outputs import prepare_runtime_media_output_plan
+    from packages.core.services.entity_fs import get_entity_root
+
+    if normalized_tool == "bash":
+        return RuntimeWorkspaceFileScope(WorkspaceFileExistence.UNKNOWN, artifact_base)
+
+    media_plan = prepare_runtime_media_output_plan(
+        tool_name=normalized_tool, arguments=args,
+        artifact_base_dir=artifact_base, entity_root=get_entity_root(normalized_entity_id),
+    )
+    if media_plan is not None:
+        return RuntimeWorkspaceFileScope(WorkspaceFileExistence.MISSING, artifact_base, media_plan)
+
+    # Narration still resolves its voice-specific directory in the handler.
+    # Retain its directory contract; ordinary media use the exact plan above.
     if (
         normalized_tool in {"generate_image", "generate_audio"}
         or generate_file_workspace_asset
@@ -1685,20 +2382,24 @@ async def resolve_runtime_workspace_file_scope(
     )
 
     resources = ()
+    from packages.core.services.generated_media_naming import workspace_artifact_default_dir
+    typed_directories = workspace_artifact_default_dir(artifact_base, "documents") != artifact_base
     media_resources = WorkspaceFileAuthorizationResourceFactory.media_tool_resources(
         normalized_tool,
         args,
+        artifact_base_dir=artifact_base,
+        entity_id=normalized_entity_id,
     )
     if normalized_tool == "generate_document_file":
         resource = str(args.get("name") or "").strip() or None
         resources = WorkspaceFileAuthorizationResourceFactory.generate_document_resources(
             args,
             resource,
-            workspace_scoped=True,
+            workspace_scoped=typed_directories,
         )
     elif normalized_tool == "sandbox_save_result":
         resources = WorkspaceFileAuthorizationResourceFactory.sandbox_save_result_resources(
-            args
+            args, typed_directories=typed_directories,
         )
     elif normalized_tool == "generate_file":
         resource = str(
@@ -1711,46 +2412,69 @@ async def resolve_runtime_workspace_file_scope(
         resources = WorkspaceFileAuthorizationResourceFactory.generate_file_resources(
             args,
             resource,
+            typed_directories=typed_directories,
         )
     elif media_resources:
         resources = media_resources
     else:
-        requested_path = str(args.get("path") or "").strip()
+        requested_path = str(
+            args.get("target_path") if normalized_tool == "replace_file" else args.get("path")
+            or ""
+        ).strip()
         literal_path = _entity_abs_path(normalized_entity_id, requested_path)
         if literal_path and os.path.exists(literal_path):
-            if not _path_is_within_artifact_base(
+            if _path_is_within_artifact_base(
                 normalized_entity_id,
                 requested_path,
                 artifact_base,
             ):
-                if artifact_folder_id_from_entity_storage_path(requested_path):
-                    # A Workspace-bound invocation may not downgrade a path in
-                    # another Workspace/task artifact root to an unbound entity
-                    # receipt. Keep the scope unresolved so commit fails closed.
-                    return RuntimeWorkspaceFileScope(
-                        WorkspaceFileExistence.UNKNOWN
-                    )
-                # An explicit existing entity path is already exact and does
-                # not belong to this Workspace storage root. Leave it on the
-                # exact entity-path receipt path; the Runtime mutation guard
-                # revalidates its Knowledge ACL before consuming the receipt.
-                return None
-            return RuntimeWorkspaceFileScope(
-                WorkspaceFileExistence.EXISTS,
-                artifact_base,
+                return RuntimeWorkspaceFileScope(
+                    WorkspaceFileExistence.EXISTS,
+                    artifact_base,
+                )
+            if artifact_base != workspace_base and _path_is_within_artifact_base(
+                normalized_entity_id,
+                requested_path,
+                workspace_base,
+            ):
+                return RuntimeWorkspaceFileScope(
+                    WorkspaceFileExistence.EXISTS,
+                    workspace_base,
+                )
+            if artifact_folder_id_from_entity_storage_path(requested_path):
+                # A Workspace-bound invocation may not downgrade a path in
+                # another Workspace/task artifact root to an unbound entity
+                # receipt. Keep the scope unresolved so commit fails closed.
+                return RuntimeWorkspaceFileScope(
+                    WorkspaceFileExistence.UNKNOWN
+                )
+            # An explicit existing entity path is already exact and does
+            # not belong to this Workspace storage root. Leave it on the
+            # exact entity-path receipt path; the Runtime mutation guard
+            # revalidates its Knowledge ACL before consuming the receipt.
+            return None
+        candidate_bases = [artifact_base]
+        if workspace_base and workspace_base != artifact_base:
+            candidate_bases.append(workspace_base)
+        for candidate_base in candidate_bases:
+            scoped_path = scope_workspace_artifact_path(
+                requested_path,
+                candidate_base,
+                default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
             )
-        scoped_path = scope_workspace_artifact_path(
-            requested_path,
-            artifact_base,
-            default_subdir=WorkspaceArtifactDir.DOCUMENTS.value,
-        )
-        existence = _entity_file_exists(normalized_entity_id, scoped_path)
+            existence = _entity_file_exists(normalized_entity_id, scoped_path)
+            if existence is True:
+                return RuntimeWorkspaceFileScope(
+                    WorkspaceFileExistence.EXISTS,
+                    candidate_base,
+                )
+            if existence is None:
+                return RuntimeWorkspaceFileScope(
+                    WorkspaceFileExistence.UNKNOWN,
+                    candidate_base,
+                )
         return RuntimeWorkspaceFileScope(
-            {
-                True: WorkspaceFileExistence.EXISTS,
-                False: WorkspaceFileExistence.MISSING,
-                None: WorkspaceFileExistence.UNKNOWN,
-            }[existence],
+            WorkspaceFileExistence.MISSING,
             artifact_base,
         )
 
@@ -1772,7 +2496,7 @@ async def resolve_runtime_workspace_file_scope(
         )
     existence = _entity_file_exists(
         normalized_entity_id,
-        f"{artifact_base}/{resource.resource_id}",
+        scope_workspace_artifact_path(resource.resource_id, artifact_base),
     )
     return RuntimeWorkspaceFileScope(
         {
@@ -1845,8 +2569,21 @@ def _classify_file_write(
     return RuntimeApprovalAction("action", default_key, "medium", title, "file", "modify", rel_path or None)
 
 
-def _classify_bash_tool(args: dict[str, Any], *, entity_id: str | None) -> RuntimeApprovalAction | None:
+def _classify_bash_tool(
+    args: dict[str, Any], *, entity_id: str | None,
+    workspace_file_scope: RuntimeWorkspaceFileScope | None = None,
+) -> RuntimeApprovalAction | None:
     command = str(args.get("command") or "").strip()
+    if workspace_file_scope and workspace_file_scope.artifact_base_dir and entity_id:
+        from packages.core.ai.runtime.bash_output_paths import BashOutputPathError, scope_bash_output_command
+        from packages.core.services.entity_fs import get_entity_root
+        try:
+            command = scope_bash_output_command(
+                command, artifact_base_dir=workspace_file_scope.artifact_base_dir,
+                entity_root=get_entity_root(entity_id),
+            ).command
+        except BashOutputPathError:
+            return RuntimeApprovalAction("action", "workspace.file.write", "high", "write workspace file", "file", "modify")
     if not command:
         return RuntimeApprovalAction("action", "cli.exec", "low", "run a command", "cli", "execute")
     base_cmd = _base_command(command)
@@ -2011,4 +2748,6 @@ def split_mcp_tool(tool_name: str) -> tuple[str | None, str | None]:
 
 def _looks_public_or_paid(server: str, action: str, args: dict[str, Any]) -> bool:
     text = f"{server} {action} {json.dumps(args, ensure_ascii=False, default=str)[:500]}".lower()
+    if server == "suno" and action in {"generate_music", "create_cover", "create_mashup"}:
+        return True
     return any(word in text for word in ("publish", "post", "send", "payment", "charge", "refund", "invoice"))

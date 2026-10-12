@@ -1,7 +1,7 @@
 ---
 name: mcp_stripe
 description: Operate Stripe through the official remote Stripe MCP (mcp.stripe.com). Use when the user asks to read or update Stripe API resources, issue refunds, plan an integration, run reports, inspect the connected account, or search Stripe documentation.
-version: 1.0.0
+version: 1.0.1
 ---
 
 # Stripe Runtime Skill
@@ -58,5 +58,5 @@ Money / lifecycle (highest impact — see Guardrails):
 
 - Amounts are in the smallest currency unit (e.g. cents) — get the unit right or you'll over/undercharge.
 - A draft invoice is not issued until its finalize operation succeeds; do not report it as issued before then.
-- Idempotency: a failed-but-maybe-applied write should be re-checked with `stripe_api_read` before retrying, so you don't double-charge or double-refund.
+- Idempotency: after a failed-but-maybe-applied write, re-check the relevant resource with a real available read such as `fetch_stripe_resources`, `list_payment_intents`, or `list_invoices` before retrying. If the available reads cannot prove the outcome, stop for manual reconciliation so you don't double-charge or double-refund.
 - Auth/permission errors (restricted key scope, mode mismatch) → stop and tell the user; don't retry blindly.

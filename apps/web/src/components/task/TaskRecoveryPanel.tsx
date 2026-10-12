@@ -1,19 +1,30 @@
 import { useEffect, useState } from "react";
-import type { TaskLog } from "../../lib/types";
+import { Link } from "react-router-dom";
+import type { Task, TaskLog, TaskInputRequest } from "../../lib/types";
 import { IconError, IconPlay, IconRefresh, IconWarning } from "../icons";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingStructuredText } from "../../lib/taskDisplay";
+import { currentTaskBlocker } from "../../lib/taskBlocker";
+import TaskBlockerNotice from "./TaskBlockerNotice";
+import Card from "../ui/Card";
+import ChatActionCard from "../ui/ChatActionCard";
+import Chip from "../ui/Chip";
 
 
 type RecoverableStatus = "waiting_on_customer" | "blocked" | "failed";
 
 interface TaskRecoveryPanelProps {
+  task?: Task;
   status: string;
   logs: TaskLog[];
   comment?: string;
   detailReason?: string;
   inputStepId?: string;
   inputPrompt?: string;
+  inputRequests?: TaskInputRequest[];
+  inputResetToken?: number;
+  onResolveInput?: (request: TaskInputRequest, choice: string, note?: string, payload?: Record<string, any>, files?: File[]) => void;
+  reviewEffectsHref?: string;
   isPending?: boolean;
   variant?: "detail" | "compact";
   onRetry: (note?: string) => void;
@@ -60,12 +71,17 @@ function fieldLabel(field: HITLField) {
 }
 
 export default function TaskRecoveryPanel({
+  task,
   status,
   logs,
   comment = "",
   detailReason = "",
   inputStepId,
   inputPrompt = "",
+  inputRequests = [],
+  inputResetToken,
+  onResolveInput,
+  reviewEffectsHref,
   isPending = false,
   variant = "detail",
   onRetry,
@@ -86,6 +102,25 @@ export default function TaskRecoveryPanel({
     setFieldValues({});
   }, [inputStepId, lastEvent?.id]);
 
+  // Runtime input is orthogonal to Task lifecycle: parallel work may still
+  // be running. Reuse the same form and exact resolver as Workspace Chat.
+  if (inputRequests.length > 0 && onResolveInput) {
+    return (
+      <Card minHeight={0} hoverable={false} className={`task-recovery-panel task-recovery-panel--${variant}`}>
+        <Chip size="sm">{t("component.workspace_chat.input_needed")}</Chip>
+        {inputRequests.map((request) => (
+          <ChatActionCard
+            key={request.message_id}
+            action={request.pending_action}
+            workspaceId={task?.workspace_id}
+            disabled={isPending}
+            resetToken={inputResetToken}
+            onResolve={(choice, note, payload, files) => onResolveInput(request, choice, note, payload, files)}
+          />
+        ))}
+      </Card>
+    );
+  }
   if (!isRecoverable) return null;
 
   const isWaiting = status === "waiting_on_customer";
@@ -108,6 +143,50 @@ export default function TaskRecoveryPanel({
     : isFailed
       ? { bg: "#f8f0ef", border: "#ecc8c5", text: "#883a35", icon: "#c14a44", iconBg: "#f1dddb" }
       : { bg: "#f9f4ec", border: "#ecdac2", text: "#7c4a2e", icon: "#b66a3c", iconBg: "#ffedd5" };
+
+  if (reviewEffectsHref) {
+    const compact = variant === "compact";
+    return (
+      <div className={`task-recovery-panel task-recovery-panel--${variant} task-recovery-panel--effect-review`} style={{
+        background: palette.bg,
+        border: `1px solid ${palette.border}`,
+        borderRadius: compact ? 10 : 12,
+        padding: compact ? 10 : 12,
+        display: "flex",
+        alignItems: "center",
+        flexWrap: "wrap",
+        gap: compact ? 8 : 10,
+      }}>
+        <div className="task-recovery-icon" style={{ width: compact ? 28 : 30, height: compact ? 28 : 30, borderRadius: 8, background: palette.iconBg, color: palette.icon, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+          <IconWarning size={compact ? 14 : 15} />
+        </div>
+        <div style={{ flex: 1, minWidth: 180 }}>
+          <div className="task-recovery-title" style={{ fontSize: compact ? 12 : 13, fontWeight: 750, color: "#1c1917" }}>{t("component.task_recovery_panel.effect_review_title")}</div>
+          <div className="task-recovery-helper" style={{ fontSize: compact ? 11 : 12, color: palette.text, lineHeight: 1.5, marginTop: 2 }}>{t("component.task_recovery_panel.effect_review_helper")}</div>
+        </div>
+        <Link to={reviewEffectsHref} className="btn-manor" style={{ fontSize: compact ? 11 : 12, padding: "0 12px", minHeight: 30, whiteSpace: "nowrap" }}>
+          {t("component.task_recovery_panel.review_in_chat")}
+        </Link>
+      </div>
+    );
+  }
+
+  const blocker = currentTaskBlocker(task);
+  if (blocker) {
+    const blockerLog = logs.find((log) => log.id === blocker.log_id);
+    return (
+      <Card minHeight={0} hoverable={false} className={`task-recovery-panel task-recovery-panel--${variant}`}>
+        <TaskBlockerNotice
+          blocker={blocker}
+          workspaceId={task?.workspace_id}
+          technicalReason={blockerLog?.content}
+          showActions
+          onRetry={() => onRetry(comment.trim() || undefined)}
+          isPending={isPending}
+        />
+      </Card>
+    );
+  }
 
   const title = isWaiting ? t("component.task_recovery_panel.agent_waiting_for_input") : isFailed ? t("component.task_recovery_panel.agent_run_failed") : t("component.task_recovery_panel.agent_is_blocked");
   const compactTitle = isWaiting ? t("component.task_recovery_panel.waiting_for_input") : title;

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import asyncio
+from contextvars import ContextVar
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -15,6 +17,8 @@ if TYPE_CHECKING:
     from packages.core.services.entity_fs import EntityFileTargetKind
 
 logger = logging.getLogger(__name__)
+_mutation_owners: ContextVar[tuple[tuple[str, Any], ...]] = ContextVar("runtime_file_mutation_owners", default=())
+_projection_owners: ContextVar[tuple[tuple[str, Any], ...]] = ContextVar("runtime_file_projection_owners", default=())
 
 
 class RuntimeFileProjectionError(RuntimeError):
@@ -37,6 +41,7 @@ class _RuntimeProjectedFile:
     rollback_snapshot: Any
     written_version: Any
     projected: bool = False
+    write_attempted: bool = False
 
 
 @dataclass
@@ -56,18 +61,42 @@ class RuntimeFileProjectionTransaction:
         self._deletions: dict[str, _RuntimeDeletedPath] = {}
         self._document_ids: list[str] = []
         self._committed = False
+        self._commit_attempted = False
+        self._mutation_context: Any | None = None
+        self._projection_token: Any | None = None
+        self._projected_documents: dict[str, str] = {}
+        from packages.core.services.runtime_file_journal import RuntimeFileJournal
+        self._journal = RuntimeFileJournal(entity_id)
 
     async def __aenter__(self) -> RuntimeFileProjectionTransaction:
         from packages.core.database import async_session
+        from packages.core.services.runtime_file_journal import recover_runtime_file_commits
 
-        self._session_context = async_session()
-        self.db = await self._session_context.__aenter__()
+        root = runtime_entity_file_root(self.entity_id)
+        if not root:
+            raise RuntimeError("Entity filesystem is not enabled")
+        owner = (self.entity_id, asyncio.current_task())
+        if owner in _projection_owners.get():
+            raise RuntimeError("Nested file projection transactions for the same entity are not supported")
+        self._mutation_context = runtime_entity_filesystem_mutation_lock(root)
+        await self._mutation_context.__aenter__()
+        try:
+            await recover_runtime_file_commits(self.entity_id)
+            self._session_context = async_session()
+            self.db = await self._session_context.__aenter__()
+            self._projection_token = _projection_owners.set((*_projection_owners.get(), owner))
+        except BaseException:
+            await self._mutation_context.__aexit__(None, None, None)
+            raise
         return self
 
     async def __aexit__(self, exc_type, exc, traceback) -> bool:
         from packages.core.services.entity_fs import finish_entity_filesystem_mutation
 
+        session_cleanup_attempted = False
+
         async def close_transaction() -> None:
+            nonlocal session_cleanup_attempted
             rollback_error: Exception | None = None
             if not self._committed:
                 if self.db is not None:
@@ -75,6 +104,13 @@ class RuntimeFileProjectionTransaction:
                         await self.db.rollback()
                     except Exception as error:  # noqa: BLE001
                         rollback_error = error
+                # Commit may have succeeded on PostgreSQL even if its ACK was
+                # lost. Never roll back bytes while committed Documents survive.
+                if self._commit_attempted and self._journal.entries:
+                    self._committed = await self._journal.committed()
+                    if self._committed:
+                        rollback_error = None
+            if not self._committed:
                 for projected_file in reversed(list(self._files.values())):
                     try:
                         self._rollback_projected_file(projected_file)
@@ -85,6 +121,8 @@ class RuntimeFileProjectionTransaction:
                             exc_info=True,
                         )
                         rollback_error = rollback_error or error
+                if rollback_error is None:
+                    await self._journal.settled(committed=False)
                 for deleted_path in reversed(list(self._deletions.values())):
                     try:
                         deleted_path.delete_snapshot.rollback()
@@ -96,6 +134,7 @@ class RuntimeFileProjectionTransaction:
                         )
                         rollback_error = rollback_error or error
             if self._session_context is not None:
+                session_cleanup_attempted = True
                 try:
                     await self._session_context.__aexit__(exc_type, exc, traceback)
                 except Exception:  # noqa: BLE001
@@ -123,26 +162,29 @@ class RuntimeFileProjectionTransaction:
                     "Runtime file projection rollback could not restore prior state",
                 ) from rollback_error
 
-        await finish_entity_filesystem_mutation(close_transaction())
+        try:
+            await finish_entity_filesystem_mutation(close_transaction())
+        finally:
+            try:
+                # A failure to read the durable commit decision must not leak a
+                # DB connection (and must not turn into a filesystem rollback).
+                close_session = getattr(self.db, "close", None)
+                if callable(close_session) and not session_cleanup_attempted:
+                    await close_session()
+            finally:
+                if self._projection_token is not None:
+                    _projection_owners.reset(self._projection_token)
+                if self._mutation_context is not None:
+                    await self._mutation_context.__aexit__(exc_type, exc, traceback)
         return False
 
     def _rollback_projected_file(self, projected_file: _RuntimeProjectedFile) -> None:
-        """Refresh the installed version when possible, then restore safely."""
+        """Restore only the exact installed version, never infer ownership."""
         if projected_file.written_version is None:
-            from packages.core.services.entity_fs import open_entity_file_snapshot
-
-            snapshot = projected_file.rollback_snapshot
-            try:
-                with open_entity_file_snapshot(
-                    self.entity_id,
-                    snapshot.rel_path,
-                    expected_resolved_path=snapshot.resolved_path,
-                ) as current:
-                    projected_file.written_version = current.version
-            except Exception:  # noqa: BLE001
-                # rollback() distinguishes a genuinely missing target from an
-                # existing target that cannot be verified and fails closed.
-                pass
+            if not projected_file.write_attempted:
+                projected_file.rollback_snapshot.discard_unwritten()
+                return
+            raise RuntimeFileCommitError("File installation has no ownership receipt; reconciliation required")
         projected_file.rollback_snapshot.rollback(
             projected_file.written_version,
         )
@@ -179,19 +221,21 @@ class RuntimeFileProjectionTransaction:
         ) as written:
             if projected_file.rollback_snapshot is not rollback_snapshot:
                 raise RuntimeError("Runtime write rollback snapshot changed")
-            projected_file.written_version = written.version
+            if projected_file.written_version != written.version:
+                raise RuntimeFileCommitError("File changed after atomic installation")
 
-    def _stage_and_write(
+    async def _stage_and_write(
         self,
         *,
         rel_path: str,
         expected_content_sha256: str,
         expected_source_version: Any | None,
-        writer: Callable[[Any | None], str],
+        writer: Callable[[Any | None, Callable[[Any], None]], str],
     ) -> str:
         from packages.core.services.entity_fs import stage_entity_file_rollback_snapshot
 
         rollback_snapshot = None
+        installed = False
         try:
             self._assert_can_stage(rel_path)
             rollback_snapshot = stage_entity_file_rollback_snapshot(
@@ -204,9 +248,23 @@ class RuntimeFileProjectionTransaction:
                 rollback_snapshot=rollback_snapshot,
                 written_version=None,
             )
-            resolved_path = writer(rollback_snapshot.source_version)
+            await self._journal.prepare(rollback_snapshot, expected_content_sha256)
+            projected_file = self._files[key]
+            projected_file.write_attempted = True
+
+            def receive_installation(version: Any | None) -> None:
+                projected_file.written_version = version
+                # None is an explicit no-install receipt, not an absent one.
+                projected_file.write_attempted = version is not None
+
+            resolved_path = writer(
+                rollback_snapshot.source_version,
+                receive_installation,
+            )
+            installed = True
             if os.path.abspath(resolved_path) != key:
                 raise RuntimeError("Runtime writer returned a different target path")
+            await self._journal.installed(rel_path, projected_file.written_version)
             self._record_written_file(
                 rel_path=rel_path,
                 resolved_path=resolved_path,
@@ -221,7 +279,13 @@ class RuntimeFileProjectionTransaction:
                 projected_file = self._files[
                     os.path.abspath(rollback_snapshot.resolved_path)
                 ]
-                self._rollback_projected_file(projected_file)
+                if installed or projected_file.written_version is not None:
+                    self._rollback_projected_file(projected_file)
+                elif not projected_file.write_attempted:
+                    rollback_snapshot.discard_unwritten()
+                # An atomic writer failure without a receipt is not proof of
+                # no installation: retain staging for the journal reconciler,
+                # which can prove an unchanged original without replacing it.
             except Exception:  # noqa: BLE001
                 logger.critical(
                     "Runtime staged write rollback failed for %s",
@@ -264,7 +328,7 @@ class RuntimeFileProjectionTransaction:
         except Exception as exc:
             raise RuntimeFileCommitError(str(exc)) from exc
 
-    def write_bytes(
+    async def write_bytes(
         self,
         rel_path: str,
         data: bytes,
@@ -276,11 +340,11 @@ class RuntimeFileProjectionTransaction:
         expected_source_version: Any | None = None,
     ) -> str:
         """Stage prior state, atomically write bytes, and pin the new version."""
-        return self._stage_and_write(
+        return await self._stage_and_write(
             rel_path=rel_path,
             expected_content_sha256=expected_content_sha256,
             expected_source_version=expected_source_version,
-            writer=lambda staged_version: runtime_write_entity_file_atomic(
+            writer=lambda staged_version, receipt: runtime_write_entity_file_atomic(
                 self.entity_id,
                 rel_path,
                 data,
@@ -288,10 +352,11 @@ class RuntimeFileProjectionTransaction:
                 allow_empty=allow_empty,
                 require_missing=require_missing,
                 expected_source_version=staged_version,
+                installed_receipt=receipt,
             ),
         )
 
-    def copy_file(
+    async def copy_file(
         self,
         rel_path: str,
         source_path: str,
@@ -303,11 +368,11 @@ class RuntimeFileProjectionTransaction:
         expected_source_version: Any | None = None,
     ) -> str:
         """Stage prior state, atomically copy a file, and pin the new version."""
-        return self._stage_and_write(
+        return await self._stage_and_write(
             rel_path=rel_path,
             expected_content_sha256=expected_content_sha256,
             expected_source_version=expected_source_version,
-            writer=lambda staged_version: runtime_copy_entity_file_atomic(
+            writer=lambda staged_version, receipt: runtime_copy_entity_file_atomic(
                 self.entity_id,
                 rel_path,
                 source_path,
@@ -315,6 +380,7 @@ class RuntimeFileProjectionTransaction:
                 allow_empty=allow_empty,
                 require_missing=require_missing,
                 expected_source_version=staged_version,
+                installed_receipt=receipt,
             ),
         )
 
@@ -337,6 +403,7 @@ class RuntimeFileProjectionTransaction:
         if not sync.synced or not sync.document_id:
             raise RuntimeFileProjectionError(rel_path, sync.reason)
         projected_file.projected = True
+        self._projected_documents[rel_path] = sync.document_id
         if getattr(sync, "content_changed", True):
             self._document_ids.append(sync.document_id)
         return sync
@@ -436,7 +503,17 @@ class RuntimeFileProjectionTransaction:
                         target_kind=cleanup_kind,
                     )
 
-            await self.db.commit()
+            await self._journal.mark_committed(self.db, self._projected_documents)
+            self._commit_attempted = True
+            try:
+                await self.db.commit()
+            except Exception:
+                try:
+                    await self.db.rollback()
+                except Exception:
+                    logger.warning("Lost file commit connection; checking durable outcome independently", exc_info=True)
+                if not self._journal.entries or not await self._journal.committed():
+                    raise
             self._committed = True
             cleaned_paths: set[str] = set()
             for projected_file in self._files.values():
@@ -484,9 +561,21 @@ class RuntimeFileProjectionTransaction:
                         "Committed Runtime file cleanup intents remain queued",
                         exc_info=True,
                     )
+            try:
+                await self._journal.settled(
+                    committed=True,
+                    cleanup_pending=any(item.rollback_snapshot.backup_name is not None for item in self._files.values()),
+                )
+            except Exception:
+                logger.warning("Committed file cleanup will be retried from its durable journal", exc_info=True)
             from packages.core.services.tool_cache_version import bump_tool_cache_version
 
-            await bump_tool_cache_version(self.entity_id, "documents")
+            try:
+                await bump_tool_cache_version(self.entity_id, "documents")
+            except Exception:
+                # Cache/embedding follow-up is not the durable write outcome.
+                # Returning failure here can provoke an unnecessary re-write.
+                logger.warning("Committed file cache invalidation failed", exc_info=True)
             for document_id in dict.fromkeys(self._document_ids):
                 runtime_trigger_document_embeddings(document_id)
         await finish_entity_filesystem_mutation(commit_transaction())
@@ -606,6 +695,7 @@ def runtime_write_entity_file_atomic(
     allow_empty: bool = False,
     require_missing: bool = False,
     expected_source_version: Any | None = None,
+    installed_receipt: Callable[[Any], None] | None = None,
 ) -> str:
     """Persist bytes through the entity filesystem write guard."""
 
@@ -622,6 +712,7 @@ def runtime_write_entity_file_atomic(
             require_missing=require_missing,
         ),
         expected_source_version=expected_source_version,
+        installed_receipt=installed_receipt,
     )
 
 
@@ -634,6 +725,7 @@ def runtime_copy_entity_file_atomic(
     allow_empty: bool = False,
     require_missing: bool = False,
     expected_source_version: Any | None = None,
+    installed_receipt: Callable[[Any], None] | None = None,
 ) -> str:
     """Persist a local file through the same Runtime commit guard as bytes."""
 
@@ -650,6 +742,7 @@ def runtime_copy_entity_file_atomic(
             require_missing=require_missing,
         ),
         expected_source_version=expected_source_version,
+        installed_receipt=installed_receipt,
     )
 
 
@@ -659,8 +752,16 @@ async def runtime_entity_filesystem_mutation_lock(entity_root: str):
 
     from packages.core.services.entity_fs import entity_filesystem_mutation_lock
 
-    async with entity_filesystem_mutation_lock(entity_root):
+    identity = (os.path.abspath(entity_root), asyncio.current_task())
+    if identity in _mutation_owners.get():
         yield
+        return
+    async with entity_filesystem_mutation_lock(entity_root):
+        token = _mutation_owners.set((*_mutation_owners.get(), identity))
+        try:
+            yield
+        finally:
+            _mutation_owners.reset(token)
 
 
 async def runtime_guard_file_mutation(
@@ -733,6 +834,7 @@ async def runtime_guard_file_read_access(
     *,
     entity_id: str,
     user_id: str | None = None,
+    conversation_id: str | None = None,
     workspace_id: str | None = None,
     runtime_envelope: Any | None = None,
     tool_name: str,
@@ -745,6 +847,7 @@ async def runtime_guard_file_read_access(
     return await guard_ai_file_read_access(
         entity_id=entity_id,
         user_id=user_id,
+        conversation_id=conversation_id,
         workspace_id=workspace_id,
         runtime_envelope=runtime_envelope,
         tool_name=tool_name,

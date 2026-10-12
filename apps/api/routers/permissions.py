@@ -99,6 +99,15 @@ async def list_permission_catalog(
 # ── Staff Role CRUD ──────────────────────────────────────────────────────────
 
 _SYSTEM_ROLE_NAMES = {"owner", "admin", "member", "viewer"}
+_REQUIRED_SYSTEM_ROLE_PERMISSIONS = {
+    "owner": {
+        Permission.DOCS_READ_ALL.value,
+        Permission.DOCS_MANAGE_ALL.value,
+        Permission.DOCS_TRANSFER_DEPARTED.value,
+        Permission.WORKSPACES_READ_ALL.value,
+    },
+    "admin": {Permission.DOCS_TRANSFER_DEPARTED.value},
+}
 
 
 class RoleResponse(BaseModel):
@@ -212,6 +221,14 @@ async def update_role(
 
     if req.permissions is not None:
         _validate_permission_keys(req.permissions)
+        missing = _REQUIRED_SYSTEM_ROLE_PERMISSIONS.get(role.name.lower(), set()).difference(
+            req.permissions
+        )
+        if missing:
+            raise HTTPException(
+                400,
+                "This system role requires: " + ", ".join(sorted(missing)),
+            )
         role.permissions = req.permissions
 
     if req.is_default is not None:

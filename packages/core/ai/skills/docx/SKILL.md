@@ -17,6 +17,7 @@ A .docx file is a ZIP archive containing XML files.
 | Read/analyze content | `pandoc` or unpack for raw XML |
 | Create new document | Use `docx-js` - see Creating New Documents below |
 | Edit existing document | Unpack → edit XML → repack - see Editing Existing Documents below |
+| Deliver the final file | Export under `projects/<project>/exports/`, render every page, pass `scripts/docx_quality_gate.py` - see Final Delivery below |
 
 ### Converting .doc to .docx
 
@@ -55,7 +56,8 @@ python scripts/accept_changes.py input.docx output.docx
 
 ## Creating New Documents
 
-Generate .docx files with JavaScript, then validate. Install: `npm install -g docx`
+Generate .docx files with JavaScript, then validate. The sandbox installs the
+bundled `docx` dependency automatically before execution.
 
 ### Setup
 ```javascript
@@ -76,6 +78,39 @@ After creating the file, validate it. If validation fails, unpack, fix the XML, 
 ```bash
 python scripts/office/validate.py doc.docx
 ```
+
+### Final Delivery (mandatory before `save_result` with `artifact_role="final"`)
+
+Manor reruns a machine quality gate server-side when a final DOCX is saved and
+binds the report to the exact file bytes. A final file outside the project
+layout, or without render and gate evidence, is refused; renaming or copying
+the file does not bypass the check. Use `artifact_role="intermediate"` for
+drafts and supporting files that must not go through the gate.
+
+1. **Project layout.** Write the final file to
+   `/skill/projects/<project>/exports/<name>.docx` (create the directories).
+2. **Render every page** after the last edit and look at the pages:
+   ```bash
+   python scripts/office/soffice.py --headless --convert-to pdf \
+     projects/<project>/exports/<name>.docx --outdir projects/<project>/qa/final-render
+   pdftoppm -jpeg -r 110 projects/<project>/qa/final-render/<name>.pdf \
+     projects/<project>/qa/final-render/page
+   ```
+3. **Run the machine gate** (exit code 1 or a score below 90 is a hard stop:
+   fix the source, re-export, re-render, rerun):
+   ```bash
+   python3 scripts/docx_quality_gate.py projects/<project>/exports/<name>.docx \
+     --project projects/<project> \
+     --render-dir projects/<project>/qa/final-render \
+     --min-score 90 \
+     --report projects/<project>/qa/docx-quality.json
+   ```
+   The gate checks the OOXML package and schema (`scripts/office/validate.py`),
+   an empty body, unresolved placeholders (`{{...}}`, `[INSERT ...]`, `TODO`,
+   lorem ipsum), and that every page has fresh render evidence. Its
+   `repair_actions` are the next-pass instructions.
+4. **Save** with `sandbox` action `save_result`,
+   `file_path="/skill/projects/<project>/exports/<name>.docx"`, `artifact_role="final"`.
 
 ### Page Size
 
@@ -585,6 +620,6 @@ After running `comment.py` (see Step 2), add markers to document.xml. For replie
 ## Dependencies
 
 - **pandoc**: Text extraction
-- **docx**: `npm install -g docx` (new documents)
+- **docx**: bundled and installed automatically for new documents
 - **LibreOffice**: PDF conversion (auto-configured for sandboxed environments via `scripts/office/soffice.py`)
 - **Poppler**: `pdftoppm` for images

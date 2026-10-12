@@ -21,6 +21,7 @@ from packages.core.services.official_remote_mcp import (
     OfficialRemoteMCPFactory,
     OfficialRemoteMCPProvider,
 )
+from packages.core.services.lark_oauth import LARK_OAUTH_SCOPES
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,13 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
     ("manor_mcp_minutes", "Manor Minutes",
      "Meeting notes from Minutes: search meetings, read transcripts, "
      "summaries, key points, and action items; ask questions about a meeting.",
-     "builtin", "packages.core.ai.mcp.manor_mcp_minutes", "none", None),
+     "builtin", "packages.core.ai.mcp.manor_mcp_minutes", "oauth2", "minutes:read minutes:write"),
+    ("manor_pms", "Manor PMS",
+     "Manage available units, leads, tours, applications, properties, tenants, leases, "
+     "maintenance, property inspections and walkthroughs, tenant communication messages, "
+     "notices and notification records, payments, accounting, and short-stay operations "
+     "through a connected PMS management account.",
+     "builtin", "packages.core.ai.mcp.manor_pms", "oauth2", "pms:read pms:write"),
     ("google_drive", "Google Drive",
      "Search and read user-requested Drive files; create and manage files "
      "that Manor creates or the user explicitly opens or shares with Manor.",
@@ -108,6 +115,11 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "builtin", "packages.core.ai.mcp.slack", "oauth2",
      "chat:write,channels:read,channels:history,users:read,"
      "app_mentions:read,im:history"),
+    ("lark", "Lark",
+     "Read chats and messages; send and reply to text messages; read and write documents; "
+     "read Bitable tables and create or update records with your authorized user account. "
+     "Existing Lark and Feishu app connections remain available.",
+     "builtin", "packages.core.ai.mcp.lark", "oauth2", LARK_OAUTH_SCOPES),
     ("notion", "Notion",
      "Read/write Notion pages and databases.",
      "builtin", "packages.core.ai.mcp.notion", "oauth2",
@@ -166,11 +178,19 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "High-quality TTS + voice cloning. Multilingual; emits MP3 to "
      "Manor's filesystem so subsequent steps can attach or stream it.",
      "builtin", "packages.core.ai.mcp.elevenlabs", "api_key", None),
+    ("suno", "Suno",
+     "Generate original songs, covers, and mashups through Suno's official "
+     "asynchronous API. Paid create calls return a job for explicit status checks.",
+     "builtin", "packages.core.ai.mcp.suno", "api_key", None),
     ("tavily", "Tavily",
      "AI-tuned web search + content extraction. Returns synthesized "
      "snippets, optional inline article body, and a 1-sentence answer. "
      "Free tier: 1000 calls/month — enough for most agent workloads.",
      "builtin", "packages.core.ai.mcp.tavily", "api_key", None),
+    ("apify", "Apify",
+     "Search public Instagram creators and collect recent posts and Reels "
+     "through Apify's official MCP with a quoted budget and tracked status.",
+     "builtin", "packages.core.ai.mcp.apify", "api_key", None),
     ("alpaca_market_data", "Alpaca Market Data",
      "Read-only US stock quotes, trades, snapshots, bars, and news. "
      "This integration cannot access brokerage accounts or place orders.",
@@ -203,10 +223,11 @@ _MCP_CATALOG: list[tuple[str, str, str, str, str, str, str | None]] = [
      "public,private"),
 
     # ── Social platforms (provider OAuth) ──
-    ("facebook", "Facebook (Pages + Messenger)",
-     "Let agents post to your Facebook Pages (text, photos, video, "
-     "scheduled), reply to comments, hide spam, pull reach + engagement "
-     "stats, and handle Messenger DMs on your behalf.",
+    # The display name is Meta; keep the facebook key for existing OAuth accounts.
+    ("facebook", "Meta",
+     "Connect Facebook Pages and their Messenger inboxes, plus Instagram "
+     "Business or Creator accounts linked to those Pages. Manage posts, "
+     "comments, and insights with one Facebook login.",
      "builtin", "packages.core.ai.mcp.facebook", "oauth2",
      "public_profile,pages_show_list,pages_read_engagement,pages_manage_posts,"
      "pages_manage_engagement,pages_messaging,pages_manage_metadata,"
@@ -335,6 +356,31 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "SELECT pg_advisory_xact_lock(hashtext('manor.mcp_seed_catalog'), 0)"
         ))
 
+        # File operations use native tools; retire the duplicate internal MCP.
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key = 'manor_mcp_file_engine'"
+        ))
+
+        # The old generic local-browser MCP was superseded by the explicit
+        # Chrome MCP. Remove the catalog row and any stale private bindings;
+        # no runtime alias remains after this migration.
+        await conn.execute(text(
+            "DELETE FROM agent_mcp_bindings WHERE mcp_server_id IN ("
+            "SELECT id FROM mcp_servers WHERE server_key = 'local_browser')"
+        ))
+        await conn.execute(text(
+            "DELETE FROM mcp_account_tool_catalogs WHERE provider = 'local_browser'"
+        ))
+        await conn.execute(text(
+            "DELETE FROM integrations WHERE provider = 'local_browser'"
+        ))
+        await conn.execute(text(
+            "DELETE FROM oauth_accounts WHERE provider = 'local_browser'"
+        ))
+        await conn.execute(text(
+            "DELETE FROM mcp_servers WHERE server_key = 'local_browser'"
+        ))
+
         # One-time migration: the SMTP-only provider was merged into a
         # combined IMAP+SMTP provider keyed ``email``. Drop any stale row
         # and re-point existing Integration rows to the new provider key.
@@ -409,6 +455,13 @@ async def seed_mcp_catalog(engine: Engine) -> int:
             "google_drive",
             "youtube",
             "whatsapp",
+            "facebook",
+            "apify",
+            "suno",
+            # Refresh authentication metadata without touching saved accounts.
+            "manor_pms",
+            "manor_mcp_minutes",
+            "lark",
         }
         for key, name, desc, transport, endpoint, auth_type, scopes in _MCP_CATALOG:
             if key not in refreshed_catalog_keys:

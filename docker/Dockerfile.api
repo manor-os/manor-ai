@@ -1,14 +1,16 @@
+
 FROM python:3.12-slim
 
 WORKDIR /app
 
 # Install system deps + FUSE + JuiceFS + LibreOffice (for PPTX/DOCX rendering)
+# Poppler + Tesseract provide the bounded OCR fallback for image-only PDFs.
 # tini is PID 1 (see ENTRYPOINT): it reaps zombies and forwards SIGTERM to
 # entrypoint.sh, which traps it to unmount JuiceFS cleanly before exit.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini curl ripgrep fuse3 ffmpeg \
     libreoffice-impress libreoffice-writer libreoffice-calc \
-    poppler-utils \
+    poppler-utils tesseract-ocr tesseract-ocr-eng tesseract-ocr-chi-sim \
     fonts-crosextra-caladea fonts-crosextra-carlito fonts-lato \
     fonts-liberation fonts-noto-core fonts-noto-cjk fonts-roboto && \
     rm -rf /var/lib/apt/lists/* && \

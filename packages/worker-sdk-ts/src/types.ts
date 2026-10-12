@@ -18,6 +18,7 @@ export interface CredentialBundle {
 
 export interface Lease {
   lease_id: string;
+  attempt_token?: string | null;
   step_id: string;
   plan_id: string;
   workspace_id: string | null;
@@ -64,7 +65,7 @@ export interface LeaseResult {
   /** Native JSON value; the leased output schema owns its shape. */
   result?: unknown;
   cost?: LeaseCost | null;
-  evidence_refs?: string[] | null;
+  evidence_refs?: (string | Record<string, unknown>)[] | null;
   task_output_value_kind?: TaskOutputValueKind;
 }
 
@@ -107,16 +108,18 @@ export class LeaseResultFactory {
 
 export interface HeartbeatActiveLease {
   lease_id: string;
+  attempt_token?: string | null;
   progress?: number;
 }
 
 export interface HeartbeatCompletedLease {
   lease_id: string;
+  attempt_token?: string | null;
   status: "done" | "failed";
   result?: unknown;
   error?: Record<string, unknown> | null;
   cost?: LeaseCost | null;
-  evidence_refs?: string[] | null;
+  evidence_refs?: (string | Record<string, unknown>)[] | null;
   task_output_value_kind: TaskOutputValueKind;
 }
 
@@ -170,12 +173,14 @@ export class NeedHumanInput extends Error {
 export class WorkerClientError extends Error {
   readonly statusCode?: number;
   readonly body?: unknown;
+  readonly retryAfterMs: number;
 
-  constructor(message: string, opts?: { statusCode?: number; body?: unknown }) {
+  constructor(message: string, opts?: { statusCode?: number; body?: unknown; retryAfterMs?: number }) {
     super(message);
     this.name = "WorkerClientError";
     this.statusCode = opts?.statusCode;
     this.body = opts?.body;
+    this.retryAfterMs = opts?.retryAfterMs ?? 0;
   }
 
   /** Retrying unchanged credentials/protocol cannot recover these responses. */

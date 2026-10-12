@@ -26,6 +26,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from packages.core.models.user import Entity
+from packages.core.governance.approval_policy_service import account_defaults, initialize_workspace_approval
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -93,6 +96,7 @@ async def _seed(db: AsyncSession, entity_id: str) -> dict[str, Any]:
     )
     db.add(ws)
     await db.flush()
+    await initialize_workspace_approval(db, ws)
 
     tool_x_post = ToolDefinition(
         id=generate_ulid(),
@@ -268,11 +272,13 @@ async def _seed(db: AsyncSession, entity_id: str) -> dict[str, Any]:
 
 
 @pytest.fixture
-def entity_id() -> str:
-    """Per-test unique entity_id so DB rows from concurrent tests don't
-    interfere with each other without needing truncation. ULID is 26
-    chars which matches the entity_id column width."""
-    return generate_ulid()
+async def entity_id(db_session) -> str:
+    """Each export starts with a real account and its approval defaults."""
+    entity = Entity(id=generate_ulid(), name="Blueprint export account",
+                    settings={"approval_defaults": account_defaults()})
+    db_session.add(entity)
+    await db_session.commit()
+    return entity.id
 
 
 # ── Tests ─────────────────────────────────────────────────────────────
@@ -628,6 +634,50 @@ async def test_export_drops_source_workspace_runtime_ids(
     assert "example-sensitive-value" not in str(payload)
 
 
+async def test_export_drops_automatic_mode_and_saved_grants_from_operating_model(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    workspace = seeded["workspace"]
+    workspace.operating_model = {
+        "governance": {
+            "approval": {"mode": "automatic", "rules": [
+                {"id": "review", "effect": "ask", "selector": {"kind": "action", "action_key": "external.post"}},
+                {"id": "grant", "effect": "allow", "selector": {"kind": "action", "action_key": "external_message.send"}},
+            ]},
+        },
+    }
+    await db_session.commit()
+
+    # The stale mirror cannot create consent or review requirements. The
+    # initialized authoritative policy is empty, so both portable views are {}.
+    payload = await export_workspace(db_session, workspace.id, title="T")
+    assert payload["policy"]["governance"] == {}
+    assert payload["recipe"]["operating_model"]["governance"] == {}
+
+    from packages.core.governance.policy import policy_from_dict
+    from packages.core.governance.service import update_policy
+
+    await update_policy(db_session, entity_id=entity_id, workspace_id=workspace.id,
+        policy=policy_from_dict({"approval": {"mode": "automatic", "rules": [
+            {"id": "current-review", "effect": "ask", "selector": {
+                "kind": "action", "action_key": "workspace.file.modify"}},
+            {"id": "current-grant", "effect": "allow", "selector": {
+                "kind": "action", "action_key": "external_message.send"}},
+        ]}}), change_summary="Authoritative export fixture")
+    await db_session.commit()
+    payload = await export_workspace(db_session, workspace.id, title="T")
+    assert payload["recipe"]["operating_model"]["governance"] == payload["policy"]["governance"]
+    portable = payload["policy"]["governance"]["approval"]
+    assert portable["mode"] is None
+    assert [(rule["effect"], rule["selector"]) for rule in portable["rules"]] == [
+        ("ask", {"kind": "action", "action_key": "workspace.file.modify"}),
+    ]
+    assert workspace.operating_model["governance"]["approval"]["mode"] == "automatic"
+    assert workspace.operating_model["governance"]["approval"]["rules"][0]["selector"]["action_key"] == "external.post"
+
+
 async def test_export_rejects_secrets_in_declared_portable_workspace_settings(
     db_session: AsyncSession,
     entity_id: str,
@@ -704,6 +754,20 @@ async def test_export_includes_workspace_workflow_binding(
                 },
                 "next": [],
             },
+            {
+                "id": "verify",
+                "type": "tool",
+                "name": "Verify",
+                "config": {
+                    "tool": "verify_file_collection",
+                    "args": {"expected_sources": [
+                        {"document_id": "{{audio_files.0.document_id}}", "role": "source_audio"},
+                        {"document_id": seeded["agent_a"].id, "role": "source_cover"},
+                        {"document_id": f"{{{{audio_files.0.document_id}}}} {seeded['agent_a'].id}", "role": "interpolated"},
+                    ]},
+                },
+                "next": [],
+            },
         ],
         variables={"tone": "concise"},
         category="content",
@@ -754,10 +818,22 @@ async def test_export_includes_workspace_workflow_binding(
     db_session.add_all([binding, scheduled_job])
     await db_session.commit()
 
+    # A fixed file locator can no longer silently disappear from an executable
+    # graph. It must reference an included starter (covered by Knowledge tests).
+    with pytest.raises(ExportError, match="Knowledge document not included"):
+        await export_workspace(db_session, seeded["workspace"].id, title="T")
+    workflow.steps = [
+        {**step, "config": {**step["config"], "args": {"expected_sources": [
+            {"document_id": "{{audio_files.0.document_id}}", "role": "source_audio"},
+        ]}}} if step["id"] == "verify" else step
+        for step in workflow.steps
+    ]
+    await db_session.flush()
     payload = await export_workspace(db_session, seeded["workspace"].id, title="T")
 
     [exported] = payload["recipe"]["workflows"]
     assert exported["slug"] == "daily-brief-v1"
+    assert exported["definition_name"] == "daily-brief"
     assert exported["name"] == "Daily Brief"
     assert exported["binding_config"] == {"chat_entrypoint": {"enabled": True}}
     assert exported["trigger_config"] == {
@@ -769,6 +845,10 @@ async def test_export_includes_workspace_workflow_binding(
     assert exported["definition_enabled"] is True
     assert exported["definition_status"] == "active"
     assert exported["run_inputs"] == [{"key": "topic", "type": "string"}]
+    verify = next(step for step in exported["steps"] if step["id"] == "verify")
+    assert verify["config"]["args"]["expected_sources"] == [
+        {"document_id": "{{audio_files.0.document_id}}", "role": "source_audio"},
+    ]
     assert exported["variables"] == [
         {"key": "audience", "default": "founders"},
         {"key": "tone", "default": "concise"},
@@ -780,6 +860,70 @@ async def test_export_includes_workspace_workflow_binding(
         "workflow_slug": "daily-brief-v1",
     }
     assert exported_job["enabled"] is False
+
+
+async def test_export_declares_fixed_workflow_tools_as_dependencies(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    workspace = Workspace(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        name="Workflow tools",
+        kind="operations",
+        operating_context="ctx",
+        primary_work="work",
+        operating_model={},
+        settings={},
+    )
+    workflow = WorkflowDefinition(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=workspace.id,
+        name="workflow-tools",
+        steps=[
+            {
+                "id": "verify",
+                "type": "tool",
+                "name": "Verify",
+                "config": {"tool": "verify_file_collection"},
+                "next": [],
+            },
+            {
+                "id": "repeat",
+                "type": "loop",
+                "name": "Repeat",
+                "config": {"steps": [
+                    {
+                        "id": "read",
+                        "type": "tool",
+                        "name": "Read",
+                        "config": {"tool": "read_file"},
+                    },
+                    {
+                        "id": "dynamic",
+                        "type": "tool",
+                        "name": "Dynamic",
+                        "config": {"tool": "{{selected_tool}}"},
+                    },
+                ]},
+                "next": [],
+            },
+        ],
+        is_active=True,
+        status="active",
+    )
+    db_session.add_all([workspace, workflow])
+    await db_session.flush()
+    await initialize_workspace_approval(db_session, workspace)
+    await db_session.commit()
+
+    payload = await export_workspace(db_session, workspace.id, title="Workflow tools")
+
+    assert payload["contract"]["requires"]["tools"] == [
+        "read_file",
+        "verify_file_collection",
+    ]
 
 
 async def test_knowledge_pack_modes_use_canonical_membership_and_real_text(
@@ -1237,21 +1381,34 @@ async def test_paused_scheduled_skill_round_trips_by_portable_component_key(
         version="2.3.4",
         status="active",
     )
+    source_subscription = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_id=seeded["agent_a"].id,
+        workspace_id=workspace.id,
+        service_key="weekly.pipeline",
+        status="active",
+    )
     source_job = ScheduledJob(
         id=generate_ulid(),
         job_id=f"weekly-pipeline-{entity_id}",
         entity_id=entity_id,
         workspace_id=workspace.id,
         name="Weekly pipeline",
+        agent_id=seeded["agent_a"].id,
         execution_type="skill",
-        execution_target={"skill_id": source_skill.id, "complexity": "worker"},
+        execution_target={
+            "skill_id": source_skill.id,
+            "complexity": "worker",
+            "agent_subscription_id": source_subscription.id,
+        },
         schedule_kind="cron",
         cron_expr="0 9 * * 1",
         payload_message="Prepare this week's pipeline report.",
         enabled=False,
         delete_after_run=True,
     )
-    db_session.add_all([source_skill, source_job])
+    db_session.add_all([source_skill, source_subscription, source_job])
     await db_session.commit()
 
     payload = await export_workspace(db_session, workspace.id, title="Portable")
@@ -1261,7 +1418,9 @@ async def test_paused_scheduled_skill_round_trips_by_portable_component_key(
         if job["job_id"] == source_job.job_id
     )
     assert "skill_id" not in exported_job["execution_target"]
+    assert "agent_subscription_id" not in exported_job["execution_target"]
     assert exported_job["execution_target"]["skill_component_key"] == source_skill.slug
+    assert exported_job["execution_target"]["service_key"] == "weekly.pipeline"
     assert exported_job["enabled"] is False
     assert exported_job["delete_after_run"] is True
     assert [
@@ -1284,12 +1443,99 @@ async def test_paused_scheduled_skill_round_trips_by_portable_component_key(
     installed_skill_id = installed_job.execution_target["skill_id"]
     assert installed_skill_id != source_skill.id
     installed_skill = await db_session.get(Skill, installed_skill_id)
+    installed_subscription = await db_session.get(
+        AgentSubscription,
+        installed_job.execution_target["agent_subscription_id"],
+    )
     assert installed_skill is not None
+    assert installed_subscription is not None
+    assert installed_subscription.workspace_id == installed.workspace_id
+    assert installed_subscription.service_key == "weekly.pipeline"
+    assert installed_job.agent_id == installed_subscription.agent_id
     assert installed_skill.workspace_id == installed.workspace_id
     assert installed_skill.version == "2.3.4"
     assert installed_skill.config["scripts"] == {"run.py": "print('ok')"}
     assert installed_job.enabled is False
     assert installed_job.delete_after_run is True
+
+
+async def test_export_rejects_custom_scheduled_agent_without_portable_deployment(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    unportable_subscription = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_id=seeded["agent_a"].id,
+        workspace_id=seeded["workspace"].id,
+        service_key=None,
+        status="active",
+    )
+    source_job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"unportable-agent-{entity_id}",
+        entity_id=entity_id,
+        workspace_id=seeded["workspace"].id,
+        agent_id=seeded["agent_a"].id,
+        execution_type="agent",
+        execution_target={"agent_subscription_id": unportable_subscription.id},
+        schedule_kind="cron",
+        cron_expr="0 9 * * *",
+        enabled=False,
+    )
+    db_session.add_all([unportable_subscription, source_job])
+    await db_session.commit()
+
+    with pytest.raises(ExportError, match="no portable Agent deployment target"):
+        await export_workspace(
+            db_session,
+            seeded["workspace"].id,
+            title="Unportable Agent schedule",
+        )
+
+
+async def test_export_rejects_ambiguous_scheduled_agent_service_key(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    seeded = await _seed(db_session, entity_id)
+    source_subscription = (await db_session.execute(
+        select(AgentSubscription).where(
+            AgentSubscription.workspace_id == seeded["workspace"].id,
+            AgentSubscription.agent_id == seeded["agent_a"].id,
+            AgentSubscription.service_key == "social.x.reply",
+        )
+    )).scalar_one()
+    duplicate_service = AgentSubscription(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        agent_id=seeded["agent_b"].id,
+        workspace_id=seeded["workspace"].id,
+        service_key="social.x.reply",
+        status="active",
+    )
+    source_job = ScheduledJob(
+        id=generate_ulid(),
+        job_id=f"ambiguous-agent-{entity_id}",
+        entity_id=entity_id,
+        workspace_id=seeded["workspace"].id,
+        agent_id=seeded["agent_a"].id,
+        execution_type="agent",
+        execution_target={"agent_subscription_id": source_subscription.id},
+        schedule_kind="cron",
+        cron_expr="0 9 * * *",
+        enabled=False,
+    )
+    db_session.add_all([duplicate_service, source_job])
+    await db_session.commit()
+
+    with pytest.raises(ExportError, match="ambiguous portable service target"):
+        await export_workspace(
+            db_session,
+            seeded["workspace"].id,
+            title="Ambiguous Agent schedule",
+        )
 
 
 @pytest.mark.parametrize(

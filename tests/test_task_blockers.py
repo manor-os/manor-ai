@@ -19,6 +19,7 @@ from packages.core.constants.approvals import (
     HitlType,
 )
 from packages.core.constants.execution import (
+    COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY,
     ExecutionPlanStatus,
     ExecutionStepStatus,
 )
@@ -183,6 +184,83 @@ async def test_answer_writes_response_and_revives_plan(db_session):
     assert fresh_request.decided_via == "chat_bridge"
 
 
+@pytest.mark.parametrize(
+    ("refuse", "expected_decision", "expected_step_status"),
+    [
+        (False, "grant", ExecutionStepStatus.PENDING.value),
+        (True, "deny", ExecutionStepStatus.FAILED.value),
+    ],
+)
+async def test_coordinator_blocker_decides_exact_approval_before_parent_step_mutation(
+    db_session,
+    monkeypatch,
+    refuse,
+    expected_decision,
+    expected_step_status,
+):
+    ids = _mk_ids()
+    _, step, request = await _seed_blocker(
+        db_session,
+        entity_id=ids["entity_id"],
+        workspace_id=ids["workspace_id"],
+        pending_kind="human_input",
+    )
+    request.context = {
+        **(request.context or {}),
+        COORDINATOR_NESTED_APPROVAL_CONTEXT_KEY: {},
+    }
+    await db_session.flush()
+
+    events = []
+
+    async def fake_grant(db, approval, **_kwargs):
+        parked = await db.get(ExecutionStep, approval.origin_step_id)
+        assert parked.step_status == ExecutionStepStatus.WAITING_HUMAN.value
+        events.append("grant")
+        approval.status = ApprovalStatus.GRANTED.value
+        return approval
+
+    async def fake_consume(_db, approval, **_kwargs):
+        assert events == ["grant"]
+        events.append("consume")
+        approval.status = ApprovalStatus.CONSUMED.value
+        return approval
+
+    async def fake_deny(db, approval, **_kwargs):
+        parked = await db.get(ExecutionStep, approval.origin_step_id)
+        assert parked.step_status == ExecutionStepStatus.WAITING_HUMAN.value
+        events.append("deny")
+        approval.status = ApprovalStatus.DENIED.value
+        return approval
+
+    monkeypatch.setattr(
+        "packages.core.governance.approvals.grant_approval",
+        fake_grant,
+    )
+    monkeypatch.setattr(
+        "packages.core.governance.approvals.consume_approval",
+        fake_consume,
+    )
+    monkeypatch.setattr(
+        "packages.core.governance.approvals.deny_approval",
+        fake_deny,
+    )
+
+    result = await answer_task_blocker(
+        db_session,
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        request_id=request.id,
+        answer="decline" if refuse else "use the landing page screenshot",
+        refuse=refuse,
+    )
+
+    assert result["resolved"] is True
+    assert events[0] == expected_decision
+    await db_session.refresh(step)
+    assert step.step_status == expected_step_status
+
+
 async def test_needs_input_merges_answers_into_step_params(db_session):
     ids = _mk_ids()
     _, step, request = await _seed_blocker(
@@ -330,14 +408,14 @@ async def test_list_open_task_blockers_scopes_and_shapes(db_session):
     assert entry["reason"].startswith("Which screenshot")
 
 
-async def test_runtime_blocker_dispatches_only_after_commit_and_recovers_failure(
+async def test_runtime_blocker_hints_durable_wake_after_commit_even_if_broker_fails(
     monkeypatch,
 ):
     from packages.core.ai.runtime.workspace_blocker_actions import (
         runtime_workspace_answer_task_blocker_action,
     )
-    from packages.core.services import task_blockers, task_retry_service
-    from packages.core.tasks import ai_tasks
+    from packages.core.plans import wakeup
+    from packages.core.services import task_blockers
     import packages.core.database as database
 
     events: list[str] = []
@@ -363,28 +441,20 @@ async def test_runtime_blocker_dispatches_only_after_commit_and_recovers_failure
             "_plan_to_run": "plan-1",
         }
 
-    def fail_dispatch(plan_id: str):
+    async def pending_wake(_db, plan_id: str):
         assert plan_id == "plan-1"
-        events.append("dispatch")
-        raise RuntimeError("broker unavailable")
+        events.append("read_wake")
+        return object()
 
-    async def fake_mark(_db, **kwargs):
-        assert kwargs == {
-            "plan_id": "plan-1",
-            "user_id": "user-1",
-            "reason": "task_blocker_dispatch_failed",
-        }
-        events.append("recover")
-        return True
+    def fail_hint(_wake, *, reason: str):
+        assert reason == "task_blocker_post_commit_hint"
+        events.append("hint_failed")
+        return False
 
     monkeypatch.setattr(database, "async_session", lambda: FakeSession())
     monkeypatch.setattr(task_blockers, "answer_task_blocker", fake_answer)
-    monkeypatch.setattr(ai_tasks.run_plan, "delay", fail_dispatch)
-    monkeypatch.setattr(
-        task_retry_service,
-        "mark_plan_continuation_dispatch_failed",
-        fake_mark,
-    )
+    monkeypatch.setattr(wakeup, "pending_plan_cycle_wake", pending_wake)
+    monkeypatch.setattr(wakeup, "dispatch_plan_cycle_wake_hint", fail_hint)
 
     payload = json.loads(await runtime_workspace_answer_task_blocker_action(
         entity_id="entity-1",
@@ -396,6 +466,6 @@ async def test_runtime_blocker_dispatches_only_after_commit_and_recovers_failure
     assert payload == {
         "resolved": True,
         "decision": "answered",
-        "dispatched": False,
+        "dispatched": True,
     }
-    assert events == ["resolve", "commit", "dispatch", "recover", "commit"]
+    assert events == ["resolve", "commit", "read_wake", "hint_failed"]

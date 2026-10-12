@@ -1,0 +1,23 @@
+{
+  "id": "remotion-create",
+  "name": "remotion-create",
+  "display_name": "Remotion Create",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Create a new Remotion video project.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "create",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["scaffold", "new project", "react video", "starter", "boilerplate", "composition"],
+    "examples": ["start new remotion project", "scaffold react video project", "create remotion composition from scratch", "set up editable remotion template"]
+  }
+}

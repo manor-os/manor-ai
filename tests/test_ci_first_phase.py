@@ -8,11 +8,13 @@ stack E2E remains outside the required pull-request path.
 from __future__ import annotations
 
 import json
+
 import re
 from pathlib import Path
 
 import pytest
 import yaml
+
 
 pytestmark = pytest.mark.oss_smoke
 
@@ -22,6 +24,7 @@ CI = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
 IS_PUBLIC_EXPORT = not (ROOT / ".ossexclude").exists()
 DOCS_DEPLOY = ROOT / ".github" / "workflows" / "deploy-docs.yml"
+DOCS_CI = ROOT / ".github" / "workflows" / "docs-ci.yml"
 WEB_PACKAGE = ROOT / "apps" / "web" / "package.json"
 
 
@@ -38,14 +41,23 @@ def load_docs_deploy() -> dict:
     return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
 
 
-def test_ci_runs_first_phase_on_pull_requests_and_manual_dispatch() -> None:
+def load_docs_ci() -> dict:
+    text = DOCS_CI.read_text()
+    return yaml.safe_load(text.replace("\non:", "\n'on':", 1))
+
+
+def test_ci_uses_private_three_stage_triggers_and_public_pr_triggers() -> None:
     workflow = load_ci()
     triggers = workflow["on"]
 
     assert triggers["workflow_dispatch"]["inputs"]["test_level"]["default"] == "smoke"
     assert triggers["workflow_dispatch"]["inputs"]["test_level"]["options"] == ["smoke", "regression"]
-    assert triggers["pull_request"]["branches"] == ["dev", "main"]
-    assert "push" not in triggers
+    if IS_PUBLIC_EXPORT:
+        assert triggers["pull_request"]["branches"] == ["dev", "main"]
+        assert triggers["push"]["branches"] == ["main"]
+    else:
+        assert triggers["pull_request"]["branches"] == ["dev", "main"]
+        assert triggers["push"]["branches"] == ["dev"]
 
 
 def test_pull_request_gate_keeps_docker_e2e_out_of_required_jobs() -> None:
@@ -87,12 +99,39 @@ def test_python_smoke_tests_are_the_required_first_phase_python_gate() -> None:
     run_commands = "\n".join(step.get("run", "") for step in smoke_job["steps"] if isinstance(step, dict))
 
     assert "continue-on-error" not in smoke_job
-    assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-    assert '-m "oss_smoke"' in run_commands
-    assert "tests/test_integrations.py" not in run_commands
+    assert "python scripts/run_python_tests.py smoke" in run_commands
+    assert "--report-dir artifacts/smoke" in run_commands
+    if not IS_PUBLIC_EXPORT:
+        assert "python scripts/ci_impact.py --run-focused" in run_commands
 
 
-def test_python_ci_jobs_stop_on_the_first_test_failure() -> None:
+def test_email_proof_smoke_installs_its_isolated_redis_binary() -> None:
+    jobs = load_ci()["jobs"]
+    required_jobs = {"python-smoke", "python-regression"}
+    for name, job in jobs.items():
+        steps = [step for step in job.get("steps", []) if isinstance(step, dict)]
+        installs = [step for step in steps if step.get("name") == "Install Redis binary for isolated email proof tests"]
+        if name not in required_jobs:
+            assert not installs
+            continue
+        assert len(installs) == 1
+        install = installs[0]
+        assert "if" not in install and not install.get("continue-on-error")
+        command = install["run"]
+        assert "sudo systemctl mask redis-server.service" in command
+        assert "sudo apt-get install --yes --no-install-recommends redis-server" in command
+        assert "redis-server --version" in command
+        assert command.index("mask redis-server.service") < command.index("apt-get install")
+        test_step = next(step for step in steps if "scripts/run_python_tests.py" in step.get("run", ""))
+        assert steps.index(install) < steps.index(test_step)
+
+    source = (ROOT / "tests/test_user_email_proof.py").read_text()
+    assert "pytestmark = pytest.mark.oss_smoke" in source
+    assert 'dir="/private/tmp"' not in source
+    assert "pytest.skip" not in source and "pytest.mark.skip" not in source
+
+
+def test_python_ci_jobs_use_bounded_runner_failures() -> None:
     jobs = load_ci()["jobs"]
     job_names = ["python-smoke", "python-regression"]
 
@@ -100,29 +139,43 @@ def test_python_ci_jobs_stop_on_the_first_test_failure() -> None:
         run_commands = "\n".join(
             step.get("run", "") for step in jobs[job_name]["steps"] if isinstance(step, dict)
         )
-        assert re.search(r"(?:^|\s)-x(?:\s|$)", run_commands) is not None
+        assert "scripts/run_python_tests.py" in run_commands
+        assert re.search(r"(?:^|\s)-x(?:\s|$)", run_commands) is None
+
+    regression_run = next(
+        step["run"]
+        for step in jobs["python-regression"]["steps"]
+        if isinstance(step, dict) and step.get("name") == "Run Python regression suite"
+    )
+    if not IS_PUBLIC_EXPORT:
+        assert "--maxfail=5" in regression_run
 
 
-def test_python_regression_suite_runs_only_for_main_or_manual_opt_in() -> None:
+def test_python_regression_suite_uses_the_environment_specific_full_gate() -> None:
     regression_job = load_ci()["jobs"]["python-regression"]
     run_commands = "\n".join(step.get("run", "") for step in regression_job["steps"] if isinstance(step, dict))
 
     assert "continue-on-error" not in regression_job
     assert "regression" in regression_job["name"].lower()
     condition = regression_job["if"]
-    assert "github.event_name == 'push'" not in condition
-    assert "github.ref_name == 'main'" not in condition
-    assert "github.base_ref == 'main'" in condition
     assert "inputs.test_level == 'regression'" in condition
     if not IS_PUBLIC_EXPORT:
-        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-        assert "not manual and not network and not docker and not cloud" in run_commands
+        assert "github.event_name == 'push'" in condition
+        assert "github.ref == 'refs/heads/dev'" in condition
+        assert "github.base_ref == 'main'" not in condition
+        assert "python scripts/run_python_tests.py regression" in run_commands
+        assert "--maxfail=5" in run_commands
     else:
-        assert re.search(r"python -m pytest\s+tests/(\s|$)", run_commands) is not None
-        assert '-m "oss_smoke or oss_regression"' in run_commands
+        assert "github.event_name == 'push'" in condition
+        assert "github.ref == 'refs/heads/main'" in condition
+        assert "python scripts/run_python_tests.py regression" in run_commands
         assert "tests/test_ci_first_phase.py" not in run_commands
         assert "tests/test_integrations.py" not in run_commands
+        public_gate = load_ci()["jobs"]["oss-regression-gate"]
+        assert public_gate["name"] == "Python regression gate"
     assert "DEPLOYMENT_MODE" not in regression_job["steps"][-1].get("env", {})
+
+
 
 
 

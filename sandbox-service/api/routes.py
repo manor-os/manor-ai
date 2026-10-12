@@ -19,6 +19,9 @@ from sandbox.models import (
     CreateSandboxResponse,
     ExecRequest,
     ExecResponse,
+    ExecutionResponseAck,
+    ExecutionResponseRequest,
+    ExecutionStatusResponse,
     FileReadBase64Request,
     FileReadBase64Response,
     FileReadRequest,
@@ -242,6 +245,8 @@ async def load_skill_into_sandbox(sandbox_id: str, req: LoadSkillRequest):
             files=req.files,
             auto_install=req.auto_install,
             idle_threshold=req.idle_threshold,
+            env=req.env,
+            allowed_sensitive_keys=set(req.allowed_sensitive_keys),
         )
         logger.info(
             "sandbox/load-skill: ok sandbox_id=%s skill=%s elapsed=%.2fs",
@@ -375,6 +380,55 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
 
 
 @router.post(
+    "/sandbox/{sandbox_id}/exec/start",
+    response_model=ExecutionStatusResponse,
+    tags=["exec"],
+)
+async def start_execution(sandbox_id: str, req: ExecRequest):
+    """Start a shell command without blocking until it exits."""
+    try:
+        return await _get_runner().start_execution(
+            sandbox_id=sandbox_id,
+            command=req.command,
+            timeout=req.timeout,
+            workdir=req.workdir,
+            execution_id=req.execution_id,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except SandboxConcurrencyExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get(
+    "/sandbox/{sandbox_id}/executions/{execution_id}",
+    response_model=ExecutionStatusResponse,
+    tags=["exec"],
+)
+async def get_execution_status(
+    sandbox_id: str,
+    execution_id: str,
+    after_sequence: int = 0,
+):
+    """Read a background command's current or terminal state."""
+    try:
+        return await _get_runner().get_execution_status(
+            sandbox_id,
+            execution_id,
+            after_sequence=max(0, after_sequence),
+        )
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Execution not found: {execution_id}",
+        )
+
+
+@router.post(
     "/sandbox/{sandbox_id}/executions/{execution_id}/cancel",
     response_model=CancelExecutionResponse,
     tags=["exec"],
@@ -392,6 +446,33 @@ async def cancel_execution(sandbox_id: str, execution_id: str):
         raise HTTPException(status_code=404, detail=f"Sandbox not found: {sandbox_id}")
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post(
+    "/sandbox/{sandbox_id}/executions/{execution_id}/responses",
+    response_model=ExecutionResponseAck,
+    tags=["exec"],
+)
+async def send_execution_response(
+    sandbox_id: str,
+    execution_id: str,
+    req: ExecutionResponseRequest,
+):
+    """Deliver one idempotent Agent response to a structured Sandbox event."""
+    try:
+        return await _get_runner().send_execution_response(
+            sandbox_id,
+            execution_id,
+            req.event_id,
+            payload=req.payload,
+            message=req.message,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # ── File operations ──
@@ -488,7 +569,7 @@ async def write_file(sandbox_id: str, req: FileWriteRequest):
             "sandbox/files/write: failed sandbox_id=%s path=%s error=%s",
             sandbox_id, req.path, exc,
         )
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post(
@@ -522,7 +603,7 @@ async def write_file_base64(sandbox_id: str, req: FileWriteBase64Request):
             "sandbox/files/write-base64: failed sandbox_id=%s path=%s error=%s",
             sandbox_id, req.path, exc,
         )
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 # ── LLM context ──

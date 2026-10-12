@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import LoadingSpinner from "./ui/LoadingSpinner";
-import { sanitizeDocumentHtml } from "../lib/sanitizeDocumentHtml";
+import { t } from "../lib/i18n";
+import { createFilePreviewSource, withFilePreviewTimeout } from "../lib/filePreviewSource";
+import { sanitizeDocumentHtml, sanitizeManorDocumentRender } from "../lib/sanitizeDocumentHtml";
 import {
   paginateManorDocument,
   renderManorDocument,
@@ -24,6 +26,7 @@ export default function DocxReadOnlyViewer({
 
   useEffect(() => {
     let cancelled = false;
+    const controller = new AbortController();
     setLoading(true);
     setError("");
     setHtml("");
@@ -31,30 +34,22 @@ export default function DocxReadOnlyViewer({
 
     (async () => {
       try {
-        if (!blob && !url) throw new Error("A DOCX source is required");
-        const buffer = blob
-          ? await blob.arrayBuffer()
-          : await (await fetch(url!)).arrayBuffer();
+        const buffer = await createFilePreviewSource({ blob, url }).getArrayBuffer(controller.signal);
         if (cancelled) return;
         const bytes = new Uint8Array(buffer);
         if (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4B) {
-          const rendered = await renderManorDocument(buffer);
+          const rendered = await withFilePreviewTimeout(renderManorDocument(buffer), 30_000, "Word preview timed out. Please retry.");
           if (cancelled) return;
           const sanitizeOptions = { allowDocxEditorAttributes: true, allowDocxLayoutStyles: true };
-          const safeRender = {
-            ...rendered,
-            html: sanitizeDocumentHtml(rendered.html, sanitizeOptions),
-            headerHtml: sanitizeDocumentHtml(rendered.headerHtml, sanitizeOptions),
-            footerHtml: sanitizeDocumentHtml(rendered.footerHtml, sanitizeOptions),
-            firstHeaderHtml: sanitizeDocumentHtml(rendered.firstHeaderHtml, sanitizeOptions),
-            firstFooterHtml: sanitizeDocumentHtml(rendered.firstFooterHtml, sanitizeOptions),
-            evenHeaderHtml: sanitizeDocumentHtml(rendered.evenHeaderHtml, sanitizeOptions),
-            evenFooterHtml: sanitizeDocumentHtml(rendered.evenFooterHtml, sanitizeOptions),
-          };
+          const safeRender = sanitizeManorDocumentRender(rendered, sanitizeOptions);
           setRender(safeRender);
           setHtml(safeRender.html);
         } else {
-          setHtml(sanitizeDocumentHtml(new TextDecoder().decode(buffer)));
+          const legacyHtml = new TextDecoder().decode(buffer);
+          if (!/^\s*<(?:!doctype|html|body|div|p|h[1-6]|table)\b/i.test(legacyHtml)) {
+            throw new Error(t("page.shared_doc.preview_unavailable"));
+          }
+          setHtml(sanitizeDocumentHtml(legacyHtml));
         }
       } catch (reason: any) {
         if (!cancelled) setError(reason.message || "Failed to render DOCX");
@@ -63,7 +58,7 @@ export default function DocxReadOnlyViewer({
       }
     })();
 
-    return () => { cancelled = true; };
+    return () => { cancelled = true; controller.abort(); };
   }, [blob, url]);
 
   useEffect(() => {
@@ -75,7 +70,7 @@ export default function DocxReadOnlyViewer({
   }, [afterRender, html, render]);
 
   if (loading) return <div style={{ display: "flex", justifyContent: "center", padding: 64 }}><LoadingSpinner size={28} /></div>;
-  if (error) return <p style={{ color: "#c14a44", textAlign: "center", padding: 32 }}>{error}</p>;
+  if (error) return <p role="alert" style={{ color: "var(--danger, #c14a44)", textAlign: "center", padding: 32 }}>{error}</p>;
 
   return (
     <div className="docx-viewer-stage">

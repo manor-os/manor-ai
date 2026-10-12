@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 
 import { api } from "../../lib/api";
 import { t } from "../../lib/i18n";
+import { workflowPath } from "../../lib/workflowRoutes";
 import { IconFlow, IconSparkles } from "../icons";
 import Button from "../ui/Button";
 import EmptyState from "../ui/EmptyState";
@@ -45,6 +46,31 @@ const NODE_WIDTH = 126;
 const NODE_HEIGHT = 54;
 
 const PREVIEW_GRAPHS: Record<string, PreviewGraph> = {
+  "opc-create-social-from-brief-v1": {
+    nodes: [
+      { id: "knowledge", label: "Brand knowledge", kind: "knowledge", x: 10, y: 54 },
+      { id: "draft", label: "Draft platform posts", kind: "agent", x: 146, y: 54 },
+      { id: "copy_review", label: "Review copy", kind: "approval", x: 282, y: 54 },
+      { id: "image", label: "Feed image", kind: "image", x: 418, y: 54 },
+      { id: "video", label: "9:16 video", kind: "video", x: 554, y: 54 },
+      { id: "media_review", label: "Approve & publish", kind: "approval", x: 690, y: 54 },
+      { id: "publish", label: "Publish to platforms", kind: "tool", x: 826, y: 54 },
+      { id: "published", label: "Published links", kind: "end", x: 962, y: 54 },
+      { id: "copy_notes", label: "Rewrite with notes ↺", kind: "agent", x: 418, y: 190 },
+      { id: "media_notes", label: "Redo media with notes ↺", kind: "agent", x: 826, y: 190 },
+    ],
+    edges: [
+      { from: "knowledge", to: "draft" },
+      { from: "draft", to: "copy_review" },
+      { from: "copy_review", to: "image", branch: "approved" },
+      { from: "copy_review", to: "copy_notes", branch: "changes" },
+      { from: "image", to: "video" },
+      { from: "video", to: "media_review" },
+      { from: "media_review", to: "publish", branch: "approved" },
+      { from: "media_review", to: "media_notes", branch: "changes" },
+      { from: "publish", to: "published" },
+    ],
+  },
   "opc-generate-topic-from-knowledge-v1": {
     nodes: [
       { id: "knowledge", label: "Workspace knowledge", kind: "knowledge", x: 28, y: 118 },
@@ -134,6 +160,7 @@ const PREVIEW_GRAPHS: Record<string, PreviewGraph> = {
 };
 
 const FEATURED_TEMPLATE_KEYS = [
+  "opc-create-social-from-brief-v1",
   "opc-generate-topic-from-knowledge-v1",
   "opc-write-article-from-topic-v1",
   "opc-create-image-from-topic-v1",
@@ -161,7 +188,7 @@ function edgePath(source: PreviewNode, target: PreviewNode) {
 }
 
 function FlowScreenshot({ template }: { template: WorkflowTemplate }) {
-  const graph = PREVIEW_GRAPHS[template.key] || PREVIEW_GRAPHS[FEATURED_TEMPLATE_KEYS[1]];
+  const graph = PREVIEW_GRAPHS[template.key] || PREVIEW_GRAPHS["opc-write-article-from-topic-v1"];
   const nodesById = new Map(graph.nodes.map((node) => [node.id, node]));
   const patternId = `flow-template-grid-${template.key.replace(/[^a-z0-9]/gi, "-")}`;
 
@@ -308,7 +335,7 @@ export default function FlowTemplateSamples() {
   const openFlow = useCallback(
     (workflowId: string) => {
       const returnTo = `${location.pathname}${location.search}${location.hash}`;
-      navigate(`/flows?workflow=${encodeURIComponent(workflowId)}`, {
+      navigate(workflowPath(workflowId), {
         state: { returnTo },
       });
     },

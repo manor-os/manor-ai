@@ -1,8 +1,8 @@
-import { createBrowserRouter, Navigate } from "react-router-dom";
+import { createBrowserRouter, Navigate, useLocation } from "react-router-dom";
 import { Suspense, lazy, useEffect } from "react";
-import AppLayout from "./layouts/AppLayout";
 import ProtectedRoute from "./components/ProtectedRoute";
 import RouteErrorBoundary from "./components/RouteErrorBoundary";
+import WorkflowLegacyRedirect from "./components/workflows/WorkflowLegacyRedirect";
 import { PageLoading } from "./components/ui/Skeleton";
 import Button from "./components/ui/Button";
 import EmptyState from "./components/ui/EmptyState";
@@ -14,6 +14,7 @@ import {
 } from "./lib/previewFeatureAccess";
 
 // Lazy load all pages
+const AppLayout = lazy(() => import("./layouts/AppLayout"));
 const Login = lazy(() => import("./pages/Login"));
 const Dashboard = lazy(() => import("./pages/Dashboard"));
 const Tasks = lazy(() => import("./pages/Tasks"));
@@ -32,16 +33,24 @@ const Agents = lazy(() => import("./pages/Agents"));
 const AgentDetail = lazy(() => import("./pages/AgentDetail"));
 const AgentDashboard = lazy(() => import("./pages/AgentDashboard"));
 const Flows = lazy(() => import("./pages/Flows"));
+const WorkflowRun = lazy(() => import("./pages/WorkflowRun"));
 const Skills = lazy(() => import("./pages/Skills"));
 const Integrations = lazy(() => import("./pages/Integrations"));
 const Workspaces = lazy(() => import("./pages/Workspaces"));
 const WorkspaceDraftChat = lazy(() => import("./pages/WorkspaceDraftChat"));
 const WorkspaceDetail = lazy(() => import("./pages/WorkspaceDetail"));
+const TeamLayout = lazy(() => import("./pages/team/TeamLayout"));
+const TeamPeople = lazy(() => import("./pages/team/TeamPeople"));
+const TeamRoles = lazy(() => import("./pages/team/TeamRoles"));
+
 const Messages = lazy(() => import("./pages/Messages"));
 const Users = lazy(() => import("./pages/Users"));
 const Activity = lazy(() => import("./pages/Activity"));
 const Settings = lazy(() => import("./pages/Settings"));
 const Notifications = lazy(() => import("./pages/Notifications"));
+const Clients = lazy(() => import("./pages/Clients"));
+const ClientDelivery = lazy(() => import("./pages/ClientDelivery"));
+const WorkspaceCollaboration = lazy(() => import("./pages/WorkspaceCollaboration"));
 const Account = lazy(() => import("./pages/Account"));
 const ScheduledJobs = lazy(() => import("./pages/ScheduledJobs"));
 const BrowserSessions = lazy(() => import("./pages/BrowserSessions"));
@@ -56,6 +65,7 @@ const BookingLink = lazy(() => import("./pages/BookingLink"));
 const ClientPortal = lazy(() => import("./pages/ClientPortal"));
 const SharedFolder = lazy(() => import("./pages/SharedFolder"));
 const SharedDocument = lazy(() => import("./pages/SharedDocument"));
+const SignDocument = lazy(() => import("./pages/SignDocument"));
 const SearchResults = lazy(() => import("./pages/SearchResults"));
 const ApiKeys = lazy(() => import("./pages/ApiKeys"));
 const AdminOAuthClients = lazy(() => import("./pages/AdminOAuthClients"));
@@ -73,6 +83,11 @@ function PageLoader() {
 // Wrap each element with Suspense
 function S({ children }: { children: React.ReactNode }) {
   return <Suspense fallback={<PageLoader />}>{children}</Suspense>;
+}
+
+function LegacyClientsRedirect() {
+  const location = useLocation();
+  return <Navigate to={`/team/clients${location.search}${location.hash}`} replace />;
 }
 
 
@@ -161,7 +176,11 @@ export const router = createBrowserRouter([
     element: <ProtectedRoute />,
     children: [
       {
-        element: <AppLayout />,
+        element: (
+          <Suspense fallback={<PageLoader />}>
+            <AppLayout />
+          </Suspense>
+        ),
         // Catches lazy-chunk-load failures (post-deploy stale references)
         // and route loader errors before React Router shows its default
         // "💿 Hey developer 👋" page. Auto-reloads once on stale chunks.
@@ -322,10 +341,22 @@ export const router = createBrowserRouter([
             element: (
               <PreviewFeatureRoute feature="flows">
                 <S>
-                  <Flows />
+                  <WorkflowLegacyRedirect><Flows /></WorkflowLegacyRedirect>
                 </S>
               </PreviewFeatureRoute>
             ),
+          },
+          {
+            path: "/flows/:workflowId",
+            element: <PreviewFeatureRoute feature="flows"><S><Flows /></S></PreviewFeatureRoute>,
+          },
+          {
+            path: "/flows/:workflowId/runs/:runId",
+            element: <PreviewFeatureRoute feature="flows"><S><WorkflowRun /></S></PreviewFeatureRoute>,
+          },
+          {
+            path: "/workspaces/:workspaceId/workflow-runs/:runId",
+            element: <PreviewFeatureRoute feature="flows"><S><WorkflowRun /></S></PreviewFeatureRoute>,
           },
           {
             path: "/skills",
@@ -391,6 +422,37 @@ export const router = createBrowserRouter([
               </S>
             ),
           },
+          {
+            path: "/team",
+            element: (
+              <S>
+                <TeamLayout />
+              </S>
+            ),
+            children: [
+              {
+                index: true,
+                element: (
+                  <S>
+                    <TeamPeople />
+                  </S>
+                ),
+              },
+              {
+                path: "roles",
+                element: (
+                  <S>
+                    <TeamRoles />
+                  </S>
+                ),
+              },
+            ],
+          },
+          { path: "/team/clients", element: <S><Clients /></S> },
+          { path: "/company/clients", element: <LegacyClientsRedirect /> },
+          { path: "/client-delivery/:token", element: <S><ClientDelivery /></S> },
+          { path: "/workspaces/:workspaceId/collaboration", element: <S><WorkspaceCollaboration /></S> },
+          { path: "/workspace-collaboration/:grantId", element: <S><WorkspaceCollaboration /></S> },
           {
             path: "/operations",
             element: <Navigate to="/workspaces" replace />,
@@ -547,6 +609,16 @@ export const router = createBrowserRouter([
     element: (
       <S>
         <SharedDocument />
+      </S>
+    ),
+  },
+
+  // Public PDF signature ceremony (opaque token + recipient email OTP).
+  {
+    path: "/sign/:token",
+    element: (
+      <S>
+        <SignDocument />
       </S>
     ),
   },

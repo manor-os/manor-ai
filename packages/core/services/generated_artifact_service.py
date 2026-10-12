@@ -9,8 +9,12 @@ from typing import Any
 async def generated_artifact_document_folder_id(
     *,
     entity_id: str,
+    user_id: str,
     workspace_id: str | None,
     rel_path: str,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    db: Any | None = None,
 ) -> str | None:
     if workspace_id:
         from packages.core.services.workspace_artifacts import (
@@ -22,11 +26,32 @@ async def generated_artifact_document_folder_id(
             workspace_id=workspace_id,
             rel_path=rel_path,
         )
+    from packages.core.services.conversation_generated_files import (
+        ensure_conversation_generated_folder, is_default_chat_output_path,
+    )
     from packages.core.services.knowledge_sync import ensure_folder_path
+
+    if conversation_id and user_id and not task_id and is_default_chat_output_path(rel_path):
+        if db is None:
+            from packages.core.database import async_session
+
+            async with async_session() as owned_db:
+                folder_id = await ensure_conversation_generated_folder(
+                    owned_db, entity_id=entity_id, user_id=user_id,
+                    conversation_id=conversation_id,
+                )
+                await owned_db.commit()
+        else:
+            folder_id = await ensure_conversation_generated_folder(
+                db, entity_id=entity_id, user_id=user_id,
+                conversation_id=conversation_id,
+            )
+        if folder_id:
+            return folder_id
 
     rel_dir = str(Path(rel_path).parent).replace("\\", "/")
     rel_dir = "" if rel_dir == "." else rel_dir
-    return await ensure_folder_path(entity_id, rel_dir)
+    return await ensure_folder_path(entity_id, rel_dir, owner_id=user_id or None)
 
 
 async def register_generated_file_artifact(
@@ -47,15 +72,35 @@ async def register_generated_file_artifact(
     generation: dict[str, Any],
 ) -> str | None:
     from packages.core.database import async_session
+    from packages.core.models.document import Document
     from packages.core.services.document_metadata import merge_document_metadata
     from packages.core.services.document_service import upsert_document_by_fs_path
+    from packages.core.services.workspace_artifacts import infer_workspace_id_from_storage_path
+    from sqlalchemy import select
 
-    folder_id = await generated_artifact_document_folder_id(
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        rel_path=rel_path,
+    target_workspace_id = await infer_workspace_id_from_storage_path(
+        entity_id=entity_id, rel_path=rel_path,
     )
+    if workspace_id and target_workspace_id and workspace_id != target_workspace_id:
+        raise ValueError("Generated artifact belongs to another Workspace")
+
+    visibility = "workspace" if target_workspace_id else "private"
     async with async_session() as db:
+        existing_document_id = (await db.execute(select(Document.id).where(
+            Document.entity_id == entity_id,
+            Document.fs_path == rel_path,
+        ).limit(1))).scalar_one_or_none()
+        folder_id = None
+        if existing_document_id is None:
+            folder_id = await generated_artifact_document_folder_id(
+                entity_id=entity_id,
+                user_id=user_id,
+                workspace_id=target_workspace_id,
+                rel_path=rel_path,
+                conversation_id=conversation_id,
+                task_id=task_id,
+                db=db,
+            )
         doc = await upsert_document_by_fs_path(
             db,
             entity_id,
@@ -66,6 +111,8 @@ async def register_generated_file_artifact(
             mime_type=mime_type,
             source="ai_generated",
             created_by=user_id or None,
+            owner_id=user_id or None,
+            visibility=visibility,
             folder_id=folder_id,
         )
         doc.source = "ai_generated"

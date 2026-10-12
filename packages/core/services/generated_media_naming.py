@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,17 +13,64 @@ from packages.core.services.workspace_artifacts import (
     WORKSPACE_STORAGE_SEGMENT,
     workspace_artifact_storage_base,
 )
+from packages.core.services.workspace_layout import (
+    TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT, WORKSPACE_LEDGER_DIRECTORIES,
+)
 
 
 WORKSPACE_ARTIFACT_ROOT = WORKSPACE_FOLDER_ROOT
 _PATH_SEGMENT_MAX_BYTES = 180
 _GENERATED_MEDIA_FILENAME_MAX_BYTES = 180
 
-#: Segment under a workspace's artifact root that groups output by the task
-#: that produced it. Without it, generated media lands in type buckets
-#: (images/ videos/ audio/) shared by every run the workspace ever made, and
-#: "which task produced this file" is unanswerable from the filesystem.
-TASK_ARTIFACT_SEGMENT = "tasks"
+
+@dataclass(frozen=True)
+class WorkspaceArtifactScope:
+    """Trusted per-call output ownership, not a permission or an approval."""
+
+    entity_id: str | None
+    workspace_id: str | None
+    workflow_run_id: str | None = None
+    workflow_lineage_root_run_id: str | None = None
+    workspace_shared: bool = False
+
+
+_artifact_scope: ContextVar[WorkspaceArtifactScope | None] = ContextVar("workspace_artifact_owner", default=None)
+
+
+@contextmanager
+def workspace_artifact_scope(scope: WorkspaceArtifactScope | None):
+    token = _artifact_scope.set(scope)
+    try:
+        yield
+    finally:
+        _artifact_scope.reset(token)
+
+
+def current_workspace_artifact_scope(
+    entity_id: str | None, workspace_id: str | None,
+) -> WorkspaceArtifactScope | None:
+    scope = _artifact_scope.get()
+    if scope is not None and scope.entity_id == entity_id and scope.workspace_id == workspace_id:
+        return scope
+    return None
+
+def narrator_audio_output_name(output_name: str, voice: str) -> str:
+    """Keep an explicitly requested parent while grouping narration by voice.
+
+    Bare names retain the default audio bucket. A supplied parent must not be
+    replaced with that bucket: both generation and normalization are authorized
+    for the requested directory. Reapplying this mapping is idempotent.
+    """
+    voice_slug = re.sub(r"[^a-z0-9]+", "-", str(voice or "").strip().lower()).strip("-")
+    if not voice_slug:
+        raise ValueError("Narrator voice must produce a non-empty storage folder name.")
+    normalized = str(output_name or "").replace("\\", "/").strip("/")
+    parent, _, filename = normalized.rpartition("/")
+    if not parent:
+        parent, filename = "audio", normalized
+    if parent.rsplit("/", 1)[-1].lower() != voice_slug:
+        parent = f"{parent}/{voice_slug}"
+    return f"{parent}/{filename.strip()}"
 
 
 def workspace_task_artifact_dir(
@@ -46,6 +95,50 @@ def workspace_task_artifact_dir(
     return _clean_rel_dir(f"{base}/{TASK_ARTIFACT_SEGMENT}/{task_segment}")
 
 
+def workspace_execution_artifact_dir(
+    workspace_base_dir: str | None,
+    *,
+    task_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_lineage_root_run_id: str | None = None,
+    entity_root: str | None = None,
+) -> str:
+    """Select the producing runtime's archive, with stable Workflow retries."""
+    base = _clean_rel_dir(workspace_base_dir or "")
+    if not base:
+        return ""
+    run_id = str(workflow_run_id or "").strip()
+    lineage = str(workflow_lineage_root_run_id or run_id).strip()
+    if run_id:
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id) or not re.fullmatch(r"[A-Za-z0-9_-]+", lineage):
+            raise ValueError("Workflow artifact identity must be a single identifier")
+        current = f"{base}/{WORKFLOW_ARTIFACT_SEGMENT}/{lineage}"
+        legacy = f"{base}/runs/{lineage}"
+        # Keep already-materialized lineages in place across an upgrade.
+        # New runs always select workflow; no folders are created by routing.
+        if entity_root and not os.path.isdir(os.path.join(entity_root, current)) and os.path.isdir(os.path.join(entity_root, legacy)):
+            return legacy
+        return current
+    return workspace_task_artifact_dir(base, task_id)
+
+
+def workspace_storage_root(path: str) -> str:
+    """Get the Workspace home from a canonical or legacy scoped path."""
+    parts = _clean_rel_dir(path).split("/")
+    if parts[:2] == [WORKSPACE_ARTIFACT_ROOT, WORKSPACE_STORAGE_SEGMENT] and len(parts) >= 3:
+        return "/".join(parts[:3])
+    if len(parts) >= 2 and parts[0] == WORKSPACE_ARTIFACT_ROOT:
+        return "/".join(parts[:2])
+    return ""
+
+
+def _is_execution_artifact_dir(path: str) -> bool:
+    root = workspace_storage_root(path)
+    relative = path.removeprefix(f"{root}/") if root else ""
+    parts = relative.split("/")
+    return len(parts) >= 2 and parts[0] in {TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT, "runs"}
+
+
 @dataclass(frozen=True)
 class GeneratedMediaTarget:
     """Resolved filesystem/document target for a generated media artifact."""
@@ -55,6 +148,117 @@ class GeneratedMediaTarget:
     rel_path: str
     abs_dir: str | None = None
     abs_path: str | None = None
+
+
+MEDIA_OUTPUT_EXTENSIONS = {
+    "image": (".png", ".jpg", ".webp"),
+    "audio": (".mp3", ".wav", ".flac", ".opus", ".aac", ".ogg"),
+    "video": (".mp4", ".webm"),
+}
+
+
+@dataclass(frozen=True)
+class GeneratedMediaOutputPlan:
+    """Exact CREATE targets selected before authorization and provider work.
+
+    Providers may return different supported encodings. Each encoding has a
+    finite, exact target; saving must select it without naming or deduping again.
+    Only relative identities are persisted across approval/worker boundaries.
+    """
+
+    kind: str
+    artifact_base_dir: str
+    targets: tuple[GeneratedMediaTarget, ...]
+    requested_name: str
+    companion_paths: tuple[str, ...] = ()
+
+    @property
+    def all_paths(self) -> tuple[str, ...]:
+        return tuple(target.rel_path for target in self.targets) + self.companion_paths
+
+    def target_for_extension(self, ext: str) -> GeneratedMediaTarget:
+        for target in self.targets:
+            if os.path.splitext(target.filename)[1] == ext:
+                return target
+        raise ValueError("Generated media format was not prepared for this operation")
+
+    def to_dict(self) -> dict:
+        return {
+            "version": 2 if self.companion_paths else 1,
+            "kind": self.kind,
+            "artifact_base_dir": self.artifact_base_dir,
+            "paths": [target.rel_path for target in self.targets],
+            "requested_name": self.requested_name,
+            **({"companion_paths": list(self.companion_paths)} if self.companion_paths else {}),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> GeneratedMediaOutputPlan:
+        if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] not in {1, 2}:
+            raise ValueError("Invalid generated media output plan")
+        kind, base, paths = value.get("kind"), value.get("artifact_base_dir"), value.get("paths")
+        if (
+            not isinstance(kind, str) or kind not in MEDIA_OUTPUT_EXTENSIONS
+            or not isinstance(base, str) or base != _clean_rel_dir(base)
+            or not isinstance(paths, list) or not paths
+            or len(paths) > len(MEDIA_OUTPUT_EXTENSIONS[kind])
+        ):
+            raise ValueError("Invalid generated media output plan")
+        targets = []
+        extensions = set()
+        for path in paths:
+            if not isinstance(path, str) or not path or path != _clean_rel_dir(path) or (base and not path.startswith(f"{base}/")):
+                raise ValueError("Generated media target escaped its prepared scope")
+            directory, filename = os.path.split(path)
+            ext = os.path.splitext(filename)[1]
+            if ext not in MEDIA_OUTPUT_EXTENSIONS[kind] or ext in extensions:
+                raise ValueError("Invalid generated media target format")
+            extensions.add(ext)
+            targets.append(GeneratedMediaTarget(filename, directory, path))
+        name = value.get("requested_name")
+        if (
+            not isinstance(name, str) or name != _clean_rel_dir(name)
+        ):
+            raise ValueError("Invalid generated media requested target")
+        companions = value.get("companion_paths", [])
+        if value["version"] == 1:
+            if companions:
+                raise ValueError("Legacy media plans cannot authorize companions")
+        elif (
+            kind != "video" or len(targets) != 1
+            or not targets[0].rel_path.endswith(".mp4")
+            or companions != [video_editor_recipe_path(targets[0].rel_path)]
+        ):
+            raise ValueError("Invalid generated media companion target")
+        return cls(kind, base, tuple(targets), name, tuple(companions))
+
+
+def video_editor_recipe_path(video_path: str) -> str:
+    """The single exact companion identity owned by video composition."""
+    return os.path.splitext(video_path)[0] + ".video-edit.json"
+
+
+def prepare_video_editor_output_pair(
+    target: GeneratedMediaTarget, *, entity_root: str,
+) -> tuple[GeneratedMediaTarget, str]:
+    """Choose a collision-free MP4/recipe pair before either is authorized."""
+    stem = os.path.splitext(target.filename)[0]
+    index = 1
+    while True:
+        suffix = "" if index == 1 else f"-{index}"
+        fitted = _fit_stem_to_filename_bytes(
+            stem, suffix=f"{suffix}.video-edit.json",
+            max_bytes=_GENERATED_MEDIA_FILENAME_MAX_BYTES,
+        )
+        filename = f"{fitted}{suffix}.mp4"
+        path = "/".join(part for part in (target.rel_dir, filename) if part)
+        companion = video_editor_recipe_path(path)
+        if not any(os.path.lexists(os.path.join(entity_root, item)) for item in (path, companion)):
+            return GeneratedMediaTarget(
+                filename, target.rel_dir, path,
+                os.path.join(entity_root, target.rel_dir), os.path.join(entity_root, path),
+            ), companion
+        index += 1
 
 
 def build_workspace_artifact_base_dir(
@@ -77,19 +281,26 @@ async def resolve_workspace_artifact_base_dir(
     entity_id: str | None,
     workspace_id: str | None,
     task_id: str | None = None,
+    workflow_run_id: str | None = None,
+    workflow_lineage_root_run_id: str | None = None,
 ) -> str:
     """Resolve the artifact base dir for generated output.
 
-    ``Workspaces/_by_id/<folder id>`` scopes the artifact to its Workspace;
-    when ``task_id`` is known it is scoped one level further, to
-    ``.../tasks/<task id>``, so every file a task produced sits together and
-    the filesystem can answer "which task made this". A retry of the same
-    task resolves to the same directory, so intermediate artifacts from the
-    previous attempt are found in place instead of being regenerated.
+    ``Workspaces/_by_id/<folder id>`` is the Workspace home. Trusted Workflow
+    ownership selects its stable lineage archive before Task ownership selects
+    ``tasks/<task id>``. Shared files stay at the home. Retries reuse their
+    existing archive, including materialized legacy Workflow directories.
     """
     workspace_id = (workspace_id or "").strip()
     if not workspace_id:
         return ""
+    scope = current_workspace_artifact_scope(entity_id, workspace_id)
+    if scope is not None:
+        if scope.workspace_shared:
+            task_id = workflow_run_id = workflow_lineage_root_run_id = None
+        else:
+            workflow_run_id = workflow_run_id or scope.workflow_run_id
+            workflow_lineage_root_run_id = workflow_lineage_root_run_id or scope.workflow_lineage_root_run_id
 
     from sqlalchemy import select
 
@@ -110,16 +321,36 @@ async def resolve_workspace_artifact_base_dir(
         folder = await ensure_workspace_artifact_folder(db, workspace)
         await db.commit()
         base = build_workspace_artifact_base_dir(artifact_folder_id=folder.id)
-        return workspace_task_artifact_dir(base, task_id)
+        from packages.core.services.entity_fs import get_entity_root
+        return workspace_execution_artifact_dir(
+            base, task_id=task_id, workflow_run_id=workflow_run_id,
+            workflow_lineage_root_run_id=workflow_lineage_root_run_id,
+            entity_root=get_entity_root(workspace.entity_id),
+        )
 
 
 def workspace_artifact_default_dir(workspace_base_dir: str | None, default_dir: str) -> str:
-    """Nest a default artifact folder under the workspace when available."""
+    """Only execution archives receive automatic type buckets."""
     default_dir = _clean_rel_dir(default_dir)
     workspace_base_dir = _clean_rel_dir(workspace_base_dir or "")
-    if not workspace_base_dir:
-        return default_dir
+    if not _is_execution_artifact_dir(workspace_base_dir):
+        return workspace_base_dir
     return _clean_rel_dir("/".join(part for part in (workspace_base_dir, default_dir) if part))
+
+
+def execution_output_directory(path: str, artifact_base: str) -> str:
+    """Translate shipped production defaults without rewriting user paths."""
+    normalized = _clean_rel_dir(path)
+    phases = {"runs", "reviews", "sources", "deliveries"}
+    if normalized in {f"production/{phase}" for phase in phases}:
+        normalized = normalized.split("/", 1)[1]
+    if normalized in phases:
+        if normalized == "runs":
+            normalized = "artifacts"
+        root = workspace_storage_root(artifact_base)
+        if root and artifact_base.startswith(f"{root}/tasks/") and normalized != "artifacts":
+            normalized = f"artifacts/{normalized}"
+    return normalized
 
 
 def scope_workspace_artifact_path(
@@ -142,6 +373,19 @@ def scope_workspace_artifact_path(
 
     if rel == workspace_base_dir or rel.startswith(f"{workspace_base_dir}/"):
         return rel
+    home = workspace_storage_root(workspace_base_dir)
+    if home and (rel == home or rel.startswith(f"{home}/")):
+        # A canonical reference or an explicit Workspace destination already
+        # identifies its home. Do not nest a sibling source under this Task.
+        return rel
+    if home and "/runs/" in workspace_base_dir:
+        lineage = workspace_base_dir.removeprefix(f"{home}/runs/")
+        if rel == f"workflow/{lineage}" or rel.startswith(f"workflow/{lineage}/"):
+            rel = "runs/" + rel.removeprefix("workflow/")
+        if rel == f"runs/{lineage}" or rel.startswith(f"runs/{lineage}/"):
+            return f"{home}/{rel}"
+    if home and rel.split("/", 1)[0] in WORKSPACE_LEDGER_DIRECTORIES | {TASK_ARTIFACT_SEGMENT, WORKFLOW_ARTIFACT_SEGMENT}:
+        return f"{home}/{rel}"
     if rel == WORKSPACE_ARTIFACT_ROOT:
         return workspace_base_dir
     if rel.startswith(f"{WORKSPACE_ARTIFACT_ROOT}/"):
@@ -156,7 +400,7 @@ def scope_workspace_artifact_path(
         return rel
 
     parts = [workspace_base_dir]
-    if default_subdir and "/" not in rel:
+    if default_subdir and "/" not in rel and _is_execution_artifact_dir(workspace_base_dir):
         parts.append(default_subdir)
     parts.append(rel)
     return _clean_rel_dir("/".join(parts))

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+from collections.abc import Awaitable, Callable
 import secrets
 import time
 from datetime import datetime, timezone
@@ -15,6 +16,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.database_runtime import release_read_transaction
 from packages.core.models.base import generate_ulid
 from packages.core.models.webhook import WebhookDelivery, WebhookEndpoint
 
@@ -164,6 +166,8 @@ async def test_endpoint(
         attempt=1,
     )
 
+    # Provider latency must not retain the endpoint lookup transaction.
+    await release_read_transaction(db)
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS) as client:
@@ -204,32 +208,55 @@ async def test_endpoint(
     }
 
 
-async def deliver_event(entity_id: str, event_type: str, payload: dict) -> dict[str, int]:
-    """Deliver an event to all subscribed webhook endpoints for this entity.
-
-    Runs in its own session (fire-and-forget from event emitter).
-    """
+async def deliver_event(
+    entity_id: str, event_type: str, payload: dict, *,
+    db: AsyncSession | None = None,
+    before_send: Callable[[], Awaitable[None]] | None = None,
+) -> dict[str, int]:
+    """Deliver using one coordinator session, or own a session for direct calls."""
+    if db is not None:
+        return await _deliver_event_in_session(db, entity_id, event_type, payload, before_send)
     from packages.core.database import async_session
 
+    async with async_session() as owned_db:
+        return await _deliver_event_in_session(owned_db, entity_id, event_type, payload, before_send)
+
+
+async def _deliver_event_in_session(
+    db: AsyncSession, entity_id: str, event_type: str, payload: dict,
+    before_send: Callable[[], Awaitable[None]] | None,
+) -> dict[str, int]:
     attempted = 0
     delivered = 0
-    async with async_session() as db:
-        result = await db.execute(
+    result = await db.execute(
+        select(WebhookEndpoint).where(
+            WebhookEndpoint.entity_id == entity_id,
+            WebhookEndpoint.enabled.is_(True),
+        )
+    )
+    endpoints = result.scalars().all()
+
+    endpoint_ids = [endpoint.id for endpoint in endpoints]
+    await db.commit()
+    for endpoint_id in endpoint_ids:
+        # Re-read after the previous network call: endpoints may be disabled
+        # or edited while another subscriber is slow.
+        endpoint = (await db.execute(
             select(WebhookEndpoint).where(
+                WebhookEndpoint.id == endpoint_id,
                 WebhookEndpoint.entity_id == entity_id,
                 WebhookEndpoint.enabled.is_(True),
-            )
-        )
-        endpoints = result.scalars().all()
-
-        for endpoint in endpoints:
-            # If endpoint subscribes to specific events, check membership
-            if endpoint.events and event_type not in endpoint.events:
-                continue
-            attempted += 1
-            if await _deliver_to_endpoint(db, endpoint, event_type, payload):
-                delivered += 1
-
+            ).execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if endpoint is None or (endpoint.events and event_type not in endpoint.events):
+            await db.commit()
+            continue
+        if before_send is not None:
+            await before_send()
+        attempted += 1
+        if await _deliver_to_endpoint(db, endpoint, event_type, payload):
+            delivered += 1
+        # Persist this receipt before waiting on the next provider.
         await db.commit()
     return {
         "attempted": attempted,
@@ -273,6 +300,8 @@ async def _deliver_to_endpoint(
         attempt=1,
     )
 
+    # Provider latency must not retain the endpoint lookup transaction.
+    await release_read_transaction(db)
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT_SECONDS) as client:

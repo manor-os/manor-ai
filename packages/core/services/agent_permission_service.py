@@ -24,6 +24,7 @@ Env-var fallback (explicitly enabled self-hosted / infrastructure defaults):
 """
 from __future__ import annotations
 
+import contextvars
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -80,7 +81,26 @@ _FIRST_PARTY_PROVIDER_PREFIXES: tuple[str, ...] = ("manor_mcp_",)
 
 
 def _is_first_party_provider(provider: str) -> bool:
-    return provider == "manor" or provider.startswith(_FIRST_PARTY_PROVIDER_PREFIXES)
+    return provider != "manor_mcp_minutes" and (
+        provider == "manor" or provider.startswith(_FIRST_PARTY_PROVIDER_PREFIXES)
+    )
+
+
+# Facts shared by provider checks in one discovery batch. Single execution-time
+# checks remain uncached, so authorization is always evaluated against live state.
+_DISCOVERY_FACTS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "integration_discovery_facts", default=None,
+)
+
+
+async def _shared_fact(key: tuple, load):
+    facts = _DISCOVERY_FACTS.get()
+    if facts is None:
+        return await load()
+    if key not in facts:
+        facts[key] = await load()
+    return facts[key]
+
 
 
 
@@ -124,6 +144,7 @@ async def can_use_integration(
     integration_account_id: str | None = None,
     integration_registry: RuntimeIntegrationRegistry | None = None,
     allow_env_fallback: bool = True,
+    for_discovery: bool = False,
 ) -> ToolAccessDecision:
     """Can the acting user use this integration via an agent right now?
 
@@ -299,10 +320,14 @@ async def resolve_usable_mcp_providers(
 ) -> frozenset[str]:
     """Batch 'which MCP servers can this user use right now'.
 
-    Used by search-time pre-filtering (tool_discovery_v2). Reuses
-    can_use_integration per provider so admin gating / first-party /
-    credential logic can't drift from the dispatch-time check. Failures
-    fail-open per provider (discovery-only surface; execution still gates).
+    Used by Tool Discovery v2 search-time pre-filtering. Account-backed
+    providers share one credential-free, actor-scoped registry snapshot;
+    special first-party/platform/CLI providers still reuse
+    ``can_use_integration`` so their gates cannot drift from dispatch.
+    Failures fail-open for discovery only; execution always revalidates.
+    Decisions read from stored rows are cached per actor until a relevant
+    write commits (integration_availability_cache); fail-open guesses are
+    never cached, and presence-based providers are decided every call.
 
     ``provider_keys`` is required (no default catalog import here): this
     file is a non-runtime production module and importing
@@ -313,18 +338,146 @@ async def resolve_usable_mcp_providers(
     runtime-owned and exempt from that scan) derives the provider keys
     from its own view of the tool schemas instead.
     """
+    canonical_keys = tuple(dict.fromkeys(
+        canonical
+        for key in provider_keys
+        if (canonical := canonical_provider_key(key))
+    ))
+    live_keys = tuple(key for key in canonical_keys if _availability_is_presence(key))
+    stable_keys = tuple(key for key in canonical_keys if key not in live_keys)
     usable: set[str] = set()
-    for key in provider_keys:
-        try:
-            decision = await can_use_integration(
-                db, user_id=user_id, entity_id=entity_id,
-                provider=key, allow_env_fallback=False,
-            )
-            if decision.allowed:
-                usable.add(key)
-        except Exception:
-            usable.add(key)  # fail-open: never hide tools due to an error
+    if live_keys:
+        usable |= (await _decide_usable_providers(
+            db, user_id=user_id, entity_id=entity_id, provider_keys=live_keys,
+        )).usable
+    if stable_keys:
+        usable |= await _cached_usable_providers(
+            db, user_id=user_id, entity_id=entity_id, provider_keys=stable_keys,
+        )
     return frozenset(usable)
+
+
+def _availability_is_presence(provider: str) -> bool:
+    """Whether usability follows a live connection rather than stored rows."""
+    return False
+
+
+@dataclass(frozen=True)
+class _UsableProviders:
+    usable: frozenset[str]
+    # False when any decision was a fail-open guess or saw a registry error.
+    complete: bool
+    # Users whose shared accounts the decisions relied on.
+    owner_user_ids: frozenset[str]
+
+
+async def _cached_usable_providers(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    entity_id: str,
+    provider_keys: tuple[str, ...],
+) -> set[str]:
+    """Stored-row decisions, cached per actor until a relevant write commits."""
+    from packages.core import read_cache
+    from packages.core.services import integration_availability_cache as availability
+
+    versions = await availability.current_versions(entity_id, user_id)
+    if versions is None:
+        decided = await _decide_usable_providers(
+            db, user_id=user_id, entity_id=entity_id, provider_keys=provider_keys,
+        )
+        return set(decided.usable)
+    read = await read_cache.lookup(availability.snapshot_key(entity_id, user_id, versions, provider_keys))
+    if read.hit and isinstance(read.value, list):
+        return set(read.value) & set(provider_keys)
+    try:
+        decided = await _decide_usable_providers(
+            db, user_id=user_id, entity_id=entity_id, provider_keys=provider_keys,
+        )
+        # Dependencies are recorded before the snapshot exists, so an owner's
+        # later change always reaches it.
+        if decided.complete and await availability.register_dependents(
+            decided.owner_user_ids - {user_id}, entity_id,
+        ):
+            await read_cache.store(
+                read, sorted(decided.usable),
+                ttl=availability.SNAPSHOT_TTL, max_ttl=availability.SNAPSHOT_MAX_TTL,
+            )
+        return set(decided.usable)
+    finally:
+        await read_cache.abandon(read)
+
+
+async def _decide_usable_providers(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    entity_id: str,
+    provider_keys: tuple[str, ...],
+) -> _UsableProviders:
+    # Presence providers are decided from their live connection before any
+    # account lookup, so they never need the registry.
+    account_provider_keys = tuple(
+        key for key in provider_keys
+        if provider_requires_integration_account_registry(key)
+        and not _availability_is_presence(key)
+    )
+    integration_registry: RuntimeIntegrationRegistry | None = None
+    complete = True
+    if account_provider_keys:
+        try:
+            integration_registry = await load_runtime_integration_registry(
+                db,
+                user_id=user_id,
+                entity_id=entity_id,
+                provider_keys=account_provider_keys,
+            )
+        except Exception:
+            # Search-time filtering is advisory. A registry outage must not
+            # hide a potentially usable provider; the execution gate will
+            # reload the exact account and fail closed before provider I/O.
+            complete = False
+        else:
+            complete = not integration_registry.load_errors and not any(
+                binding.load_errors for binding in integration_registry.integrations
+            )
+
+    usable: set[str] = set()
+    facts_token = _DISCOVERY_FACTS.set({})
+    try:
+        await _preload_platform_credentials(db, provider_keys)
+        for key in provider_keys:
+            if integration_registry is None and key in account_provider_keys:
+                usable.add(key)
+                continue
+            try:
+                decision = await can_use_integration(
+                    db, user_id=user_id, entity_id=entity_id,
+                    provider=key,
+                    integration_registry=integration_registry,
+                    allow_env_fallback=False,
+                    for_discovery=True,
+                )
+                if decision.allowed:
+                    usable.add(key)
+            except Exception:
+                usable.add(key)  # fail-open: never hide tools due to an error
+                complete = False
+    finally:
+        _DISCOVERY_FACTS.reset(facts_token)
+    owners = frozenset(
+        account.owner_user_id
+        for binding in (integration_registry.integrations if integration_registry else ())
+        for account in binding.accounts
+        if account.owner_user_id
+    )
+    return _UsableProviders(frozenset(usable), complete, owners)
+
+
+async def _preload_platform_credentials(db: AsyncSession, provider_keys: Iterable[str]) -> None:
+    """Read every requested Manor-funded provider's credential row in one query."""
+    return
 
 
 async def can_use_mcp_server(

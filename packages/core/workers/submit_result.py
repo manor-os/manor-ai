@@ -24,6 +24,8 @@ is the deliberate, structured hand-off:
 """
 from __future__ import annotations
 
+from copy import deepcopy
+
 import json
 from typing import Any, Callable, Optional
 
@@ -36,6 +38,7 @@ from packages.core.contracts.task_output import (
     OutputContractKind,
     SchemaContractError,
     output_contract_for_schema,
+    TASK_FAILURE_BLOCKER_ITEM_SCHEMA,
     task_failure_control_schema,
     task_output_terminal_branch_schema,
     validate_schema_contract,
@@ -66,11 +69,19 @@ SUBMIT_RESULT_TERMINAL_POLICY: dict[str, Any] = {
 SUBMIT_RESULT_PROMPT_SUFFIX = (
     "\n\nWhen the work is complete (or you cannot proceed), you MUST finish by "
     "calling the `submit_result` tool exactly once with your final outcome. "
-    "If status is failed, include a factual failure block. Set retryable=false "
-    "when another identical attempt cannot change the blocker, and set "
-    "requires_human=true when permissions, credentials, or missing human input "
-    "must change before any plan can proceed. For a failed outcome, do not "
-    "fabricate or include a `result`; put all evidence in `failure`. "
+    "`status` reports whether the deliverable this step exists to produce now "
+    "exists: succeeded = it exists in full; partial = a usable but incomplete "
+    "deliverable exists; failed = it was not produced. A placeholder, an "
+    "explanation, or a list of what is missing standing in for the deliverable "
+    "is not a deliverable — that outcome is failed, never succeeded or partial. "
+    "If status is failed, include a factual failure block: list every missing "
+    "input, evidence, permission, or credential in `failure.blockers`, set "
+    "retryable=false when another identical attempt cannot change the blocker, "
+    "and set requires_human=true when a person must supply a missing fact or "
+    "credential before any plan can proceed — not for tool errors, "
+    "authorization_receipt_mismatch, unsupported_operation_for_file_type, "
+    "path traversal, or unsupported_binary_edit. For a failed outcome, do not fabricate or "
+    "include a `result`; put all evidence in `failure`. "
     "Do not end with a plain text message."
 )
 
@@ -81,7 +92,7 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
     Legacy, unmarked object schemas expose their properties as advisory hints
     without required fields. Task-authored terminal contracts and explicit
     PlanStep output contracts preserve the complete payload schema.
-    Successful/partial outcomes require ``result``; a failed Task envelope
+    Successful/partial outcomes require ``result``; a failed hard-contract step
     requires ``failure`` instead. Missing success fields must retry instead
     of becoming a summary-only success. Steps without either schema receive
     a free object.
@@ -121,14 +132,14 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
             "reason": {"type": "string"},
             "blockers": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": dict(TASK_FAILURE_BLOCKER_ITEM_SCHEMA),
             },
             "retryable": {"type": "boolean"},
             "requires_human": {"type": "boolean"},
         },
         "required": ["reason", "retryable"],
     }
-    if contract.kind is OutputContractKind.TASK_ENVELOPE:
+    if hard_declared_contract:
         failure_schema = task_failure_control_schema()
         failure_schema["description"] = (
             "Why a failed step could not complete and whether retrying can help."
@@ -149,8 +160,10 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
                 # agent's answer is silently rewritten downstream.
                 "enum": list(StepResultStatus.values()),
                 "description": (
-                    "succeeded = objective met; partial = some of it; "
-                    "failed = could not proceed."
+                    "succeeded = the deliverable exists in full; partial = a "
+                    "usable but incomplete deliverable exists; failed = the "
+                    "deliverable was not produced (blocked, missing input or "
+                    "evidence, could not proceed)."
                 ),
             },
             "result": result_schema,
@@ -158,10 +171,18 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
         },
         "required": ["summary"],
     }
-    if contract.kind is OutputContractKind.TASK_ENVELOPE:
-        parameters["allOf"] = [task_output_terminal_branch_schema("result")]
-    elif hard_declared_contract:
-        parameters["required"].append("result")
+    if hard_declared_contract:
+        # The exclusive success/failure branch (``task_output_terminal_branch_
+        # schema``) is enforced on the submitted payload by
+        # ``step_result_from_submit`` and the persisted envelope. It must not
+        # be advertised in the tool's ``parameters``: Anthropic rejects any
+        # ``allOf``/``anyOf``/``oneOf`` at the top level of ``input_schema``
+        # (HTTP 400), which took every Anthropic-routed hard-contract step
+        # down before the model ran. The rule is stated in prose instead.
+        parameters["properties"]["status"]["description"] += (
+            " For succeeded or partial, `result` is required and `failure` must "
+            "be omitted; for failed, `failure` is required."
+        )
     return {
         "type": "function",
         "function": {
@@ -174,6 +195,21 @@ def build_submit_result_tool(expected_output_schema: Optional[dict]) -> dict[str
             "parameters": parameters,
         },
     }
+
+
+def submit_result_contract_schema(expected_output_schema: Optional[dict]) -> dict[str, Any]:
+    """The validation contract for a submitted payload.
+
+    The advertised tool parameters plus, for a hard contract, the exclusive
+    success/failure branch. This is what a payload is judged against
+    (``step_result_from_submit`` and the persisted envelope apply the same
+    branch); the model-facing tool leaves the branch out because Anthropic
+    rejects top-level combinators in ``input_schema``.
+    """
+    parameters = deepcopy(build_submit_result_tool(expected_output_schema)["function"]["parameters"])
+    if output_contract_for_schema(expected_output_schema).requires_result:
+        parameters["allOf"] = [task_output_terminal_branch_schema("result")]
+    return parameters
 
 
 def submit_result_capture() -> tuple[Callable[[dict[str, Any]], str], Callable[[], Optional[dict]]]:
@@ -209,7 +245,7 @@ def step_result_from_submit(
     # Keep omission distinct from an explicit JSON null.  The latter is
     # allowed to reach the validator for schemas whose value is nullable; an
     # omitted member is always a malformed hard-contract submission.
-    contract.require_submission_result(payload)
+    failure_control = contract.require_submission_result(payload)
     if contract.kind is OutputContractKind.TASK_ENVELOPE:
         summary = str(payload.get("summary") or "").strip()
         status = normalize_step_result_status(payload.get("status"))
@@ -226,6 +262,10 @@ def step_result_from_submit(
         return envelope
 
     if contract.is_bare_payload:
+        if failure_control is not None:
+            # A failed outcome is Runtime control, not a fabricated value of
+            # the declared payload schema. The worker settles it via fail_lease.
+            raise failure_control
         # A PlanStep payload is the exact declared value, not a control
         # envelope. Injecting the tool's summary/status here would violate
         # custom schemas that correctly use additionalProperties=false.

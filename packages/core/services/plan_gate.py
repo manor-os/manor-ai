@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.plans import ai_credit_limits_enabled, is_cloud
@@ -116,10 +116,26 @@ async def _count_users(db: AsyncSession, entity_id: str) -> int:
 
 @counter("storage_mb")
 async def _count_storage(db: AsyncSession, entity_id: str) -> float:
+    from packages.core.models.chat_room import ChatRoom, ChatRoomFile, ChatRoomMessage
+    from packages.core.models.user import User
     from packages.core.services.document_service import storage_usage
 
     size_bytes, _file_count = await storage_usage(db, entity_id)
-    return size_bytes / (1024 * 1024)
+    # Inline group copies live outside Documents but consume the same Entity
+    # storage. Generated group Documents are already included above.
+    personal_owner_ids = select(User.id).where(User.entity_id == entity_id)
+    group_bytes = (await db.execute(
+        select(func.coalesce(func.sum(ChatRoomFile.size), 0))
+        .join(ChatRoomMessage, ChatRoomMessage.id == ChatRoomFile.message_id)
+        .join(ChatRoom, ChatRoom.id == ChatRoomMessage.room_id)
+        .where(
+            ChatRoom.kind == "group",
+            ChatRoomFile.document_id.is_(None),
+            or_(ChatRoom.owner_entity_id == entity_id,
+                ChatRoom.owner_user_id.in_(personal_owner_ids)),
+        )
+    )).scalar_one()
+    return (size_bytes + int(group_bytes or 0)) / (1024 * 1024)
 
 
 @counter("ai_budget_usd")

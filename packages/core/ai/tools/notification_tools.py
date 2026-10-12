@@ -107,10 +107,12 @@ FIND_TEAM_MEMBERS_SCHEMA: dict[str, Any] = {
     "function": {
         "name": "find_team_members",
         "description": (
-            "Search for Manor users in your entity. Use this to resolve "
+            "Search for active Manor users in your entity with all filters in one "
+            "call. Values within a plural filter are ORed; different filters and "
+            "inclusive ranges are ANDed before pagination, with an exact total. "
+            "Use this to resolve "
             "names / emails / handles to a ``user_id`` you can hand to "
-            "``notify_user``. With no ``query`` it returns the entity's "
-            "active members (capped at ``limit``)."
+            "``notify_user``. With no filters it returns active members."
         ),
         "parameters": {
             "type": "object",
@@ -131,11 +133,47 @@ FIND_TEAM_MEMBERS_SCHEMA: dict[str, Any] = {
                         "``workspace_staff``."
                     ),
                 },
+                "workspace_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
+                    "description": "Match members of any listed Workspace (OR).",
+                },
+                "roles": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "uniqueItems": True,
+                    "description": "Match any effective entity membership role (OR).",
+                },
+                **{
+                    field: {
+                        "type": "string",
+                        "format": "date-time",
+                        "description": "Inclusive ISO-8601 range endpoint.",
+                    }
+                    for field in (
+                        "created_after",
+                        "created_before",
+                        "updated_after",
+                        "updated_before",
+                        "last_login_after",
+                        "last_login_before",
+                    )
+                },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 50,
                     "default": 20,
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
                 },
             },
         },

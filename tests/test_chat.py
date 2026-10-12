@@ -993,10 +993,6 @@ async def test_chat_stream_projects_workspace_recommendation_after_unrelated_act
     monkeypatch: pytest.MonkeyPatch,
 ):
     from apps.api.routers import chat as chat_router
-    from packages.core.ai.runtime.auto_route_classifier import (
-        AutoRouteDecision,
-        AutoRouteMode,
-    )
     from packages.core.ai.runtime.general_chat_intent import (
         GeneralChatIntentDecision,
     )
@@ -1042,9 +1038,6 @@ async def test_chat_stream_projects_workspace_recommendation_after_unrelated_act
     )
     await db_session.commit()
 
-    async def fake_auto_route(**_kwargs):
-        return AutoRouteDecision(AutoRouteMode.DIRECT_CHAT, 0.98)
-
     async def fake_creation_authorization(**_kwargs):
         return WorkspaceCreationAuthorizationDecision.not_authorized(0.99)
 
@@ -1065,7 +1058,6 @@ async def test_chat_stream_projects_workspace_recommendation_after_unrelated_act
             candidates=candidates,
         )
 
-    monkeypatch.setattr(chat_intent_routing, "classify_auto_route", fake_auto_route)
     monkeypatch.setattr(
         chat_intent_routing,
         "classify_workspace_creation_authorization",
@@ -1107,8 +1099,13 @@ async def test_chat_stream_projects_workspace_recommendation_after_unrelated_act
     assert response.status_code == 200, response.text
     metadata = captured["runtime_metadata"]
     assert isinstance(metadata, dict)
-    assert metadata["workspace_recommendation"]["action"] == "create_new"
-    assert metadata["workspace_recommendation"]["request"] == "我想长期管理招聘流程"
+    # The recommendation is classified beside the turn and read at its end.
+    assert "workspace_recommendation" not in metadata
+    published = await chat_intent_routing.wait_for_deferred_chat_intent(
+        metadata["deferred_chat_intent_key"], timeout=5,
+    )
+    assert published["workspace_recommendation"]["action"] == "create_new"
+    assert published["workspace_recommendation"]["request"] == "我想长期管理招聘流程"
 
 
 @pytest.mark.asyncio
@@ -1383,6 +1380,76 @@ async def test_workspace_chat_user_message_records_author(client: AsyncClient):
     user_msgs = [m for m in msgs if m["author_kind"] == "user"]
     assert user_msgs, "expected the user message to be persisted in workspace chat"
     assert all(m["author_user_id"] == me["id"] for m in user_msgs)
+
+
+@pytest.mark.asyncio
+async def test_workspace_screenshot_turn_retains_client_and_server_receipts(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from apps.api.main import _cors_allowed_origins
+    from packages.core.services.file_context import FileAttachments
+    from packages.core.services.runtime_file_context import RuntimeFileContextTurn
+    from packages.core.services.sse_events import format_sse
+
+    headers = await _auth(client, "ws_screenshot_receipt")
+    me = (await client.get("/api/v1/auth/me", headers=headers)).json()
+    workspace = (await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Screenshot receipt WS"},
+    )).json()
+    text = "怎么还需要elevenlabs"
+    client_message_id = "screenshot-request-1"
+    image_url = f"/api/v1/fs/{me['entity_id']}/uploads/chat/screenshot.png"
+    image_ref = {
+        "kind": "chat_upload", "mime": "image/png", "name": "image.png",
+        "path": "uploads/chat/screenshot.png", "url": image_url, "image": True,
+    }
+    reference_line = f"[Image: image.png → {image_url}]"
+
+    async def prepared_attachments(*_args, **_kwargs):
+        return RuntimeFileContextTurn(cleaned_message=text, attachments=FileAttachments(
+            image_urls=[image_url], image_reference_lines=[reference_line],
+            attachment_refs=[image_ref],
+        ))
+
+    async def fake_stream(_message, conversation_id, **kwargs):
+        assert kwargs["runtime_metadata"]["origin_user_message_id"]
+        yield format_sse("stream_start", {
+            "conversation_id": conversation_id,
+            "message_id": kwargs["assistant_message_id"],
+        })
+        yield format_sse("stream_end", {"conversation_id": conversation_id, "persisted": False})
+
+    monkeypatch.setattr(chat_router, "_build_attachments", prepared_attachments)
+    monkeypatch.setattr(chat_router, "runtime_stream_chat_turn", fake_stream)
+    monkeypatch.setattr(chat_router.get_settings(), "MANOR_RUNTIME_EXECUTION_MODE", "inline")
+    origin = _cors_allowed_origins()[0]
+    response = await client.post("/api/v1/chat/stream", headers={**headers, "Origin": origin}, data={
+        "message": text, "client_message_id": client_message_id,
+        "workspace_context": "true", "workspace_id": workspace["id"],
+    })
+    assert response.status_code == 200, response.text
+    conversation_id = response.headers["X-Conversation-ID"]
+    message_id = response.headers["X-User-Message-ID"]
+    assert response.headers["X-Client-Message-ID"] == client_message_id
+    assert response.headers["Access-Control-Allow-Origin"] == origin
+    exposed_headers = {
+        name.strip().lower()
+        for name in response.headers["Access-Control-Expose-Headers"].split(",")
+    }
+    assert {"x-conversation-id", "x-user-message-id", "x-client-message-id", "x-runtime-run-id"} <= exposed_headers
+    history = (await client.get(
+        f"/api/v1/workspaces/{workspace['id']}/chat/messages", headers=headers,
+    )).json()
+    user_messages = [message for message in history if message["author_kind"] == "user"]
+    assert len(user_messages) == 1
+    message = user_messages[0]
+    assert message["id"] == message_id
+    assert message["conversation_id"] == conversation_id
+    assert message["author_user_id"] == me["id"]
+    assert message["meta"]["client_message_id"] == client_message_id
+    assert message["body"] == f"{text}\n{reference_line}"
+    assert message["attachments"] == [image_ref]
 
 
 @pytest.mark.asyncio

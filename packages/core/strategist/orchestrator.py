@@ -9,6 +9,7 @@ trigger transports.
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 from typing import Any
@@ -20,6 +21,7 @@ from packages.core.constants.review import (
     ReviewSkipReason,
 )
 from packages.core.models.base import generate_ulid
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 logger = logging.getLogger(__name__)
 _REVIEW_LEASE_HEARTBEAT_SECONDS = 30
@@ -158,10 +160,12 @@ async def run_strategist_review_cycle(
     trigger,
     *,
     execution_owner: str | None = None,
+    automation_context: dict | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """Execute one full Strategist review cycle over an open session."""
     from packages.core.models.workspace import Workspace
-    from packages.core.strategist import ReviewTrigger
+    from packages.core.strategist import ReviewTrigger, ReviewTriggerKind
 
     trigger = ReviewTrigger.coerce(trigger)
 
@@ -173,6 +177,16 @@ async def run_strategist_review_cycle(
             )
         )
     ).scalar_one_or_none()
+    if workspace is not None and (
+        not workspace_allows_manual_work(workspace)
+        or (workspace.status == "paused" and not trigger.is_human_initiated)
+    ):
+        return {
+            "workspace_id": workspace_id,
+            "skipped": True,
+            "reason": ReviewSkipReason.WORKSPACE_INACTIVE,
+            "workspace_status": workspace.status,
+        }
     entity_id = workspace.entity_id if workspace is not None else None
     review_v2_enabled = False
     if entity_id is not None:
@@ -185,24 +199,37 @@ async def run_strategist_review_cycle(
             fallback=False,
         )
 
-    if review_v2_enabled:
+    language_scope = nullcontext()
+    if user_id is None and trigger.kind is ReviewTriggerKind.SCHEDULED and workspace is not None:
+        creator_id = (workspace.settings or {}).get("created_by_user_id")
+        if isinstance(creator_id, str) and creator_id.strip():
+            from packages.core.ai.response_language import resolve_response_locale
+            from packages.core.ai.runtime.response_language import (
+                RuntimeResponseLanguage,
+                runtime_response_language_scope,
+            )
+
+            # Legacy schedules may lack an execution owner. The exact saved
+            # creator supplies only language, never billing or tool authority.
+            locale = await resolve_response_locale(creator_id, db=db)
+            if locale is not None:
+                language_scope = runtime_response_language_scope(RuntimeResponseLanguage(
+                    entity_id=entity_id,
+                    user_id=None,
+                    locale=locale,
+                ))
+
+    with language_scope:
         return await _run_strategist_review_cycle(
             db,
             workspace_id,
             trigger,
             workspace=workspace,
-            use_review_run=True,
+            use_briefing=review_v2_enabled,
             execution_owner=execution_owner or "review:" + generate_ulid(),
+            automation_context=automation_context,
+            user_id=user_id,
         )
-
-    return await _run_strategist_review_cycle(
-        db,
-        workspace_id,
-        trigger,
-        workspace=workspace,
-        use_review_run=False,
-        execution_owner=None,
-    )
 
 
 async def _run_strategist_review_cycle(
@@ -211,14 +238,17 @@ async def _run_strategist_review_cycle(
     trigger,
     *,
     workspace,
-    use_review_run: bool,
+    use_briefing: bool,
     execution_owner: str | None,
+    automation_context: dict | None,
+    user_id: str | None = None,
 ) -> dict:
     """Claim and run one review, recovering expiry or the same redelivery."""
     from packages.core.constants.review import ReviewRunStatus
     from packages.core.models.review_run import ReviewRun
     from packages.core.review import (
         ReviewAlreadyRunning,
+        ReviewWorkspaceUnavailable,
         begin_review,
         fail_review,
         review_lease_is_expired,
@@ -228,7 +258,9 @@ async def _run_strategist_review_cycle(
     entity_id = workspace.entity_id if workspace is not None else None
     review = None
     review_id: str | None = None
-    if use_review_run and entity_id is not None:
+    # Every review needs a durable admission/lease receipt, including the
+    # legacy prompt path. The feature flag controls evidence formatting only.
+    if entity_id is not None:
         terminal_delivery = await _terminal_delivery_result(
             db,
             workspace_id=workspace_id,
@@ -328,6 +360,13 @@ async def _run_strategist_review_cycle(
             # Make the partial-unique-index claim visible before the expensive
             # evidence work. The durable lease is renewed independently.
             await db.commit()
+        except ReviewWorkspaceUnavailable:
+            await db.rollback()
+            return {
+                "workspace_id": workspace_id,
+                "skipped": True,
+                "reason": ReviewSkipReason.WORKSPACE_INACTIVE,
+            }
         except ReviewAlreadyRunning:
             terminal_delivery = await _terminal_delivery_result(
                 db,
@@ -354,7 +393,7 @@ async def _run_strategist_review_cycle(
     )
     try:
         initial_activity_message_id: str | None = None
-        if workspace is not None and workspace.status == "active":
+        if workspace_allows_manual_work(workspace):
             from packages.core.strategist.service import _post_strategist_activity
 
             initial_activity_message_id = await _post_strategist_activity(
@@ -368,7 +407,7 @@ async def _run_strategist_review_cycle(
             )
 
         briefing_markdown: str | None = None
-        if review is not None:
+        if use_briefing and review is not None:
             from packages.core.consolidators import run_all
             from packages.core.review.briefing import build_briefing
             from packages.core.review.briefing_render import render_briefing_markdown
@@ -392,6 +431,8 @@ async def _run_strategist_review_cycle(
             review_lease_owner=execution_owner,
             activity_review_id=activity_review_id,
             initial_activity_message_id=initial_activity_message_id,
+            automation_context=automation_context,
+            user_id=user_id,
         )
     except Exception as exc:
         if review_id is not None:

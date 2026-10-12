@@ -14,10 +14,13 @@ in Redis (``ops:snapshot``) without further serialization gymnastics.
 """
 from __future__ import annotations
 
+import os
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import re
 import time
-from typing import Any
+from typing import Callable, Any
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +98,50 @@ def collect_host_metrics() -> dict[str, Any]:
         return {"error": str(exc)}
 
 
+# One tick must never outlive its interval: per-container Docker calls block
+# ~1-2 s each, so on a busy host a serial walk over 60+ containers took
+# minutes and monopolised whichever queue it ran on. Calls run in a small
+# thread pool under a wall-clock budget; whatever has not answered by then is
+# reported unsampled and picked up next tick.
+OPS_SNAPSHOT_BUDGET_SECONDS = float(os.getenv("OPS_SNAPSHOT_BUDGET_SECONDS", "8"))
+OPS_SNAPSHOT_MAX_WORKERS = int(os.getenv("OPS_SNAPSHOT_MAX_WORKERS", "8"))
+
+
+def _bounded_map(
+    items: list[Any],
+    fn: Callable[[Any], Any],
+    *,
+    budget_seconds: float,
+    max_workers: int,
+) -> tuple[dict[int, Any], int]:
+    """Apply ``fn`` to ``items`` concurrently; return ``(index -> result, skipped)``.
+
+    Results that miss the budget are omitted (counted in ``skipped``); their
+    threads finish in the background and are not awaited.
+    """
+    if not items:
+        return {}, 0
+    results: dict[int, Any] = {}
+    budget = max(0.5, float(budget_seconds))
+    pool = ThreadPoolExecutor(max_workers=max(1, int(max_workers)))
+    futures = {pool.submit(fn, item): index for index, item in enumerate(items)}
+    try:
+        for future in as_completed(futures, timeout=budget):
+            index = futures[future]
+            try:
+                results[index] = future.result()
+            except Exception as exc:  # noqa: BLE001 - one container must not fail the tick
+                logger.debug("ops snapshot item %s failed: %s", index, exc)
+    except TimeoutError:
+        pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    skipped = len(items) - len(results)
+    if skipped:
+        logger.info("ops snapshot: %d of %d items missed the %.0fs budget", skipped, len(items), budget)
+    return results, skipped
+
+
 def collect_docker_containers() -> list[dict[str, Any]]:
     """Per-container snapshot. Skips ``stats`` calls on exited containers
     (those raise APIError). For running containers, ``stats(stream=False)``
@@ -113,6 +160,19 @@ def collect_docker_containers() -> list[dict[str, Any]]:
         logger.warning("docker.containers.list failed: %s", exc)
         return [{"error": str(exc)}]
 
+    running = [c for c in containers if ((c.attrs or {}).get("State") or {}).get("Status") == "running"]
+    # Workers pull in submission order, so a binding budget would otherwise
+    # cut the same tail every tick and those containers would never be
+    # sampled. A random order spreads the misses across ticks.
+    random.shuffle(running)
+    sampled, _skipped = _bounded_map(
+        running,
+        lambda c: c.stats(stream=False),
+        budget_seconds=OPS_SNAPSHOT_BUDGET_SECONDS,
+        max_workers=OPS_SNAPSHOT_MAX_WORKERS,
+    )
+    stats_by_id = {running[index].id: stats for index, stats in sampled.items()}
+
     for c in containers:
         attrs = c.attrs or {}
         state = attrs.get("State") or {}
@@ -120,17 +180,19 @@ def collect_docker_containers() -> list[dict[str, Any]]:
         cpu_pct = 0.0
         mem_mb = 0
         mem_pct = 0.0
+        stats_sampled = False
 
-        if state.get("Status") == "running":
+        stats = stats_by_id.get(c.id)
+        if stats:
             try:
-                stats = c.stats(stream=False)
                 cpu_pct = _calc_cpu_pct(stats)
                 mem_usage = (stats.get("memory_stats") or {}).get("usage") or 0
                 mem_limit = (stats.get("memory_stats") or {}).get("limit") or 0
                 mem_mb = mem_usage // (1024 * 1024)
                 mem_pct = round((mem_usage / mem_limit) * 100, 1) if mem_limit else 0.0
+                stats_sampled = True
             except Exception as exc:
-                logger.debug("stats(%s) failed: %s", c.name, exc)
+                logger.debug("stats(%s) unreadable: %s", c.name, exc)
 
         health = (state.get("Health") or {}).get("Status") if state.get("Health") else None
         # ``c.image`` lazy-fetches the image record — if the image was
@@ -152,6 +214,7 @@ def collect_docker_containers() -> list[dict[str, Any]]:
             "mem_mb": int(mem_mb),
             "mem_pct": mem_pct,
             "mem_limit_mb": (host_cfg.get("Memory") or 0) // (1024 * 1024) or None,
+            "stats_sampled": stats_sampled,
         })
     return out
 
@@ -259,13 +322,17 @@ def collect_log_error_counts(since_seconds: int = 60) -> dict[str, int]:
         return {}
     out: dict[str, int] = {}
     try:
-        for c in client.containers.list(all=False):
-            name = c.name
-            if name.endswith("-init"):
-                continue
-            text = fetch_container_logs(name, since_seconds=since_seconds, tail=2000)
+        names = [c.name for c in client.containers.list(all=False) if not c.name.endswith("-init")]
+        random.shuffle(names)  # same fairness reason as collect_docker_containers
+        texts, _skipped = _bounded_map(
+            names,
+            lambda name: fetch_container_logs(name, since_seconds=since_seconds, tail=2000),
+            budget_seconds=OPS_SNAPSHOT_BUDGET_SECONDS,
+            max_workers=OPS_SNAPSHOT_MAX_WORKERS,
+        )
+        for index, text in texts.items():
             if text:
-                out[name] = count_errors(text)
+                out[names[index]] = count_errors(text)
     except Exception as exc:
         logger.warning("collect_log_error_counts failed: %s", exc)
     return out

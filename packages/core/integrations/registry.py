@@ -168,3 +168,7 @@ register_integration(
 # personal ClawBot and Official Account integrations. Keep legacy rows
 # addressable as the Official Account provider until operators re-save them.
 register_integration("wechat_official", aliases=("wechat",))
+
+# Lark and Feishu share one app-credential connector; each account selects its
+# platform explicitly so aliases never choose an API region implicitly.
+register_integration("lark", aliases=("feishu",))

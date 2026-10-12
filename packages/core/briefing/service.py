@@ -25,6 +25,7 @@ from packages.core.briefing.schema import Briefing
 from packages.core.constants.goals import GoalStatus
 from packages.core.models.base import generate_ulid
 from packages.core.models.workspace import Workspace
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 from packages.core.workspaces import is_sandbox_workspace
 from packages.core.workspace_chat import service as chat_service
 
@@ -42,6 +43,8 @@ async def generate_briefing(
     sources: Optional[list[str]] = None,
     max_per_source: int = 10,
     timezone_name: Optional[str] = None,
+    user_id: str | None = None,
+    require_autonomous_runtime: bool = True,
 ) -> dict:
     """Build + post one briefing for a workspace. Caller commits.
 
@@ -57,7 +60,9 @@ async def generate_briefing(
     )).scalar_one_or_none()
     if workspace is None:
         raise BriefingError(f"workspace {workspace_id} not found")
-    if workspace.status != "active":
+    if workspace.status != "active" and (
+        require_autonomous_runtime or not workspace_allows_manual_work(workspace)
+    ):
         return {
             "workspace_id": workspace_id,
             "skipped": True,
@@ -105,6 +110,7 @@ async def generate_briefing(
         goals_snapshot=goals_snapshot,
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
+        user_id=user_id,
         workspace_summary=workspace_summary,
     )
     briefing = _attach_workspace_summary(briefing, workspace_summary)

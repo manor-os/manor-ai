@@ -361,6 +361,7 @@ class EntityFileSnapshot:
 
     abs_path: str
     descriptor_path: str
+    file_descriptor: int
     stat: os.stat_result
     version: EntityFileVersion
     content_sha256: str
@@ -1089,6 +1090,7 @@ def open_entity_file_snapshot(
             snapshot = EntityFileSnapshot(
                 abs_path=full_path,
                 descriptor_path=os.path.join(descriptor_root, str(file_fd)),
+                file_descriptor=file_fd,
                 stat=target_stat,
                 version=EntityFileVersion.from_stat(target_stat),
                 content_sha256=content_sha256,
@@ -1300,6 +1302,7 @@ def _persist_entity_file_atomic(
     write_precondition: Callable[[str, bool, str], None] | None,
     expected_source_version: EntityFileVersion | None,
     lock_mode: EntityFileWriteLockMode,
+    installed_receipt: Callable[[EntityFileVersion | None], None] | None = None,
 ) -> str:
     """Commit one file through a pinned parent directory descriptor."""
     lock_boundary = (
@@ -1391,6 +1394,8 @@ def _persist_entity_file_atomic(
                     dir_fd=parent_fd,
                     follow_symlinks=False,
                 )
+                if (target_stat.st_dev, target_stat.st_ino) != (tmp_stat.st_dev, tmp_stat.st_ino):
+                    raise EntityFileWriteError(f"Entity file replaced during installation: {safe_rel}")
                 if not stat.S_ISREG(target_stat.st_mode):
                     raise EntityFileWriteError(
                         f"Persisted file missing after write: {safe_rel}",
@@ -1404,7 +1409,13 @@ def _persist_entity_file_atomic(
                     raise EntityFileWriteError(
                         f"Entity file parent changed during commit: {safe_rel}",
                     )
+                os.fsync(parent_fd)
                 commit_state = EntityFileCommitState.VERIFIED
+                # Capture ownership while the pinned parent and writer lock are
+                # still held. A later read at this name is not proof that the
+                # file belongs to this write (another writer may replace it).
+                if installed_receipt is not None:
+                    installed_receipt(EntityFileVersion.from_stat(target_stat))
                 if backup_name is not None:
                     try:
                         os.unlink(backup_name, dir_fd=parent_fd)
@@ -1428,6 +1439,12 @@ def _persist_entity_file_atomic(
                         tmp_name,
                         exc_info=True,
                     )
+                if commit_state is EntityFileCommitState.INSTALLED:
+                    current = _target_stat_at(parent_fd, target_name)
+                    if (current.st_dev, current.st_ino) != (tmp_stat.st_dev, tmp_stat.st_ino):
+                        raise EntityFileWriteError(
+                            f"Entity file changed during failed installation: {safe_rel}; retained backup {backup_name}",
+                        )
                 if (
                     commit_state is EntityFileCommitState.INSTALLED
                     and backup_name is not None
@@ -1467,6 +1484,12 @@ def _persist_entity_file_atomic(
                             backup_name,
                             exc_info=True,
                         )
+                if commit_state is not EntityFileCommitState.VERIFIED and installed_receipt is not None:
+                    # Explicit proof of no installed mutation: either refusal
+                    # preceded rename, or the exact installed inode has just
+                    # been rolled back above. Unknown rollback paths raise
+                    # before reaching here and intentionally issue no receipt.
+                    installed_receipt(None)
                 raise
 
 
@@ -1500,6 +1523,7 @@ def write_entity_file_atomic(
     write_precondition: Callable[[str, bool, str], None] | None = None,
     expected_source_version: EntityFileVersion | None = None,
     lock_mode: EntityFileWriteLockMode = EntityFileWriteLockMode.ACQUIRE,
+    installed_receipt: Callable[[EntityFileVersion | None], None] | None = None,
 ) -> str:
     """Atomically write bytes into an entity filesystem and verify the result."""
     assert_entity_filesystem_ready()
@@ -1521,6 +1545,7 @@ def write_entity_file_atomic(
         write_precondition=write_precondition,
         expected_source_version=expected_source_version,
         lock_mode=lock_mode,
+        installed_receipt=installed_receipt,
     )
 
 
@@ -1529,20 +1554,24 @@ def copy_entity_file_atomic(
     rel_path: str,
     source_path: str,
     *,
+    source_fd: int | None = None,
     expected_size: int | None = None,
     allow_empty: bool = False,
     write_precondition: Callable[[str, bool, str], None] | None = None,
     expected_source_version: EntityFileVersion | None = None,
     lock_mode: EntityFileWriteLockMode = EntityFileWriteLockMode.ACQUIRE,
+    installed_receipt: Callable[[EntityFileVersion | None], None] | None = None,
 ) -> str:
     """Atomically copy an existing local file into an entity filesystem."""
     assert_entity_filesystem_ready()
     try:
-        source_fd = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW)
+        opened_fd = os.dup(source_fd) if source_fd is not None else os.open(
+            source_path, os.O_RDONLY | os.O_NOFOLLOW,
+        )
     except OSError as exc:
         raise EntityFileWriteError(f"Source file does not exist: {source_path}") from exc
     try:
-        source_stat = os.fstat(source_fd)
+        source_stat = os.fstat(opened_fd)
         if not stat.S_ISREG(source_stat.st_mode):
             raise EntityFileWriteError(f"Source is not a regular file: {source_path}")
         source_size = source_stat.st_size
@@ -1560,8 +1589,8 @@ def copy_entity_file_atomic(
             raise EntityFileWriteError(f"Path traversal not allowed: {rel_path!r}")
 
         def copy_source(temporary: BinaryIO) -> None:
-            os.lseek(source_fd, 0, os.SEEK_SET)
-            with os.fdopen(os.dup(source_fd), "rb") as source:
+            os.lseek(opened_fd, 0, os.SEEK_SET)
+            with os.fdopen(os.dup(opened_fd), "rb") as source:
                 shutil.copyfileobj(source, temporary)
 
         return _persist_entity_file_atomic(
@@ -1573,9 +1602,10 @@ def copy_entity_file_atomic(
             write_precondition=write_precondition,
             expected_source_version=expected_source_version,
             lock_mode=lock_mode,
+            installed_receipt=installed_receipt,
         )
     finally:
-        os.close(source_fd)
+        os.close(opened_fd)
 
 
 def delete_entity_path(
@@ -1633,6 +1663,54 @@ def delete_entity_path(
                 raise
             return EntityFileTargetKind.DIRECTORY
         raise EntityFilesystemError("Entity file target has an unsupported type")
+
+
+def unlink_entity_file_entry(
+    entity_id: str,
+    rel_path: str,
+    *,
+    allow_symlink: bool = False,
+) -> bool:
+    """Unlink one exact file entry through a pinned, non-symlink parent.
+
+    Unlike :func:`resolve_path`, this intentionally does not follow the final
+    directory entry. Cleanup jobs can therefore remove a final symlink itself
+    without ever touching its destination. Parent-directory aliases still fail
+    closed through ``_open_entity_target_parent``.
+    """
+    safe_rel = rel_path.replace("\\", "/").lstrip("/")
+    if not safe_rel or any(part in {"", ".", ".."} for part in safe_rel.split("/")):
+        raise EntityFilesystemError(f"Invalid entity file path: {rel_path!r}")
+    entity_root = canonical_entity_root(entity_id)
+    full_path = os.path.abspath(os.path.join(entity_root, safe_rel))
+    try:
+        if os.path.commonpath([entity_root, full_path]) != entity_root:
+            raise EntityFilesystemError(f"Path traversal not allowed: {rel_path!r}")
+    except ValueError as exc:
+        raise EntityFilesystemError(f"Invalid entity file path: {rel_path!r}") from exc
+
+    with _open_entity_target_parent(entity_id, full_path, create=False) as (
+        parent_fd,
+        target_name,
+        parent_path,
+    ):
+        if not _directory_fd_matches_path(parent_fd, parent_path):
+            raise EntityFilesystemError("Entity file parent changed before unlink")
+        try:
+            target_stat = os.stat(
+                target_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(target_stat.st_mode):
+            if not allow_symlink:
+                raise EntityFilesystemError("Entity file target became a filesystem alias")
+        elif not stat.S_ISREG(target_stat.st_mode):
+            raise EntityFilesystemError("Entity file target is not a regular file")
+        os.unlink(target_name, dir_fd=parent_fd)
+        return True
 
 
 def entity_fs_exists(entity_id: str) -> bool:
@@ -1741,7 +1819,7 @@ You are **Manor AI**, the primary intelligent assistant for this organization.
 - First person ("I can help with that")
 - Active voice, short sentences
 - No filler phrases ("certainly!", "great question!")
-- Use the user's language (detect from their messages)
+- Use the user's saved response language; infer it from their messages only when no saved language is provided
 
 ## Things to Avoid
 - Never fabricate data, citations, or numbers

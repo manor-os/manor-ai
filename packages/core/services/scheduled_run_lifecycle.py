@@ -27,9 +27,12 @@ EXECUTION_CHILD_ID_KEY = "scheduled_child_id"
 SETTLEMENT_KEY = "scheduled_settlement"
 RESULT_PROJECTION_KEY = "scheduled_result_projection"
 RESULT_PROJECTION_QUARANTINE_KEY = "scheduled_result_projection_quarantine"
+MANUAL_AGENT_INITIATIVE_ADMISSION_KEY = "manual_agent_initiative_admission"
+MANUAL_AGENT_INITIATIVE_ADMISSION_VERSION = "1"
 RECOVERY_EPOCH_PATTERN = r"^[0-9]{1,10}(?:\.[0-9]{1,6})?$"
 RECOVERY_MAX_EPOCH_SECONDS = 9_999_999_999
 _DISPATCH_KEYS = ("dispatch", "dispatch_status", "dispatch_ledger")
+MANUAL_SCHEDULED_REQUEST_KEY = "manual_request"
 _TERMINAL_RUN_STATUSES = frozenset({
     ScheduledRunStatus.SUCCESS,
     ScheduledRunStatus.COMPLETED,
@@ -173,6 +176,20 @@ class ScheduledChildAdmission:
     @property
     def admitted(self) -> bool:
         return self.status is ScheduledChildAdmissionStatus.ADMITTED
+
+
+class ScheduledAgentLineageDeletionBlockedError(ValueError):
+    """A scheduler lineage cannot be removed across an active Agent child."""
+
+    code = "scheduled_agent_lineage_deletion_blocked"
+
+    def __init__(self, *, job_id: str, task_ids: list[str]):
+        self.job_id = job_id
+        self.task_ids = tuple(task_ids)
+        super().__init__(
+            "Scheduled job cannot be deleted while an Agent task is executing "
+            "or its lifecycle lineage is inconsistent"
+        )
 
 
 @dataclass(frozen=True)
@@ -425,6 +442,10 @@ def merge_scheduled_run_result(
     for key in _DISPATCH_KEYS:
         if key in existing_result:
             merged[key] = existing_result[key]
+    if MANUAL_SCHEDULED_REQUEST_KEY in existing_result:
+        merged[MANUAL_SCHEDULED_REQUEST_KEY] = existing_result[MANUAL_SCHEDULED_REQUEST_KEY]
+    else:
+        merged.pop(MANUAL_SCHEDULED_REQUEST_KEY, None)
     if execution_state is not None:
         merged[EXECUTION_STATE_KEY] = execution_state.value
     if settlement is not None:
@@ -477,6 +498,63 @@ def _dispatch_matches_scheduled_child(
     )
 
 
+def manual_scheduled_request_user_id(run: object, *, job_id: str) -> str | None:
+    """Read the authenticated requester from this exact server-owned occurrence."""
+    result = getattr(run, "result", None)
+    receipt = result.get(MANUAL_SCHEDULED_REQUEST_KEY) if isinstance(result, dict) else None
+    if (
+        getattr(run, "job_id", None) != job_id
+        or getattr(run, "trigger_type", None) != "manual"
+        or not str(getattr(run, "idempotency_key", None) or "").startswith("manual:")
+        or not isinstance(receipt, dict)
+        or type(receipt.get("version")) is not int
+        or receipt["version"] != 1
+    ):
+        return None
+    user_id = receipt.get("user_id")
+    return user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
+
+
+def is_manual_scheduled_occurrence(run: object, *, job_id: str) -> bool:
+    """Manual clock overrides alone are not evidence of a human request."""
+    return manual_scheduled_request_user_id(run, job_id=job_id) is not None
+
+
+def _manual_agent_initiative_admits_disabled_child(
+    job: object,
+    run: object,
+    *,
+    child_kind: ScheduledDispatchKind | None,
+    child_id: str | None,
+) -> bool:
+    """Accept only the exact paused run-now occurrence minted by its owner path."""
+
+    result = getattr(run, "result", None)
+    marker = (
+        result.get(MANUAL_AGENT_INITIATIVE_ADMISSION_KEY)
+        if isinstance(result, dict)
+        else None
+    )
+    target = getattr(job, "execution_target", None)
+    initiative_id = str(
+        getattr(job, "agent_initiative_id", None) or ""
+    ).strip()
+    return bool(
+        child_kind is ScheduledDispatchKind.AGENT_TASK
+        and child_id
+        and initiative_id
+        and getattr(job, "execution_type", None) == "agent_initiative"
+        and isinstance(target, dict)
+        and target.get("managed_by") == "agent_initiative"
+        and str(target.get("initiative_id") or "") == initiative_id
+        and getattr(run, "trigger_type", None) == "manual"
+        and str(getattr(run, "idempotency_key", None) or "").startswith("manual:")
+        and isinstance(marker, dict)
+        and marker.get("version") == MANUAL_AGENT_INITIATIVE_ADMISSION_VERSION
+        and str(marker.get("initiative_id") or "") == initiative_id
+    )
+
+
 async def _scheduled_child_has_exact_provenance(
     db,
     *,
@@ -491,7 +569,14 @@ async def _scheduled_child_has_exact_provenance(
 
     if child_kind is ScheduledDispatchKind.AGENT_TASK:
         from packages.core.models.task import Task
+        from packages.core.services.task_runtime_approvals import (
+            lock_task_runtime_approval_boundary,
+        )
 
+        # Admission already owns the ScheduledJob/Run boundary.  Enter the
+        # Task approval serialization domain before the provenance row lock;
+        # later cancellation re-enters the same xact advisory lock safely.
+        await lock_task_runtime_approval_boundary(db, task_id=child_id)
         child = (await db.execute(
             select(Task).where(Task.id == child_id).with_for_update()
         )).scalar_one_or_none()
@@ -620,16 +705,46 @@ async def cancel_scheduled_child_if_pristine(
     from sqlalchemy import select
 
     if child_kind is ScheduledDispatchKind.AGENT_TASK:
+        from packages.core.constants.approvals import APPROVAL_LIVE_STATUSES
         from packages.core.constants.task import TaskStatus
+        from packages.core.models.hitl_request import HitlRequest
         from packages.core.models.task import Task
+        from packages.core.services.task_runtime_approvals import (
+            TASK_RUNTIME_HITL_DETAIL_KEY,
+            lock_task_runtime_approval_boundary,
+        )
         from packages.core.services.task_state_machine import apply_task_status_transition
 
+        # A runtime approval is a second durable owner of this Task's execution
+        # boundary.  Serialize with its creation/resolution first, then preserve
+        # the shared HitlRequest -> Task row-lock order used by cancellation and
+        # approval claims everywhere else.
+        await lock_task_runtime_approval_boundary(db, task_id=child_id)
+        live_hitl_id = (await db.execute(
+            select(HitlRequest.id)
+            .where(
+                HitlRequest.origin_task_id == child_id,
+                HitlRequest.status.in_(
+                    tuple(status.value for status in APPROVAL_LIVE_STATUSES)
+                ),
+            )
+            .order_by(HitlRequest.id.asc())
+            .limit(1)
+            .with_for_update()
+        )).scalar_one_or_none()
         task = (await db.execute(
             select(Task).where(Task.id == child_id).with_for_update()
         )).scalar_one_or_none()
         if task is None:
             return False
         details = task.details if isinstance(task.details, dict) else {}
+        runtime_hitl = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
+        if live_hitl_id is not None or (
+            isinstance(runtime_hitl, dict)
+            and str(runtime_hitl.get("state") or "")
+            in {"waiting", "resume_queued", "resuming"}
+        ):
+            return False
         if (
             str(details.get("scheduled_run_id") or "") != run_id
             or str(details.get("scheduled_job_id") or "") != job_id
@@ -700,6 +815,204 @@ async def cancel_scheduled_child_if_pristine(
         return True
 
     return False
+
+
+async def cancel_scheduled_runtime_hitl_tasks_for_job_deletion(
+    db,
+    *,
+    entity_id: str,
+    job_id: str,
+    legacy_task_id: str | None = None,
+    reason: str = "scheduled_job_deleted",
+) -> int:
+    """Close suspended Agent Tasks before their scheduler lineage is deleted.
+
+    Job deletion removes the occurrence rows that both an active execution and
+    a signed approval resume must settle against.  Pristine or human-suspended
+    children can be cancelled with the Job.  An executing child blocks deletion.
+    The Job caller already owns the parent scheduler lock; this helper then
+    follows the shared child order: Task advisory boundary -> HitlRequest(s) ->
+    Task.
+
+    A ``resuming`` Task or provider action with a durable execution claim blocks
+    deletion because its external side effect may already be in flight and its
+    current execution owner still needs the scheduler lineage for settlement.
+    """
+
+    from sqlalchemy import or_, select
+
+    from packages.core.constants.approvals import (
+        APPROVAL_LIVE_STATUSES,
+        ApprovalOriginKind,
+    )
+    from packages.core.constants.task import TaskStatus
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task import Task
+    from packages.core.services.task_runtime_approvals import (
+        TASK_RUNTIME_HITL_DETAIL_KEY,
+        expire_task_runtime_approval_for_terminal,
+        lock_task_runtime_approval_boundary,
+    )
+    from packages.core.services.task_service import update_task
+    from packages.core.services.task_state_machine import TERMINAL_STATUSES
+
+    lineage_filters = [Task.details["scheduled_job_id"].astext == job_id]
+    if legacy_task_id:
+        lineage_filters.append(Task.id == legacy_task_id)
+    candidate_ids = list((await db.execute(
+        select(Task.id)
+        .where(
+            Task.entity_id == entity_id,
+            Task.status.notin_(tuple(TERMINAL_STATUSES)),
+            or_(*lineage_filters),
+        )
+        .order_by(Task.id.asc())
+    )).scalars())
+
+    cancellable_tasks: list[Task] = []
+    blocked_task_ids: list[str] = []
+    for task_id in candidate_ids:
+        await lock_task_runtime_approval_boundary(db, task_id=task_id)
+        live_requests = list((await db.execute(
+            select(HitlRequest)
+            .where(
+                HitlRequest.entity_id == entity_id,
+                HitlRequest.origin_kind == ApprovalOriginKind.TOOL_CALL.value,
+                HitlRequest.origin_task_id == task_id,
+                HitlRequest.status.in_(
+                    tuple(status.value for status in APPROVAL_LIVE_STATUSES)
+                ),
+            )
+            .order_by(HitlRequest.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalars().all())
+        task = (await db.execute(
+            select(Task)
+            .where(Task.id == task_id, Task.entity_id == entity_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if task is None or task.status in TERMINAL_STATUSES:
+            continue
+
+        details = task.details if isinstance(task.details, dict) else {}
+        if (
+            str(details.get("scheduled_job_id") or "") != job_id
+            and task.id != legacy_task_id
+        ):
+            continue
+        marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
+        marker_state = (
+            str(marker.get("state") or "") if isinstance(marker, dict) else ""
+        )
+        exact_live_requests = [
+            request
+            for request in live_requests
+            if request.origin_conversation_id == task.conversation_id
+        ]
+        if len(exact_live_requests) != len(live_requests):
+            # A malformed cross-conversation request is not this lifecycle's
+            # authority to revoke.  Fail closed instead of terminalizing its
+            # Task while leaving an actionable card behind.
+            blocked_task_ids.append(task.id)
+            continue
+        if (
+            task.status == TaskStatus.IN_PROGRESS
+            or marker_state == "resuming"
+            or any(
+                isinstance(request.context, dict)
+                and isinstance(request.context.get("provider_action_claim"), dict)
+                for request in exact_live_requests
+            )
+        ):
+            blocked_task_ids.append(task.id)
+            continue
+        if isinstance(marker, dict) and marker_state not in {
+            "",
+            "waiting",
+            "resume_queued",
+            "finished",
+        }:
+            blocked_task_ids.append(task.id)
+            continue
+        if task.status in {
+            "created",
+            "pending",
+            "scheduled",
+            "waiting_on_customer",
+        }:
+            cancellable_tasks.append(task)
+        else:
+            # Unknown/non-pristine lifecycle states keep their scheduler
+            # lineage until a dedicated owner settles them.
+            blocked_task_ids.append(task.id)
+
+    if blocked_task_ids:
+        raise ScheduledAgentLineageDeletionBlockedError(
+            job_id=job_id,
+            task_ids=blocked_task_ids,
+        )
+
+    cancelled = 0
+    for task in cancellable_tasks:
+        details = task.details if isinstance(task.details, dict) else {}
+        await expire_task_runtime_approval_for_terminal(
+            db,
+            task=task,
+            reason=reason,
+        )
+        terminal_details = {
+            **details,
+            "scheduled_suppression_reason": reason,
+        }
+        updated = await update_task(
+            db,
+            task.id,
+            entity_id,
+            dispatch_plan=False,
+            status="cancelled",
+            details=terminal_details,
+        )
+        if updated is not None and updated.status == "cancelled":
+            cancelled += 1
+    return cancelled
+
+
+async def _fail_cancelled_agent_initiative_child(
+    db,
+    *,
+    job: object,
+    run: object,
+    child_kind: ScheduledDispatchKind | None,
+    child_id: str | None,
+    reason: str,
+) -> bool:
+    """Prevent a cancelled scheduler child from leaving its InitiativeRun open."""
+
+    initiative_id = str(
+        getattr(job, "agent_initiative_id", None) or ""
+    ).strip()
+    scheduled_run_id = str(getattr(run, "id", None) or "").strip()
+    if (
+        getattr(job, "execution_type", None) != "agent_initiative"
+        or child_kind is not ScheduledDispatchKind.AGENT_TASK
+        or not initiative_id
+        or not scheduled_run_id
+        or not child_id
+    ):
+        return False
+    from packages.core.services.agent_initiative_decision import (
+        fail_scheduled_initiative_child,
+    )
+
+    return await fail_scheduled_initiative_child(
+        db,
+        initiative_id=initiative_id,
+        scheduled_run_id=scheduled_run_id,
+        task_id=child_id,
+        reason=reason,
+    )
 
 
 async def admit_scheduled_child(
@@ -835,6 +1148,14 @@ async def admit_scheduled_child(
             run_id=run.id,
             job_id=job.job_id,
         )
+        await _fail_cancelled_agent_initiative_child(
+            db,
+            job=job,
+            run=run,
+            child_kind=child_kind,
+            child_id=child_id,
+            reason="scheduled_job_revision_changed",
+        )
         await reconcile_scheduled_job_run_projection(
             db,
             job,
@@ -853,7 +1174,13 @@ async def admit_scheduled_child(
             "scheduled_job_revision_changed",
         )
 
-    if not job.enabled:
+    manual_run_allowed = (
+        is_manual_scheduled_occurrence(run, job_id=job.job_id)
+        and job.execution_type != "agent_initiative"
+    ) or _manual_agent_initiative_admits_disabled_child(
+        job, run, child_kind=child_kind, child_id=child_id,
+    )
+    if not job.enabled and not manual_run_allowed:
         outcome = ScheduledRunOutcome.cancelled("scheduled_job_disabled")
         apply_scheduled_run_outcome(run, outcome)
         await cancel_scheduled_child_if_pristine(
@@ -862,6 +1189,14 @@ async def admit_scheduled_child(
             child_id=child_id,
             run_id=run.id,
             job_id=job.job_id,
+        )
+        await _fail_cancelled_agent_initiative_child(
+            db,
+            job=job,
+            run=run,
+            child_kind=child_kind,
+            child_id=child_id,
+            reason="scheduled_job_disabled",
         )
         await reconcile_scheduled_job_run_projection(
             db,

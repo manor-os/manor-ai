@@ -59,12 +59,25 @@ def share_requires_verification(share: Share) -> bool:
     return bool(getattr(share, "require_otp", False)) or str(share.audience or "anonymous") != "anonymous"
 
 
+def share_recipient_emails(share: Share) -> list[str]:
+    """Return the exact email audience, including a signature's alternate addresses."""
+    audience = str(share.audience or "").strip().lower()
+    if not audience.startswith("email:"):
+        return []
+    emails = [audience[6:]]
+    metadata = getattr(share, "metadata_", {}) or {}
+    alternates = metadata.get("recipient_emails")
+    if metadata.get("kind") == "signature_request" and isinstance(alternates, list):
+        emails.extend(value.strip().lower() for value in alternates if isinstance(value, str))
+    return list(dict.fromkeys(emails))
+
+
 def audience_allows_email(share: Share, email: str) -> bool:
     audience = str(share.audience or "anonymous").strip().lower()
     if audience == "anonymous":
         return True
     if audience.startswith("email:"):
-        return hmac.compare_digest(email, audience[6:])
+        return any(hmac.compare_digest(email, recipient) for recipient in share_recipient_emails(share))
     if audience.startswith("domain:"):
         domain = audience[7:].lstrip("@")
         return email.rsplit("@", 1)[-1] == domain

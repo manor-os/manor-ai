@@ -60,6 +60,7 @@ class Capability:
     SHARE_INTERNAL = "share_internal"
     SHARE_EXTERNAL = "share_external"
     DOWNLOAD = "download"
+    SIGN = "sign"
     PRINT = "print"
     RECLASSIFY = "reclassify"
     DELETE = "delete"

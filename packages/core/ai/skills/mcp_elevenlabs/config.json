@@ -12,5 +12,9 @@
     "mcp__elevenlabs__text_to_dialogue",
     "mcp__elevenlabs__generate_sound_effect",
     "mcp__elevenlabs__compose_music"
-  ]
+  ],
+  "search": {
+    "terms": ["eleven labs", "tts", "narration", "speech", "voice over", "audio clip", "podcast voice", "jingle", "sfx"],
+    "examples": ["generate voiceover from this script", "text to speech in british accent", "two speaker dialogue audio", "create rain sound effect ambience"]
+  }
 }

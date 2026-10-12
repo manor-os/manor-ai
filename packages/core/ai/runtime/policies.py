@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable
 
-from packages.core.ai.runtime.capabilities import allowed_tools_for_profile
+from packages.core.ai.runtime.capabilities import (
+    AGENT_INITIATIVE_TOOL_NAMES,
+    allowed_tools_for_profile,
+)
 from packages.core.ai.runtime.envelope import RuntimeEnvelope
 from packages.core.ai.runtime.file_context import check_file_context_policy
 from packages.core.ai.runtime.profiles import RuntimeProfile
@@ -19,12 +22,14 @@ _ALWAYS_DENIED_FOR_EXTERNAL = {
     "write_file",
     "edit_file",
     "patch_file",
+    "replace_file",
     "delete_file",
     "inspect_file_engine",
     "list_files",
     "glob_files",
     "grep_files",
     "generate_file",
+    "code_project",
     "manor",
     "workspace_agent",
     "workspace_update_task_runtime",
@@ -41,11 +46,15 @@ _ALWAYS_DENIED_FOR_EXTERNAL = {
     "toggle_scheduled_job",
     "run_scheduled_job_now",
     "sandbox_create",
+    "sandbox",
     "sandbox_exec",
+    "sandbox_status",
+    "sandbox_respond",
+    "sandbox_cancel",
     "sandbox_write_file",
     "sandbox_save_result",
     "sandbox_destroy",
-}
+} | set(AGENT_INITIATIVE_TOOL_NAMES)
 
 
 class RuntimeInjectedTool(str, Enum):
@@ -66,6 +75,8 @@ class RuntimeInjectedTool(str, Enum):
 
     SUBMIT_RESULT = "submit_result"
     SEND_CHANNEL_ATTACHMENT = "send_channel_attachment"
+    # Armed only by an InternalWorker holding a Dispatcher action lease.
+    EXECUTE_PLANNED_ACTION = "execute_planned_action"
 
     @classmethod
     def names(cls) -> frozenset[str]:
@@ -148,27 +159,32 @@ def filter_runtime_tools(
     that the runtime would later deny.
     """
 
-    del surface
+    initiative_blocked = (
+        set(AGENT_INITIATIVE_TOOL_NAMES)
+        if surface not in {ChatSurface.GLOBAL_OWNER_CHAT, ChatSurface.AGENT_DM}
+        else set()
+    )
     profile_allowed = allowed_tools_for_profile(profile)
     if profile_allowed is not None:
-        profile_allowed = set(profile_allowed) | {
+        profile_allowed = (set(profile_allowed) | {
             str(name).strip()
             for name in profile_extra_allowed_tool_names
             if str(name or "").strip()
-        }
+        }) - initiative_blocked
     incoming_allowed = {str(name) for name in allowed_tool_names if str(name or "").strip()}
     if profile_allowed is None:
         filtered_tools = [
             tool
             for tool in (tools or [])
-            if not incoming_allowed or tool_name_from_schema(tool) in incoming_allowed
+            if tool_name_from_schema(tool) not in initiative_blocked
+            and (not incoming_allowed or tool_name_from_schema(tool) in incoming_allowed)
         ]
         visible_names = {
             name
             for name in (tool_name_from_schema(tool) for tool in filtered_tools)
             if name
         }
-        return filtered_tools, incoming_allowed or visible_names, set()
+        return filtered_tools, (incoming_allowed - initiative_blocked) or visible_names, incoming_allowed & initiative_blocked
 
     filtered: list[dict[str, Any]] = []
     visible_names: set[str] = set()
@@ -270,7 +286,18 @@ def check_runtime_tool_policy(
         RuntimeProfile.EXTERNAL_CUSTOMER_SAFE,
         RuntimeProfile.EXTERNAL_CHANNEL_SAFE,
     }:
-        if name in _ALWAYS_DENIED_FOR_EXTERNAL or name.startswith("mcp__"):
+        group_file_grant = (
+            envelope.surface == ChatSurface.PUBLIC_CUSTOMER_CHAT
+            and name in {"generate_file", "sandbox"}
+            and name in getattr(envelope, "room_file_tool_names", ())
+            and (
+                name != "sandbox"
+                or envelope.discovered_tool_grants.allows("sandbox")
+            )
+            and bool((envelope.metadata or {}).get("room_id"))
+            and bool((envelope.metadata or {}).get("room_agent_run_id"))
+        )
+        if (name in _ALWAYS_DENIED_FOR_EXTERNAL or name.startswith("mcp__")) and not group_file_grant:
             return RuntimeToolPolicyDecision(
                 False,
                 code=RuntimeToolPolicyCode.EXTERNAL_PRINCIPAL_TOOL_DENIED.value,
@@ -293,10 +320,25 @@ def check_runtime_tool_policy(
                 False,
                 code=RuntimeToolPolicyCode.FILE_EDITOR_TOOL_DENIED.value,
                 reason=(
-                    "File editor chat can only inspect context and propose patches; "
-                    "it cannot execute business side-effect, shell, sandbox, or write tools."
+                    "File editor chat can only inspect its mounted context or use the "
+                    "approval-gated native patch tool; business side effects, shell, "
+                    "sandbox, and unrestricted write tools are blocked."
                 ),
                 tool_name=name,
             )
+
+    if (
+        name in AGENT_INITIATIVE_TOOL_NAMES
+        and envelope.surface not in {ChatSurface.GLOBAL_OWNER_CHAT, ChatSurface.AGENT_DM}
+    ):
+        return RuntimeToolPolicyDecision(
+            False,
+            code=RuntimeToolPolicyCode.TOOL_NOT_IN_RUNTIME_SURFACE.value,
+            reason=(
+                "Agent Initiatives are available only in private Agent or Manor Chat. "
+                "Use a Workspace automation for scheduled Workspace work."
+            ),
+            tool_name=name,
+        )
 
     return RuntimeToolPolicyDecision(True, tool_name=name)

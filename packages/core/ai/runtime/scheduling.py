@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from packages.core.ai.runtime.billing import (
     runtime_ensure_goal_billing_context,
@@ -19,6 +21,7 @@ from packages.core.ai.runtime.sources import (
     RUNTIME_PLAN_AND_RUN_TASK_SOURCE,
     RUNTIME_STRATEGIST_REVIEW_SOURCE,
 )
+from packages.core.services.scheduler_service import RuntimeScheduledJobAgentSelection
 
 
 RUNTIME_SCHEDULED_WORKSPACE_AI_BILLING_SOURCES: Mapping[str, str] = {
@@ -54,6 +57,15 @@ SCHEDULED_FILE_OUTPUT_KINDS: tuple[str, ...] = (
     "mp3",
 )
 
+SCHEDULED_JOB_CREATE_KINDS: tuple[str, ...] = ("cron", "every", "at")
+# ``interval`` and ``once`` are legacy persisted aliases. Keep them queryable
+# without advertising them for new jobs.
+SCHEDULED_JOB_QUERY_KINDS: tuple[str, ...] = (
+    *SCHEDULED_JOB_CREATE_KINDS,
+    "interval",
+    "once",
+)
+
 
 @dataclass(frozen=True)
 class RuntimeScheduledJobPrompt:
@@ -62,6 +74,36 @@ class RuntimeScheduledJobPrompt:
     prompt: str
     source: str
     includes_payload_context: bool = False
+
+
+async def _resolve_runtime_scheduled_job_agent_id(
+    db: Any,
+    *,
+    entity_id: str,
+    requested_agent_id: str = "",
+    caller_agent_id: str = "",
+    caller_agent_subscription_id: str | None = None,
+    workspace_id: str | None = None,
+    user_id: str | None = None,
+) -> RuntimeScheduledJobAgentSelection:
+    """Compatibility facade for the Scheduler-owned locked resolver."""
+
+    from packages.core.services.scheduler_service import (
+        RuntimeScheduledJobAgentRequest,
+        resolve_runtime_scheduled_job_agent,
+    )
+
+    return await resolve_runtime_scheduled_job_agent(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        request=RuntimeScheduledJobAgentRequest(
+            requested_agent_id=requested_agent_id,
+            caller_agent_id=caller_agent_id,
+            caller_agent_subscription_id=caller_agent_subscription_id,
+        ),
+    )
 
 
 def runtime_scheduled_job_prompt(
@@ -127,6 +169,8 @@ async def runtime_create_scheduled_job_action(
     every_seconds: int | float = 0,
     run_at: str = "",
     agent_id: str = "",
+    caller_agent_id: str = "",
+    caller_agent_subscription_id: str | None = None,
     timezone_str: str = "UTC",
     workspace_id: str | None = None,
     conversation_id: str | None = None,
@@ -142,10 +186,37 @@ async def runtime_create_scheduled_job_action(
 ) -> str:
     """Create a scheduled job through the Runtime action boundary."""
 
+    try:
+        if schedule_kind not in SCHEDULED_JOB_CREATE_KINDS:
+            raise ValueError(
+                "schedule_kind must be one of: "
+                + ", ".join(SCHEDULED_JOB_CREATE_KINDS)
+            )
+        ZoneInfo(str(timezone_str or "UTC"))
+        if schedule_kind == "cron":
+            from packages.core.cron import validate_cron_expression
+
+            cron_expr = validate_cron_expression(cron_expr)
+        elif schedule_kind == "every":
+            every_seconds = float(every_seconds)
+            if every_seconds <= 0:
+                raise ValueError("every_seconds must be greater than zero")
+        else:
+            datetime.fromisoformat(str(run_at or ""))
+    except (TypeError, ValueError, ZoneInfoNotFoundError) as exc:
+        return json.dumps({
+            "ok": False,
+            "error": "invalid_automation_schedule",
+            "message": str(exc) or "invalid schedule",
+        })
+
     import uuid
 
     from packages.core.database import async_session
-    from packages.core.services.scheduler_service import create_scheduled_job
+    from packages.core.services.scheduler_service import (
+        RuntimeScheduledJobAgentRequest,
+        create_scheduled_job,
+    )
 
     job_id = f"agent-{uuid.uuid4().hex[:12]}"
     job_type = (
@@ -166,6 +237,20 @@ async def runtime_create_scheduled_job_action(
     )
 
     async with async_session() as db:
+        if workspace_id and user_id:
+            from packages.core.services.workspace_access import user_can_write_workspace_id
+
+            if not await user_can_write_workspace_id(
+                db,
+                workspace_id=workspace_id,
+                entity_id=entity_id,
+                user_id=user_id,
+                role=None,
+            ):
+                return json.dumps({
+                    "ok": False,
+                    "error": "Workspace not found or not writable",
+                })
         job = await create_scheduled_job(
             db,
             entity_id,
@@ -174,21 +259,27 @@ async def runtime_create_scheduled_job_action(
             job_type=job_type,
             schedule_kind=schedule_kind,
             cron_expr=cron_expr or None,
-            every_seconds=float(every_seconds) if every_seconds else None,
+            every_seconds=float(every_seconds) if schedule_kind == "every" else None,
             run_at=run_at or None,
             timezone_str=timezone_str,
             payload_message=payload_message,
-            agent_id=agent_id or None,
+            agent_id=None,
             workspace_id=workspace_id,
             default_delivery_mode=default_delivery_mode,
             conversation_id=conversation_id,
             user_id=user_id,
             execution_target=resolved_execution_target,
             require_workspace=bool(workspace_id),
+            runtime_agent_request=RuntimeScheduledJobAgentRequest(
+                requested_agent_id=agent_id,
+                caller_agent_id=caller_agent_id,
+                caller_agent_subscription_id=caller_agent_subscription_id,
+            ),
         )
+        agent_selection = job._runtime_agent_selection
         await db.commit()
 
-        if payload_message and agent_id and job.enabled:
+        if payload_message and agent_selection.agent_id and job.enabled:
             try:
                 from packages.core.tasks.ai_tasks import generate_job_skill
 
@@ -234,6 +325,8 @@ async def runtime_create_scheduled_job_action(
             "run_at": job.run_at,
             "timezone": job.timezone,
             "enabled": bool(job.enabled),
+            "agent_id": str(job.agent_id or agent_selection.agent_id),
+            "agent_selection": agent_selection.source,
         },
         "url": f"/jobs?job={job.job_id}",
         "message": (
@@ -243,14 +336,79 @@ async def runtime_create_scheduled_job_action(
     }, ensure_ascii=False, default=str)
 
 
-async def runtime_list_scheduled_jobs_action(*, entity_id: str) -> str:
+def runtime_workspace_chat_automation_scope(
+    runtime_kwargs: Mapping[str, Any] | None,
+) -> tuple[str, str] | None:
+    """Return trusted Workspace Chat scope, never a model-selected workspace."""
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
+
+    context = runtime_tool_call_context_from_kwargs(dict(runtime_kwargs or {}))
+    if getattr(context.runtime_envelope, "surface", None) != ChatSurface.WORKSPACE_CHAT:
+        return None
+    if not context.workspace_id or not context.user_id:
+        raise PermissionError("Workspace automation scope is unavailable")
+    return context.workspace_id, context.user_id
+
+
+async def _runtime_scoped_job_writable(
+    db: Any,
+    *,
+    job: Any,
+    entity_id: str,
+    scope: tuple[str, str] | None,
+) -> bool:
+    if scope is None:
+        return True
+    if job is None or job.workspace_id != scope[0]:
+        return False
+
+    from packages.core.services.workspace_access import user_can_write_workspace_id
+
+    if not await user_can_write_workspace_id(
+        db, workspace_id=scope[0], entity_id=entity_id, user_id=scope[1],
+    ):
+        raise PermissionError("Workspace write access is required to manage automations")
+    return True
+
+
+async def runtime_list_scheduled_jobs_action(
+    *,
+    entity_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
+) -> str:
     """List scheduled jobs through the Runtime action boundary."""
 
     from packages.core.database import async_session
     from packages.core.services.scheduler_service import list_scheduled_jobs
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
+
+    scope = runtime_workspace_chat_automation_scope(runtime_kwargs)
+    if not user_id and not workspace_id and not scope:
+        return json.dumps({"ok": False, "error": "user or Workspace context is required"})
 
     async with async_session() as db:
-        jobs, _total = await list_scheduled_jobs(db, entity_id)
+        readable_workspace_ids = (
+            await readable_workspace_ids_for_user(
+                db,
+                entity_id=entity_id,
+                user_id=user_id,
+                role=None,
+            )
+            if user_id
+            else {scope[0] if scope else str(workspace_id)}
+        )
+        if scope:
+            readable_workspace_ids &= {scope[0]}
+        jobs, _total = await list_scheduled_jobs(
+            db,
+            entity_id,
+            workspace_id=scope[0] if scope else (str(workspace_id) if not user_id and workspace_id else None),
+            readable_workspace_ids=readable_workspace_ids,
+        )
 
     if not jobs:
         return "No scheduled jobs found."
@@ -273,68 +431,229 @@ async def runtime_list_scheduled_jobs_action(*, entity_id: str) -> str:
 async def runtime_query_scheduled_jobs_action(
     *,
     entity_id: str,
+    user_id: str | None = None,
+    runtime_workspace_id: str | None = None,
     query: str = "",
     workspace_id: str = "",
+    workspace_ids: list[str] | None = None,
     enabled_only: bool = False,
+    statuses: list[str] | None = None,
+    agent_id: str = "",
+    agent_ids: list[str] | None = None,
+    schedule_kinds: list[str] | None = None,
+    job_types: list[str] | None = None,
+    execution_types: list[str] | None = None,
+    last_statuses: list[str] | None = None,
+    created_after: str = "",
+    created_before: str = "",
+    updated_after: str = "",
+    updated_before: str = "",
+    last_run_after: str = "",
+    last_run_before: str = "",
+    next_run_after: str = "",
+    next_run_before: str = "",
+    consecutive_errors_min: int | None = None,
+    consecutive_errors_max: int | None = None,
     limit: int = 50,
+    offset: int = 0,
+    db: Any = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
 ) -> str:
-    """Return structured scheduled-job data through the Runtime boundary."""
+    """Return one fully filtered scheduled-job page through Runtime."""
 
     from packages.core.database import async_session
     from packages.core.services.scheduler_service import list_scheduled_jobs
+    from packages.core.services.workspace_access import readable_workspace_ids_for_user
 
-    resolved_limit = max(1, min(int(limit or 50), 200))
-    resolved_workspace_id = str(workspace_id or "").strip() or None
-    normalized_query = str(query or "").strip().casefold()
-    async with async_session() as db:
-        jobs, _total = await list_scheduled_jobs(
-            db,
-            entity_id,
-            enabled_only=enabled_only,
-            workspace_id=resolved_workspace_id,
-            limit=200,
+    scope = runtime_workspace_chat_automation_scope(runtime_kwargs)
+    if scope:
+        user_id = scope[1]
+        runtime_workspace_id = scope[0]
+    try:
+        resolved_limit = max(1, min(int(limit or 50), 200))
+        resolved_offset = max(0, min(int(offset or 0), 10_000))
+        resolved_workspace_id = scope[0] if scope else str(workspace_id or "").strip() or None
+        if scope:
+            workspace_ids = []
+        resolved_errors_min = (
+            int(consecutive_errors_min)
+            if consecutive_errors_min is not None
+            else None
         )
-
-    items = []
-    for job in jobs:
-        if normalized_query and normalized_query not in (
-            f"{job.name or ''} {job.job_id}".casefold()
+        resolved_errors_max = (
+            int(consecutive_errors_max)
+            if consecutive_errors_max is not None
+            else None
+        )
+        if (resolved_errors_min is not None and resolved_errors_min < 0) or (
+            resolved_errors_max is not None and resolved_errors_max < 0
         ):
-            continue
-        items.append(
+            raise ValueError("consecutive error bounds must be non-negative")
+        invalid_schedule_kinds = sorted(
             {
-                "job_id": job.job_id,
-                "name": job.name,
-                "schedule_kind": job.schedule_kind,
-                "cron_expr": job.cron_expr,
-                "every_seconds": job.every_seconds,
-                "run_at": job.run_at,
-                "timezone": job.timezone,
-                "enabled": bool(job.enabled),
-                "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
-                "last_status": job.last_status,
-                "consecutive_errors": int(job.consecutive_errors or 0),
-                "workspace_id": job.workspace_id,
-                "agent_id": job.agent_id,
+                str(value or "").strip().lower()
+                for value in (schedule_kinds or [])
             }
+            - set(SCHEDULED_JOB_QUERY_KINDS)
         )
-        if len(items) >= resolved_limit:
-            break
-    return json.dumps({"automations": items, "total": len(items)})
+        if invalid_schedule_kinds:
+            raise ValueError(
+                "schedule_kinds contains unsupported values: "
+                + ", ".join(invalid_schedule_kinds)
+            )
+        if not user_id and not runtime_workspace_id:
+            return json.dumps({
+                "ok": False,
+                "error": "user or Workspace context is required",
+            })
+        session_context = nullcontext(db) if db is not None else async_session()
+        async with session_context as session:
+            if not user_id:
+                if resolved_workspace_id and resolved_workspace_id != runtime_workspace_id:
+                    return json.dumps({"ok": True, "automations": [], "total": 0, "count": 0})
+                if workspace_ids and set(map(str, workspace_ids)) != {str(runtime_workspace_id)}:
+                    return json.dumps({"ok": True, "automations": [], "total": 0, "count": 0})
+                resolved_workspace_id = str(runtime_workspace_id)
+                workspace_ids = None
+                readable_workspace_ids = {str(runtime_workspace_id)}
+            else:
+                readable_workspace_ids = await readable_workspace_ids_for_user(
+                    session,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    role=None,
+                )
+            jobs, total = await list_scheduled_jobs(
+                session,
+                entity_id,
+                enabled_only=enabled_only,
+                workspace_id=resolved_workspace_id,
+                workspace_ids=workspace_ids,
+                search=str(query or "").strip() or None,
+                statuses=statuses,
+                agent_id=str(agent_id or "").strip() or None,
+                agent_ids=agent_ids,
+                schedule_kinds=schedule_kinds,
+                job_types=job_types,
+                execution_types=execution_types,
+                last_statuses=last_statuses,
+                created_after=created_after or None,
+                created_before=created_before or None,
+                updated_after=updated_after or None,
+                updated_before=updated_before or None,
+                last_run_after=last_run_after or None,
+                last_run_before=last_run_before or None,
+                next_run_after=next_run_after or None,
+                next_run_before=next_run_before or None,
+                consecutive_errors_min=resolved_errors_min,
+                consecutive_errors_max=resolved_errors_max,
+                limit=resolved_limit,
+                offset=resolved_offset,
+                readable_workspace_ids=readable_workspace_ids,
+            )
+    except (TypeError, ValueError) as exc:
+        return json.dumps({
+            "ok": False,
+            "error": "invalid_automation_filters",
+            "message": str(exc),
+        })
+
+    items = [
+        {
+            "job_id": job.job_id,
+            "name": job.name,
+            "schedule_kind": job.schedule_kind,
+            "job_type": job.job_type,
+            "execution_type": job.execution_type,
+            "cron_expr": job.cron_expr,
+            "every_seconds": job.every_seconds,
+            "run_at": job.run_at,
+            "timezone": job.timezone,
+            "enabled": bool(job.enabled),
+            "last_run_at": job.last_run_at.isoformat() if job.last_run_at else None,
+            "next_run_at": job.next_run_at.isoformat() if job.next_run_at else None,
+            "last_status": job.last_status,
+            "consecutive_errors": int(job.consecutive_errors or 0),
+            "workspace_id": job.workspace_id,
+            "agent_id": job.agent_id,
+            "created_at": job.created_at.isoformat() if job.created_at else None,
+            "updated_at": job.updated_at.isoformat() if job.updated_at else None,
+        }
+        for job in jobs
+    ]
+    next_offset = resolved_offset + len(items)
+    has_more = next_offset < total
+    return json.dumps({
+        "ok": True,
+        "automations": items,
+        "total": total,
+        "count": len(items),
+        "limit": resolved_limit,
+        "offset": resolved_offset,
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+    })
 
 
 async def runtime_cancel_scheduled_job_action(
     *,
     entity_id: str,
     job_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
 ) -> str:
     """Cancel a scheduled job through the Runtime action boundary."""
 
     from packages.core.database import async_session
-    from packages.core.services.scheduler_service import delete_scheduled_job
+    from packages.core.services.scheduler_service import (
+        ManagedAgentInitiativeDriverError,
+        delete_scheduled_job,
+        get_scheduled_job,
+    )
+    from packages.core.services.scheduled_run_lifecycle import (
+        ScheduledAgentLineageDeletionBlockedError,
+    )
 
+    scope = runtime_workspace_chat_automation_scope(runtime_kwargs)
     async with async_session() as db:
-        deleted = await delete_scheduled_job(db, job_id, entity_id)
+        existing = await get_scheduled_job(db, job_id, entity_id)
+        if existing is not None and not await _runtime_scoped_job_writable(
+            db, job=existing, entity_id=entity_id, scope=scope,
+        ):
+            existing = None
+        if existing is not None and not await _runtime_can_manage_scheduled_job(
+            db,
+            entity_id=entity_id,
+            job=existing,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        ):
+            existing = None
+        if existing is None:
+            return f"Job '{job_id}' not found."
+        if existing is not None and getattr(existing, "agent_initiative_id", None):
+            return json.dumps({
+                "ok": False,
+                "error": "managed_agent_initiative",
+                "message": "Use the Agent Initiative controls to delete this rule.",
+            })
+        try:
+            deleted = await delete_scheduled_job(db, job_id, entity_id)
+        except ManagedAgentInitiativeDriverError:
+            await db.rollback()
+            return json.dumps({
+                "ok": False,
+                "error": "managed_agent_initiative",
+                "message": "Use the Agent Initiative controls to delete this rule.",
+            })
+        except ScheduledAgentLineageDeletionBlockedError as exc:
+            await db.rollback()
+            return json.dumps({
+                "ok": False,
+                "error": exc.code,
+                "message": str(exc),
+            })
         if deleted:
             await db.commit()
 
@@ -349,14 +668,42 @@ async def runtime_toggle_scheduled_job_action(
     job_id: str,
     enabled: bool = True,
     actor_id: str | None = None,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
+    runtime_kwargs: Mapping[str, Any] | None = None,
 ) -> str:
     """Enable or disable a scheduled job through the Runtime action boundary."""
 
     from packages.core.database import async_session
     from packages.core.constants.task_actors import TaskActor
-    from packages.core.services.scheduler_service import toggle_scheduled_job
+    from packages.core.services.scheduler_service import (
+        get_scheduled_job,
+        toggle_scheduled_job,
+    )
 
+    scope = runtime_workspace_chat_automation_scope(runtime_kwargs)
     async with async_session() as db:
+        existing = await get_scheduled_job(db, job_id, entity_id)
+        if existing is not None and not await _runtime_scoped_job_writable(
+            db, job=existing, entity_id=entity_id, scope=scope,
+        ):
+            existing = None
+        if existing is not None and not await _runtime_can_manage_scheduled_job(
+            db,
+            entity_id=entity_id,
+            job=existing,
+            user_id=user_id,
+            workspace_id=workspace_id,
+        ):
+            existing = None
+        if existing is None:
+            return f"Job '{job_id}' not found."
+        if existing is not None and getattr(existing, "agent_initiative_id", None):
+            return json.dumps({
+                "ok": False,
+                "error": "managed_agent_initiative",
+                "message": "Use mute, pause, or resume on the Agent Initiative.",
+            })
         job = await toggle_scheduled_job(
             db,
             job_id,
@@ -367,6 +714,8 @@ async def runtime_toggle_scheduled_job_action(
             ),
             changed_by_id=actor_id,
             require_workspace=True,
+            scope_workspace_id=scope[0] if scope else None,
+            scope_user_id=scope[1] if scope else None,
         )
         if job:
             await db.commit()
@@ -380,38 +729,88 @@ async def runtime_run_scheduled_job_now_action(
     *,
     entity_id: str,
     job_id: str,
+    runtime_kwargs: dict[str, Any] | None = None,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> str:
     """Dispatch an immediate run for a scheduled job through Runtime."""
-
-    from datetime import datetime, timezone
 
     from sqlalchemy import select
 
     from packages.core.database import async_session
     from packages.core.models.base import generate_ulid
     from packages.core.models.scheduler import ScheduledJob
+    from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
+    from packages.core.ai.runtime.tool_context import runtime_tool_call_context_from_kwargs
 
+    scope = runtime_workspace_chat_automation_scope(runtime_kwargs)
     async with async_session() as db:
-        result = await db.execute(
-            select(ScheduledJob).where(
-                ScheduledJob.job_id == job_id,
-                ScheduledJob.entity_id == entity_id,
-            )
+        query = select(ScheduledJob).where(
+            ScheduledJob.job_id == job_id,
+            ScheduledJob.entity_id == entity_id,
         )
+        result = await db.execute(query.with_for_update() if scope else query)
         job = result.scalar_one_or_none()
+        if not await _runtime_scoped_job_writable(
+            db, job=job, entity_id=entity_id, scope=scope,
+        ):
+            return f"Job '{job_id}' not found."
+        if not job or getattr(job, "agent_initiative_id", None):
+            return f"Job '{job_id}' not found."
+        context_kwargs = dict(runtime_kwargs or {})
+        context = runtime_tool_call_context_from_kwargs(context_kwargs, entity_id=entity_id)
+        resolved_user_id = user_id or context.user_id
+        resolved_workspace_id = workspace_id or context.workspace_id
+        if not await _runtime_can_manage_scheduled_job(
+            db,
+            entity_id=entity_id,
+            job=job,
+            user_id=resolved_user_id,
+            workspace_id=resolved_workspace_id,
+        ):
+            return f"Job '{job_id}' not found."
+        human_requested = bool(context.user_id) and await runtime_tool_is_user_requested(
+            db, entity_id=entity_id, workspace_id=job.workspace_id, kwargs=context_kwargs,
+        )
+        job_db_id = job.id
 
-    if not job:
-        return f"Job '{job_id}' not found."
+    from packages.core.tasks.scheduler_tasks import dispatch_job_occurrence
 
-    from packages.core.tasks.scheduler_tasks import _dispatch_job_task
-
-    _dispatch_job_task.delay(
-        job.id,
-        datetime.now(timezone.utc).isoformat(),
-        manual=True,
-        occurrence_key=f"manual:{generate_ulid()}",
+    dispatch = await dispatch_job_occurrence(
+        job_db_id=job_db_id,
+        trigger_type="manual" if human_requested else "runtime",
+        occurrence_key=f"{'manual' if human_requested else 'runtime'}:{generate_ulid()}",
+        requesting_user_id=context.user_id if human_requested else None,
     )
+    if dispatch is None:
+        return f"Job '{job_id}' is unavailable for this execution."
     return f"Dispatched immediate run for job '{job_id}'."
+
+
+async def _runtime_can_manage_scheduled_job(
+    db: Any,
+    *,
+    entity_id: str,
+    job: Any,
+    user_id: str | None,
+    workspace_id: str | None,
+) -> bool:
+    """Apply row-level Workspace authorization after coarse tool permission."""
+
+    job_workspace_id = str(getattr(job, "workspace_id", "") or "")
+    if user_id:
+        if not job_workspace_id:
+            return True
+        from packages.core.services.workspace_access import user_can_write_workspace_id
+
+        return await user_can_write_workspace_id(
+            db,
+            workspace_id=job_workspace_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            role=None,
+        )
+    return bool(workspace_id and job_workspace_id == str(workspace_id))
 
 
 async def runtime_ensure_scheduled_workspace_ai_billing_context(

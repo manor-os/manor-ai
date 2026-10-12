@@ -16,7 +16,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 import httpx
 
@@ -792,8 +792,21 @@ async def send_digest() -> dict[str, Any]:
         logger.info("ops digest: empty queue, no email sent")
         return {"ok": True, "events": 0, "emailed": False}
 
-    if not _OPS_RECIPIENTS:
-        logger.info("ops digest: %d events, OPS_EMAIL_RECIPIENTS unset — skipping email", len(raw_items))
+    try:
+        from packages.core.services.ops_config import load_config
+
+        config = await load_config()
+        recipients = [
+            str(address).strip()
+            for address in (config.get("recipients") or [])
+            if str(address or "").strip()
+        ]
+    except Exception as exc:
+        logger.warning("ops digest config load failed: %s", exc)
+        recipients = []
+
+    if not recipients:
+        logger.info("ops digest: %d events, no recipients configured — skipping email", len(raw_items))
         return {"ok": True, "events": len(raw_items), "emailed": False}
 
     # Bucket by severity → rule_id → list of targets
@@ -825,7 +838,7 @@ async def send_digest() -> dict[str, Any]:
 
     try:
         from packages.core.services.email_service import send_email
-        for addr in _OPS_RECIPIENTS:
+        for addr in recipients:
             await send_email(addr, subject, html, text_body=text)
     except Exception as exc:
         logger.warning("digest email failed: %s", exc)

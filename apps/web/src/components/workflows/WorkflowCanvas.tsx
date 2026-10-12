@@ -10,9 +10,13 @@ import {
   useNodesState,
   useEdgesState,
   addEdge,
+  reconnectEdge,
   BaseEdge,
   EdgeLabelRenderer,
-  getBezierPath,
+  getSmoothStepPath,
+  useReactFlow,
+  useStore,
+  useNodesInitialized,
   type Node,
   type Edge,
   type Connection,
@@ -23,7 +27,18 @@ import "@xyflow/react/dist/style.css";
 import MediaPreview from "./MediaPreview";
 import { resolveConnectorBrand } from "../../lib/workflowBrand";
 import IntegrationLogo from "../IntegrationLogo";
+import { IconClose } from "../icons";
 import type { MediaRef } from "../../lib/workflowMedia";
+import {
+  computeWorkflowCanvasLayout,
+  workflowCanvasRoutes,
+  workflowEdgeCorners,
+  workflowEdgeMidpoint,
+  workflowEdgePathThrough,
+  workflowEdgeWaypointInsertIndex,
+  type CanvasPoint,
+  workflowCanvasTopologySignature,
+} from "./workflowCanvasGraph";
 
 /* ------------------------------------------------------------------ */
 /*  Node-graph editor built on React Flow — the React sibling of the   */
@@ -41,13 +56,13 @@ export interface CanvasStep {
   false_next?: string[];
   config?: { cases?: { expression?: string; next?: string[] }[]; default_next?: string[]; [k: string]: any };
   position?: { x: number; y: number };
-  meta?: { original_type?: string };
+  // Canvas-only layout: saved bend points of outgoing lines, keyed by
+  // `${kind}:${target}` (see edgeRouteKey). Never read by the runner.
+  meta?: { original_type?: string; routes?: Record<string, { points?: CanvasPoint[]; x?: number; y?: number }>; [key: string]: unknown };
 }
 
 const NODE_W = 210;
 const NODE_H = 60;
-const GAP_X = 86;
-const GAP_Y = 34;
 
 // Each node belongs to a category; categories carry a distinct, *muted* accent
 // (desaturated, on-brand) so node types are visually distinguishable at a
@@ -238,6 +253,8 @@ const NoteEditContext = createContext<((id: string, text: string) => void) | nul
 // lets an edge delete itself (hover ✕) — so connections are removable without
 // knowing the select-then-Backspace gesture
 const EdgeDeleteContext = createContext<((edgeId: string) => void) | null>(null);
+// Move (or with null, reset) the bend point of one drawn line.
+const EdgeRouteContext = createContext<((edgeId: string, route: { points: CanvasPoint[] } | null) => void) | null>(null);
 // per-node quick actions (test this node / delete it) shown on hover, so you
 // don't have to open the detail panel
 const NodeActionsContext = createContext<{ run?: (id: string) => void; remove?: (id: string) => void } | null>(null);
@@ -284,36 +301,169 @@ function NodeToolbar({ id, show }: { id: string; show: boolean }) {
   );
 }
 
-/** A curved connection with a hover ✕ to delete it, plus its branch label. */
-function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, style, markerEnd, label, labelStyle, selected }: EdgeProps) {
+/** An orthogonal connection with a contextual delete action and branch label. */
+type EdgeRoute = { points?: CanvasPoint[]; x?: number; y?: number };
+
+/** Saved waypoints of a line (a legacy single bend point counts as one). */
+function edgeWaypoints(route: EdgeRoute | undefined): CanvasPoint[] {
+  if (!route) return [];
+  if (Array.isArray(route.points)) {
+    return route.points.filter((point) => Number.isFinite(point?.x) && Number.isFinite(point?.y));
+  }
+  return Number.isFinite(route.x) && Number.isFinite(route.y) ? [{ x: route.x!, y: route.y! }] : [];
+}
+
+function DeletableEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, style, markerEnd, label, labelStyle, selected, data }: EdgeProps) {
   const onDelete = useContext(EdgeDeleteContext);
-  const [path, labelX, labelY] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
+  const onMoveRoute = useContext(EdgeRouteContext);
+  const { screenToFlowPosition } = useReactFlow();
+  const [hovered, setHovered] = useState(false);
+  // While dragging, the waypoints follow the pointer locally; saved on release.
+  const [draft, setDraft] = useState<CanvasPoint[] | null>(null);
+  const saved = edgeWaypoints((data as { route?: EdgeRoute } | undefined)?.route);
+  const waypoints = draft || saved;
+  const actionsVisible = selected || hovered || !!draft;
+  const source = { x: sourceX, y: sourceY };
+  const target = { x: targetX, y: targetY };
+  let path: string;
+  let labelX: number;
+  let labelY: number;
+  if (waypoints.length) {
+    const corners = workflowEdgeCorners(source, waypoints, target);
+    path = workflowEdgePathThrough(corners);
+    ({ x: labelX, y: labelY } = workflowEdgeMidpoint(corners));
+  } else {
+    [path, labelX, labelY] = getSmoothStepPath({
+      sourceX,
+      sourceY,
+      sourcePosition,
+      targetX,
+      targetY,
+      targetPosition,
+      borderRadius: 12,
+      offset: 24,
+    });
+  }
+
+  // Drag a waypoint (`index`), or grab the line to add one where it was
+  // grabbed and drag it anywhere. A click without movement only selects.
+  const startDrag = (event: React.PointerEvent, index: number | null) => {
+    if (!onMoveRoute) return;
+    event.stopPropagation();
+    event.preventDefault();
+    const element = event.currentTarget as HTMLElement;
+    element.setPointerCapture(event.pointerId);
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let points: CanvasPoint[] | null = null;
+    let dragged = index;
+    const move = (e: PointerEvent) => {
+      if (!points && Math.hypot(e.clientX - startX, e.clientY - startY) < 4) return;
+      const at = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      const point = { x: Math.round(at.x), y: Math.round(at.y) };
+      if (!points) {
+        points = [...saved];
+        if (dragged === null) {
+          dragged = workflowEdgeWaypointInsertIndex(source, saved, target, point);
+          points.splice(dragged, 0, point);
+        }
+      }
+      points = points.map((existing, position) => (position === dragged ? point : existing));
+      setDraft(points);
+    };
+    const end = () => {
+      element.removeEventListener("pointermove", move);
+      element.removeEventListener("pointerup", end);
+      element.removeEventListener("pointercancel", end);
+      if (points) onMoveRoute(id, { points });
+      setDraft(null);
+    };
+    element.addEventListener("pointermove", move);
+    element.addEventListener("pointerup", end);
+    element.addEventListener("pointercancel", end);
+  };
+  const removeWaypoint = (index: number) => {
+    if (!onMoveRoute) return;
+    const remaining = saved.filter((_, position) => position !== index);
+    onMoveRoute(id, remaining.length ? { points: remaining } : null);
+  };
+
   return (
     <>
       <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />
+      {onMoveRoute && (
+        // Grab anywhere on the line (a wide invisible hit area over it) to
+        // bend it there; double-click resets it to the automatic route.
+        <path
+          d={path}
+          className="nopan nodrag workflow-edge-drag-target"
+          fill="none"
+          stroke="transparent"
+          strokeWidth={16}
+          style={{ cursor: draft ? "grabbing" : "grab", pointerEvents: "stroke" }}
+          onPointerDown={(e) => startDrag(e, null)}
+          onDoubleClick={(e) => { e.stopPropagation(); onMoveRoute(id, null); }}
+          onMouseEnter={() => setHovered(true)}
+          onMouseLeave={() => setHovered(false)}
+        />
+      )}
       <EdgeLabelRenderer>
+        {onMoveRoute && waypoints.map((point, index) => (
+          <span
+            key={index}
+            className="nodrag nopan workflow-edge-waypoint"
+            role="button"
+            tabIndex={actionsVisible ? 0 : -1}
+            title="Drag to move this bend; double-click to remove it"
+            aria-label="Move line bend"
+            aria-hidden={!actionsVisible}
+            onPointerDown={(e) => startDrag(e, index)}
+            onDoubleClick={(e) => { e.stopPropagation(); removeWaypoint(index); }}
+            onMouseEnter={() => setHovered(true)}
+            onMouseLeave={() => setHovered(false)}
+            style={{
+              position: "absolute",
+              transform: `translate(-50%,-50%) translate(${point.x}px,${point.y}px)`,
+              width: 11, height: 11, borderRadius: "50%",
+              cursor: draft ? "grabbing" : "grab",
+              background: "var(--surface-panel)",
+              boxShadow: "0 1px 3px rgba(28,25,23,0.18), 0 0 0 1.5px rgba(28,25,23,0.28)",
+              opacity: actionsVisible ? 1 : 0,
+              pointerEvents: actionsVisible ? "all" : "none",
+              transition: "opacity .12s",
+              touchAction: "none",
+            }}
+          />
+        ))}
         <div
           className="nodrag nopan"
-          style={{ position: "absolute", transform: `translate(-50%,-50%) translate(${labelX}px,${labelY}px)`, pointerEvents: "all", display: "flex", alignItems: "center", gap: 4 }}
+          onMouseEnter={() => setHovered(true)}
+          onMouseLeave={() => setHovered(false)}
+          onFocus={() => setHovered(true)}
+          onBlur={() => setHovered(false)}
+          style={{ position: "absolute", minWidth: 25, minHeight: 25, transform: `translate(-50%,-50%) translate(${labelX}px,${labelY}px)`, pointerEvents: "all", display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}
         >
           {label && <span style={labelStyle as React.CSSProperties}>{label}</span>}
           {onDelete && (
             <button
               className="nodrag"
               title="Delete connection"
+              aria-label="Delete connection"
+              aria-hidden={!actionsVisible}
+              tabIndex={actionsVisible ? 0 : -1}
               onClick={(e) => { e.stopPropagation(); onDelete(id); }}
               style={{
                 width: 17, height: 17, borderRadius: "50%", border: "none", cursor: "pointer",
                 background: selected ? "#d65f59" : "var(--surface-panel)", color: selected ? "#fff" : "#d65f59",
                 boxShadow: `0 1px 3px rgba(28,25,23,0.18), 0 0 0 1px rgba(28,25,23,0.10)`,
                 display: "inline-flex", alignItems: "center", justifyContent: "center",
-                fontSize: 11, lineHeight: 1, padding: 0, opacity: selected ? 1 : 0.8,
-                transition: "opacity .12s, background .12s",
+                lineHeight: 1, padding: 0, opacity: actionsVisible ? 1 : 0,
+                pointerEvents: actionsVisible ? "auto" : "none",
+                transform: actionsVisible ? "scale(1)" : "scale(0.84)",
+                transition: "opacity .12s, background .12s, transform .12s",
               }}
-              onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.opacity = "1"; }}
-              onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.opacity = selected ? "1" : "0.8"; }}
             >
-              ✕
+              <IconClose size={11} />
             </button>
           )}
         </div>
@@ -524,6 +674,35 @@ function AgentPort({ icon, label, color }: { icon: string; label: string; color:
   );
 }
 
+/** A working node's icon: a ring of dots turning in the node's colour. */
+function RunningDots({ color }: { color: string }) {
+  const dots = 8;
+  return (
+    <svg
+      className="workflow-node-running-dots"
+      width={20}
+      height={20}
+      viewBox="0 0 20 20"
+      role="img"
+      aria-label="Running"
+    >
+      {Array.from({ length: dots }, (_, index) => {
+        const angle = (index / dots) * Math.PI * 2;
+        return (
+          <circle
+            key={index}
+            cx={10 + Math.cos(angle) * 7}
+            cy={10 + Math.sin(angle) * 7}
+            r={1.7}
+            fill={color}
+            opacity={0.25 + (0.75 * (index + 1)) / dots}
+          />
+        );
+      })}
+    </svg>
+  );
+}
+
 /** A single node card with typed input / output connection handles. */
 function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
   const m = typeMeta(data.type);
@@ -536,6 +715,7 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
   const [hovered, setHovered] = useState(false);
   return (
     <div
+      className={data.status === "running" ? "workflow-node is-running" : "workflow-node"}
       style={{ position: "relative", width: NODE_W, minHeight: NODE_H }}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
@@ -584,7 +764,9 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
             display: "flex", alignItems: "center", justifyContent: "center",
           }}
         >
-          {data.brand ? (
+          {data.status === "running" ? (
+            <RunningDots color={tileColor} />
+          ) : data.brand ? (
             <IntegrationLogo provider={data.brand.provider} size={19} />
           ) : (
             <NodeIcon type={data.type} />
@@ -684,36 +866,6 @@ function WorkflowNode({ id, data, selected }: NodeProps<Node<NodeData>>) {
 
 const nodeTypes = { workflow: WorkflowNode, note: NoteNode };
 
-function computeLayout(allSteps: CanvasStep[]): Map<string, { x: number; y: number }> {
-  // Notes are free-floating annotations — keep them out of the flow layout.
-  const steps = allSteps.filter((s) => s.type !== "note");
-  const byId = new Map(steps.map((s) => [s.id, s]));
-  const succ = (s: CanvasStep) =>
-    [...new Set([...(s.next || []), ...(s.true_next || []), ...(s.false_next || [])])].filter((id) => byId.has(id));
-  const indeg = new Map(steps.map((s) => [s.id, 0]));
-  steps.forEach((s) => succ(s).forEach((t) => indeg.set(t, (indeg.get(t) || 0) + 1)));
-  const level = new Map<string, number>();
-  const ind = new Map(indeg);
-  const q = steps.filter((s) => (indeg.get(s.id) || 0) === 0).map((s) => s.id);
-  q.forEach((id) => level.set(id, 0));
-  while (q.length) {
-    const id = q.shift()!;
-    succ(byId.get(id)!).forEach((t) => {
-      level.set(t, Math.max(level.get(t) ?? 0, (level.get(id) ?? 0) + 1));
-      ind.set(t, (ind.get(t) || 0) - 1);
-      if ((ind.get(t) || 0) === 0) q.push(t);
-    });
-  }
-  steps.forEach((s) => { if (!level.has(s.id)) level.set(s.id, 0); });
-  const byLevel: Record<number, string[]> = {};
-  steps.forEach((s) => { const l = level.get(s.id)!; (byLevel[l] = byLevel[l] || []).push(s.id); });
-  const pos = new Map<string, { x: number; y: number }>();
-  Object.entries(byLevel).forEach(([l, ids]) =>
-    ids.forEach((id, i) => pos.set(id, { x: Number(l) * (NODE_W + GAP_X), y: i * (NODE_H + GAP_Y) })),
-  );
-  return pos;
-}
-
 function buildGraph(
   steps: CanvasStep[],
   statusById?: Record<string, string>,
@@ -721,7 +873,7 @@ function buildGraph(
   issueById?: Record<string, "error" | "warning">,
   outputById?: Record<string, string>,
 ): { nodes: Node<NodeData>[]; edges: Edge[] } {
-  const layout = computeLayout(steps);
+  const layout = computeWorkflowCanvasLayout(steps);
   const ids = new Set(steps.map((s) => s.id));
   const switchCases = (s: CanvasStep) => (s.type === "switch" ? s.config?.cases || [] : null);
   const nodes: Node<any>[] = steps.map((s) => {
@@ -768,7 +920,7 @@ function buildGraph(
 
   const outTypeById = new Map(steps.map((s) => [s.id, nodeOutputType(s)]));
   const edges: Edge[] = [];
-  const add = (from: string, to: string, kind: string, baseColor: string, handle?: string, label?: string) => {
+  const add = (from: string, to: string, kind: string, baseColor: string, handle?: string, label?: string, route?: { points?: CanvasPoint[]; x?: number; y?: number }) => {
     if (!ids.has(to)) return;
     // data ("default"/next) wires take the source node's output-type colour
     // (ComfyUI-style); branch wires (true/false/case) keep their semantic hue.
@@ -777,29 +929,107 @@ function buildGraph(
     const look = edgeLook(statusById?.[from], statusById?.[to], color);
     edges.push({
       id: `${from}-${to}-${kind}`, source: from, target: to,
-      sourceHandle: handle, label, type: "deletable", // bezier curve + hover ✕
+      sourceHandle: handle, label, type: "deletable", // orthogonal line + contextual delete
       animated: look.animated,
-      data: { baseColor: color },
+      data: { baseColor: color, kind, ...(route ? { route } : {}) },
       style: { stroke: look.stroke, strokeWidth: look.strokeWidth },
       labelStyle: { fontSize: 10, fill: color, fontWeight: 600 },
     });
   };
-  steps.forEach((s) => {
-    const cases = switchCases(s);
-    if (cases) {
-      cases.forEach((c, i) => (c.next || []).forEach((t) => add(s.id, t, `case${i}`, "#8b6fb0", `case${i}`, c.expression?.slice(0, 14))));
-      (s.config?.default_next || []).forEach((t) => add(s.id, t, "default", "#cfc9c1", "default", "default"));
-      return; // switch routes via cases, not the flattened next
-    }
-    (s.next || []).forEach((t) => add(s.id, t, "default", "#cfc9c1"));
-    (s.true_next || []).forEach((t) => add(s.id, t, "true", "#4f9c84", "true", "true"));
-    (s.false_next || []).forEach((t) => add(s.id, t, "false", "#d65f59", "false", "false"));
-  });
+  steps.forEach((step) => workflowCanvasRoutes(step).forEach((route) => {
+    const color = route.kind === "true"
+      ? "#4f9c84"
+      : route.kind === "false"
+        ? "#d65f59"
+        : route.kind === "error"
+          ? "#b7791f"
+          : route.kind.startsWith("case") ? "#8b6fb0" : "#cfc9c1";
+    add(
+      step.id,
+      route.target,
+      route.kind,
+      color,
+      route.handle,
+      route.label?.slice(0, 14),
+      step.meta?.routes?.[edgeRouteKey(route.kind, route.target)],
+    );
+  }));
   return { nodes, edges };
 }
 
 // edits applied to the source-of-truth steps array, then persisted upstream
 const branchKey = (h?: string | null) => (h === "true" ? "true_next" : h === "false" ? "false_next" : "next");
+
+// Where a drawn route is stored on its source step: handled failures in
+// config.error_next, switch cases in config.cases[i].next, the switch default
+// in config.default_next, and everything else in the key its handle names.
+type RouteSlot =
+  | { kind: "step"; key: "next" | "true_next" | "false_next" }
+  | { kind: "config"; key: "error_next" | "default_next" }
+  | { kind: "case"; index: number };
+
+function routeSlot(step: CanvasStep, handle?: string | null, edgeKind?: string): RouteSlot {
+  if (edgeKind === "error") return { kind: "config", key: "error_next" };
+  const caseMatch = /^case(\d+)$/.exec(handle || "");
+  if (caseMatch) return { kind: "case", index: Number(caseMatch[1]) };
+  if (handle === "default" && step.type === "switch") return { kind: "config", key: "default_next" };
+  return { kind: "step", key: branchKey(handle) as "next" | "true_next" | "false_next" };
+}
+
+function editRoute(step: CanvasStep, slot: RouteSlot, edit: (targets: string[]) => string[]): CanvasStep {
+  const list = (value: unknown) => (Array.isArray(value) ? value.map(String) : []);
+  if (slot.kind === "step") return { ...step, [slot.key]: edit(list(step[slot.key])) };
+  if (slot.kind === "config") {
+    return { ...step, config: { ...(step.config || {}), [slot.key]: edit(list(step.config?.[slot.key])) } };
+  }
+  const cases = [...(step.config?.cases || [])];
+  if (!cases[slot.index]) return step;
+  cases[slot.index] = { ...cases[slot.index], next: edit(list(cases[slot.index].next)) };
+  return { ...step, config: { ...(step.config || {}), cases } };
+}
+
+function edgeKind(edge: Pick<Edge, "data">): string | undefined {
+  return (edge.data as { kind?: string } | undefined)?.kind;
+}
+
+function edgeRouteKey(kind: string, target: string): string {
+  return `${kind}:${target}`;
+}
+
+// Save or clear one line's bend point on its source step.
+function withEdgeRoute(step: CanvasStep, key: string, route: { points: CanvasPoint[] } | null): CanvasStep {
+  const routes = { ...(step.meta?.routes || {}) };
+  if (route) routes[key] = route;
+  else delete routes[key];
+  return { ...step, meta: { ...(step.meta || {}), routes } };
+}
+
+// Remove one drawn route from its source step.
+function withoutRoute(step: CanvasStep, edge: Pick<Edge, "sourceHandle" | "target" | "data">): CanvasStep {
+  return editRoute(step, routeSlot(step, edge.sourceHandle, edgeKind(edge)), (targets) => (
+    targets.filter((target) => target !== edge.target)
+  ));
+}
+
+// Add one route to its source step (no duplicates).
+function withRoute(step: CanvasStep, handle: string | null | undefined, kind: string | undefined, target: string): CanvasStep {
+  return editRoute(step, routeSlot(step, handle, kind), (targets) => (
+    targets.includes(target) ? targets : [...targets, target]
+  ));
+}
+
+function FitRunCanvasOnResize() {
+  const { fitView } = useReactFlow();
+  const width = useStore((state) => state.width);
+  const height = useStore((state) => state.height);
+  const initialized = useNodesInitialized();
+  useEffect(() => {
+    if (!initialized || !width || !height) return;
+    const frame = requestAnimationFrame(() => { void fitView({ padding: 0.2 }); });
+    return () => cancelAnimationFrame(frame);
+  }, [fitView, width, height, initialized]);
+  return null;
+}
 
 export default function WorkflowCanvas({
   steps,
@@ -811,6 +1041,7 @@ export default function WorkflowCanvas({
   issueById,
   outputById,
   onRunNode,
+  fitOnResize = false,
 }: {
   steps: CanvasStep[];
   onStepsChange?: (steps: CanvasStep[]) => void;
@@ -821,6 +1052,7 @@ export default function WorkflowCanvas({
   issueById?: Record<string, "error" | "warning">;
   outputById?: Record<string, string>;
   onRunNode?: (stepId: string) => void;
+  fitOnResize?: boolean;
 }) {
   const editable = !!onStepsChange;
   const initial = useMemo(() => buildGraph(steps, statusById, previewById, issueById, outputById), [steps, statusById, previewById, issueById, outputById]);
@@ -830,7 +1062,7 @@ export default function WorkflowCanvas({
   // Full rebuild ONLY when the graph topology changes (nodes added/removed or
   // re-wired). Position-only changes are excluded so dragging isn't clobbered.
   const topoSig = useMemo(
-    () => steps.map((s) => `${s.id}>${(s.next || []).join(",")}|${(s.true_next || []).join(",")}|${(s.false_next || []).join(",")}`).join(";"),
+    () => workflowCanvasTopologySignature(steps),
     [steps],
   );
   useEffect(() => {
@@ -839,6 +1071,26 @@ export default function WorkflowCanvas({
     setEdges(g.edges);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [topoSig]);
+
+  // Saved line bend points are layout, not topology: patch them in place.
+  const routeSig = useMemo(
+    () => steps.map((s) => `${s.id}:${JSON.stringify(s.meta?.routes || {})}`).join(";"),
+    [steps],
+  );
+  useEffect(() => {
+    const routesBySource = new Map(steps.map((s) => [s.id, s.meta?.routes || {}]));
+    setEdges((eds) => eds.map((e) => {
+      const kind = edgeKind(e) || "default";
+      const route = routesBySource.get(e.source)?.[edgeRouteKey(kind, e.target)];
+      const current = (e.data as { route?: unknown } | undefined)?.route;
+      if (JSON.stringify(route ?? null) === JSON.stringify(current ?? null)) return e;
+      const data = { ...(e.data || {}) } as Record<string, unknown>;
+      if (route) data.route = route;
+      else delete data.route;
+      return { ...e, data };
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeSig]);
 
   // Per-node run status / output preview / validation are PATCHED in place —
   // never a full rebuild — so a streaming run lighting up node-by-node doesn't
@@ -865,15 +1117,25 @@ export default function WorkflowCanvas({
     (c: Connection) => {
       setEdges((eds) => addEdge({ ...c, type: "deletable" }, eds));
       if (!onStepsChange || !c.source || !c.target) return;
-      const key = branchKey(c.sourceHandle);
-      onStepsChange(
-        steps.map((s) => {
-          if (s.id !== c.source) return s;
-          const arr = [...((s as any)[key] || [])];
-          if (!arr.includes(c.target!)) arr.push(c.target!);
-          return { ...s, [key]: arr };
-        }),
-      );
+      onStepsChange(steps.map((s) => (s.id === c.source ? withRoute(s, c.sourceHandle, undefined, c.target!) : s)));
+    },
+    [steps, onStepsChange, setEdges],
+  );
+
+  // Drag either end of an existing line onto another node or port to move it.
+  // An error route keeps being an error route when only its target moves.
+  const onReconnect = useCallback(
+    (oldEdge: Edge, c: Connection) => {
+      if (!onStepsChange || !c.source || !c.target) return;
+      if (c.source === oldEdge.source && c.target === oldEdge.target && c.sourceHandle === oldEdge.sourceHandle) return;
+      setEdges((eds) => reconnectEdge(oldEdge, c, eds));
+      const keepsErrorRoute = edgeKind(oldEdge) === "error" && c.source === oldEdge.source;
+      const next = steps
+        .map((s) => (s.id === oldEdge.source ? withoutRoute(s, oldEdge) : s))
+        .map((s) => (s.id === c.source
+          ? withRoute(s, keepsErrorRoute ? null : c.sourceHandle, keepsErrorRoute ? "error" : undefined, c.target!)
+          : s));
+      onStepsChange(next);
     },
     [steps, onStepsChange, setEdges],
   );
@@ -883,10 +1145,7 @@ export default function WorkflowCanvas({
       if (!onStepsChange) return;
       let next = steps;
       for (const e of removed) {
-        const key = branchKey(e.sourceHandle);
-        next = next.map((s) =>
-          s.id === e.source ? { ...s, [key]: ((s as any)[key] || []).filter((t: string) => t !== e.target) } : s,
-        );
+        next = next.map((s) => (s.id === e.source ? withoutRoute(s, e) : s));
       }
       onStepsChange(next);
     },
@@ -912,11 +1171,23 @@ export default function WorkflowCanvas({
     const edge = edges.find((e) => e.id === edgeId);
     setEdges((eds) => eds.filter((e) => e.id !== edgeId));
     if (edge && onStepsChange) {
-      const key = branchKey(edge.sourceHandle);
-      onStepsChange(steps.map((s) =>
-        s.id === edge.source ? { ...s, [key]: ((s as any)[key] || []).filter((t: string) => t !== edge.target) } : s,
-      ));
+      onStepsChange(steps.map((s) => (s.id === edge.source ? withoutRoute(s, edge) : s)));
     }
+  }, [edges, steps, onStepsChange, setEdges]);
+
+  const onMoveEdgeRoute = useCallback((edgeId: string, route: { points: CanvasPoint[] } | null) => {
+    const edge = edges.find((e) => e.id === edgeId);
+    if (!edge || !onStepsChange) return;
+    const key = edgeRouteKey(edgeKind(edge) || "default", edge.target);
+    // Show the new shape at once; the save follows in the background.
+    setEdges((eds) => eds.map((e) => {
+      if (e.id !== edgeId) return e;
+      const data = { ...(e.data || {}) } as Record<string, unknown>;
+      if (route) data.route = route;
+      else delete data.route;
+      return { ...e, data };
+    }));
+    onStepsChange(steps.map((s) => (s.id === edge.source ? withEdgeRoute(s, key, route) : s)));
   }, [edges, steps, onStepsChange, setEdges]);
 
   // Delete one or more nodes from the source-of-truth steps. React Flow emits
@@ -933,6 +1204,9 @@ export default function WorkflowCanvas({
           next: (s.next || []).filter((t) => !removed.has(t)),
           true_next: (s.true_next || []).filter((t) => !removed.has(t)),
           false_next: (s.false_next || []).filter((t) => !removed.has(t)),
+          ...(Array.isArray(s.config?.error_next)
+            ? { config: { ...s.config, error_next: (s.config.error_next as string[]).filter((t) => !removed.has(t)) } }
+            : {}),
         })),
     );
   }, [steps, onStepsChange]);
@@ -953,6 +1227,7 @@ export default function WorkflowCanvas({
   return (
     <NodeActionsContext.Provider value={nodeActions}>
     <EdgeDeleteContext.Provider value={editable ? onDeleteEdge : null}>
+    <EdgeRouteContext.Provider value={editable ? onMoveEdgeRoute : null}>
     <NoteEditContext.Provider value={editable ? onEditNote : null}>
     <AddFromContext.Provider value={onAddFrom || null}>
     <div style={{ width: "100%", height: "100%", borderRadius: 16, overflow: "hidden" }}>
@@ -962,6 +1237,8 @@ export default function WorkflowCanvas({
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={editable ? onConnect : undefined}
+        onReconnect={editable ? onReconnect : undefined}
+        edgesReconnectable={editable}
         onEdgesDelete={editable ? onEdgesDelete : undefined}
         onNodesDelete={editable ? onNodesDelete : undefined}
         onNodeDragStop={editable ? onNodeDragStop : undefined}
@@ -971,16 +1248,18 @@ export default function WorkflowCanvas({
         deleteKeyCode={editable ? ["Backspace", "Delete"] : null}
         nodesDraggable={editable}
         nodesConnectable={editable}
+        zoomOnDoubleClick={editable || !onNodeOpen}
         connectOnClick
         connectionRadius={30}
         elementsSelectable
         fitView
         fitViewOptions={{ padding: 0.25 }}
-        minZoom={0.2}
+        minZoom={0.08}
         maxZoom={2}
         proOptions={{ hideAttribution: true }}
         style={{ background: "var(--surface-app)" }}
       >
+        {fitOnResize && <FitRunCanvasOnResize />}
         <Background variant={BackgroundVariant.Dots} gap={22} size={1.4} color="rgba(28,25,23,0.12)" />
         <Controls showInteractive={false} />
         <MiniMap
@@ -994,6 +1273,7 @@ export default function WorkflowCanvas({
     </div>
     </AddFromContext.Provider>
     </NoteEditContext.Provider>
+    </EdgeRouteContext.Provider>
     </EdgeDeleteContext.Provider>
     </NodeActionsContext.Provider>
   );

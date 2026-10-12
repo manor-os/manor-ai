@@ -1,0 +1,18 @@
+{
+  "id": "marketing-platform",
+  "name": "marketing-platform",
+  "display_name": "Marketing Platform",
+  "type": "runtime_guidance",
+  "description": "Shared destination guidance for marketing-campaign and video-production: platform-native creative, video format, composition, captions, delivery, CTA, and measurement. Read only the relevant platform playbook.",
+  "category": "marketing",
+  "output_format": "guidance",
+  "tags": ["marketing", "platform", "channel", "distribution", "runtime-guidance", "builtin"],
+  "bundle_roots": ["references"],
+  "tools": ["read_file"],
+  "max_rounds": 8,
+  "temperature": 0.2,
+  "search": {
+    "terms": ["social network", "channel specs", "aspect ratio", "call to action", "tiktok instagram youtube shorts", "ad format"],
+    "examples": ["video format for instagram reels campaign", "adapt marketing creative to linkedin", "platform cta and length for shorts", "which platform specs for ad video"]
+  }
+}

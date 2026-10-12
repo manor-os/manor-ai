@@ -592,6 +592,8 @@ def test_planner_generate_plan_uses_runtime_chat_turn_boundary(monkeypatch):
               "steps": [
                 {
                   "key": "draft_update",
+                  "output_shape": "TextResult",
+                  "execution_contract": {"delivery": "inline", "effects": "read_only"},
                   "kind": "llm",
                   "service_key": "content",
                   "params": {"prompt": "Draft the update."}
@@ -631,7 +633,9 @@ def test_planner_generate_plan_uses_runtime_chat_turn_boundary(monkeypatch):
 
     assert plan.steps[0].key == "draft_update"
     assert calls[0]["messages"][0]["role"] == "user"
-    assert calls[0]["tools"][0]["function"]["name"] == "list_tools"
+    tool_names = [tool["function"]["name"] for tool in calls[0]["tools"]]
+    assert tool_names[0] == "get_agent_schema"
+    assert {"get_task_context", "list_tools", "get_tool_schema", "submit_plan"} <= set(tool_names)
     assert "Planner for Manor" in calls[0]["system_prompt"]
 
     source = Path("packages/core/plans/planner.py").read_text()
@@ -656,6 +660,7 @@ def test_planner_drops_unrequested_text_report_file_write_step(monkeypatch):
               "steps": [
                 {
                   "key": "compile_baseline_report",
+                  "execution_contract": {"delivery": "inline", "effects": "read_only"},
                   "kind": "subagent",
                   "service_key": "analytics_reporting",
                   "capability_id": "knowledge.public_search",
@@ -672,6 +677,8 @@ def test_planner_drops_unrequested_text_report_file_write_step(monkeypatch):
                 },
                 {
                   "key": "write_report_file",
+                  "execution_contract": {"delivery": "artifact", "effects": "artifact_write"},
+                  "output_shape": "DocumentResult",
                   "kind": "subagent",
                   "service_key": "analytics_reporting",
                   "capability_id": "file.write",
@@ -730,12 +737,16 @@ def test_planner_keeps_explicit_saved_report_file_write_step(monkeypatch):
               "steps": [
                 {
                   "key": "compile_report",
+                  "execution_contract": {"delivery": "inline", "effects": "read_only"},
+                  "output_shape": "TextResult",
                   "kind": "subagent",
                   "service_key": "analytics_reporting",
                   "params": {"prompt": "Read the workspace files and draft the report."}
                 },
                 {
                   "key": "write_report_file",
+                  "execution_contract": {"delivery": "artifact", "effects": "artifact_write"},
+                  "output_shape": "DocumentResult",
                   "kind": "subagent",
                   "service_key": "analytics_reporting",
                   "capability_id": "file.write",
@@ -791,12 +802,15 @@ def test_planner_keeps_mp4_production_when_task_also_requests_plain_text(monkeyp
               "steps": [
                 {
                   "key": "generate_script_storyboard_packet",
+                  "execution_contract": {"delivery": "inline", "effects": "read_only"},
+                  "output_shape": "TextResult",
                   "kind": "subagent",
                   "service_key": "stickman.production",
                   "params": {"prompt": "Create the script and storyboard packet."}
                 },
                 {
                   "key": "produce_and_verify_mp4",
+                  "execution_contract": {"delivery": "artifact", "effects": "authorized"},
                   "kind": "subagent",
                   "service_key": "stickman.production",
                   "capability_id": "file.write",
@@ -872,6 +886,8 @@ def test_planner_clears_hard_approval_for_generated_pdf(monkeypatch):
               "steps": [
                 {
                   "key": "research_block_context",
+                  "execution_contract": {"delivery": "inline", "effects": "read_only"},
+                  "output_shape": "TextResult",
                   "kind": "subagent",
                   "service_key": "launch_assets",
                   "capability_id": "workspace.search",
@@ -879,6 +895,8 @@ def test_planner_clears_hard_approval_for_generated_pdf(monkeypatch):
                 },
                 {
                   "key": "generate_brochure_pdf",
+                  "execution_contract": {"delivery": "artifact", "effects": "artifact_write"},
+                  "output_shape": "ArtifactResult",
                   "kind": "subagent",
                   "service_key": "launch_assets",
                   "capability_id": "file.write",
@@ -935,6 +953,8 @@ def test_planner_clears_high_risk_for_internal_mp4_production(monkeypatch):
               "steps": [
                 {
                   "key": "produce_verified_stickman_mp4",
+                  "execution_contract": {"delivery": "artifact", "effects": "authorized"},
+                  "output_shape": "ArtifactResult",
                   "kind": "subagent",
                   "service_key": "stickman.production",
                   "params": {
@@ -1003,6 +1023,8 @@ def test_planner_clears_hard_approval_for_action_steps(monkeypatch):
               "steps": [
                 {
                   "key": "draft_reply",
+                  "execution_contract": {"delivery": "inline", "effects": "read_only"},
+                  "output_shape": "TextResult",
                   "kind": "llm",
                   "service_key": "content",
                   "params": {"prompt": "Draft a reply."}
@@ -1063,7 +1085,10 @@ def test_planner_list_tools_returns_capability_first_catalog():
     )
     from packages.core.plans.planner import _Context
 
-    agent = SimpleNamespace(id="agent_1", name="Content Agent", system_prompt="Draft content")
+    agent = SimpleNamespace(
+        id="agent_1", name="Content Agent", description="Draft customer-facing content.",
+        system_prompt="Private execution instructions",
+    )
     ctx = _Context(
         workspace=None,
         subscriptions=[SimpleNamespace(service_key="content", id="sub_1", agent_id="agent_1")],
@@ -1096,9 +1121,14 @@ def test_planner_list_tools_returns_capability_first_catalog():
     assert by_id["file.write"]["platform_tools"] == ["generate_file"]
     publish_binding = next(binding for binding in result["action_bindings"] if binding["action_key"] == "publish_tweet")
     assert publish_binding["capability_id"] == "external.social"
-    assert "Allowed runtime capabilities and bindings" in prompt
-    assert "Do not use requires_approval to encode approval policy" in prompt
-    assert "external.social" in prompt
+    assert '"service_key":"content"' in prompt
+    assert agent.description in prompt
+    assert "Use get_agent_schema" in prompt
+    assert "Runtime owns approval/credit/evidence gates" in prompt
+    # Detailed capability discovery remains available on demand, rather than
+    # copying tools or the Agent's execution instructions into the initial prompt.
+    for execution_detail in ("external.social", "twitter_x", "generate_file", agent.system_prompt):
+        assert execution_detail not in prompt
 
 
 def test_planner_action_catalog_is_scoped_to_selected_service():

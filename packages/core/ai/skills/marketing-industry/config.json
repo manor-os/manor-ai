@@ -1,0 +1,18 @@
+{
+  "id": "marketing-industry",
+  "name": "marketing-industry",
+  "display_name": "Marketing Industry",
+  "type": "runtime_guidance",
+  "description": "Apply detailed industry buying and proof rules, with deep tracks for restaurant promotion, software/product launches, and physical-product marketing plus a general local/regulated track.",
+  "category": "marketing",
+  "output_format": "guidance",
+  "tags": ["marketing", "industry", "restaurant", "product", "local-business", "runtime-guidance", "builtin"],
+  "bundle_roots": ["references"],
+  "tools": ["read_file"],
+  "max_rounds": 8,
+  "temperature": 0.2,
+  "search": {
+    "terms": ["vertical", "niche messaging", "business model positioning", "compliance claims", "b2b vs b2c"],
+    "examples": ["marketing angle for saas business", "ecommerce campaign claims customer decision", "adapt marketing to real estate industry", "industry specific ad messaging guidance"]
+  }
+}

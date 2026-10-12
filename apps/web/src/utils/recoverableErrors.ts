@@ -5,6 +5,20 @@ const AUTO_RELOAD_RESET_AFTER_MS = 60_000;
 const STATEFUL_EDITING_PATH_PREFIXES = ["/video-editor", "/editor"] as const;
 let autoReloadScheduled = false;
 
+export enum ApplicationReloadMode {
+  Refresh = "refresh",
+  RecoverAssets = "recover_assets",
+}
+
+export function reloadApplication(mode = ApplicationReloadMode.Refresh): void {
+  if (mode === ApplicationReloadMode.RecoverAssets) {
+    const next = `${window.location.pathname}${window.location.search || ""}${window.location.hash || ""}`;
+    window.location.replace(`/app-recovery.html?next=${encodeURIComponent(next)}`);
+    return;
+  }
+  window.location.reload();
+}
+
 interface RecoverableErrorAutoReloadState {
   version: string;
   attempts: number;
@@ -153,13 +167,15 @@ export function markRecoverableErrorAutoReloadAttempt(): boolean {
   }
 }
 
-export function scheduleRecoverableErrorAutoReload(): number | null {
+export function scheduleRecoverableErrorAutoReload(error?: unknown): number | null {
   if (autoReloadScheduled || !shouldAutoReloadForRecoverableError()) return null;
 
   const reloadDelayMs = getRecoverableErrorAutoReloadDelayMs();
   if (!markRecoverableErrorAutoReloadAttempt()) return null;
   autoReloadScheduled = true;
-  window.setTimeout(() => window.location.reload(), reloadDelayMs);
+  window.setTimeout(() => reloadApplication(
+    isStaleChunkError(error) ? ApplicationReloadMode.RecoverAssets : ApplicationReloadMode.Refresh,
+  ), reloadDelayMs);
   return reloadDelayMs;
 }
 

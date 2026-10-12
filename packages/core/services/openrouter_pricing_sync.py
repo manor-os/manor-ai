@@ -24,6 +24,14 @@ def pricing_cache_path() -> str:
     return configured or str(private_runtime_dir("cache") / "openrouter-pricing.json")
 
 
+def _to_positive_int(v: Any) -> int | None:
+    try:
+        value = int(v)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _to_float(v: Any) -> float | None:
     try:
         if v is None or v == "":
@@ -44,7 +52,8 @@ async def sync_openrouter_pricing_cache(*, timeout_s: float = 30.0) -> dict[str,
             "input_per_m": float | null,
             "output_per_m": float | null,
             "image_per_1k": float | null,
-            "request_usd": float | null
+            "request_usd": float | null,
+            "context_window": int | null
           }
         }
       }
@@ -55,7 +64,7 @@ async def sync_openrouter_pricing_cache(*, timeout_s: float = 30.0) -> dict[str,
         body = resp.json()
 
     rows = body.get("data") or []
-    models: dict[str, dict[str, float | None]] = {}
+    models: dict[str, dict[str, float | int | None]] = {}
     for row in rows:
         mid = str(row.get("id") or "").strip()
         if not mid:
@@ -70,6 +79,15 @@ async def sync_openrouter_pricing_cache(*, timeout_s: float = 30.0) -> dict[str,
             "output_per_m": (completion * 1_000_000.0) if completion is not None else None,
             "image_per_1k": (image * 1000.0) if image is not None else None,
             "request_usd": request,
+            # OpenRouter may route to any listed provider; the top provider's
+            # limit can be lower than the model's advertised maximum.
+            "context_window": min(
+                (value for value in (
+                    _to_positive_int(row.get("context_length")),
+                    _to_positive_int((row.get("top_provider") or {}).get("context_length")),
+                ) if value is not None),
+                default=None,
+            ),
         }
 
     payload = {

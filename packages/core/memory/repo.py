@@ -60,8 +60,10 @@ def read_entry(file_path: str) -> Optional[MemoryEntry]:
         return None
     workspace_id, scope, slug = parsed_path
 
-    with open(file_path, encoding="utf-8") as f:
-        text = f.read()
+    from packages.core.memory.cache import read_memory_text
+    text = read_memory_text(file_path)
+    if text is None:
+        return None
 
     try:
         fm, body = parse_md(text)

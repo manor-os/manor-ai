@@ -1,8 +1,8 @@
 {
   "id": "file_engine",
   "name": "File Engine",
-  "description": "Create and patch Knowledge files through one generate/read/patch contract.",
-  "version": "1.0.0",
+  "description": "Create, convert (Office/DOCX to PDF and legacy Office to OOXML), patch, and replace Knowledge files through one file contract.",
+  "version": "1.4.0",
   "tools": [
     "inspect_file_engine",
     "search_documents",
@@ -10,8 +10,10 @@
     "read_file",
     "generate_file",
     "patch_file",
-    "mcp__manor_mcp_file_engine__inspect",
-    "mcp__manor_mcp_file_engine__generate",
-    "mcp__manor_mcp_file_engine__patch"
-  ]
+    "replace_file"
+  ],
+  "search": {
+    "terms": ["word to pdf", "docx", "pdf export", "edit document", "overwrite file", "document conversion"],
+    "examples": ["convert docx to pdf", "edit word document and export pdf", "overwrite docx with revised version", "turn word document into pdf"]
+  }
 }

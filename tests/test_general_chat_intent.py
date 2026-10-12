@@ -3,10 +3,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from packages.core.ai.runtime.auto_route_classifier import (
-    AutoRouteDecision,
-    AutoRouteMode,
-)
 from packages.core.ai.runtime.general_chat_intent import (
     GeneralChatIntentDecision,
     GeneralChatIntentKind,
@@ -17,10 +13,12 @@ from packages.core.ai.runtime.general_chat_intent import (
 )
 from packages.core.ai.runtime.surfaces import ChatSurface
 from packages.core.ai.runtime.turn_policy import (
+    CHAT_MAX_ROUNDS,
     TurnExecutionMode,
     TurnExecutionPlan,
     TurnToolCatalogMode,
     build_turn_execution_plan,
+    runtime_turn_max_rounds,
     runtime_turn_visible_tool_names,
 )
 from packages.core.ai.runtime.workspace_creation_authorization import (
@@ -31,9 +29,11 @@ from packages.core.ai.runtime.workspace_creation_authorization import (
 )
 from packages.core.services.chat_intent_routing import (
     ChatIntentRoutingDecision,
+    DeferredChatIntentRequest,
     _workspace_draft_ids,
     auto_chat_intent_routing_allowed,
     classify_chat_intent_routing,
+    classify_deferred_chat_intent,
     workspace_recommendations_enabled,
 )
 
@@ -161,7 +161,8 @@ async def test_suitability_classifier_receives_latest_query_and_active_draft_con
                     reason="Recruiting needs its own recurring operating system.",
                 ),
                 ensure_ascii=False,
-            )
+            ),
+            usage={},
         )
 
     monkeypatch.setattr(
@@ -231,7 +232,7 @@ def test_creation_authorization_prompt_does_not_classify_workspace_suitability()
 @pytest.mark.asyncio
 async def test_classifier_malformed_result_fails_closed_to_agent_chat(monkeypatch):
     async def fake_completion(*_args, **_kwargs):
-        return SimpleNamespace(content='{"kind":"workspace_recommendation"}')
+        return SimpleNamespace(content='{"kind":"workspace_recommendation"}', usage={})
 
     monkeypatch.setattr(
         "packages.core.ai.runtime.general_chat_intent.runtime_execute_text_completion",
@@ -249,7 +250,7 @@ async def test_classifier_malformed_result_fails_closed_to_agent_chat(monkeypatc
 @pytest.mark.asyncio
 async def test_creation_authorization_malformed_result_fails_closed(monkeypatch):
     async def fake_completion(*_args, **_kwargs):
-        return SimpleNamespace(content='{"status":"authorized"}')
+        return SimpleNamespace(content='{"status":"authorized"}', usage={})
 
     monkeypatch.setattr(
         "packages.core.ai.runtime.workspace_creation_authorization."
@@ -264,79 +265,46 @@ async def test_creation_authorization_malformed_result_fails_closed(monkeypatch)
     assert decision.status is WorkspaceCreationAuthorizationStatus.NOT_AUTHORIZED
 
 
-def test_routing_metadata_keeps_recommendation_separate_from_agent_prompt():
-    general_intent = GeneralChatIntentDecision.from_payload(
-        _payload(),
-        candidates=[_candidate()],
-    )
-    decision = ChatIntentRoutingDecision(
-        auto_route=AutoRouteDecision(AutoRouteMode.GENERAL_CHAT, 0.96),
-        general_intent=general_intent,
-        workspace_creation_authorization=_not_authorized(),
-        execution_plan=TurnExecutionPlan(
-            mode=TurnExecutionMode.TOOL_CHAT,
-            max_rounds=8,
+def _routing_decision() -> ChatIntentRoutingDecision:
+    return ChatIntentRoutingDecision(
+        execution_plan=TurnExecutionPlan(mode=TurnExecutionMode.TOOL_CHAT, max_rounds=8),
+        deferred=DeferredChatIntentRequest(
+            key="intent-1", message="Run the launch every week", recent_context="",
+            entity_id="entity-1", user_id="user-1", conversation_id=None,
+            recommendations_enabled=True,
         ),
     )
 
-    metadata = decision.runtime_metadata(request="Run the launch every week")
 
-    assert metadata["workspace_recommendation"]["workspace_id"] == (
-        "01WORKSPACEEXACT0000000000"
-    )
-    assert metadata["workspace_recommendation"]["request"] == (
-        "Run the launch every week"
-    )
+def test_recommendation_stays_out_of_the_agent_prompt():
+    """A card may follow any reply, so the prompt never announces one and the
+    recommendation itself is delivered beside the turn, not in its metadata."""
+    metadata = _routing_decision().runtime_metadata(request="Run the launch every week")
+
+    assert "workspace_recommendation" not in metadata
     response_guardrail = metadata["general_intent_prompt"]
     assert "A separate UI card may offer" not in response_guardrail
     assert "never mention or allude" in response_guardrail
-    assert "Do not predict or announce that any interface element will appear" in (
+    assert "do not predict or announce that any interface element will appear" in (
         response_guardrail
     )
-    assert "Do not tell the user to click, choose, accept, or wait" in response_guardrail
-    assert "Do not start or modify a Workspace" in response_guardrail
 
 
 def test_agent_chat_prompt_forbids_implicit_new_workspace_draft():
-    decision = ChatIntentRoutingDecision(
-        auto_route=AutoRouteDecision(AutoRouteMode.GENERAL_CHAT, 0.96),
-        general_intent=GeneralChatIntentDecision.agent_chat(0.99),
-        workspace_creation_authorization=_not_authorized(),
-        execution_plan=TurnExecutionPlan(
-            mode=TurnExecutionMode.TOOL_CHAT,
-            max_rounds=8,
-        ),
-    )
+    prompt = _routing_decision().runtime_metadata(request="管理我的房产")["general_intent_prompt"]
 
-    prompt = decision.runtime_metadata(request="管理我的房产")["general_intent_prompt"]
-
-    assert "Do not start a new Workspace or a new Workspace draft" in prompt
+    assert "Start a new Workspace draft only when the user explicitly asks" in prompt
     assert "existing active Workspace draft may still be updated" in prompt
 
 
-def test_explicit_creation_authorization_allows_draft_but_not_final_workspace():
-    decision = ChatIntentRoutingDecision(
-        auto_route=AutoRouteDecision(AutoRouteMode.GENERAL_CHAT, 0.96),
-        general_intent=GeneralChatIntentDecision.agent_chat(1.0),
-        workspace_creation_authorization=(
-            WorkspaceCreationAuthorizationDecision.from_payload({
-                "status": "authorized",
-                "confidence": 0.99,
-            })
-        ),
-        execution_plan=TurnExecutionPlan(
-            mode=TurnExecutionMode.TOOL_CHAT,
-            max_rounds=8,
-        ),
-    )
+def test_explicit_creation_allows_a_draft_but_not_the_final_workspace():
+    prompt = _routing_decision().runtime_metadata(request="Create a Workspace")["general_intent_prompt"]
 
-    prompt = decision.runtime_metadata(request="Create a Workspace")["general_intent_prompt"]
-
-    assert "explicitly authorized starting a new Workspace draft" in prompt
-    assert "Do not create the final Workspace" in prompt
+    assert "save a guided Workspace draft" in prompt
+    assert "do not create the final Workspace" in prompt
 
 
-def test_auto_chat_intent_routing_is_only_for_plain_owner_auto_chat():
+def test_auto_chat_intent_routing_is_only_for_unencumbered_owner_auto_request():
     base = dict(
         surface=ChatSurface.GLOBAL_OWNER_CHAT,
         chat_mode="auto",
@@ -356,6 +324,86 @@ def test_auto_chat_intent_routing_is_only_for_plain_owner_auto_chat():
     assert not auto_chat_intent_routing_allowed(**{**base, "workspace_id": "ws-1"})
     assert not auto_chat_intent_routing_allowed(**{**base, "has_attachments": True})
     assert not auto_chat_intent_routing_allowed(**{**base, "chat_mode": "research"})
+
+
+def _forbid_planning_classifiers(monkeypatch, module) -> None:
+    async def unexpected(**_kwargs):
+        raise AssertionError("planning a turn must not wait on a model classifier")
+
+    monkeypatch.setattr(module, "classify_general_chat_intent", unexpected)
+    monkeypatch.setattr(module, "classify_workspace_creation_authorization", unexpected)
+
+
+def _deferred_request(**overrides) -> DeferredChatIntentRequest:
+    return DeferredChatIntentRequest(**{
+        "key": "intent-1",
+        "message": "How should I organize this eight-week launch?",
+        "recent_context": "",
+        "entity_id": "entity-1",
+        "user_id": "user-1",
+        "conversation_id": None,
+        "recommendations_enabled": True,
+        **overrides,
+    })
+
+
+@pytest.mark.asyncio
+async def test_planning_a_turn_waits_on_no_classifier(monkeypatch):
+    """Creation authorization and recommendation run beside the turn."""
+    from packages.core.services import chat_intent_routing as module
+
+    async def fake_recent_context(*_args, **_kwargs):
+        return "assistant: earlier turn", False
+
+    monkeypatch.setattr(module, "_recent_chat_context", fake_recent_context)
+    _forbid_planning_classifiers(monkeypatch, module)
+
+    decision = await classify_chat_intent_routing(
+        object(),
+        user=SimpleNamespace(entity_id="entity-1", id="user-1"),
+        message="最近跑过吗？",
+        conversation_id="initiative-chat",
+        agent_subscription_id="subscription-1",
+    )
+    metadata = decision.runtime_metadata(request="最近跑过吗？")
+
+    assert decision.execution_plan.mode is TurnExecutionMode.AGENT
+    assert decision.execution_plan.disable_tools is False
+    assert decision.execution_plan.tool_catalog_mode is TurnToolCatalogMode.FULL
+    assert decision.deferred.message == "最近跑过吗？"
+    assert decision.deferred.recent_context == "assistant: earlier turn"
+    assert decision.deferred.recommendations_enabled is True
+    assert metadata["workspace_creation_authorization"] == {
+        "status": "deferred", "key": decision.deferred.key,
+    }
+    assert metadata["deferred_chat_intent_key"] == decision.deferred.key
+    assert "workspace_recommendation" not in metadata
+    assert "do not create the final Workspace" in metadata["general_intent_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_voice_greeting_uses_the_same_routing_as_other_chat(monkeypatch):
+    from packages.core.services import chat_intent_routing as module
+
+    async def recent_context(*_args, **_kwargs):
+        return "", False
+
+    monkeypatch.setattr(module, "_recent_chat_context", recent_context)
+    _forbid_planning_classifiers(monkeypatch, module)
+
+    decision = await classify_chat_intent_routing(
+        object(),
+        user=SimpleNamespace(entity_id="entity-1", id="user-1", preferences={
+            "workspace_recommendations_enabled": False,
+        }),
+        message="Hi.",
+        conversation_id="conversation-1",
+        runtime_metadata={"voice_session_mode": "chat_gateway"},
+    )
+
+    assert decision.execution_plan.mode is TurnExecutionMode.TOOL_CHAT
+    assert decision.execution_plan.disable_tools is False
+    assert decision.deferred.recommendations_enabled is False
 
 
 def test_workspace_recommendations_default_on_and_respect_user_opt_out():
@@ -379,19 +427,10 @@ def test_workspace_draft_ids_use_only_structured_artifact_ids():
 
 
 @pytest.mark.asyncio
-async def test_direct_chat_route_still_checks_workspace_recommendation(monkeypatch):
+async def test_deferred_intent_recommends_a_workspace(monkeypatch):
     from packages.core.services import chat_intent_routing as module
 
     calls: list[list[WorkspaceIntentCandidate]] = []
-
-    async def fake_recent_context(*_args, **_kwargs):
-        return "", False
-
-    async def fake_auto_route(**_kwargs):
-        return AutoRouteDecision(AutoRouteMode.DIRECT_CHAT, 0.98)
-
-    async def fake_candidates(*_args, **_kwargs):
-        return [_candidate()]
 
     async def fake_general_intent(*, candidates, **_kwargs):
         calls.append(candidates)
@@ -407,83 +446,23 @@ async def test_direct_chat_route_still_checks_workspace_recommendation(monkeypat
     async def fake_creation_authorization(**_kwargs):
         return _not_authorized()
 
-    monkeypatch.setattr(module, "_recent_chat_context", fake_recent_context)
-    monkeypatch.setattr(module, "classify_auto_route", fake_auto_route)
-    monkeypatch.setattr(module, "list_workspace_intent_candidates", fake_candidates)
     monkeypatch.setattr(module, "classify_general_chat_intent", fake_general_intent)
-    monkeypatch.setattr(
-        module,
-        "classify_workspace_creation_authorization",
-        fake_creation_authorization,
-    )
+    monkeypatch.setattr(module, "classify_workspace_creation_authorization", fake_creation_authorization)
 
-    decision = await classify_chat_intent_routing(
-        object(),
-        user=SimpleNamespace(entity_id="entity-1", id="user-1"),
-        message="How should I organize this eight-week launch?",
-        conversation_id=None,
-    )
+    result = await classify_deferred_chat_intent(_deferred_request(), candidates=[_candidate()])
+    metadata = result.to_metadata(request="How should I organize this eight-week launch?")
 
-    assert decision.auto_route.mode is AutoRouteMode.DIRECT_CHAT
-    assert decision.general_intent.kind is GeneralChatIntentKind.WORKSPACE_RECOMMENDATION
-    assert decision.execution_plan.mode is TurnExecutionMode.DIRECT_CHAT
+    assert result.general_intent.kind is GeneralChatIntentKind.WORKSPACE_RECOMMENDATION
+    assert metadata["workspace_recommendation"]["action"] == "create_new"
+    assert metadata["workspace_creation_authorization"]["status"] == "not_authorized"
     assert calls == [[_candidate()]]
 
 
 @pytest.mark.asyncio
-async def test_voice_greeting_skips_remote_routing_classifiers(monkeypatch):
-    from packages.core.services import chat_intent_routing as module
-
-    async def unexpected(*_args, **_kwargs):
-        raise AssertionError("voice greeting should use the local direct-chat plan")
-
-    monkeypatch.setattr(module, "_recent_chat_context", unexpected)
-    monkeypatch.setattr(module, "classify_auto_route", unexpected)
-    monkeypatch.setattr(module, "list_workspace_intent_candidates", unexpected)
-    monkeypatch.setattr(module, "classify_general_chat_intent", unexpected)
-    monkeypatch.setattr(
-        module,
-        "classify_workspace_creation_authorization",
-        unexpected,
-    )
-
-    decision = await classify_chat_intent_routing(
-        object(),
-        user=SimpleNamespace(entity_id="entity-1", id="user-1"),
-        message="Hi.",
-        conversation_id="conversation-1",
-        runtime_metadata={"voice_session_mode": "chat_gateway"},
-    )
-
-    assert decision.auto_route.mode is AutoRouteMode.DIRECT_CHAT
-    assert decision.general_intent.kind is GeneralChatIntentKind.AGENT_CHAT
-    assert (
-        decision.workspace_creation_authorization.status
-        is WorkspaceCreationAuthorizationStatus.NOT_AUTHORIZED
-    )
-    assert decision.execution_plan.mode is TurnExecutionMode.DIRECT_CHAT
-    assert decision.execution_plan.disable_tools is True
-    assert decision.execution_plan.use_fast_model is True
-
-
-@pytest.mark.asyncio
-async def test_unrelated_request_with_active_draft_still_checks_workspace_recommendation(monkeypatch):
+async def test_active_draft_context_still_reaches_the_recommendation(monkeypatch):
     from packages.core.services import chat_intent_routing as module
 
     seen_context: list[str] = []
-
-    async def fake_recent_context(*_args, **_kwargs):
-        return (
-            "[An active Workspace Draft exists in this conversation.]\n"
-            "assistant: Property marketing draft",
-            True,
-        )
-
-    async def fake_auto_route(**_kwargs):
-        return AutoRouteDecision(AutoRouteMode.DIRECT_CHAT, 0.98)
-
-    async def fake_candidates(*_args, **_kwargs):
-        return [_candidate()]
 
     async def fake_general_intent(*, candidates, recent_context_text, **_kwargs):
         seen_context.append(recent_context_text)
@@ -499,26 +478,21 @@ async def test_unrelated_request_with_active_draft_still_checks_workspace_recomm
     async def fake_creation_authorization(**_kwargs):
         return _not_authorized()
 
-    monkeypatch.setattr(module, "_recent_chat_context", fake_recent_context)
-    monkeypatch.setattr(module, "classify_auto_route", fake_auto_route)
-    monkeypatch.setattr(module, "list_workspace_intent_candidates", fake_candidates)
     monkeypatch.setattr(module, "classify_general_chat_intent", fake_general_intent)
-    monkeypatch.setattr(
-        module,
-        "classify_workspace_creation_authorization",
-        fake_creation_authorization,
+    monkeypatch.setattr(module, "classify_workspace_creation_authorization", fake_creation_authorization)
+
+    result = await classify_deferred_chat_intent(
+        _deferred_request(
+            message="我想长期管理招聘流程",
+            recent_context=(
+                "[An active Workspace Draft exists in this conversation.]\n"
+                "assistant: Property marketing draft"
+            ),
+        ),
+        candidates=[_candidate()],
     )
 
-    decision = await classify_chat_intent_routing(
-        object(),
-        user=SimpleNamespace(entity_id="entity-1", id="user-1"),
-        message="我想长期管理招聘流程",
-        conversation_id="conversation-with-property-draft",
-    )
-    metadata = decision.runtime_metadata(request="我想长期管理招聘流程")
-
-    assert decision.general_intent.kind is GeneralChatIntentKind.WORKSPACE_RECOMMENDATION
-    assert metadata["workspace_recommendation"]["action"] == "create_new"
+    assert result.general_intent.kind is GeneralChatIntentKind.WORKSPACE_RECOMMENDATION
     assert seen_context and "Property marketing draft" in seen_context[0]
 
 
@@ -526,16 +500,7 @@ async def test_unrelated_request_with_active_draft_still_checks_workspace_recomm
 async def test_user_opt_out_skips_suitability_but_keeps_creation_authorization(monkeypatch):
     from packages.core.services import chat_intent_routing as module
 
-    async def fake_recent_context(*_args, **_kwargs):
-        return "", False
-
-    async def fake_auto_route(**_kwargs):
-        return AutoRouteDecision(AutoRouteMode.DIRECT_CHAT, 0.98)
-
     authorization_calls: list[dict] = []
-
-    async def unexpected_candidate_call(*_args, **_kwargs):
-        raise AssertionError("workspace candidates must not be loaded after opt-out")
 
     async def unexpected_general_intent(**_kwargs):
         raise AssertionError("suitability must not run after recommendation opt-out")
@@ -544,38 +509,15 @@ async def test_user_opt_out_skips_suitability_but_keeps_creation_authorization(m
         authorization_calls.append(kwargs)
         return _not_authorized()
 
-    monkeypatch.setattr(module, "_recent_chat_context", fake_recent_context)
-    monkeypatch.setattr(module, "classify_auto_route", fake_auto_route)
-    monkeypatch.setattr(
-        module,
-        "list_workspace_intent_candidates",
-        unexpected_candidate_call,
-    )
-    monkeypatch.setattr(
-        module,
-        "classify_general_chat_intent",
-        unexpected_general_intent,
-    )
-    monkeypatch.setattr(
-        module,
-        "classify_workspace_creation_authorization",
-        fake_creation_authorization,
+    monkeypatch.setattr(module, "classify_general_chat_intent", unexpected_general_intent)
+    monkeypatch.setattr(module, "classify_workspace_creation_authorization", fake_creation_authorization)
+
+    result = await classify_deferred_chat_intent(
+        _deferred_request(recommendations_enabled=False), candidates=[],
     )
 
-    decision = await classify_chat_intent_routing(
-        object(),
-        user=SimpleNamespace(
-            entity_id="entity-1",
-            id="user-1",
-            preferences={"workspace_recommendations_enabled": False},
-        ),
-        message="How should I organize this eight-week launch?",
-        conversation_id=None,
-    )
-
-    assert decision.auto_route.mode is AutoRouteMode.DIRECT_CHAT
-    assert decision.general_intent.kind is GeneralChatIntentKind.AGENT_CHAT
-    assert decision.general_intent.recommendation is None
+    assert result.general_intent.kind is GeneralChatIntentKind.AGENT_CHAT
+    assert result.general_intent.recommendation is None
     assert len(authorization_calls) == 1
     assert authorization_calls[0]["message_text"] == (
         "How should I organize this eight-week launch?"
@@ -586,15 +528,6 @@ async def test_user_opt_out_skips_suitability_but_keeps_creation_authorization(m
 async def test_user_opt_out_does_not_block_explicit_workspace_creation(monkeypatch):
     from packages.core.services import chat_intent_routing as module
 
-    async def fake_recent_context(*_args, **_kwargs):
-        return "", False
-
-    async def fake_auto_route(**_kwargs):
-        return AutoRouteDecision(AutoRouteMode.DIRECT_CHAT, 0.98)
-
-    async def unexpected_candidate_call(*_args, **_kwargs):
-        raise AssertionError("workspace candidates must not load after opt-out")
-
     async def unexpected_general_intent(**_kwargs):
         raise AssertionError("suitability must not run after opt-out")
 
@@ -604,54 +537,22 @@ async def test_user_opt_out_does_not_block_explicit_workspace_creation(monkeypat
             "confidence": 0.99,
         })
 
-    monkeypatch.setattr(module, "_recent_chat_context", fake_recent_context)
-    monkeypatch.setattr(module, "classify_auto_route", fake_auto_route)
-    monkeypatch.setattr(
-        module,
-        "list_workspace_intent_candidates",
-        unexpected_candidate_call,
-    )
-    monkeypatch.setattr(
-        module,
-        "classify_general_chat_intent",
-        unexpected_general_intent,
-    )
-    monkeypatch.setattr(
-        module,
-        "classify_workspace_creation_authorization",
-        fake_creation_authorization,
-    )
+    monkeypatch.setattr(module, "classify_general_chat_intent", unexpected_general_intent)
+    monkeypatch.setattr(module, "classify_workspace_creation_authorization", fake_creation_authorization)
 
-    decision = await classify_chat_intent_routing(
-        object(),
-        user=SimpleNamespace(
-            entity_id="entity-1",
-            id="user-1",
-            preferences={"workspace_recommendations_enabled": False},
-        ),
-        message="Create a Workspace for this launch",
-        conversation_id=None,
+    result = await classify_deferred_chat_intent(
+        _deferred_request(message="Create a Workspace for this launch", recommendations_enabled=False),
+        candidates=[],
     )
-    metadata = decision.runtime_metadata(request="Create a Workspace for this launch")
+    metadata = result.to_metadata(request="Create a Workspace for this launch")
 
-    assert decision.auto_route.mode is AutoRouteMode.GENERAL_CHAT
     assert metadata["workspace_creation_authorization"]["status"] == "authorized"
-    assert "workspace_recommendation" not in metadata
-    assert "Start and save a guided Workspace draft" in metadata["general_intent_prompt"]
+    assert metadata["workspace_recommendation"] is None
 
 
 @pytest.mark.asyncio
 async def test_explicit_create_suppresses_recommendation_and_authorizes_draft(monkeypatch):
     from packages.core.services import chat_intent_routing as module
-
-    async def fake_recent_context(*_args, **_kwargs):
-        return "", False
-
-    async def fake_auto_route(**_kwargs):
-        return AutoRouteDecision(AutoRouteMode.GENERAL_CHAT, 0.98)
-
-    async def fake_candidates(*_args, **_kwargs):
-        return [_candidate()]
 
     async def fake_general_intent(**_kwargs):
         return GeneralChatIntentDecision.from_payload(
@@ -665,30 +566,63 @@ async def test_explicit_create_suppresses_recommendation_and_authorizes_draft(mo
             "confidence": 0.99,
         })
 
-    monkeypatch.setattr(module, "_recent_chat_context", fake_recent_context)
-    monkeypatch.setattr(module, "classify_auto_route", fake_auto_route)
-    monkeypatch.setattr(module, "list_workspace_intent_candidates", fake_candidates)
     monkeypatch.setattr(module, "classify_general_chat_intent", fake_general_intent)
-    monkeypatch.setattr(
-        module,
-        "classify_workspace_creation_authorization",
-        fake_creation_authorization,
-    )
+    monkeypatch.setattr(module, "classify_workspace_creation_authorization", fake_creation_authorization)
 
-    decision = await classify_chat_intent_routing(
-        object(),
-        user=SimpleNamespace(entity_id="entity-1", id="user-1"),
-        message="Create a Workspace for this launch",
-        conversation_id=None,
+    result = await classify_deferred_chat_intent(
+        _deferred_request(message="Create a Workspace for this launch"),
+        candidates=[_candidate()],
     )
-    metadata = decision.runtime_metadata(request="Create a Workspace for this launch")
+    metadata = result.to_metadata(request="Create a Workspace for this launch")
 
-    assert decision.auto_route.mode is AutoRouteMode.GENERAL_CHAT
-    assert decision.execution_plan.mode is TurnExecutionMode.TOOL_CHAT
-    assert decision.general_intent.kind is GeneralChatIntentKind.AGENT_CHAT
-    assert "workspace_recommendation" not in metadata
+    assert result.general_intent.kind is GeneralChatIntentKind.AGENT_CHAT
+    assert metadata["workspace_recommendation"] is None
     assert metadata["workspace_creation_authorization"]["status"] == "authorized"
-    assert "Start and save a guided Workspace draft" in metadata["general_intent_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_deferred_intent_is_published_and_read_back(monkeypatch):
+    from packages.core.services import chat_intent_routing as module
+
+    async def fake_classify(request, *, candidates):
+        return module.DeferredChatIntent(
+            workspace_creation_authorization=WorkspaceCreationAuthorizationDecision.from_payload({
+                "status": "authorized", "confidence": 0.95,
+            }),
+            general_intent=GeneralChatIntentDecision.agent_chat(1.0),
+        )
+
+    monkeypatch.setattr(module, "classify_deferred_chat_intent", fake_classify)
+    from packages.core.models.base import generate_ulid
+
+    request = _deferred_request(key=generate_ulid(), recommendations_enabled=False)
+
+    assert await module.wait_for_deferred_chat_intent(request.key, timeout=0) is None
+    await module.publish_deferred_chat_intent(request)
+    published = await module.wait_for_deferred_chat_intent(request.key, timeout=0)
+
+    assert published["workspace_creation_authorization"]["status"] == "authorized"
+    assert published["workspace_recommendation"] is None
+
+
+@pytest.mark.asyncio
+async def test_failed_deferred_classification_publishes_a_closed_default(monkeypatch):
+    """The draft gate must not wait out its timeout when classification failed."""
+    from packages.core.services import chat_intent_routing as module
+
+    async def broken(request, *, candidates):
+        raise RuntimeError("provider error")
+
+    monkeypatch.setattr(module, "classify_deferred_chat_intent", broken)
+    from packages.core.models.base import generate_ulid
+
+    request = _deferred_request(key=generate_ulid(), recommendations_enabled=False)
+
+    await module.publish_deferred_chat_intent(request)
+    published = await module.wait_for_deferred_chat_intent(request.key, timeout=0)
+
+    assert published["workspace_creation_authorization"]["status"] == "not_authorized"
+    assert published["workspace_recommendation"] is None
 
 
 def test_turn_execution_plan_factory_fails_closed_on_invalid_enum():
@@ -699,159 +633,233 @@ def test_turn_execution_plan_factory_fails_closed_on_invalid_enum():
     assert plan.reason == "invalid_turn_execution_plan_metadata"
 
 
-def test_workspace_ledger_query_uses_the_read_only_ledger_catalog():
-    plan = build_turn_execution_plan(
-        enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
-        message=(
-            "请查询 Finance Ledger，统计 sum_inflow_minor 和 "
-            "sum_outflow_minor，并展示财务汇总。"
-        ),
-        message_text=(
-            "请查询 Finance Ledger，统计 sum_inflow_minor 和 "
-            "sum_outflow_minor，并展示财务汇总。"
-        ),
-        workspace_id="ws-finance",
-    )
-
-    assert plan.mode is TurnExecutionMode.WORKSPACE
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.LEDGER_QUERY
-    assert runtime_turn_visible_tool_names(plan) == (
-        "read_content_ledger",
-        "read_finance_ledger",
-        "read_recruiting_ledger",
-        "read_relationship_ledger",
-        "query_ledger",
-        "visualize_workspace_ledgers",
-    )
-
-
 @pytest.mark.parametrize(
-    "message",
+    ("message", "message_text", "metadata"),
     [
-        "花了多少钱了",
-        "这个月收入和支出是多少？",
-        "How much have we spent this month?",
+        ("你去做", "你去做", {}),
+        (
+            "Fill the attached document and export a PDF.",
+            "Fill the attached document and export a PDF.", {},
+        ),
+        (
+            "暂停这个 Chat 里的 AMDL 价格与新闻监控。",
+            "暂停这个 Chat 里的 AMDL 价格与新闻监控。", {},
+        ),
+        ("你去做", "你去做", {"extra_tool_names": ["generate_file"]}),
+        (
+            [
+                {"type": "text", "text": "Inspect this image."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
+            ],
+            "Inspect this image.", {},
+        ),
     ],
+    ids=["continuation", "document", "action", "explicit-tool", "multimodal"],
 )
-def test_workspace_natural_finance_query_uses_the_read_only_ledger_catalog(
-    message: str,
+def test_owner_tool_chat_has_room_to_complete_multi_step_work(
+    message, message_text, metadata,
 ):
     plan = build_turn_execution_plan(
         enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
+        surface=ChatSurface.GLOBAL_OWNER_CHAT,
         message=message,
-        message_text=message,
-        workspace_id="ws-finance",
+        message_text=message_text,
+        runtime_metadata=metadata,
     )
 
-    assert plan.mode is TurnExecutionMode.WORKSPACE
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.LEDGER_QUERY
-    assert runtime_turn_visible_tool_names(plan) is not None
+    assert plan.mode is TurnExecutionMode.TOOL_CHAT
+    assert plan.disable_tools is False
+    assert plan.max_rounds == CHAT_MAX_ROUNDS
+    # Chat persists the plan before the execution worker consumes its budget.
+    persisted = TurnExecutionPlan.from_metadata(plan.to_metadata())
+    assert runtime_turn_max_rounds(SimpleNamespace(turn_execution_plan=persisted)) == CHAT_MAX_ROUNDS
+
+
+@pytest.mark.parametrize(
+    ("message", "overrides", "expected_budget"),
+    [
+        ("Why is the sky blue?", {}, CHAT_MAX_ROUNDS),
+        ("你去做", {"disable_tools": True}, 1),
+        (
+            "Run this", {"runtime_metadata": {"forced_tool_calls": [{"name": "read_file"}]}}, CHAT_MAX_ROUNDS,
+        ),
+        (
+            "制作完整视频",
+            {"runtime_metadata": {"forced_tool_calls": [
+                {"name": "invoke_skill", "arguments": {"skill": "video-production"}}
+            ]}},
+            CHAT_MAX_ROUNDS,
+        ),
+        ("Create a PowerPoint presentation", {}, CHAT_MAX_ROUNDS),
+        ("你去做", {"runtime_metadata": {"chat_mode": "document"}}, CHAT_MAX_ROUNDS),
+        (
+            "你去做", {"runtime_metadata": {"continuation_context_text": "Fill the attached DOCX."}}, CHAT_MAX_ROUNDS,
+        ),
+        ("查一下 AMDL 当前价格和最新新闻。", {"manual_skill_selected": True}, CHAT_MAX_ROUNDS),
+        ("你去做", {"agent_id": "agent-1"}, CHAT_MAX_ROUNDS),
+        ("你去做", {"surface": ChatSurface.WORKSPACE_CHAT, "workspace_id": "ws-1"}, CHAT_MAX_ROUNDS),
+    ],
+    ids=["direct", "tools-disabled", "forced", "video-production", "slides", "document-mode",
+         "generation-continuation", "skill-research", "bound-agent", "workspace"],
+)
+def test_every_tool_using_chat_turn_shares_one_round_budget(message, overrides, expected_budget):
+    plan = build_turn_execution_plan(**{
+        "enabled": True,
+        "surface": ChatSurface.GLOBAL_OWNER_CHAT,
+        "message": message,
+        "message_text": message,
+        **overrides,
+    })
+
+    assert plan.max_rounds == expected_budget
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("metadata", "expected_budget"), [({}, 1000), ({"chat_mode": "document"}, 1000)])
+async def test_owner_turn_budget_reaches_loop_without_changing_its_default(
+    monkeypatch, metadata, expected_budget,
+):
+    import importlib
+    from unittest.mock import AsyncMock, Mock
+
+    from packages.core.ai.runtime.harness import runtime_execute_agentic_loop
+    from packages.core.ai.runtime.response_language import RuntimeResponseLanguage
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    seen = {}
+
+    async def fake_loop(*, max_rounds=loop_module.DEFAULT_MAX_ROUNDS, **kwargs):
+        seen["max_rounds"] = max_rounds
+        return SimpleNamespace(content="done", usage={}, rounds=1, tool_calls_made=[])
+
+    billing = Mock()
+    monkeypatch.setattr(loop_module, "agentic_loop", fake_loop)
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.completions.runtime_resolve_text_completion_route",
+        AsyncMock(return_value=("test-model", {}, False)),
+    )
+    monkeypatch.setattr(
+        "packages.core.ai.runtime.response_language.resolve_runtime_response_language",
+        AsyncMock(return_value=RuntimeResponseLanguage("entity-1", "user-1")),
+    )
+    monkeypatch.setattr("packages.core.ai.runtime.billing.runtime_ensure_billing_context", billing)
+    plan = build_turn_execution_plan(
+        enabled=True,
+        surface=ChatSurface.GLOBAL_OWNER_CHAT,
+        message="你去做",
+        message_text="你去做",
+        runtime_metadata=metadata,
+    )
+    ctx = SimpleNamespace(turn_execution_plan=plan.to_metadata())
+
+    result = await runtime_execute_agentic_loop(
+        runtime_envelope=None,
+        system_prompt="system",
+        user_message="你去做",
+        tools=[],
+        entity_id="entity-1",
+        agent_id=None,
+        user_id="user-1",
+        conversation_id="conversation-1",
+        billing_source="chat",
+        max_rounds=runtime_turn_max_rounds(ctx),
+    )
+
+    assert result.content == "done"
+    assert seen["max_rounds"] == expected_budget
+    assert loop_module.DEFAULT_MAX_ROUNDS == 200
+    billing.assert_called_once_with(
+        "entity-1", source="chat", user_id="user-1", agent_id=None,
+        workspace_id=None, conversation_id="conversation-1", task_id=None, byok=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_owner_tool_chat_can_finish_after_nine_tool_rounds(monkeypatch):
+    import importlib
+    from unittest.mock import AsyncMock
+
+    loop_module = importlib.import_module("packages.core.ai.agentic_loop")
+    model_calls = 0
+    tool_calls = []
+
+    async def completion(messages, tools, **kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        usage = {"prompt": 10, "completion": 1, "total": 11}
+        if model_calls == 10:
+            return "Verified output is ready.", [], usage
+        return "", [{
+            "id": f"call-{model_calls}",
+            "name": "read_file",
+            "arguments": {"path": f"evidence-{model_calls}.txt"},
+        }], usage
+
+    async def execute(name, args):
+        tool_calls.append((name, args))
+        return json.dumps({"content": "verified"})
+
+    final_summary = AsyncMock(side_effect=AssertionError("The work must finish before its budget."))
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_round_tool_completion", completion)
+    monkeypatch.setattr(loop_module, "runtime_execute_agentic_final_completion", final_summary)
+    plan = build_turn_execution_plan(
+        enabled=True,
+        surface=ChatSurface.GLOBAL_OWNER_CHAT,
+        message="你去做",
+        message_text="你去做",
+    )
+
+    result = await loop_module.agentic_loop(
+        system_prompt="Complete and verify the requested work.",
+        user_message="你去做",
+        tools=[{"type": "function", "function": {
+            "name": "read_file", "parameters": {"type": "object"},
+        }}],
+        tool_executor=execute,
+        max_rounds=runtime_turn_max_rounds(SimpleNamespace(turn_execution_plan=plan)),
+    )
+
+    assert result.stop_reason == "completed"
+    assert result.content == "Verified output is ready."
+    assert len(tool_calls) == 9
+    assert model_calls == result.rounds == 10
+    final_summary.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
     "message",
     [
-        "How much did this task spend in AI credits?",
-        "这份方案花费了多少 tokens？",
+        "暂停这个 Chat 里的 AMDL 价格与新闻监控。",
+        "Resume my daily briefing monitor.",
+        "请只使用给出的材料回答。",
+        "What is the current price of AMDL?",
+        "Hello",
     ],
 )
-def test_workspace_ai_usage_cost_question_keeps_the_full_catalog(message: str):
-    plan = build_turn_execution_plan(
-        enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
-        message=message,
-        message_text=message,
-        workspace_id="ws-finance",
-    )
-
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.FULL
-    assert runtime_turn_visible_tool_names(plan) is None
-
-
-def test_workspace_natural_finance_query_falls_back_without_ledger_tools():
-    message = "How much have we spent this month?"
-    plan = build_turn_execution_plan(
-        enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
-        message=message,
-        message_text=message,
-        workspace_id="ws-without-ledgers",
-    )
-
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.LEDGER_QUERY
-    assert runtime_turn_visible_tool_names(
-        plan,
-        available_tool_names=set(),
-    ) is None
-
-
-def test_workspace_ledger_write_intent_keeps_the_full_catalog():
-    message = "请在 Finance Ledger 里新增一笔客户回款记录。"
-    plan = build_turn_execution_plan(
-        enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
-        message=message,
-        message_text=message,
-        workspace_id="ws-finance",
-    )
-
-    assert plan.mode is TurnExecutionMode.WORKSPACE
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.FULL
-    assert runtime_turn_visible_tool_names(plan) is None
-
-
 @pytest.mark.parametrize(
-    "message",
+    ("surface", "workspace_id", "agent_id", "expected_mode"),
     [
-        "在 Finance Ledger 记一笔 100 美元的支出",
-        "log expense to the Finance Ledger",
+        (ChatSurface.GLOBAL_OWNER_CHAT, None, None, TurnExecutionMode.TOOL_CHAT),
+        (ChatSurface.WORKSPACE_CHAT, "ws-1", None, TurnExecutionMode.WORKSPACE),
+        (ChatSurface.AGENT_DM, None, "agent-1", TurnExecutionMode.AGENT),
     ],
 )
-def test_workspace_common_ledger_write_intent_keeps_the_full_catalog(
-    message: str,
+def test_chat_wording_never_narrows_authorized_tools(
+    message, surface, workspace_id, agent_id, expected_mode,
 ):
     plan = build_turn_execution_plan(
         enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
+        surface=surface,
         message=message,
         message_text=message,
-        workspace_id="ws-finance",
+        workspace_id=workspace_id,
+        agent_id=agent_id,
     )
 
-    assert plan.mode is TurnExecutionMode.WORKSPACE
+    assert plan.mode is expected_mode
+    assert plan.disable_tools is False
     assert plan.tool_catalog_mode is TurnToolCatalogMode.FULL
-    assert runtime_turn_visible_tool_names(plan) is None
-
-
-def test_workspace_non_ledger_research_keeps_the_full_catalog():
-    message = "Search the latest market news for this Workspace."
-    plan = build_turn_execution_plan(
-        enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
-        message=message,
-        message_text=message,
-        workspace_id="ws-finance",
-    )
-
-    assert plan.mode is TurnExecutionMode.WORKSPACE
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.FULL
-    assert runtime_turn_visible_tool_names(plan) is None
-
-
-def test_workspace_non_ledger_count_keeps_the_full_catalog():
-    message = "Count the open tasks in this Workspace."
-    plan = build_turn_execution_plan(
-        enabled=True,
-        surface=ChatSurface.WORKSPACE_CHAT,
-        message=message,
-        message_text=message,
-        workspace_id="ws-finance",
-    )
-
-    assert plan.mode is TurnExecutionMode.WORKSPACE
-    assert plan.tool_catalog_mode is TurnToolCatalogMode.FULL
+    assert plan.research_strategy.value == "none"
     assert runtime_turn_visible_tool_names(plan) is None
 
 

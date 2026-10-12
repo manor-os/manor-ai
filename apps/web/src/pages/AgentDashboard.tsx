@@ -1,3 +1,4 @@
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router-dom";
 import { api } from "../lib/api";
@@ -40,11 +41,11 @@ const KPI_THEMES = [
 /* -- component --------------------------------------------- */
 
 export default function AgentDashboard() {
+  const catalogScope = useCatalogScope();
   const navigate = useNavigate();
 
   const { data: agents, isLoading: agentsLoading } = useQuery({
-    queryKey: ["agents", "my"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
 
   const { data: executions, isLoading: execLoading } = useQuery({

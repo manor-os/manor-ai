@@ -1,4 +1,4 @@
-from packages.core.contracts.envelope import Success, Failure, StepResult
+from packages.core.contracts.envelope import Success, Failure
 
 
 def test_success_carries_data_and_is_ok():
@@ -13,7 +13,3 @@ def test_failure_carries_reason_and_is_not_ok():
     assert r.ok is False
     assert r.reason == "sandbox tool unavailable"
     assert r.to_dict() == {"ok": False, "reason": "sandbox tool unavailable", "detail": {"tool": "docx"}}
-
-
-def test_step_result_union_type_exists():
-    assert StepResult is not None

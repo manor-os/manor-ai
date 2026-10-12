@@ -89,6 +89,7 @@ export interface WorkflowRunProgressProps {
   workflowHref?: string;
   historyHref?: string;
   headerAction?: ReactNode;
+  submitting?: boolean;
 }
 
 export default function WorkflowRunProgress({
@@ -97,6 +98,7 @@ export default function WorkflowRunProgress({
   workflowHref,
   historyHref,
   headerAction,
+  submitting = false,
 }: WorkflowRunProgressProps) {
   const [expanded, setExpanded] = useState(false);
   const [showAllNodes, setShowAllNodes] = useState(false);
@@ -193,13 +195,13 @@ export default function WorkflowRunProgress({
               <IconList size={14} aria-hidden="true" />
             </a>
           )}
-          <span className="workflow-run-status" data-status={statusPresentation.labelKey} role="status">
+          <span className="workflow-run-status" data-status={submitting ? "submitting" : statusPresentation.labelKey} role="status">
             <span
               className="workflow-run-status-indicator"
-              data-motion={statusPresentation.motion}
+              data-motion={submitting ? "static" : statusPresentation.motion}
               aria-hidden="true"
             />
-            {statusLabel(statusPresentation.labelKey)}
+            {submitting ? t("component.workflow_run.submitting") : statusLabel(statusPresentation.labelKey)}
           </span>
           {headerAction}
         </div>

@@ -52,6 +52,7 @@ async def test_manor_can_create_folder_and_move_documents(client):
             "create_document_folder",
             {"name": "YouTube Channel"},
             entity_id,
+            user_id=owner["user_id"],
         )
     )
     assert created["created"] is True
@@ -74,6 +75,7 @@ async def test_manor_can_create_folder_and_move_documents(client):
             "list_document_folders",
             {},
             entity_id,
+            user_id=owner["user_id"],
         )
     )
     assert listed["count"] == 1
@@ -92,7 +94,8 @@ async def test_manor_move_documents_requires_explicit_target_folder(client):
     from packages.core.ai.tools.manor_tool import _dispatch_action
     from packages.core.services.document_service import create_document
 
-    entity_id = "ent_move_requires_target"
+    owner = await _register_owner(client, "target")
+    entity_id = owner["entity_id"]
 
     async with db_module.async_session() as db:
         doc = await create_document(
@@ -106,6 +109,7 @@ async def test_manor_move_documents_requires_explicit_target_folder(client):
             "move_documents_to_folder",
             {"document_ids": [doc_id]},
             entity_id,
+            user_id=owner["user_id"],
         )
     )
     assert "error" in result
@@ -136,6 +140,7 @@ async def test_manor_move_documents_enforces_folder_id_contract(client):
             "create_document_folder",
             {"name": "Interview Prepare/01_System_Design"},
             entity_id,
+            user_id=owner["user_id"],
         )
     )
     assert created["created"] is True
@@ -258,6 +263,7 @@ async def test_manor_move_documents_to_folder_moves_filesystem_payload(client, t
                 "create_document_folder",
                 {"name": "New"},
                 entity_id,
+                user_id=owner["user_id"],
             )
         )
         folder_id = created["folder"]["id"]
@@ -287,18 +293,10 @@ async def test_manor_move_documents_to_folder_moves_filesystem_payload(client, t
         settings.MANOR_FS_ROOT = old_root
 
 
-@pytest.mark.asyncio
-async def test_manor_search_finds_knowledge_folder_actions():
-    from packages.core.ai.tools.manor_tool import _manor_handler
+def test_manor_catalog_exposes_knowledge_folder_actions():
+    from packages.core.ai.tools.manor_tool import manor_action_manifests
 
-    result = json.loads(
-        await _manor_handler(
-            entity_id="ent_folder_actions",
-            action="search",
-            query="create knowledge folder move documents",
-        )
-    )
-    actions = {item["action"] for item in result["matches"]}
+    actions = {item["invoke_with"]["arguments"]["action"] for item in manor_action_manifests()}
 
     assert "create_document_folder" in actions
     assert "move_documents_to_folder" in actions
@@ -308,13 +306,15 @@ async def test_manor_search_finds_knowledge_folder_actions():
 async def test_manor_create_document_folder_accepts_nested_path(client):
     from packages.core.ai.tools.manor_tool import _dispatch_action
 
-    entity_id = "ent_nested_folder_actions"
+    owner = await _register_owner(client, "nested")
+    entity_id = owner["entity_id"]
 
     created = json.loads(
         await _dispatch_action(
             "create_document_folder",
             {"name": "Series/openings/op-01-Opening"},
             entity_id,
+            user_id=owner["user_id"],
         )
     )
 
@@ -332,6 +332,7 @@ async def test_manor_create_document_folder_accepts_nested_path(client):
             "create_document_folder",
             {"name": "Series/openings/op-01-Opening"},
             entity_id,
+            user_id=owner["user_id"],
         )
     )
 
@@ -396,7 +397,7 @@ async def test_manor_lists_workspace_artifacts_from_document_provenance(client):
         )
     )
 
-    assert listed["workspace_id"] == workspace_id
+    assert listed.get("workspace_id") == workspace_id, listed
     assert listed["count"] == 1
     assert listed["artifacts"][0]["document_id"] == artifact_id
     assert listed["artifacts"][0]["fs_path"] == "generated-recap.md"
@@ -445,6 +446,6 @@ async def test_manor_infers_workspace_artifacts_from_task_id(client):
         )
     )
 
-    assert listed["workspace_id"] == workspace_id
+    assert listed.get("workspace_id") == workspace_id, listed
     assert listed["count"] == 1
     assert listed["artifacts"][0]["document_id"] == artifact_id

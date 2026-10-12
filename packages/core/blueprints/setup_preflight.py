@@ -243,8 +243,10 @@ class BlueprintSetupPreflightFactory:
         selected_channels = selected_channel_config_ids or {}
         from packages.core.services.workspace_readiness import (
             BUILT_IN_CHANNEL_TYPES,
+            channel_type_has_account_model,
         )
 
+        connected_provider_keys: set[str] | None = None
         for index, spec in enumerate(contract.get("channels") or []):
             if not isinstance(spec, dict):
                 continue
@@ -256,6 +258,26 @@ class BlueprintSetupPreflightFactory:
                 index,
                 spec,
             )
+            if not channel_type_has_account_model(channel_type):
+                # A platform with no channel adapter (``other``): nothing to
+                # attach here. Its access comes from a dedicated integration
+                # or the Chrome extension, so evaluate those instead of
+                # demanding an account type that does not exist.
+                if connected_provider_keys is None:
+                    from packages.core.services.integration_resolution import (
+                        connected_integration_provider_keys,
+                    )
+
+                    connected_provider_keys = await connected_integration_provider_keys(
+                        db, entity_id=entity_id, user_id=user_id,
+                    )
+                requirements.append(_unbacked_channel_requirement(
+                    spec,
+                    requirement_key=requirement_key,
+                    connected_provider_keys=connected_provider_keys,
+                    workspace_id=workspace_id,
+                ))
+                continue
             if channel_type in BUILT_IN_CHANNEL_TYPES:
                 requirements.append(BlueprintSetupRequirementState(
                     kind=BlueprintInstallRequirementKind.CHANNEL,
@@ -455,6 +477,59 @@ class BlueprintSetupPreflightFactory:
 def _optional_text(value: object) -> str | None:
     text = str(value or "").strip()
     return text or None
+
+
+_BROWSER_EXTENSION_PROVIDER = "chrome"
+
+
+def _unbacked_channel_requirement(
+    spec: dict[str, Any],
+    *,
+    requirement_key: str,
+    connected_provider_keys: set[str],
+    workspace_id: str | None,
+) -> BlueprintSetupRequirementState:
+    """Requirement for a declared platform Manor has no channel adapter for.
+
+    Satisfied by either a dedicated integration for the platform or the
+    Chrome extension; both connected is best, one is enough. Optional unless
+    the declaration says ``required``: the declaration records what the
+    workspace is about, and the agent can still be given the platform later.
+    """
+    from packages.core.services.workspace_readiness import (
+        describe_unbacked_channel,
+        unbacked_channel_platform,
+    )
+
+    platform = unbacked_channel_platform(spec)
+    platform_key = canonical_provider_key(platform) if platform else ""
+    dedicated = bool(platform_key) and platform_key in connected_provider_keys
+    browser = _BROWSER_EXTENSION_PROVIDER in connected_provider_keys
+    label, reason = describe_unbacked_channel(spec)
+    if dedicated and browser:
+        reason = f"{platform} integration and the Chrome extension are both connected."
+    elif dedicated:
+        reason = (
+            f"{platform} integration is connected. Connecting the Chrome extension "
+            "as well gives agents a fallback for actions the integration does not cover."
+        )
+    elif browser:
+        reason = (
+            f"The Chrome extension is connected and can operate {platform or 'this platform'}. "
+            + (f"Connecting a dedicated {platform} integration as well is best." if platform else "")
+        ).strip()
+    return BlueprintSetupRequirementState(
+        kind=BlueprintInstallRequirementKind.CHANNEL,
+        provider=platform_key or platform or str(spec.get("channel_type") or "other"),
+        label=str(spec.get("label") or label),
+        required=bool(spec.get("required", False)),
+        ready=dedicated or browser,
+        reason=reason,
+        purpose=_optional_text(spec.get("purpose")),
+        setup_kind="platform_access",
+        scope="workspace" if workspace_id else "user",
+        requirement_key=requirement_key,
+    )
 
 
 def blueprint_channel_requirement_key(

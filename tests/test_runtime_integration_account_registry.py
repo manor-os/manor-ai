@@ -150,7 +150,13 @@ def test_account_aware_tool_schema_keeps_every_account_callable() -> None:
         "type": "function",
         "function": {
             "name": "mcp__gmail__list_messages",
-            "parameters": {"type": "object", "properties": {}},
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "integration_account_continuation": {"type": "string"},
+                },
+                "required": ["integration_account_continuation"],
+            },
         },
     }
     decorated = runtime_apply_integration_account_options_to_schema(
@@ -181,6 +187,9 @@ def test_account_aware_tool_schema_keeps_every_account_callable() -> None:
     ]
     assert selection["enum"] == ["default", "all"]
     assert "every listed account" in selection["description"]
+    parameters = decorated["function"]["parameters"]
+    assert "integration_account_continuation" not in parameters["properties"]
+    assert "integration_account_continuation" not in parameters["required"]
 
 
 def test_mutating_tool_schema_requires_one_explicit_or_default_account() -> None:

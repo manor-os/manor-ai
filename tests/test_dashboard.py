@@ -753,6 +753,12 @@ async def test_dashboard_generation_uses_persistent_manor_agent_conversation(
                 "manual_skill_refs": kwargs["manual_skill_refs"],
             }
         )
+        from packages.core.models.task import Message
+
+        origin = await kwargs["db"].get(
+            Message, kwargs["runtime_metadata"].get("origin_user_message_id") or ""
+        )
+        captured["origin_row"] = (origin.role, origin.content) if origin else None
         validation = json.loads(
             await _code_handler(
                 action="dashboard_module_validate",
@@ -835,6 +841,9 @@ async def test_dashboard_generation_uses_persistent_manor_agent_conversation(
         "assistant",
     ]
     assert history.json()["messages"][1]["tool_calls"] == ["web_search", "code"]
+    # The run writes this turn to the transcript itself; without the id the
+    # saved request would also be synced in as a row no run wrote.
+    assert captured["origin_row"] == ("user", captured["message"])
 
 
 @pytest.mark.asyncio
@@ -1425,7 +1434,7 @@ async def test_recent_activity(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_recent_activity_filters_workspace_and_automation_tasks(client: AsyncClient):
+async def test_recent_activity_filters_workspace_and_automation_tasks(client: AsyncClient, db_session):
     """Recent activity should respect workspace filters and hide scheduler internals."""
     headers = await _auth(client, "dashactivityscope")
     ws_a = await client.post("/api/v1/workspaces", headers=headers, json={"name": "Activity A"})
@@ -1443,7 +1452,7 @@ async def test_recent_activity_filters_workspace_and_automation_tasks(client: As
         headers=headers,
         json=_task_payload(title="B hidden by workspace filter", workspace_id=ws_b_id),
     )
-    await client.post(
+    automation_resp = await client.post(
         "/api/v1/tasks",
         headers=headers,
         json=_task_payload(
@@ -1452,6 +1461,16 @@ async def test_recent_activity_filters_workspace_and_automation_tasks(client: As
             details={"scheduled_job_id": "job_123"},
         ),
     )
+    assert automation_resp.status_code == 201, automation_resp.text
+    assert "scheduled_job_id" not in automation_resp.json()["details"]
+
+    # Public task creation cannot forge scheduler provenance. Seed the trusted
+    # runtime metadata directly so this fixture represents an automation task.
+    automation_task = await db_session.get(Task, automation_resp.json()["id"])
+    assert automation_task is not None
+    assert "scheduled_job_id" not in automation_task.details
+    automation_task.details = {**automation_task.details, "scheduled_job_id": "job_123"}
+    await db_session.commit()
 
     resp = await client.get(f"/api/v1/dashboard/recent-activity?limit=10&workspace_id={ws_a_id}", headers=headers)
 

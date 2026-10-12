@@ -12,11 +12,17 @@ All log entries share a `trace_id` for correlation.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
+
+from packages.core.services.sensitive_data import (
+    sanitize_approval_credentials,
+    sanitize_sensitive_payload,
+)
 
 logger = logging.getLogger("manor.chat")
 
@@ -30,8 +36,13 @@ def safe_tool_args(tool_args: dict[str, Any] | None) -> dict[str, Any] | None:
     """Drop internal context kwargs and truncate large values for storage."""
     if not tool_args:
         return None
+    sanitized_args = sanitize_sensitive_payload(
+        sanitize_approval_credentials(tool_args)
+    )
+    if not isinstance(sanitized_args, dict):
+        return None
     safe: dict[str, Any] = {}
-    for key, value in tool_args.items():
+    for key, value in sanitized_args.items():
         if str(key).startswith("_"):
             continue  # skip internal context keys
         rendered = str(value)
@@ -107,6 +118,18 @@ class ChatTrace:
     conversation_id: str | None = None
     started_at: float = field(default_factory=time.time)
 
+    # Turn preparation timing: wall time between consecutive ``mark`` calls,
+    # logged once as ``chat.phases`` right before the first LLM call.
+    phase_ms: dict[str, int] = field(default_factory=dict)
+    _phase_at: float = field(default_factory=time.monotonic, repr=False)
+    _started_mono: float = field(default_factory=time.monotonic, repr=False)
+    _phases_logged: bool = field(default=False, repr=False)
+    # Event-loop stall probe: a phase that awaits nothing but still takes
+    # seconds is synchronous work blocking every coroutine in the process.
+    _lag_task: Any = field(default=None, repr=False)
+    loop_blocked_ms: int = 0
+    loop_max_lag_ms: int = 0
+
     # Accumulated during the request
     tool_names_loaded: list[str] = field(default_factory=list)
     tool_calls_made: list[str] = field(default_factory=list)
@@ -122,6 +145,66 @@ class ChatTrace:
             "workspace_id": self.workspace_id,
             "conversation_id": self.conversation_id,
         }
+
+    # ── Timing ──
+
+    def mark(self, phase: str) -> None:
+        now = time.monotonic()
+        self.phase_ms[phase] = self.phase_ms.get(phase, 0) + int((now - self._phase_at) * 1000)
+        self._phase_at = now
+
+    def start_loop_probe(
+        self,
+        *,
+        interval: float = 0.05,
+        report_ms: int = 250,
+        max_seconds: float = 600.0,
+    ) -> None:
+        if self._lag_task is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def probe() -> None:
+            deadline = loop.time() + max_seconds
+            while loop.time() < deadline:
+                before = loop.time()
+                await asyncio.sleep(interval)
+                lag_ms = int((loop.time() - before - interval) * 1000)
+                if lag_ms < 20:
+                    continue
+                self.loop_blocked_ms += lag_ms
+                self.loop_max_lag_ms = max(self.loop_max_lag_ms, lag_ms)
+                if lag_ms >= report_ms:
+                    logger.warning(
+                        "chat.loop_blocked trace_id=%s lag_ms=%d after_phase=%s",
+                        self.trace_id, lag_ms, next(reversed(self.phase_ms), "request"),
+                    )
+
+        self._lag_task = loop.create_task(probe())
+
+    def stop_loop_probe(self) -> None:
+        if self._lag_task is not None:
+            self._lag_task.cancel()
+            self._lag_task = None
+
+    def log_phases(self, label: str = "prepare") -> None:
+        if self._phases_logged:
+            return
+        self._phases_logged = True
+        logger.info(
+            "chat.phases %s",
+            {
+                **self._base(),
+                "phase": label,
+                "total_ms": int((time.monotonic() - self._started_mono) * 1000),
+                "phases_ms": dict(self.phase_ms),
+                "loop_blocked_ms": self.loop_blocked_ms,
+                "loop_max_lag_ms": self.loop_max_lag_ms,
+            },
+        )
 
     # ── Lifecycle events ──
 
@@ -284,6 +367,7 @@ class ChatTrace:
             )
 
     def log_complete(self, *, result: Any = None) -> None:
+        self.stop_loop_probe()
         elapsed_ms = (time.time() - self.started_at) * 1000
         logger.info(
             "chat.complete %s",
@@ -291,6 +375,8 @@ class ChatTrace:
                 **self._base(),
                 "phase": "complete",
                 "elapsed_ms": round(elapsed_ms, 1),
+                "loop_blocked_ms": self.loop_blocked_ms,
+                "loop_max_lag_ms": self.loop_max_lag_ms,
                 "rounds": self.llm_rounds,
                 "tools_loaded": len(self.tool_names_loaded),
                 "tool_calls_made": self.tool_calls_made,
@@ -302,6 +388,7 @@ class ChatTrace:
         )
 
     def log_error(self, error: str, *, phase: str = "unknown") -> None:
+        self.stop_loop_probe()
         elapsed_ms = (time.time() - self.started_at) * 1000
         logger.error(
             "chat.error %s",

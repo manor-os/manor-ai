@@ -15,8 +15,10 @@ from typing import Any, AsyncIterator, Coroutine, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.response_language import resolve_response_locale
 from packages.core.ai.runtime.completions import runtime_execute_text_completion
 from packages.core.constants.agent_capabilities import AGENT_CAPABILITY_SELECTION_LIMIT
+from packages.core.i18n import get_locale, t
 from packages.core.services.agent_capability_catalog import (
     AgentCapabilitySelectionError,
 )
@@ -587,7 +589,10 @@ async def _complete_capability_ids(
     raise last_error
 
 
-async def update_agent_via_ai(agent_id: str, change: str, entity_id: str, db: AsyncSession) -> Any:
+async def update_agent_via_ai(
+    agent_id: str, change: str, entity_id: str, db: AsyncSession,
+    *, user_id: str | None = None,
+) -> Any:
     """Apply a natural-language change to an existing agent."""
     from packages.core.services.agent_service import get_agent, update_agent
 
@@ -615,6 +620,7 @@ async def update_agent_via_ai(agent_id: str, change: str, entity_id: str, db: As
         source=_AGENT_SOURCE,
         temperature=0.3,
         max_tokens=8000,
+        user_id=user_id,
     )
     raw = completion.content
     if not raw or not raw.strip():
@@ -636,7 +642,9 @@ async def update_agent_via_ai(agent_id: str, change: str, entity_id: str, db: As
     return updated
 
 
-async def agent_clarifying_questions(prompt: str, *, entity_id: str) -> list[str]:
+async def agent_clarifying_questions(
+    prompt: str, *, entity_id: str, user_id: str | None = None,
+) -> list[str]:
     """Up to 3 clarifying questions for an agent request (empty = ready)."""
     text = (prompt or "").strip()
     if not text:
@@ -650,6 +658,7 @@ async def agent_clarifying_questions(prompt: str, *, entity_id: str) -> list[str
         source=_AGENT_SOURCE,
         temperature=0.3,
         max_tokens=500,
+        user_id=user_id,
     )
     return parse_clarifying_questions(completion.content or "")
 
@@ -669,12 +678,14 @@ async def generate_agent_streaming(
     """
     from packages.core.services.agent_service import create_agent
 
+    progress_locale = await resolve_response_locale(user_id or None, db=db) or get_locale()
     spec: dict[str, Any] | None = None
     async for kind, payload in generate_agent_draft_streaming(
         prompt,
         entity_id,
         db=db,
         user_id=user_id,
+        progress_locale=progress_locale,
     ):
         if kind == "step":
             yield ("step", payload)
@@ -683,7 +694,7 @@ async def generate_agent_streaming(
     if spec is None:
         raise ValueError("Agent generation did not produce a draft")
 
-    yield ("step", "Saving the agent")
+    yield ("step", t("generation.agent.saving", locale=progress_locale))
     config: dict[str, Any] = {}
     selected_capability_ids = list(spec.get("capability_ids") or [])
     if selected_capability_ids:
@@ -739,13 +750,15 @@ async def generate_agent_draft_streaming(
     *,
     db: AsyncSession | None = None,
     user_id: str = "",
+    progress_locale: str | None = None,
 ) -> AsyncIterator[Tuple[str, object]]:
     """Generate an agent draft without persisting it.
 
     This powers the AI create review step: the UI can show the generated
     persona and only call ``create_agent`` after the user confirms.
     """
-    yield ("step", "Designing the agent")
+    progress_locale = progress_locale or await resolve_response_locale(user_id or None, db=db) or get_locale()
+    yield ("step", t("generation.agent.designing", locale=progress_locale))
     capability_catalog = None
     if db is not None and user_id:
         from packages.core.services.agent_capability_catalog import (
@@ -769,6 +782,7 @@ async def generate_agent_draft_streaming(
         source=_AGENT_SOURCE,
         temperature=0.4,
         max_tokens=8000,
+        user_id=user_id or None,
     )
     raw = completion.content
     if not raw or not raw.strip():
@@ -776,7 +790,7 @@ async def generate_agent_draft_streaming(
 
     raw_spec = _extract_json(raw)
     if capability_catalog is not None:
-        yield ("step", "Matching capabilities")
+        yield ("step", t("generation.agent.matching", locale=progress_locale))
         plan = await _match_agent_capabilities(
             prompt=prompt,
             spec=raw_spec,
@@ -785,7 +799,7 @@ async def generate_agent_draft_streaming(
         )
         raw_spec["capability_ids"] = list(plan.selected_catalog_ids)
     spec = _normalize_agent_spec(raw_spec, capability_catalog=capability_catalog)
-    yield ("step", "Preparing preview")
+    yield ("step", t("generation.agent.preview", locale=progress_locale))
     yield ("draft", spec)
 
 

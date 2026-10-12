@@ -1,20 +1,11 @@
-"""M9.3/M8 chat-card API — reject reason codes + always-approve standing grant.
-
-The proposal card resolve endpoint
-(``POST /workspaces/{id}/chat/messages/{mid}/resolve``) now:
-
-* threads an optional ``payload.reason_code`` (+ ``note``) into
-  ``reject_proposal`` so the item decision carries the machine-readable
-  vocabulary — unknown / system-only codes fall back to ``OTHER``;
-* on ``always_approve`` with ``strategist_review_v2`` enabled writes the
-  auditable standing grant (``workspace.proposal.task`` in the workspace
-  governance policy) in addition to the legacy workspace boolean.
-"""
+"""Proposal decisions preserve rejection reasons and reject unversioned grants."""
 from __future__ import annotations
 
 import asyncio
 import json
 from types import SimpleNamespace
+
+from tests.strategist_helpers import proposal_with_execution_review
 
 import pytest
 from httpx import AsyncClient
@@ -26,11 +17,10 @@ from packages.core.ledger import record_event
 from packages.core.models.base import generate_ulid
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
-from packages.core.models.governance import GovernancePolicy, GovernanceRevision
+from packages.core.models.governance import GovernanceRevision
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
-from packages.core.models.task import Conversation, Message
+from packages.core.models.task import Conversation, Message, Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
-from packages.core.proposals.constants import TASK_ACTION_KEY
 from packages.core.services import feature_flags as feature_flags_service
 from packages.core.strategist import service as strategist_service
 from packages.core.tasks import ai_tasks
@@ -91,7 +81,7 @@ async def _set_flag(db, enabled: bool) -> None:
 
 def _fake_completion(payload: dict = _ONE_TASK):
     async def fake(system_prompt, user_prompt, **kwargs):
-        return SimpleNamespace(content=json.dumps(payload))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payload, user_prompt)))
     return fake
 
 
@@ -130,6 +120,9 @@ async def _seed_review_card(client: AsyncClient, monkeypatch, username: str) -> 
             status="active",
         )
         db.add_all([workspace, goal, agent, subscription])
+        await db.flush()
+        from approval_settings_test_utils import initialize_test_approval_owners
+        await initialize_test_approval_owners(db, workspace, user_id=user_id)
         await db.commit()
 
         await _set_flag(db, True)
@@ -231,6 +224,34 @@ async def test_reject_with_reason_code_lands_in_item_decision(client: AsyncClien
 
 
 @pytest.mark.asyncio
+async def test_reject_with_code_only_is_recent_rejected_feedback(client: AsyncClient, monkeypatch):
+    import packages.core.database as dbmod
+    from packages.core.strategist.context import _recent_proposal_outcomes
+
+    ctx = await _seed_review_card(client, monkeypatch, "reject_code_only_owner")
+    resp = await client.post(
+        f"/api/v1/workspaces/{ctx['workspace_id']}/chat/messages/{ctx['message_id']}/resolve",
+        headers=ctx["headers"],
+        json={"choice": "reject", "payload": {"reason_code": "WRONG_DIRECTION"}},
+    )
+    assert resp.status_code == 200, resp.text
+
+    for row in await _item_decisions(ctx["review_id"]):
+        assert row["status"] == "rejected"
+        assert row["decision"]["reason_code"] == "WRONG_DIRECTION"
+        assert row["decision"]["comment"] is None
+
+    async with dbmod.async_session() as db:
+        task = await db.get(Task, ctx["task_ids"][0])
+        assert task.status == "cancelled"
+        assert task.details["rejection_reason_code"] == "WRONG_DIRECTION"
+        assert not task.details.get("rejection_reason")
+        outcomes = await _recent_proposal_outcomes(db, ctx["workspace_id"])
+        assert any(item.id == task.id for item in outcomes.get("rejected", []))
+        assert not any(item.id == task.id for item in outcomes.get("abandoned", []))
+
+
+@pytest.mark.asyncio
 async def test_reject_unknown_or_system_reason_code_falls_back_other(client: AsyncClient, monkeypatch):
     # Unknown vocabulary must not 500 — it degrades to OTHER. The same
     # guard covers system-only codes (POLICY_BLOCKED etc.), which are
@@ -250,46 +271,46 @@ async def test_reject_unknown_or_system_reason_code_falls_back_other(client: Asy
 
 
 @pytest.mark.asyncio
-async def test_always_approve_with_flag_writes_boolean_and_standing_grant(client: AsyncClient, monkeypatch):
+async def test_retired_always_choice_preserves_proposal_and_policy(client: AsyncClient, monkeypatch):
     import packages.core.database as dbmod
 
     ctx = await _seed_review_card(client, monkeypatch, "always_grant_owner")
 
+    path = f"/api/v1/approval-settings/workspaces/{ctx['workspace_id']}"
+    before = await client.get(path, headers=ctx["headers"])
+    assert before.status_code == 200, before.text
+    async with dbmod.async_session() as db:
+        revisions_before = list((await db.execute(select(GovernanceRevision.id).where(
+            GovernanceRevision.workspace_id == ctx["workspace_id"]
+        ))).scalars())
     resp = await client.post(
         f"/api/v1/workspaces/{ctx['workspace_id']}/chat/messages/{ctx['message_id']}/resolve",
-        headers=ctx["headers"],
-        json={"choice": "always_approve"},
+        headers=ctx["headers"], json={"choice": "always_approve"},
     )
-    assert resp.status_code == 200, resp.text
-
+    assert resp.status_code == 410, resp.text
+    assert "Execution & approvals" in resp.json()["detail"]
+    assert (await client.get(path, headers=ctx["headers"])).json() == before.json()
     async with dbmod.async_session() as db:
-        workspace = await db.get(Workspace, ctx["workspace_id"])
-        # Legacy boolean kept for compat with the flag-off path.
-        assert workspace.settings["strategist"]["auto_approve_proposals"] is True
+        revisions_after = list((await db.execute(select(GovernanceRevision.id).where(
+            GovernanceRevision.workspace_id == ctx["workspace_id"]
+        ))).scalars())
+        assert (await db.get(Message, ctx["message_id"])).resolved_at is None
+    assert revisions_after == revisions_before
+    for row in await _item_decisions(ctx["review_id"]):
+        assert row["status"] == "proposed"
 
-        policy_row = (await db.execute(
-            select(GovernancePolicy).where(
-                GovernancePolicy.workspace_id == ctx["workspace_id"]
-            )
-        )).scalar_one()
-        assert TASK_ACTION_KEY in policy_row.policy["auto_approve_actions"]
-
-        revisions = list((await db.execute(
-            select(GovernanceRevision).where(
-                GovernanceRevision.workspace_id == ctx["workspace_id"]
-            )
-        )).scalars().all())
-        assert any(
-            (r.change_summary or "").startswith("always-approve action:")
-            for r in revisions
-        )
-
+    approved = await client.post(
+        f"/api/v1/workspaces/{ctx['workspace_id']}/chat/messages/{ctx['message_id']}/resolve",
+        headers=ctx["headers"], json={"choice": "approve"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert (await client.get(path, headers=ctx["headers"])).json() == before.json()
     for row in await _item_decisions(ctx["review_id"]):
         assert row["status"] == "approved"
 
 
 @pytest.mark.asyncio
-async def test_always_approve_with_flag_off_skips_standing_grant(client: AsyncClient, monkeypatch):
+async def test_retired_always_choice_with_flag_off_preserves_policy(client: AsyncClient, monkeypatch):
     import packages.core.database as dbmod
 
     ctx = await _seed_review_card(client, monkeypatch, "always_legacy_owner")
@@ -299,21 +320,25 @@ async def test_always_approve_with_flag_off_skips_standing_grant(client: AsyncCl
     async with dbmod.async_session() as db:
         await _set_flag(db, False)
 
+    path = f"/api/v1/approval-settings/workspaces/{ctx['workspace_id']}"
+    before = await client.get(path, headers=ctx["headers"])
+    assert before.status_code == 200, before.text
+    async with dbmod.async_session() as db:
+        revisions_before = list((await db.execute(select(GovernanceRevision.id).where(
+            GovernanceRevision.workspace_id == ctx["workspace_id"]
+        ))).scalars())
     resp = await client.post(
         f"/api/v1/workspaces/{ctx['workspace_id']}/chat/messages/{ctx['message_id']}/resolve",
-        headers=ctx["headers"],
-        json={"choice": "always_approve"},
+        headers=ctx["headers"], json={"choice": "always_approve"},
     )
-    assert resp.status_code == 200, resp.text
-
+    assert resp.status_code == 410, resp.text
+    assert "Execution & approvals" in resp.json()["detail"]
+    assert (await client.get(path, headers=ctx["headers"])).json() == before.json()
     async with dbmod.async_session() as db:
-        workspace = await db.get(Workspace, ctx["workspace_id"])
-        assert workspace.settings["strategist"]["auto_approve_proposals"] is True
-
-        policy_row = (await db.execute(
-            select(GovernancePolicy).where(
-                GovernancePolicy.workspace_id == ctx["workspace_id"]
-            )
-        )).scalar_one_or_none()
-        granted = (policy_row.policy.get("auto_approve_actions") if policy_row else []) or []
-        assert TASK_ACTION_KEY not in granted
+        revisions_after = list((await db.execute(select(GovernanceRevision.id).where(
+            GovernanceRevision.workspace_id == ctx["workspace_id"]
+        ))).scalars())
+        assert (await db.get(Message, ctx["message_id"])).resolved_at is None
+    assert revisions_after == revisions_before
+    for row in await _item_decisions(ctx["review_id"]):
+        assert row["status"] == "proposed"

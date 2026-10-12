@@ -18,5 +18,9 @@
     "mcp__shopify__add_order_tags",
     "mcp__shopify__create_customer",
     "mcp__shopify__adjust_inventory"
-  ]
+  ],
+  "search": {
+    "terms": ["ecommerce", "online store", "sku", "stock level", "tags", "store orders", "merchant", "shop"],
+    "examples": ["list recent orders in my shopify store", "update product price in shopify", "adjust inventory for product", "tag orders as shipped"]
+  }
 }

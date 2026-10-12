@@ -130,5 +130,7 @@ def test_checker_rejects_source_entity_user_ids_with_nonportable_policy() -> Non
 
 def test_checker_accepts_governance_without_recipe_escalation_rule() -> None:
     payload = _payload()
-    payload["policy"]["governance"] = {"hitl_required_actions": ["social.publish_*"]}
+    payload["policy"]["governance"] = {"approval": {"mode": None, "rules": [
+        {"id": "review-social", "effect": "ask", "selector": {"kind": "action", "action_key": "social_post.publish"}},
+    ]}}
     assert not check_blueprint_payload(payload)

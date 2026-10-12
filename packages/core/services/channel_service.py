@@ -15,6 +15,7 @@ Configuration:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from typing import Optional
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.database_runtime import release_read_transaction
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import (
     Announcement,
@@ -214,6 +216,9 @@ async def send_message(
     if not cc:
         raise ValueError(f"Channel config {channel_config_id} not found for entity {entity_id}")
 
+    # The provider and credential lease must not wait behind this read transaction.
+    await release_read_transaction(db)
+
     # Dispatch to provider
     result: dict = {}
     try:
@@ -374,7 +379,8 @@ async def _send_sms(config: ChannelConfig, *, to: str, content: str) -> dict:
 
     try:
         client = TwilioClient(account_sid, auth_token)
-        message = client.messages.create(
+        message = await asyncio.to_thread(
+            client.messages.create,
             body=content,
             from_=from_number,
             to=to,
@@ -471,7 +477,8 @@ async def _send_voice_call(config: ChannelConfig, *, to: str, twiml_url: str) ->
 
     try:
         client = TwilioClient(account_sid, auth_token)
-        call = client.calls.create(
+        call = await asyncio.to_thread(
+            client.calls.create,
             url=twiml_url,
             from_=from_number,
             to=to,
@@ -511,6 +518,21 @@ async def handle_inbound_message(
         or payload.get("external_id")
     )
 
+    raw_attachments = payload.get("attachments")
+    logged_attachments = None
+    if isinstance(raw_attachments, list) and raw_attachments:
+        logged_attachments = {
+            "items": [
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"data_base64", "content_base64"}
+                }
+                for item in raw_attachments
+                if isinstance(item, dict)
+            ]
+        }
+
     log_entry = MessageLog(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -523,6 +545,7 @@ async def handle_inbound_message(
         subject=subject,
         content=content,
         html_content=payload.get("html_content"),
+        attachments=logged_attachments,
         external_id=external_id,
         status="received",
     )
@@ -763,7 +786,7 @@ async def send_announcement(
         return {"sent": 0, "failed": 0, "errors": ["No pending recipients"]}
 
     ann.status = "sending"
-    await db.flush()
+    await db.commit()
 
     sent = 0
     failed = 0
@@ -798,6 +821,8 @@ async def send_announcement(
             rec.error_message = str(exc)
             failed += 1
             errors.append(f"{rec.recipient_address}: {exc}")
+        # The receipt belongs to this external send, not the entire batch.
+        await db.commit()
 
     # Update announcement
     ann.status = "sent" if failed == 0 else ("failed" if sent == 0 else "sent")

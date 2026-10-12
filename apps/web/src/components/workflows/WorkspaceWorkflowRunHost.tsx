@@ -7,7 +7,13 @@ import {
   type QueryKey,
 } from "@tanstack/react-query";
 import { api } from "../../lib/api";
+import { useLocation } from "react-router-dom";
 import { t } from "../../lib/i18n";
+import { workflowPath, workflowRunPath } from "../../lib/workflowRoutes";
+import {
+  ACTIVE_WORKFLOW_FAMILY_POLL_MS,
+  ACTIVE_WORKFLOW_RUN_POLL_MS,
+} from "../../lib/workspaceLiveRefresh";
 import { IconPause, IconStop } from "../icons";
 import ConfirmDialog from "../ui/ConfirmDialog";
 import LoadingSpinner from "../ui/LoadingSpinner";
@@ -216,7 +222,10 @@ export function buildWorkspaceWorkflowRunGroups(
 
   messages.forEach((message, index) => {
     if (message.meta?.workflow_run_accessible === false) return;
-    const runId = workflowRunIdForMessage(message);
+    const messageRunId = workflowRunIdForMessage(message);
+    const runId = nonEmptyString(
+      message.pending_action?.workflow_chat_host_run_id,
+    ) || messageRunId;
     if (!runId) return;
     const ownsActivity = message.message_kind === "workflow_activity";
     const ownsAction = WORKFLOW_HOST_ACTION_KINDS.has(
@@ -238,7 +247,9 @@ export function buildWorkspaceWorkflowRunGroups(
     group.latestIndex = index;
     group.latestCreatedAt = message.created_at || group.latestCreatedAt;
     if (message.id) group.ownedMessageIds.push(message.id);
-    const projectionUpdatedAt = nonEmptyString(message.updated_at);
+    const projectionUpdatedAt = messageRunId === runId
+      ? nonEmptyString(message.updated_at)
+      : "";
     if (
       projectionUpdatedAt
       && (!group.projectionUpdatedAt || projectionUpdatedAt > group.projectionUpdatedAt)
@@ -311,15 +322,48 @@ export function actionableWorkflowRunGroups(
   ));
 }
 
+export function isWorkspaceWorkflowRunInProgress(
+  run: { status?: unknown; businessOutcome?: unknown; business_outcome?: unknown },
+): boolean {
+  const status = nonEmptyString(run.status).toLowerCase();
+  if (["queued", "pending", "running", "paused"].includes(status)) return true;
+  return status === "completed"
+    && nonEmptyString(run.businessOutcome || run.business_outcome).toLowerCase() === "needs_input";
+}
+
+export function currentWorkspaceWorkflowRunGroups(
+  groups: WorkspaceWorkflowRunGroup[],
+  detailsByRunId: Record<string, unknown> = {},
+  dismissedRunIds: ReadonlySet<string> = new Set(),
+): WorkspaceWorkflowRunGroup[] {
+  const latestAttempts = excludeSupersededWorkflowRunGroups(groups, detailsByRunId).map((group) => ({
+    ...group,
+    projection: mergeWorkflowRunView(detailsByRunId[group.id], group.projection, group.projectionUpdatedAt),
+  }));
+  // Keep one recent result beside live runs. A newer success or cancellation
+  // retires old failures instead of revealing the next old failure in the list.
+  const latestResult = latestAttempts.filter((group) => (
+    !isWorkspaceWorkflowRunInProgress(group.projection)
+  )).sort((left, right) => {
+    const leftTime = Date.parse(left.projection.startedAt || left.latestCreatedAt || "");
+    const rightTime = Date.parse(right.projection.startedAt || right.latestCreatedAt || "");
+    return (Number.isFinite(rightTime) && Number.isFinite(leftTime) ? rightTime - leftTime : 0)
+      || right.latestIndex - left.latestIndex;
+  })[0];
+  return latestAttempts.filter((group) => (
+    !dismissedRunIds.has(group.id)
+    && isWorkspaceWorkflowRunActionable(group.projection)
+    && (isWorkspaceWorkflowRunInProgress(group.projection) || group.id === latestResult?.id)
+  ));
+}
+
 export function suppressUnverifiedWorkflowRunGroups(
   groups: WorkspaceWorkflowRunGroup[],
   unverifiedRunIds: ReadonlySet<string>,
 ): WorkspaceWorkflowRunGroup[] {
-  return excludeSupersededWorkflowRunGroups(groups).filter((group) => {
-    if (!unverifiedRunIds.has(group.id)) return true;
-    const status = nonEmptyString(group.projection.status).toLowerCase();
-    return status === "pending" || status === "running";
-  });
+  return excludeSupersededWorkflowRunGroups(groups).filter(
+    (group) => !unverifiedRunIds.has(group.id),
+  );
 }
 
 function workflowFamilyAttemptTimestamp(run: WorkflowHistoryRun): number {
@@ -563,18 +607,64 @@ export function mergeWorkflowRunView(
   const hasAuthoritativeCurrentNode = Object.hasOwn(detail, "current_step_id");
   const hasAuthoritativeError = Object.hasOwn(detail, "error");
   const hasAuthoritativeIntervention = Object.hasOwn(detail, "intervention");
+  const hasAuthoritativeRetryFrom = Object.hasOwn(detail, "retry_from_step_id");
+  const projectionActionRunId = nonEmptyString(projection.action?.workflow_run_id);
+  const projectionHasNestedAction = Boolean(
+    projectionActionRunId && projectionActionRunId !== projection.id,
+  );
   const detailIntervention = mergeWorkflowIntervention(
     detail.intervention,
     projection.action,
   );
+  const mergedAction = projectionIsNewer
+    ? projection.action
+    : projectionHasNestedAction
+      ? projection.action
+      : hasAuthoritativeIntervention ? detailIntervention : projection.action;
+  const currentStepId = nonEmptyString(detail.current_step_id);
+  const currentStepResult = recordValue(
+    recordValue(detail.step_results)?.[currentStepId],
+  );
+  const compactCurrentStep = recordValue(compactSteps?.find(
+    (rawNode) => nonEmptyString(recordValue(rawNode)?.id) === currentStepId,
+  ));
+  const compactCurrentStepType = nonEmptyString(compactCurrentStep?.type).toLowerCase();
+  const detailedStepWaitsOnSubworkflow = Boolean(
+    nonEmptyString(currentStepResult?.status).toLowerCase() === "paused"
+    && nonEmptyString(currentStepResult?.subrun_id)
+    && nonEmptyString(currentStepResult?.output).toLowerCase()
+      === "waiting for subworkflow to resume"
+  );
+  const compactStepWaitsOnSubworkflow = Boolean(
+    (compactCurrentStepType === "subworkflow" || compactCurrentStepType === "foreach_subworkflow")
+    && nonEmptyString(compactCurrentStep?.status).toLowerCase() === "paused"
+    && Array.isArray(compactCurrentStep?.child_run_ids)
+    && compactCurrentStep.child_run_ids.some((childRunId) => nonEmptyString(childRunId))
+  );
+  const waitsOnSubworkflow = Boolean(
+    !projectionIsNewer
+    && normalizeWorkflowRunStatus(detail.status) === "paused"
+    && (detailedStepWaitsOnSubworkflow || compactStepWaitsOnSubworkflow)
+    && !mergedAction
+  );
+  // The runtime suspends the parent while its asynchronous child owns execution.
+  const visibleNodes = waitsOnSubworkflow
+    ? nodes.map((node) => (
+        node.id === currentStepId
+          ? { ...node, status: "running" as const }
+          : node
+      ))
+    : nodes;
   return {
     ...projection,
     id: nonEmptyString(detail.id) || projection.id,
     title: nonEmptyString(snapshot?.name) || projection.title,
     status: projectionIsNewer
       ? projection.status
-      : normalizeWorkflowRunStatus(detail.status || projection.status),
-    nodes,
+      : waitsOnSubworkflow
+        ? "running"
+        : normalizeWorkflowRunStatus(detail.status || projection.status),
+    nodes: visibleNodes,
     workflowId: nonEmptyString(detail.workflow_id) || projection.workflowId,
     currentNodeId: projectionIsNewer
       ? projection.currentNodeId || null
@@ -583,7 +673,9 @@ export function mergeWorkflowRunView(
         : projection.currentNodeId || null,
     retryFromStepId: projectionIsNewer
       ? projection.retryFromStepId || null
-      : nonEmptyString(detail.retry_from_step_id) || projection.retryFromStepId || null,
+      : hasAuthoritativeRetryFrom
+        ? nonEmptyString(detail.retry_from_step_id) || null
+        : projection.retryFromStepId || null,
     attemptNumber: Math.max(1, Number(detail.attempt_number || projection.attemptNumber || 1)),
     startedAt: nonEmptyString(detail.started_at) || projection.startedAt || null,
     completedAt: nonEmptyString(detail.completed_at) || projection.completedAt || null,
@@ -591,10 +683,16 @@ export function mergeWorkflowRunView(
     error: projectionIsNewer
       ? projection.error
       : hasAuthoritativeError ? detail.error : projection.error,
-    action: projectionIsNewer
-      ? projection.action
-      : hasAuthoritativeIntervention ? detailIntervention : projection.action,
+    action: mergedAction,
   };
+}
+
+export function selectWorkspaceWorkflowRunDetail(
+  queryDetail: unknown,
+  cachedDetails: Record<string, unknown>,
+  runId: string,
+): unknown {
+  return queryDetail === undefined ? cachedDetails[runId] : queryDetail;
 }
 
 export interface WorkflowApprovalReviewHydration {
@@ -626,12 +724,13 @@ export function workflowApprovalReviewFromRunDetail(
 }
 
 function directInterventionAction(run: WorkflowRunView): WorkflowRunAction | null {
-  if (run.status === "failed" && run.currentNodeId) {
+  const retryFromStepId = nonEmptyString(run.retryFromStepId);
+  if (run.status === "failed" && run.currentNodeId && retryFromStepId) {
     return {
       kind: "workflow_retry",
       workflow_run_id: run.id,
       step_id: run.currentNodeId,
-      retry_from_step_id: run.retryFromStepId || run.currentNodeId,
+      retry_from_step_id: retryFromStepId,
       editable_input_schema: { type: "object", properties: {} },
       options: ["retry"],
     };
@@ -651,6 +750,13 @@ export function selectWorkspaceWorkflowInterventionAction(
   run: WorkflowRunView,
 ): WorkflowRunAction | null {
   return run.action || directInterventionAction(run);
+}
+
+export function workflowResumeTargetRunId(
+  action: WorkflowRunAction | null | undefined,
+  fallbackRunId: string,
+): string {
+  return nonEmptyString(action?.workflow_run_id) || fallbackRunId;
 }
 
 export async function resolveWorkspaceWorkflowMessageAction(
@@ -682,9 +788,9 @@ export interface WorkflowRunInvalidationContext {
 
 interface WorkspaceWorkflowRunHostProps {
   workspaceId?: string;
-  workspacePaused?: boolean;
   conversationId?: string;
   groups: WorkspaceWorkflowRunGroup[];
+  attentionKeys?: Record<string, Record<string, string>>;
   onResolveMessage: (
     messageId: string,
     choice: string,
@@ -767,9 +873,9 @@ function runSwitcherLabel(run: WorkflowRunView): string {
 
 export default function WorkspaceWorkflowRunHost({
   workspaceId,
-  workspacePaused = false,
   conversationId,
   groups,
+  attentionKeys,
   onResolveMessage,
   resolveLoading = false,
   resolveError,
@@ -779,6 +885,9 @@ export default function WorkspaceWorkflowRunHost({
   onRunChange,
 }: WorkspaceWorkflowRunHostProps) {
   const queryClient = useQueryClient();
+  const location = useLocation();
+  const attentionMessageId = new URLSearchParams(location.search).has("attention") && location.hash.startsWith("#workspace-chat-message-")
+    ? location.hash.slice("#workspace-chat-message-".length) : "";
   const familyQueryGroups = useMemo(
     () => excludeSupersededWorkflowRunGroups(groups).filter((group) => (
       isWorkspaceWorkflowRunActionable(group.projection)
@@ -788,13 +897,14 @@ export default function WorkspaceWorkflowRunHost({
   const familyQueries = useQueries({
     queries: familyQueryGroups.map((group) => ({
       queryKey: ["workspace-chat-workflow-run-family", group.id],
-      queryFn: () => api.workflows.getRunFamily(group.id),
+      queryFn: ({ signal }) => api.workflows.getRunFamily(group.id, signal),
       refetchInterval: (query: { state: { data?: WorkflowHistoryRun[] } }) => {
         const latestRun = latestWorkflowFamilyAttempt(query.state.data || []);
         return latestRun && ["pending", "running"].includes(
           nonEmptyString(latestRun.status).toLowerCase(),
-        ) ? 1_000 : false;
+        ) ? ACTIVE_WORKFLOW_FAMILY_POLL_MS : false;
       },
+      refetchIntervalInBackground: false,
     })),
   });
   const familyRunsByGroupId = useMemo(
@@ -820,11 +930,13 @@ export default function WorkspaceWorkflowRunHost({
     () => reconcileWorkspaceWorkflowRunGroups(verifiedGroups, familyRunsByGroupId),
     [familyRunsByGroupId, verifiedGroups],
   );
-  const initialGroups = excludeSupersededWorkflowRunGroups(reconciledGroups);
+  const initialGroups = currentWorkspaceWorkflowRunGroups(reconciledGroups);
   const initialForegroundRunId = selectForegroundWorkflowRunId(initialGroups, "");
   const [selectedRunId, setSelectedRunId] = useState(initialForegroundRunId);
   const [dismissedRunIds, setDismissedRunIds] = useState<Set<string>>(() => new Set());
   const [runDetailsById, setRunDetailsById] = useState<Record<string, unknown>>({});
+  const submittingRunIdsRef = useRef(new Set<string>());
+  const [submittingRunIds, setSubmittingRunIds] = useState<Set<string>>(() => new Set());
   const [cancelConfirmationOpen, setCancelConfirmationOpen] = useState(false);
   const [cancelConfirmationRunId, setCancelConfirmationRunId] = useState<string | null>(null);
   const cancelConfirmationIdentityRef = useRef<CancelConfirmationIdentity | null>(null);
@@ -848,21 +960,31 @@ export default function WorkspaceWorkflowRunHost({
     setSelectedRunId(selectForegroundWorkflowRunId(reconciledGroups, ""));
   }, [groupSignature, reconciledGroups]);
 
-  const actionableGroups = useMemo(
-    () => actionableWorkflowRunGroups(
+  const currentGroups = useMemo(
+    () => currentWorkspaceWorkflowRunGroups(
       reconciledGroups,
       runDetailsById,
       dismissedRunIds,
     ),
     [dismissedRunIds, reconciledGroups, runDetailsById],
   );
-  const foregroundRunId = selectForegroundWorkflowRunId(actionableGroups, selectedRunId);
-  const foregroundGroup = actionableGroups.find((group) => group.id === foregroundRunId) || null;
+  const attentionGroup = actionableWorkflowRunGroups(reconciledGroups, runDetailsById, dismissedRunIds)
+    .find((group) => group.ownedMessageIds.includes(attentionMessageId));
+  // An explicitly opened reminder can still be inspected, but is not an active run.
+  const selectableGroups = attentionGroup && !currentGroups.some((group) => group.id === attentionGroup.id)
+    ? [...currentGroups, attentionGroup]
+    : currentGroups;
+  const activeRunCount = currentGroups.filter((group) => isWorkspaceWorkflowRunInProgress(group.projection)).length;
+  useEffect(() => {
+    if (attentionGroup) setSelectedRunId(attentionGroup.id);
+  }, [attentionMessageId, attentionGroup?.id]);
+  const foregroundRunId = selectForegroundWorkflowRunId(selectableGroups, selectedRunId);
+  const foregroundGroup = selectableGroups.find((group) => group.id === foregroundRunId) || null;
   const foregroundProjection = foregroundGroup?.projection;
   const foregroundProjectionUpdatedAt = foregroundGroup?.projectionUpdatedAt;
   const runQuery = useQuery({
     queryKey: ["workflow-run", foregroundRunId],
-    queryFn: () => api.workflows.getRun(foregroundRunId, false),
+    queryFn: ({ signal }) => api.workflows.getRun(foregroundRunId, false, signal),
     enabled: Boolean(foregroundRunId),
     refetchInterval: (query) => {
       if (!foregroundProjection) return false;
@@ -871,17 +993,25 @@ export default function WorkspaceWorkflowRunHost({
         foregroundProjection,
         foregroundProjectionUpdatedAt,
       );
-      return isWorkflowRunActive(currentRun) ? 1_000 : false;
+      return isWorkflowRunActive(currentRun)
+        ? ACTIVE_WORKFLOW_RUN_POLL_MS
+        : false;
     },
+    refetchIntervalInBackground: false,
   });
+  const selectedRunDetail = selectWorkspaceWorkflowRunDetail(
+    runQuery.data,
+    runDetailsById,
+    foregroundRunId,
+  );
   const foregroundRun = foregroundProjection
     ? mergeWorkflowRunView(
-        runQuery.data,
+        selectedRunDetail,
         foregroundProjection,
         foregroundProjectionUpdatedAt,
       )
     : null;
-  const runDetail = recordValue(runQuery.data);
+  const runDetail = recordValue(selectedRunDetail);
   const authoritativeWorkspaceId = nonEmptyString(runDetail?.workspace_id);
   const resolvedWorkspaceId = authoritativeWorkspaceId || workspaceId || "";
   const runCapabilities = recordValue(runDetail?.capabilities);
@@ -900,13 +1030,16 @@ export default function WorkspaceWorkflowRunHost({
       || interventionAction?.action_id
       || interventionAction?.id,
   );
+  const approvalReviewRunId = nonEmptyString(
+    interventionAction?.workflow_run_id,
+  ) || foregroundRunId;
   const hydratesApprovalReview = interventionAction?.kind === "workflow_approval"
     && interventionAction.review_location === "workflow_history"
     && Boolean(approvalReviewStepId);
   const approvalReviewQuery = useQuery({
-    queryKey: ["workflow-run-review", foregroundRunId, approvalReviewStepId, approvalReviewActionId],
-    queryFn: () => api.workflows.getRun(foregroundRunId),
-    enabled: Boolean(foregroundRunId && hydratesApprovalReview),
+    queryKey: ["workflow-run-review", approvalReviewRunId, approvalReviewStepId, approvalReviewActionId],
+    queryFn: ({ signal }) => api.workflows.getRun(approvalReviewRunId, true, signal),
+    enabled: Boolean(approvalReviewRunId && hydratesApprovalReview),
     staleTime: Infinity,
   });
   const approvalReview = workflowApprovalReviewFromRunDetail(
@@ -953,7 +1086,10 @@ export default function WorkspaceWorkflowRunHost({
     const invalidations = [
       queryClient.invalidateQueries({ queryKey: ["workflow-run", runId] }),
       queryClient.invalidateQueries({ queryKey: ["workflow-runs"] }),
-      queryClient.invalidateQueries({ queryKey: ["workspace-chat-workflow-run-family"] }),
+      queryClient.invalidateQueries({
+        queryKey: ["workspace-chat-workflow-run-family", runId],
+        exact: true,
+      }),
       ...invalidationQueryKeys.map((queryKey: QueryKey) => (
         queryClient.invalidateQueries({ queryKey })
       )),
@@ -999,9 +1135,12 @@ export default function WorkspaceWorkflowRunHost({
     },
   });
   const resumeMutation = useMutation({
-    mutationFn: () => api.workflows.resumeRun(foregroundRunId),
-    onSuccess: async () => {
-      await invalidateRunSurfaces(foregroundRunId);
+    mutationFn: ({ runId }: { runId: string }) => api.workflows.resumeRun(runId),
+    onSuccess: async (_result, { runId }) => {
+      await invalidateRunSurfaces(runId);
+      if (runId !== foregroundRunId) {
+        await invalidateRunSurfaces(foregroundRunId);
+      }
     },
   });
   const retryMutation = useMutation({
@@ -1014,6 +1153,9 @@ export default function WorkspaceWorkflowRunHost({
     ),
     onSuccess: async (_result, { runId }) => {
       await invalidateRunSurfaces(runId);
+      if (runId !== foregroundRunId) {
+        await invalidateRunSurfaces(foregroundRunId);
+      }
     },
   });
 
@@ -1057,17 +1199,21 @@ export default function WorkspaceWorkflowRunHost({
   const resolvingMessage = Boolean(
     actionMessageId && actionMessageId === resolveMessageId && resolveLoading,
   );
-  const resolving = resolvingMessage
+  const resolving = submittingRunIds.has(foregroundRunId)
+    || resolvingMessage
     || cancelMutation.isPending
     || pauseMutation.isPending
     || resumeMutation.isPending
     || retryMutation.isPending;
   const scopedResolveError = actionMessageId === resolveMessageId ? resolveError : null;
   const workflowHref = foregroundRun.workflowId
-    ? `/flows?workflow=${encodeURIComponent(foregroundRun.workflowId)}`
+    ? workflowPath(foregroundRun.workflowId)
     : undefined;
-  const historyHref = resolvedWorkspaceId
-    ? `/workspaces/${encodeURIComponent(resolvedWorkspaceId)}?tab=workflows&workflow_view=history&workflow_run=${encodeURIComponent(foregroundRun.id)}`
+  const historyHref = foregroundRun.workflowId
+    ? workflowRunPath(foregroundRun.workflowId, foregroundRun.id, resolvedWorkspaceId)
+    : undefined;
+  const approvalHistoryHref = foregroundRun.workflowId && approvalReviewRunId
+    ? workflowRunPath(foregroundRun.workflowId, approvalReviewRunId, resolvedWorkspaceId)
     : undefined;
   const cancelActionLabel = t("component.workflow_run.action.cancel");
   const cancelError = cancelMutation.variables?.source === "direct" && cancelMutation.error
@@ -1083,32 +1229,51 @@ export default function WorkspaceWorkflowRunHost({
     payload?: Record<string, unknown>,
     files?: File[],
   ) => {
-    const messageHandled = await resolveWorkspaceWorkflowMessageAction(
-      interventionAction,
-      choice,
-      note,
-      payload,
-      files,
-      onResolveMessage,
-    );
-    if (messageHandled) {
-      if (conversationId) await invalidateRunSurfaces(foregroundRunId);
-      return;
-    }
-    const normalizedChoice = normalizeWorkflowActionChoice(choice);
-    if (normalizedChoice === "resume") {
-      await resumeMutation.mutateAsync();
-    } else if (normalizedChoice === "retry" && interventionAction?.kind === "workflow_retry") {
-      await retryMutation.mutateAsync({
-        runId: foregroundRunId,
-        action: interventionAction,
-        variables: payload?.variables as Record<string, unknown> | undefined,
-      });
-    } else if (normalizedChoice === "cancel") {
-      await cancelMutation.mutateAsync({
-        runId: foregroundRunId,
-        source: "intervention",
-      });
+    if (!canControl || resolving || submittingRunIdsRef.current.has(foregroundRunId)) return;
+    submittingRunIdsRef.current.add(foregroundRunId);
+    setSubmittingRunIds(new Set(submittingRunIdsRef.current));
+    try {
+      const runtimeApprovalId = nonEmptyString(interventionAction?.runtime_approval_id);
+      if (interventionAction?.kind === "workflow_approval" && runtimeApprovalId) {
+        if ((choice !== "approve" && choice !== "reject") || !interventionAction.options?.includes(choice)) return;
+        const runId = workflowResumeTargetRunId(interventionAction, foregroundRunId);
+        await api.workflows.resolveRuntimeApproval(runId, runtimeApprovalId, choice);
+        await invalidateRunSurfaces(runId);
+        if (runId !== foregroundRunId) await invalidateRunSurfaces(foregroundRunId);
+        return;
+      }
+      const messageHandled = await resolveWorkspaceWorkflowMessageAction(
+        interventionAction,
+        choice,
+        note,
+        payload,
+        files,
+        onResolveMessage,
+      );
+      if (messageHandled) {
+        await invalidateRunSurfaces(foregroundRunId);
+        return;
+      }
+      const normalizedChoice = normalizeWorkflowActionChoice(choice);
+      if (normalizedChoice === "resume") {
+        await resumeMutation.mutateAsync({
+          runId: workflowResumeTargetRunId(interventionAction, foregroundRunId),
+        });
+      } else if (normalizedChoice === "retry" && interventionAction?.kind === "workflow_retry") {
+        await retryMutation.mutateAsync({
+          runId: foregroundRunId,
+          action: interventionAction,
+          variables: payload?.variables as Record<string, unknown> | undefined,
+        });
+      } else if (normalizedChoice === "cancel") {
+        await cancelMutation.mutateAsync({
+          runId: foregroundRunId,
+          source: "intervention",
+        });
+      }
+    } finally {
+      submittingRunIdsRef.current.delete(foregroundRunId);
+      setSubmittingRunIds(new Set(submittingRunIdsRef.current));
     }
   };
 
@@ -1176,20 +1341,24 @@ export default function WorkspaceWorkflowRunHost({
       aria-label={t("component.workflow_run.progress")}
       aria-busy={runQuery.isLoading || resolving}
     >
-      {actionableGroups.length > 1 && (
+      {selectableGroups.length > 1 && (
         <div className="workspace-workflow-run-switcher">
-          <span className="workspace-workflow-run-count mono">
-            {t("component.workflow_run.active_runs").replace(
-              "{count}",
-              String(actionableGroups.length),
-            )}
-          </span>
+          {activeRunCount > 0 && (
+            <span className="workspace-workflow-run-count mono">
+              {t("component.workflow_run.active_runs").replace("{count}", String(activeRunCount))}
+            </span>
+          )}
           <Select
             value={foregroundRunId}
             onChange={setSelectedRunId}
-            options={actionableGroups.map((group) => ({
+            options={selectableGroups.map((group) => ({
               value: group.id,
-              label: runSwitcherLabel(group.projection),
+              label: runSwitcherLabel(mergeWorkflowRunView(
+                runDetailsById[group.id],
+                group.projection,
+                group.projectionUpdatedAt,
+              )) + (currentGroups.some((current) => current.id === group.id)
+                ? "" : ` · ${t("component.workflow_run_history.history")}`),
             }))}
             ariaLabel={t("component.workflow_run.switcher_label")}
             showSelectedIcon
@@ -1211,6 +1380,7 @@ export default function WorkspaceWorkflowRunHost({
         )}
         <WorkflowRunProgress
           run={foregroundRun}
+          submitting={resolving}
           workflowHref={workflowHref}
           historyHref={historyHref}
           headerAction={canCancelRun ? (
@@ -1221,7 +1391,7 @@ export default function WorkspaceWorkflowRunHost({
                   className="workflow-run-pause-action"
                   title={t("component.workflow_run.action.pause")}
                   aria-label={t("component.workflow_run.action.pause")}
-                  disabled={workspacePaused || resolving}
+                  disabled={resolving}
                   onClick={() => pauseMutation.mutate()}
                 >
                   {pauseMutation.isPending
@@ -1234,7 +1404,7 @@ export default function WorkspaceWorkflowRunHost({
                 className="workflow-run-cancel-action"
                 title={cancelActionLabel}
                 aria-label={cancelActionLabel}
-                disabled={workspacePaused || resolving}
+                disabled={resolving}
                 onClick={openCancellationConfirmation}
               >
                 {cancelMutation.isPending
@@ -1250,20 +1420,25 @@ export default function WorkspaceWorkflowRunHost({
           </p>
         )}
         {headerInterventionAction && (
-          <WorkflowRunIntervention
-            key={`${foregroundRun.id}:${actionMessageId || headerInterventionAction.kind}`}
-            run={foregroundRun}
-            action={headerInterventionAction}
-            onResolve={resolveIntervention}
-            disabled={workspacePaused || resolving || !canControl}
-            loading={resolving}
-            error={scopedResolveError || directActionError}
-            historyHref={historyHref}
-            historyReview={approvalReview?.review}
-            historyReviewTitle={approvalReview?.reviewTitle}
-            historyReviewLoading={approvalReviewQuery.isLoading}
-            historyReviewError={approvalReviewQuery.error}
-          />
+          <div data-workspace-action-message-id={actionMessageId || undefined} data-workspace-attention-key={actionMessageId
+            ? attentionKeys?.[actionMessageId]?.[String(headerInterventionAction.approval_request_id || headerInterventionAction.approval_token || actionMessageId)]
+            : undefined}>
+            <WorkflowRunIntervention
+              key={`${foregroundRun.id}:${actionMessageId || headerInterventionAction.kind}`}
+              run={foregroundRun}
+              action={headerInterventionAction}
+              workspaceId={resolvedWorkspaceId || undefined}
+              onResolve={resolveIntervention}
+              disabled={resolving || !canControl}
+              loading={resolving}
+              error={scopedResolveError || directActionError}
+              historyHref={approvalHistoryHref}
+              historyReview={approvalReview?.review}
+              historyReviewTitle={approvalReview?.reviewTitle}
+              historyReviewLoading={approvalReviewQuery.isLoading}
+              historyReviewError={approvalReviewQuery.error}
+            />
+          </div>
         )}
       </div>
       <ConfirmDialog

@@ -1,6 +1,6 @@
 """OAuth 2.0 provider service — Manor as IdP for downstream apps.
 
-Authorization Code flow only (no implicit, no client_credentials, no PKCE in V1).
+Authorization Code flow only (no implicit, no client_credentials, optional/required S256 PKCE).
 
 Public functions:
   - verify_client_credentials(client_id, client_secret) -> OAuthClientApp | None
@@ -12,6 +12,10 @@ Public functions:
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import re
 import logging
 import os
 import secrets
@@ -19,11 +23,12 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import bcrypt
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.oauth_provider import OAuthAuthorizationCode, OAuthClientApp
 from packages.core.models.user import User
+from packages.core.services.actor_authorization import AuthenticatedUserCredential, resolve_current_user_actor
 from packages.core.services.auth_service import create_access_token
 
 logger = logging.getLogger(__name__)
@@ -73,6 +78,36 @@ def validate_redirect_uri(client: OAuthClientApp, redirect_uri: str) -> bool:
     return redirect_uri in allowed
 
 
+# RFC 7636: S256 is unpadded base64url(SHA256(verifier)); verifier is 43..128 unreserved ASCII.
+_PKCE_CHALLENGE = re.compile(r"[A-Za-z0-9_-]{43}\Z", re.ASCII)
+_PKCE_VERIFIER = re.compile(r"[A-Za-z0-9._~-]{43,128}\Z", re.ASCII)
+
+
+def validate_pkce_authorization(client: OAuthClientApp, challenge: Optional[str], method: Optional[str]) -> None:
+    if challenge is None and method is None:
+        if client.require_pkce:
+            raise ValueError("invalid_request:pkce_required")
+        return
+    if (method != "S256" or not isinstance(challenge, str)
+            or not _PKCE_CHALLENGE.fullmatch(challenge)):
+        raise ValueError("invalid_request:unsupported_or_invalid_pkce")
+
+
+def _verify_pkce(client: OAuthClientApp, code: OAuthAuthorizationCode, verifier: Optional[str]) -> None:
+    challenge, method = code.code_challenge, code.code_challenge_method
+    if challenge is None and method is None:
+        if client.require_pkce or verifier is not None:
+            raise ValueError("invalid_grant")
+        return
+    if (method != "S256" or not isinstance(challenge, str)
+            or not _PKCE_CHALLENGE.fullmatch(challenge)
+            or not isinstance(verifier, str) or not _PKCE_VERIFIER.fullmatch(verifier)):
+        raise ValueError("invalid_grant")
+    derived = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest()).rstrip(b"=").decode("ascii")
+    if not hmac.compare_digest(challenge, derived):
+        raise ValueError("invalid_grant")
+
+
 # ── Authorization code ──
 
 def _generate_code() -> str:
@@ -87,11 +122,19 @@ async def create_authorization_code(
     redirect_uri: str,
     scope: list[str],
     state: Optional[str],
+    code_challenge: Optional[str] = None,
+    code_challenge_method: Optional[str] = None,
 ) -> OAuthAuthorizationCode:
     """Mint a short-lived authorization code bound to (client, user, redirect_uri)."""
     if client.restricted_entity_id and client.restricted_entity_id != user.entity_id:
         raise PermissionError("User's entity is not permitted for this OAuth client")
 
+    from packages.core.services.user_email_proof import email_is_verified
+
+    if client.require_verified_email and not email_is_verified(user):
+        raise PermissionError("email_verification_required")
+
+    validate_pkce_authorization(client, code_challenge, code_challenge_method)
     code_str = _generate_code()
     expires = datetime.now(timezone.utc) + timedelta(minutes=AUTHORIZATION_CODE_TTL_MINUTES)
     code = OAuthAuthorizationCode(
@@ -102,6 +145,8 @@ async def create_authorization_code(
         redirect_uri=redirect_uri,
         scope=scope or [],
         state=state,
+        code_challenge=code_challenge,
+        code_challenge_method=code_challenge_method,
         expires_at=expires,
     )
     db.add(code)
@@ -116,6 +161,7 @@ async def exchange_code_for_token(
     client_id: str,
     client_secret: str,
     redirect_uri: str,
+    code_verifier: Optional[str] = None,
 ) -> dict:
     """Redeem an authorization code for a Manor JWT access token.
 
@@ -140,8 +186,10 @@ async def exchange_code_for_token(
     if code_row.client_id != client.client_id:
         raise ValueError("invalid_grant")
 
-    # Redirect URI must match exactly
-    if code_row.redirect_uri != redirect_uri:
+    # Recheck current client restrictions as well as the original code binding.
+    if code_row.redirect_uri != redirect_uri or not validate_redirect_uri(client, redirect_uri):
+        raise ValueError("invalid_grant")
+    if client.restricted_entity_id and client.restricted_entity_id != code_row.entity_id:
         raise ValueError("invalid_grant")
 
     # Expiry check
@@ -151,13 +199,52 @@ async def exchange_code_for_token(
     if expires < datetime.now(timezone.utc):
         raise ValueError("invalid_grant")
 
-    # Mark redeemed (single-use)
-    code_row.redeemed_at = datetime.now(timezone.utc)
+    _verify_pkce(client, code_row, code_verifier)
 
-    # Load user
-    user_result = await db.execute(select(User).where(User.id == code_row.user_id))
+    # The code records the selected team, which can differ from User.entity_id.
+    # Resolve current membership/Staff admission instead of falling back to the
+    # user's primary team's role, including if access changed after consent.
+    # Lock identity before actor resolution and the atomic code consume. Keep
+    # this lock until the caller commits: email/proof changes must not overtake
+    # a token response while membership queries or a code-row lock are awaited.
+    # Refresh a User already present in this session's identity map as well.
+    user_result = await db.execute(
+        select(User).where(User.id == code_row.user_id).with_for_update()
+        .execution_options(populate_existing=True)
+    )
     user = user_result.scalar_one_or_none()
     if not user:
+        raise ValueError("invalid_grant")
+    from packages.core.services.user_email_proof import email_is_verified
+
+    if client.require_verified_email and not email_is_verified(user):
+        raise ValueError("email_verification_required")
+    actor = await resolve_current_user_actor(
+        db,
+        AuthenticatedUserCredential(
+            user_id=user.id,
+            entity_id=code_row.entity_id,
+            token_version=int(user.token_version or 0),
+        ),
+    )
+    if actor is None:
+        raise ValueError("invalid_grant")
+
+    # Competing requests may both have read an unused code. Only the transaction
+    # that atomically consumes it may mint a token; the caller commits/rolls back.
+    now = datetime.now(timezone.utc)
+    redeemed = await db.execute(
+        update(OAuthAuthorizationCode)
+        .where(
+            OAuthAuthorizationCode.id == code_row.id,
+            OAuthAuthorizationCode.redeemed_at.is_(None),
+            OAuthAuthorizationCode.expires_at > now,
+        )
+        .values(redeemed_at=now)
+        .returning(OAuthAuthorizationCode.id)
+        .execution_options(synchronize_session=False)
+    )
+    if redeemed.scalar_one_or_none() is None:
         raise ValueError("invalid_grant")
 
     # OAuth clients receive the same short-lived, revocable API token as the
@@ -165,8 +252,8 @@ async def exchange_code_for_token(
     ttl_minutes = min(max(1, client.access_token_ttl_minutes or 60), 60)
     access_token = create_access_token(
         user.id,
-        user.entity_id,
-        user.role,
+        actor.entity_id,
+        actor.display_role,
         token_version=user.token_version,
         expires_minutes=ttl_minutes,
     )
@@ -181,9 +268,10 @@ async def exchange_code_for_token(
         "user": {
             "id": user.id,
             "email": user.email,
+            "email_verified": email_is_verified(user),
             "name": user.display_name or user.email,
-            "entity_id": user.entity_id,
-            "role": user.role,
+            "entity_id": actor.entity_id,
+            "role": actor.display_role,
         },
     }
 
@@ -198,6 +286,8 @@ async def exchange_code_for_token(
 #   MANOR_OAUTH_CLIENT_<SLUG>_REDIRECT_URIS=<csv>                 (required for new clients)
 #   MANOR_OAUTH_CLIENT_<SLUG>_SCOPES=<csv>                        (optional, defaults to openid,profile,email)
 #   MANOR_OAUTH_CLIENT_<SLUG>_RESTRICTED_ENTITY_ID=<ulid>         (optional)
+#   MANOR_OAUTH_CLIENT_<SLUG>_REQUIRE_PKCE=true|false            (optional; omitted preserves existing)
+#   MANOR_OAUTH_CLIENT_<SLUG>_REQUIRE_VERIFIED_EMAIL=true|false  (optional; default false for new clients)
 #   MANOR_OAUTH_CLIENT_<SLUG>_ACCESS_TOKEN_TTL_MINUTES=<int>      (optional, defaults to 1440)
 #
 # <SLUG> uses UPPERCASE_WITH_UNDERSCORES; the resulting client_id is
@@ -206,8 +296,7 @@ async def exchange_code_for_token(
 # casing/format.
 #
 # Adding a new app (e.g. mobile portal) requires zero code change — just set
-# the env vars in the deploy environment (PROD_ENV_FILE blob or via the
-# inject_from_env mechanism in .github/workflows/deploy.yml).
+# the env vars through the deployment's secret injection mechanism.
 
 _ENV_PREFIX = "MANOR_OAUTH_CLIENT_"
 _ENV_SECRET_SUFFIX = "_SECRET"
@@ -254,7 +343,19 @@ def _read_client_config(slug_upper: str) -> Optional[dict]:
     except ValueError:
         ttl = 1440
 
+    pkce_text = os.getenv(f"{base}_REQUIRE_PKCE")
+    if pkce_text is not None and pkce_text.strip().lower() not in {"true", "false"}:
+        raise ValueError("invalid_require_pkce_configuration")
+    require_pkce = None if pkce_text is None else pkce_text.strip().lower() == "true"
+
+    verified_text = os.getenv(f"{base}_REQUIRE_VERIFIED_EMAIL")
+    if verified_text is not None and verified_text.strip().lower() not in {"true", "false"}:
+        raise ValueError("invalid_require_verified_email_configuration")
+    require_verified_email = None if verified_text is None else verified_text.strip().lower() == "true"
+
     return {
+        "require_pkce": require_pkce,
+        "require_verified_email": require_verified_email,
         "client_id": client_id,
         "secret": secret,
         "name": os.getenv(f"{base}_NAME") or f"OAuth Client {client_id}",
@@ -284,7 +385,11 @@ async def seed_clients_from_env(db: AsyncSession) -> dict[str, str]:
     actions: dict[str, str] = {}
 
     for slug in _discover_client_slugs():
-        config = _read_client_config(slug)
+        try:
+            config = _read_client_config(slug)
+        except ValueError as exc:
+            actions[_slug_to_client_id(slug)] = f"error:{exc}"
+            continue
         if config is None:
             continue  # secret env present but empty — _read_client_config returns None
 
@@ -315,6 +420,8 @@ async def seed_clients_from_env(db: AsyncSession) -> dict[str, str]:
                         allowed_scopes=config["allowed_scopes"],
                         restricted_entity_id=config["restricted_entity_id"],
                         active=True,
+                        require_pkce=config["require_pkce"],
+                        require_verified_email=config["require_verified_email"] or False,
                         access_token_ttl_minutes=config["access_token_ttl_minutes"],
                     )
                 )
@@ -345,6 +452,12 @@ async def seed_clients_from_env(db: AsyncSession) -> dict[str, str]:
                 if existing.access_token_ttl_minutes != config["access_token_ttl_minutes"]:
                     existing.access_token_ttl_minutes = config["access_token_ttl_minutes"]
                     changed_fields.append("ttl")
+                if config["require_pkce"] is not None and existing.require_pkce != config["require_pkce"]:
+                    existing.require_pkce = config["require_pkce"]
+                    changed_fields.append("require_pkce")
+                if config["require_verified_email"] is not None and existing.require_verified_email != config["require_verified_email"]:
+                    existing.require_verified_email = config["require_verified_email"]
+                    changed_fields.append("require_verified_email")
                 if not existing.active:
                     existing.active = True
                     changed_fields.append("active")

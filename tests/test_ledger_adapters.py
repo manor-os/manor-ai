@@ -22,7 +22,7 @@ from packages.core.models.base import generate_ulid
 from packages.core.models.product_growth import ProductGrowthEvent
 from packages.core.models.task import Task
 from packages.core.models.user import User
-from packages.core.models.workspace import Workspace
+from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.ledger.adapters import record_workflow_run_status
 from packages.core.services.task_state_machine import apply_task_status_transition
@@ -352,12 +352,26 @@ async def test_approve_proposal_emits_item_approved_with_batch_root(db_session):
 
     ws = _mk_workspace(db_session)
     review_id = "rv_ledger_approve"
+    agent = Agent(
+        id=generate_ulid(), entity_id=ws.entity_id, name="Ledger Agent", status="active",
+    )
+    subscription = AgentSubscription(
+        id=generate_ulid(), entity_id=ws.entity_id, workspace_id=ws.id,
+        agent_id=agent.id, service_key="ops", status="active",
+    )
+    db_session.add_all([agent, subscription])
     tasks = [
         _mk_task(db_session, ws, status="proposed", details={"strategist_review_id": review_id})
         for _ in range(2)
     ]
+    for task in tasks:
+        task.owner_service_key = subscription.service_key
+        task.owner_subscription_id = subscription.id
     await db_session.commit()
 
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    await initialize_test_task_proposal(db_session, ws, review_id=review_id, actor_id="user_1")
     moved = await strategist_service.approve_proposal(
         db_session, entity_id=ws.entity_id, review_id=review_id, actor_id="user_1",
     )

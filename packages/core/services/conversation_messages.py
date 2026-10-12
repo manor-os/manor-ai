@@ -13,6 +13,7 @@ from packages.core.ai.runtime.output_policy import (
     runtime_assistant_stream_interrupted_content,
 )
 from packages.core.models.base import generate_ulid
+from packages.core.models.runtime_run import RuntimeRun, RuntimeRunStatus
 from packages.core.models.task import Conversation, Message
 from packages.core.models.workspace import AgentSubscription
 
@@ -65,6 +66,9 @@ async def add_message(
 ) -> Message:
     """Persist a conversation message and notify workspace chat listeners."""
 
+    if role == "assistant":
+        from packages.core.services.webchat_resident import authorize_private_persistence
+        await authorize_private_persistence(db, conversation_id)
     author_kind = "agent" if role == "assistant" else "system" if role == "system" else "user"
     action = pending_action if isinstance(pending_action, dict) and pending_action.get("kind") else None
     msg = Message(
@@ -248,6 +252,8 @@ async def save_or_update_assistant_stream_message(
         from packages.core.database import async_session as _session_factory
 
         async with _session_factory() as save_db:
+            from packages.core.services.webchat_resident import authorize_private_persistence
+            await authorize_private_persistence(save_db, conversation_id)
             author_subscription_id = await resolve_author_subscription_id(
                 save_db,
                 entity_id=entity_id,
@@ -354,11 +360,15 @@ async def save_assistant_stream_error_message(
 ) -> str | None:
     """Persist a streaming failure so workspace chat/history keeps it."""
     error_meta = dict(meta or {})
-    # A failed turn must never retain a successful, interactive assistant
-    # surface. Keep durable identity/runtime metadata, but remove the blocks
-    # that could still accept actions after the turn has failed.
-    error_meta.pop("assistant_blocks", None)
-    error_meta.pop("assistant_blocks_schema", None)
+    from packages.core.services.assistant_blocks import project_failed_assistant_blocks
+
+    public_content = runtime_assistant_stream_error_content(error_message)
+    blocks = project_failed_assistant_blocks(error_meta.get("assistant_blocks"), public_content)
+    if blocks:
+        error_meta["assistant_blocks"] = blocks
+    else:
+        error_meta.pop("assistant_blocks", None)
+        error_meta.pop("assistant_blocks_schema", None)
     error_meta.update({
         "stream_status": "error",
         "stream_error": True,
@@ -370,7 +380,7 @@ async def save_assistant_stream_error_message(
         workspace_id=workspace_id,
         agent_id=agent_id,
         message_id=message_id,
-        content=runtime_assistant_stream_error_content(error_message),
+        content=public_content,
         meta=error_meta,
     )
 
@@ -411,7 +421,7 @@ async def mark_stale_assistant_streams_interrupted(
     During SSE chat, partial assistant content is periodically persisted as a
     checkpoint with ``stream_status=streaming``. If the API process is killed
     mid-stream, the normal cancellation handler may not run, leaving the UI
-    with a forever-streaming partial response. This startup repair makes those
+    with a forever-streaming partial response. Periodic repair makes those
     old checkpoints terminal while preserving their partial content.
     """
 
@@ -421,25 +431,39 @@ async def mark_stale_assistant_streams_interrupted(
         minutes = STALE_STREAM_GRACE_MINUTES
 
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+    # A deployment can restart the API while a durable worker is still alive.
+    # Its old message timestamp does not make that worker's checkpoint stale.
+    has_active_runtime_run = select(RuntimeRun.id).where(
+        RuntimeRun.assistant_message_id == Message.id,
+        RuntimeRun.conversation_id == Message.conversation_id,
+        RuntimeRun.status.in_(RuntimeRunStatus.active_root()),
+    ).exists()
     rows = (await db.execute(
         select(Message.id, Message.meta)
         .where(
             Message.role == "assistant",
             Message.created_at < cutoff,
             Message.meta["stream_status"].astext.in_(["running", "streaming"]),
+            ~has_active_runtime_run,
         )
     )).all()
     if not rows:
         return 0
 
+    count = 0
     for message_id, meta in rows:
-        await db.execute(
+        result = await db.execute(
             update(Message)
-            .where(Message.id == message_id)
+            .where(
+                Message.id == message_id,
+                Message.created_at < cutoff,
+                Message.meta["stream_status"].astext.in_(["running", "streaming"]),
+                ~has_active_runtime_run,
+            )
             .values(meta=assistant_stream_interrupted_meta(meta))
         )
+        count += result.rowcount
     await db.commit()
-    count = len(rows)
     if count:
         logger.info("Marked %d stale assistant stream checkpoint(s) interrupted", count)
     return count

@@ -364,6 +364,44 @@ export type EditorLiveTurnMetadata = Pick<
   "documentName" | "fileType" | "mimeType" | "editorType" | "sourcePath"
 >;
 
+export type EditorNativeFilePatchResult = {
+  patched: true;
+  path: string;
+  document_id?: string | null;
+  source_sha256?: string | null;
+  knowledge_synced?: boolean;
+  [key: string]: unknown;
+};
+
+/** Extract only a completed, successful native patch_file result from an SSE frame. */
+export function nativeFilePatchResultFromSseFrame(
+  parsed: unknown,
+): EditorNativeFilePatchResult | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const frame = parsed as {
+    tool_call?: { name?: string; result?: unknown; status?: string };
+  };
+  const tool = frame.tool_call;
+  if (!tool) return null;
+  const status = String(tool.status || "").trim().toLowerCase();
+  if (!["success", "completed", "ok"].includes(status)) return null;
+  if ((tool.name || "").toLowerCase() !== "patch_file") return null;
+  let result = tool.result;
+  if (typeof result === "string") {
+    try {
+      result = JSON.parse(result.trim());
+    } catch {
+      return null;
+    }
+  }
+  if (!result || typeof result !== "object") return null;
+  const record = result as Record<string, unknown>;
+  if (record.error || record.patched !== true || typeof record.path !== "string" || !record.path) {
+    return null;
+  }
+  return record as EditorNativeFilePatchResult;
+}
+
 export type EditorLiveChatMetadata = {
   documentId?: string | null;
   documentName?: string | null;
@@ -371,6 +409,9 @@ export type EditorLiveChatMetadata = {
   mimeType?: string | null;
   editorType?: string | null;
   sourcePath?: string | null;
+  /** Browser route that owns this session. This must not be overloaded with
+   * sourcePath, which can be a Knowledge filesystem path for native tools. */
+  routePath?: string | null;
   instruction?: string | null;
   sessionLabel?: string | null;
   emptyDescription?: string | null;
@@ -382,8 +423,19 @@ export type EditorLiveChatMetadata = {
     imageUrl: string,
     meta: EditorLiveApplyMeta,
   ) => boolean | void | Promise<boolean | void>;
+  supportsNativeFilePatch?: boolean;
+  /** Reload persisted editor bytes after an approval-gated patch_file succeeds. */
+  applyNativeFilePatch?: (
+    result: EditorNativeFilePatchResult,
+    meta: EditorLiveApplyMeta,
+  ) => boolean | void | Promise<boolean | void>;
   /** Resolved after read() locks the target for the current streamed turn. */
   getTurnMetadata?: () => EditorLiveTurnMetadata;
+  previewStatus?: AiEditPreviewStatus | null;
+  previewChangeCount?: number;
+  previewAccepting?: boolean;
+  acceptPreview?: () => void | Promise<void>;
+  discardPreview?: () => void | Promise<void>;
 };
 
 export type EditorLiveChatDetail = EditorLiveChatMetadata & {
@@ -513,6 +565,123 @@ function firstFailure(index: number, reason: string) {
   return [{ index, reason }];
 }
 
+const PRESENTATION_LIVE_EDIT_JSON_FORMAT = "manor-presentation-edit-v2";
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parsePresentationJsonFragment(value: string) {
+  const trimmed = value.trim();
+  for (const [source, wrapped] of [[trimmed, false], [`{${trimmed}}`, true]] as const) {
+    try {
+      const parsed = JSON.parse(source);
+      if (isJsonRecord(parsed) && Object.keys(parsed).length > 0) {
+        return { parsed, wrapped };
+      }
+    } catch {
+      // A property fragment such as `"format": {...}` needs the wrapped attempt.
+    }
+  }
+  return null;
+}
+
+function hasConcreteJsonConstraint(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasConcreteJsonConstraint);
+  if (isJsonRecord(value)) return Object.values(value).some(hasConcreteJsonConstraint);
+  return true;
+}
+
+function isJsonSubset(candidate: unknown, expected: unknown): boolean {
+  if (Array.isArray(expected)) {
+    return Array.isArray(candidate)
+      && candidate.length === expected.length
+      && expected.every((value, index) => isJsonSubset(candidate[index], value));
+  }
+  if (isJsonRecord(expected)) {
+    if (!isJsonRecord(candidate)) return false;
+    return Object.entries(expected).every(
+      ([key, value]) => Object.hasOwn(candidate, key) && isJsonSubset(candidate[key], value),
+    );
+  }
+  return Object.is(candidate, expected);
+}
+
+function mergeJsonReplacement(candidate: unknown, replacement: unknown): unknown {
+  if (!isJsonRecord(candidate) || !isJsonRecord(replacement)) return replacement;
+  const merged: Record<string, unknown> = { ...candidate };
+  for (const [key, value] of Object.entries(replacement)) {
+    merged[key] = mergeJsonReplacement(candidate[key], value);
+  }
+  return merged;
+}
+
+type JsonSubsetMatch = {
+  parent: Record<string, unknown> | unknown[] | null;
+  key: string | number | null;
+  value: unknown;
+};
+
+function collectJsonSubsetMatches(
+  value: unknown,
+  expected: Record<string, unknown>,
+  matches: JsonSubsetMatch[],
+  parent: JsonSubsetMatch["parent"] = null,
+  key: JsonSubsetMatch["key"] = null,
+) {
+  if (isJsonSubset(value, expected)) matches.push({ parent, key, value });
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => collectJsonSubsetMatches(item, expected, matches, value, index));
+  } else if (isJsonRecord(value)) {
+    for (const [childKey, child] of Object.entries(value)) {
+      collectJsonSubsetMatches(child, expected, matches, value, childKey);
+    }
+  }
+}
+
+function applyUniquePresentationJsonReplacement(
+  currentContent: string,
+  find: string,
+  replacement: string,
+): string | null {
+  let documentState: unknown;
+  try {
+    documentState = JSON.parse(currentContent);
+  } catch {
+    return null;
+  }
+  if (
+    !isJsonRecord(documentState)
+    || documentState.format !== PRESENTATION_LIVE_EDIT_JSON_FORMAT
+  ) return null;
+
+  const findFragment = parsePresentationJsonFragment(find);
+  const replacementFragment = parsePresentationJsonFragment(replacement);
+  if (
+    !findFragment
+    || !replacementFragment
+    || findFragment.wrapped !== replacementFragment.wrapped
+    || !hasConcreteJsonConstraint(findFragment.parsed)
+  ) return null;
+
+  const matches: JsonSubsetMatch[] = [];
+  collectJsonSubsetMatches(documentState, findFragment.parsed, matches);
+  if (matches.length !== 1) return null;
+
+  const match = matches[0]!;
+  const nextValue = mergeJsonReplacement(match.value, replacementFragment.parsed);
+  if (match.parent == null || match.key == null) {
+    documentState = nextValue;
+  } else if (Array.isArray(match.parent) && typeof match.key === "number") {
+    match.parent[match.key] = nextValue;
+  } else if (isJsonRecord(match.parent) && typeof match.key === "string") {
+    match.parent[match.key] = nextValue;
+  } else {
+    return null;
+  }
+  return JSON.stringify(documentState, null, 2);
+}
+
 export function applyEditorLivePatch(
   currentContent: string,
   patchJson: string,
@@ -574,6 +743,13 @@ export function applyEditorLivePatch(
 
     const at = draft.indexOf(operation.find);
     if (at < 0) {
+      const structuralReplacement = operation.op === "replace" && !operation.all
+        ? applyUniquePresentationJsonReplacement(draft, operation.find, operation.replace)
+        : null;
+      if (structuralReplacement != null) {
+        draft = structuralReplacement;
+        continue;
+      }
       return {
         content: currentContent,
         applied: index,
@@ -1262,6 +1438,27 @@ export function extractRecoverableEditorLivePatchOperationPayloads(text: string)
   return operations.length === completeOperationCount ? operations : null;
 }
 
+/** Recover only the unstreamed suffix of a complete patch carried by stream_end. */
+export function recoverEditorLivePatchStreamTail(
+  frame: unknown,
+  streamedText: string,
+) {
+  if (!frame || typeof frame !== "object" || Array.isArray(frame)) return "";
+  const blocks = (frame as Record<string, unknown>).assistant_blocks;
+  if (!Array.isArray(blocks)) return "";
+  for (let index = blocks.length - 1; index >= 0; index -= 1) {
+    const block = blocks[index];
+    if (!block || typeof block !== "object" || Array.isArray(block)) continue;
+    const record = block as Record<string, unknown>;
+    if (record.type !== "text" || typeof record.text !== "string") continue;
+    if (!record.text.startsWith(streamedText)) continue;
+    const operations = extractRecoverableEditorLivePatchOperationPayloads(record.text);
+    if (!operations?.length) continue;
+    return record.text.slice(streamedText.length);
+  }
+  return "";
+}
+
 export type EditorLivePatchStreamEvent = Readonly<{
   kind: AiEditPatchStreamEventKind;
   operationIndex: number;
@@ -1565,6 +1762,7 @@ export function openEditorLiveChat(detail: EditorLiveChatDetail) {
   const liveEditDetail: EditorLiveChatDetail = {
     ...detail,
     sourcePath: detail.sourcePath || window.location.pathname,
+    routePath: detail.routePath || window.location.pathname,
   };
   window.dispatchEvent(
     new CustomEvent<EditorLiveChatDetail>(EDITOR_LIVE_CHAT_EVENT, {
@@ -1581,6 +1779,7 @@ export function updateEditorLiveChat(detail: EditorLiveChatDetail) {
       detail: {
         ...detail,
         sourcePath: detail.sourcePath || window.location.pathname,
+        routePath: detail.routePath || window.location.pathname,
       },
     }),
   );

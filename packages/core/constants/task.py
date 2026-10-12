@@ -61,7 +61,15 @@ assert set(TaskStatus.values()) == set(TASK_STATUSES.keys()), (
 VALID_STATUSES = set(TaskStatus.values())
 
 # Board columns (kanban view groups)
-BOARD_COLUMNS = ["pending", "scheduled", "in_progress", "waiting_on_customer", "on_hold", "blocked", "completed"]
+BOARD_COLUMNS = [
+    TaskStatus.PENDING.value,
+    TaskStatus.SCHEDULED.value,
+    TaskStatus.IN_PROGRESS.value,
+    TaskStatus.WAITING_ON_CUSTOMER.value,
+    TaskStatus.ON_HOLD.value,
+    TaskStatus.BLOCKED.value,
+    TaskStatus.COMPLETED.value,
+]
 
 # ── Priorities ──
 # 1 (lowest) to 5 (highest)
@@ -147,6 +155,25 @@ class TaskType(str, Enum):
 
 
 TASK_TYPES = TaskType.values()
+
+
+class TaskRuntimeKind(str, Enum):
+    """Runtime adapter selected independently from a Task's business type.
+
+    ``TaskType`` is intentionally extensible (Blueprints and integrations may
+    persist custom slugs), so it must not double as an execution-engine enum.
+    Every Task enters this closed factory instead.
+    """
+
+    COORDINATED_PLAN = "coordinated_plan"
+    PLAN_RESUME = "plan_resume"
+    INTERACTIVE_SESSION = "interactive_session"
+    HUMAN_DECISION = "human_decision"
+    MANUAL = "manual"
+    # Read compatibility for Tasks/checkpoints created before coordinated
+    # execution became the Workspace default. New Workspace work must not
+    # choose this adapter when a valid service scope exists.
+    LEGACY_AGENT = "legacy_agent"
 
 
 class TaskApprovalChoice(str, Enum):

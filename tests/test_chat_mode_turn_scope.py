@@ -9,6 +9,7 @@ from packages.core.models.task import Conversation, Message
 from packages.core.services.conversation_history import (
     ATTACHMENT_HISTORY_INSTRUCTION,
     COMPLETED_TOOL_ACTIVITY_FRAME,
+    FAILED_ASSISTANT_TURN_HISTORY,
     load_conversation_history,
 )
 
@@ -103,10 +104,49 @@ async def test_new_hotel_ppt_request_does_not_replay_previous_job_search_tools(d
     )
 
     # The most recent assistant turn's tool trace is kept as reusable context,
-    # but framed as completed so it is not replayed as active work.
+    # but framed as historical data so it is not replayed as active work.
     assert COMPLETED_TOOL_ACTIVITY_FRAME in history[1]["content"]
-    assert "do not re-run" in history[1]["content"]
+    assert "Do not replay past side effects" in history[1]["content"]
     assert history[-1]["content"] == "Writ a 5 pages hotel industry growth ppt / Slides"
+
+
+@pytest.mark.asyncio
+async def test_failed_workspace_tool_turn_is_not_replayed_as_completed(db_session):
+    db_session.add(
+        Message(
+            id="msg_failed_ws_title",
+            conversation_id="conv_failed_ws_title",
+            role="assistant",
+            content="已完成。",
+            meta={
+                "error": "stateful_tool_call_failed",
+                "stop_reason": "error",
+                "stream_status": "error",
+            },
+            tool_calls=[{
+                "name": "manor",
+                "arguments": {
+                    "action": "workspace",
+                    "params": {"action": "create_task", "params": {"name": "Production plans"}},
+                },
+                "result": '{"error":"title is required"}',
+                "status": "error",
+            }],
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    await db_session.commit()
+
+    history = await load_conversation_history(
+        db_session,
+        "conv_failed_ws_title",
+        latest_user_message="继续",
+    )
+
+    assert FAILED_ASSISTANT_TURN_HISTORY in history[0]["content"]
+    assert "title is required" in history[0]["content"]
+    assert "已完成。" not in history[0]["content"]
+    assert COMPLETED_TOOL_ACTIVITY_FRAME not in history[0]["content"]
 
 
 @pytest.mark.asyncio
@@ -268,7 +308,10 @@ async def test_chat_history_uses_persisted_attachment_refs_when_available(
     )
     await db_session.commit()
 
-    history = await load_conversation_history(db_session, conversation_id)
+    runtime_metadata = {}
+    history = await load_conversation_history(
+        db_session, conversation_id, runtime_metadata=runtime_metadata,
+    )
 
     assert "[Attached file context]" in history[0]["content"]
     assert ATTACHMENT_HISTORY_INSTRUCTION in history[0]["content"]
@@ -276,6 +319,62 @@ async def test_chat_history_uses_persisted_attachment_refs_when_available(
     assert f"document_id={doc_id}" in history[0]["content"]
     assert "path=uploads/chat/reference.pdf" in history[0]["content"]
     assert f"url=/api/v1/fs/{entity_id}/uploads/chat/reference.pdf" in history[0]["content"]
+    refs = runtime_metadata["runtime_history_attachment_refs"]
+    assert refs[0]["document_id"] == doc_id
+    assert refs[0]["path"] == "uploads/chat/reference.pdf"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_resolves_generated_media_with_only_fs_path(db_session):
+    conversation_id = "conv_generated_media_path"
+    entity_id = "ent_generated_media_path"
+    media_path = "Videos/ad/visuals/shot-01.png"
+    db_session.add_all([
+        Conversation(
+            id=conversation_id,
+            entity_id=entity_id,
+            user_id="user_generated_media_path",
+            title="Generated media history",
+            channel="web",
+            scope="channel",
+        ),
+        Document(
+            id="doc_generated_media_path",
+            entity_id=entity_id,
+            name="shot-01.png",
+            fs_path=media_path,
+            file_type="png",
+            mime_type="image/png",
+            source="ai_generated",
+            vector_status=VectorStatus.READY,
+        ),
+        Message(
+            id="msg_generated_media_path",
+            conversation_id=conversation_id,
+            role="assistant",
+            content="The shot is ready.",
+            attachments=[
+                {"name": "shot-01.png", "type": "knowledge", "fs_path": media_path},
+                {"name": "stale.png", "type": "knowledge", "fs_path": "Videos/ad/visuals/stale.png"},
+            ],
+        ),
+    ])
+    await db_session.commit()
+
+    runtime_metadata = {}
+    await load_conversation_history(
+        db_session, conversation_id, runtime_metadata=runtime_metadata,
+    )
+
+    assert runtime_metadata["runtime_history_attachment_refs"] == [{
+        "kind": "knowledge_document",
+        "name": "shot-01.png",
+        "document_id": "doc_generated_media_path",
+        "path": media_path,
+        "url": f"/api/v1/fs/{entity_id}/{media_path}",
+        "mime": "image/png",
+        "file_type": "png",
+    }]
 
 
 @pytest.mark.asyncio
@@ -323,11 +422,15 @@ async def test_chat_history_drops_cross_entity_attachment_even_with_persisted_pa
     )
     await db_session.commit()
 
-    history = await load_conversation_history(db_session, conversation_id)
+    runtime_metadata = {}
+    history = await load_conversation_history(
+        db_session, conversation_id, runtime_metadata=runtime_metadata,
+    )
 
     assert "[Attached file context]" not in history[0]["content"]
     assert document_id not in history[0]["content"]
     assert "private/private.pdf" not in history[0]["content"]
+    assert runtime_metadata.get("runtime_history_attachment_refs", []) == []
 
 
 @pytest.mark.asyncio
@@ -402,7 +505,7 @@ async def test_chat_history_prefers_persisted_attachments_over_inline_name_looku
 
 
 @pytest.mark.asyncio
-async def test_older_tool_activity_is_still_dropped_on_new_turn(db_session):
+async def test_new_turn_keeps_three_recent_tool_observations_after_plain_reply(db_session):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     db_session.add_all(
         [
@@ -421,25 +524,53 @@ async def test_older_tool_activity_is_still_dropped_on_new_turn(db_session):
                 ],
             ),
             Message(
-                id="msg_mid_user",
-                conversation_id="conv_two_turn_scope",
-                role="user",
-                content="thanks",
-                created_at=start + timedelta(seconds=1),
-            ),
-            Message(
-                id="msg_new_tool_assistant",
+                id="msg_recent_tool_two",
                 conversation_id="conv_two_turn_scope",
                 role="assistant",
-                content="Listed the files.",
+                content="Observed the second tab.",
+                created_at=start + timedelta(seconds=1),
+                tool_calls=[
+                    {
+                        "name": "mcp__chrome__observe",
+                        "arguments": {},
+                        "result": "second recent tab observation",
+                    }
+                ],
+            ),
+            Message(
+                id="msg_recent_tool_three",
+                conversation_id="conv_two_turn_scope",
+                role="assistant",
+                content="Observed the third tab.",
                 created_at=start + timedelta(seconds=2),
                 tool_calls=[
                     {
-                        "name": "list_files",
+                        "name": "mcp__chrome__observe",
                         "arguments": {"path": ""},
-                        "result": "fresh file listing payload",
+                        "result": "third recent tab observation",
                     }
                 ],
+            ),
+            Message(
+                id="msg_recent_tool_four",
+                conversation_id="conv_two_turn_scope",
+                role="assistant",
+                content="Observed the selected object.",
+                created_at=start + timedelta(seconds=3),
+                tool_calls=[
+                    {
+                        "name": "mcp__chrome__observe",
+                        "arguments": {"path": ""},
+                        "result": "latest selected object observation",
+                    }
+                ],
+            ),
+            Message(
+                id="msg_plain_after_tools",
+                conversation_id="conv_two_turn_scope",
+                role="assistant",
+                content="I have finished checking the current page.",
+                created_at=start + timedelta(seconds=4),
             ),
         ]
     )
@@ -451,7 +582,9 @@ async def test_older_tool_activity_is_still_dropped_on_new_turn(db_session):
         latest_user_message="move them into folders",
     )
 
-    old_entry = next(h for h in history if "Searched jobs." in h["content"])
-    new_entry = next(h for h in history if "Listed the files." in h["content"])
-    assert "stale search result payload" not in old_entry["content"]
-    assert COMPLETED_TOOL_ACTIVITY_FRAME in new_entry["content"]
+    contents = "\n".join(entry["content"] for entry in history)
+    assert "stale search result payload" not in contents
+    assert "second recent tab observation" in contents
+    assert "third recent tab observation" in contents
+    assert "latest selected object observation" in contents
+    assert contents.count(COMPLETED_TOOL_ACTIVITY_FRAME) == 3

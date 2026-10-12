@@ -32,9 +32,11 @@ from packages.core.constants.execution import (
     ScheduledResultProjectionState,
     ScheduledRunStatus,
 )
+from packages.core.constants.task import TaskStatus
 from packages.core.ai.llm_client import CreditExhaustedError
 from packages.core.services.workspace_autonomy import (
     WorkspaceAutonomyState,
+    workspace_allows_manual_work,
     workspace_autonomy_skip_reason,
     workspace_autonomy_state,
 )
@@ -91,6 +93,7 @@ _SCHEDULED_OCCURRENCE_PREFIX = "scheduled:v2:"
 _SCHEDULED_JOB_BILLING_SOURCE = "scheduled_job"
 _SCHEDULED_JOB_MODEL_ROLES = {
     "agent": "primary",
+    "agent_initiative": "primary",
     "orchestrator_prompt": "primary",
     "skill": "primary",
     "workflow": "workflow_runner",
@@ -167,6 +170,7 @@ def _scheduled_job_requires_credit_gate(job) -> bool:
     """Return whether dispatch should stop when tenant credits are exhausted."""
     return (getattr(job, "execution_type", None) or "agent") in {
         "agent",
+        "agent_initiative",
         "orchestrator_prompt",
         "skill",
         "workflow",
@@ -181,6 +185,7 @@ async def _preflight_scheduled_job_credits(
     *,
     db=None,
     workspace_id: str | None = None,
+    user_id: str | None = None,
 ) -> None:
     """Block a scheduled AI dispatch before it creates downstream work.
 
@@ -192,7 +197,7 @@ async def _preflight_scheduled_job_credits(
     if not entity_id or not _scheduled_job_requires_credit_gate(job):
         return
 
-    user_id = getattr(job, "user_id", None)
+    user_id = user_id or getattr(job, "user_id", None)
     byok = False
     try:
         from packages.core.ai.llm_client import metadata_has_native_byok
@@ -612,12 +617,42 @@ async def _prepare_scheduler_parent_dispatch(
         return dispatch, run.id
 
 
+async def _manual_scheduled_request_allowed(db, job, user_id: str) -> bool:
+    """Revalidate a human requester without substituting the definition owner."""
+    from sqlalchemy import select
+    from packages.core.models.user import User
+    from packages.core.permissions import resolve_effective_user_role_name
+    from packages.core.services.workspace_access import (
+        lock_workspace_access_boundary,
+        user_can_write_workspace_id,
+    )
+
+    actor = (await db.execute(select(User.id).where(
+        User.id == user_id, User.status == "active", User.deleted_at.is_(None),
+    ))).scalar_one_or_none()
+    if actor is None:
+        return False
+    role = await resolve_effective_user_role_name(db, user_id=user_id, entity_id=job.entity_id)
+    if not role:
+        return False
+    if not job.workspace_id:
+        return True
+    workspace = await lock_workspace_access_boundary(
+        db, workspace_id=job.workspace_id, entity_id=job.entity_id,
+    )
+    return workspace_allows_manual_work(workspace) and await user_can_write_workspace_id(
+        db, workspace_id=job.workspace_id, entity_id=job.entity_id, user_id=user_id, role=role,
+    )
+
+
 async def dispatch_job_occurrence(
     *,
     job_db_id: str,
     occurrence_key: str,
     trigger_type: str = "manual",
     trigger_detail: str | None = None,
+    allow_disabled_agent_initiative: bool = False,
+    requesting_user_id: str | None = None,
 ) -> ScheduledOccurrenceDispatch | None:
     """Commit and publish one explicit idempotent scheduler occurrence."""
 
@@ -650,7 +685,28 @@ async def dispatch_job_occurrence(
             .with_for_update()
             .execution_options(populate_existing=True)
         )).scalar_one_or_none()
-        if job is None or not job.enabled:
+        disabled_initiative_allowed = bool(
+            job is not None
+            and not job.enabled
+            and allow_disabled_agent_initiative
+            and job.execution_type == "agent_initiative"
+            and job.agent_initiative_id
+            and str(trigger_type or "manual") == "manual"
+            and clean_key.startswith("manual:")
+        )
+        manual_request = bool(
+            requesting_user_id
+            and trigger_type == "manual"
+            and clean_key.startswith("manual:")
+        )
+        if job is None or (
+            not job.enabled
+            and not disabled_initiative_allowed
+            and not (manual_request and job.execution_type != "agent_initiative")
+        ):
+            await db.rollback()
+            return None
+        if manual_request and not await _manual_scheduled_request_allowed(db, job, requesting_user_id):
             await db.rollback()
             return None
 
@@ -679,6 +735,7 @@ async def dispatch_job_occurrence(
                 kwargs={
                     "manual": True,
                     "occurrence_key": clean_key,
+                    "allow_disabled_agent_initiative": disabled_initiative_allowed,
                 },
             )
             run.result = {
@@ -694,6 +751,23 @@ async def dispatch_job_occurrence(
                     "detail": str(trigger_detail or "")[:200],
                 },
             }
+            if manual_request:
+                from packages.core.services.scheduled_run_lifecycle import MANUAL_SCHEDULED_REQUEST_KEY
+
+                run.result[MANUAL_SCHEDULED_REQUEST_KEY] = {
+                    "version": 1,
+                    "user_id": requesting_user_id,
+                }
+            if disabled_initiative_allowed:
+                from packages.core.services.scheduled_run_lifecycle import (
+                    MANUAL_AGENT_INITIATIVE_ADMISSION_KEY,
+                    MANUAL_AGENT_INITIATIVE_ADMISSION_VERSION,
+                )
+
+                run.result[MANUAL_AGENT_INITIATIVE_ADMISSION_KEY] = {
+                    "version": MANUAL_AGENT_INITIATIVE_ADMISSION_VERSION,
+                    "initiative_id": str(job.agent_initiative_id),
+                }
             await db.commit()
 
     try:
@@ -718,6 +792,48 @@ async def dispatch_job_occurrence(
             clean_key,
         )
     return ScheduledOccurrenceDispatch(run_id=run_id, published=True)
+
+
+async def dispatch_agent_initiative_now(
+    *,
+    job_db_id: str,
+    initiative_id: str,
+    occurrence_key: str,
+    trigger_detail: str | None = None,
+    requesting_user_id: str | None = None,
+) -> ScheduledOccurrenceDispatch | None:
+    """Durably dispatch one owner-confirmed Initiative run-now occurrence.
+
+    This is the only explicit-dispatch wrapper allowed to consume a disabled
+    managed driver (needed for confirmed paused run-now).  Admission still
+    revalidates the exact Initiative, owner, Subscription and revision, and
+    the manual execution does not advance the driver's schedule clock.
+    """
+
+    from sqlalchemy import select
+
+    from packages.core.database import create_worker_session
+    from packages.core.models.scheduler import ScheduledJob
+
+    async with create_worker_session()() as db:
+        exact_driver = (await db.execute(
+            select(ScheduledJob.id).where(
+                ScheduledJob.id == job_db_id,
+                ScheduledJob.agent_initiative_id == initiative_id,
+                ScheduledJob.execution_type == "agent_initiative",
+            )
+        )).scalar_one_or_none()
+        await db.rollback()
+    if exact_driver is None:
+        return None
+    return await dispatch_job_occurrence(
+        job_db_id=job_db_id,
+        occurrence_key=occurrence_key,
+        trigger_type="manual",
+        trigger_detail=trigger_detail or "agent_initiative_run_now",
+        allow_disabled_agent_initiative=True,
+        requesting_user_id=requesting_user_id,
+    )
 
 
 async def _mark_scheduled_job_dispatched_if_current(
@@ -1017,6 +1133,26 @@ async def _queue_stale_prepared_dispatch_recovery(db, now: datetime) -> int:
                 )
                 await db.commit()
                 handled += int(quarantined)
+                continue
+            if await _scheduled_agent_execution_recovery_is_suspended(
+                db,
+                run,
+                recovery,
+            ):
+                # The Task's durable human wait owns recovery now.  Keep the
+                # occurrence open, but do not periodically re-enter TaskRunner
+                # without an approval continuation.
+                defer_scheduled_recovery(
+                    run,
+                    kind=ScheduledRecoveryKind.EXECUTION,
+                    now=now,
+                    retry_after=timedelta(
+                        seconds=SCHEDULED_RUN_EXECUTION_RECHECK_SECONDS
+                    ),
+                )
+                await db.flush()
+                await db.commit()
+                handled += 1
                 continue
             if (
                 recovery["action"]
@@ -1620,6 +1756,7 @@ def _dispatch_job_task(
     now_iso: str,
     manual: bool = False,
     occurrence_key: str | None = None,
+    allow_disabled_agent_initiative: bool = False,
     _terminal_failure_error: str | None = None,
     _terminal_persistence_retry_limit: int | None = None,
 ):
@@ -1644,6 +1781,7 @@ def _dispatch_job_task(
                     now_iso,
                     manual=manual,
                     occurrence_key=occurrence_key,
+                    allow_disabled_agent_initiative=allow_disabled_agent_initiative,
                 )
             )
             return
@@ -1667,6 +1805,7 @@ def _dispatch_job_task(
                         now_iso,
                         manual=manual,
                         occurrence_key=occurrence_key,
+                        allow_disabled_agent_initiative=allow_disabled_agent_initiative,
                         allow_legacy_uncommitted_clock=True,
                     )
                 )
@@ -1921,8 +2060,100 @@ def _prepared_scheduled_dispatch_recovery(
     )
 
 
+async def _scheduled_agent_execution_recovery_is_suspended(
+    db,
+    run,
+    recovery: PreparedScheduledDispatchRecovery,
+) -> bool:
+    """Return whether an exact Task runtime is durably waiting for a human.
+
+    Scheduler execution recovery may replay the admitted Task gateway after
+    its lease window, but it must not invent a continuation for either a
+    coordinator or legacy HITL wait. The Task row is the durable suspension
+    fact; exact occurrence lineage prevents an unrelated or malformed Task
+    from suppressing recovery.
+    """
+
+    if (
+        recovery.get("action")
+        != ScheduledDispatchRecoveryAction.REPUBLISH_EXECUTION.value
+    ):
+        return False
+    from packages.core.services.scheduled_run_lifecycle import (
+        EXECUTION_CHILD_ID_KEY,
+        EXECUTION_CHILD_KIND_KEY,
+        scheduled_child_execution_state,
+    )
+
+    if (
+        scheduled_child_execution_state(run)
+        is not ScheduledChildExecutionState.ADMITTED
+    ):
+        return False
+    dispatch = recovery.get("dispatch")
+    if not isinstance(dispatch, dict):
+        return False
+    try:
+        dispatch_kind = ScheduledDispatchKind(str(dispatch.get("kind") or ""))
+    except ValueError:
+        return False
+    if dispatch_kind is not ScheduledDispatchKind.AGENT_TASK:
+        return False
+    args = dispatch.get("args")
+    if not isinstance(args, list) or not args or not str(args[0] or "").strip():
+        return False
+    task_id = str(args[0]).strip()
+    result = run.result if isinstance(getattr(run, "result", None), dict) else {}
+    if (
+        result.get(EXECUTION_CHILD_KIND_KEY)
+        != ScheduledDispatchKind.AGENT_TASK.value
+        or str(result.get(EXECUTION_CHILD_ID_KEY) or "") != task_id
+    ):
+        return False
+
+    from sqlalchemy import select
+
+    from packages.core.models.task import Task
+
+    task = (await db.execute(
+        select(Task).where(Task.id == task_id)
+    )).scalar_one_or_none()
+    from packages.core.services.task_state_machine import TERMINAL_STATUSES
+
+    # A terminal Task is never suspended, whatever a stale HITL marker says.
+    if task is None or task.status in TERMINAL_STATUSES:
+        return False
+    details = task.details if isinstance(task.details, dict) else {}
+    from packages.core.services.task_runtime_approvals import (
+        TASK_RUNTIME_HITL_DETAIL_KEY,
+    )
+
+    runtime_marker = details.get(TASK_RUNTIME_HITL_DETAIL_KEY)
+    human_suspended = (
+        task.status in {
+            TaskStatus.WAITING_ON_CUSTOMER.value,
+            TaskStatus.BLOCKED.value,
+        }
+        or (
+            isinstance(runtime_marker, dict)
+            and runtime_marker.get("state") == "waiting"
+        )
+    )
+    if not human_suspended:
+        return False
+    return (
+        str(details.get("scheduled_run_id") or "") == str(run.id or "")
+        and str(details.get("scheduled_job_id") or "") == str(run.job_id or "")
+    )
+
+
 def _scheduled_dispatch_task(kind: ScheduledDispatchKind):
-    """Resolve one durable dispatch kind to its Celery task."""
+    """Resolve one durable transport kind to its Celery gateway.
+
+    ``AGENT_TASK`` is retained in persisted occurrence envelopes for rolling
+    compatibility.  The mapped worker resolves ``TaskExecutionDispatch``; it
+    does not imply that Workspace work may enter the legacy Agent loop.
+    """
 
     from packages.core.tasks.ai_tasks import (
         run_agent_task,
@@ -2089,11 +2320,18 @@ async def _load_prepared_scheduled_dispatch(
         run = (await db.execute(
             select(ScheduledJobRun).where(ScheduledJobRun.id == run_id)
         )).scalar_one_or_none()
-        return (
-            _prepared_scheduled_dispatch_recovery(run)
-            if run is not None
-            else None
-        )
+        if run is None:
+            return None
+        recovery = _prepared_scheduled_dispatch_recovery(run)
+        if recovery is None:
+            return None
+        if await _scheduled_agent_execution_recovery_is_suspended(
+            db,
+            run,
+            recovery,
+        ):
+            return None
+        return recovery
 
 
 @celery_app.task(
@@ -2203,12 +2441,14 @@ async def _async_dispatch_single(
     *,
     manual: bool = False,
     occurrence_key: str | None = None,
+    allow_disabled_agent_initiative: bool = False,
     allow_legacy_uncommitted_clock: bool = False,
 ):
     from packages.core.database import create_worker_session
     from sqlalchemy import select
     from packages.core.models.scheduler import ScheduledJob
     from packages.core.services.reusable_resource_locks import (
+        lock_reusable_resource_lifecycle,
         reusable_resource_lifecycle_lease,
     )
 
@@ -2222,6 +2462,11 @@ async def _async_dispatch_single(
         )).scalar_one_or_none()
         if entity_id is None:
             return
+        if manual:
+            # Manual admission re-locks Workspace access after the Job lookup.
+            # Keep the entity fence through that transaction so pause/delete
+            # cannot hold Workspace while waiting for our Job lock.
+            await lock_reusable_resource_lifecycle(db, entity_id=entity_id)
         async with reusable_resource_lifecycle_lease(db, entity_id=entity_id):
             result = await db.execute(
                 select(ScheduledJob)
@@ -2231,7 +2476,24 @@ async def _async_dispatch_single(
             job = result.scalar_one_or_none()
         if not job:
             return
-        if not job.enabled:
+        disabled_initiative_allowed = bool(
+            manual
+            and allow_disabled_agent_initiative
+            and job.execution_type == "agent_initiative"
+            and job.agent_initiative_id
+            and str(occurrence_key or "").startswith("manual:")
+        )
+        manual_job_allowed = False
+        if manual and occurrence_key and job.execution_type != "agent_initiative":
+            from packages.core.models.scheduler import ScheduledJobRun
+            from packages.core.services.scheduled_run_lifecycle import is_manual_scheduled_occurrence
+
+            occurrence = (await db.execute(select(ScheduledJobRun).where(
+                ScheduledJobRun.job_id == job.job_id,
+                ScheduledJobRun.idempotency_key == occurrence_key,
+            ))).scalar_one_or_none()
+            manual_job_allowed = is_manual_scheduled_occurrence(occurrence, job_id=job.job_id)
+        if not job.enabled and not (manual_job_allowed or disabled_initiative_allowed):
             if occurrence_key and occurrence_key.startswith(
                 _SCHEDULED_OCCURRENCE_PREFIX
             ):
@@ -2653,6 +2915,13 @@ async def _dispatch_job(
             occurrence_key=resolved_occurrence_key,
         )
         if parent_dispatch is not None:
+            ledger = (run.result or {}).get("dispatch_ledger") or {}
+            if ledger.get("revision") != getattr(job, "revision", None):
+                await _cancel_scheduler_parent_dispatch(
+                    db, job, occurrence_key=resolved_occurrence_key,
+                    reason="scheduled_job_revision_changed",
+                )
+                return
             logger.info(
                 "Consuming durable scheduler parent job=%s key=%s run=%s",
                 job.job_id,
@@ -2681,18 +2950,28 @@ async def _dispatch_job(
             )
             return
     run_id = run.id
+    from packages.core.services.scheduled_run_lifecycle import manual_scheduled_request_user_id
 
-    # Update job state
-    job.last_run_at = now
-    job.last_status = "running"
-    from packages.core.schedule_clock import refresh_scheduled_job_next_run_at
+    manual_user_id = manual_scheduled_request_user_id(run, job_id=job.job_id) if manual else None
+    human_requested = manual_user_id is not None
+    execution_user_id = manual_user_id or job.user_id
 
-    refresh_scheduled_job_next_run_at(
-        job,
-        now=now,
-        inclusive=False,
-    )
+    # Manual run-now is an independent occurrence and must not move the
+    # driver's recurring clock. Scheduled parent admission already persisted
+    # its clock before publishing this worker handoff.
+    if not manual:
+        job.last_run_at = now
+        job.last_status = "running"
+        from packages.core.schedule_clock import refresh_scheduled_job_next_run_at
+
+        refresh_scheduled_job_next_run_at(
+            job,
+            now=now,
+            inclusive=False,
+        )
     await db.flush()
+
+    initiative_admission = None
 
     async def _mark_run_error(reason: str) -> None:
         """Surface a misconfiguration as a failed run instead of leaving
@@ -2721,13 +3000,25 @@ async def _dispatch_job(
             run_id=run.id,
             status="error",
         )
+        if initiative_admission is not None:
+            from packages.core.services.agent_initiative_decision import (
+                fail_admitted_initiative_run,
+            )
+
+            await fail_admitted_initiative_run(
+                db,
+                initiative_admission.run,
+                reason,
+            )
         await db.flush()
 
     async def _mark_run_skipped(reason: str) -> None:
         """Skip workspace-scoped automation when the workspace is offline."""
         completed_at = datetime.now(timezone.utc)
         run.status = "skipped"
-        run.result = {"skipped": True, "reason": reason}
+        from packages.core.services.scheduled_run_lifecycle import merge_scheduled_run_result
+
+        run.result = merge_scheduled_run_result(run.result, {"skipped": True, "reason": reason})
         run.completed_at = completed_at
         if run.started_at:
             run.duration_ms = (completed_at - run.started_at).total_seconds() * 1000
@@ -2742,7 +3033,9 @@ async def _dispatch_job(
         """Close a dispatch whose durable output is the created Task itself."""
         completed_at = datetime.now(timezone.utc)
         run.status = "completed"
-        run.result = result
+        from packages.core.services.scheduled_run_lifecycle import merge_scheduled_run_result
+
+        run.result = merge_scheduled_run_result(run.result, result)
         run.completed_at = completed_at
         if run.started_at:
             run.duration_ms = (
@@ -2777,7 +3070,29 @@ async def _dispatch_job(
             job,
             {"enabled": False},
             causation_id=run.id,
+            allow_agent_initiative_driver=(exec_type == "agent_initiative"),
         )
+
+    exec_type = job.execution_type or "agent"
+
+    async def _quarantine_initiative_workspace() -> None:
+        if exec_type != "agent_initiative":
+            return
+        from packages.core.services.agent_initiative_decision import (
+            mark_initiative_driver_needs_setup,
+        )
+
+        await mark_initiative_driver_needs_setup(
+            db,
+            job=job,
+            reason_code="initiative_workspace_inactive",
+            causation_id=run.id,
+        )
+        await _disable_job()
+
+    if manual_user_id and not await _manual_scheduled_request_allowed(db, job, manual_user_id):
+        await _mark_run_skipped("manual_requester_unavailable")
+        return
 
     entity_id = str(getattr(job, "entity_id", None) or "").strip()
     if not entity_id and _scheduled_job_requires_credit_gate(job):
@@ -2818,6 +3133,7 @@ async def _dispatch_job(
         )).scalar_one_or_none()
         if workspace is None:
             await _mark_run_skipped("workspace_not_found")
+            await _quarantine_initiative_workspace()
             return
         from packages.core.services.workspace_readiness import (
             evaluate_workspace_blocking_setup,
@@ -2837,20 +3153,49 @@ async def _dispatch_job(
             }
             if str(job.job_id or "").strip() not in allowed_setup_job_ids:
                 await _mark_run_skipped("workspace_setup_incomplete")
+                await _quarantine_initiative_workspace()
                 return
         from packages.core.workspaces import is_sandbox_workspace
 
         if is_sandbox_workspace(workspace):
             await _mark_run_skipped("workspace_simulation")
+            await _quarantine_initiative_workspace()
             return
         autonomy_state = workspace_autonomy_state(workspace)
-        if autonomy_state not in {
+        manual_workspace_allowed = human_requested and workspace_allows_manual_work(workspace)
+        if not manual_workspace_allowed and autonomy_state not in {
             WorkspaceAutonomyState.RUNNING,
             WorkspaceAutonomyState.DISABLED,
         }:
             await _mark_run_skipped(
                 workspace_autonomy_skip_reason(workspace) or "workspace_unavailable"
             )
+            await _quarantine_initiative_workspace()
+            return
+
+    if exec_type == "agent_initiative":
+        from packages.core.services.agent_initiative_decision import (
+            InitiativeAdmissionRejected,
+            admit_scheduled_initiative,
+        )
+
+        try:
+            initiative_admission = await admit_scheduled_initiative(
+                db,
+                job=job,
+                scheduled_run_id=run_id,
+                occurrence_key=resolved_occurrence_key,
+                trigger_type=trigger_type,
+                now=now,
+                manual=human_requested,
+            )
+        except InitiativeAdmissionRejected as exc:
+            await _mark_run_skipped(exc.reason_code)
+            # Persistent authority/config failures must not create a provider
+            # error storm. User/service reconciliation can re-enable the
+            # managed driver after the underlying boundary is repaired.
+            if not manual:
+                await _disable_job()
             return
 
     try:
@@ -2858,6 +3203,7 @@ async def _dispatch_job(
             job,
             db=db,
             workspace_id=workspace_id,
+            user_id=execution_user_id,
         )
     except CreditExhaustedError as exc:
         await _mark_run_error(f"credits_exhausted: {exc}")
@@ -2883,7 +3229,6 @@ async def _dispatch_job(
     ).prompt
 
     # ── Dispatch based on execution_type ──
-    exec_type = job.execution_type or "agent"
     prepared_dispatch: PreparedScheduledDispatch | None = None
     terminal_dispatch_result: dict | None = None
 
@@ -2933,8 +3278,8 @@ async def _dispatch_job(
                     binding,
                     variables={"payload_message": prompt},
                     trigger_data=trigger_data,
-                    started_by=job.user_id,
-                    trigger_source="schedule",
+                    started_by=execution_user_id,
+                    trigger_source="manual" if human_requested else "schedule",
                 )
             else:
                 wrun = await start_workflow(
@@ -2943,9 +3288,9 @@ async def _dispatch_job(
                     workflow_id=workflow_id,
                     variables={"payload_message": prompt},
                     trigger_data=trigger_data,
-                    started_by=job.user_id,
+                    started_by=execution_user_id,
                     workspace_id=workspace_id,
-                    trigger_source="schedule",
+                    trigger_source="manual" if human_requested else "schedule",
                 )
         except ValueError as exc:
             await _mark_run_error(str(exc))
@@ -2985,8 +3330,8 @@ async def _dispatch_job(
             skill,
             entity_id=str(job.entity_id or ""),
             workspace_id=workspace_id,
-            user_id=job.user_id,
-            enforce_user_access=bool(job.user_id),
+            user_id=execution_user_id,
+            enforce_user_access=bool(execution_user_id),
         )
         if not eligible:
             await _mark_run_error(
@@ -3002,6 +3347,19 @@ async def _dispatch_job(
             skill_input,
             run_id,
             scheduled_skill_id=skill.id,
+        )
+
+    elif exec_type == "agent_initiative":
+        if initiative_admission is None or not job.agent_id:
+            await _mark_run_error("Initiative admission did not resolve an Agent")
+            return
+        prepared_dispatch = await _dispatch_agent_task(
+            db,
+            job,
+            now,
+            prompt,
+            run_id,
+            initiative_admission=initiative_admission,
         )
 
     elif exec_type == "agent" or exec_type == "orchestrator_prompt":
@@ -3022,7 +3380,7 @@ async def _dispatch_job(
                 title=f"[Auto] {job.name or 'Scheduled Task'}",
                 description=prompt, task_type="ai_generated",
                 workspace_id=job.workspace_id,
-                creator_id=job.user_id,
+                creator_id=execution_user_id,
                 details={
                     "scheduled_job_id": job.job_id,
                     "scheduled_run_id": run_id,
@@ -3035,6 +3393,12 @@ async def _dispatch_job(
                     "scheduled_run_id": run_id,
                 },
             )
+            if manual_user_id:
+                from packages.core.services.task_execution_origin import record_manual_task_execution
+
+                record_manual_task_execution(
+                    task, user_id=manual_user_id, action="scheduled_run_now",
+                )
             job.manor_task_id = task.id
             await db.flush()
             terminal_dispatch_result = {
@@ -3073,7 +3437,8 @@ async def _dispatch_job(
             await _disable_job()
             return
         if (
-            workspace_id
+            not human_requested
+            and workspace_id
             and workspace_autonomy_state(workspace) is not WorkspaceAutonomyState.RUNNING
         ):
             await _mark_run_skipped(
@@ -3135,9 +3500,13 @@ async def _dispatch_job(
                 args=[workspace_id],
                 kwargs={
                     **finalise_kwargs,
+                    "user_id": execution_user_id,
                     **ReviewTrigger(
-                        kind=ReviewTriggerKind.SCHEDULED,
-                        detail="workspace cadence",
+                        kind=(
+                            ReviewTriggerKind.HUMAN_REQUESTED
+                            if human_requested else ReviewTriggerKind.SCHEDULED
+                        ),
+                        detail="manual run-now" if human_requested else "workspace cadence",
                     ).celery_kwargs(),
                 },
             )
@@ -3146,7 +3515,11 @@ async def _dispatch_job(
             prepared_dispatch = _prepared_scheduled_dispatch(
                 ScheduledDispatchKind.MORNING_BRIEFING,
                 args=[workspace_id],
-                kwargs={**finalise_kwargs, "timezone_name": briefing_timezone},
+                kwargs={
+                    **finalise_kwargs,
+                    "timezone_name": briefing_timezone,
+                    "user_id": execution_user_id,
+                },
             )
         elif exec_type == "outcome_evaluation":
             prepared_dispatch = _prepared_scheduled_dispatch(
@@ -3176,7 +3549,8 @@ async def _dispatch_job(
         return
 
     if prepared_dispatch is not None:
-        run.result = {
+        prior_result = run.result if isinstance(run.result, dict) else {}
+        next_result = {
             "dispatch": prepared_dispatch,
             "dispatch_status": ScheduledDispatchState.PREPARED.value,
             "dispatch_ledger": ScheduledDispatchLedgerContext(
@@ -3185,6 +3559,21 @@ async def _dispatch_job(
                 experiment_id=experiment_id,
             ),
         }
+        from packages.core.services.scheduled_run_lifecycle import (
+            MANUAL_AGENT_INITIATIVE_ADMISSION_KEY,
+            MANUAL_SCHEDULED_REQUEST_KEY,
+        )
+
+        for occurrence_metadata_key in (
+            "explicit_trigger",
+            MANUAL_AGENT_INITIATIVE_ADMISSION_KEY,
+            MANUAL_SCHEDULED_REQUEST_KEY,
+        ):
+            if occurrence_metadata_key in prior_result:
+                next_result[occurrence_metadata_key] = prior_result[
+                    occurrence_metadata_key
+                ]
+        run.result = next_result
 
     # Immediate/terminal work is already accepted here. Queue handoffs record
     # this fact only in _mark_scheduled_dispatch_published after broker accept.
@@ -3214,13 +3603,30 @@ async def _dispatch_agent_task(
     run_id: str | None = None,
     *,
     scheduled_skill_id: str | None = None,
+    initiative_admission=None,
 ):
-    """Create one Task per scheduled occurrence and prepare its queue handoff."""
+    """Create one Task per occurrence and prepare its runtime-gateway handoff.
+
+    The persisted ``AGENT_TASK`` kind identifies the Task child for admission,
+    cancellation, settlement, and replay. Runtime selection remains exclusively
+    owned by the TaskExecution factory in the receiving worker.
+    """
+
+    from packages.core.models.scheduler import ScheduledJobRun
+    from packages.core.services.scheduled_run_lifecycle import manual_scheduled_request_user_id
+
+    run = await db.get(ScheduledJobRun, run_id) if run_id else None
+    manual_user_id = manual_scheduled_request_user_id(run, job_id=job.job_id)
+    execution_user_id = manual_user_id or job.user_id
 
     # A scheduled occurrence is immutable runtime identity. Reusing the
     # job-level Task lets a later overlapping occurrence overwrite the first
     # delivery's run metadata and terminalize the wrong ScheduledJobRun.
-    task_id = None if run_id else job.manor_task_id
+    task_id = (
+        initiative_admission.run.task_id
+        if initiative_admission is not None
+        else None if run_id else job.manor_task_id
+    )
 
     target = job.execution_target or {}
     done_when = str(
@@ -3228,7 +3634,12 @@ async def _dispatch_agent_task(
         or target.get("completion_criteria")
         or ""
     ).strip()
-    if not done_when:
+    if initiative_admission is not None:
+        done_when = (
+            "The final output is one valid version-1 Agent Initiative JSON "
+            "decision with decision=notify or decision=silent."
+        )
+    elif not done_when:
         done_when = (
             "The scheduled automation has completed the requested work and "
             "reported the concrete result. If the prompt requests a side "
@@ -3237,7 +3648,12 @@ async def _dispatch_agent_task(
             "state whether it succeeded."
         )
     deliverable = str(target.get("deliverable") or "").strip()
-    if not deliverable:
+    if initiative_admission is not None:
+        deliverable = (
+            "Exactly one JSON object matching the Agent Initiative Decision "
+            "contract; no markdown fences or surrounding prose."
+        )
+    elif not deliverable:
         deliverable = (
             "A concise final report with the queried results, completion "
             "times when relevant, and any delivery/send status."
@@ -3266,6 +3682,67 @@ async def _dispatch_agent_task(
         "max_turns": max_turns,
         "model_role": target.get("complexity", "primary"),
     }
+    owner_subscription_id = None
+    if initiative_admission is not None:
+        from packages.core.services.agent_initiative_decision import (
+            initiative_marker_for_admission,
+        )
+
+        marker = initiative_marker_for_admission(initiative_admission)
+        details_base.update({
+            "agent_initiative": marker.as_dict(),
+            "blocked_tool_names": list(target.get("blocked_tool_names") or []),
+        })
+        owner_subscription_id = marker.agent_subscription_id
+    elif job.agent_id:
+        from sqlalchemy import select
+
+        from packages.core.constants.agents import is_master_agent
+        from packages.core.models.workspace import Agent, AgentSubscription
+
+        if not is_master_agent(job.agent_id):
+            active_agent_id = (await db.execute(
+                select(Agent.id).where(
+                    Agent.id == job.agent_id,
+                    Agent.entity_id == job.entity_id,
+                    Agent.status == "active",
+                    Agent.deleted_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if active_agent_id is None:
+                raise RuntimeError(
+                    "Scheduled Agent execution requires an active Agent"
+                )
+            configured_subscription_id = str(
+                target.get("agent_subscription_id") or ""
+            ).strip()
+            subscription_query = select(AgentSubscription).where(
+                AgentSubscription.entity_id == job.entity_id,
+                AgentSubscription.agent_id == job.agent_id,
+                AgentSubscription.status == "active",
+            )
+            if configured_subscription_id:
+                subscription_query = subscription_query.where(
+                    AgentSubscription.id == configured_subscription_id,
+                )
+            if job.workspace_id:
+                subscription_query = subscription_query.where(
+                    AgentSubscription.workspace_id == job.workspace_id,
+                )
+            else:
+                subscription_query = subscription_query.where(
+                    AgentSubscription.workspace_id.is_(None),
+                    AgentSubscription.owner_user_id == job.user_id,
+                )
+            subscriptions = list((await db.execute(
+                subscription_query.order_by(AgentSubscription.id.asc()).limit(2)
+            )).scalars().all())
+            if len(subscriptions) != 1:
+                raise RuntimeError(
+                    "Scheduled Agent execution requires its exact active "
+                    "AgentSubscription"
+                )
+            owner_subscription_id = subscriptions[0].id
     if scheduled_skill_id:
         details_base["scheduled_skill_id"] = scheduled_skill_id
     if required_plan_steps is not None:
@@ -3278,8 +3755,9 @@ async def _dispatch_agent_task(
             title=f"[Auto] {job.name or 'Scheduled Task'}",
             description=prompt, task_type="ai_generated",
             workspace_id=job.workspace_id,
-            creator_id=job.user_id,
+            creator_id=execution_user_id,
             agent_id=job.agent_id,
+            owner_subscription_id=owner_subscription_id,
             details=details_base,
             conversation_id=job.conversation_id,
             creation_logged_by_system=True,
@@ -3292,17 +3770,29 @@ async def _dispatch_agent_task(
         )
         await db.flush()
         task_id = task.id
+        if initiative_admission is not None:
+            initiative_admission.run.task_id = task_id
         job.manor_task_id = task_id
         await db.flush()
         logger.info("Created task %s for job %s", task_id, job.job_id)
     else:
         from packages.core.services.task_service import update_task
-        await update_task(db, task_id, job.entity_id or "",
+        task = await update_task(db, task_id, job.entity_id or "",
             status="pending", description=prompt,
             workspace_id=job.workspace_id,
-            creator_id=job.user_id,
+            creator_id=execution_user_id,
+            agent_id=job.agent_id,
+            owner_subscription_id=owner_subscription_id,
             conversation_id=job.conversation_id,
             details={**details_base, "run_at": now.isoformat()},
+        )
+        await db.flush()
+
+    if task is not None and manual_user_id:
+        from packages.core.services.task_execution_origin import record_manual_task_execution
+
+        record_manual_task_execution(
+            task, user_id=manual_user_id, action="scheduled_run_now",
         )
         await db.flush()
 

@@ -1,0 +1,16 @@
+{
+  "id": "restaurant-promotion-video",
+  "name": "restaurant-promotion-video",
+  "display_name": "Restaurant Promotion Video",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Restaurant-specific food, venue, people, and sound continuity guidance for a restaurant video brief or script in the Video Production suite.",
+  "category": "video",
+  "output_format": "guidance",
+  "tags": ["video", "restaurant", "food", "script-to-video", "runtime-guidance", "builtin"],
+  "tools": [],
+  "search": {
+    "terms": ["food video", "cafe", "menu", "chef", "dining", "dish", "bar", "eatery", "hospitality"],
+    "examples": ["restaurant promo video with food shots", "make video of my cafe dishes", "showcase signature drinks and venue", "short ad video for local restaurant"]
+  }
+}

@@ -69,6 +69,11 @@ the model, embedding calls fail and search degrades to text-only.
 
 ## Production Notes
 
+Local Office/PDF generation, previews and signatures use this deployment's
+storage and permissions, not Cloud storage. SMTP is only needed for email
+delivery. Preserve matching credential-backend keys/configuration with backups;
+copying database references alone cannot restore encrypted provider access.
+
 - Use persistent volumes for every stateful service (`pg_data`, `redis_data`,
   `minio_data`, `ollama_data`).
 - Monitor disk usage — generated media and document uploads accumulate in

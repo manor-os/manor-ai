@@ -17,8 +17,10 @@ import json
 import logging
 from typing import Any, AsyncIterator, Tuple
 
+from packages.core.ai.response_language import resolve_response_locale
 from packages.core.ai.runtime.completions import runtime_execute_text_completion
-from packages.core.ai.workflow_import.model import CANONICAL_NODE_TYPES
+from packages.core.ai.workflow_import.model import CANONICAL_NODE_TYPES, HIDDEN_NODE_TYPES
+from packages.core.i18n import get_locale, t
 from packages.core.services.skill_bundle import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -38,9 +40,6 @@ _TYPE_SYNONYMS = {
     "httprequest": "http",
     "request": "http",
     "api": "http",
-    "knowledge": "rag",
-    "retrieval": "rag",
-    "vectorstore": "rag",
     "classify": "classifier",
     "router": "switch",
     "webhook": "webhook",
@@ -69,7 +68,7 @@ _TYPE_SYNONYMS = {
 }
 
 # webhook is a first-class trigger variant in the canvas vocabulary.
-_ALLOWED_TYPES = CANONICAL_NODE_TYPES | {"webhook"}
+_ALLOWED_TYPES = (CANONICAL_NODE_TYPES | {"webhook"}) - HIDDEN_NODE_TYPES
 
 WORKFLOW_GEN_SYSTEM_PROMPT = """\
 You design automation workflows for a visual node-graph builder (like n8n / \
@@ -98,7 +97,6 @@ keys below are EXACTLY what the runner reads — use these names, not synonyms:
   llm        - call a language model. config: {model?, system_prompt?, prompt, temperature?, max_rounds?}
                (temperature 0–2; max_rounds = tool-call rounds, default 1)
   agent      - run an existing manor Agent. config: {agent_id?, input, model?}
-  rag        - retrieve from a knowledge base. config: {query, limit?, workspace_id?, collection?}
   tool       - call a single tool. config: {tool, args}   (args is an object)
   connector  - call an external integration / MCP server. config: {tool, args}
                (tool = resolved name e.g. "mcp__slack__post_message")
@@ -158,13 +156,11 @@ DATA FLOW — how a step uses an earlier step's result:
   upstream results with the step's OWN id — never invent variable names.
 - Output shapes (use the right path):
     llm / agent / classifier → text          → ``{{id}}``
-    rag                      → {context, sources} → ``{{id.context}}``
     http                     → {status_code, body} → ``{{id.body}}``
     image / video / audio    → {image_url, ...}    → ``{{id.image_url}}``
     transform                → the {set} object     → ``{{id.var_name}}``
-  Example: a rag step ``r`` feeding an llm step → the llm prompt is
-  ``"Summarise these notes:\n{{r.context}}"``. An llm ``a`` feeding a translate
-  llm ``b`` → b's prompt is ``"Translate to Spanish:\n{{a}}"``.
+  Example: an llm ``a`` feeding a translate llm ``b`` → b's prompt is
+  ``"Translate to Spanish:\n{{a}}"``.
 - For ``condition`` / ``switch`` expressions, reference variables by BARE name
   (no braces): ``a == "high"``, ``r.source_count > 0`` — operators
   == != > < >= <= combined with and / or.
@@ -266,6 +262,8 @@ async def generate_workflow_streaming(
     prompt: str,
     current_steps: list[dict] | None,
     entity_id: str,
+    *,
+    user_id: str | None = None,
 ) -> AsyncIterator[Tuple[str, object]]:
     """Generate / edit a workflow graph, yielding progress then the result.
 
@@ -273,7 +271,11 @@ async def generate_workflow_streaming(
     ``("workflow", {name, steps, variables})`` tuple.
     """
     has_current = bool(current_steps)
-    yield ("step", "Refining the workflow" if has_current else "Designing the workflow")
+    progress_locale = await resolve_response_locale(user_id) or get_locale()
+    yield ("step", t(
+        "generation.workflow.refining" if has_current else "generation.workflow.designing",
+        locale=progress_locale,
+    ))
 
     user_parts = [f"Request:\n{prompt}"]
     if has_current:
@@ -290,6 +292,7 @@ async def generate_workflow_streaming(
             {"role": "user", "content": user_content},
         ],
         entity_id=entity_id,
+        user_id=user_id,
         source=_SOURCE,
         temperature=0.3,
         max_tokens=8000,
@@ -298,7 +301,7 @@ async def generate_workflow_streaming(
     if not raw or not raw.strip():
         raise ValueError("LLM returned an empty response for workflow generation")
 
-    yield ("step", "Validating nodes")
+    yield ("step", t("generation.workflow.validating", locale=progress_locale))
     result = normalize_workflow(extract_json_object(raw))
     if not result["steps"]:
         raise ValueError("Workflow generation did not produce any nodes")
@@ -314,6 +317,8 @@ async def generate_workflow(
     prompt: str,
     current_steps: list[dict] | None,
     entity_id: str,
+    *,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Generate a workflow graph without exposing the streaming transport.
 
@@ -327,6 +332,7 @@ async def generate_workflow(
         prompt,
         current_steps,
         entity_id,
+        user_id=user_id,
     ):
         if kind == "workflow" and isinstance(payload, dict):
             result = payload

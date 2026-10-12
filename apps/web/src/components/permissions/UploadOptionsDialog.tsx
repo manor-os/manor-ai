@@ -28,6 +28,7 @@ export interface UploadOptionsValue {
 interface Props {
   open: boolean;
   files: File[];
+  workspaceTarget?: boolean;
   /** Default values to preselect (e.g. from folder rules). */
   defaults?: Partial<UploadOptionsValue>;
   /** Restrict pickable visibilities (e.g. folder caps at workspace). */
@@ -78,14 +79,16 @@ function formatSize(bytes: number): string {
 export default function UploadOptionsDialog({
   open,
   files,
+  workspaceTarget = false,
   defaults,
   visibilityCap,
   classificationFloor,
   onCancel,
   onConfirm,
 }: Props) {
+  const defaultVisibility = workspaceTarget ? "workspace" : (defaults?.visibility ?? "private");
   const [visibility, setVisibility] = useState<Visibility>(
-    defaults?.visibility ?? "workspace",
+    defaultVisibility,
   );
   const [classification, setClassification] = useState<Classification>(
     defaults?.classification ?? "internal",
@@ -99,12 +102,12 @@ export default function UploadOptionsDialog({
   // across separate uploads).
   useEffect(() => {
     if (open) {
-      setVisibility(defaults?.visibility ?? "workspace");
+      setVisibility(defaultVisibility);
       setClassification(defaults?.classification ?? "internal");
       setClientVisible(defaults?.client_visible ?? false);
       setConfirmRestricted(false);
     }
-  }, [open, defaults]);
+  }, [open, defaults, defaultVisibility]);
 
   // Restricted classification can never be client-visible.
   useEffect(() => {
@@ -120,7 +123,9 @@ export default function UploadOptionsDialog({
 
   const isRestrictedNeedsConfirm = classification === "restricted" && !confirmRestricted;
   const clientVisibleAllowed = classification !== "confidential" && classification !== "restricted";
-  const visibilityOptions = _visibilityOptions();
+  const visibilityOptions = _visibilityOptions().filter(
+    (option) => workspaceTarget ? option.value === "workspace" : option.value !== "workspace",
+  );
   const classificationOptions = _classificationOptions();
 
   return (
@@ -134,7 +139,7 @@ export default function UploadOptionsDialog({
           <Button variant="outline" onClick={onCancel}>{t("permissions.action.cancel")}</Button>
           <Button
             variant="ghost"
-            onClick={() => onConfirm({ visibility: "workspace", classification: "internal", client_visible: false })}
+            onClick={() => onConfirm({ visibility: defaultVisibility, classification: "internal", client_visible: false })}
           >
             {t("permissions.action.use_defaults")}
           </Button>

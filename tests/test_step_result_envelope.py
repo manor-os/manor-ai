@@ -266,12 +266,12 @@ def test_planner_prompt_requires_an_explicit_output_contract_per_agent_step():
         agents_by_id={},
         allowed_service_keys=[],
     )
-    assert "StepResult" in prompt
-    assert "exactly one output contract" in prompt
+    assert "Each llm/subagent declares output_shape OR an exact expected_output_schema" in prompt
+    assert "Do not use generic StepResult" in prompt
     assert "expected_output_schema" in prompt
     assert "it never guesses missing fields or shapes" in prompt
-    assert "platform receipts" in prompt
-    assert "steps.<key>.result.outputs.text" in prompt
+    assert "Runtime owns approval/credit/evidence gates" in prompt
+    assert "steps.KEY.result.FIELD" in prompt
     # Explicit specialized shapes remain available.
     assert "ArtifactResult" in prompt
 

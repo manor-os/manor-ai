@@ -32,10 +32,12 @@ import IntegrationLogo from "./IntegrationLogo";
 import NangoConnectButton from "./integrations/NangoConnectButton";
 import Modal from "./ui/Modal";
 import { useAuthStore } from "../stores/auth";
+import { useDisplayPreferences } from "../stores/displayPreferences";
 import UserAvatar from "./ui/UserAvatar";
 import { type ChatMessage, useDebounced } from "../lib/chatStream";
 import { getSkillDescription } from "../pages/skills/skillTypes";
 import { shouldHandleComposerEnter } from "../lib/composerKeyboard";
+import { composerIdentityLabel, composerResourceOrigin, searchComposerOptions, type ComposerResourceOrigin } from "../lib/composerSearch";
 import type { ManualSkillReference } from "../lib/manualSkillRefs";
 import { InlineRowsSkeleton } from "./ui/Skeleton";
 import {
@@ -50,8 +52,9 @@ import {
 } from "./icons";
 import Select from "./ui/Select";
 import { t } from "../lib/i18n";
+import { prepareChatUploadFile } from "../lib/browserImage";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
-import { connectorAccessState } from "../lib/integration-usability.mjs";
+import { connectorAccessState, integrationSetupState } from "../lib/integration-usability.mjs";
 
 
 export interface AttachedItem {
@@ -77,7 +80,31 @@ type ComposerDocumentOption = {
   fs_path?: string | null;
   file_type?: string | null;
   mime_type?: string | null;
+  file_size?: number | null;
+  classification?: string | null;
+  quarantine_status?: string | null;
+  current_user_capabilities?: string[];
 };
+
+const ROOM_FILE_MAX_BYTES = 100 * 1024 * 1024;
+
+function roomKnowledgeBlockReason(doc: ComposerDocumentOption): string | null {
+  if (doc.classification === "confidential" || doc.classification === "restricted" ||
+      doc.quarantine_status !== "clean") {
+    return t("component.chat_input_footer.knowledge_group_restricted");
+  }
+  if (!doc.fs_path) {
+    return t("component.chat_input_footer.knowledge_group_local_only");
+  }
+  if (doc.file_size != null && doc.file_size > ROOM_FILE_MAX_BYTES) {
+    return t("component.chat_input_footer.knowledge_group_too_large");
+  }
+  if (!doc.current_user_capabilities?.includes("download") ||
+      !doc.current_user_capabilities.includes("share_external")) {
+    return t("component.chat_input_footer.knowledge_group_no_permission");
+  }
+  return null;
+}
 
 function composerPreviewItemFromDoc(doc: ComposerDocumentOption): AttachedItem {
   return {
@@ -102,22 +129,24 @@ function attachedItemLooksLikeImage(item: AttachedItem) {
 export async function createChatMessageAttachmentSnapshot(
   item: AttachedItem,
 ): Promise<NonNullable<ChatMessage["attachments"]>[number]> {
+  const file = item.file ? await prepareChatUploadFile(item.file) : undefined;
   let previewUrl = item.previewUrl;
   if (
     !previewUrl &&
     item.type === "file" &&
-    item.file &&
+    file &&
     attachedItemLooksLikeImage(item)
   ) {
-    previewUrl = await api.documents.localImageThumbnail(item.file).catch(() => undefined);
+    previewUrl = await api.documents.localImageThumbnail(file).catch(() => undefined);
   }
   return {
-    name: item.name,
+    name: file?.name || item.name,
+    file,
     document_id: item.id,
     fsPath: item.fsPath,
     type: item.type,
-    fileType: item.fileType,
-    mimeType: item.mimeType || item.file?.type,
+    fileType: file && file !== item.file ? file.name.split(".").pop() : item.fileType,
+    mimeType: file?.type || item.mimeType,
     previewUrl,
   };
 }
@@ -166,7 +195,7 @@ function ComposerReferenceThumbnail({
       return () => {};
     }
     const load = (() => {
-      if (item.file && kind === "image") return Promise.resolve(URL.createObjectURL(item.file));
+      if (item.file && kind === "image") return api.documents.localImageThumbnail(item.file);
       if (!item.id) return null;
       return kind === "image"
         ? api.documents.imageThumbnail(item.id, { cache: true })
@@ -203,7 +232,7 @@ function ComposerReferenceThumbnail({
   );
 }
 
-export interface MentionOption {
+export interface MentionOption extends ComposerResourceOrigin {
   id: string;
   type: "agent" | "user";
   name: string;
@@ -212,7 +241,7 @@ export interface MentionOption {
   avatarSeed?: string;
 }
 
-export interface ManualSkillItem {
+export interface ManualSkillItem extends ComposerResourceOrigin {
   id: string;
   name: string;
   reference?: ManualSkillReference;
@@ -235,11 +264,21 @@ export interface WorkflowInvokeItem {
   title: string;
   description?: string | null;
   placeholder?: string | null;
+  workspace_id?: string | null;
+  workspace_name?: string | null;
 }
 
 export interface ChatComposerSendContext {
   localWorkerId?: string;
   localWorkerName?: string;
+}
+
+function ComposerResourceSource({ source, identity, id }: { source: string; identity: string; id: string }) {
+  if (!source && !identity) return null;
+  return <small className="chat-composer-resource-source" title={`${source} · ${id}`}>
+    <span>{source}</span>
+    {identity && <code>{identity}</code>}
+  </small>;
 }
 
 function slugifySkillToken(value: string) {
@@ -440,6 +479,7 @@ const COMPOSER_INTEGRATION_PROVIDERS = new Set([
   "google_drive",
   "notion",
   "slack",
+  "lark",
   "discord",
   "telegram",
   "wechat_personal",
@@ -489,6 +529,10 @@ interface ChatInputFooterProps {
    *  @deprecated Behavior is now fixed: Enter sends, Cmd/Ctrl+Enter or Shift+Enter inserts a newline. */
   enterToSend?: boolean;
   streaming: boolean;
+  /** "room-files" shares local files or a copy from the sender's Knowledge. */
+  attachments: "documents" | "room-files" | "none";
+  /** Reuse the composer for human rooms without AI-only controls. */
+  humanChat?: boolean;
   /** Fired when the user clicks send / uses an explicit send shortcut.
    *  Receives a snapshot of attachments at send time; the footer clears them after. The
    *  parent is responsible for clearing `value` (call onChange("")). */
@@ -513,6 +557,7 @@ interface ChatInputFooterProps {
   topSlot?: React.ReactNode;
   /** Rendered at the beginning of the action row (e.g., chat mode picker). */
   modeSlot?: React.ReactNode;
+  approvalSlot?: React.ReactNode;
   /** When true, mode controls replace the default action buttons in the bottom row. */
   replaceActionButtons?: boolean;
   /** Rendered inside the input row before the textarea (e.g., @mention pill). */
@@ -527,6 +572,8 @@ interface ChatInputFooterProps {
   editorRef?: React.RefObject<HTMLDivElement>;
   seedAttachments?: AttachedItem[];
   seedAttachmentsKey?: string;
+  seedWorkflow?: WorkflowInvokeItem;
+  seedWorkflowKey?: string;
   attachmentButtonIcon?: "plus" | "paperclip";
   /** Optional className for the outer footer wrapper. */
   className?: string;
@@ -865,6 +912,7 @@ export default function ChatInputFooter({
   showStopButton = true,
   topSlot,
   modeSlot,
+  approvalSlot,
   replaceActionButtons = false,
   beforeTextarea,
   mentions = [],
@@ -876,15 +924,21 @@ export default function ChatInputFooter({
   editorRef: externalEditorRef,
   seedAttachments,
   seedAttachmentsKey,
+  seedWorkflow,
+  seedWorkflowKey,
   attachmentButtonIcon = "plus",
+  attachments,
+  humanChat = false,
   className,
 }: ChatInputFooterProps) {
   const navigate = useNavigate();
+  const isSimple = useDisplayPreferences((s) => s.interfaceMode === "simple");
   const flowsAccess = usePreviewFeatureAccess("flows");
   const flowsAvailable = flowsAccess.enabled;
   const flowsComingSoon = flowsAccess.loaded && !flowsAccess.released;
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
+  const authUser = useAuthStore((s) => s.user);
   const privateApiEnabled = !authLoading && Boolean(authToken);
   const internalEditorRef = useRef<HTMLDivElement>(null);
   const editorRef = externalEditorRef || internalEditorRef;
@@ -896,6 +950,7 @@ export default function ChatInputFooter({
   const pendingSkillTriggerPosRef = useRef<number | null>(null);
   const pendingWorkflowTriggerPosRef = useRef<number | null>(null);
   const appliedSeedAttachmentsKeyRef = useRef<string | undefined>();
+  const appliedSeedWorkflowKeyRef = useRef<string | undefined>();
   const lastNativeValueRef = useRef(value);
   const sendLockedRef = useRef(false);
   const streamingRef = useRef(streaming);
@@ -909,6 +964,9 @@ export default function ChatInputFooter({
     useState<WorkflowInvokeItem | null>(null);
   const attachedFilesRef = useRef<AttachedItem[]>([]);
   const [attachedFiles, setAttachedFilesState] = useState<AttachedItem[]>([]);
+  const [preparingFiles, setPreparingFiles] = useState(false);
+  const fileDragDepthRef = useRef(0);
+  const [fileDragActive, setFileDragActive] = useState(false);
   const [attachMenuOpen, setAttachMenuOpen] = useState(false);
   const [integrationsMenuOpen, setIntegrationsMenuOpen] = useState(false);
   const [nangoConnector, setNangoConnector] = useState<IntegrationMCPServer | null>(null);
@@ -965,6 +1023,14 @@ export default function ChatInputFooter({
   const workflowReplaceEndRef = useRef(-1);
   const [workflowActiveIdx, setWorkflowActiveIdx] = useState(0);
 
+  useEffect(() => {
+    if (!isSimple || humanChat) return;
+    setMentionDropdownOpen(false);
+    setSkillDropdownOpen(false);
+    setWorkflowDropdownOpen(false);
+    setIntegrationsMenuOpen(false);
+  }, [isSimple, humanChat]);
+
   const voice = useChatVoiceInput({
     scope: voiceScope, disabled: streaming || disabled,
     onTranscript: (text) => {
@@ -973,6 +1039,14 @@ export default function ChatInputFooter({
     },
   });
   const [focused, setFocused] = useState(false);
+  const [attachmentError, setAttachmentError] = useState("");
+
+  useEffect(() => {
+    if (disabled || streaming) {
+      fileDragDepthRef.current = 0;
+      setFileDragActive(false);
+    }
+  }, [disabled, streaming]);
 
   useEffect(() => {
     streamingRef.current = streaming;
@@ -1017,13 +1091,20 @@ export default function ChatInputFooter({
     if (!seedAttachments?.length) return;
 
     setAttachedFiles((prev) => {
+      const seenFiles = new Set(prev.flatMap((item) => item.file ? [item.file] : []));
       const seen = new Set(
-        prev.map((item) =>
+        prev.filter((item) => !item.file).map((item) =>
           item.id ? `${item.type || "file"}:${item.id}` : `${item.type || "file"}:${item.name}`,
         ),
       );
       const next = [...prev];
       seedAttachments.forEach((item) => {
+        if (item.file) {
+          if (seenFiles.has(item.file)) return;
+          seenFiles.add(item.file);
+          next.push(item);
+          return;
+        }
         const key = item.id
           ? `${item.type || "file"}:${item.id}`
           : `${item.type || "file"}:${item.name}`;
@@ -1034,6 +1115,23 @@ export default function ChatInputFooter({
       return next;
     });
   }, [seedAttachments, seedAttachmentsKey, setAttachedFiles]);
+
+  useEffect(() => {
+    if (!seedWorkflow || !seedWorkflowKey || appliedSeedWorkflowKeyRef.current === seedWorkflowKey || !flowsAvailable || isSimple || humanChat) return;
+    appliedSeedWorkflowKeyRef.current = seedWorkflowKey;
+    const token = workflowInvokeToken(seedWorkflow);
+    const draft = selectedWorkflow && selectedWorkflow.bindingId !== seedWorkflow.bindingId
+      ? stripWorkflowInvokeToken(value, selectedWorkflow)
+      : value;
+    const nextDraft = hasInlineToken(draft, token) ? draft : `${token} ${draft.trimStart()}`;
+    pendingCursorRef.current = nextDraft.length;
+    onChange(nextDraft);
+    setSelectedWorkflow(seedWorkflow);
+    setTimeout(() => {
+      editorRef.current?.focus();
+      setPlainOffset(editorRef.current, nextDraft.length);
+    }, 0);
+  }, [seedWorkflow, seedWorkflowKey, flowsAvailable, isSimple, humanChat, selectedWorkflow, value, onChange]);
 
   const getPortalMenuCoords = useCallback(
     (
@@ -1154,10 +1252,11 @@ export default function ChatInputFooter({
   /* # autocomplete */
   const debouncedHashQuery = useDebounced(hashQuery, 250);
   const { data: hashDocs } = useQuery({
-    queryKey: ["documents", "hash-autocomplete", debouncedHashQuery],
+    queryKey: ["documents", "hash-autocomplete", voiceScope?.workspaceId, debouncedHashQuery],
     queryFn: () =>
       api.documents.list({
         search: debouncedHashQuery || undefined,
+        workspace_id: voiceScope?.workspaceId || undefined,
         limit: 200,
       }),
     enabled: hashDropdownOpen,
@@ -1190,74 +1289,77 @@ export default function ChatInputFooter({
     .filter((doc: any) => !attachedKnowledgeIds.has(doc.id))
     .sort((a: any, b: any) => hashMatchScore(a) - hashMatchScore(b))
     .slice(0, 50);
-  const debouncedSkillQuery = useDebounced(skillQuery, 200);
-  const { data: skillOptions, isLoading: skillsLoading } = useQuery({
-    queryKey: ["skills", "composer-manual"],
-    queryFn: () => api.skills.list(),
-    enabled: skillDropdownOpen,
+  // The parent resolves the sending Agent, including fixed DM recipients.
+  // Only fall back to an inline @Agent when the surface has not resolved one.
+  const skillScope = {
+    conversation_id: voiceScope?.conversationId || undefined,
+    workspace_id: voiceScope?.workspaceId || undefined,
+    agent_id: voiceScope?.agentId
+      || selectedMentions.find((mention) => mention.type === "agent" && hasInlineToken(value, `@${mention.name}`))?.id || undefined,
+    thread_ref_kind: voiceScope?.threadRefKind,
+    thread_ref_id: voiceScope?.threadRefId,
+  };
+  const { data: skillOptions = [], isLoading: skillsLoading, isError: skillsError, refetch: refetchSkills } = useQuery({
+    queryKey: ["skills", "composer-manual", skillScope],
+    queryFn: () => api.chat.listComposerSkills(skillScope),
+    enabled: skillDropdownOpen && !voiceScope?.publicToken,
   });
   const selectedManualSkillIds = new Set(
     selectedManualSkills.map((skill) => skill.id),
   );
-  const skillFiltered = (skillOptions || [])
-    .filter((raw: any) => {
-      if (!raw?.id || selectedManualSkillIds.has(raw.id)) return false;
-      if (!canShowManualSkill(raw)) return false;
-      const q = debouncedSkillQuery.trim().toLowerCase();
-      if (!q) return true;
-      const description = getSkillDescription(raw);
-      const haystack = [
-        raw.name,
-        raw.slug,
-        raw.display_name,
-        raw.displayName,
-        description,
-        raw.category,
-        ...(Array.isArray(raw.tags) ? raw.tags : []),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return haystack.includes(q);
-    })
-    .slice(0, 20);
+  const resourceOrigin = (resource: ComposerResourceOrigin) => composerResourceOrigin(resource, {
+    builtin: t("component.chat_input_footer.source_builtin"),
+    workspace: t("page.app_layout.workspace"),
+    personal: t("component.chat_input_footer.source_personal"),
+    shared: t("component.chat_input_footer.source_shared"),
+  });
+  const skillIdentity = (skill: ManualSkillItem) => composerIdentityLabel(skill, skillOptions, {
+    key: (item) => item.id, name: manualSkillLabel, source: () => "",
+  });
+  const mentionIdentity = (mention: MentionOption) => composerIdentityLabel(mention, mentions, {
+    key: (item) => `${item.type}:${item.id}`, name: (item) => item.name,
+    source: () => "",
+  });
+  const workflowIdentity = (workflow: WorkflowInvokeItem) => composerIdentityLabel(workflow, workflows, {
+    key: (item) => item.bindingId, name: (item) => item.title,
+    source: () => "",
+  });
+  // Text tokens cannot distinguish two selected instances of the same slug.
+  // Keep the chosen exact ID, and offer other instances again after removal.
+  const selectedSkillTokens = new Set(selectedManualSkills.map(manualSkillToken));
+  const skillFiltered = searchComposerOptions((skillsError ? [] : skillOptions).filter((raw: any) =>
+    raw?.id && !selectedManualSkillIds.has(raw.id) && !selectedSkillTokens.has(manualSkillToken(raw)) && canShowManualSkill(raw)), skillQuery, {
+    key: (raw: any) => raw.id,
+    names: (raw: any) => [raw.name, raw.slug, raw.display_name, raw.displayName],
+    keywords: (raw: any) => [getSkillDescription(raw), raw.category, resourceOrigin(raw), ...(Array.isArray(raw.tags) ? raw.tags : [])],
+    limit: 20,
+  });
   const selectedWorkflowIsInline = Boolean(
     selectedWorkflow && hasInlineToken(value, workflowInvokeToken(selectedWorkflow)),
   );
-  const workflowFiltered = workflows
-    .filter((workflow) => {
-      if (selectedWorkflowIsInline) return false;
-      const q = workflowQuery.trim().toLowerCase();
-      if (!q) return true;
-      return [
-        workflow.title,
-        workflow.description,
-        workflowInvokeToken(workflow),
-      ]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase()
-        .includes(q);
-    })
-    .slice(0, 20);
-  const mentionFiltered = mentions
-    .filter((mention) => {
-      const q = mentionQuery.trim().toLowerCase();
-      if (!q) return true;
-      return (
-        mention.name.toLowerCase().includes(q) ||
-        mention.subtitle?.toLowerCase().includes(q) ||
-        mention.type.includes(q)
-      );
-    })
-    .slice(0, 12);
+  const workflowFiltered = searchComposerOptions(selectedWorkflowIsInline ? [] : workflows, workflowQuery, {
+    key: (item) => item.bindingId,
+    names: (item) => [item.title, workflowInvokeToken(item).slice(1)],
+    keywords: (item) => [item.description, item.workspace_name], limit: 20,
+  });
+  const mentionFiltered = searchComposerOptions(mentions.filter((mention) =>
+    !selectedMentions.some((selected) => selected.name === mention.name && hasInlineToken(value, `@${selected.name}`))), mentionQuery, {
+    key: (item) => `${item.type}:${item.id}`, names: (item) => [item.name],
+    keywords: (item) => [item.subtitle, item.type, resourceOrigin(item)], limit: 12,
+  });
+  useEffect(() => {
+    setSkillActiveIdx((index) => Math.min(index, Math.max(0, skillFiltered.length - 1)));
+    setWorkflowActiveIdx((index) => Math.min(index, Math.max(0, workflowFiltered.length - 1)));
+    setMentionActiveIdx((index) => Math.min(index, Math.max(0, mentionFiltered.length - 1)));
+  }, [skillFiltered.length, workflowFiltered.length, mentionFiltered.length]);
 
   /* KB picker */
-  const { data: kbDocs, isLoading: kbDocsLoading } = useQuery({
-    queryKey: ["documents", "kb-picker-shared", kbSearch],
+  const { data: kbDocs, isLoading: kbDocsLoading, isError: kbDocsError, refetch: refetchKbDocs } = useQuery({
+    queryKey: ["documents", "kb-picker-shared", authUser?.id, authUser?.entity_id, voiceScope?.workspaceId, kbSearch],
     queryFn: () =>
       api.documents.list({
         search: kbSearch || undefined,
+        workspace_id: voiceScope?.workspaceId || undefined,
         limit: 20,
       }),
     enabled: kbPickerOpen,
@@ -1324,7 +1426,7 @@ export default function ChatInputFooter({
             : findLastTriggerOutsideTokens(val, "@", allProtectedTokenRanges)
           : findLastTriggerOutsideTokens(before, "@", protectedTokenRanges));
       if (
-        mentions.length > 0 &&
+        (!isSimple || humanChat) && mentions.length > 0 &&
         atIdx >= 0 &&
         (atIdx === 0 || /\s/.test(val[atIdx - 1]))
       ) {
@@ -1371,7 +1473,7 @@ export default function ChatInputFooter({
             ? forcedHashIdx
             : findLastTriggerOutsideTokens(val, "#", allProtectedTokenRanges)
           : findLastTriggerOutsideTokens(before, "#", protectedTokenRanges));
-      if (hashIdx >= 0 && (hashIdx === 0 || /\s/.test(val[hashIdx - 1]))) {
+      if (!humanChat && hashIdx >= 0 && (hashIdx === 0 || /\s/.test(val[hashIdx - 1]))) {
         const hashCursor = activeHashTrigger
           ? hashIdx + 1 + activeHashTrigger.query.length
           : forcedHashIdx != null || cursorPos < hashIdx + 1
@@ -1409,7 +1511,7 @@ export default function ChatInputFooter({
             ? forcedSkillIdx
             : findLastTriggerOutsideTokens(val, "/", allProtectedTokenRanges)
           : findLastTriggerOutsideTokens(before, "/", protectedTokenRanges));
-      if (skillIdx >= 0 && (skillIdx === 0 || /\s/.test(val[skillIdx - 1]))) {
+      if (!humanChat && !isSimple && skillIdx >= 0 && (skillIdx === 0 || /\s/.test(val[skillIdx - 1]))) {
         const skillCursor = activeSkillTrigger
           ? skillIdx + 1 + activeSkillTrigger.query.length
           : forcedSkillIdx != null || cursorPos < skillIdx + 1
@@ -1453,7 +1555,7 @@ export default function ChatInputFooter({
             : findLastTriggerOutsideTokens(val, "%", allProtectedTokenRanges)
           : findLastTriggerOutsideTokens(before, "%", protectedTokenRanges));
       if (
-        workflows.length > 0 &&
+        !humanChat && !isSimple && workflows.length > 0 &&
         workflowIdx >= 0 &&
         (workflowIdx === 0 || /\s/.test(val[workflowIdx - 1]))
       ) {
@@ -1488,6 +1590,8 @@ export default function ChatInputFooter({
     },
     [
       attachedFiles,
+      humanChat,
+      isSimple,
       mentions.length,
       onChange,
       selectedManualSkills,
@@ -1602,6 +1706,10 @@ export default function ChatInputFooter({
         id: rawSkill.id,
         name: rawSkill.name || rawSkill.slug || t("component.chat_input_footer.skill"),
         reference: { kind: "id", value: rawSkill.id },
+        entity_id: rawSkill.entity_id,
+        workspace_id: rawSkill.workspace_id,
+        workspace_name: rawSkill.workspace_name,
+        visibility: rawSkill.visibility,
         slug: rawSkill.slug,
         displayName: rawSkill.displayName || rawSkill.display_name,
         display_name: rawSkill.display_name,
@@ -1613,12 +1721,13 @@ export default function ChatInputFooter({
         skillTriggerPos >= 0
           ? skillTriggerPos
           : getPlainOffset(editorRef.current);
-      const before = value.substring(0, start);
+      const currentValue = getEditorText(editorRef.current) || value;
+      const before = currentValue.substring(0, start);
       const replaceEnd =
         skillReplaceEndRef.current >= start
           ? skillReplaceEndRef.current
           : Math.max(start, getPlainOffset(editorRef.current));
-      const after = value.substring(replaceEnd);
+      const after = currentValue.substring(replaceEnd);
       const token = manualSkillToken(skill);
       const prefixSpacer =
         before && !before.endsWith(" ") && !before.endsWith("\n") ? " " : "";
@@ -1836,34 +1945,17 @@ export default function ChatInputFooter({
     [onMentionRemove, removeTokenText],
   );
 
-  const handleFileSelect = useCallback(
-    (e: React.ChangeEvent<HTMLInputElement>) => {
-      closeAttachmentPickers();
-      const files = e.target.files;
-      if (files) {
-        Array.from(files).forEach((file) => {
-          setAttachedFiles((prev) => [
-            ...prev,
-            {
-              name: file.name,
-              type: "file",
-              file,
-              mimeType: file.type,
-              fileType: extensionFromMimeType(file.type),
-            },
-          ]);
-        });
-      }
-      e.target.value = "";
-    },
-    [closeAttachmentPickers],
-  );
-
   const attachLocalFiles = useCallback((files: File[]) => {
     if (files.length === 0) return;
+    const accepted = attachments === "room-files"
+      ? files.filter((file) => file.size <= ROOM_FILE_MAX_BYTES)
+      : files;
+    setAttachmentError(accepted.length !== files.length
+      ? t("component.chat_input_footer.knowledge_group_too_large") : "");
+    if (accepted.length === 0) return;
     setAttachedFiles((prev) => [
       ...prev,
-      ...files.map((file) => ({
+      ...accepted.map((file) => ({
         name: file.name,
         type: "file" as const,
         file,
@@ -1871,7 +1963,52 @@ export default function ChatInputFooter({
         fileType: extensionFromMimeType(file.type),
       })),
     ]);
-  }, []);
+  }, [attachments, setAttachedFiles]);
+
+  const handleFileSelect = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      closeAttachmentPickers();
+      attachLocalFiles(Array.from(e.target.files || []));
+      e.target.value = "";
+    },
+    [attachLocalFiles, closeAttachmentPickers],
+  );
+
+  const handleFileDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (disabled || streaming || attachments === "none") return;
+    fileDragDepthRef.current += 1;
+    setFileDragActive(true);
+  };
+
+  const handleFileDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = disabled || streaming || attachments === "none" ? "none" : "copy";
+  };
+
+  const handleFileDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    fileDragDepthRef.current = Math.max(0, fileDragDepthRef.current - 1);
+    if (fileDragDepthRef.current === 0) setFileDragActive(false);
+  };
+
+  const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer.types.includes("Files") && !e.dataTransfer.files.length) return;
+    e.preventDefault();
+    e.stopPropagation();
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    if (disabled || streaming || attachments === "none") return;
+    closeAttachmentPickers();
+    attachLocalFiles(Array.from(e.dataTransfer.files));
+    editorRef.current?.focus();
+  };
 
   const handleEditorPaste = useCallback(
     (e: React.ClipboardEvent<HTMLDivElement>) => {
@@ -1885,7 +2022,8 @@ export default function ChatInputFooter({
         itemFiles.length > 0
           ? []
           : Array.from(e.clipboardData.files || []).map(normalizePastedFile);
-      const files = [...itemFiles, ...dataFiles];
+      // A surface that does not transmit attachments must not accept pasted files.
+      const files = attachments === "none" ? [] : [...itemFiles, ...dataFiles];
       const text = e.clipboardData.getData("text/plain");
 
       e.preventDefault();
@@ -1896,7 +2034,7 @@ export default function ChatInputFooter({
       }
       insertPlainTextAtCursor(text);
     },
-    [attachLocalFiles, insertPlainTextAtCursor],
+    [attachLocalFiles, attachments, insertPlainTextAtCursor],
   );
 
   const addKbDoc = (doc: ComposerDocumentOption) => {
@@ -1934,6 +2072,7 @@ export default function ChatInputFooter({
         insertComposerHint(`Use ${server.name} to `);
         return;
       }
+      if (accessState === "connect" && integrationSetupState(server) !== "ready") return;
       setIntegrationsMenuOpen(false);
       // Popup authorization must not unmount the composer and discard its draft/files.
       // Reuse Integrations' authorization controller, including sync and WhatsApp setup.
@@ -1952,14 +2091,14 @@ export default function ChatInputFooter({
     setAttachedFiles((prev) => prev.filter((_, i) => i !== idx));
   };
 
-  const triggerSend = useCallback(() => {
+  const triggerSend = useCallback(async () => {
     const text = value.trim();
     const currentAttachments = attachedFilesRef.current;
-    const manualSkillSnapshot = selectedManualSkills.filter((skill) =>
+    const manualSkillSnapshot = isSimple || humanChat ? [] : selectedManualSkills.filter((skill) =>
       hasInlineToken(value, manualSkillToken(skill)),
     );
     const workflowSnapshot =
-      flowsAvailable &&
+      !humanChat && !isSimple && flowsAvailable &&
       selectedWorkflow &&
       hasInlineToken(value, workflowInvokeToken(selectedWorkflow))
         ? selectedWorkflow
@@ -1976,8 +2115,32 @@ export default function ChatInputFooter({
     )
       return;
     sendLockedRef.current = true;
+    setAttachmentError("");
+    let snapshot = currentAttachments;
+    if (attachments === "documents" && currentAttachments.some((item) => item.file)) {
+      setPreparingFiles(true);
+      try {
+        snapshot = await Promise.all(currentAttachments.map(async (item) => {
+          if (!item.file) return item;
+          const file = await prepareChatUploadFile(item.file);
+          return file === item.file ? item : {
+            ...item, file, name: file.name,
+            fileType: file.name.split(".").pop(), mimeType: file.type,
+          };
+        }));
+        if (attachedFilesRef.current !== currentAttachments) {
+          sendLockedRef.current = false;
+          return;
+        }
+      } catch {
+        setAttachmentError(t("component.chat_input_footer.file_prepare_failed"));
+        sendLockedRef.current = false;
+        return;
+      } finally {
+        setPreparingFiles(false);
+      }
+    }
     dismissHashAutocomplete(false, false);
-    const snapshot = currentAttachments;
     setAttachedFiles([]);
     setSelectedManualSkills([]);
     setSelectedWorkflow(null);
@@ -1993,6 +2156,9 @@ export default function ChatInputFooter({
     }, 750);
   }, [
     value,
+    attachments,
+    isSimple,
+    humanChat,
     streaming,
     selectedManualSkills,
     selectedWorkflow,
@@ -2213,14 +2379,14 @@ export default function ChatInputFooter({
     (item) =>
       item.type === "knowledge" && hasInlineToken(value, `#${item.name}`),
   );
-  const inlineMentionRefs = selectedMentions.filter((mention) =>
+  const inlineMentionRefs = isSimple && !humanChat ? [] : selectedMentions.filter((mention) =>
     hasInlineToken(value, `@${mention.name}`),
   );
-  const inlineSkillRefs = selectedManualSkills.filter((skill) =>
+  const inlineSkillRefs = isSimple || humanChat ? [] : selectedManualSkills.filter((skill) =>
     hasInlineToken(value, manualSkillToken(skill)),
   );
   const inlineWorkflowRef =
-    selectedWorkflow && selectedWorkflowIsInline ? selectedWorkflow : null;
+    !humanChat && !isSimple && selectedWorkflow && selectedWorkflowIsInline ? selectedWorkflow : null;
   const inlineCardParts = (() => {
     type InlinePart =
       | { kind: "text"; text: string; key: string }
@@ -2325,8 +2491,12 @@ export default function ChatInputFooter({
       return;
     inlineThumbnailUrlsRef.current.forEach(revokeObjectUrl);
     inlineThumbnailUrlsRef.current = [];
-    inlineAvatarRootsRef.current.forEach((avatarRoot) => avatarRoot.unmount());
+    const avatarRoots = inlineAvatarRootsRef.current;
     inlineAvatarRootsRef.current = [];
+    // These are independent React roots; dispose them after this layout commit.
+    queueMicrotask(() =>
+      avatarRoots.forEach((avatarRoot) => avatarRoot.unmount()),
+    );
     let cancelled = false;
 
     const makeTokenNode = (part: (typeof inlineCardParts)[number]) => {
@@ -2384,7 +2554,7 @@ export default function ChatInputFooter({
         badge.textContent = composerReferenceBadge(part.item, refKind).slice(0, 5);
         if (refKind === "image" || refKind === "video") {
           const load = (() => {
-            if (part.item.file && refKind === "image") return Promise.resolve(URL.createObjectURL(part.item.file));
+            if (part.item.file && refKind === "image") return api.documents.localImageThumbnail(part.item.file);
             if (!part.item.id) return null;
             return refKind === "image"
               ? api.documents.imageThumbnail(part.item.id, { cache: true })
@@ -2449,7 +2619,7 @@ export default function ChatInputFooter({
             className="chat-composer-menu chat-composer-menu--capabilities chat-composer-menu--portal"
             style={portalMenuStyle(attachMenuCoords)}
           >
-            <button
+            {(!humanChat || attachments === "room-files") && <button
               onClick={() => {
                 setAttachMenuOpen(false);
                 setKbPickerOpen(true);
@@ -2459,7 +2629,7 @@ export default function ChatInputFooter({
             >
               <IconDocument size={16} style={{ color: "#4869ac" }} />
               <span>{t("component.chat_input_footer.add_from_knowledge_base")}</span>
-            </button>
+            </button>}
             <button
               onClick={() => {
                 setAttachMenuOpen(false);
@@ -2517,6 +2687,7 @@ export default function ChatInputFooter({
                 <button
                   key={server.server_key}
                   onClick={() => handleConnectorClick(server)}
+                  disabled={connectorAccessState(server) === "connect" && integrationSetupState(server) !== "ready"}
                   className="chat-composer-connector"
                   type="button"
                 >
@@ -2532,6 +2703,10 @@ export default function ChatInputFooter({
                       ? t("component.chat_input_footer.use_connector")
                       : connectorAccessState(server) === "repair"
                       ? t("page.integrations.needs_attention")
+                      : integrationSetupState(server) === "unavailable"
+                      ? t("page.integrations.status_unavailable")
+                      : integrationSetupState(server) === "checking"
+                      ? t("page.integrations.checking_setup")
                       : t("page.apps.connect")}
                   </span>
                 </button>
@@ -2596,17 +2771,26 @@ export default function ChatInputFooter({
                 <IconClose size={12} />
               </button>
             </div>
+            {humanChat && attachments === "room-files" && (
+              <p className="m-0 px-2 pb-2 text-xs leading-5 text-[var(--text-muted)]">
+                {t("component.chat_input_footer.knowledge_shared_with_group")}
+              </p>
+            )}
             <div className="chat-composer-knowledge-list">
               {kbDocsLoading ? (
                 <div className="chat-composer-hash-empty chat-composer-knowledge-loading">
                   <InlineRowsSkeleton rows={4} dense />
                 </div>
+              ) : kbDocsError ? (
+                <button type="button" className="chat-composer-menu-item" onClick={() => void refetchKbDocs()}>
+                  {t("component.chat_input_footer.knowledge_load_failed")}
+                </button>
               ) : (kbDocs?.items || []).length === 0 ? (
                 <div className="chat-composer-hash-empty">
                   {t("component.chat_input_footer.no_documents_found")}
                 </div>
               ) : null}
-              {!kbDocsLoading &&
+              {!kbDocsLoading && !kbDocsError &&
                 (kbDocs?.items || []).map((doc: ComposerDocumentOption) => {
                   const ext = (
                     doc.file_type ||
@@ -2616,21 +2800,27 @@ export default function ChatInputFooter({
                   const alreadyAttached = attachedFiles.some(
                     (file) => file.id === doc.id,
                   );
+                  const blockReason = humanChat && attachments === "room-files"
+                    ? roomKnowledgeBlockReason(doc)
+                    : null;
                   return (
                     <button
                       key={doc.id}
-                      onClick={() => addKbDoc(doc)}
+                      onClick={() => { if (!blockReason) addKbDoc(doc); }}
                       disabled={alreadyAttached}
+                      aria-disabled={Boolean(blockReason) || alreadyAttached}
                       className="chat-composer-hash-item chat-composer-knowledge-item"
                       type="button"
-                      aria-label={doc.name}
+                      aria-label={blockReason ? `${doc.name}: ${blockReason}` : doc.name}
+                      title={blockReason || doc.name}
                     >
                       <ComposerReferenceThumbnail
                         item={composerPreviewItemFromDoc(doc)}
                         className="chat-composer-hash-thumb"
                       />
-                      <span className="chat-composer-hash-name">
-                        {doc.name}
+                      <span className="min-w-0 flex-1">
+                        <span className="chat-composer-hash-name block">{doc.name}</span>
+                        {blockReason && <span className="block truncate text-[10px] text-[var(--text-muted)]">{blockReason}</span>}
                       </span>
                       <span className="chat-composer-hash-ext">
                         {ext.slice(0, 4) || "?"}
@@ -2647,14 +2837,15 @@ export default function ChatInputFooter({
   return (
     <>
       {attachMenuPortal}
-      {integrationsMenuPortal}
-      {kbPickerPortal}
+      {!humanChat && !isSimple && integrationsMenuPortal}
+      {(!humanChat || attachments === "room-files") && kbPickerPortal}
 
       <div
         className={className || "embedded-chat-footer"}
         style={{ position: "relative" }}
       >
         {topSlot}
+        {attachmentError && <p role="alert" className="m-0 pb-2 text-sm text-red-700">{attachmentError}</p>}
 
         <input
           ref={fileInputRef}
@@ -2668,7 +2859,17 @@ export default function ChatInputFooter({
         <div
           ref={composerRef}
           className={`chat-composer ${focused ? "chat-composer--focused" : ""} ${streaming ? "chat-composer--streaming" : ""}`}
+          onDragEnter={handleFileDragEnter}
+          onDragOver={handleFileDragOver}
+          onDragLeave={handleFileDragLeave}
+          onDrop={handleFileDrop}
         >
+          {fileDragActive && attachments !== "none" && !disabled && !streaming && (
+            <div className="chat-composer-drop-overlay" role="status">
+              <IconUpload size={20} />
+              <span>{t("component.chat_input_footer.drop_files_to_attach")}</span>
+            </div>
+          )}
           {attachedFiles.length > 0 && (
             <div className="chat-composer-attachments">
               {attachedFiles.map((f, i) => (
@@ -2720,7 +2921,7 @@ export default function ChatInputFooter({
 
           {/* Textarea + # autocomplete */}
           <div className="chat-composer-input-wrap">
-            {mentionDropdownOpen && (
+            {(!isSimple || humanChat) && mentionDropdownOpen && (
               <div className="chat-composer-mention-menu">
                 <div className="chat-composer-hash-title">
                   <span>{t("component.chat_input_footer.mention")}</span>
@@ -2767,6 +2968,7 @@ export default function ChatInputFooter({
                       </span>
                       <span className="chat-composer-mention-main">
                         <strong>{mention.name}</strong>
+                        <ComposerResourceSource source={mention.type === "agent" && !humanChat ? resourceOrigin(mention) : ""} identity={mentionIdentity(mention)} id={mention.id} />
                         <small>
                           {mention.subtitle ||
                             (mention.type === "agent"
@@ -2782,7 +2984,7 @@ export default function ChatInputFooter({
                 )}
               </div>
             )}
-            {skillDropdownOpen && (
+            {!humanChat && !isSimple && skillDropdownOpen && (
               <div className="chat-composer-mention-menu chat-composer-skill-menu">
                 <div className="chat-composer-hash-title">
                   <span>{t("nav.skills")}</span>
@@ -2800,6 +3002,13 @@ export default function ChatInputFooter({
                 {skillsLoading ? (
                   <div className="chat-composer-hash-empty" style={{ textAlign: "left" }}>
                     <InlineRowsSkeleton rows={4} dense />
+                  </div>
+                ) : skillsError ? (
+                  <div className="chat-composer-hash-empty" role="alert">
+                    {t("component.chat_input_footer.skills_load_failed")}{" "}
+                    <button type="button" onMouseDown={(e) => e.preventDefault()} onClick={() => void refetchSkills()}>
+                      {t("component.chat_input_footer.retry")}
+                    </button>
                   </div>
                 ) : skillFiltered.length === 0 ? (
                   <div className="chat-composer-hash-empty">
@@ -2827,6 +3036,7 @@ export default function ChatInputFooter({
                               skill.name ||
                               skill.slug}
                           </strong>
+                          <ComposerResourceSource source={resourceOrigin(skill)} identity={skillIdentity(skill)} id={skill.id} />
                           <small>
                             {description ||
                               skill.slug ||
@@ -2842,7 +3052,7 @@ export default function ChatInputFooter({
                 )}
               </div>
             )}
-            {workflowDropdownOpen && (
+            {!humanChat && !isSimple && workflowDropdownOpen && (
               <div className="chat-composer-mention-menu chat-composer-workflow-menu">
                 <div className="chat-composer-hash-title">
                   <span>
@@ -2890,6 +3100,7 @@ export default function ChatInputFooter({
                       </span>
                       <span className="chat-composer-mention-main">
                         <strong>{workflow.title}</strong>
+                        <ComposerResourceSource source={workflow.workspace_name || (workflow.workspace_id ? t("page.app_layout.workspace") : "")} identity={workflowIdentity(workflow)} id={workflow.bindingId} />
                         <small>
                           {workflow.description ||
                             t("component.chat_input_footer.run_this_flow_for_the_next_message")}
@@ -2905,7 +3116,7 @@ export default function ChatInputFooter({
                 )}
               </div>
             )}
-            {hashDropdownOpen && (
+            {!humanChat && hashDropdownOpen && (
               <div className="chat-composer-hash-menu">
                 <div className="chat-composer-hash-title">
                   <span>{t("component.chat_input_footer.files_and_documents")}</span>
@@ -2959,12 +3170,14 @@ export default function ChatInputFooter({
               ref={editorRef}
               role="textbox"
               aria-multiline="true"
-              contentEditable={!streaming && !disabled}
-              aria-disabled={disabled || streaming}
+              contentEditable={!streaming && !disabled && !preparingFiles}
+              aria-disabled={disabled || streaming || preparingFiles}
               suppressContentEditableWarning
               data-placeholder={
                 voice.phase === "recording"
                   ? t("component.chat_input_footer.speak_now")
+                  : isSimple && !humanChat && !disabled
+                  ? t("component.chat_input_footer.simple_placeholder")
                   : placeholder || t("component.chat_input_footer.message_placeholder")
               }
               onBeforeInput={handleEditorBeforeInput}
@@ -2977,16 +3190,24 @@ export default function ChatInputFooter({
             />
           </div>
 
-          <VoiceInputStatus voice={voice} />
+          {!humanChat && <VoiceInputStatus voice={voice} />}
           <div
-            className={`chat-composer-row ${modeSlot ? "chat-composer-row--mode-aware" : ""}`}
+            className={`chat-composer-row ${!isSimple && modeSlot ? "chat-composer-row--mode-aware" : ""}`}
           >
-            {modeSlot}
+            {((!humanChat && !isSimple && modeSlot) || approvalSlot) && (
+              <div className="chat-composer-context-controls">
+                {!humanChat && !isSimple && modeSlot}
+                {approvalSlot}
+              </div>
+            )}
 
-            {!replaceActionButtons ? (
-              <>
-            {/* Attach */}
-            <div style={{ position: "relative" }} ref={attachMenuRef}>
+            {(humanChat || isSimple || !replaceActionButtons) ? (
+              <div className="chat-composer-tools">
+            {/* Attach: only offered when the parent surface transmits attachments */}
+            <div
+              style={{ position: "relative", display: attachments === "none" ? "none" : undefined }}
+              ref={attachMenuRef}
+            >
               <button
                 ref={attachMenuButtonRef}
                 onClick={() => {
@@ -2996,12 +3217,12 @@ export default function ChatInputFooter({
                 }}
                 disabled={streaming || disabled}
                 title={
-                  attachmentButtonIcon === "paperclip"
+                  humanChat || isSimple || attachmentButtonIcon === "paperclip"
                     ? t("page.task_detail.attachments")
                     : t("component.chat_input_footer.add_context_or_tools")
                 }
                 aria-label={
-                  attachmentButtonIcon === "paperclip"
+                  humanChat || isSimple || attachmentButtonIcon === "paperclip"
                     ? t("page.task_detail.attachments")
                     : t("component.chat_input_footer.add_context_or_tools")
                 }
@@ -3031,12 +3252,15 @@ export default function ChatInputFooter({
             </div>
 
             {/* Integrations */}
+            {!humanChat && !isSimple && <>
             <div style={{ position: "relative" }} ref={integrationsMenuRef}>
               <button
                 ref={integrationsMenuButtonRef}
                 onClick={() => setIntegrationsMenuOpen(!integrationsMenuOpen)}
                 disabled={streaming || disabled}
                 title={t("component.chat_input_footer.connectors")}
+                aria-label={t("component.chat_input_footer.connectors")}
+                aria-expanded={integrationsMenuOpen}
                 className={`chat-composer-icon-btn ${integrationsMenuOpen ? "chat-composer-icon-btn--active" : ""}`}
                 type="button"
               >
@@ -3048,6 +3272,7 @@ export default function ChatInputFooter({
               onClick={() => insertComposerHint(t("component.chat_input_footer.create_task_hint"))}
               disabled={streaming || disabled}
               title={t("component.chat_input_footer.create_task")}
+              aria-label={t("component.chat_input_footer.create_task")}
               className="chat-composer-icon-btn"
               type="button"
             >
@@ -3058,24 +3283,28 @@ export default function ChatInputFooter({
               onClick={openSkillPicker}
               disabled={streaming || disabled}
               title={t("component.chat_input_footer.use_skill")}
+              aria-label={t("component.chat_input_footer.use_skill")}
+              aria-expanded={skillDropdownOpen}
               className={`chat-composer-icon-btn ${skillDropdownOpen ? "chat-composer-icon-btn--active" : ""}`}
               type="button"
             >
               <IconSkill size={17} />
             </button>
+            </>}
 
-            <VoiceInputButton voice={voice} disabled={streaming || disabled} />
-            {voiceScope && <LiveChatCallButton scope={voiceScope} disabled={streaming || disabled || voice.busy} onConversation={onVoiceConversation} />}
-              </>
+            {!humanChat && <VoiceInputButton voice={voice} disabled={streaming || disabled} />}
+            {!humanChat && voiceScope && <LiveChatCallButton scope={voiceScope} disabled={streaming || disabled || voice.busy} onConversation={onVoiceConversation} />}
+              </div>
             ) : null}
 
-            {beforeTextarea}
+            {!humanChat && !isSimple && beforeTextarea}
 
             {/* Send / Stop */}
             {streaming && showStopButton ? (
               <button
                 onClick={onStop}
                 disabled={disabled}
+                aria-label={t("component.chat_input_footer.stop_generating")}
                 title={t("component.chat_input_footer.stop_generating")}
                 className="chat-composer-send chat-composer-send--stop"
                 type="button"
@@ -3092,11 +3321,13 @@ export default function ChatInputFooter({
             ) : (
               <button
                 onClick={triggerSend}
-                disabled={disabled || streaming || voice.busy || !canSend}
+                disabled={disabled || streaming || preparingFiles || voice.busy || !canSend}
+                aria-busy={preparingFiles}
+                aria-label={t("page.messages.send")}
                 className="chat-composer-send"
                 type="button"
               >
-                <svg
+                {preparingFiles ? <span className="chat-tool-spinner" aria-hidden="true" /> : <svg
                   width="16"
                   height="16"
                   viewBox="0 0 24 24"
@@ -3108,7 +3339,7 @@ export default function ChatInputFooter({
                 >
                   <path d="M22 2L11 13" />
                   <path d="M22 2l-7 20-4-9-9-4 20-7z" />
-                </svg>
+                </svg>}
               </button>
             )}
           </div>

@@ -38,16 +38,16 @@ export function getFilePreviewKind(file: FilePreviewReference): FilePreviewKind 
 
   if (fileReferenceKind(file.name || "", file.mime_type || file.mimeType || undefined, file.file_type || file.fileType || undefined) === "diagram") return "diagram";
   if (["docx", "doc", "wps"].includes(ext) || ["docx", "doc"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") return "docx";
-  if (["xlsx", "xls", "et"].includes(ext) || ["xlsx", "xls"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return "xlsx";
+  if (["xlsx", "xls", "xlsm", "et", "ods"].includes(ext) || ["xlsx", "xls"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return "xlsx";
   if (["pptx", "ppt", "dps"].includes(ext) || ["pptx", "ppt"].includes(fileType) || mime === "application/vnd.openxmlformats-officedocument.presentationml.presentation") return "pptx";
   if (ext === "pdf" || fileType === "pdf" || mime === "application/pdf") return "pdf";
   if (["md", "markdown"].includes(ext)) return "markdown";
   if (["html", "htm"].includes(ext) || mime === "text/html") return "html";
   if (ext === "json" || mime === "application/json") return "json";
-  if (ext === "csv" || mime === "text/csv") return "csv";
+  if (["csv", "tsv"].includes(ext) || ["text/csv", "text/tab-separated-values"].includes(mime)) return "csv";
   if (persistedKind === "page") return "html";
-  if (["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"].includes(ext) || fileType === "image" || mime.startsWith("image/")) return "image";
-  if (["mp4", "webm", "mov", "avi", "mkv"].includes(ext) || fileType === "video" || mime.startsWith("video/")) return "video";
+  if (["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif"].includes(ext) || fileType === "image" || mime.startsWith("image/")) return "image";
+  if (["mp4", "m4v", "webm", "mov", "avi", "mkv"].includes(ext) || fileType === "video" || mime.startsWith("video/")) return "video";
   if (["mp3", "wav", "ogg", "aac", "flac", "m4a"].includes(ext) || fileType === "audio" || mime.startsWith("audio/")) return "audio";
   if (persistedKind === "code" || isCodeLikeFile(file)) return "code";
   if (["txt", "log", "env", "gitignore", "dockerignore", "editorconfig"].includes(ext) || mime.startsWith("text/")) return "text";

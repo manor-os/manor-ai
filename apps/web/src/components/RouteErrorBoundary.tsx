@@ -14,6 +14,8 @@ import { useRouteError } from "react-router-dom";
 import { useEffect, useState } from "react";
 import {
   clearRecoverableErrorAutoReloadAttempt,
+  ApplicationReloadMode,
+  reloadApplication,
   getErrorText,
   isRecoverableErrorAutoReloadScheduled,
   isRecoverableUiRuntimeError,
@@ -46,7 +48,7 @@ export default function RouteErrorBoundary() {
 
   useEffect(() => {
     if (!autoReloadAvailable) return;
-    const reloadDelayMs = scheduleRecoverableErrorAutoReload();
+    const reloadDelayMs = scheduleRecoverableErrorAutoReload(error);
     if (reloadDelayMs === null) {
       if (!isRecoverableErrorAutoReloadScheduled()) setAutoReloadUnavailable(true);
       return;
@@ -91,7 +93,7 @@ export default function RouteErrorBoundary() {
           <button
             onClick={() => {
               clearRecoverableErrorAutoReloadAttempt();
-              window.location.reload();
+              reloadApplication(stale ? ApplicationReloadMode.RecoverAssets : ApplicationReloadMode.Refresh);
             }}
             className="px-4 py-2 btn-manor"
           >

@@ -226,12 +226,11 @@ export default function DateTimePicker({
 
       {/* Popup — portaled to body so ancestor overflow/backdrop-filter
           can't clip it (the task drawer was clipping the calendar).
-          Z-index 10500 so it sits above modal overlays (10000) and the
-          onboarding tour (10001) — needed when the picker is triggered
-          from inside a modal form (e.g., create-task dialog deadline). */}
+          Modal uses the 20000/20001 layer, so match other portaled menus
+          opened from a dialog and render above its surface. */}
       {open && coords && createPortal(
         <div ref={popupNodeRef} style={{
-          position: "fixed", top: coords.top, left: coords.left, zIndex: 10500,
+          position: "fixed", top: coords.top, left: coords.left, zIndex: 20010,
           background: "var(--surface-panel)", backdropFilter: "blur(24px)",
           border: "1px solid var(--border-default)", borderRadius: 16,
           boxShadow: "var(--shadow-lg)",

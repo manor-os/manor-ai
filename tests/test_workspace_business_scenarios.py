@@ -16,6 +16,10 @@ from sqlalchemy import select
 
 from packages.core.ai.tools.workspace_agent_tools import _workspace_create_task_handler
 from packages.core.governance import check_step_policy, get_policy
+from packages.core.governance.approval_projection import policy_override
+from packages.core.governance.approval_policy_service import account_defaults, local_defaults
+from packages.core.models.user import Entity, User, UserMembership
+from tests.approval_settings_test_utils import action_rule, set_workspace_test_approval
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.document import Channel, DocumentGroup
@@ -32,8 +36,10 @@ from packages.core.models.workspace import (
 )
 from packages.core.services.credit_service import usd_to_credits
 from packages.core.services.workspace_setup_service import (
+    EXPLICIT_HARD_BLOCK_RULES_FIELD,
     WorkspaceSetupSession,
     finalize_setup,
+    workspace_rule_fingerprint,
 )
 
 # Register built-in channel adapters, including webchat, before setup finalizes.
@@ -249,8 +255,9 @@ BUSINESS_SCENARIOS: list[dict[str, Any]] = [
             },
         ],
         "policy_checks": [
+            # These are system-authored draft rules, not operator-confirmed bans.
             ("email.send", "medium", False, True),
-            ("workspace.file.delete", "medium", False, False),
+            ("workspace.file.delete", "medium", False, True),
         ],
         "task": {
             "title": "Draft a discovery-to-proposal brief for a new strategy client",
@@ -406,7 +413,7 @@ BUSINESS_SCENARIOS: list[dict[str, Any]] = [
         ],
         "policy_checks": [
             ("social_post.publish", "high", False, True),
-            ("social_post.delete", "medium", False, False),
+            ("social_post.delete", "medium", False, True),
         ],
         "task": {
             "title": "Create next week's WeChat Channels script and posting pack",
@@ -571,7 +578,7 @@ BUSINESS_SCENARIOS: list[dict[str, Any]] = [
         ],
         "policy_checks": [
             ("social_post.publish", "high", False, True),
-            ("social_post.delete", "medium", False, False),
+            ("social_post.delete", "medium", False, True),
         ],
         "task": {
             "title": "Prepare a cross-platform campaign calendar and review queue",
@@ -602,7 +609,7 @@ def _business_workspace_fields(scenario: dict[str, Any], budget_credits: int) ->
         "rules": scenario["rules"],
         "governance_policy": {
             "max_risk_level": "high",
-            "default_action": "allow",
+            "approval": {"mode": None, "rules": []},
         },
         "flagged_integrations": scenario["flagged_integrations"],
         "channel_config": scenario["channel_config"],
@@ -619,6 +626,7 @@ def _business_workspace_fields(scenario: dict[str, Any], budget_credits: int) ->
 async def _create_business_workspace(db_session, scenario: dict[str, Any]):
     entity_id = generate_ulid()
     user_id = generate_ulid()
+    await _create_approval_owner(db_session, entity_id, user_id)
     budget_credits = usd_to_credits(250)
     setup_session = WorkspaceSetupSession(
         entity_id=entity_id,
@@ -633,6 +641,14 @@ async def _create_business_workspace(db_session, scenario: dict[str, Any]):
     await db_session.commit()
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == workspace_id))).scalar_one()
     return workspace, entity_id, user_id, budget_credits
+
+
+async def _create_approval_owner(db, entity_id, user_id):
+    db.add_all([Entity(id=entity_id, name="Scenario account", settings={"approval_defaults": account_defaults()}),
+        User(id=user_id, entity_id=entity_id, email=f"{user_id}@example.test", password_hash="test-only", role="owner",
+            preferences={"approval_policy": {entity_id: local_defaults(entity_id)}}),
+        UserMembership(user_id=user_id, entity_id=entity_id, role="owner", status="active", is_primary=True)])
+    await db.flush()
 
 
 @pytest.mark.asyncio
@@ -685,6 +701,56 @@ async def test_business_workspaces_can_operate_end_to_end(db_session, scenario):
 
 
 @pytest.mark.asyncio
+async def test_confirmed_business_delete_ban_remains_a_hard_block(db_session):
+    scenario = BUSINESS_SCENARIOS[0]
+    fields = _business_workspace_fields(scenario, usd_to_credits(250))
+    fields["rules"] = [dict(rule) for rule in fields["rules"]]
+    manual_rule = fields["rules"][1]
+    manual_rule["rule_key"] = "operator_delete_ban"
+    manual_rule["enforcement_scope"] = "all_matching_actions"
+    # Simulate the exact server-owned receipt issued after an operator request.
+    fields[EXPLICIT_HARD_BLOCK_RULES_FIELD] = {
+        manual_rule["rule_key"]: workspace_rule_fingerprint(manual_rule),
+    }
+    setup_session = WorkspaceSetupSession(
+        entity_id=generate_ulid(),
+        user_id=generate_ulid(),
+        fields=fields,
+        messages=[],
+        ready=True,
+        missing=[],
+    )
+    await _create_approval_owner(db_session, setup_session.entity_id, setup_session.user_id)
+
+    workspace_id = await finalize_setup(setup_session, db_session)
+    workspace = await db_session.get(Workspace, workspace_id)
+    assert workspace.operating_model["rules"][1]["rule_type"] == "never_allow"
+    assert EXPLICIT_HARD_BLOCK_RULES_FIELD not in workspace.operating_model
+
+    policy = await get_policy(db_session, workspace_id)
+    assert any(rule.effect == "deny" and rule.selector.kind == "action"
+        and rule.selector.action_key == "workspace.file.delete" for rule in policy_override(policy).rules)
+    denied = await check_step_policy(
+        db_session,
+        workspace_id=workspace_id,
+        kind="agent",
+        action_key="workspace.file.delete",
+        risk_level="medium",
+    )
+    assert denied.allowed is False
+    assert denied.pause_for_hitl is False
+    review = await check_step_policy(
+        db_session,
+        workspace_id=workspace_id,
+        kind="agent",
+        action_key="email.send",
+        risk_level="medium",
+    )
+    assert review.allowed is False
+    assert review.pause_for_hitl is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "scenario",
     BUSINESS_SCENARIOS,
@@ -719,14 +785,15 @@ async def test_business_workspace_strategist_context_reflects_business_state(
     }
 
     policy = ctx.governance_policy or {}
-    required_actions = set(policy.get("hitl_required_actions") or [])
-    blocked_actions = set(policy.get("never_allow_actions") or [])
+    typed_rules = policy_override(policy).rules
+    required_actions = {rule.selector.action_key for rule in typed_rules
+        if rule.effect == "ask" and rule.selector.kind == "action"}
+    blocked_actions = {rule.id for rule in typed_rules if rule.effect == "deny"}
+    assert not blocked_actions
     for rule in scenario["rules"]:
         patterns = set(rule["action_patterns"])
-        if rule["rule_type"] == "hitl_required":
+        if rule["rule_type"] in {"hitl_required", "never_allow"}:
             assert patterns.issubset(required_actions)
-        if rule["rule_type"] == "never_allow":
-            assert patterns.issubset(blocked_actions)
 
     system_prompt = runtime_strategist_system_prompt(ctx)
     user_prompt = runtime_strategist_user_prompt(
@@ -760,7 +827,10 @@ async def test_business_workspace_strategist_review_persists_business_proposal(
     from packages.core.strategist import service as strategist_service
     from packages.core.strategist.proposal import Deliverable, EstimatedImpact, Proposal, ProposedTask
 
-    workspace, _, _, _ = await _create_business_workspace(db_session, scenario)
+    workspace, _, owner_id, _ = await _create_business_workspace(db_session, scenario)
+    await set_workspace_test_approval(db_session, workspace_id=workspace.id,
+        entity_id=workspace.entity_id, actor_id=owner_id,
+        user_rules=[action_rule("workspace.proposal.task")])
     task_spec = scenario["task"]
     goals = (await db_session.execute(select(Goal).where(Goal.workspace_id == workspace.id))).scalars().all()
     goals_by_metric = {goal.metric_key: goal for goal in goals}
@@ -825,7 +895,7 @@ async def test_business_workspace_strategist_review_persists_business_proposal(
         auto_approved=False, policy_denied=False, pending_items=None,
         auto_approved_action_key=None,
     ):
-        assert auto_approved is False
+        assert auto_approved is True
         posted_cards.append(
             {
                 "workspace_id": workspace_arg.id,
@@ -850,6 +920,8 @@ async def test_business_workspace_strategist_review_persists_business_proposal(
     assert result["workspace_id"] == workspace.id
     assert result["task_count"] == 1
     assert result["task_ids"]
+    assert result["auto_approved"] is True
+    assert result["approved_task_ids"] == result["task_ids"]
     assert posted_cards == [
         {
             "workspace_id": workspace.id,
@@ -859,7 +931,7 @@ async def test_business_workspace_strategist_review_persists_business_proposal(
     ]
 
     task = (await db_session.execute(select(Task).where(Task.id == result["task_ids"][0]))).scalar_one()
-    assert task.status == "proposed"
+    assert task.status == "in_progress"
     assert task.task_type == "ai_generated"
     assert task.title == task_title
     assert task.owner_service_key == owner_service_key
@@ -927,7 +999,8 @@ async def _assert_custom_agent_subscriptions(db_session, workspace_id: str, scen
             .scalars()
             .all()
         )
-        assert {"manor", "workspace_agent", "rag", "generate_file", "web_search"}.issubset(set(tool_rows))
+        assert {"manor", "workspace_agent", "generate_file", "web_search"}.issubset(set(tool_rows))
+        assert "rag" not in set(tool_rows)
         assert "invoke_skill" in set(tool_rows)
 
         skill_slugs = set(draft["skill_bindings"])

@@ -2,15 +2,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import (
+    without_rolled_up_coordinator_children,
+)
+from packages.core.models.billing import CreditUsageLog
 from packages.core.models.execution import ExecutionStep
 from packages.core.models.workspace import Workspace
+from packages.core.services.timezone_utils import (
+    user_current_date,
+    user_day_bounds_utc,
+    user_timezone_name,
+    utc_now,
+)
 
 
 @dataclass
@@ -39,6 +49,72 @@ class BudgetStatus:
     credits_per_usd: int
     """The rate at the time of read; lets the UI explain "$X = N credits"
     if the operator wants to see the underlying."""
+
+
+@dataclass
+class CreditUsageSummary:
+    today_credits: int
+    week_credits: int
+    all_time_credits: int
+    timezone: str
+
+
+async def get_workspace_credit_usage_summary(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    workspace_created_at: datetime,
+    timezone_name: str | None,
+) -> CreditUsageSummary:
+    timezone_label = user_timezone_name(timezone_name)
+    now = utc_now()
+    today = user_current_date(timezone_label, now)
+    today_start, _ = user_day_bounds_utc(timezone_label, day=today)
+    week_start, _ = user_day_bounds_utc(
+        timezone_label,
+        day=today - timedelta(days=today.weekday()),
+    )
+
+    row = (await db.execute(
+        select(
+            func.coalesce(
+                func.sum(case(
+                    (
+                        CreditUsageLog.created_at >= today_start,
+                        CreditUsageLog.total_credit,
+                    ),
+                    else_=0,
+                )),
+                0,
+            ).label("today_credits"),
+            func.coalesce(
+                func.sum(case(
+                    (
+                        CreditUsageLog.created_at >= week_start,
+                        CreditUsageLog.total_credit,
+                    ),
+                    else_=0,
+                )),
+                0,
+            ).label("week_credits"),
+            func.coalesce(
+                func.sum(CreditUsageLog.total_credit),
+                0,
+            ).label("all_time_credits"),
+        ).where(
+            CreditUsageLog.entity_id == entity_id,
+            CreditUsageLog.workspace_id == workspace_id,
+            CreditUsageLog.created_at >= workspace_created_at,
+        )
+    )).one()
+
+    return CreditUsageSummary(
+        today_credits=int(row.today_credits),
+        week_credits=int(row.week_credits),
+        all_time_credits=int(row.all_time_credits),
+        timezone=timezone_label,
+    )
 
 
 async def get_budget_status(
@@ -145,17 +221,19 @@ async def get_workspace_spent_credits_per_kind(
     from packages.core.services.credit_service import usd_to_credits
 
     since = since or _month_start()
-    rows = (await db.execute(
-        select(ExecutionStep.kind, ExecutionStep.cost)
+    rows = list((await db.execute(
+        select(ExecutionStep)
         .where(
             ExecutionStep.workspace_id == workspace_id,
             ExecutionStep.finished_at.is_not(None),
             ExecutionStep.finished_at >= since,
         )
-    )).all()
+    )).scalars().all())
 
     by_kind_usd: dict[str, Decimal] = {}
-    for kind, cost in rows:
+    for step in without_rolled_up_coordinator_children(rows):
+        kind = step.kind
+        cost = step.cost
         raw = (cost or {}).get("usd") if isinstance(cost, dict) else None
         if raw is None:
             continue

@@ -18,5 +18,9 @@
     "search_tools",
     "web_search",
     "web_event_search"
-  ]
+  ],
+  "search": {
+    "terms": ["widget", "home screen", "homepage", "news feed", "stock ticker", "panel", "card"],
+    "examples": ["add daily news widget to dashboard", "show stock prices on my dashboard", "remove module from dashboard", "rearrange my home screen widgets"]
+  }
 }

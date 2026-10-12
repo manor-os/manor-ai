@@ -38,6 +38,30 @@ export interface ProposalDecisionResolution {
   payload?: Record<string, unknown> | null;
 }
 
+/** Approval facts are supplied by the server, never inferred from card prose. */
+export function proposalApprovalView(
+  source: unknown,
+  resolution?: ProposalDecisionResolution | null,
+) {
+  if (resolution?.choice || !source || typeof source !== "object") return null;
+  const approval = source as Record<string, unknown>;
+  const status = approval.status;
+  if (
+    status !== "auto_approved" && status !== "pending" &&
+    status !== "rejected" && status !== "not_required"
+  ) return null;
+  const reason = typeof approval.reason === "string"
+    ? formatUserFacingText(approval.reason.trim())
+    : "";
+  return {
+    status,
+    label: t(`component.proposal.approval_${status}`),
+    reason: reason || (status === "auto_approved"
+      ? t("component.proposal.approval_auto_approved_reason")
+      : ""),
+  };
+}
+
 function decisionIds(value: unknown): string[] {
   return Array.isArray(value)
     ? value.map((item) => String(item || "").trim()).filter(Boolean)

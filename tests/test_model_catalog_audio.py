@@ -21,6 +21,7 @@ def test_media_catalog_restores_the_recent_stable_model_choices():
         "sesame/csm-1b",
     }.issubset({item["id"] for item in CATALOG["voice"]})
     assert {
+        "suno/music",
         "google/lyria-3-clip-preview",
         "google/lyria-3-pro-preview",
         "openai/gpt-audio-mini",
@@ -37,11 +38,11 @@ def test_media_catalog_restores_the_recent_stable_model_choices():
         "openai/gpt-audio",
     }.issubset({item["id"] for item in CATALOG["stt"]})
     assert {
+        "bytedance/seedance-v1.0-pro-fast",
         "kwaivgi/kling-v3.0-std",
         "kwaivgi/kling-v3.0-pro",
         "atlascloud/wan-2.2-turbo-spicy",
     }.issubset({item["id"] for item in CATALOG["video"]})
-    assert "openai/gpt-4" in {item["id"] for item in CATALOG["worker"]}
 
 
 def test_audio_roles_keep_the_product_catalog_models():
@@ -57,7 +58,7 @@ def test_audio_roles_keep_the_product_catalog_models():
     assert DEFAULTS["audio"] in audio_ids
     assert DEFAULTS["sfx"] in sfx_ids
     assert {"openai/tts-1", "openai/tts-1-hd"}.issubset(voice_ids)
-    assert {"google/lyria-3-clip-preview", "google/lyria-3-pro-preview"}.issubset(audio_ids)
+    assert {"suno/music", "google/lyria-3-clip-preview", "google/lyria-3-pro-preview"}.issubset(audio_ids)
     assert {"openai/gpt-audio-mini", "openai/gpt-audio"}.issubset(sfx_ids)
 
 

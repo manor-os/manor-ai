@@ -68,16 +68,6 @@ _INTEGRATION_ACCOUNT_PARAMETER = {
         "only to use the default."
     ),
 }
-_INTEGRATION_ACCOUNT_CONTINUATION_PARAMETER = {
-    "type": "string",
-    "minLength": 1,
-    "maxLength": INTEGRATION_ACCOUNT_CONTINUATION_MAX_CHARS,
-    "description": (
-        "Opaque continuation token returned by a previous bounded all-account "
-        "result. Send it only with integration_account_selection='all' to "
-        "resume the same query from the next unattempted account."
-    ),
-}
 _MCP_DISPATCH_CONTEXT_ARGUMENT = "_runtime_mcp_dispatch_context"
 _MCP_ALLOWED_ACCOUNT_IDS_ARGUMENT = "_runtime_mcp_allowed_account_ids"
 _MCP_ALL_ACCOUNTS_MAX_CALLS = 20
@@ -855,6 +845,9 @@ def _mcp_error_result_to_text(server_key: str, tool_name: str, result: dict) -> 
         "tool": tool_name,
         "error": "tool_error",
         "detail": text,
+        # Preserve all provider diagnostics, not only the first display block.
+        # This is data: the compatibility control fields below remain explicit.
+        "details": result,
     }
     if isinstance(text, str) and text.lstrip().startswith("{"):
         try:
@@ -862,21 +855,34 @@ def _mcp_error_result_to_text(server_key: str, tool_name: str, result: dict) -> 
         except (TypeError, json.JSONDecodeError):
             parsed = None
         if isinstance(parsed, dict):
-            for key in (
-                "content",
-                "message",
-                "notice",
-                "notice_key",
-                "replace_visible_text",
-                "stop_parent",
-                "stop_reason",
-                "terminal_failure",
-                "retryable",
-                "recommended_next_action",
-                "reason",
-            ):
-                if key in parsed:
-                    payload[key] = parsed[key]
+            nested_data = parsed.get("data")
+            sources = (
+                nested_data if isinstance(nested_data, dict) else {},
+                parsed,
+            )
+            for source in sources:
+                for key in (
+                    "content",
+                    "message",
+                    "notice",
+                    "notice_key",
+                    "replace_visible_text",
+                    "stop_parent",
+                    "stop_reason",
+                    "terminal_failure",
+                    "retryable",
+                    "recommended_next_action",
+                    "reason",
+                    "action_executed",
+                    "do_not_replay",
+                ):
+                    if key in source:
+                        payload[key] = source[key]
+    if server_key == "chrome":
+        from packages.core.ai.chrome_results import normalize_chrome_result
+
+        # Keep the original diagnostic detail for durable audit consumers.
+        payload = {**normalize_chrome_result(payload), "detail": text}
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -887,7 +893,6 @@ from packages.core.ai.mcp import gmail as _gmail_module  # noqa: E402
 from packages.core.ai.mcp import email as _email_module  # noqa: E402
 from packages.core.ai.mcp import google_calendar as _gcal_module  # noqa: E402
 from packages.core.ai.mcp import manor_mcp_calendar as _manor_calendar_module  # noqa: E402
-from packages.core.ai.mcp import manor_mcp_file_engine as _manor_file_engine_module  # noqa: E402
 from packages.core.ai.mcp import manor_mcp_minutes as _manor_minutes_module  # noqa: E402
 from packages.core.ai.mcp import google_drive as _gdrive_module  # noqa: E402
 from packages.core.ai.mcp import notion as _notion_module  # noqa: E402
@@ -911,16 +916,22 @@ from packages.core.ai.mcp import tiktok_shop as _tiktok_shop_module  # noqa: E40
 from packages.core.ai.mcp import amazon as _amazon_module  # noqa: E402
 from packages.core.ai.mcp import twilio as _twilio_module  # noqa: E402
 from packages.core.ai.mcp import webhook as _webhook_module  # noqa: E402
+from packages.core.ai.mcp import manor_pms as _pms_module  # noqa: E402
 from packages.core.ai.mcp import quickbooks as _qb_module  # noqa: E402
 from packages.core.ai.mcp import telegram as _telegram_module  # noqa: E402
 from packages.core.ai.mcp import discord as _discord_module  # noqa: E402
+from packages.core.ai.mcp import lark as _lark_module  # noqa: E402
 from packages.core.ai.mcp import nango as _nango_module  # noqa: E402
+from packages.core.ai.mcp import apify as _apify_module  # noqa: E402
+from packages.core.ai.mcp import suno as _suno_module  # noqa: E402
 from packages.core.services.official_remote_mcp import (  # noqa: E402
     OfficialRemoteMCPFactory,
     OfficialRemoteMCPProvider,
 )
 
 _SERVER_TOOL_SCHEMAS["github"] = _adapt_module_tools(_gh_module)
+_SERVER_TOOL_SCHEMAS["apify"] = _adapt_module_tools(_apify_module)
+_SERVER_TOOL_SCHEMAS["suno"] = _adapt_module_tools(_suno_module)
 # quickbooks/telegram had hardcoded catalog entries above whose tool names
 # and params had drifted from the real handlers (e.g. list_customers vs
 # query_customers; telegram send_message's `text` vs the module's `content`).
@@ -928,6 +939,7 @@ _SERVER_TOOL_SCHEMAS["github"] = _adapt_module_tools(_gh_module)
 _SERVER_TOOL_SCHEMAS["quickbooks"] = _adapt_module_tools(_qb_module)
 _SERVER_TOOL_SCHEMAS["telegram"] = _adapt_module_tools(_telegram_module)
 _SERVER_TOOL_SCHEMAS["discord"] = _adapt_module_tools(_discord_module)
+_SERVER_TOOL_SCHEMAS["lark"] = _adapt_module_tools(_lark_module)
 _SERVER_TOOL_SCHEMAS["facebook"] = _adapt_module_tools(_fb_module)
 _SERVER_TOOL_SCHEMAS["whatsapp"] = _adapt_module_tools(_whatsapp_module)
 _SERVER_TOOL_SCHEMAS["gmail"] = _adapt_module_tools(_gmail_module)
@@ -938,8 +950,8 @@ _SERVER_TOOL_SCHEMAS["gmail"] = _adapt_module_tools(_gmail_module)
 _SERVER_TOOL_SCHEMAS["email"] = _adapt_module_tools(_email_module)
 _SERVER_TOOL_SCHEMAS["google_calendar"] = _adapt_module_tools(_gcal_module)
 _SERVER_TOOL_SCHEMAS["manor_mcp_calendar"] = _adapt_module_tools(_manor_calendar_module)
-_SERVER_TOOL_SCHEMAS["manor_mcp_file_engine"] = _adapt_module_tools(_manor_file_engine_module)
 _SERVER_TOOL_SCHEMAS["manor_mcp_minutes"] = _adapt_module_tools(_manor_minutes_module)
+_SERVER_TOOL_SCHEMAS["manor_pms"] = _adapt_module_tools(_pms_module)
 _SERVER_TOOL_SCHEMAS["google_drive"] = _adapt_module_tools(_gdrive_module)
 _SERVER_TOOL_SCHEMAS["notion"] = _adapt_module_tools(_notion_module)
 _SERVER_TOOL_SCHEMAS["outlook"] = _adapt_module_tools(_outlook_module)
@@ -1151,6 +1163,10 @@ def _build_handler(
             )
 
         if selection_mode is IntegrationAccountSelectionMode.ALL:
+            if server_key == "chrome":
+                return json.dumps({"server": server_key, "tool": tool_name,
+                    "error": "chrome_requires_one_connection",
+                    "reason": "Chrome execution uses one selected browser connection."})
             full_tool_name = f"mcp__{server_key}__{tool_name}"
             supports_all_accounts = (
                 effect is MCPActionEffect.READ
@@ -1492,16 +1508,26 @@ def _build_handler(
                 ensure_ascii=False,
             )
 
-        async with async_session() as db:
-            decision = await can_use_integration(
-                db,
-                user_id=user_id,
-                entity_id=entity_id,
-                provider=server_key,
-                integration_account_id=kwargs.get(INTEGRATION_ACCOUNT_ARGUMENT),
-                integration_registry=integration_registry,
-                allow_env_fallback=False,
+        legacy_direct_chrome = False
+        if legacy_direct_chrome:
+            from packages.core.services.agent_permission_service import ToolAccessDecision
+
+            decision = ToolAccessDecision(
+                allowed=True,
+                reason="Direct Chrome migration context is available.",
+                scope="chrome_extension",
             )
+        else:
+            async with async_session() as db:
+                decision = await can_use_integration(
+                    db,
+                    user_id=user_id,
+                    entity_id=entity_id,
+                    provider=server_key,
+                    integration_account_id=kwargs.get(INTEGRATION_ACCOUNT_ARGUMENT),
+                    integration_registry=integration_registry,
+                    allow_env_fallback=False,
+                )
 
         if not decision.allowed:
             # Cross-provider hint: when the primary provider is missing,
@@ -1579,11 +1605,40 @@ def _build_handler(
             clear_ctx = getattr(module, "clear_call_context", None)
             if set_ctx:
                 call_ctx = {"user_id": user_id, "entity_id": entity_id}
+                if server_key == "apify":
+                    actor_context = runtime_tool_call_context_from_kwargs(kwargs)
+                    call_ctx.update({
+                        "user_id": actor_context.user_id or user_id,
+                        "credential_scope": decision.scope,
+                        "workspace_id": actor_context.workspace_id,
+                        "conversation_id": actor_context.conversation_id,
+                        "agent_id": actor_context.agent_id,
+                    })
                 if server_key == "manor_mcp_admin":
                     from packages.core.services.auth_context import current_mfa_verified
 
                     call_ctx["mfa_verified"] = "true" if current_mfa_verified() else "false"
                 runtime_context = runtime_tool_call_context_from_kwargs(kwargs)
+                performance_run_id = runtime_context.performance_run_id
+                if not performance_run_id:
+                    from packages.core.ai.runtime.performance import (
+                        runtime_performance_run_id,
+                    )
+
+                    performance_run_id = runtime_performance_run_id(
+                        runtime_run_id=runtime_context.runtime_run_id,
+                        workflow_run_id=runtime_context.workflow_run_id,
+                        task_id=runtime_context.task_id,
+                    )
+                if performance_run_id:
+                    call_ctx["performance_run_id"] = performance_run_id
+                if runtime_context.runtime_run_id:
+                    call_ctx["runtime_run_id"] = runtime_context.runtime_run_id
+                if runtime_context.runtime_tool_call_id:
+                    call_ctx["runtime_tool_call_id"] = runtime_context.runtime_tool_call_id
+                call_ctx["runtime_validation_duration_ms"] = (
+                    runtime_context.runtime_validation_duration_ms
+                )
                 if decision.account_id:
                     call_ctx[INTEGRATION_ACCOUNT_ARGUMENT] = decision.account_id
                 for key in ("conversation_id", "workspace_id", "task_id"):
@@ -1593,6 +1648,21 @@ def _build_handler(
                 if active_message:
                     call_ctx["active_user_message"] = str(active_message)
                 call_ctx.update(_runtime_workflow_call_context(runtime_context))
+                if server_key == "tiktok" and tool_name == "post_video":
+                    from packages.core.ai.runtime.authorization_receipts import (
+                        runtime_current_tool_authorization_receipt,
+                    )
+
+                    receipt = runtime_current_tool_authorization_receipt()
+                    if receipt is not None and receipt.tiktok_publish_consent is not None:
+                        call_ctx["tiktok_publish_consent"] = receipt.tiktok_publish_consent
+                if (
+                    server_key == "chrome"
+                    and runtime_context.chrome_interaction_mode == "fast"
+                ):
+                    call_ctx["chrome_interaction_mode"] = "fast"
+                if server_key == "chrome" and runtime_context.chrome_sequence_child:
+                    call_ctx["chrome_sequence_child"] = True
                 set_ctx(call_ctx)
             try:
                 result = await module.call_tool(tool_name, tool_kwargs, bearer_token or "")
@@ -1711,12 +1781,14 @@ def _build_handler(
 
 
 _JSON_BLOB_PROVIDERS: set[str] = {
+    "manor_pms",
     "email",
     "twilio",
     "whatsapp",
     "webhook",
     "telegram",
     "discord",
+    "lark",
     "wechat_personal",
     "wechat_official",
     # E-commerce: multi-field store credentials (domain + token, or
@@ -1742,17 +1814,17 @@ _CONTEXT_ONLY_SERVERS: set[str] = {
 
 def _is_context_only_server(server_key: str) -> bool:
     key = str(server_key or "").strip().lower()
-    return key in _CONTEXT_ONLY_SERVERS or key.startswith("manor_mcp_")
+    return key in _CONTEXT_ONLY_SERVERS or (key.startswith("manor_mcp_") and key != "manor_mcp_minutes")
 
 
 def _is_accountless_platform_server(server_key: str) -> bool:
     """Return whether Cloud funds this provider without tenant accounts."""
     try:
         from packages.core.services.platform_managed_mcp import (
-            is_platform_managed_mcp_server,
+            is_accountless_platform_mcp_server,
         )
 
-        return is_platform_managed_mcp_server(server_key)
+        return is_accountless_platform_mcp_server(server_key)
     except Exception:  # noqa: BLE001
         return False
 
@@ -1836,6 +1908,7 @@ async def _resolve_bearer_token(
     scope: str,
     integration_account_id: str | None = None,
     allow_env_fallback: bool = False,
+    session_factory: Any = None,
 ) -> str | None:
     """Load the actual token based on the scope the permission decision
     resolved to. Mirrors the logic in can_use_integration() but returns
@@ -1848,6 +1921,8 @@ async def _resolve_bearer_token(
     from packages.core.services.agent_permission_service import _env_token_for
     from packages.core.services.provider_keys import provider_key_aliases
 
+    session_factory = session_factory or async_session
+
     if scope == "env":
         if not allow_env_fallback:
             return None
@@ -1858,7 +1933,7 @@ async def _resolve_bearer_token(
 
     nango_token_request: tuple[str, str, str] | None = None
     entity_fallback_token: str | None = None
-    async with async_session() as db:
+    async with session_factory() as db:
         provider_aliases = provider_key_aliases(server_key)
         if scope == "user":
             query = select(OAuthAccount).where(
@@ -1875,6 +1950,15 @@ async def _resolve_bearer_token(
                     None,
                 )
                 chosen = default or rows[0]
+                from packages.core.services.manor_integration_oauth import manor_oauth_account_matches
+
+                if not manor_oauth_account_matches(chosen, entity_id=entity_id):
+                    return None
+                if server_key == "lark":
+                    from packages.core.services.lark_oauth import lark_oauth_account_matches
+
+                    if not await lark_oauth_account_matches(db, chosen):
+                        return None
                 from packages.core.services.oauth_account_credentials import lease_oauth_account_tokens
 
                 token = lease_oauth_account_tokens(
@@ -1884,6 +1968,14 @@ async def _resolve_bearer_token(
                     requester_kind="agent",
                 ).get("access_token")
                 if token:
+                    if server_key == "lark":
+                        profile = chosen.profile
+                        return json.dumps({
+                            "access_token": token,
+                            "platform": "lark",
+                            "app_id": profile["app_id"],
+                            "token_type": "user_access_token",
+                        })
                     if server_key == "discord":
                         from packages.core.services.discord_app_config import (
                             resolve_discord_app_config,
@@ -2113,13 +2205,18 @@ class MCPToolRegistrationFactory:
                     INTEGRATION_ACCOUNT_SELECTION_ARGUMENT,
                     dict(_INTEGRATION_ACCOUNT_SELECTION_PARAMETER),
                 )
-                properties.setdefault(
-                    INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT,
-                    dict(_INTEGRATION_ACCOUNT_CONTINUATION_PARAMETER),
-                )
             else:
                 properties.pop(INTEGRATION_ACCOUNT_SELECTION_ARGUMENT, None)
-                properties.pop(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT, None)
+            # Continuations are dispatcher-issued runtime state. The model may
+            # select all accounts but must never invent or replay the token.
+            properties.pop(INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT, None)
+            required = parameters.get("required")
+            if isinstance(required, list):
+                parameters["required"] = [
+                    item
+                    for item in required
+                    if item != INTEGRATION_ACCOUNT_CONTINUATION_ARGUMENT
+                ]
         schema = {
             "type": "function",
             "function": {

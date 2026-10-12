@@ -748,6 +748,45 @@ def _validate_record_sections(p: dict[str, Any]) -> None:
             )
 
 
+def _validate_stat_assessment_producers(recipe: dict[str, Any]) -> None:
+    from packages.core.stats.assessment import validate_review_definition
+
+    workflows = {item.get("slug"): item for item in recipe.get("workflows", [])}
+    subscriptions = {item.get("service_key") for item in recipe.get("subscriptions", [])}
+    for index, stat in enumerate(recipe.get("stats", [])):
+        if stat.get("collector_type") != "agent_review":
+            continue
+        config = stat.get("collector_config") or {}
+        try:
+            validate_review_definition("agent_review", config, stat.get("collection_cadence"))
+        except ValueError as exc:
+            raise PayloadError(f"recipe.stats[{index}]: {exc}") from exc
+        workflow = workflows.get(config["workflow_slug"])
+        if workflow is None:
+            raise PayloadError(f"recipe.stats[{index}] references missing assessment Workflow")
+        producers = [step for step in workflow.get("steps", []) if
+                     stat.get("key") in (step.get("config", {}).get("stat_assessment_keys") or [])]
+        if len(producers) != 1 or producers[0].get("type") != "agent":
+            raise PayloadError(f"recipe.stats[{index}] requires exactly one Agent assessment producer")
+        if producers[0].get("config", {}).get("service_key") not in subscriptions:
+            raise PayloadError(f"recipe.stats[{index}] assessment producer requires a declared service subscription")
+        producer_config = producers[0].get("config", {})
+        keys = producer_config.get("stat_assessment_keys")
+        defined_keys = {item.get("key") for item in recipe.get("stats", []) if
+                        item.get("collector_type") == "agent_review" and
+                        (item.get("collector_config") or {}).get("workflow_slug") == config["workflow_slug"]}
+        if (not isinstance(keys, list) or any(not isinstance(key, str) for key in keys) or
+                len(keys) != len(set(keys)) or not set(keys) <= defined_keys):
+            raise PayloadError("assessment producer references undefined, duplicate or differently scoped metrics")
+        if producer_config.get("skill") or producer_config.get("output_schema"):
+            raise PayloadError("assessment producer must use the evidence receipt contract directly")
+        schedules = [job for job in recipe.get("scheduled_jobs", []) if
+                     job.get("execution_type") == "workflow" and
+                     (job.get("execution_target") or {}).get("workflow_slug") == config["workflow_slug"]]
+        if len(schedules) != 1:
+            raise PayloadError(f"recipe.stats[{index}] requires one shared Workflow Automation")
+
+
 def _validate_workflows(recipe: dict[str, Any]) -> None:
     workflows = list(recipe.get("workflows") or [])
     slugs: set[str] = set()
@@ -1018,6 +1057,11 @@ def _validate_v11(p: dict[str, Any]) -> None:
     version = manifest.get("blueprint_version")
     if version != BLUEPRINT_VERSION:
         raise PayloadError(f"manifest.blueprint_version must be {BLUEPRINT_VERSION!r}, got {version!r}")
+    usage_guide = manifest.get("usage_guide")
+    if usage_guide is not None and (
+        not isinstance(usage_guide, str) or len(usage_guide) > 10000
+    ):
+        raise PayloadError("manifest.usage_guide must be a string of at most 10000 characters")
 
     # 3) List-shaped sections must be arrays where present.
     for path in _LIST_PATHS:
@@ -1041,6 +1085,13 @@ def _validate_v11(p: dict[str, Any]) -> None:
     _validate_goals(recipe)
     _validate_task_policy_sections(recipe)
     _validate_workflows(recipe)
+    from packages.core.blueprints.app_view import validate_portable_app_view
+
+    try:
+        validate_portable_app_view(p)
+    except ValueError as exc:
+        raise PayloadError(str(exc)) from exc
+    _validate_stat_assessment_producers(recipe)
 
     # 4) embedded.agents[].tool_bindings ⊆ contract.requires.tools
     declared_tools = set((contract.get("requires") or {}).get("tools") or [])
@@ -1159,9 +1210,9 @@ def _validate_v11(p: dict[str, Any]) -> None:
                     f"{BLUEPRINT_KNOWLEDGE_MAX_DOCUMENTS} starter documents"
                 )
             path = d.get("path") or ""
-            if not isinstance(path, str) or not path.endswith(".md"):
+            if not isinstance(path, str) or not path.endswith((".md", ".csv")):
                 raise PayloadError(
-                    f"knowledge_pack {pack_slug!r}: starter_documents must be .md files only (got {path!r})"
+                    f"knowledge_pack {pack_slug!r}: starter_documents must be .md or .csv text files (got {path!r})"
                 )
             if path in pack_paths:
                 raise PayloadError(
@@ -1238,6 +1289,22 @@ def _validate_v11(p: dict[str, Any]) -> None:
                     f"starter document key {document_key!r} describes conflicting content"
                 )
 
+    from packages.core.blueprints.workflow_dependencies import (
+        WorkflowDependencyError, WorkflowDocumentDependencyFactory,
+    )
+    inline_keys = {
+        document.get("key")
+        for pack in embedded.get("knowledge_packs") or [] if pack.get("mode") == "inline_text"
+        for document in pack.get("starter_documents") or []
+    }
+    for workflow in recipe.get("workflows") or []:
+        try:
+            required_keys = WorkflowDocumentDependencyFactory.portable_keys(workflow.get("steps") or [])
+        except WorkflowDependencyError as exc:
+            raise PayloadError(str(exc)) from exc
+        if required_keys - inline_keys:
+            raise PayloadError("Workflow Knowledge references must resolve to included inline starter documents")
+
     # 9) strategist.business_model.model_type enum.
     strategist = recipe.get("strategist")
     if isinstance(strategist, dict):
@@ -1261,16 +1328,17 @@ def _validate_v11(p: dict[str, Any]) -> None:
                 if not (0.99 <= total <= 1.01):
                     raise PayloadError(f"strategist.evaluation_rubric.weights must sum to 1.0 (got {total:.3f})")
 
-    # 11) governance never_allow ∩ auto_approve = ∅
+    # 11) Approval configuration uses the same typed selectors as runtime.
+    # Historical packages are converted at the explicit import boundary.
     gov = policy.get("governance") or {}
     if isinstance(gov, dict):
-        never = set(gov.get("never_allow_actions") or [])
-        auto = set(gov.get("auto_approve_actions") or [])
-        overlap = never & auto
-        if overlap:
-            raise PayloadError(
-                f"policy.governance.never_allow_actions and auto_approve_actions overlap: {sorted(overlap)}"
-            )
+        from packages.core.governance.approval_policy_migration import normalize_legacy_workspace_policy
+        from packages.core.governance.policy import policy_from_dict
+
+        try:
+            policy_from_dict(normalize_legacy_workspace_policy(gov, safe_import=True))
+        except ValueError as exc:
+            raise PayloadError(f"Invalid policy.governance: {exc}") from exc
 
     # 12) Optional Blueprint-owned simulation experience. Older payloads may
     #     omit it; exporter and installer materialise a deterministic fallback.
@@ -1450,6 +1518,7 @@ def _scan_local_reference_values(node: Any) -> set[str]:
 #     "summary": "Daily posts + reply triage + engagement",
 #     "use_when": "you want consistent X presence with HITL on risky actions",
 #     "description": "Long-form markdown — story, design choices, gotchas.",
+#     "usage_guide": "Open Workspace Chat, then review the first result.",
 #     "tags": ["social", "growth"],
 #     "kind": "social_media",
 #     "category": "marketing.social",

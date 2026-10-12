@@ -17,6 +17,52 @@ def _youtube_html(*, player: dict, initial: dict) -> str:
     )
 
 
+def _youtube_html_with_comment_continuation(
+    *,
+    player: dict,
+    token: str = "comment-continuation-token",
+) -> str:
+    config = {
+        "INNERTUBE_API_KEY": "public-page-api-key",
+        "INNERTUBE_CLIENT_NAME": "WEB",
+        "INNERTUBE_CLIENT_VERSION": "2.20260907.06.00",
+        "INNERTUBE_CONTEXT_CLIENT_NAME": 1,
+    }
+    initial = {
+        "contents": {
+            "twoColumnWatchNextResults": {
+                "results": {
+                    "results": {
+                        "contents": [
+                            {
+                                "itemSectionRenderer": {
+                                    "sectionIdentifier": "comment-item-section",
+                                    "targetId": "comments-section",
+                                    "contents": [
+                                        {
+                                            "continuationItemRenderer": {
+                                                "continuationEndpoint": {
+                                                    "continuationCommand": {
+                                                        "token": token,
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    ],
+                                }
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    return _youtube_html(player=player, initial=initial).replace(
+        "<html>",
+        f"<html><script>ytcfg.set({json.dumps(config)});</script>",
+    )
+
+
 def _player(**overrides) -> dict:
     player = {
         "playabilityStatus": {"status": "OK"},
@@ -222,6 +268,95 @@ async def test_fetches_the_canonical_public_page_without_authentication() -> Non
         "https://www.youtube.com/watch?v=tsJff6wc2XQ"
     )
     assert "cookie" not in requests[0].headers
+
+
+@pytest.mark.asyncio
+async def test_fetches_comment_count_from_public_page_continuation() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text=_youtube_html_with_comment_continuation(player=_player()),
+            )
+        assert str(request.url) == (
+            "https://www.youtube.com/youtubei/v1/next?key=public-page-api-key"
+        )
+        assert json.loads(request.content) == {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": "2.20260907.06.00",
+                    "gl": "US",
+                    "hl": "en",
+                }
+            },
+            "continuation": "comment-continuation-token",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "onResponseReceivedEndpoints": [
+                    {
+                        "reloadContinuationItemsCommand": {
+                            "continuationItems": [
+                                {
+                                    "commentsHeaderRenderer": {
+                                        "countText": {
+                                            "runs": [
+                                                {"text": "12,345"},
+                                                {"text": " Comments"},
+                                            ]
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = await youtube_public_video.fetch_youtube_public_metrics(
+            "https://www.youtube.com/watch?v=tsJff6wc2XQ",
+            client=client,
+        )
+
+    assert result.comments == 12_345
+    assert "comments" not in result.unavailable_fields
+    assert [request.method for request in requests] == ["GET", "POST"]
+
+
+@pytest.mark.asyncio
+async def test_keeps_other_metrics_when_comment_continuation_fails() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            return httpx.Response(
+                200,
+                text=_youtube_html_with_comment_continuation(player=_player()),
+            )
+        return httpx.Response(503, text="unavailable")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        result = await youtube_public_video.fetch_youtube_public_metrics(
+            "https://www.youtube.com/watch?v=tsJff6wc2XQ",
+            client=client,
+        )
+
+    assert result.views == 0
+    assert result.comments is None
+    assert "comments" in result.unavailable_fields
+    assert [request.method for request in requests] == ["GET", "POST"]
 
 
 @pytest.mark.asyncio

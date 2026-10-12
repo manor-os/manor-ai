@@ -16,17 +16,23 @@ Configuration (env vars):
   APP_URL          — Base URL for links in emails (default: http://localhost:3010)
 """
 import html
+import base64
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from email import encoders
 from email.header import Header
+from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formataddr
 from html import escape
 from pathlib import Path
-from typing import Optional, Union
+from typing import Mapping, Optional, Sequence, Union
+
+import httpx
 
 from packages.core.services import smtp_transport
 
@@ -34,6 +40,17 @@ logger = logging.getLogger(__name__)
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "email"
 _template_cache: dict[str, str] = {}
+
+
+@dataclass(frozen=True)
+class EmailAttachment:
+    """One attachment owned by the caller for the duration of a send."""
+
+    filename: str
+    mime_type: str
+    data: bytes
+    content_id: Optional[str] = None
+    source_url: Optional[str] = None
 
 
 def _get_smtp_config() -> dict:
@@ -67,6 +84,11 @@ def _render(template_name: str, **kwargs) -> str:
     # Inject common variables
     kwargs.setdefault("app_url", os.getenv("APP_URL", "http://localhost:3010").rstrip("/"))
     kwargs.setdefault("year", str(datetime.now(timezone.utc).year))
+    if template_name == "common":
+        kwargs.setdefault("email_locale", "en")
+        kwargs.setdefault("browser_link", "View in a web browser")
+        kwargs.setdefault("footer_title", "Empowering Progress, Simplifying Success")
+        kwargs.setdefault("rights_reserved", "All rights reserved")
 
     for key, value in kwargs.items():
         html = html.replace("{{ " + key + " }}", str(value))
@@ -115,6 +137,7 @@ async def _deliver_email(
     text_body: Optional[str],
     config: dict,
     headers: Optional[dict[str, str]] = None,
+    attachments: Optional[Sequence[EmailAttachment]] = None,
 ) -> tuple[bool, Optional[str]]:
     """Deliver to exactly ONE recipient. Returns ``(ok, error)``.
 
@@ -135,7 +158,29 @@ async def _deliver_email(
         logger.info("Blocked email to test domain %s: %s", to, subject)
         return True, None  # pretend success
 
-    msg = MIMEMultipart("alternative")
+    inline_attachments = [item for item in attachments or () if item.content_id]
+    file_attachments = [item for item in attachments or () if not item.content_id]
+    alternative = MIMEMultipart("alternative")
+    if text_body:
+        alternative.attach(MIMEText(text_body, "plain"))
+    alternative.attach(MIMEText(html_body, "html"))
+
+    content = alternative
+    if inline_attachments:
+        related = MIMEMultipart("related")
+        related.attach(alternative)
+        for attachment in inline_attachments:
+            related.attach(_attachment_mime_part(attachment))
+        content = related
+
+    if file_attachments:
+        msg = MIMEMultipart("mixed")
+        msg.attach(content)
+        for attachment in file_attachments:
+            msg.attach(_attachment_mime_part(attachment))
+    else:
+        msg = content
+
     msg["Subject"] = _encode_header_text(subject)
     msg["From"] = _format_from(config["from_name"], config["from_email"])
     msg["To"] = to
@@ -145,10 +190,6 @@ async def _deliver_email(
         if key.lower() in {"subject", "from", "to", "content-type", "mime-version"}:
             continue
         msg[key] = value
-
-    if text_body:
-        msg.attach(MIMEText(text_body, "plain"))
-    msg.attach(MIMEText(html_body, "html"))
 
     try:
         await smtp_transport.send_message_async(
@@ -168,6 +209,27 @@ async def _deliver_email(
         return False, str(e)
 
 
+def _attachment_mime_part(attachment: EmailAttachment) -> MIMEBase:
+    """Build a base64 MIME part without trusting user-controlled headers."""
+    mime_type = (attachment.mime_type or "application/octet-stream").split(";", 1)[0]
+    if "/" not in mime_type:
+        mime_type = "application/octet-stream"
+    maintype, subtype = mime_type.lower().split("/", 1)
+    part = MIMEBase(maintype or "application", subtype or "octet-stream")
+    part.set_payload(attachment.data)
+    encoders.encode_base64(part)
+    filename = os.path.basename(
+        str(attachment.filename or "attachment").replace("\r", "-").replace("\n", "-")
+    ) or "attachment"
+    disposition = "inline" if attachment.content_id else "attachment"
+    part.add_header("Content-Disposition", disposition, filename=filename)
+    if attachment.content_id:
+        content_id = re.sub(r"[^A-Za-z0-9@._-]", "-", attachment.content_id)
+        part.add_header("Content-ID", f"<{content_id}>")
+        part.add_header("X-Attachment-Id", content_id)
+    return part
+
+
 def is_email_delivery_enabled() -> bool:
     """Return whether this deployment is configured for real SMTP delivery."""
     return bool(_get_smtp_config()["enabled"])
@@ -180,13 +242,14 @@ async def send_email(
     text_body: str = None,
     *,
     headers: Optional[dict[str, str]] = None,
+    attachments: Optional[Sequence[EmailAttachment]] = None,
 ) -> bool:
     """Send an email to a single recipient. Returns True on success, False on
     failure (never raises). For multiple recipients use ``send_bulk_email``,
     which fans out one clean single-recipient message per address."""
     config = _get_smtp_config()
     ok, _error = await _deliver_email(
-        to, subject, html_body, text_body, config, headers,
+        to, subject, html_body, text_body, config, headers, attachments,
     )
     return ok
 
@@ -352,7 +415,12 @@ def normalize_announcement_email_locale(locale: Optional[str]) -> str:
     return candidate if candidate in SUPPORTED_ANNOUNCEMENT_EMAIL_LOCALES else "en"
 
 
-def _render_announcement_body_html(body_md: str) -> str:
+def _render_announcement_body_html(
+    body_md: str,
+    *,
+    media_sources: Optional[Mapping[str, str]] = None,
+    attached_media_urls: Optional[set[str]] = None,
+) -> str:
     """Render the markdown subset admins use in announcements to HTML.
 
     Intentionally tiny — no external dep, no raw-HTML passthrough. The
@@ -367,6 +435,20 @@ def _render_announcement_body_html(body_md: str) -> str:
     """
     # Escape first so any literal HTML in the markdown becomes text.
     safe = html.escape(body_md or "").replace("\r\n", "\n").replace("\r", "\n")
+    escaped_media_sources = {
+        html.escape(source_url): rendered_source
+        for source_url, rendered_source in (media_sources or {}).items()
+    }
+    escaped_attached_media_urls = {
+        html.escape(source_url) for source_url in attached_media_urls or set()
+    }
+
+    def render_inline(value: str) -> str:
+        return _inline_md(
+            value,
+            media_sources=escaped_media_sources,
+            attached_media_urls=escaped_attached_media_urls,
+        )
 
     lines = safe.split("\n")
     out: list[str] = []
@@ -395,7 +477,11 @@ def _render_announcement_body_html(body_md: str) -> str:
         if not line.strip():
             flush_para(); close_lists()
             if table_rows:
-                out.append(_render_md_table(table_rows))
+                out.append(_render_md_table(
+                    table_rows,
+                    media_sources=escaped_media_sources,
+                    attached_media_urls=escaped_attached_media_urls,
+                ))
                 table_rows.clear()
             continue
 
@@ -411,7 +497,11 @@ def _render_announcement_body_html(body_md: str) -> str:
             table_rows.append(line)
             continue
         if table_rows:
-            out.append(_render_md_table(table_rows))
+            out.append(_render_md_table(
+                table_rows,
+                media_sources=escaped_media_sources,
+                attached_media_urls=escaped_attached_media_urls,
+            ))
             table_rows.clear()
 
         # Headings
@@ -419,7 +509,7 @@ def _render_announcement_body_html(body_md: str) -> str:
         if m:
             flush_para(); close_lists()
             level = len(m.group(1))
-            out.append(f"<h{level}>{_inline_md(m.group(2))}</h{level}>")
+            out.append(f"<h{level}>{render_inline(m.group(2))}</h{level}>")
             continue
 
         # Blockquote
@@ -429,7 +519,7 @@ def _render_announcement_body_html(body_md: str) -> str:
             if in_ol: out.append("</ol>"); in_ol = False
             if not in_quote:
                 out.append("<blockquote>"); in_quote = True
-            out.append(f"<p>{_inline_md(line.lstrip()[len('&gt; '):])}</p>")
+            out.append(f"<p>{render_inline(line.lstrip()[len('&gt; '):])}</p>")
             continue
 
         # Unordered list
@@ -440,7 +530,7 @@ def _render_announcement_body_html(body_md: str) -> str:
             if in_quote: out.append("</blockquote>"); in_quote = False
             if not in_ul:
                 out.append("<ul>"); in_ul = True
-            out.append(f"<li>{_inline_md(m.group(1))}</li>")
+            out.append(f"<li>{render_inline(m.group(1))}</li>")
             continue
 
         # Ordered list
@@ -451,24 +541,83 @@ def _render_announcement_body_html(body_md: str) -> str:
             if in_quote: out.append("</blockquote>"); in_quote = False
             if not in_ol:
                 out.append("<ol>"); in_ol = True
-            out.append(f"<li>{_inline_md(m.group(1))}</li>")
+            out.append(f"<li>{render_inline(m.group(1))}</li>")
             continue
 
         # Plain paragraph line — accumulate, flush on blank line.
         if in_ul or in_ol or in_quote:
             close_lists()
-        para.append(_inline_md(line))
+        para.append(render_inline(line))
 
     flush_para(); close_lists()
     if table_rows:
-        out.append(_render_md_table(table_rows))
+        out.append(_render_md_table(
+            table_rows,
+            media_sources=escaped_media_sources,
+            attached_media_urls=escaped_attached_media_urls,
+        ))
     return "\n".join(out) if out else "<p></p>"
 
 
-def _inline_md(s: str) -> str:
+def _inline_md(
+    s: str,
+    *,
+    media_sources: Optional[Mapping[str, str]] = None,
+    attached_media_urls: Optional[set[str]] = None,
+) -> str:
     """Inline markdown for one line of already-escaped text."""
     # Code (do first so * and _ inside aren't interpreted)
     s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+    # Uploaded/Knowledge announcement assets stay authenticated. Senders can
+    # substitute verified CID/data sources and mark ordinary files as attached;
+    # unavailable/oversized media falls back to the signed-in app.
+    protected_media = (
+        r"/api/v1/platform/announcement-media/"
+        r"[0-9A-HJKMNP-TV-Z]{26}/[^\s)]+"
+    )
+    app_announcements_url = html.escape(
+        f"{os.getenv('APP_URL', 'http://localhost:3010').rstrip('/')}/announcements",
+        quote=True,
+    )
+    s = re.sub(
+        rf"!\[([^\]]*)\]\(({protected_media})\)",
+        lambda match: (
+            (
+                f'<img src="{html.escape(media_sources[match.group(2)], quote=True)}" '
+                f'alt="{match.group(1)}" style="max-width:100%;height:auto;'
+                'border-radius:8px;display:block;margin:12px 0;">'
+            )
+            if media_sources and match.group(2) in media_sources
+            else
+            f'<a href="{app_announcements_url}">'
+            f'🖼 {match.group(1) or "Image"} — view in Manor AI</a>'
+        ),
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(
+        rf"\[([^\]]+)\]\(({protected_media})\)",
+        lambda match: (
+            (
+                f'<span>📎 {match.group(1)} — attached to this email</span>'
+            )
+            if attached_media_urls and match.group(2) in attached_media_urls
+            else
+            f'<a href="{app_announcements_url}">'
+            f'{match.group(1)} — view in Manor AI</a>'
+        ),
+        s,
+        flags=re.IGNORECASE,
+    )
+    # Linked image / video poster [![alt](https://image)](https://target).
+    # Render this before standalone images and links so the nested Markdown
+    # does not get split into two malformed replacements.
+    s = re.sub(
+        r"\[!\[([^\]]*)\]\((https://[^\s)]+)\)\]\((https?://[^\s)]+)\)",
+        r'<a href="\3"><img src="\2" alt="\1" style="max-width:100%;'
+        r'height:auto;border-radius:8px;display:block;margin:12px 0;"></a>',
+        s,
+    )
     # Images ![alt](https://url) — https only, block display for email.
     # Must come before link rule so ![] prefix doesn't pass through as broken link.
     s = re.sub(
@@ -493,7 +642,12 @@ def _inline_md(s: str) -> str:
 _TABLE_SEP_CELL = re.compile(r"^:?-{3,}:?$")
 
 
-def _render_md_table(rows: list[str]) -> str:
+def _render_md_table(
+    rows: list[str],
+    *,
+    media_sources: Optional[Mapping[str, str]] = None,
+    attached_media_urls: Optional[set[str]] = None,
+) -> str:
     """Render accumulated pipe-table lines (already escaped) to HTML.
 
     Row 2 must be a separator (---) for row 1 to become a header;
@@ -512,11 +666,17 @@ def _render_md_table(rows: list[str]) -> str:
     parts = ["<table>"]
     if header:
         parts.append(
-            "<tr>" + "".join(f"<th>{_inline_md(c)}</th>" for c in header) + "</tr>"
+            "<tr>" + "".join(
+                f"<th>{_inline_md(c, media_sources=media_sources, attached_media_urls=attached_media_urls)}</th>"
+                for c in header
+            ) + "</tr>"
         )
     for row in body:
         parts.append(
-            "<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in row) + "</tr>"
+            "<tr>" + "".join(
+                f"<td>{_inline_md(c, media_sources=media_sources, attached_media_urls=attached_media_urls)}</td>"
+                for c in row
+            ) + "</tr>"
         )
     parts.append("</table>")
     return "".join(parts)
@@ -531,13 +691,19 @@ def render_announcement_email_html(
     cta_url: Optional[str] = None,
     cta_label: Optional[str] = None,
     locale: str = "en",
+    media_sources: Optional[Mapping[str, str]] = None,
+    attached_media_urls: Optional[set[str]] = None,
 ) -> str:
     """Render the full announcement email HTML (for preview + send)."""
     email_locale = normalize_announcement_email_locale(locale)
     copy = _ANNOUNCEMENT_EMAIL_COPY[email_locale]
     style = _SEVERITY_STYLES.get(severity, _SEVERITY_STYLES["info"])
     severity_label = copy.get(severity, copy["announcement"])
-    body_html = _render_announcement_body_html(body_md)
+    body_html = _render_announcement_body_html(
+        body_md,
+        media_sources=media_sources,
+        attached_media_urls=attached_media_urls,
+    )
     cta_block = ""
     if cta_url:
         label = (cta_label or copy["view_details"]).strip() or copy["view_details"]
@@ -588,17 +754,36 @@ async def send_announcement_email(
     cta_url: Optional[str] = None,
     cta_label: Optional[str] = None,
     locale: str = "en",
+    media: Optional[Sequence[EmailAttachment]] = None,
 ) -> bool:
     """Send a platform announcement to one recipient."""
     resolved_subject = f"[Manor AI] {title}"
     resolved_subject = " ".join(resolved_subject.splitlines()).strip()
+    media_sources = {
+        item.source_url: f"cid:{item.content_id}"
+        for item in media or ()
+        if item.source_url and item.content_id
+    }
+    attached_media_urls = {
+        item.source_url
+        for item in media or ()
+        if item.source_url and not item.content_id
+    }
     html_body = render_announcement_email_html(
         title=title, body_md=body_md, severity=severity,
         display_name=display_name, cta_url=cta_url, cta_label=cta_label,
         locale=locale,
+        media_sources=media_sources,
+        attached_media_urls=attached_media_urls,
     )
     headers = None
-    return await send_email(to, resolved_subject, html_body, headers=headers)
+    return await send_email(
+        to,
+        resolved_subject,
+        html_body,
+        headers=headers,
+        attachments=media,
+    )
 
 
 async def send_password_reset_email(to: str, reset_token: str, reset_url: str = None) -> bool:
@@ -651,6 +836,23 @@ async def send_staff_invite_email(
     )
 
 
+def chat_room_invite_email_content(*, room_name: str, inviter_name: str, invite_url: str) -> str:
+    """Build a group invitation for delivery through the inviter's mailbox."""
+    safe_room = escape(room_name)
+    safe_inviter = escape(inviter_name)
+    safe_url = escape(invite_url, quote=True)
+    content = (
+        f"<p>{safe_inviter} invited you to join the group chat <strong>{safe_room}</strong> on Manor AI.</p>"
+        "<p>Sign in or register with this email address, then verify it before accepting. "
+        "This invitation expires in 7 days and does not grant company or Workspace access.</p>"
+        f"<p style='margin-top:20px;'><a href='{safe_url}' "
+        "style='background:#0d9488;color:#fff;text-decoration:none;padding:10px 18px;"
+        "border-radius:8px;display:inline-block;font-weight:600;'>Accept invitation</a></p>"
+        f"<p style='word-break:break-all;font-size:12px;'>{safe_url}</p>"
+    )
+    return content
+
+
 async def send_task_review_email(to: str, task_result: str, feedback_url: str) -> bool:
     """Send task completion review email with rating buttons."""
     subject = "Task completed — please rate your experience"
@@ -669,6 +871,118 @@ async def send_common_email(to: str, subject: str, content: str) -> bool:
     """Send a generic email with custom HTML content in the branded wrapper."""
     html = _render("common", content=content)
     return await send_email(to, subject, html)
+
+
+def connected_smtp_sender(credentials: dict) -> str:
+    """Return the address configured on a user's send-capable email account."""
+    from email.utils import parseaddr
+
+    address = parseaddr(str(
+        credentials.get("from_address") or credentials.get("from_email")
+        or credentials.get("email") or credentials.get("username") or ""
+    ))[1].strip().lower()
+    try:
+        port = int(credentials.get("smtp_port") or credentials.get("port") or 587)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A valid SMTP port is required") from exc
+    if (
+        not credentials.get("smtp_host") and not credentials.get("host")
+    ) or not 1 <= port <= 65535 or not credentials.get("username") or not credentials.get("password") or not re.fullmatch(
+        r"[^\s@]+@[^\s@]+\.[^\s@]+", address
+    ):
+        raise ValueError("A send-capable SMTP account with a valid From address is required")
+    return address
+
+
+async def send_connected_email(
+    credentials: dict, *, to: str, subject: str, content: str,
+    sender_name: str, expected_sender: str,
+) -> bool:
+    """Send a transactional message through the owner's saved SMTP account."""
+    from email.utils import parseaddr
+
+    try:
+        sender = connected_smtp_sender(credentials)
+    except ValueError:
+        return False
+    if sender != expected_sender:
+        return False
+    configured_name = parseaddr(str(credentials.get("from_address") or ""))[0]
+    port = int(credentials.get("smtp_port") or credentials.get("port") or 587)
+    config = {
+        "hostname": credentials.get("smtp_host") or credentials.get("host"),
+        "port": port,
+        "username": credentials["username"],
+        "password": credentials["password"],
+        "use_starttls": bool(credentials.get("use_tls_smtp", port == 587)),
+        "use_ssl": bool(credentials.get("use_ssl_smtp", port == 465)),
+        "from_email": sender,
+        "from_name": re.sub(r"[\r\n]+", " ", configured_name or sender_name).strip(),
+        "enabled": True,
+    }
+    delivered, _error = await _deliver_email(to, subject, _render("common", content=content), None, config)
+    return delivered
+
+
+async def connected_oauth_sender(provider: str, access_token: str) -> str | None:
+    """Read the actual mailbox behind a Google/Microsoft access token."""
+    if provider == "gmail":
+        url = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+    elif provider == "outlook":
+        url = "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName"
+    else:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+            response.raise_for_status()
+            profile = response.json()
+        address = str(
+            profile.get("emailAddress") if provider == "gmail"
+            else profile.get("mail") or profile.get("userPrincipalName") or ""
+        ).strip().lower()
+        return address if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", address) else None
+    except (httpx.HTTPError, ValueError, TypeError):
+        logger.warning("Connected %s mailbox identity check failed", provider)
+        return None
+
+
+async def send_connected_oauth_email(
+    provider: str, access_token: str, *, to: str, subject: str, content: str,
+    sender_name: str, expected_sender: str,
+) -> bool:
+    """Send via the exact OAuth mailbox; never fall back to platform SMTP."""
+    actual_sender = await connected_oauth_sender(provider, access_token)
+    if not actual_sender or actual_sender != expected_sender:
+        return False
+    html_body = _render("common", content=content)
+    safe_subject = re.sub(r"[\r\n]+", " ", subject).strip()
+    if provider == "gmail":
+        message = MIMEText(html_body, "html", "utf-8")
+        message["From"] = _format_from(re.sub(r"[\r\n]+", " ", sender_name).strip(), actual_sender)
+        message["To"] = to
+        message["Subject"] = _encode_header_text(safe_subject)
+        url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
+        payload = {"raw": base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")}
+    elif provider == "outlook":
+        url = "https://graph.microsoft.com/v1.0/me/sendMail"
+        payload = {"message": {
+            "subject": safe_subject,
+            "body": {"contentType": "HTML", "content": html_body},
+            "toRecipients": [{"emailAddress": {"address": to}}],
+        }, "saveToSentItems": True}
+    else:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                url, headers={"Authorization": f"Bearer {access_token}"}, json=payload,
+            )
+            response.raise_for_status()
+        return True
+    except httpx.HTTPError:
+        logger.warning("Connected %s mailbox delivery failed", provider)
+        return False
 
 
 # ── Payment receipts (Stripe webhook → user) ────────────────────────
@@ -979,3 +1293,76 @@ async def send_notification_email(to: str, notification_title: str, notification
 async def send_task_assigned_email(to: str, task_title: str, assigner_name: str) -> bool:
     content = f"<p><strong>{assigner_name}</strong> assigned you a task: <strong>{task_title}</strong></p>"
     return await send_common_email(to, f"Task assigned: {task_title}", content)
+
+
+_CLIENT_DELIVERY_EMAIL_COPY = {
+    "en": {
+        "receive": "Receive Workspace", "trial": "Customer testing", "delivered": "Direct delivery",
+        "intro": "{entity} has delivered {workspace} to you on Manor AI.",
+        "account": "Sign in or register with {email}, verify your email, then accept in your own company to become Workspace Owner. The received Workspace starts paused.",
+        "scope": "The delivery contains configuration and any starter files selected by the sender. Conversations, run history, credentials and unselected Knowledge are excluded. Connect your accounts after receiving; the provider has no access by default.",
+        "expiry": "This link expires in 7 days. If you were not expecting this invitation, ignore it.",
+        "browser": "View in a web browser",
+    },
+    "zh": {
+        "receive": "接收工作空间", "trial": "客户测试", "delivered": "直接交付",
+        "intro": "{entity} 通过 Manor AI 向您交付了 {workspace}。",
+        "account": "请使用 {email} 登录或注册并验证邮箱，在您自己的组织中接收后成为工作空间所有者。接收后默认暂停。",
+        "scope": "此次交付包含配置及发送人选择的初始模板文件，不含聊天、运行历史、账号凭据及未选择的 Knowledge。接收后请连接自己的账号；交付方默认无访问权限。",
+        "expiry": "链接有效期为 7 天；如非预期邀请，请忽略。",
+        "browser": "在浏览器中查看",
+    },
+    "es": {
+        "receive": "Recibir espacio de trabajo", "trial": "Prueba del cliente", "delivered": "Entrega directa",
+        "intro": "{entity} te ha entregado {workspace} en Manor AI.",
+        "account": "Inicia sesión o regístrate con {email}, verifica tu correo y acepta en tu propia organización para ser propietario del espacio de trabajo. El espacio recibido estará en pausa.",
+        "scope": "La entrega incluye la configuración y los archivos iniciales que haya seleccionado el remitente. Se excluyen conversaciones, historial de ejecución, credenciales y otros archivos de Knowledge. Conecta tus cuentas después de recibirla; el proveedor no tiene acceso por defecto.",
+        "expiry": "Este enlace caduca en 7 días. Si no esperabas esta invitación, ignórala.",
+        "browser": "Ver en el navegador",
+    },
+    "fr": {
+        "receive": "Recevoir l’espace de travail", "trial": "Test client", "delivered": "Livraison directe",
+        "intro": "{entity} vous a livré {workspace} sur Manor AI.",
+        "account": "Connectez-vous ou inscrivez-vous avec {email}, vérifiez votre adresse et acceptez dans votre propre organisation pour devenir propriétaire de l’espace de travail. L’espace reçu sera en pause.",
+        "scope": "La livraison comprend la configuration et les fichiers de démarrage sélectionnés par l’expéditeur. Les conversations, l’historique d’exécution, les identifiants et les autres fichiers Knowledge sont exclus. Connectez vos comptes après réception ; le prestataire n’a aucun accès par défaut.",
+        "expiry": "Ce lien expire dans 7 jours. Si vous n’attendiez pas cette invitation, ignorez-la.",
+        "browser": "Voir dans le navigateur",
+    },
+    "de": {
+        "receive": "Arbeitsbereich empfangen", "trial": "Kundentest", "delivered": "Direkte Übergabe",
+        "intro": "{entity} hat Ihnen {workspace} auf Manor AI übergeben.",
+        "account": "Melden Sie sich mit {email} an oder registrieren Sie sich, bestätigen Sie Ihre E-Mail-Adresse und nehmen Sie die Einladung in Ihrer eigenen Organisation an, um Eigentümer des Arbeitsbereichs zu werden. Der empfangene Arbeitsbereich ist zunächst pausiert.",
+        "scope": "Die Übergabe enthält die Konfiguration und die vom Absender ausgewählten Startdateien. Gespräche, Ausführungsverlauf, Zugangsdaten und nicht ausgewählte Knowledge-Dateien sind ausgeschlossen. Verbinden Sie danach Ihre Konten; der Anbieter hat standardmäßig keinen Zugriff.",
+        "expiry": "Dieser Link läuft nach 7 Tagen ab. Falls Sie diese Einladung nicht erwartet haben, ignorieren Sie sie.",
+        "browser": "Im Browser ansehen",
+    },
+}
+
+
+async def send_client_delivery_email(
+    to: str, *, entity_name: str, workspace_name: str, phase: str, invite_url: str, locale: str = "en",
+) -> bool:
+    """Email a private handover in the recipient's language, never a Staff invitation."""
+    config = _get_smtp_config()
+    domain = to.rsplit("@", 1)[-1].lower()
+    # Unlike legacy send_email, skipped delivery must never report SMTP success.
+    if not config["enabled"] or ((domain in _BLOCKED_DOMAINS or domain.endswith((".local", ".test", ".invalid"))) and not os.getenv("PYTEST_CURRENT_TEST")):
+        return False
+    email_locale = normalize_announcement_email_locale(locale)
+    copy = _CLIENT_DELIVERY_EMAIL_COPY[email_locale]
+    shared = _ANNOUNCEMENT_EMAIL_COPY[email_locale]
+    safe_url = escape(invite_url, quote=True)
+    intro = copy["intro"].format(entity=f"<strong>{escape(entity_name)}</strong>", workspace=f"<strong>{escape(workspace_name)}</strong>")
+    account = copy["account"].format(email=f"<strong>{escape(to)}</strong>")
+    content = (
+        f"<p>{intro}</p><p>{copy['trial' if phase == 'trial' else 'delivered']}</p>"
+        f"<p>{account}</p><p>{copy['scope']}</p>"
+        f"<p><a href='{safe_url}' style='display:inline-block;padding:13px 24px;border-radius:12px;"
+        "background:#436b65;color:#ffffff;text-decoration:none;font-weight:700;'>"
+        f"{copy['receive']}</a></p>"
+        f"<p style='word-break:break-all;'>{safe_url}</p><p>{copy['expiry']}</p>"
+    )
+    body = _render("common", content=content, email_locale=email_locale,
+                   browser_link=copy["browser"], footer_title=shared["tagline"], rights_reserved=shared["rights"])
+    ok, _error = await _deliver_email(to, f"{copy['receive']}: {workspace_name}", body, None, config)
+    return ok

@@ -107,6 +107,7 @@ def test_realtime_transcription_session_uses_asr_without_bridge_tool():
 def test_realtime_event_builders_keep_provider_output_constrained():
     from packages.core.services.voice.realtime import (
         build_function_output_event,
+        build_function_result_event,
         build_input_audio_event,
         build_spoken_response_event,
     )
@@ -127,6 +128,15 @@ def test_realtime_event_builders_keep_provider_output_constrained():
         "status": "ok",
         "spoken_reply": "The Manor answer.",
     }
+    result = build_function_result_event(
+        call_id="call-2",
+        result={"result": "work_accepted", "persisted": True},
+    )
+    assert result["item"]["call_id"] == "call-2"
+    assert json.loads(result["item"]["output"]) == {
+        "result": "work_accepted",
+        "persisted": True,
+    }
 
     response = build_spoken_response_event(spoken_reply="The Manor answer.")
     assert response == {
@@ -142,17 +152,75 @@ def test_realtime_event_builders_keep_provider_output_constrained():
     }
 
 
+def test_live_agent_builds_contextual_reply_only_from_accepted_work_result():
+    from packages.core.services.voice.live_agent import (
+        LiveVoiceToolResult,
+        live_voice_session_factory,
+    )
+
+    kind = LiveVoiceToolResult.WORK_ACCEPTED
+    assert live_voice_session_factory.tool_result(kind) == {
+        "result": "work_accepted",
+        "persisted": True,
+        "work_state": "running",
+    }
+    event = live_voice_session_factory.tool_result_response_event(kind)
+    assert event["response"]["tool_choice"] == "none"
+    assert event["response"]["output_modalities"] == ["audio"]
+    assert "language of the caller" in event["response"]["instructions"]
+    assert "first person" in event["response"]["instructions"]
+    assert "好，我来处理" not in event["response"]["instructions"]
+
+
+def test_live_agent_presents_saved_work_result_instead_of_reading_it_verbatim():
+    from packages.core.services.voice.live_agent import live_voice_session_factory
+
+    event = live_voice_session_factory.result_response_event(
+        request="请帮我查完整报告",
+        status="ok",
+        result="The report is ready. Raw tool trace: 42 rows. APR is 6.25%.",
+        instructions="## Current Agent Runtime Instructions\nYou are Agent Lee.",
+    )
+
+    response = event["response"]
+    assert response["tool_choice"] == "none"
+    assert response["output_modalities"] == ["audio"]
+    assert "You are Agent Lee" in response["instructions"]
+    assert '"request":"请帮我查完整报告"' in response["instructions"]
+    assert '"status":"ok"' in response["instructions"]
+    assert "APR is 6.25%" in response["instructions"]
+    assert "first person" in response["instructions"]
+    assert "Do not read the result verbatim" in response["instructions"]
+    assert "full details are in Chat" in response["instructions"]
+    assert "Speak exactly this Manor response" not in response["instructions"]
+
+
+def test_voice_agent_outcome_accepts_explicit_cancelled_status():
+    from typing import get_args
+
+    from packages.core.services.voice.realtime import (
+        VoiceAgentOutcome,
+        VoiceOutcomeStatus,
+    )
+
+    outcome = VoiceAgentOutcome(status="cancelled", spoken_reply="")
+
+    assert outcome.status == "cancelled"
+    assert "cancelled" in get_args(VoiceOutcomeStatus)
+
+
 @pytest.mark.asyncio
 async def test_resolve_realtime_route_uses_admin_vercel_before_managed_openai(
     monkeypatch,
 ):
     from packages.core.services.voice import realtime
 
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     async def no_byok(_entity_id):
         return None
 
     async def managed_route(model_id, **kwargs):
-        assert model_id == "openai/gpt-realtime"
+        assert model_id == "openai/gpt-realtime-2.1"
         assert kwargs == {
             "reason": "channel.voice.realtime.official_provider_key",
             "provider_chain": ("vercel", "openai"),
@@ -177,7 +245,7 @@ async def test_resolve_realtime_route_uses_admin_vercel_before_managed_openai(
     assert route == realtime.RealtimeRoute(
         api_key="managed-vercel-key",
         base_url="https://ai-gateway.vercel.sh/v1",
-        model="openai/gpt-realtime-mini",
+        model="openai/gpt-realtime-2.1",
         byok=False,
         provider="vercel",
         auth_method="api-key",
@@ -188,6 +256,7 @@ async def test_resolve_realtime_route_uses_admin_vercel_before_managed_openai(
 async def test_resolve_realtime_route_accepts_managed_openai_fallback(monkeypatch):
     from packages.core.services.voice import realtime
 
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     async def no_byok(_entity_id):
         return None
 
@@ -211,7 +280,7 @@ async def test_resolve_realtime_route_accepts_managed_openai_fallback(monkeypatc
     assert route == realtime.RealtimeRoute(
         api_key="managed-openai-key",
         base_url="https://api.openai.com/v1",
-        model="openai/gpt-realtime",
+        model="openai/gpt-realtime-2.1",
         byok=False,
         provider="openai",
         auth_method="api-key",
@@ -222,6 +291,7 @@ async def test_resolve_realtime_route_accepts_managed_openai_fallback(monkeypatc
 async def test_resolve_realtime_route_rejects_untrusted_vercel_gateway(monkeypatch):
     from packages.core.services.voice import realtime
 
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     async def no_byok(_entity_id):
         return None
 
@@ -297,7 +367,7 @@ async def test_resolve_realtime_route_uses_actor_for_primary_byok(monkeypatch):
         user_id="owner-user",
     )
 
-    assert route.model == "openai/gpt-realtime"
+    assert route.model == "openai/gpt-realtime-2.1"
     assert route.byok is True
 
 
@@ -305,12 +375,12 @@ async def test_resolve_realtime_route_uses_actor_for_primary_byok(monkeypatch):
 async def test_optional_realtime_route_returns_none_for_browser_fallback(monkeypatch):
     from packages.core.services.voice import realtime
 
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     monkeypatch.setattr(realtime, "_resolve_realtime_byok", AsyncMock(return_value=None))
     monkeypatch.setattr(
         "packages.core.services.model_gateway.resolve_official_model_route",
         AsyncMock(return_value=None),
     )
-
     assert (
         await realtime.resolve_realtime_route(
             "entity-realtime",
@@ -319,6 +389,44 @@ async def test_optional_realtime_route_returns_none_for_browser_fallback(monkeyp
         )
         is None
     )
+
+
+async def test_oss_realtime_never_uses_managed_credentials_even_when_allowed(monkeypatch):
+    from packages.core.services.voice import realtime
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setattr(realtime, "_resolve_realtime_byok", AsyncMock(return_value=None))
+    resolver = AsyncMock()
+    monkeypatch.setattr(
+        "packages.core.services.model_gateway.resolve_official_model_route",
+        resolver,
+    )
+
+    assert await realtime.resolve_realtime_route(
+        "entity-realtime", user_id="owner-user", required=False, allow_managed=True,
+    ) is None
+    resolver.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        ({"llm_api_key": ""}, "requires native OpenAI BYOK; configure an OpenAI Realtime API key"),
+        (
+            {"llm_api_key": "sk-user-openai", "llm_base_url": "https://compatible.example/v1"},
+            "configured OpenAI-compatible custom base URL cannot carry realtime audio",
+        ),
+    ],
+)
+async def test_oss_realtime_errors_do_not_suggest_managed_credentials(monkeypatch, metadata, expected):
+    from packages.core.services.voice import realtime
+
+    monkeypatch.setenv("DEPLOYMENT_MODE", "oss")
+    monkeypatch.setattr(realtime, "_resolve_realtime_byok", AsyncMock(return_value=metadata))
+
+    with pytest.raises(RuntimeError, match=expected) as exc:
+        await realtime.resolve_realtime_route("entity-realtime", required=True)
+    assert "Admin" not in str(exc.value)
 
 
 @pytest.mark.asyncio
@@ -342,6 +450,7 @@ async def test_resolve_realtime_route_rejects_unsupported_routes(
 ):
     from packages.core.services.voice import realtime
 
+    monkeypatch.setenv("DEPLOYMENT_MODE", "cloud")
     async def byok(_entity_id):
         return metadata
 
@@ -399,12 +508,13 @@ async def test_vercel_realtime_connection_mints_token_and_uses_gateway_protocols
         async def __aexit__(self, *_args):
             return False
 
-    def connect(url, *, subprotocols, open_timeout, max_size):
+    def connect(url, *, subprotocols, open_timeout, close_timeout, max_size):
         websocket_calls.append(
             {
                 "url": url,
                 "subprotocols": subprotocols,
                 "open_timeout": open_timeout,
+                "close_timeout": close_timeout,
                 "max_size": max_size,
             }
         )
@@ -449,6 +559,7 @@ async def test_vercel_realtime_connection_mints_token_and_uses_gateway_protocols
                 "ai-gateway-auth.vcst_test",
             ],
             "open_timeout": 15,
+            "close_timeout": 2,
             "max_size": 2 * 1024 * 1024,
         }
     ]
@@ -734,6 +845,28 @@ async def test_vercel_realtime_connection_verifies_manor_response_controls():
         await connection.recv()
 
 
+def test_vercel_browser_session_keeps_live_agent_tools_server_gated():
+    from packages.core.services.voice.browser import browser_session_update
+    from packages.core.services.voice.realtime import _vercel_session_update_event
+
+    session = browser_session_update("openai/gpt-realtime-mini")["session"]
+    mapped = _vercel_session_update_event(session)["config"]
+
+    assert mapped["outputModalities"] == ["audio"]
+    assert [tool["name"] for tool in mapped["tools"]] == [
+        "delegate_to_main_agent",
+        "update_active_work",
+        "wait_for_user",
+    ]
+    assert mapped["providerOptions"]["tool_choice"] == "auto"
+    assert (
+        mapped["providerOptions"]["audio"]["input"]["turn_detection"][
+            "create_response"
+        ]
+        is False
+    )
+
+
 @pytest.mark.asyncio
 async def test_vercel_realtime_connection_switches_between_bridge_and_speech_controls():
     from packages.core.services.voice import realtime
@@ -866,16 +999,17 @@ def test_realtime_model_rejects_non_ga_or_non_openai_models(monkeypatch, model):
     "model",
     ["openai/gpt-realtime-1.5", "openai/gpt-audio-mini"],
 )
-def test_vercel_realtime_only_supports_realtime_mini(monkeypatch, model):
+def test_vercel_realtime_rejects_unsupported_realtime_models(monkeypatch, model):
     from packages.core.services.voice import realtime
 
     monkeypatch.setenv("VERCEL_REALTIME_MODEL", model)
 
-    with pytest.raises(RuntimeError, match="openai/gpt-realtime-mini"):
+    with pytest.raises(RuntimeError, match="supported OpenAI Realtime"):
         realtime.resolve_vercel_realtime_model()
 
 
 def test_bridge_call_executes_only_from_completed_response_done():
+    from packages.core.services.voice.live_agent import LiveVoiceTool
     from packages.core.services.voice.realtime import (
         BridgeCall,
         parse_completed_bridge_call,
@@ -910,6 +1044,7 @@ def test_bridge_call_executes_only_from_completed_response_done():
         call_id="call-1",
         utterance="hello",
         response_id="response-1",
+        tool=LiveVoiceTool.MANOR_AGENT,
     )
     assert seen_call_ids == {"call-1"}
 
@@ -929,6 +1064,25 @@ def test_bridge_call_accepts_sdk_response_done_event():
 
     assert call is not None
     assert call.utterance == "hello"
+
+
+def test_live_agent_bridge_call_parses_typed_task_action():
+    from packages.core.services.voice.realtime import parse_completed_bridge_call
+    from packages.core.services.voice.work_types import VoiceWorkAction
+
+    call = parse_completed_bridge_call(
+        _response_done(
+            arguments=json.dumps(
+                {"action": "status", "utterance": "What's the status?"}
+            )
+        ),
+        seen_event_ids=set(),
+        seen_call_ids=set(),
+    )
+
+    assert call is not None
+    assert call.utterance == "What's the status?"
+    assert call.action is VoiceWorkAction.STATUS
 
 
 @pytest.mark.parametrize(
@@ -1873,6 +2027,7 @@ async def test_voice_session_serializes_completed_bridge_calls_fifo():
 
     first_release.set()
     await asyncio.wait_for(second_entered.wait(), timeout=1)
+    await _complete_twilio_response(session, "first-spoken-response")
     second_release.set()
     await session._bridge_calls.join()
     await session._bridge_calls.put(None)
@@ -1902,6 +2057,671 @@ async def test_voice_session_serializes_completed_bridge_calls_fifo():
         and event["response"]["output_modalities"] == ["audio"]
         for event in speech_responses
     )
+
+
+@pytest.mark.asyncio
+async def test_twilio_voice_acknowledges_durable_work_before_agent_completes():
+    from packages.core.services.voice.realtime import (
+        BridgeCall,
+        RealtimeRoute,
+        VoiceAgentOutcome,
+    )
+    from packages.core.services.voice.session import TwilioVoiceSession
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+
+    class RealtimeConnection:
+        def __init__(self):
+            self.sent: list[dict] = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    receipt = VoiceWorkReceipt(
+        "work-1",
+        "message-1",
+        "Run the report",
+        scope_id="call-session-1",
+    )
+    agent_entered = asyncio.Event()
+    release_agent = asyncio.Event()
+
+    async def execute_work(work):
+        assert work == receipt
+        agent_entered.set()
+        await release_agent.wait()
+        return VoiceAgentOutcome(status="ok", spoken_reply="The report is ready.")
+
+    realtime = RealtimeConnection()
+    session = TwilioVoiceSession(
+        SimpleNamespace(),
+        realtime_route=RealtimeRoute(
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+            model="gpt-realtime",
+            byok=True,
+        ),
+        agent_callable=AsyncMock(),
+        admit_work=AsyncMock(return_value=receipt),
+        execute_work=execute_work,
+        call_session_id="call-session-1",
+        channel_config_id="config-1",
+        entity_id="entity-1",
+        hold_message="I'm working on that now.",
+    )
+    session._realtime = realtime
+    worker = asyncio.create_task(session._agent_worker())
+    await session._bridge_calls.put(
+        BridgeCall("bridge-call-1", receipt.text, "response-1")
+    )
+
+    await asyncio.wait_for(agent_entered.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    assert not release_agent.is_set()
+    assert json.loads(realtime.sent[0]["item"]["output"]) == {
+        "status": "action_handled",
+        "spoken_reply": "I'm working on that now.",
+    }
+    assert "I'm working on that now." in realtime.sent[1]["response"]["instructions"]
+    assert all(
+        "The report is ready." not in json.dumps(event)
+        for event in realtime.sent
+    )
+
+    await _complete_twilio_response(session, "durable-ack")
+    release_agent.set()
+    for _ in range(20):
+        if any("The report is ready." in json.dumps(event) for event in realtime.sent):
+            break
+        await asyncio.sleep(0)
+    await session._bridge_calls.put(None)
+    await worker
+    await asyncio.gather(*session._detached_agent_tasks)
+
+    assert any("The report is ready." in json.dumps(event) for event in realtime.sent)
+
+
+@pytest.mark.asyncio
+async def test_twilio_voice_waits_for_response_done_before_starting_next_speech():
+    from packages.core.services.voice.realtime import (
+        RealtimeRoute,
+        VoiceAgentOutcome,
+        build_spoken_response_event,
+    )
+    from packages.core.services.voice.session import TwilioVoiceSession
+
+    class RealtimeConnection:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, event):
+            self.sent.append(event)
+
+    session = TwilioVoiceSession(
+        SimpleNamespace(),
+        realtime_route=RealtimeRoute(
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+            model="gpt-realtime",
+            byok=True,
+        ),
+        agent_callable=AsyncMock(
+            return_value=VoiceAgentOutcome(status="no_reply", spoken_reply="")
+        ),
+        call_session_id="call-1",
+        channel_config_id="config-1",
+        entity_id="entity-1",
+    )
+    realtime = RealtimeConnection()
+    session._realtime = realtime
+
+    await session._create_realtime_response(
+        build_spoken_response_event(spoken_reply="First response")
+    )
+    second = asyncio.create_task(
+        session._create_realtime_response(
+            build_spoken_response_event(spoken_reply="Second response")
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert len(realtime.sent) == 1
+    assert not second.done()
+
+    await session._handle_realtime_event(
+        {
+            "type": "response.done",
+            "response": {
+                "id": "speech-response-1",
+                "status": "completed",
+                "output": [],
+            },
+        }
+    )
+    await second
+
+    assert len(realtime.sent) == 2
+    assert "First response" in realtime.sent[0]["response"]["instructions"]
+    assert "Second response" in realtime.sent[1]["response"]["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_twilio_durable_voice_work_remains_fifo_while_foreground_listens():
+    from packages.core.services.voice.realtime import (
+        BridgeCall,
+        RealtimeRoute,
+        VoiceAgentOutcome,
+    )
+    from packages.core.services.voice.session import TwilioVoiceSession
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+
+    first = VoiceWorkReceipt("work-1", "message-1", "First", scope_id="call-1")
+    second = VoiceWorkReceipt("work-2", "message-2", "Second", scope_id="call-1")
+    first_entered = asyncio.Event()
+    first_release = asyncio.Event()
+    second_entered = asyncio.Event()
+    second_release = asyncio.Event()
+
+    async def execute_work(receipt):
+        if receipt == first:
+            first_entered.set()
+            await first_release.wait()
+        else:
+            second_entered.set()
+            await second_release.wait()
+        return VoiceAgentOutcome(status="no_reply", spoken_reply="")
+
+    session = TwilioVoiceSession(
+        SimpleNamespace(),
+        realtime_route=RealtimeRoute(
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+            model="gpt-realtime",
+            byok=True,
+        ),
+        agent_callable=AsyncMock(),
+        admit_work=AsyncMock(side_effect=[first, second]),
+        execute_work=execute_work,
+        call_session_id="call-1",
+        channel_config_id="config-1",
+        entity_id="entity-1",
+    )
+    session._realtime = AsyncMock()
+    worker = asyncio.create_task(session._agent_worker())
+    await session._bridge_calls.put(BridgeCall("bridge-1", "First", "response-1"))
+    await session._bridge_calls.put(BridgeCall("bridge-2", "Second", "response-2"))
+
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+    await _complete_twilio_response(session, "first-ack")
+    await session._bridge_calls.join()
+    assert not second_entered.is_set()
+
+    await _complete_twilio_response(session, "queue-ack")
+    first_release.set()
+    await asyncio.wait_for(second_entered.wait(), timeout=1)
+    await _complete_twilio_response(session, "second-ack")
+    second_release.set()
+    for _ in range(20):
+        if session._active_durable_work is None:
+            break
+        await asyncio.sleep(0)
+    await session._bridge_calls.put(None)
+    await worker
+
+    assert session._active_durable_work is None
+
+
+@pytest.mark.asyncio
+async def test_twilio_closed_session_drains_admitted_queue_without_provider_io():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+
+    first = VoiceWorkReceipt("work-1", "message-1", "First", scope_id="call-1")
+    second = VoiceWorkReceipt("work-2", "message-2", "Second", scope_id="call-1")
+    first_release = asyncio.Event()
+    second_finished = asyncio.Event()
+    executed: list[str] = []
+
+    async def execute_work(receipt):
+        executed.append(receipt.id)
+        if receipt == first:
+            await first_release.wait()
+        else:
+            second_finished.set()
+        return VoiceAgentOutcome(status="no_reply", spoken_reply="")
+
+    session = _durable_twilio_session(
+        admit_work=AsyncMock(side_effect=[first, second]),
+        execute_work=execute_work,
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", first.text, "r1"))
+    await _complete_twilio_response(session, "closed-first-ack")
+    await session._start_durable_agent_turn(BridgeCall("bridge-2", second.text, "r2"))
+    await _complete_twilio_response(session, "closed-queue-ack")
+    session._realtime.send.reset_mock()
+    session._closed = True
+    first_release.set()
+
+    await asyncio.wait_for(second_finished.wait(), timeout=1)
+    for _ in range(20):
+        if session._active_durable_work is None and not session._detached_agent_tasks:
+            break
+        await asyncio.sleep(0)
+
+    assert executed == [first.id, second.id]
+    session._realtime.send.assert_not_awaited()
+    assert session._active_durable_work is None
+    assert session._detached_agent_tasks == set()
+
+
+def _durable_twilio_session(
+    *,
+    admit_work,
+    execute_work,
+    route_followup=None,
+    cancel_work=None,
+    record_control_turn=None,
+):
+    from packages.core.services.voice.realtime import RealtimeRoute
+    from packages.core.services.voice.session import TwilioVoiceSession
+
+    session = TwilioVoiceSession(
+        SimpleNamespace(),
+        realtime_route=RealtimeRoute(
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+            model="gpt-realtime",
+            byok=True,
+        ),
+        agent_callable=AsyncMock(),
+        admit_work=admit_work,
+        execute_work=execute_work,
+        route_followup=route_followup,
+        cancel_work=cancel_work,
+        record_control_turn=record_control_turn,
+        call_session_id="call-1",
+        channel_config_id="config-1",
+        entity_id="entity-1",
+    )
+    session._realtime = AsyncMock()
+    return session
+
+
+async def _complete_twilio_response(session, response_id: str) -> None:
+    await session._handle_realtime_event(
+        {
+            "type": "response.done",
+            "response": {
+                "id": response_id,
+                "status": "completed",
+                "output": [],
+            },
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_twilio_status_followup_does_not_admit_an_agent_turn():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    receipt = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    release = asyncio.Event()
+
+    async def execute_work(_receipt):
+        await release.wait()
+        return VoiceAgentOutcome(status="ok", spoken_reply="Report ready")
+
+    admit_work = AsyncMock(return_value=receipt)
+    route_followup = AsyncMock(
+        return_value=VoiceWorkDecision(
+            VoiceWorkAction.STATUS,
+            "The report is still running.",
+        )
+    )
+    record_control_turn = AsyncMock()
+    session = _durable_twilio_session(
+        admit_work=admit_work,
+        execute_work=execute_work,
+        route_followup=route_followup,
+        record_control_turn=record_control_turn,
+    )
+    first_call = BridgeCall("bridge-1", receipt.text, "response-1")
+    status_call = BridgeCall("bridge-status", "Any update?", "response-status")
+
+    await session._start_durable_agent_turn(first_call)
+    await _complete_twilio_response(session, "status-first-ack")
+    await session._start_durable_agent_turn(status_call)
+
+    admit_work.assert_awaited_once_with(receipt.text)
+    route_followup.assert_awaited_once_with(status_call.utterance, receipt)
+    record_control_turn.assert_awaited_once_with(
+        status_call.utterance,
+        "The report is still running.",
+    )
+    await _complete_twilio_response(session, "status-control")
+    release.set()
+    await asyncio.gather(*session._detached_agent_tasks)
+
+
+@pytest.mark.asyncio
+async def test_twilio_queue_followup_is_admitted_and_runs_after_active_work():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    first = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    second = VoiceWorkReceipt("work-2", "message-2", "Email it", scope_id="call-1")
+    first_release = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def execute_work(receipt):
+        if receipt == first:
+            await first_release.wait()
+        else:
+            second_started.set()
+        return VoiceAgentOutcome(status="no_reply", spoken_reply="")
+
+    admit_work = AsyncMock(side_effect=[first, second])
+    route_followup = AsyncMock(
+        return_value=VoiceWorkDecision(
+            VoiceWorkAction.QUEUE,
+            "I'll email it after the report is ready.",
+        )
+    )
+    session = _durable_twilio_session(
+        admit_work=admit_work,
+        execute_work=execute_work,
+        route_followup=route_followup,
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", first.text, "r1"))
+    await _complete_twilio_response(session, "queue-first-ack")
+    await session._start_durable_agent_turn(BridgeCall("bridge-2", second.text, "r2"))
+
+    assert not second_started.is_set()
+    assert [item.receipt for item in session._queued_durable_calls] == [second]
+    await _complete_twilio_response(session, "queue-control")
+    first_release.set()
+    await asyncio.wait_for(second_started.wait(), timeout=1)
+    await _complete_twilio_response(session, "queue-second-ack")
+    await asyncio.gather(*session._detached_agent_tasks)
+
+
+@pytest.mark.asyncio
+async def test_twilio_cancel_followup_suppresses_the_stale_agent_result():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    receipt = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    release = asyncio.Event()
+
+    async def execute_work(_receipt):
+        await release.wait()
+        return VoiceAgentOutcome(status="ok", spoken_reply="stale report")
+
+    cancel_work = AsyncMock(return_value=True)
+    session = _durable_twilio_session(
+        admit_work=AsyncMock(return_value=receipt),
+        execute_work=execute_work,
+        route_followup=AsyncMock(
+            return_value=VoiceWorkDecision(
+                VoiceWorkAction.CANCEL,
+                "The report was cancelled.",
+            )
+        ),
+        cancel_work=cancel_work,
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", receipt.text, "r1"))
+    await _complete_twilio_response(session, "cancel-first-ack")
+    await session._start_durable_agent_turn(BridgeCall("bridge-cancel", "Stop it", "r2"))
+
+    cancel_work.assert_awaited_once_with(receipt, None)
+    assert session._active_durable_work.suppress_delivery is True
+    await _complete_twilio_response(session, "cancel-control")
+    release.set()
+    await asyncio.gather(*session._detached_agent_tasks)
+    sent = [call.args[0] for call in session._realtime.send.await_args_list]
+    assert all("stale report" not in json.dumps(event) for event in sent)
+
+
+@pytest.mark.asyncio
+async def test_twilio_replace_admits_new_work_before_interrupting_the_old_receipt():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    first = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    replacement = VoiceWorkReceipt(
+        "work-2",
+        "message-2",
+        "Check staging instead",
+        scope_id="call-1",
+    )
+    first_release = asyncio.Event()
+    replacement_started = asyncio.Event()
+
+    async def execute_work(receipt):
+        if receipt == first:
+            await first_release.wait()
+        else:
+            replacement_started.set()
+        return VoiceAgentOutcome(status="ok", spoken_reply=f"done:{receipt.text}")
+
+    events = []
+
+    async def admit_work(text):
+        events.append(("admit", text))
+        return first if len(events) == 1 else replacement
+
+    async def cancel_work(active, queued):
+        events.append(("cancel", active.id, queued.id if queued else None))
+        return True
+
+    session = _durable_twilio_session(
+        admit_work=admit_work,
+        execute_work=execute_work,
+        route_followup=AsyncMock(
+            return_value=VoiceWorkDecision(
+                VoiceWorkAction.REPLACE,
+                "I'll switch to staging.",
+            )
+        ),
+        cancel_work=cancel_work,
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", first.text, "r1"))
+    await _complete_twilio_response(session, "replace-first-ack")
+    await session._start_durable_agent_turn(
+        BridgeCall("bridge-replace", replacement.text, "r2")
+    )
+
+    assert events == [
+        ("admit", first.text),
+        ("admit", replacement.text),
+        ("cancel", first.id, replacement.id),
+    ]
+    assert session._active_durable_work.suppress_delivery is True
+    await _complete_twilio_response(session, "replace-control")
+    first_release.set()
+    await asyncio.wait_for(replacement_started.wait(), timeout=1)
+    await _complete_twilio_response(session, "replace-second-ack")
+    await asyncio.gather(*session._detached_agent_tasks)
+
+
+@pytest.mark.asyncio
+async def test_twilio_second_replace_skips_the_superseded_pending_replacement():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    first = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    stale = VoiceWorkReceipt("work-2", "message-2", "Check staging", scope_id="call-1")
+    newest = VoiceWorkReceipt("work-3", "message-3", "Check production", scope_id="call-1")
+    first_release = asyncio.Event()
+    newest_started = asyncio.Event()
+    executed: list[str] = []
+
+    async def execute_work(receipt):
+        executed.append(receipt.id)
+        if receipt == first:
+            await first_release.wait()
+        if receipt == newest:
+            newest_started.set()
+        return VoiceAgentOutcome(status="no_reply", spoken_reply="")
+
+    session = _durable_twilio_session(
+        admit_work=AsyncMock(side_effect=[first, stale, newest]),
+        execute_work=execute_work,
+        route_followup=AsyncMock(
+            side_effect=[
+                VoiceWorkDecision(
+                    VoiceWorkAction.REPLACE,
+                    "I'll switch to staging.",
+                ),
+                VoiceWorkDecision(
+                    VoiceWorkAction.REPLACE,
+                    "I'll switch to production.",
+                    superseded_by=stale.id,
+                ),
+            ]
+        ),
+        cancel_work=AsyncMock(return_value=True),
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", first.text, "r1"))
+    await _complete_twilio_response(session, "replace-first-ack")
+    await session._start_durable_agent_turn(BridgeCall("bridge-2", stale.text, "r2"))
+    await _complete_twilio_response(session, "replace-stale-control")
+    await session._start_durable_agent_turn(BridgeCall("bridge-3", newest.text, "r3"))
+
+    assert [item.receipt for item in session._queued_durable_calls] == [newest]
+    await _complete_twilio_response(session, "replace-newest-control")
+    first_release.set()
+    await asyncio.wait_for(newest_started.wait(), timeout=1)
+    await _complete_twilio_response(session, "replace-newest-ack")
+    await asyncio.gather(*session._detached_agent_tasks)
+
+    assert executed == [first.id, newest.id]
+
+
+@pytest.mark.asyncio
+async def test_twilio_cancel_after_replace_skips_the_pending_replacement():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    first = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    replacement = VoiceWorkReceipt(
+        "work-2",
+        "message-2",
+        "Check staging",
+        scope_id="call-1",
+    )
+    first_release = asyncio.Event()
+    executed: list[str] = []
+
+    async def execute_work(receipt):
+        executed.append(receipt.id)
+        if receipt == first:
+            await first_release.wait()
+        return VoiceAgentOutcome(status="no_reply", spoken_reply="")
+
+    session = _durable_twilio_session(
+        admit_work=AsyncMock(side_effect=[first, replacement]),
+        execute_work=execute_work,
+        route_followup=AsyncMock(
+            side_effect=[
+                VoiceWorkDecision(
+                    VoiceWorkAction.REPLACE,
+                    "I'll switch to staging.",
+                ),
+                VoiceWorkDecision(
+                    VoiceWorkAction.CANCEL,
+                    "I'll cancel the pending replacement.",
+                    superseded_by=replacement.id,
+                ),
+            ]
+        ),
+        cancel_work=AsyncMock(return_value=True),
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", first.text, "r1"))
+    await _complete_twilio_response(session, "cancel-replace-first-ack")
+    await session._start_durable_agent_turn(
+        BridgeCall("bridge-2", replacement.text, "r2")
+    )
+    await _complete_twilio_response(session, "cancel-replace-control")
+    assert [item.receipt for item in session._queued_durable_calls] == [replacement]
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-3", "Stop it", "r3"))
+
+    assert list(session._queued_durable_calls) == []
+    await _complete_twilio_response(session, "cancel-pending-control")
+    first_release.set()
+    await asyncio.gather(*session._detached_agent_tasks)
+
+    assert executed == [first.id]
+
+
+@pytest.mark.asyncio
+async def test_twilio_cancel_race_reports_the_refreshed_completed_state():
+    from packages.core.services.voice.realtime import BridgeCall, VoiceAgentOutcome
+    from packages.core.services.voice.work_queue import VoiceWorkReceipt
+    from packages.core.services.voice.work_types import VoiceWorkAction, VoiceWorkDecision
+
+    receipt = VoiceWorkReceipt("work-1", "message-1", "Run report", scope_id="call-1")
+    release = asyncio.Event()
+
+    async def execute_work(_receipt):
+        await release.wait()
+        return VoiceAgentOutcome(status="no_reply", spoken_reply="")
+
+    route_followup = AsyncMock(
+        side_effect=[
+            VoiceWorkDecision(
+                VoiceWorkAction.CANCEL,
+                "Okay, I'll stop the current task.",
+            ),
+            VoiceWorkDecision(
+                VoiceWorkAction.STATUS,
+                "It just finished. The result is in the chat.",
+            ),
+        ]
+    )
+    record_control_turn = AsyncMock()
+    session = _durable_twilio_session(
+        admit_work=AsyncMock(return_value=receipt),
+        execute_work=execute_work,
+        route_followup=route_followup,
+        cancel_work=AsyncMock(return_value=False),
+        record_control_turn=record_control_turn,
+    )
+
+    await session._start_durable_agent_turn(BridgeCall("bridge-1", receipt.text, "r1"))
+    await _complete_twilio_response(session, "cancel-race-first-ack")
+    cancel_call = BridgeCall("bridge-cancel", "Stop it", "r2")
+    await session._start_durable_agent_turn(cancel_call)
+
+    assert [item.args for item in route_followup.await_args_list] == [
+        (cancel_call.utterance, receipt),
+        (cancel_call.utterance, receipt),
+    ]
+    record_control_turn.assert_awaited_once_with(
+        cancel_call.utterance,
+        "It just finished. The result is in the chat.",
+    )
+    sent = [entry.args[0] for entry in session._realtime.send.await_args_list]
+    assert any("It just finished" in json.dumps(event) for event in sent)
+    assert all("I'll stop" not in json.dumps(event) for event in sent)
+
+    await _complete_twilio_response(session, "cancel-race-control")
+    release.set()
+    await asyncio.gather(*session._detached_agent_tasks)
 
 
 @pytest.mark.asyncio
@@ -2133,6 +2953,7 @@ async def test_voice_session_long_turn_emits_one_hold_and_one_final(monkeypatch)
     assert len(hold_responses) == 1
     assert "still working" in hold_responses[0]["response"]["instructions"]
 
+    await _complete_twilio_response(session, "hold-response")
     release_agent.set()
     await turn
 
@@ -2272,6 +3093,15 @@ async def test_voice_session_vercel_long_turn_keeps_tool_conversation_order(monk
             {"status": "unbound", "reason": "binding_scope_changed"},
             "error",
             "Sorry, I cannot complete that request right now.",
+        ),
+        (
+            {
+                "status": "cancelled",
+                "conversation_id": "conversation-1",
+                "agent_id": "agent-1",
+            },
+            "cancelled",
+            "",
         ),
     ],
 )
@@ -3125,7 +3955,7 @@ async def test_vercel_voice_session_starts_with_realtime_transcription(monkeypat
 
     assert session.error_message is None
     assert sent[0]["session"]["audio"]["input"]["transcription"] == {
-        "model": "gpt-4o-mini-transcribe"
+        "model": "gpt-4o-mini-transcribe",
     }
     assert "tools" not in sent[0]["session"]
     assert "tool_choice" not in sent[0]["session"]

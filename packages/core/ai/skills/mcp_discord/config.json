@@ -11,5 +11,9 @@
     "mcp__discord__list_channels",
     "mcp__discord__send_message",
     "mcp__discord__add_reaction"
-  ]
+  ],
+  "search": {
+    "terms": ["chat server", "community", "guild", "emoji", "post to discord", "channel message"],
+    "examples": ["post announcement in discord channel", "list channels in my discord server", "react with emoji to discord message", "send message to discord community"]
+  }
 }

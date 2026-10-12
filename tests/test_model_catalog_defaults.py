@@ -43,6 +43,34 @@ def test_primary_default_accepts_image_input():
     assert "image" in modalities
 
 
+def test_chat_catalog_records_video_understanding_separately_from_generation():
+    for role in CHAT_ROLES:
+        for item in CATALOG[role]:
+            modalities = model_input_modalities(item["id"])
+            assert item["capabilities"]["video_input"] is (
+                True if modalities and "video" in modalities else None
+            )
+
+    supported = {
+        "google/gemini-2.5-pro",
+        "moonshotai/kimi-k3",
+        "moonshotai/kimi-k2.6",
+        "qwen/qwen3.8-max",
+        "qwen/qwen3.7-flash",
+        "qwen/qwen3.6-plus",
+    }
+    for model_id in supported:
+        assert any(
+            item["id"] == model_id and item["capabilities"]["video_input"] is True
+            for role in CHAT_ROLES
+            for item in CATALOG[role]
+        ), model_id
+    assert next(
+        item for item in CATALOG["primary"] if item["id"] == DEFAULTS["primary"]
+    )["capabilities"]["video_input"] is None
+    assert "video_input" not in CATALOG["video"][0]["capabilities"]
+
+
 def test_chat_catalog_models_are_priced():
     unpriced = [
         item["id"]

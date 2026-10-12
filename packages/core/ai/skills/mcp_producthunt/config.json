@@ -13,5 +13,9 @@
     "mcp__producthunt__list_comments",
     "mcp__producthunt__post_comment",
     "mcp__producthunt__me"
-  ]
+  ],
+  "search": {
+    "terms": ["ph", "launch day", "startup launches", "upvote", "maker", "trending products", "new products"],
+    "examples": ["top product hunt launches today", "read comments on product hunt post", "search product hunt for ai tools", "comment on my product hunt launch"]
+  }
 }

@@ -21,6 +21,7 @@ from packages.core.models.document import (
     Document,
     DocumentChunk,
     DocumentFolder,
+    DocumentGroup,
     DocumentGroupMember,
 )
 from packages.core.models.document_version import DocumentVersion
@@ -31,7 +32,6 @@ from packages.core.models.permission import (
     ResourceType,
     Share,
 )
-from packages.core.models.workspace import Workspace
 from packages.core.services.entity_fs import (
     EntityFilesystemError,
     assert_entity_filesystem_ready,
@@ -39,7 +39,6 @@ from packages.core.services.entity_fs import (
     get_entity_root,
 )
 from packages.core.services.comment_service import delete_resource_comments
-from packages.core.services.workspace_artifacts import workspace_artifact_storage_base
 
 
 logger = logging.getLogger(__name__)
@@ -54,6 +53,7 @@ DOCUMENT_DERIVED_TREE_CACHE_ROOTS = (
     ".slide-object-cache",
     ".doc-thumb-cache",
 )
+DOCUMENT_VERSION_SNAPSHOT_ROOT = ".versions/documents"
 _ARTIFACT_CLEANUP_KINDS = {
     ARTIFACT_CLEANUP_KIND_EMPTY_DIRECTORY,
     ARTIFACT_CLEANUP_KIND_TREE,
@@ -80,6 +80,14 @@ def document_derived_tree_cleanup_bases(document_ids) -> set[str]:
         f"{cache_root}/{document_id}"
         for cache_root in DOCUMENT_DERIVED_TREE_CACHE_ROOTS
         for document_id in normalized_ids
+    }
+
+
+def document_version_snapshot_cleanup_bases(document_ids) -> set[str]:
+    return {
+        f"{DOCUMENT_VERSION_SNAPSHOT_ROOT}/{document_id}"
+        for value in document_ids
+        if (document_id := str(value or "").strip())
     }
 
 
@@ -498,24 +506,53 @@ def _remove_empty_artifact_directory(entity_id: str, storage_base: str) -> None:
         os.rmdir(target_name, dir_fd=parent_fd)
 
 
+async def _artifact_target_is_retained_knowledge(
+    db: AsyncSession,
+    job: WorkspaceArtifactPurgeJob,
+) -> bool:
+    """Whether a durable cleanup target is still referenced by Entity Knowledge."""
+    if job.target_kind == ARTIFACT_CLEANUP_KIND_FILE:
+        path_clause = Document.fs_path == job.storage_base
+        version_path_clause = DocumentVersion.fs_path == job.storage_base
+    elif job.target_kind == ARTIFACT_CLEANUP_KIND_TREE:
+        path_clause = or_(
+            Document.fs_path == job.storage_base,
+            Document.fs_path.startswith(f"{job.storage_base}/", autoescape=True),
+        )
+        version_path_clause = or_(
+            DocumentVersion.fs_path == job.storage_base,
+            DocumentVersion.fs_path.startswith(
+                f"{job.storage_base}/", autoescape=True,
+            ),
+        )
+    else:
+        return False
+
+    if await db.scalar(select(Document.id).where(
+        Document.entity_id == job.entity_id,
+        path_clause,
+    ).limit(1)) is not None:
+        return True
+
+    entity_document_ids = select(Document.id).where(
+        Document.entity_id == job.entity_id,
+    )
+    return await db.scalar(select(DocumentVersion.id).where(
+        DocumentVersion.document_id.in_(entity_document_ids),
+        version_path_clause,
+    ).limit(1)) is not None
+
+
 async def _remove_artifact_job_target(
     db: AsyncSession,
     job: WorkspaceArtifactPurgeJob,
 ) -> None:
+    # A stale cleanup intent must never win against retained Knowledge. This
+    # check runs under the same entity filesystem mutation lock as deletion;
+    # callers discard the obsolete intent rather than retrying it forever.
+    if await _artifact_target_is_retained_knowledge(db, job):
+        return
     if job.target_kind == ARTIFACT_CLEANUP_KIND_FILE:
-        # The database deletion and physical retry are intentionally separate.
-        # A writer can legitimately reuse this path between them, so recheck
-        # ownership while holding the same entity filesystem lock as writers.
-        reused_document_id = (await db.execute(
-            select(Document.id)
-            .where(
-                Document.entity_id == job.entity_id,
-                Document.fs_path == job.storage_base,
-            )
-            .limit(1)
-        )).scalar_one_or_none()
-        if reused_document_id is not None:
-            return
         await asyncio.to_thread(
             _remove_artifact_file,
             job.entity_id,
@@ -537,59 +574,49 @@ async def _remove_artifact_job_target(
     )
 
 
-async def purge_workspace_artifacts(
+async def purge_entity_knowledge(
     db: AsyncSession,
-    workspace: Workspace,
+    entity_id: str,
 ) -> None:
-    """Delete one Workspace's unique artifact root, projections, and folders."""
+    """Delete all Entity Knowledge as part of terminal Entity deletion only."""
 
-    artifact_folder_id = str(workspace.artifact_folder_id or "").strip()
-    if not artifact_folder_id:
-        return
-    storage_base = workspace_artifact_storage_base(artifact_folder_id)
-    folder_tree = select(DocumentFolder.id).where(
-        DocumentFolder.id == artifact_folder_id,
-        DocumentFolder.entity_id == workspace.entity_id,
-    ).cte("workspace_artifact_folder_tree", recursive=True)
-    folder_tree = folder_tree.union(
-        select(DocumentFolder.id).join(
-            folder_tree,
-            DocumentFolder.parent_id == folder_tree.c.id,
-        ).where(DocumentFolder.entity_id == workspace.entity_id)
-    )
-    folder_ids = set((await db.execute(select(folder_tree.c.id))).scalars().all())
-    path_clause = or_(
-        Document.fs_path == storage_base,
-        Document.fs_path.startswith(f"{storage_base}/", autoescape=True),
-    )
-    document_scope = (
-        or_(path_clause, Document.folder_id.in_(folder_ids))
-        if folder_ids
-        else path_clause
-    )
     document_rows = (await db.execute(
         select(Document.id, Document.fs_path)
         .where(
-            Document.entity_id == workspace.entity_id,
-            document_scope,
+            Document.entity_id == entity_id,
         )
         .order_by(Document.id)
         .with_for_update()
     )).all()
     document_ids = {row.id for row in document_rows}
+    version_rows = (await db.execute(
+        select(DocumentVersion.fs_path)
+        .where(DocumentVersion.document_id.in_(document_ids))
+        .order_by(DocumentVersion.id)
+        .with_for_update()
+    )).all() if document_ids else []
+    folder_ids = set((await db.execute(
+        select(DocumentFolder.id)
+        .where(DocumentFolder.entity_id == entity_id)
+        .order_by(DocumentFolder.id)
+        .with_for_update()
+    )).scalars().all())
+    group_ids = set((await db.execute(
+        select(DocumentGroup.id)
+        .where(DocumentGroup.entity_id == entity_id)
+        .order_by(DocumentGroup.id)
+        .with_for_update()
+    )).scalars().all())
     document_source_bases = _validated_cleanup_bases(
         row.fs_path for row in document_rows if row.fs_path
     )
-    external_document_source_bases = {
-        source_base
-        for source_base in document_source_bases
-        if source_base != storage_base
-        and not source_base.startswith(f"{storage_base}/")
-    }
+    version_source_bases = _validated_cleanup_bases(
+        row.fs_path for row in version_rows if row.fs_path
+    )
     if document_ids:
         await delete_resource_comments(
             db,
-            workspace.entity_id,
+            entity_id,
             "document",
             document_ids,
         )
@@ -617,17 +644,32 @@ async def purge_workspace_artifacts(
             ))
         await db.execute(delete(DocumentFolder).where(DocumentFolder.id.in_(folder_ids)))
 
-    cleanup_bases = {storage_base} | document_derived_tree_cleanup_bases(document_ids)
+    if group_ids:
+        await db.execute(delete(DocumentGroupMember).where(
+            DocumentGroupMember.group_id.in_(group_ids),
+        ))
+        for model in (ResourceGrant, ResourceGrantPending, Share):
+            await db.execute(delete(model).where(
+                model.resource_type == ResourceType.DOCUMENT_GROUP,
+                model.resource_id.in_(group_ids),
+            ))
+        await db.execute(delete(DocumentGroup).where(DocumentGroup.id.in_(group_ids)))
+
+    cleanup_bases = (
+        document_derived_tree_cleanup_bases(document_ids)
+        | document_version_snapshot_cleanup_bases(document_ids)
+    )
     await enqueue_artifact_cleanup_jobs(
         db,
-        workspace.entity_id,
+        entity_id,
         cleanup_bases,
     )
     await enqueue_artifact_cleanup_jobs(
         db,
-        workspace.entity_id,
+        entity_id,
         document_derived_file_cleanup_bases(document_ids)
-        | external_document_source_bases,
+        | document_source_bases
+        | version_source_bases,
         target_kind=ARTIFACT_CLEANUP_KIND_FILE,
     )
 
@@ -755,10 +797,12 @@ __all__ = [
     "ARTIFACT_CLEANUP_KIND_FILE",
     "ARTIFACT_CLEANUP_KIND_TREE",
     "DOCUMENT_DERIVED_TREE_CACHE_ROOTS",
+    "DOCUMENT_VERSION_SNAPSHOT_ROOT",
     "clear_artifact_cleanup_jobs",
     "document_derived_file_cleanup_bases",
     "document_derived_tree_cleanup_bases",
+    "document_version_snapshot_cleanup_bases",
     "drain_workspace_artifact_purge_jobs",
     "enqueue_artifact_cleanup_jobs",
-    "purge_workspace_artifacts",
+    "purge_entity_knowledge",
 ]

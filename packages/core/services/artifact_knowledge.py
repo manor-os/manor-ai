@@ -11,7 +11,10 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from packages.core.services.entity_fs import get_entity_root
+from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.generated_file_refs import (
     ArtifactReferenceFactory,
     ArtifactReferenceIdentity,
@@ -44,13 +47,11 @@ def _entity_relative_artifact_path(
 
     parsed = urlsplit(text)
     path = unquote(parsed.path or "").replace("\\", "/")
-    api_prefix = "/api/v1/fs/"
-    if path.startswith(api_prefix):
-        scoped = path[len(api_prefix):]
-        scoped_entity, separator, rel_path = scoped.partition("/")
-        if not separator or unquote(scoped_entity) != str(entity_id):
+    file_ref = parse_file_reference(text)
+    if file_ref is not None and file_ref.entity_id:
+        if file_ref.entity_id != str(entity_id):
             return None
-        path = rel_path
+        path = file_ref.fs_path
     elif parsed.scheme or parsed.netloc:
         return None
     elif path.lstrip("/").startswith(("viewer/", "api/v1/", "documents/")):
@@ -95,7 +96,8 @@ def _ref_local_path(
             )
     for key in ("url", "file_url", "result_url", "download_url"):
         value = ref.get(key)
-        if value and "/api/v1/fs/" in str(value):
+        file_ref = parse_file_reference(value) if value else None
+        if file_ref is not None and file_ref.entity_id:
             return _entity_relative_artifact_path(
                 value, entity_id=entity_id, entity_root=entity_root,
             )
@@ -130,6 +132,7 @@ class ArtifactDocumentResolver:
         agent_id: str | None,
         user_id: str | None,
         tool_name: str,
+        db: AsyncSession | None = None,
     ) -> None:
         self.entity_id = entity_id
         self.entity_root = entity_root
@@ -138,6 +141,7 @@ class ArtifactDocumentResolver:
         self.agent_id = agent_id
         self.user_id = user_id
         self.tool_name = tool_name
+        self.db = db
         self._bind_cache: dict[str, str | None] = {}
         self._sync_cache: dict[str, ArtifactDocumentResolution] = {}
 
@@ -160,6 +164,9 @@ class ArtifactDocumentResolver:
 
     async def _bind(self, document_id: str) -> str | None:
         if document_id not in self._bind_cache:
+            bind_kwargs: dict[str, Any] = {}
+            if self.db is not None:
+                bind_kwargs["db"] = self.db
             self._bind_cache[document_id] = await bind_document_to_workspace(
                 entity_id=self.entity_id,
                 document_id=document_id,
@@ -168,6 +175,7 @@ class ArtifactDocumentResolver:
                 agent_id=self.agent_id,
                 user_id=self.user_id,
                 tool_name=self.tool_name,
+                **bind_kwargs,
             )
         return self._bind_cache[document_id]
 
@@ -179,6 +187,9 @@ class ArtifactDocumentResolver:
         if not os.path.isfile(abs_path):
             resolution = ArtifactDocumentResolution(failure_reason="not_file")
         else:
+            sync_kwargs: dict[str, Any] = {}
+            if self.db is not None:
+                sync_kwargs["db"] = self.db
             sync = await sync_file_to_knowledge(
                 entity_id=self.entity_id,
                 abs_path=abs_path,
@@ -191,6 +202,7 @@ class ArtifactDocumentResolver:
                 agent_id=self.agent_id,
                 user_id=self.user_id,
                 tool_name=self.tool_name,
+                **sync_kwargs,
             )
             document_id = str(sync.document_id or "").strip()
             resolution = ArtifactDocumentResolution(
@@ -212,6 +224,7 @@ async def project_artifact_refs_to_knowledge(
     agent_id: str | None = None,
     user_id: str | None = None,
     tool_name: str = "plan_artifact_finalize",
+    db: AsyncSession | None = None,
 ) -> ArtifactKnowledgeProjection:
     """Return canonical refs and fail any claimed local file without a Document."""
 
@@ -225,6 +238,7 @@ async def project_artifact_refs_to_knowledge(
         agent_id=agent_id,
         user_id=user_id,
         tool_name=tool_name,
+        db=db,
     )
     projected: list[dict[str, Any]] = []
     knowledge_artifacts: list[dict[str, Any]] = []

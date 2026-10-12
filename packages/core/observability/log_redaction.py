@@ -7,14 +7,15 @@ import re
 
 
 _SENSITIVE_QUERY_RE = re.compile(
-    r"([?&](?:token|access_token|refresh_token|id_token|api_?key|client_secret|password|code)=)"
+    r"([?&](?:token|access_token|refresh_token|id_token|api_?key|key|client_secret|password|code)=)"
     r"[^&\s\"']+",
     re.IGNORECASE,
 )
 _SENSITIVE_LOG_VALUE_RE = re.compile(
     r"(?i)\b(verification[_ -]?code|password[_ -]?reset[_ -]?token|"
-    r"access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|api[_ -]?key)"
-    r"(\s*(?:for\s+[^\s:]+)?\s*[:=]\s*)([^\s,;&\"']+)"
+    r"access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|api[_ -]?key|"
+    r"x-manor-geo-token|geo_cloudflare_token)"
+    r"([\"']?\s*(?:for\s+[^\s:]+)?\s*[:=]\s*[\"']?)([^\s,;&\"']+)"
 )
 
 
@@ -26,6 +27,16 @@ def redact_sensitive_log_text(value: str) -> str:
 
 class SensitiveQueryStringFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == "uvicorn.access" and isinstance(record.args, tuple) and len(record.args) == 5:
+            # AccessFormatter unpacks these arguments after filters run. Preserve
+            # their shape while still removing credentials from the request path.
+            record.msg = redact_sensitive_log_text(str(record.msg))
+            record.args = tuple(
+                redact_sensitive_log_text(value) if isinstance(value, str) else value
+                for value in record.args
+            )
+            return True
+
         # HTTPX passes a URL object, and callers may split a key and value
         # across format arguments. Redact the rendered message, not just str args.
         if record.name == "uvicorn.access" and isinstance(record.args, tuple) and len(record.args) == 5:

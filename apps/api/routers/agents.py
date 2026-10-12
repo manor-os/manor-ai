@@ -18,6 +18,7 @@ from packages.core.models.workspace import Agent, AgentSubscription, AgentToolBi
 from packages.core.services.resource_access import (
     ResourceDescriptor,
     is_read_capability,
+    readable_resource_ids,
     user_can_access_resource,
 )
 from packages.core.services.workspace_access import (
@@ -34,6 +35,7 @@ from packages.core.services.agent_service import (
     update_agent_mcp_action_refs,
 )
 from apps.api.errors import CodedError
+from apps.api.catalog import CatalogResponse, catalog_response
 from packages.core.services.agent_prompt_preview import preview_agent_prompt
 from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 from apps.api.deps import get_current_user
@@ -102,6 +104,9 @@ async def _require_agent(
 class AgentResponse(BaseModel):
     id: str
     entity_id: str | None = None
+    workspace_id: str | None = None
+    workspace_name: str | None = None
+    visibility: str | None = None
     name: str
     slug: str | None = None
     description: str | None = None
@@ -159,6 +164,10 @@ class SubscriptionResponse(BaseModel):
     entity_id: str
     agent_id: str
     workspace_id: str | None = None
+    owner_user_id: str | None = None
+    name: str | None = None
+    scope_kind: str = "personal"
+    can_manage: bool = False
     custom_prompt: str | None = None
     status: str = "active"
 
@@ -198,6 +207,10 @@ class AgentDeploymentResponse(BaseModel):
     entity_id: str
     agent_id: str
     workspace_id: str | None = None
+    owner_user_id: str | None = None
+    name: str | None = None
+    scope_kind: str = "personal"
+    can_manage: bool = False
     workspace_name: str | None = None
     workspace_status: str | None = None
     service_key: str | None = None
@@ -274,7 +287,7 @@ def _mcp_action_tool_response(
     )
 
 
-def _agent_resp(a, tool_count: int = 0, skill_count: int = 0) -> AgentResponse:
+def _agent_resp(a, tool_count: int = 0, skill_count: int = 0, workspace_name: str | None = None) -> AgentResponse:
     config = normalize_agent_runtime_config(a.config)
     description_i18n = (
         config.get("description_i18n")
@@ -283,6 +296,8 @@ def _agent_resp(a, tool_count: int = 0, skill_count: int = 0) -> AgentResponse:
     )
     return AgentResponse(
         id=a.id, entity_id=a.entity_id, name=a.name, slug=a.slug,
+        workspace_id=getattr(a, "workspace_id", None), workspace_name=workspace_name,
+        visibility=getattr(a, "visibility", None),
         description=a.description, description_i18n=description_i18n,
         avatar_url=a.avatar_url,
         system_prompt=a.system_prompt, config=config,
@@ -363,6 +378,8 @@ async def _owned_subscription(
     db: AsyncSession,
     subscription_id: str,
     user: User,
+    *,
+    require_write: bool = False,
 ) -> AgentSubscription:
     sub = (
         await db.execute(
@@ -375,7 +392,18 @@ async def _owned_subscription(
     ).scalar_one_or_none()
     if not sub:
         raise HTTPException(404, "Subscription not found")
-    if sub.workspace_id and not await _subscription_is_visible(db, sub, user):
+    if sub.workspace_id:
+        if not await _subscription_is_visible(db, sub, user):
+            raise HTTPException(404, "Subscription not found")
+        if require_write and not await user_can_write_workspace_id(
+            db,
+            workspace_id=sub.workspace_id,
+            entity_id=user.entity_id,
+            user_id=user.id,
+            role=user.role,
+        ):
+            raise HTTPException(403, "Workspace write access is required")
+    elif sub.owner_user_id and sub.owner_user_id != user.id:
         raise HTTPException(404, "Subscription not found")
     return sub
 
@@ -386,7 +414,9 @@ async def _subscription_is_visible(
     user: User,
 ) -> bool:
     if not subscription.workspace_id:
-        return True
+        # Ownerless rows predate personal deployments and remain entity-visible
+        # for legacy channel management. New personal rows are private.
+        return not subscription.owner_user_id or subscription.owner_user_id == user.id
     readable_workspace_ids = await user_readable_workspace_ids(
         db,
         entity_id=user.entity_id,
@@ -395,6 +425,22 @@ async def _subscription_is_visible(
         workspace_ids={str(subscription.workspace_id)},
     )
     return str(subscription.workspace_id) in readable_workspace_ids
+
+
+async def _subscription_can_manage(
+    db: AsyncSession,
+    subscription: AgentSubscription,
+    user: User,
+) -> bool:
+    if not subscription.workspace_id:
+        return bool(subscription.owner_user_id == user.id)
+    return await user_can_write_workspace_id(
+        db,
+        workspace_id=subscription.workspace_id,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=user.role,
+    )
 
 
 async def _visible_subscriptions(
@@ -408,7 +454,12 @@ async def _visible_subscriptions(
         if subscription.workspace_id
     }
     if not workspace_ids:
-        return subscriptions
+        return [
+            subscription
+            for subscription in subscriptions
+            if not subscription.owner_user_id
+            or subscription.owner_user_id == user.id
+        ]
     readable_workspace_ids = await user_readable_workspace_ids(
         db,
         entity_id=user.entity_id,
@@ -419,7 +470,13 @@ async def _visible_subscriptions(
     return [
         subscription
         for subscription in subscriptions
-        if not subscription.workspace_id
+        if (
+            not subscription.workspace_id
+            and (
+                not subscription.owner_user_id
+                or subscription.owner_user_id == user.id
+            )
+        )
         or str(subscription.workspace_id) in readable_workspace_ids
     ]
 
@@ -480,6 +537,54 @@ async def _agent_binding_counts(
     return tool_counts, skill_counts
 
 
+async def _visible_agents(
+    db: AsyncSession,
+    user: User,
+    *,
+    include_templates: bool = False,
+) -> list[Agent]:
+    agents = await list_agents(db, user.entity_id, include_templates=include_templates)
+    # Platform templates carry no entity and are catalog-public; entity-owned
+    # agents go through the gateway so private and workspace-scoped ones stay
+    # out of the list.
+    readable_ids = await readable_resource_ids(
+        db,
+        descriptors=[
+            ResourceDescriptor.from_row(candidate, ResourceType.AGENT)
+            for candidate in agents if candidate.entity_id
+        ],
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=getattr(user, "role", None),
+    )
+    return [
+        candidate for candidate in agents
+        if not candidate.entity_id or candidate.id in readable_ids
+    ]
+
+
+async def _agent_list_response(
+    db: AsyncSession,
+    user: User,
+    *,
+    include_templates: bool = False,
+) -> list[AgentResponse]:
+    agents = await _visible_agents(db, user, include_templates=include_templates)
+    from packages.core.services.composer_resources import resource_workspace_names
+    workspace_names = await resource_workspace_names(db, agents, user)
+    agent_ids = [a.id for a in agents]
+    tool_counts, skill_counts = await _agent_binding_counts(db, agent_ids)
+    return [
+        _agent_resp(
+            a,
+            tool_count=tool_counts.get(a.id, 0),
+            skill_count=skill_counts.get(a.id, 0),
+            workspace_name=workspace_names.get(a.workspace_id),
+        )
+        for a in agents
+    ]
+
+
 # ── CRUD ──
 
 @router.get("", response_model=list[AgentResponse])
@@ -488,35 +593,19 @@ async def list_my_agents(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    agents = await list_agents(db, user.entity_id, include_templates=include_templates)
-    # Platform templates carry no entity and are catalog-public; entity-owned
-    # agents go through the gateway so private and workspace-scoped ones stay
-    # out of the list.
-    visible: list[Agent] = []
-    for candidate in agents:
-        if not candidate.entity_id:
-            visible.append(candidate)
-            continue
-        if await user_can_access_resource(
-            db,
-            descriptor=ResourceDescriptor.from_row(candidate, ResourceType.AGENT),
-            entity_id=user.entity_id,
-            user_id=user.id,
-            role=getattr(user, "role", None),
-            capability=Capability.VIEW,
-        ):
-            visible.append(candidate)
-    agents = visible
-    agent_ids = [a.id for a in agents]
-    tool_counts, skill_counts = await _agent_binding_counts(db, agent_ids)
-    return [
-        _agent_resp(
-            a,
-            tool_count=tool_counts.get(a.id, 0),
-            skill_count=skill_counts.get(a.id, 0),
-        )
-        for a in agents
-    ]
+    return await _agent_list_response(db, user, include_templates=include_templates)
+
+
+@router.get("/catalog", response_model=CatalogResponse[AgentResponse])
+async def agent_catalog(
+    known_version: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    items = await _agent_list_response(db, user)
+    return catalog_response(
+        items, catalog="agents", user=user, filters={}, known_version=known_version,
+    )
 
 
 @router.post("", response_model=AgentResponse, status_code=201)
@@ -630,7 +719,9 @@ async def draft_agent_questions(
     from packages.core.services.agent_generator import agent_clarifying_questions
 
     try:
-        questions = await agent_clarifying_questions(body.prompt, entity_id=user.entity_id)
+        questions = await agent_clarifying_questions(
+            body.prompt, entity_id=user.entity_id, user_id=user.id,
+        )
     except Exception:
         questions = []
     return AgentDraftQuestionsResponse(questions=questions, ready=not questions)
@@ -754,10 +845,28 @@ async def ai_update_agent_endpoint(
     from packages.core.services.agent_generator import update_agent_via_ai
 
     try:
-        agent = await update_agent_via_ai(agent_id, body.prompt, user.entity_id, db)
+        agent = await update_agent_via_ai(
+            agent_id, body.prompt, user.entity_id, db, user_id=user.id,
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return _agent_resp(agent)
+
+
+@router.get("/deployments", response_model=dict[str, list[AgentDeploymentResponse]])
+async def list_agent_deployments(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read deployments for the caller's visible Agent list in one request."""
+    agents = await _visible_agents(db, user)
+    deployments_by_agent: dict[str, list[AgentDeploymentResponse]] = {
+        agent.id: [] for agent in agents
+    }
+    deployments = await _agent_deployments_for_ids(db, user, list(deployments_by_agent))
+    for deployment in deployments:
+        deployments_by_agent[deployment.agent_id].append(deployment)
+    return deployments_by_agent
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)
@@ -875,6 +984,7 @@ async def preview_prompt(
     try:
         content = await preview_agent_prompt(
             entity_id=user.entity_id,
+            user_id=user.id,
             system_prompt=req.system_prompt,
             test_message=req.test_message,
         )
@@ -894,7 +1004,11 @@ async def my_subscriptions(
     subs = await _visible_subscriptions(db, subs, user)
     return [SubscriptionResponse(
         id=s.id, entity_id=s.entity_id, agent_id=s.agent_id,
-        workspace_id=s.workspace_id, custom_prompt=s.custom_prompt, status=s.status,
+        workspace_id=s.workspace_id, owner_user_id=s.owner_user_id,
+        name=s.name,
+        scope_kind="workspace" if s.workspace_id else "personal",
+        can_manage=await _subscription_can_manage(db, s, user),
+        custom_prompt=s.custom_prompt, status=s.status,
     ) for s in subs]
 
 
@@ -923,7 +1037,11 @@ async def subscribe(
         raise HTTPException(404, "Agent not found") from exc
     return SubscriptionResponse(
         id=sub.id, entity_id=sub.entity_id, agent_id=sub.agent_id,
-        workspace_id=sub.workspace_id, custom_prompt=sub.custom_prompt, status=sub.status,
+        workspace_id=sub.workspace_id, owner_user_id=sub.owner_user_id,
+        name=sub.name,
+        scope_kind="workspace" if sub.workspace_id else "personal",
+        can_manage=True,
+        custom_prompt=sub.custom_prompt, status=sub.status,
     )
 
 
@@ -933,6 +1051,7 @@ async def unsubscribe(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    await _owned_subscription(db, subscription_id, user, require_write=True)
     ok = await unsubscribe_agent(db, subscription_id, user.entity_id)
     if not ok:
         raise HTTPException(404, "Subscription not found")
@@ -955,7 +1074,7 @@ async def bind_subscription_worker_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _owned_subscription(db, subscription_id, user)
+    await _owned_subscription(db, subscription_id, user, require_write=True)
     worker = (
         await db.execute(
             _user_visible_worker_scope(select(Worker), user).where(
@@ -1004,7 +1123,7 @@ async def unbind_subscription_worker_endpoint(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _owned_subscription(db, subscription_id, user)
+    await _owned_subscription(db, subscription_id, user, require_write=True)
     binding = (
         await db.execute(
             select(SubscriptionWorker)
@@ -1036,6 +1155,16 @@ async def agent_deployments(
     db: AsyncSession = Depends(get_db),
 ):
     await _require_agent(db, user, agent_id, Capability.VIEW)
+    return await _agent_deployments_for_ids(db, user, [agent_id])
+
+
+async def _agent_deployments_for_ids(
+    db: AsyncSession,
+    user: User,
+    agent_ids: list[str],
+) -> list[AgentDeploymentResponse]:
+    if not agent_ids:
+        return []
 
     rows = (
         await db.execute(
@@ -1043,7 +1172,7 @@ async def agent_deployments(
             .join(Workspace, Workspace.id == AgentSubscription.workspace_id, isouter=True)
             .where(
                 AgentSubscription.entity_id == user.entity_id,
-                AgentSubscription.agent_id == agent_id,
+                AgentSubscription.agent_id.in_(agent_ids),
                 AgentSubscription.status == "active",
             )
             .order_by(AgentSubscription.created_at.desc())
@@ -1069,6 +1198,10 @@ async def agent_deployments(
             entity_id=sub.entity_id,
             agent_id=sub.agent_id,
             workspace_id=sub.workspace_id,
+            owner_user_id=sub.owner_user_id,
+            name=sub.name,
+            scope_kind="workspace" if sub.workspace_id else "personal",
+            can_manage=await _subscription_can_manage(db, sub, user),
             workspace_name=workspace.name if workspace else None,
             workspace_status=workspace.status if workspace else None,
             service_key=sub.service_key,
@@ -1085,6 +1218,21 @@ async def agent_deployments(
 
 # ── Tool bindings ──
 
+async def _agent_has_mcp_surface(db: AsyncSession, agent_id: str, tools) -> bool:
+    """True when the agent binds any MCP-derived tool or an active MCP server."""
+    from packages.core.models.mcp import AgentMCPBinding
+
+    if any(str(tool.name or "").startswith("mcp__") for tool in tools):
+        return True
+    binding_id = (await db.execute(
+        select(AgentMCPBinding.id).where(
+            AgentMCPBinding.agent_id == agent_id,
+            AgentMCPBinding.status == "active",
+        ).limit(1)
+    )).scalar_one_or_none()
+    return binding_id is not None
+
+
 @router.get("/{agent_id}/tools", response_model=list[ToolResponse])
 async def agent_tools(
     agent_id: str,
@@ -1093,6 +1241,20 @@ async def agent_tools(
 ):
     await _require_agent(db, user, agent_id, Capability.VIEW)
     tools = await get_agent_tools(db, agent_id)
+    if not await _agent_has_mcp_surface(db, agent_id, tools):
+        # No MCP surface bound: skip the actor capability catalog. Building it
+        # enumerates every MCP server with per-actor discovery and dominated
+        # this endpoint's latency (5-22s in production on 2026-09-11).
+        return [
+            ToolResponse(
+                id=tool.id,
+                name=tool.name,
+                display_name=tool.display_name,
+                description=tool.description,
+                category=tool.category,
+            )
+            for tool in tools
+        ]
     catalog = await _actor_agent_capability_catalog(db, user)
     operations = _actor_mcp_operations(catalog)
     actor_tool_names = {

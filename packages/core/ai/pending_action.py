@@ -58,7 +58,7 @@ to questions). The kind-specific handler decides how to resume:
 from __future__ import annotations
 
 import secrets
-from typing import Any, ClassVar, Dict, List, Literal, Optional
+from typing import Any, ClassVar, Dict, List, Optional
 
 from packages.core.constants.pending_actions import PendingActionKind
 
@@ -88,6 +88,7 @@ KIND_HUMAN_INPUT = PendingActionKind.HUMAN_INPUT
 KIND_APPROVE_PROPOSALS = PendingActionKind.APPROVE_PROPOSALS
 KIND_RETRY_STRATEGIST_REVIEW = PendingActionKind.RETRY_STRATEGIST_REVIEW
 KIND_GOVERNANCE_APPROVAL = PendingActionKind.GOVERNANCE_APPROVAL
+KIND_EFFECT_RECONCILIATION = PendingActionKind.EFFECT_RECONCILIATION
 
 
 #: Mid-execution ("path C") HITL pauses whose unified HitlRequest the chat
@@ -116,6 +117,7 @@ LEASE_HITL_CLOSEABLE_KINDS: frozenset[str] = frozenset({
     KIND_NEEDS_INPUT.value,
     KIND_NEEDS_CONFIRMATION.value,
     KIND_NEEDS_LOGIN.value,
+    KIND_EFFECT_RECONCILIATION.value,
 })
 
 

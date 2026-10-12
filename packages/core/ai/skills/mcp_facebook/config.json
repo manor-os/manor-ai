@@ -25,5 +25,9 @@
     "mcp__facebook__create_instagram_media",
     "mcp__facebook__publish_instagram_media",
     "mcp__facebook__reply_instagram_comment"
-  ]
+  ],
+  "search": {
+    "terms": ["fb", "meta page", "instagram", "reels", "messenger", "page post", "social media post"],
+    "examples": ["post photo to facebook page", "reply to comments on page post", "read facebook page insights last week", "publish instagram business photo"]
+  }
 }

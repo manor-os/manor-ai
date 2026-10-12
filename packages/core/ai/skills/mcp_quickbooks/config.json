@@ -23,5 +23,9 @@
     "mcp__quickbooks__query_bills",
     "mcp__quickbooks__run_report",
     "mcp__quickbooks__custom_query"
-  ]
+  ],
+  "search": {
+    "terms": ["qbo", "accounting software", "bookkeeping", "accounts receivable", "profit and loss report", "expenses", "intuit", "vendors"],
+    "examples": ["create quickbooks invoice for customer", "show profit and loss report", "list unpaid bills in quickbooks", "void invoice in quickbooks"]
+  }
 }

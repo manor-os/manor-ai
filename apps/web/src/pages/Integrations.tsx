@@ -1,7 +1,10 @@
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useEffect, useRef, useState } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
-import { parseIntegrationSetupLink } from "../lib/integrationSetupLinks";
-import { integrationCatalogQueryOptions, INTEGRATION_CATALOG_QUERY_KEY } from "../lib/integrationCatalog";
+import { parseIntegrationSetupLink, PLATFORM_OAUTH_CLIENTS_HREF } from "../lib/integrationSetupLinks";
+import { useIntegrationCatalog, INTEGRATION_CATALOG_QUERY_KEY } from "../lib/integrationCatalog";
+import IntegrationCatalogLoading from "../components/integrations/IntegrationCatalogLoading";
+import { useEmailAccounts } from "../lib/emailAccounts";
 import IntegrationLogo from "../components/IntegrationLogo";
 import { getIntegrationBrandColor as getLogoColor, resolveIntegrationBrand } from "../lib/brands/catalog";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -36,6 +39,8 @@ import { t } from "../lib/i18n";
 import {
   connectorAccessState,
   integrationReadyCount,
+  integrationSetupState,
+  type IntegrationSetupState,
 } from "../lib/integration-usability.mjs";
 // Backend sentinel for "this secret is stored; don't change it". See
 // _SECRET_MASK / credential_preview in apps/api/routers/integrations.py.
@@ -44,6 +49,7 @@ const UNCHANGED = "__unchanged__";
 
 import {
   IconFolder,
+  IconMail,
   IconChat,
   IconDollar,
   IconCheckCircle,
@@ -60,6 +66,7 @@ import {
   IconMegaphone,
   IconMoreHorizontal,
   IconEdit,
+  IconExternalLink,
   type IconProps,
 } from "../components/icons";
 
@@ -73,6 +80,7 @@ type IntegrationAudience =
   | "all"
   | "cloud"
 type IntegrationDisplayCategoryKey =
+  | "email"
   | "communication"
   | "social_marketing"
   | "work_apps"
@@ -81,10 +89,20 @@ type IntegrationDisplayCategoryKey =
   | "ai_media"
   | "other";
 
+const MANOR_ACCOUNT_OAUTH_KEYS = new Set([
+  "manor_pms",
+  "manor_mcp_minutes",
+]);
+
 const INTEGRATION_DISPLAY_CATEGORIES: Record<
   IntegrationDisplayCategoryKey,
   { labelKey: string; Icon: (props: IconProps) => JSX.Element; rank: number }
 > = {
+  email: {
+    labelKey: "page.integrations.category_email",
+    Icon: IconMail,
+    rank: 15,
+  },
   communication: {
     labelKey: "page.integrations.category_communication",
     Icon: IconChat,
@@ -126,7 +144,7 @@ const INTEGRATION_CATEGORY_ALIASES: Record<
   string,
   IntegrationDisplayCategoryKey
 > = {
-  email: "communication",
+  email: "email",
   messaging: "communication",
   social: "social_marketing",
   marketing: "social_marketing",
@@ -143,12 +161,15 @@ const INTEGRATION_SERVER_CATEGORY_OVERRIDES: Record<
   IntegrationDisplayCategoryKey
 > = {
   _google_workspace: "work_apps",
+  lark: "communication",
   tavily: "ai_media",
   github: "developer_tools",
   webhook: "developer_tools",
   replicate: "ai_media",
   elevenlabs: "ai_media",
+  suno: "ai_media",
   jimeng: "ai_media",
+  remotion: "ai_media",
 };
 
 /* ------------------------------------------------------------------ */
@@ -161,6 +182,20 @@ export default function Integrations() {
   const requestedProvider = parseIntegrationSetupLink(`${location.pathname}${location.search}`, window.location.origin);
   const [tab, setTab] = useState<Tab>("agents");
   const [integrationSearch, setIntegrationSearch] = useState("");
+  const cancelledNoticeShown = useRef(false);
+  useEffect(() => {
+    const provider = searchParams.get("oauth_cancelled");
+    if (
+      !provider ||
+      !MANOR_ACCOUNT_OAUTH_KEYS.has(provider) ||
+      cancelledNoticeShown.current
+    ) return;
+    cancelledNoticeShown.current = true;
+    useToastStore.getState().info(t("page.integrations.oauth_cancelled"));
+    const next = new URLSearchParams(searchParams);
+    next.delete("oauth_cancelled");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
   useEffect(() => {
     if (requestedProvider) setTab("agents");
   }, [requestedProvider, location.key]);
@@ -241,9 +276,8 @@ export default function Integrations() {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
-   MCPAgentsPanel — live view of the 8 MCP servers with per-user + per-entity
-   connection status. Agents use these servers to act on behalf of the
-   current user via tool_pool → agent_permission_service → mcp module.
+   MCPAgentsPanel — live view of agent Integrations. Most rows come from the
+   MCP catalog; Skills-only plugins can add honest, no-auth catalog entries.
    ══════════════════════════════════════════════════════════════════════════ */
 
 
@@ -404,6 +438,7 @@ function InfoAlert({
    ══════════════════════════════════════════════════════════════════════════ */
 
 function ChannelBindingsPanel() {
+  const catalogScope = useCatalogScope();
   const queryClient = useQueryClient();
   const toast = useToastStore();
 
@@ -413,8 +448,7 @@ function ChannelBindingsPanel() {
   });
 
   const { data: agents } = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
 
   const { data: subscriptions } = useQuery({
@@ -904,7 +938,34 @@ function MCPAgentsPanel({
     data: servers,
     isLoading,
     isError,
-  } = useQuery(integrationCatalogQueryOptions(privateApiEnabled));
+    isFetching: catalogRefreshing,
+  } = useIntegrationCatalog(privateApiEnabled);
+  const builtinPluginMutation = useMutation({
+    mutationFn: ({
+      pluginKey,
+      enabled,
+    }: {
+      pluginKey: string;
+      name: string;
+      enabled: boolean;
+    }) => api.integrations.setBuiltinPluginEnabled(pluginKey, enabled),
+    onSuccess: (_result, vars) => {
+      void queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      toast.success(
+        t(
+          vars.enabled
+            ? "page.integrations.plugin_enabled"
+            : "page.integrations.plugin_disabled",
+        ).replace("{name}", vars.name),
+      );
+    },
+    onError: (error: any) => {
+      toast.error(
+        t("page.integrations.plugin_update_failed"),
+        error?.message || t("page.integrations.unknown_error"),
+      );
+    },
+  });
 
   async function startOAuth(
     serverKey: string,
@@ -931,26 +992,10 @@ function MCPAgentsPanel({
   }
 
   if (isLoading) {
-    return (
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          padding: "64px 0",
-          gap: 12,
-          color: "#a8a29e",
-        }}
-      >
-        <LoadingSpinner size={20} />
-        <span style={{ fontSize: 14 }}>
-          {t("page.integrations.loading_integrations")}
-        </span>
-      </div>
-    );
+    return <IntegrationCatalogLoading />;
   }
 
-  if (isError || (!isLoading && !servers)) {
+  if (!servers) {
     return (
       <div style={{ textAlign: "center", padding: "64px 0", color: "#a8a29e" }}>
         <p style={{ fontSize: 14, margin: "0 0 8px" }}>
@@ -975,14 +1020,13 @@ function MCPAgentsPanel({
     );
   }
 
-  // Merge Gmail / Calendar / Drive into one synthetic "Google
-  // Workspace" card. They share the same OAuth client and the same
-  // user account on Google's side, so 3 separate cards is just
-  // visual noise. The synthetic row carries its 3 sub-rows in
-  // ``_googleSubs`` so the grid render can swap to
-  // GoogleWorkspaceCard.
-  const baseRowsRaw = servers || [];
-  const GOOGLE_KEYS = ["gmail", "google_calendar", "google_drive"];
+  // Keep Gmail in Email. Calendar and Drive still share the Google
+  // Workspace card under Work apps.
+  const baseRowsRaw = servers.map((server) =>
+    server.setup_pending && isError ? { ...server, setup_unavailable: true } : server,
+  );
+  const catalogRefreshFailed = isError || servers.some((server) => server.setup_unavailable);
+  const GOOGLE_KEYS = ["google_calendar", "google_drive"];
   const googleSubs = baseRowsRaw.filter((s) =>
     GOOGLE_KEYS.includes(s.server_key),
   );
@@ -991,7 +1035,6 @@ function MCPAgentsPanel({
   );
   // Drop internal automation-only cards from the public integration grid.
   const HIDDEN_INTERNAL_AUTOMATION_KEYS = new Set([
-    "local_browser",
     "knowledge_local",
     "chrome_knowledge_local",
   ]);
@@ -1018,18 +1061,16 @@ function MCPAgentsPanel({
   const visibleRows = canManage
     ? rowsWithWorkerEntry
     : rowsWithWorkerEntry.filter((s) => {
-        const isOAuth = s.auth_type === "oauth2";
-        if (!isOAuth) return true;
-        const hasConn =
-          (s.connections?.length ?? 0) > 0 ||
-          (s.entity_accounts?.length ?? 0) > 0;
-        // Regular users: show only OAuth-ready or already-connected.
-        return s.oauth_configured || s.nango_provider_config_key || hasConn;
+        // A grouped card is visible when any of its real providers would be.
+        return (s._googleSubs || [s]).some((provider) =>
+          provider.auth_type !== "oauth2" || provider.oauth_configured || provider.nango_provider_config_key ||
+          (provider.connections?.length ?? 0) > 0 || (provider.entity_accounts?.length ?? 0) > 0,
+        );
       });
   // Runtime-managed cards are hidden from the OSS catalog fallback.
   // SaaS/API cards are the inverse.
   const isRuntimeManagedCard = (s: McpServerRow) =>
-    s.auth_type === "cli_worker";
+    s.auth_type === "cli_worker" || s.auth_type === "chrome_extension";
   const matchesSearch = (s: McpServerRow, value: string) => {
     const hay = [s.name, s.tagline, s.description, s.category]
       .filter(Boolean)
@@ -1082,14 +1123,14 @@ function MCPAgentsPanel({
         onConnect={(connectionId) =>
           void startOAuth(s.server_key, s.name, connectionId)
         }
-        onConfigureOAuth={() =>
+        onConfigureOAuth={() => {
           setOAuthConfigFor({
             key: s.server_key,
             name: s.name,
             scopes: s.scopes,
             clientSecretRequired: s.oauth_client_secret_required,
-          })
-        }
+          });
+        }}
         onAddApiKey={() => {
           // Email has its own multi-section modal (IMAP + SMTP
           // presets); every other credential/api_key provider
@@ -1127,6 +1168,20 @@ function MCPAgentsPanel({
           }
         }}
         onScanQr={(accountId) => setWechatScanFor(accountId)}
+        onTogglePlugin={
+          s.plugin_key
+            ? (enabled) =>
+                builtinPluginMutation.mutate({
+                  pluginKey: s.plugin_key || "",
+                  name: s.name,
+                  enabled,
+                })
+            : undefined
+        }
+        pluginToggleBusy={
+          builtinPluginMutation.isPending &&
+          builtinPluginMutation.variables?.pluginKey === s.plugin_key
+        }
       />
     );
   };
@@ -1149,15 +1204,24 @@ function MCPAgentsPanel({
       >
         <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: 13, fontWeight: 700, color: "#44403c" }}>
-            {readyCatalogCount} {t("page.integrations.of")}{" "}
-            {visibleCatalogCount}{" "}
-            {t("page.integrations.servers_usable_by_your_agents")}
+            {readyCatalogCount} / {visibleCatalogCount}{" "}
+            {t("page.integrations.ready")}
           </div>
           <div style={{ fontSize: 11, color: "#78716c", marginTop: 2 }}>
-            {t(
-              "page.integrations.connect_a_server_bind_it_in_agent_skills_then_ru",
-            )}
+            {t("page.integrations.connect_external_services_and_tools")}
           </div>
+        </div>
+        <div role="status" style={{ fontSize: 12, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 8 }}>
+          {catalogRefreshing ? (
+            <><LoadingSpinner size={13} />{t("page.integrations.refreshing_status")}</>
+          ) : catalogRefreshFailed ? (
+            <>
+              <span>{t("page.integrations.refresh_failed")}</span>
+              <Button variant="ghost" size="sm" onClick={() => void queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY })}>
+                {t("page.dashboard.retry")}
+              </Button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -1213,7 +1277,7 @@ function MCPAgentsPanel({
       </div>
 
 
-      {showSearchEmptyState && !requestedProvider ? (
+      {showSearchEmptyState && !requestedProvider && !catalogRefreshing ? (
         <EmptyState
           title={t("page.integrations.no_integrations_match_your_search")}
           description={t("page.integrations.nothing_found_for_search").replace(
@@ -1233,7 +1297,7 @@ function MCPAgentsPanel({
           <Button variant="ghost" onClick={onClearProvider}>{t("page.integrations.all_integrations")}</Button>
           {setupServer
             ? renderServerCard(setupServer, true)
-            : <EmptyState title={t("page.integrations.setup_link_unavailable")} />}
+            : catalogRefreshing ? <IntegrationCatalogLoading /> : <EmptyState title={t("page.integrations.setup_link_unavailable")} />}
         </div>
       )}
 
@@ -1310,6 +1374,7 @@ type McpServerRow = {
   scopes: string | null;
   tagline: string | null;
   docs_url: string | null;
+  app_url?: string | null;
   setup_hint: string | null;
   color_hex: string | null;
   supports_multi_account: boolean;
@@ -1365,6 +1430,9 @@ type McpServerRow = {
   agent_can_use: boolean;
   requires_explicit_account: boolean;
   hint: string;
+  setup_pending?: boolean;
+  setup_unavailable?: boolean;
+  _googleSubs?: McpServerRow[];
   /** When set, this provider is configured in our self-hosted Nango.
    *  The Connect button on the card opens Nango's hosted OAuth popup
    *  scoped to this provider — invisible aggregator under the hood. */
@@ -1377,6 +1445,14 @@ type McpServerRow = {
   /** True when this integration is not yet production-ready.
    *  Single source of truth: backend _COMING_SOON_SERVERS. */
   coming_soon?: boolean;
+  plugin_key?: string | null;
+  plugin_enabled?: boolean | null;
+  plugin_skills?: Array<{
+    slug: string;
+    display_name: string;
+    description: string;
+    installed: boolean;
+  }>;
   /** "What can my agent do once connected?" — surfaced via the ?
    *  info button. Empty list hides the button. */
   capabilities?: string[];
@@ -1393,6 +1469,16 @@ const AUTH_LABELS: Record<
     chipVariant: "blue" | "teal" | "purple" | "orange" | "green";
   }
 > = {
+  lark: {
+    label: `${t("page.integrations.lark_app_id")} + ${t("page.integrations.lark_app_secret")}`,
+    configureVerb: t("page.apps.connect"),
+    chipVariant: "blue",
+  },
+  manor_pms: {
+    label: t("page.integrations.access_token"),
+    configureVerb: t("page.apps.connect"),
+    chipVariant: "teal",
+  },
   email: {
     label: t("page.integrations.imap_smtp"),
     configureVerb: t("page.integrations.mail_server"),
@@ -1424,11 +1510,8 @@ const AUTH_LABELS: Record<
 // Google Workspace consolidation
 // ──────────────────────────────────────────────────────────────────────
 //
-// Gmail / Calendar / Drive share one OAuth client and one Google
-// account — three cards is just visual noise. We collapse them into a
-// single synthetic row whose ``_googleSubs`` carries the originals;
-// GoogleWorkspaceCard renders one card with three internal Connect
-// rows.
+// Calendar and Drive share one Google Workspace card. Gmail remains
+// a separate Email card while keeping the same OAuth connection flow.
 
 function buildGoogleGroupRow(subs: McpServerRow[]): McpServerRow {
   const anyUserConnected = subs.some((s) => s.user_connected);
@@ -1441,10 +1524,8 @@ function buildGoogleGroupRow(subs: McpServerRow[]): McpServerRow {
     server_key: "_google_workspace",
     name: t("page.integrations.google_workspace"),
     category: t("page.integrations.category_productivity"),
-    description: t(
-      "page.integrations.sign_in_once_with_your_google_account_gmail_calendar_a",
-    ),
-    tagline: t("page.integrations.gmail_calendar_drive"),
+    description: t("page.integrations.google_calendar_drive_description"),
+    tagline: t("page.integrations.google_calendar_drive_summary"),
     docs_url: "https://workspace.google.com/",
     setup_hint: null,
     color_hex: "#4285F4",
@@ -1462,6 +1543,8 @@ function buildGoogleGroupRow(subs: McpServerRow[]): McpServerRow {
     requires_explicit_account: requiresExplicitAccount,
     hint: anyComingSoon ? t("page.integrations.coming_soon") : "",
     coming_soon: anyComingSoon,
+    setup_pending: subs.some((s) => s.setup_pending),
+    setup_unavailable: subs.some((s) => s.setup_unavailable),
     nango_provider_config_key: null,
     oauth_configured: allConfigured,
     _googleSubs: subs,
@@ -1522,6 +1605,18 @@ function GoogleWorkspaceCard({
 }) {
   const logoColor = getLogoColor("google_calendar", "#4285F4");
   const isComingSoon = subs.some((s) => s.coming_soon);
+  const setupPending = subs.some((s) => integrationSetupState(s) !== "ready");
+  const setupLabel = subs.some((s) => integrationSetupState(s) === "unavailable")
+    ? t("page.integrations.status_unavailable")
+    : t("page.integrations.checking_setup");
+  const detailKey = "integration:_google_workspace";
+  const currentDetailKey = useDetailStore((s) => s.payload?.key);
+  const detailVersion = JSON.stringify(subs);
+  useEffect(() => {
+    if (currentDetailKey === detailKey) openGoogleDetail();
+    // The detail store holds rendered content; refresh it when the snapshot resolves.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentDetailKey, detailVersion, canManage]);
   const readyCount = integrationReadyCount(subs);
   const total = subs.length;
   const hasAnyReadyConnection = readyCount > 0;
@@ -1594,42 +1689,18 @@ function GoogleWorkspaceCard({
             ? t("page.integrations.connected_count_of_total")
                 .replace("{count}", String(readyCount))
                 .replace("{total}", String(total))
-            : t("page.integrations.not_connected");
+            : setupPending ? setupLabel : t("page.integrations.not_connected");
 
-  return (
-    <CompactCard
-      icon={
-        <IconTile color={logoColor} size={34}>
-          <IntegrationLogo provider="google" size={18} />
-        </IconTile>
-      }
-      title={t("page.integrations.google_workspace")}
-      subtitle={t(
-        "page.integrations.gmail_calendar_drive_one_google_sign_in_three_se",
-      )}
-      meta={
-        <span
-          title={statusLabel}
-          style={{
-            width: 7,
-            height: 7,
-            borderRadius: "50%",
-            background: needsAttention ? statusColor : "currentColor",
-          }}
-        />
-      }
-      metaTone={hasAnyReadyConnection && !needsAttention ? "connected" : "muted"}
-      onClick={() =>
-        openDetail({
+  function openGoogleDetail() {
+    openDetail({
+          key: detailKey,
           icon: (
             <IconTile color={logoColor} size={48}>
               <IntegrationLogo provider="google" size={25} />
             </IconTile>
           ),
           title: t("page.integrations.google_workspace"),
-          subtitle: t(
-            "page.integrations.gmail_calendar_drive_one_google_sign_in_three_se",
-          ),
+          subtitle: t("page.integrations.google_calendar_drive_summary"),
           badges: (
             <span
               style={{
@@ -1728,6 +1799,11 @@ function GoogleWorkspaceCard({
                 </div>
               )}
               {subs.map((s) => {
+                const subSetupState = integrationSetupState(s);
+                const subSetupPending = subSetupState !== "ready";
+                const subSetupLabel = subSetupState === "unavailable"
+                  ? t("page.integrations.status_unavailable")
+                  : t("page.integrations.checking_setup");
                 const hasStoredConnection =
                   s.connections.length > 0 ||
                   (s.entity_accounts?.length ?? 0) > 0;
@@ -1806,7 +1882,8 @@ function GoogleWorkspaceCard({
                                 ? t("page.integrations.needs_attention")
                               : hasUsableConnection
                                 ? t("status.connected")
-                                : s.oauth_configured
+                                : subSetupPending ? subSetupLabel
+                                : s.oauth_configured || s.nango_provider_config_key
                                   ? t("page.integrations.ready_to_connect")
                                   : t("page.integrations.oauth_not_configured")}
                         </div>
@@ -1815,10 +1892,18 @@ function GoogleWorkspaceCard({
                         <Chip size="sm" variant="slate">
                           {t("page.integrations.soon")}
                         </Chip>
+                      ) : subSetupPending && !(subSetupState === "unavailable" && canManage && !s.oauth_configured && !s.nango_provider_config_key) ? (
+                        <Button variant="outline" size="sm" disabled>{subSetupLabel}</Button>
                       ) : hasUsableConnection ? (
                         <Chip size="sm" variant="slate">
                           {subAuthFailed ? "!" : "✓"}
                         </Chip>
+                      ) : s.nango_provider_config_key ? (
+                        <NangoConnectButton
+                          providerConfigKeys={[s.nango_provider_config_key]}
+                          label={t("page.apps.connect")}
+                          size="sm"
+                        />
                       ) : s.oauth_configured ? (
                         <Button
                           variant="primary"
@@ -1858,7 +1943,7 @@ function GoogleWorkspaceCard({
                             serverKey={s.server_key}
                             showActions={connection.can_manage}
                             canShare={connection.can_share}
-                            onReconnect={() =>
+                            onReconnect={subSetupPending ? undefined : () =>
                               onConnect(s.server_key, s.name, connection.id)
                             }
                           />
@@ -1868,12 +1953,21 @@ function GoogleWorkspaceCard({
                             key={`google-entity-${s.server_key}-${account.id}`}
                             account={account}
                             serverKey={s.server_key}
+                            nangoProviderConfigKey={s.nango_provider_config_key}
+                            setupState={subSetupState}
                             onEdit={() => {}}
                             showActions={account.can_manage}
                             canShare={account.can_share}
                           />
                         ))}
-                        {s.oauth_configured && !isComingSoon ? (
+                        {s.nango_provider_config_key && !isComingSoon && !subSetupPending ? (
+                          <NangoConnectButton
+                            providerConfigKeys={[s.nango_provider_config_key]}
+                            label={t("page.integrations.plus_add_account")}
+                            variant="outline"
+                            size="sm"
+                          />
+                        ) : s.oauth_configured && !isComingSoon && !subSetupPending ? (
                           <Button
                             variant="outline"
                             size="sm"
@@ -1890,12 +1984,70 @@ function GoogleWorkspaceCard({
               })}
             </div>
           ),
-        })
+    });
+  }
+
+  return (
+    <CompactCard
+      icon={
+        <IconTile color={logoColor} size={34}>
+          <IntegrationLogo provider="google" size={18} />
+        </IconTile>
       }
+      title={t("page.integrations.google_workspace")}
+      subtitle={t("page.integrations.google_calendar_drive_summary")}
+      meta={
+        <span title={statusLabel} style={{ width: 7, height: 7, borderRadius: "50%", background: needsAttention ? statusColor : "currentColor" }} />
+      }
+      metaTone={hasAnyReadyConnection && !needsAttention ? "connected" : "muted"}
+      onClick={openGoogleDetail}
     />
   );
 }
 
+
+const META_PRODUCTS = [
+  { provider: "facebook", label: "Facebook Pages" },
+  { provider: "messenger", label: "Messenger" },
+  { provider: "instagram", label: "Instagram" },
+] as const;
+
+function MetaProductMarks({ labeled = false }: { labeled?: boolean }) {
+  return (
+    <div
+      role={labeled ? undefined : "img"}
+      aria-label={labeled ? undefined : "Meta: Facebook Pages, Messenger, Instagram"}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        flexWrap: labeled ? "wrap" : "nowrap",
+        gap: labeled ? 12 : 3,
+      }}
+    >
+      {!labeled && (
+        <IconTile color={getLogoColor("meta")} size={34}>
+          <IntegrationLogo provider="meta" size={22} />
+        </IconTile>
+      )}
+      {META_PRODUCTS.map(({ provider, label }) => (
+        <div
+          key={provider}
+          style={{ display: "flex", alignItems: "center", gap: 6 }}
+          title={label}
+        >
+          <IconTile color={getLogoColor(provider)} size={labeled ? 28 : 21}>
+            <IntegrationLogo provider={provider} size={labeled ? 17 : 13} />
+          </IconTile>
+          {labeled && (
+            <span style={{ color: "var(--text-default)", fontSize: 12, fontWeight: 600 }}>
+              {label}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
 
 function ServerCard({
   server,
@@ -1906,6 +2058,8 @@ function ServerCard({
   onAddApiKey,
   onEditAccount,
   onScanQr,
+  onTogglePlugin,
+  pluginToggleBusy = false,
 }: {
   server: McpServerRow;
   openOnLoad?: boolean;
@@ -1915,17 +2069,21 @@ function ServerCard({
   onAddApiKey: () => void;
   onEditAccount: (accountId: string) => void;
   onScanQr?: (accountId: string) => void;
+  onTogglePlugin?: (enabled: boolean) => void;
+  pluginToggleBusy?: boolean;
 }) {
   const logoColor = getLogoColor(server.server_key);
-  const brandColor = logoColor;
+  const brandColor = server.server_key === "facebook" ? getLogoColor("meta") : logoColor;
 
   const isOAuth = server.auth_type === "oauth2";
+  let larkPlatformAdmin = false;
+  const isManorAccountOAuth = MANOR_ACCOUNT_OAUTH_KEYS.has(server.server_key);
+  const isSkillPlugin = server.auth_type === "skill_plugin";
   const isCredentials =
     server.auth_type === "credentials" || server.auth_type === "api_key";
   let isCliWorker = false;
   let isLocalWorkerManager = false;
   let isManagedSessionCard = false;
-  let isChromeManagedSession = false;
   const hasEntityAccounts = (server.entity_accounts?.length ?? 0) > 0;
   const accessState = connectorAccessState(server);
   const hasPartialConnection = accessState !== "connect";
@@ -1935,7 +2093,6 @@ function ServerCard({
     : server.capabilities || [];
   const showGenericCapabilities = genericCapabilities.length > 0;
   let showManagedSessionCapabilities = false;
-  let managedSessionNeedsLoginSave = false;
   let managedSessionBusy = false;
   let managedSessionActionKey = server.server_key;
   const isEntityLevel = !!server.required_permission;
@@ -1963,16 +2120,25 @@ function ServerCard({
     ? "#cf9b44"
     : server.agent_can_use
       ? "#168a5b"
+      : isSkillPlugin
+        ? "var(--text-faint)"
       : hasPartialConnection
         ? "#cf9b44"
         : "#d6d3d1";
+  const setupState = integrationSetupState(server);
+  const setupPending = setupState !== "ready";
+  const setupLabel = setupState === "unavailable"
+    ? t("page.integrations.status_unavailable")
+    : t("page.integrations.checking_setup");
   const statusLabel = server.requires_explicit_account
     ? t("page.integrations.needs_attention")
     : server.agent_can_use
       ? t("page.integrations.ready")
-      : hasPartialConnection
-        ? t("page.integrations.needs_attention")
-        : t("page.integrations.not_connected");
+      : isSkillPlugin
+        ? (setupPending ? setupLabel : t("page.integrations.disabled"))
+        : hasPartialConnection
+          ? t("page.integrations.needs_attention")
+          : setupPending ? setupLabel : t("page.integrations.not_connected");
   const detailKey = `integration:${managedSessionActionKey}`;
   const currentDetailKey = useDetailStore((s) => s.payload?.key);
 
@@ -1982,7 +2148,7 @@ function ServerCard({
       icon: (
         <IconTile color={brandColor} size={48}>
           <IntegrationLogo
-            provider={server.server_key}
+            provider={server.server_key === "facebook" ? "meta" : server.server_key}
             size={24}
           />
         </IconTile>
@@ -2016,6 +2182,23 @@ function ServerCard({
       ),
       body: (
         <>
+          {server.server_key === "facebook" && (
+            <div style={{ marginBottom: 16 }}>
+              <div
+                style={{
+                  color: "var(--text-faint)",
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: "0.06em",
+                  textTransform: "uppercase",
+                  marginBottom: 8,
+                }}
+              >
+                One Facebook login covers
+              </div>
+              <MetaProductMarks labeled />
+            </div>
+          )}
           <p style={{ margin: 0, color: "#44403c" }}>
             {server.description ||
               server.tagline ||
@@ -2024,6 +2207,84 @@ function ServerCard({
                 "page.integrations.connect_this_integration_then_use_its_tools_from_any_b",
               )}
           </p>
+          {server.server_key === "lark" && isOAuth && (
+            <p className="mt-3 mb-0 text-xs leading-relaxed text-[var(--text-muted)]">
+              {t("page.integrations.lark_oauth_hint")}
+            </p>
+          )}
+          {server.app_url && (
+            <a
+              className="btn-manor-outline"
+              href={server.app_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{ marginTop: 16, textDecoration: "none" }}
+            >
+              {t("page.integrations.open_application", {
+                name: server.name,
+              })}
+              <IconExternalLink size={14} aria-hidden="true" />
+              <span className="sr-only">
+                {t("page.integrations.opens_in_new_tab")}
+              </span>
+            </a>
+          )}
+          {isSkillPlugin && (server.plugin_skills?.length ?? 0) > 0 ? (
+            <>
+              <div
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: "var(--text-faint)",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.06em",
+                  margin: "16px 0 8px",
+                }}
+              >
+                {t("page.integrations.skills")} {server.plugin_skills?.length}
+              </div>
+              <div style={{ display: "grid", gap: 6 }}>
+                {server.plugin_skills?.map((skill) => (
+                  <div
+                    key={skill.slug}
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "10px minmax(0, 1fr)",
+                      gap: 8,
+                      alignItems: "start",
+                      color: skill.installed
+                        ? "var(--text-default)"
+                        : "var(--text-faint)",
+                    }}
+                  >
+                    <span
+                      aria-hidden="true"
+                      style={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: "50%",
+                        background: skill.installed ? "#168a5b" : "#d6d3d1",
+                        marginTop: 6,
+                      }}
+                    />
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontSize: 12.5, fontWeight: 650 }}>
+                        /{skill.slug}
+                        {!skill.installed ? (
+                          <span style={{ marginLeft: 6, fontWeight: 500 }}>
+                            {setupPending ? setupLabel : t("page.integrations.skill_missing")}
+                          </span>
+                        ) : null}
+                      </div>
+                      <div style={{ fontSize: 11.5, lineHeight: 1.45 }}>
+                        {skill.description}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : null}
           {showGenericCapabilities && (
             <>
               <div
@@ -2067,6 +2328,9 @@ function ServerCard({
               >
                 Connected accounts
               </div>
+              {["email", "gmail", "outlook"].includes(server.server_key) && (
+                <p className="m-0 mb-3 text-xs leading-5 text-[var(--text-muted)]">{t("email_accounts.description")}</p>
+              )}
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                 {server.connections.map((c) => (
                   <ConnectionRow
@@ -2075,7 +2339,7 @@ function ServerCard({
                     serverKey={server.server_key}
                     showActions={c.can_manage}
                     canShare={c.can_share}
-                    onReconnect={isOAuth ? () => onConnect(c.id) : undefined}
+                    onReconnect={isOAuth && !setupPending ? () => onConnect(c.id) : undefined}
                   />
                 ))}
                 {server.entity_accounts.map((account) => (
@@ -2086,6 +2350,7 @@ function ServerCard({
                     onEdit={() => onEditAccount(account.id)}
                     onScanQr={onScanQr}
                     nangoProviderConfigKey={server.nango_provider_config_key}
+                    setupState={setupState}
                     showActions={account.can_manage}
                     canShare={account.can_share}
                   />
@@ -2104,7 +2369,28 @@ function ServerCard({
             width: "100%",
           }}
         >
-          {isComingSoon ? (
+          {setupPending && !isComingSoon ? (
+            <>
+              <Button variant="outline" disabled style={{ width: "100%" }}>{setupLabel}</Button>
+              {setupState === "unavailable" && isOAuth && canManage && onConfigureOAuth && !server.oauth_configured && !server.nango_provider_config_key ? (
+                <Button variant="outline" style={{ width: "100%" }} onClick={() => { closeDetail(); onConfigureOAuth(); }}>
+                  {t("page.integrations.configure_client")}
+                </Button>
+              ) : null}
+            </>
+          ) : isSkillPlugin ? (
+            <Button
+              variant={server.plugin_enabled ? "outline" : "primary"}
+              style={{ width: "100%" }}
+              loading={pluginToggleBusy}
+              disabled={pluginToggleBusy || !onTogglePlugin}
+              onClick={() => onTogglePlugin?.(!server.plugin_enabled)}
+            >
+              {server.plugin_enabled
+                ? t("page.workspace_detail.disable")
+                : t("page.workspace_detail.enable")}
+            </Button>
+          ) : isComingSoon ? (
             <Button variant="outline" disabled style={{ width: "100%" }}>
               {t("page.integrations.coming_soon")}
             </Button>
@@ -2158,6 +2444,29 @@ function ServerCard({
                 ? t("page.integrations.plus_add_account")
                 : configureNoun}
             </Button>
+          ) : isOAuth && isManorAccountOAuth ? (
+            <Button
+              variant={
+                server.agent_can_use &&
+                (server.user_connected || hasEntityAccounts) &&
+                server.supports_multi_account
+                  ? "outline"
+                  : "primary"
+              }
+              style={{ width: "100%" }}
+              onClick={() => {
+                closeDetail();
+                onConnect();
+              }}
+            >
+              {!server.agent_can_use && accessState === "repair"
+                ? t("page.integrations.reconnect_required")
+                : server.agent_can_use &&
+                    (server.user_connected || hasEntityAccounts) &&
+                    server.supports_multi_account
+                  ? t("page.integrations.plus_add_account")
+                  : t("page.apps.connect")}
+            </Button>
           ) : isOAuth && server.oauth_configured && !server.agent_can_use ? (
             <Button
               variant="primary"
@@ -2171,7 +2480,7 @@ function ServerCard({
                 ? t("page.integrations.reconnect_required")
                 : t("page.apps.connect")}
             </Button>
-          ) : isOAuth && server.user_connected && server.supports_multi_account ? (
+          ) : isOAuth && server.oauth_configured && (server.user_connected || hasEntityAccounts) && server.supports_multi_account ? (
             <Button
               variant="outline"
               style={{ width: "100%" }}
@@ -2182,6 +2491,10 @@ function ServerCard({
             >
               {t("page.integrations.plus_add_account")}
             </Button>
+          ) : isOAuth && server.server_key === "lark" && larkPlatformAdmin && canManage ? (
+            <a href={PLATFORM_OAUTH_CLIENTS_HREF} className="btn-manor-outline" style={{ textDecoration: "none", justifyContent: "center" }}>
+              {t("page.integrations.lark_admin_configuration")}
+            </a>
           ) : isOAuth ? (
             canManage && onConfigureOAuth ? (
               <Button
@@ -2223,25 +2536,37 @@ function ServerCard({
     currentDetailKey,
     detailKey,
     server.agent_can_use,
+    server.setup_pending,
+    server.setup_unavailable,
+    server.nango_provider_config_key,
+    server.oauth_configured,
     server.category,
     server.connections,
     server.description,
     server.entity_accounts,
     server.entity_connected,
+    server.plugin_enabled,
+    server.plugin_skills,
     server.user_connected,
     server.setup_hint,
     server.tagline,
+    server.app_url,
+    pluginToggleBusy,
   ]);
 
   return (
     <CompactCard
       icon={
-        <IconTile color={brandColor} size={34}>
-          <IntegrationLogo
-            provider={server.server_key}
-            size={18}
-          />
-        </IconTile>
+        server.server_key === "facebook" ? (
+          <MetaProductMarks />
+        ) : (
+          <IconTile color={brandColor} size={34}>
+            <IntegrationLogo
+              provider={server.server_key}
+              size={18}
+            />
+          </IconTile>
+        )
       }
       title={server.name}
       subtitle={server.tagline || server.category || ""}
@@ -2430,6 +2755,7 @@ function EmailConfigModal({
     },
     onSuccess: async (row: any) => {
       queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["email-accounts"] });
       const savedId = (row && row.id) || effectiveAccountId;
       if (savedId && !accountId) setCreatedId(savedId);
 
@@ -2715,7 +3041,8 @@ function EmailConfigModal({
 type ApiKeyField = {
   key: string;
   label: string;
-  type?: "text" | "password" | "textarea";
+  type?: "text" | "password" | "textarea" | "select";
+  options?: Array<{ value: string; label: string }>;
   placeholder?: string;
   required?: boolean;
   help?: string;
@@ -2729,9 +3056,60 @@ type ApiKeyField = {
 type ApiKeyProviderSpec = {
   fields: ApiKeyField[];
   docs_hint?: string;
+  docs_links?: Array<{ label: string; href: string }>;
 };
 
 const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
+  // Existing application/bot connections remain editable after the OAuth rollout.
+  lark: {
+    fields: [
+      {
+        key: "app_id",
+        label: t("page.integrations.lark_app_id"),
+        placeholder: "cli_…",
+        required: true,
+      },
+      {
+        key: "app_secret",
+        label: t("page.integrations.lark_app_secret"),
+        type: "password",
+        required: true,
+      },
+      {
+        key: "platform",
+        label: t("page.integrations.lark_platform"),
+        type: "select",
+        required: true,
+        default_value: "lark",
+        options: [
+          { value: "lark", label: "Lark" },
+          { value: "feishu", label: t("page.integrations.lark_platform_feishu") },
+        ],
+        help: t("page.integrations.lark_platform_help"),
+      },
+    ],
+    docs_hint: t("page.integrations.lark_setup_hint"),
+    docs_links: [
+      { label: t("page.integrations.lark_console"), href: "https://open.larksuite.com/app" },
+      { label: t("page.integrations.feishu_console"), href: "https://open.feishu.cn/app" },
+    ],
+  },
+  manor_pms: {
+    fields: [
+      {
+        key: "base_url",
+        label: t("page.integrations.pms_endpoint"),
+        placeholder: "https://portfolio.manorai.xyz/api/mcp",
+      },
+      {
+        key: "access_token",
+        label: t("page.integrations.access_token"),
+        type: "password",
+        required: true,
+      },
+    ],
+    docs_hint: t("page.integrations.pms_setup_hint"),
+  },
   stripe: {
     fields: [
       {
@@ -2920,6 +3298,17 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
     ],
     docs_hint: t("page.integrations.docs_hint_14"),
   },
+  suno: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.api_keys.api_key"),
+        type: "password",
+        placeholder: "sk_live_…",
+        required: true,
+      },
+    ],
+  },
   tavily: {
     fields: [
       {
@@ -2932,6 +3321,17 @@ const API_KEY_FIELDS: Record<string, ApiKeyProviderSpec> = {
       },
     ],
     docs_hint: t("page.integrations.docs_hint_16"),
+  },
+  apify: {
+    fields: [
+      {
+        key: "api_key",
+        label: t("page.api_keys.api_key"),
+        type: "password",
+        placeholder: "apify_api_…",
+        required: true,
+      },
+    ],
   },
   jimeng: {
     fields: [
@@ -3092,17 +3492,20 @@ function OAuthClientConfigModal({
         <p
           style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
         >
-          {t(needsSecret ? "page.integrations.oauth_client_description" : "page.integrations.public_oauth_client_hint")}
+          {t(target.key === "lark" ? "page.integrations.lark_oauth_admin_hint" : needsSecret ? "page.integrations.oauth_client_description" : "page.integrations.public_oauth_client_hint")}
         </p>
+        {target.key === "lark" && <a href="https://open.larksuite.com/app" target="_blank" rel="noopener noreferrer" className="text-xs text-[var(--text-muted)] underline underline-offset-2 hover:text-[var(--text-strong)]">
+          {t("page.integrations.lark_console")}
+        </a>}
 
         <Input
-          label={t("page.integrations.client_id_or_key")}
+          label={t(target.key === "lark" ? "page.integrations.lark_app_id" : "page.integrations.client_id_or_key")}
           value={clientId}
           onChange={(e) => setClientId(e.target.value)}
           placeholder={t("page.integrations.client_id_or_key_placeholder")}
         />
         {needsSecret && <Input
-          label={t("page.integrations.client_secret")}
+          label={t(target.key === "lark" ? "page.integrations.lark_app_secret" : "page.integrations.client_secret")}
           type="password"
           value={clientSecret}
           onChange={(e) => setClientSecret(e.target.value)}
@@ -3150,11 +3553,14 @@ function ApiKeyConfigModal({
 
   const [values, setValues] = useState<Record<string, string>>({});
   const [accountName, setAccountName] = useState("");
+  const formKey = target ? `${target.key}:${target.accountId || "new"}` : null;
+  const [initializedForm, setInitializedForm] = useState<string | null>(null);
+  const formReady = open && !!formKey && initializedForm === formKey;
 
   // Pre-fill from the existing Integration when editing
-  const { data: existingRow } = useQuery({
+  const { data: existingRow, isFetching, isError: loadError } = useQuery({
     queryKey: ["integration-row", target?.accountId],
-    enabled: editing && !!target?.accountId,
+    enabled: open && editing && !!target?.accountId,
     queryFn: async () => {
       const list = await api.integrations.list();
       return (list as any[]).find((i) => i.id === target?.accountId) || null;
@@ -3165,13 +3571,20 @@ function ApiKeyConfigModal({
   // the stored value.
   const [touched, setTouched] = useState<Record<string, boolean>>({});
   useEffect(() => {
-    if (!editing || !existingRow) return;
-    const creds = existingRow.credential_preview || {};
-    const cfg = existingRow.config || {};
+    if (!open || !target || !spec) {
+      setInitializedForm(null);
+      return;
+    }
+    // Initialize once per open/account. Later query refreshes must not erase
+    // replacements the user has typed, including the secret-field sentinel.
+    if (initializedForm === formKey) return;
+    if (editing && (isFetching || loadError || !existingRow)) return;
+    const creds = editing ? existingRow.credential_preview || {} : {};
+    const cfg = editing ? existingRow.config || {} : {};
     setValues(
       Object.fromEntries(
-        (spec?.fields || []).map((f) => {
-          const raw = String(creds[f.key] ?? "");
+        spec.fields.map((f) => {
+          const raw = String(creds[f.key] ?? (editing ? "" : f.default_value ?? ""));
           // Secret fields come back as the sentinel; show them as empty
           // so the user can type a replacement if they want.
           const isSecret = f.type === "password";
@@ -3182,31 +3595,8 @@ function ApiKeyConfigModal({
     );
     setAccountName(String(cfg.name || ""));
     setTouched({});
-  }, [editing, existingRow, spec]);
-
-  // Seed default_value into a fresh form on open. Skipped during edit
-  // (we already pre-fill from the saved row). Lets per-provider specs
-  // ship sensible factory defaults — e.g. the wechat_personal runner
-  // URL is fixed at the Docker service hostname for the standard
-  // self-hosted Manor deployment.
-  useEffect(() => {
-    if (editing) return;
-    if (!target || !spec) return;
-    setValues((prev) => {
-      const next = { ...prev };
-      let changed = false;
-      for (const f of spec.fields) {
-        if (
-          f.default_value !== undefined &&
-          (next[f.key] === undefined || next[f.key] === "")
-        ) {
-          next[f.key] = f.default_value;
-          changed = true;
-        }
-      }
-      return changed ? next : prev;
-    });
-  }, [target?.key, editing, spec]);
+    setInitializedForm(formKey);
+  }, [open, target, spec, editing, existingRow, isFetching, loadError, initializedForm, formKey]);
 
   const mutation = useMutation({
     mutationFn: async () => {
@@ -3217,6 +3607,10 @@ function ApiKeyConfigModal({
         const isSecret = f.type === "password";
         if (v) {
           credentials[f.key] = v;
+        } else if (editing && target.key === "manor_pms" && f.key === "base_url") {
+          // An explicit blank removes an account override; omitted fields are
+          // merged with the saved credentials by the API.
+          credentials[f.key] = "";
         } else if (editing && isSecret && !touched[f.key]) {
           // Preserve existing secret when editing and user didn't touch it
           credentials[f.key] = UNCHANGED;
@@ -3278,7 +3672,8 @@ function ApiKeyConfigModal({
       if (editing && f.type === "password" && !touched[f.key]) return false;
       return true;
     });
-  const canSave = !missing && !mutation.isPending;
+  const canSave = formReady && !missing && !mutation.isPending;
+  const fieldsDisabled = !formReady || mutation.isPending;
 
   return (
     <Modal
@@ -3312,7 +3707,14 @@ function ApiKeyConfigModal({
         </>
       }
     >
-      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div aria-busy={!formReady && isFetching} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        {!formReady && editing && (
+          <p role={loadError || (!isFetching && !existingRow) ? "alert" : "status"} className="text-xs text-stone-500">
+            {loadError || (!isFetching && !existingRow)
+              ? t("page.integrations.failed_to_load_integrations")
+              : t("status.loading")}
+          </p>
+        )}
         <p
           style={{ fontSize: 12, color: "#78716c", lineHeight: 1.5, margin: 0 }}
         >
@@ -3327,6 +3729,7 @@ function ApiKeyConfigModal({
           onChange={(e) => setAccountName(e.target.value)}
           placeholder={t("page.integrations.e_g_support_inbox_or_sales_bot")}
           autoComplete="nickname"
+          disabled={fieldsDisabled}
         />
 
         {spec.fields.map((f) => {
@@ -3336,6 +3739,29 @@ function ApiKeyConfigModal({
             editing && isSecret
               ? t("page.integrations.leave_blank_to_keep_existing")
               : f.placeholder;
+          if (f.type === "select") {
+            const fieldId = `integration-credential-${f.key}`;
+            const helpId = `${fieldId}-help`;
+            return (
+              <div key={f.key}>
+                <label htmlFor={fieldId} className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+                  {f.label}
+                </label>
+                <Select
+                  id={fieldId}
+                  role="combobox"
+                  ariaLabel={f.label}
+                  ariaRequired={f.required}
+                  ariaDescribedBy={f.help ? helpId : undefined}
+                  value={values[f.key] || ""}
+                  options={f.options || []}
+                  onChange={(value) => setValues((v) => ({ ...v, [f.key]: value }))}
+                  disabled={fieldsDisabled}
+                />
+                {f.help && <p id={helpId} className="mt-1.5 text-xs leading-relaxed text-stone-500">{f.help}</p>}
+              </div>
+            );
+          }
           if (isTextarea) {
             return (
               <div
@@ -3350,6 +3776,7 @@ function ApiKeyConfigModal({
                 </label>
                 <textarea
                   value={values[f.key] || ""}
+                  disabled={fieldsDisabled}
                   onChange={(e) => {
                     setValues((v) => ({ ...v, [f.key]: e.target.value }));
                     setTouched((t) => ({ ...t, [f.key]: true }));
@@ -3388,11 +3815,23 @@ function ApiKeyConfigModal({
               }}
               placeholder={placeholder}
               autoComplete={isSecret ? "new-password" : "off"}
+              disabled={fieldsDisabled}
             />
           );
         })}
 
         {spec.docs_hint && <InfoAlert>{spec.docs_hint}</InfoAlert>}
+        {spec.docs_links && (
+          <div className="flex flex-wrap gap-3">
+            {spec.docs_links.map((link) => (
+              <a key={link.href} href={link.href} target="_blank" rel="noopener noreferrer"
+                className="text-xs text-[var(--text-muted)] underline underline-offset-2 hover:text-[var(--text-strong)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] focus-visible:outline-offset-2">
+                {link.label}
+                <span className="sr-only"> {t("page.integrations.opens_in_new_tab")}</span>
+              </a>
+            ))}
+          </div>
+        )}
 
         {mutation.isError && (
           <p style={{ color: "#c14a44", fontSize: 12 }}>
@@ -3928,6 +4367,7 @@ function EntityAccountRow({
   onEdit,
   onScanQr,
   nangoProviderConfigKey,
+  setupState = "ready",
   showActions = true,
   canShare = false,
 }: {
@@ -3956,11 +4396,18 @@ function EntityAccountRow({
   onEdit: () => void;
   onScanQr?: (accountId: string) => void;
   nangoProviderConfigKey?: string | null;
+  setupState?: IntegrationSetupState;
   showActions?: boolean;
   canShare?: boolean;
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const ownedEmailAccount = ["email", "gmail", "outlook"].includes(serverKey) && account.ownership === "mine";
+  const emailSettings = useEmailAccounts(ownedEmailAccount);
+  const senderId = account.id;
+  const isDefault = ownedEmailAccount
+    ? emailSettings.data?.default_sender_id === senderId
+    : account.is_default;
   const [shareOpen, setShareOpen] = useState(false);
   const [whatsappPinOpen, setWhatsAppPinOpen] = useState(false);
   const [whatsappPin, setWhatsAppPin] = useState("");
@@ -3974,8 +4421,11 @@ function EntityAccountRow({
   const setDefault = useMutation({
     mutationFn: () =>
       api.integrations.setDefaultEntityAccount(serverKey, account.id),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["email-accounts"] });
+    },
+    onError: (error: Error) => toast.error(t("page.integrations.failed_to_save"), error.message),
   });
 
   const retryWhatsAppProvisioning = useMutation({
@@ -4005,6 +4455,7 @@ function EntityAccountRow({
       api.integrations.deleteEntityAccount(serverKey, account.id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["email-accounts"] });
       queryClient.invalidateQueries({ queryKey: ["channel-bindings"] });
     },
   });
@@ -4040,7 +4491,8 @@ function EntityAccountRow({
   const hasWiring = !!account.health?.wiring;
   const wiringBroken = hasWiring && account.health?.wiring?.ok === false;
   const unavailable = !account.runtime_callable;
-  const canSetDefault = account.runtime_callable && !account.is_default;
+  const canSetDefault = account.runtime_callable && !isDefault
+    && (!ownedEmailAccount || Boolean(emailSettings.data?.accounts.some((sender) => sender.id === senderId)));
 
   const items = [
     ...(showActions
@@ -4053,7 +4505,7 @@ function EntityAccountRow({
                 {
                   key: "reconnect",
                   label: t("page.integrations.reconnect"),
-                  disabled: reconnect.isWorking,
+                  disabled: reconnect.isWorking || setupState !== "ready",
                 },
               ]
             : []),
@@ -4092,7 +4544,7 @@ function EntityAccountRow({
         ]
       : []),
     ...(canSetDefault
-      ? [{ key: "default", label: t("page.integrations.set_as_default") }]
+      ? [{ key: "default", label: t("page.integrations.set_as_default"), disabled: setDefault.isPending }]
       : []),
     ...(showActions
       ? [{
@@ -4125,10 +4577,10 @@ function EntityAccountRow({
         gap: 4,
         padding: "6px 10px",
         borderRadius: 8,
-        background: account.is_default
+        background: isDefault
           ? "rgba(168,162,158,0.12)"
           : "rgba(250,250,249,0.7)",
-        border: `1px solid ${account.is_default ? "rgba(168,162,158,0.35)" : "rgba(231,229,228,0.6)"}`,
+        border: `1px solid ${isDefault ? "rgba(168,162,158,0.35)" : "rgba(231,229,228,0.6)"}`,
         fontSize: 12,
       }}
     >
@@ -4161,7 +4613,7 @@ function EntityAccountRow({
               </span>
             )}
         </span>
-        {account.is_default && <DefaultBadge />}
+        {isDefault && <DefaultBadge />}
         {canShare && !unavailable && (
           <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
             Share
@@ -4172,7 +4624,7 @@ function EntityAccountRow({
             items={items}
             onSelect={(key) => {
               if (key === "edit") onEdit();
-              else if (key === "reconnect") reconnect.begin();
+              else if (key === "reconnect" && setupState === "ready") reconnect.begin();
               else if (key === "whatsapp-pin") setWhatsAppPinOpen(true);
               else if (key === "scan") onScanQr?.(account.id);
               else if (key === "test") testNow.mutate();
@@ -4193,6 +4645,12 @@ function EntityAccountRow({
           />
         )}
       </div>
+      {ownedEmailAccount && emailSettings.error && (
+        <div className="flex flex-wrap items-center gap-2">
+          <p role="alert" className="m-0 text-xs text-[var(--text-muted)]">{t("email_accounts.load_error")}</p>
+          <Button variant="ghost" size="sm" onClick={() => void emailSettings.refetch()}>{t("email_accounts.retry")}</Button>
+        </div>
+      )}
       {failureDetail && (
         <div
           style={{
@@ -4531,20 +4989,33 @@ function ConnectionRow({
 }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const ownedEmailAccount = ["email", "gmail", "outlook"].includes(serverKey) && connection.ownership === "mine";
+  const emailSettings = useEmailAccounts(ownedEmailAccount);
+  const senderId = `oauth:${connection.id}`;
+  const isDefault = ownedEmailAccount
+    ? emailSettings.data?.default_sender_id === senderId
+    : connection.is_default;
   const [shareOpen, setShareOpen] = useState(false);
 
   const setDefault = useMutation({
     mutationFn: () =>
       api.integrations.setDefaultConnection(serverKey, connection.id),
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["email-accounts"] });
+    },
+    onError: (error: Error) => toast.error(t("page.integrations.failed_to_save"), error.message),
   });
 
   const disconnect = useMutation({
     mutationFn: () =>
       api.integrations.disconnectAccount(serverKey, connection.id),
-    onSuccess: () => {
+    onError: (error: any) =>
+      toast.error(t("page.integrations.disconnect_failed"), error?.message || ""),
+    onSettled: () => {
+      // A failed remote revocation can still disable this account locally.
       queryClient.invalidateQueries({ queryKey: INTEGRATION_CATALOG_QUERY_KEY });
+      queryClient.invalidateQueries({ queryKey: ["email-accounts"] });
       queryClient.invalidateQueries({ queryKey: ["channel-bindings"] });
     },
   });
@@ -4564,7 +5035,8 @@ function ConnectionRow({
     connection.expires_at && new Date(connection.expires_at) < new Date();
   const authFailed = connection.health?.ok === false;
   const unavailable = !connection.runtime_callable;
-  const canSetDefault = connection.runtime_callable && !connection.is_default;
+  const canSetDefault = connection.runtime_callable && !isDefault
+    && (!ownedEmailAccount || Boolean(emailSettings.data?.accounts.some((sender) => sender.id === senderId)));
   const reconnectUnavailable =
     connection.availability === "reconnect_required"
     || connection.availability === "load_failed";
@@ -4610,7 +5082,7 @@ function ConnectionRow({
     ...(canSetDefault
       ? [{
           key: "default",
-          label: t("page.integrations.set_as_default"),
+          label: t("page.integrations.set_as_default"), disabled: setDefault.isPending,
         }]
       : []),
     ...(showActions
@@ -4630,10 +5102,10 @@ function ConnectionRow({
         gap: 4,
         padding: "6px 10px",
         borderRadius: 8,
-        background: connection.is_default
+        background: isDefault
           ? "rgba(168,162,158,0.12)"
           : "rgba(250,250,249,0.7)",
-        border: `1px solid ${connection.is_default ? "rgba(168,162,158,0.35)" : "rgba(231,229,228,0.6)"}`,
+        border: `1px solid ${isDefault ? "rgba(168,162,158,0.35)" : "rgba(231,229,228,0.6)"}`,
         fontSize: 12,
       }}
     >
@@ -4656,7 +5128,7 @@ function ConnectionRow({
         >
           {label}
         </span>
-        {connection.is_default && <DefaultBadge />}
+        {isDefault && <DefaultBadge />}
         {expired && <ExpiredBadge />}
         {canShare && !unavailable && (
           <Button variant="outline" size="sm" onClick={() => setShareOpen(true)}>
@@ -4696,6 +5168,12 @@ function ConnectionRow({
           />
         )}
       </div>
+      {ownedEmailAccount && emailSettings.error && (
+        <div className="flex flex-wrap items-center gap-2">
+          <p role="alert" className="m-0 text-xs text-[var(--text-muted)]">{t("email_accounts.load_error")}</p>
+          <Button variant="ghost" size="sm" onClick={() => void emailSettings.refetch()}>{t("email_accounts.retry")}</Button>
+        </div>
+      )}
       {failureDetail && (
         <div
           style={{

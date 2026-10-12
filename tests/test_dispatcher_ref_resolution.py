@@ -3,12 +3,16 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import pytest
 
 from packages.core.constants.task import TaskLogType
 from packages.core.dispatcher.service import Dispatcher
 from packages.core.models.base import generate_ulid
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_account_approval, initialize_test_approval_owners,
+)
 from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.scheduler import ScheduledJob
 from packages.core.models.staff import Staff
@@ -21,6 +25,105 @@ from packages.core.models.workspace import (
     Workspace,
     WorkspaceActivity,
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("workspace_status", "deleted_at"),
+    [
+        ("paused", None),
+        ("active", datetime.now(timezone.utc)),
+    ],
+)
+async def test_dispatcher_excludes_inactive_workspace_before_candidate_scan(
+    db_session,
+    monkeypatch,
+    workspace_status,
+    deleted_at,
+) -> None:
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    plan_id = generate_ulid()
+    worker = Worker(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        kind="internal",
+        display_name="Internal worker",
+        capabilities={"supported_kinds": ["llm"], "max_risk_level": "high"},
+        monthly_spent_usd=Decimal("0"),
+        auto_pause_on_budget=True,
+        status="active",
+    )
+    workspace = Workspace(
+        id=workspace_id,
+        entity_id=entity_id,
+        name="Lifecycle-gated Workspace",
+        status=workspace_status,
+        deleted_at=deleted_at,
+    )
+    step = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        service_key="writer",
+        step_key="write_summary",
+        kind="llm",
+        params={"prompt": "Write the summary"},
+        depends_on=[],
+        step_status="pending",
+        attempt_count=0,
+        max_attempts=3,
+    )
+    db_session.add_all(
+        [
+            worker,
+            workspace,
+            ExecutionPlan(
+                id=plan_id,
+                entity_id=entity_id,
+                workspace_id=workspace_id,
+                status="running",
+                execution_mode="live",
+                approval_required=False,
+                plan_dag={"steps": []},
+            ),
+            step,
+        ]
+    )
+    await db_session.flush()
+
+    readiness = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "packages.core.services.workspace_readiness."
+        "evaluate_current_workspace_blocking_setup",
+        readiness,
+    )
+
+    assert await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        worker,
+        max_n=1,
+    ) == []
+    readiness.assert_not_awaited()
+    assert step.step_status == "pending"
+
+    actor = await initialize_test_account_approval(db_session, entity_id=entity_id,
+        user_rules=[action_rule("unclassified.action")])
+    await initialize_test_approval_owners(db_session, workspace, user_id=actor.id)
+    # Restore/resume makes the row visible to the normal readiness gate again.
+    # It remains unleased here because this focused fixture intentionally has
+    # no AgentSubscription; active subscription dispatch is covered below.
+    workspace.status = "active"
+    workspace.deleted_at = None
+    await db_session.flush()
+
+    assert await Dispatcher().checkout_steps_for_worker(
+        db_session,
+        worker,
+        max_n=1,
+    ) == []
+    readiness.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -546,6 +649,8 @@ async def test_internal_worker_rejects_legacy_task_without_executable_requester(
     monkeypatch.setattr(internal, "_execute_by_kind", should_not_execute)
 
     async with dbmod.async_session() as db:
+        await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("unclassified.action")])
         db.add_all(
             [
                 Agent(
@@ -649,6 +754,8 @@ async def test_dispatcher_resolves_step_refs_before_leasing(client) -> None:
     )
 
     async with dbmod.async_session() as db:
+        await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("unclassified.action")])
         db.add(worker)
         db.add(
             ExecutionPlan(
@@ -725,6 +832,8 @@ async def test_dispatcher_hydrates_agent_id_from_workspace_subscription(client) 
     )
 
     async with dbmod.async_session() as db:
+        actor = await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("unclassified.action")])
         db.add(worker)
         db.add(
             Workspace(
@@ -788,6 +897,7 @@ async def test_dispatcher_hydrates_agent_id_from_workspace_subscription(client) 
         )
         db.add(pending)
         await db.flush()
+        await initialize_test_approval_owners(db, await db.get(Workspace, workspace_id), user_id=actor.id)
 
         leases = await Dispatcher().checkout_steps_for_worker(db, worker, max_n=1)
 
@@ -914,6 +1024,9 @@ async def test_dispatcher_rejects_action_not_bound_to_resolved_service_agent(cli
         )
         db.add(pending)
         await db.flush()
+        actor = await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("search_tweets")])
+        await initialize_test_approval_owners(db, await db.get(Workspace, workspace_id), user_id=actor.id)
 
         leases = await Dispatcher().checkout_steps_for_worker(db, worker, max_n=1)
 
@@ -973,6 +1086,8 @@ async def test_dispatcher_coerces_worker_output_before_validation(
     }
 
     async with dbmod.async_session() as db:
+        await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("unclassified.action")])
         db.add(
             Worker(
                 id=worker_id,
@@ -1078,6 +1193,8 @@ async def test_internal_worker_heartbeats_during_long_lease(client, monkeypatch)
     monkeypatch.setattr(internal, "_execute_by_kind", slow_handler)
 
     async with dbmod.async_session() as db:
+        await initialize_test_account_approval(db, entity_id=entity_id,
+            user_rules=[action_rule("unclassified.action")])
         db.add_all(
             [
                 User(

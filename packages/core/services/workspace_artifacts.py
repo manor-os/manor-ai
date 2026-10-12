@@ -107,15 +107,24 @@ async def infer_workspace_id_from_storage_path(
     *,
     entity_id: str,
     rel_path: str,
+    db: AsyncSession | None = None,
 ) -> str | None:
     """Resolve manually added ID-scoped files back to their workspace."""
     folder_id = artifact_folder_id_from_entity_storage_path(rel_path)
     if not entity_id or not folder_id:
         return None
+    if db is not None:
+        return (await db.execute(
+            select(Workspace.id).where(
+                Workspace.entity_id == entity_id,
+                Workspace.artifact_folder_id == folder_id,
+                Workspace.deleted_at.is_(None),
+            ).limit(1)
+        )).scalar_one_or_none()
     from packages.core.database import async_session
 
-    async with async_session() as db:
-        return (await db.execute(
+    async with async_session() as owned_db:
+        return (await owned_db.execute(
             select(Workspace.id).where(
                 Workspace.entity_id == entity_id,
                 Workspace.artifact_folder_id == folder_id,
@@ -134,7 +143,13 @@ async def ensure_workspace_artifact_folder(
     when one exists. This preserves the user's Knowledge tree while switching
     all future physical writes to the folder ID.
     """
-    root = await _ensure_folder(db, entity_id=workspace.entity_id, name=WORKSPACE_FOLDER_ROOT, parent_id=None)
+    root = await _ensure_folder(
+        db,
+        entity_id=workspace.entity_id,
+        name=WORKSPACE_FOLDER_ROOT,
+        parent_id=None,
+        visibility="entity",
+    )
     # Serialize sibling name allocation and legacy-folder claims per entity.
     root = (await db.execute(
         select(DocumentFolder).where(DocumentFolder.id == root.id).with_for_update()
@@ -156,6 +171,7 @@ async def ensure_workspace_artifact_folder(
                 DocumentFolder.entity_id == workspace.entity_id,
                 DocumentFolder.parent_id == root.id,
                 DocumentFolder.name == desired_name,
+                DocumentFolder.owner_id.is_(None),
             ).limit(1)
         )).scalar_one_or_none()
         if (
@@ -176,6 +192,8 @@ async def ensure_workspace_artifact_folder(
                 entity_id=workspace.entity_id,
                 name=folder_name,
                 parent_id=root.id,
+                owner_id=None,
+                visibility="workspace",
             )
             db.add(linked)
             await db.flush()
@@ -184,6 +202,10 @@ async def ensure_workspace_artifact_folder(
 
     if linked.parent_id != root.id:
         linked.parent_id = root.id
+    if linked.owner_id is not None:
+        linked.owner_id = None
+    if linked.visibility != "workspace":
+        linked.visibility = "workspace"
     target_name = await _available_folder_name(
         db,
         workspace=workspace,
@@ -246,7 +268,14 @@ async def _ensure_workspace_document_folder_in_session(
     root = await ensure_workspace_artifact_folder(db, workspace)
     parent_id = root.id
     for name in _artifact_relative_directory_parts(rel_path, root.id):
-        child = await _ensure_folder(db, entity_id=entity_id, name=name, parent_id=parent_id)
+        child = await _ensure_folder(
+            db,
+            entity_id=entity_id,
+            name=name,
+            parent_id=parent_id,
+            visibility="workspace",
+            accept_owned=True,
+        )
         parent_id = child.id
     return parent_id
 
@@ -282,6 +311,8 @@ async def ensure_workspace_artifact_directory(
                 entity_id=entity_id,
                 name=name,
                 parent_id=parent_id,
+                visibility="workspace",
+                accept_owned=True,
             )
             parent_id = child.id
         await db.commit()
@@ -412,20 +443,34 @@ async def _ensure_folder(
     entity_id: str,
     name: str,
     parent_id: str | None,
+    visibility: str,
+    accept_owned: bool = False,
 ) -> DocumentFolder:
+    query = select(DocumentFolder).where(
+        DocumentFolder.entity_id == entity_id,
+        DocumentFolder.name == name,
+        DocumentFolder.parent_id == parent_id,
+    )
+    if not accept_owned:
+        query = query.where(DocumentFolder.owner_id.is_(None))
     existing = (await db.execute(
-        select(DocumentFolder).where(
-            DocumentFolder.entity_id == entity_id,
-            DocumentFolder.name == name,
-            DocumentFolder.parent_id == parent_id,
-        ).limit(1)
+        query.order_by(DocumentFolder.owner_id.isnot(None), DocumentFolder.id).limit(1)
     )).scalar_one_or_none()
     if existing is not None:
+        if existing.visibility != visibility:
+            existing.visibility = visibility
         return existing
     folder_id = generate_ulid()
     result = await db.execute(
         pg_insert(DocumentFolder)
-        .values(id=folder_id, entity_id=entity_id, name=name, parent_id=parent_id)
+        .values(
+            id=folder_id,
+            entity_id=entity_id,
+            name=name,
+            parent_id=parent_id,
+            owner_id=None,
+            visibility=visibility,
+        )
         .on_conflict_do_nothing()
         .returning(DocumentFolder.id)
     )
@@ -439,6 +484,7 @@ async def _ensure_folder(
             DocumentFolder.entity_id == entity_id,
             DocumentFolder.name == name,
             DocumentFolder.parent_id == parent_id,
+            DocumentFolder.owner_id.is_(None),
         ).limit(1)
     )).scalar_one()
 
@@ -488,6 +534,7 @@ async def _available_folder_name(
             DocumentFolder.entity_id == workspace.entity_id,
             DocumentFolder.parent_id == parent_id,
             DocumentFolder.name == candidate,
+            DocumentFolder.owner_id.is_(None),
         ]
         if current_folder_id:
             conditions.append(DocumentFolder.id != current_folder_id)

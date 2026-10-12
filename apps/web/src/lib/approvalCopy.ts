@@ -1,3 +1,5 @@
+import { formatUserFacingText } from "./taskDisplay";
+
 type ApprovalCopyInput = {
   prompt?: string;
   action?: string;
@@ -37,7 +39,9 @@ export type StructuredApprovalCopy = {
 
 function payloadText(payload: Record<string, any>, key: string): string {
   const value = payload[key];
-  return typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  return typeof value === "string"
+    ? formatUserFacingText(value.replace(/\s+/g, " ").trim())
+    : "";
 }
 
 /**
@@ -96,6 +100,14 @@ const ACTION_LABELS: Record<string, string> = {
   "workspace.automation.delete": "Cancel automation",
   "workspace.automation.update": "Update automation",
   "workspace.automation.run": "Run automation",
+  "workspace.automation.agent_initiative.create": "Create initiative",
+  "workspace.automation.agent_initiative.update": "Update initiative",
+  "workspace.automation.agent_initiative.mute": "Mute initiative",
+  "workspace.automation.agent_initiative.unmute": "Unmute initiative",
+  "workspace.automation.agent_initiative.pause": "Pause initiative",
+  "workspace.automation.agent_initiative.resume": "Resume initiative",
+  "workspace.automation.agent_initiative.delete": "Delete initiative",
+  "workspace.automation.agent_initiative.run": "Run initiative now",
   "workspace.operation.apply": "Apply workspace changes",
   "workspace.operation.draft": "Draft workspace changes",
   "workspace.operation.discard": "Discard workspace changes",
@@ -104,10 +116,22 @@ const ACTION_LABELS: Record<string, string> = {
   "email.send": "Send email",
   "external_message.send": "Send message",
   "social_post.publish": "Publish post",
+  "chrome.publication.publish": "Publish content",
   "social_post.delete": "Delete post",
   "social_post.mutate": "Update post",
   shell_modify: "Run a command",
   "cli.exec": "Run a command",
+};
+
+const TOOL_LABELS: Record<string, string> = {
+  create_agent_initiative: "Create initiative",
+  update_agent_initiative: "Update initiative",
+  mute_agent_initiative: "Mute initiative",
+  unmute_agent_initiative: "Unmute initiative",
+  pause_agent_initiative: "Pause initiative",
+  resume_agent_initiative: "Resume initiative",
+  delete_agent_initiative: "Delete initiative",
+  run_agent_initiative_now: "Run initiative now",
 };
 
 const PROMPT_REWRITES: Array<[RegExp, string]> = [
@@ -134,6 +158,9 @@ export function friendlyApprovalActionLabel(action?: string): string {
 export function friendlyApprovalToolLabel(tool?: string): string {
   const normalized = String(tool || "").trim();
   if (!normalized) return "Tool";
+  if (TOOL_LABELS[normalized]) return TOOL_LABELS[normalized];
+  const pmsAction = normalized.match(/^mcp__manor_pms__(.+)$/)?.[1];
+  if (pmsAction) return `Manor PMS · ${friendlyApprovalActionLabel(pmsAction)}`;
   const dispatchVerb = friendlyDispatchVerb(normalizeAction(normalized));
   if (dispatchVerb) return dispatchVerb.charAt(0).toUpperCase() + dispatchVerb.slice(1);
   const mcpMatch = normalized.match(/^mcp__([^_]+)__(.+)$/);
@@ -151,8 +178,8 @@ export function friendlyApprovalToolLabel(tool?: string): string {
 
 export function friendlyApprovalDescription(input: ApprovalCopyInput): string {
   // A typed payload knows what this card is about; the prompt only guesses.
-  // When one is present it wins outright — no rewrite pass runs over it, so
-  // nothing it says can be swallowed.
+  // Keep the typed explanation instead of substituting generic approval copy.
+  // Shared display formatting removes internal identifiers, not the reason.
   const structured = structuredApprovalCopy(input.payload);
   if (structured) return structured.headline;
   const prompt = cleanPrompt(input.prompt);

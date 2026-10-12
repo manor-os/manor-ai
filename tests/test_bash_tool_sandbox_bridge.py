@@ -7,7 +7,7 @@ import pytest
 
 
 @pytest.mark.asyncio
-async def test_bash_uses_sdk_sandbox_without_local_fallback(monkeypatch) -> None:
+async def test_bash_uses_sdk_sandbox_without_local_fallback(monkeypatch, tmp_path) -> None:
     from packages.core.ai.tools import bash_tool
     from packages.core.config import get_settings
 
@@ -48,8 +48,14 @@ async def test_bash_uses_sdk_sandbox_without_local_fallback(monkeypatch) -> None
     monkeypatch.setenv("SANDBOX_SERVICE_URL", "http://sandbox-service")
     monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", FakeSandboxClient)
     monkeypatch.setattr(bash_tool, "_execute_local", forbidden_local)
+    monkeypatch.setattr(settings, "MANOR_FS_ENABLED", True)
+    monkeypatch.setattr(settings, "MANOR_FS_ROOT", str(tmp_path))
+    (tmp_path / "entity_1").mkdir()
+    monkeypatch.setattr(bash_tool, "_workspace_bash_artifact_base", forbidden_local)
     try:
-        payload = json.loads(await bash_tool._bash("entity_1", command="python3 --version"))
+        payload = json.loads(await bash_tool._bash(
+            "entity_1", command="python3 --version", workspace_id="workspace1",
+        ))
     finally:
         settings.SANDBOX_SERVICE_URL = old_url
         setattr(settings, "SANDBOX_API_TOKEN", old_token)

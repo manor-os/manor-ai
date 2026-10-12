@@ -222,18 +222,27 @@ async def test_manor_lists_ready_integrations_for_current_user(client):
 
 
 @pytest.mark.asyncio
-async def test_manor_search_finds_ready_integration_action():
+async def test_manor_search_finds_ready_integrations_in_the_platform_catalog(monkeypatch):
+    from packages.core.ai.runtime import tool_registry
     from packages.core.ai.tools.manor_tool import _manor_handler
 
-    result = json.loads(
-        await _manor_handler(
-            entity_id="ent_ready_integrations",
-            action="search",
-            query="ready integrations mcp connected usable",
-        )
-    )
-    actions = {item["action"] for item in result["matches"]}
+    # manor ranks its own catalog; it no longer forwards to search_tools.
+    async def not_search_tools(**kwargs):
+        raise AssertionError("manor search is not a search_tools alias")
 
+    monkeypatch.setattr(tool_registry, "runtime_discover_tools", not_search_tools)
+    result = json.loads(await _manor_handler(
+        entity_id="ent_ready_integrations", action="search",
+        query="ready integrations mcp connected usable",
+    ))
+    assert result["mode"] == "manor"
+    assert result["matches"][0]["call"] == {"tool": "manor", "arguments": {"action": "list_ready_integrations"}}
+
+
+def test_manor_catalog_exposes_ready_integration_action():
+    from packages.core.ai.tools.manor_tool import manor_action_manifests
+
+    actions = {item["invoke_with"]["arguments"]["action"] for item in manor_action_manifests()}
     assert "list_ready_integrations" in actions
 
 
@@ -262,10 +271,10 @@ def test_manor_merge_action_params_keeps_params_explicit():
 
 
 def test_manor_tool_schema_documents_task_status_values():
-    from packages.core.ai.tools.manor_tool import _search_actions
+    from packages.core.ai.tools.manor_tool import manor_action_manifests
     from packages.core.constants.task import TASK_STATUSES
 
-    schema_text = json.dumps(_search_actions("task status", max_results=8), ensure_ascii=False)
+    schema_text = json.dumps(manor_action_manifests(), ensure_ascii=False)
 
     assert "status='pending'" in schema_text
     assert "do not pass status='todo'" in schema_text

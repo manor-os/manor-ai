@@ -4,30 +4,38 @@ On the strategist_review_v2 path each persisted proposed Task also gets a
 ``proposal_items`` row, and the cohort's approval is resolved ONCE through
 the unified approval core:
 
-* standing grant (policy auto_approve_actions) → auto-approve, items
+* a saved exact action allow rule → auto-approve, items
   ``approved`` with the work-batch execution root
 * no grant → items stay ``proposed`` behind one pending HitlRequest;
   the existing chat-card approve/reject mirrors decisions onto items and
   settles the request (grant+consume / deny)
-* legacy boolean ``strategist.auto_approve_proposals`` still auto-approves
-* flag off → zero proposal rows (legacy path untouched)
+* legacy scheduling booleans never bypass the canonical approval policy
+* flag off → the same Proposal rows and approval gates
 """
 from __future__ import annotations
 
 import asyncio
 import json
 from types import SimpleNamespace
+
+from tests.strategist_helpers import proposal_with_execution_review
+from tests.approval_settings_test_utils import (
+    action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+)
 from unittest.mock import AsyncMock
 
+import pytest
 from sqlalchemy import select
 
 from packages.core.ledger import event_types as et
 from packages.core.ledger import record_event
+from packages.core.governance.policy import PolicyDecision
 from packages.core.models.base import generate_ulid
 from packages.core.models.feature_flag import FeatureFlag
 from packages.core.models.goal import Goal
 from packages.core.models.hitl_request import HitlRequest
 from packages.core.models.proposal import ProposalItemRecord, ProposalRecord
+from packages.core.models.review_run import ReviewRun
 from packages.core.models.task import Task
 from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
@@ -95,6 +103,8 @@ async def _seed_workspace(db, *, settings: dict | None = None) -> Workspace:
         agent,
         subscription,
     ])
+    await db.flush()
+    await initialize_test_approval_owners(db, workspace, user_id=actor_id)
     await db.commit()
     return workspace
 
@@ -174,7 +184,7 @@ _TWO_TASKS = {
 
 def _fake_completion(payload: dict = _TWO_TASKS):
     async def fake(system_prompt, user_prompt, **kwargs):
-        return SimpleNamespace(content=json.dumps(payload))
+        return SimpleNamespace(content=json.dumps(proposal_with_execution_review(payload, user_prompt)))
     return fake
 
 
@@ -185,6 +195,7 @@ async def _run_v2_review(
     *,
     flag: bool = True,
     payload: dict = _TWO_TASKS,
+    automation_context: dict | None = None,
 ) -> dict:
     await _emit(db, workspace)
     await _set_flag(db, flag)
@@ -197,7 +208,12 @@ async def _run_v2_review(
         return None
     monkeypatch.setattr(strategist_service, "_post_proposal_chat", _noop_post)
     monkeypatch.setattr(ai_tasks.plan_and_run_task, "delay", lambda task_id: None)
-    return await _execute_strategist_review_cycle(db, workspace.id, "scheduled")
+    return await _execute_strategist_review_cycle(
+        db,
+        workspace.id,
+        "scheduled",
+        automation_context=automation_context,
+    )
 
 
 async def _items(db, review_id: str) -> list[ProposalItemRecord]:
@@ -219,7 +235,7 @@ async def _tasks(db, workspace: Workspace) -> dict[str, Task]:
 async def _proposal_request(db, proposal_id: str) -> HitlRequest | None:
     return (await db.execute(
         select(HitlRequest).where(
-            HitlRequest.dedup_key == f"proposal:{proposal_id}",
+            HitlRequest.dedup_key == f"operation:proposal:{proposal_id}",
         ).order_by(HitlRequest.created_at.desc()).limit(1)
     )).scalar_one_or_none()
 
@@ -377,9 +393,11 @@ async def test_public_workflow_run_proposal_uses_declared_external_risk(db_sessi
     assert items[0].payload["_proposal_authorization_binding"]["revision"] == 1
 
 
+@pytest.mark.parametrize("actor_kind", ["user", "automatic", "unavailable_user"])
 async def test_approved_workflow_run_item_dispatches_once_through_shared_launcher(
     db_session,
     monkeypatch,
+    actor_kind,
 ) -> None:
     from unittest.mock import AsyncMock
 
@@ -388,6 +406,7 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
     from packages.core.proposals.service import create_workflow_run_items
     from packages.core.services.auth_service import hash_password
     from packages.core.services.proposal_workflow_runs import (
+        ProposalWorkflowRunError,
         ProposalWorkflowRunConflict,
         dispatch_workflow_run_item,
     )
@@ -396,7 +415,7 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
     workspace = await _seed_workspace(db_session)
     user = User(
         entity_id=workspace.entity_id,
-        email="proposal-flow-owner@test.com",
+        email=f"proposal-flow-owner-{actor_kind}@test.com",
         display_name="Proposal Flow Owner",
         password_hash=hash_password("pass123"),
         role="owner",
@@ -508,15 +527,25 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
         enqueue,
     )
 
+    actor_id = user.id if actor_kind == "user" else None
+    if actor_kind == "unavailable_user":
+        with pytest.raises(ProposalWorkflowRunError, match="requesting user"):
+            await dispatch_workflow_run_item(
+                db_session, item_id=item.id, actor_id="missing-actor",
+            )
+        launch.assert_not_awaited()
+        enqueue.assert_not_awaited()
+        return
+
     first = await dispatch_workflow_run_item(
         db_session,
         item_id=item.id,
-        actor_id=user.id,
+        actor_id=actor_id,
     )
     second = await dispatch_workflow_run_item(
         db_session,
         item_id=item.id,
-        actor_id=user.id,
+        actor_id=actor_id,
     )
 
     assert first.id == launched_run.id
@@ -524,6 +553,8 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
     assert launch.await_count == 1
     assert launch.await_args.kwargs["starter_policy"] == "only_missing"
     assert launch.await_args.kwargs["transaction_owner"] == "caller"
+    assert launch.await_args.kwargs["source"] == "proposal"
+    assert launch.await_args.kwargs["user_requested"] is (actor_kind == "user")
     assert launch.await_args.kwargs["proposal_context"]["proposal_item_id"] == item.id
     await db_session.refresh(item)
     assert item.status == "executing"
@@ -549,8 +580,6 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
     duplicate.status = "approved"
     await db_session.flush()
 
-    import pytest
-
     with pytest.raises(ProposalWorkflowRunConflict) as exc_info:
         await dispatch_workflow_run_item(
             db_session,
@@ -559,6 +588,78 @@ async def test_approved_workflow_run_item_dispatches_once_through_shared_launche
         )
     assert exc_info.value.run_id == launched_run.id
     assert launch.await_count == 1
+
+
+@pytest.mark.parametrize("lifecycle_change", ["pause", "delete"])
+async def test_proposal_rechecks_lifecycle_after_workflow_dispatch_commit(
+    db_session, monkeypatch, lifecycle_change,
+) -> None:
+    from datetime import datetime, timezone
+    from sqlalchemy import update
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from packages.core.services.runtime_authorization import PermissionDecision
+    from packages.core.strategist.proposal import ProposedWorkflowRun
+
+    workspace = await _seed_workspace(db_session)
+    record = ProposalRecord(
+        entity_id=workspace.entity_id, workspace_id=workspace.id,
+        review_id=generate_ulid(), summary="Two approved Flow candidates", status="open",
+    )
+    db_session.add(record)
+    await db_session.commit()
+    proposed = [ProposedWorkflowRun.model_validate({
+        "run_key": key,
+        "workflow_ref": {"blueprint_slug": "test-blueprint", "workflow_slug": key},
+        "inputs": {}, "source_brief": f"Run {key}.", "rationale": "Requested work.",
+    }) for key in ("first", "second")]
+    monkeypatch.setattr(
+        "packages.core.services.proposal_workflow_runs.resolve_proposal_workflow_binding",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        strategist_service, "_strategist_permission_decision",
+        AsyncMock(return_value=PermissionDecision.allow()),
+    )
+    monkeypatch.setattr(
+        "packages.core.governance.approvals._policy_decision",
+        AsyncMock(return_value=PolicyDecision(
+            allowed=True, pause_for_hitl=False, matched_rule="standing grant",
+            reason="Workspace standing consent",
+        )),
+    )
+    async def first_dispatch_commits_then_workspace_changes(db, **_kwargs):
+        workspace_id = workspace.id
+        await db.commit()
+        # A separate transaction changes lifecycle while the review retains
+        # its old ORM Workspace snapshot after the committed child handoff.
+        async with AsyncSession(db.bind, expire_on_commit=False) as concurrent:
+            changes = {"status": "paused"}
+            if lifecycle_change == "delete":
+                changes["deleted_at"] = datetime.now(timezone.utc)
+            await concurrent.execute(update(Workspace).where(
+                Workspace.id == workspace_id,
+            ).values(**changes))
+            await concurrent.commit()
+        return SimpleNamespace(id="first-dispatched-flow")
+
+    dispatch = AsyncMock(side_effect=first_dispatch_commits_then_workspace_changes)
+    monkeypatch.setattr(
+        "packages.core.services.proposal_workflow_runs.dispatch_workflow_run_item",
+        dispatch,
+    )
+    execute = strategist_service._execute_workflow_run_items(
+        db_session, workspace=workspace, record=record, review_id=record.review_id,
+        proposal=SimpleNamespace(workflow_runs=proposed),
+    )
+    if lifecycle_change == "delete":
+        with pytest.raises(strategist_service.StrategistError, match="unavailable"):
+            await execute
+    else:
+        digests = await execute
+        assert [digest["outcome"] for digest in digests] == ["allow", "needs_human"]
+        assert digests[1]["approval_request_id"]
+    dispatch.assert_awaited_once()
 
 
 async def test_workflow_run_item_lifecycle_tracks_retry_lineage(db_session) -> None:
@@ -1034,7 +1135,9 @@ async def test_legacy_auto_approve_does_not_start_external_proposal_task(
         payload=external_payload,
     )
 
-    assert "approval_outcome" not in result
+    assert result["approval_outcome"] == "needs_human"
+    request = await _proposal_request(db_session, result["proposal_id"])
+    assert request is not None and request.status == "pending"
     assert result["auto_approved"] is False
     tasks = await _tasks(db_session, workspace)
     assert {task.status for task in tasks.values()} == {"proposed"}
@@ -1043,11 +1146,11 @@ async def test_legacy_auto_approve_does_not_start_external_proposal_task(
     ].details
 
 
-async def test_legacy_user_approval_mints_review_bound_external_scope(
+async def test_user_approval_mints_durable_review_bound_external_scope(
     db_session,
 ):
     workspace = await _seed_workspace(db_session)
-    review_id = "rv_legacy_external_user_approval"
+    review_id = "rv_durable_external_user_approval"
     render_task = Task(
         id=generate_ulid(),
         entity_id=workspace.entity_id,
@@ -1089,6 +1192,9 @@ async def test_legacy_user_approval_mints_review_bound_external_scope(
     db_session.add_all([render_task, publish_task])
     await db_session.commit()
 
+    from tests.approval_settings_test_utils import initialize_test_task_proposal
+
+    await initialize_test_task_proposal(db_session, workspace, review_id=review_id)
     actor_id = workspace.entity_id
     moved = await strategist_service.approve_proposal(
         db_session,
@@ -1102,8 +1208,8 @@ async def test_legacy_user_approval_mints_review_bound_external_scope(
     await db_session.refresh(publish_task)
     authorization = publish_task.details["proposal_external_authorization"]
     assert authorization["review_id"] == review_id
-    assert authorization["proposal_id"] == f"legacy:{review_id}"
-    assert authorization["proposal_item_id"] == f"legacy:{publish_task.id}"
+    assert authorization["proposal_id"] == publish_task.details["strategist_proposal_id"]
+    assert authorization["proposal_item_id"] == publish_task.details["strategist_proposal_item_id"]
     assert authorization["task_id"] == publish_task.id
     assert authorization["predecessor_task_id"] == render_task.id
     assert authorization["approved_by"] == actor_id
@@ -1112,15 +1218,13 @@ async def test_legacy_user_approval_mints_review_bound_external_scope(
 # ── standing grant → auto-approve ─────────────────────────────────────
 
 async def test_standing_grant_auto_approves_cohort(db_session, monkeypatch):
-    from packages.core.governance.service import add_auto_approve_action
-
     workspace = await _seed_workspace(db_session)
-    await add_auto_approve_action(
+    await set_workspace_test_approval(
         db_session,
         entity_id=workspace.entity_id,
         workspace_id=workspace.id,
-        action_key="workspace.proposal.task",
-        changed_by="operator",
+        actor_id=workspace.entity_id,
+        user_rules=[action_rule("workspace.proposal.task")],
     )
     await db_session.commit()
 
@@ -1245,31 +1349,198 @@ async def test_reject_records_reason_and_denies_request(db_session, monkeypatch)
     assert {t.status for t in tasks.values()} == {"cancelled"}
 
 
-# ── legacy boolean auto-approve still works on v2 ─────────────────────
+# ── a legacy boolean never overrides canonical approval policy ──────
 
-async def test_legacy_boolean_auto_approve_still_works_on_v2(db_session, monkeypatch):
+@pytest.mark.parametrize("flag", [False, True])
+async def test_legacy_boolean_does_not_bypass_proposal_approval(db_session, monkeypatch, flag):
     workspace = await _seed_workspace(
         db_session,
         settings={"strategist": {"auto_approve_proposals": True}},
     )
-    result = await _run_v2_review(db_session, monkeypatch, workspace)
+    result = await _run_v2_review(db_session, monkeypatch, workspace, flag=flag)
 
-    # No standing grant → the resolver wants a human, but the legacy
-    # workspace boolean still auto-approves for compat...
+    # Scheduling/configuration residue is not an operator standing grant.
     assert result["approval_outcome"] == "needs_human"
-    assert result["auto_approved"] is True
+    assert result["auto_approved"] is False
 
     items = await _items(db_session, result["review_id"])
-    assert {i.status for i in items} == {"approved"}
+    assert {i.status for i in items} == {"proposed"}
 
-    # ...and the minted request is settled, not orphaned.
+    # One durable, actionable cohort request remains pending.
     req = await _proposal_request(db_session, result["proposal_id"])
     assert req is not None
-    assert req.status == "consumed"
+    assert req.status == "pending"
 
     tasks = await _tasks(db_session, workspace)
-    assert tasks["draft_docs"].status == "in_progress"
-    assert tasks["publish_docs"].status == "pending"
+    assert {task.status for task in tasks.values()} == {"proposed"}
+
+
+@pytest.mark.parametrize("allow_action", [False, True])
+async def test_automation_proposal_needs_saved_action_rule_with_valid_run_context(
+    db_session,
+    monkeypatch,
+    allow_action,
+):
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+
+    workspace = await _seed_workspace(
+        db_session,
+        settings={},
+    )
+    if allow_action:
+        await set_workspace_test_approval(db_session, entity_id=workspace.entity_id,
+            workspace_id=workspace.id, actor_id=workspace.entity_id,
+            user_rules=[action_rule("workspace.proposal.task")])
+    job = ScheduledJob(
+        job_id=f"strategist-{workspace.id}",
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        execution_type="strategist_review",
+        enabled=True,
+    )
+    run = ScheduledJobRun(
+        job_id=job.job_id,
+        status="running",
+        trigger_type="cron",
+    )
+    db_session.add_all([job, run])
+    await db_session.commit()
+
+    result = await _run_v2_review(
+        db_session,
+        monkeypatch,
+        workspace,
+        automation_context={
+            "scheduled_job_id": job.job_id,
+            "scheduled_run_id": run.id,
+        },
+    )
+
+    assert result["approval_outcome"] == ("allow" if allow_action else "needs_human")
+    assert result["auto_approved"] is allow_action
+    tasks = await _tasks(db_session, workspace)
+    assert tasks["draft_docs"].status == ("in_progress" if allow_action else "proposed")
+    assert tasks["draft_docs"].details["automation_origin"] == {
+        "scheduled_job_id": job.job_id,
+        "scheduled_run_id": run.id,
+    }
+
+
+async def test_automation_proposal_external_task_gets_bound_authorization(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+    from packages.core.proposals.constants import EXTERNAL_TASK_ACTION_KEY, TASK_ACTION_KEY
+
+    workspace = await _seed_workspace(db_session, settings={})
+    await set_workspace_test_approval(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        actor_id=workspace.entity_id,
+        # System approval must cover both the render task and the external task.
+        user_rules=[action_rule(TASK_ACTION_KEY), action_rule(EXTERNAL_TASK_ACTION_KEY)],
+    )
+    job = ScheduledJob(
+        job_id=f"strategist-{workspace.id}",
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        execution_type="strategist_review",
+        enabled=True,
+    )
+    run = ScheduledJobRun(
+        job_id=job.job_id,
+        status="running",
+        trigger_type="cron",
+    )
+    db_session.add_all([job, run])
+    await db_session.commit()
+
+    result = await _run_v2_review(
+        db_session,
+        monkeypatch,
+        workspace,
+        automation_context={
+            "scheduled_job_id": job.job_id,
+            "scheduled_run_id": run.id,
+        },
+        payload={
+            "summary": "Render and publish one video.",
+            "tasks": [
+                {
+                    "task_key": "render_video",
+                    "title": "Render video",
+                    "owner_service_key": "ops",
+                    "deliverables": [{
+                        "name": "verified_mp4",
+                        "kind": "file",
+                        "shape": "ArtifactResult",
+                        "acceptance": "A verified MP4 exists.",
+                        "usage": "Input to publishing.",
+                    }],
+                },
+                {
+                    "task_key": "publish_youtube_public",
+                    "title": "Publish video to YouTube",
+                    "owner_service_key": "ops",
+                    "depends_on_task_keys": ["render_video"],
+                    "required_capabilities": ["skill.invoke", "external.social"],
+                    "external_action": {
+                        "provider": "youtube",
+                        "action": "publish_video",
+                        "destination": "studio.youtube.com",
+                        "visibility": "public",
+                        "intended_channel": "paired_chrome_signed_in_channel",
+                        "predecessor_task_key": "render_video",
+                    },
+                    "deliverables": [{
+                        "name": "publication_receipt",
+                        "kind": "value",
+                        "shape": "PublishResult",
+                        "acceptance": "A public URL and receipt exist.",
+                        "usage": "Input to daily metrics.",
+                    }],
+                },
+            ],
+        },
+    )
+
+    assert result["approval_outcome"] == "allow"
+    tasks = await _tasks(db_session, workspace)
+    publication = tasks["publish_youtube_public"]
+    authorization = publication.details["proposal_external_authorization"]
+    assert authorization["task_id"] == publication.id
+    assert authorization["review_id"] == result["review_id"]
+    assert authorization["approved_by_kind"] == "system"
+    assert authorization["consumed_at"] is None
+
+
+@pytest.mark.parametrize("automation_context", [None, {
+    "scheduled_job_id": "missing-job", "scheduled_run_id": "missing-run",
+}])
+async def test_saved_rule_does_not_make_unverified_automation_origin_trusted(
+    db_session,
+    monkeypatch,
+    automation_context,
+):
+    workspace = await _seed_workspace(db_session)
+    await set_workspace_test_approval(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        actor_id=workspace.entity_id,
+        user_rules=[action_rule("workspace.proposal.task")],
+    )
+    await db_session.commit()
+
+    result = await _run_v2_review(db_session, monkeypatch, workspace,
+        automation_context=automation_context)
+
+    assert result["approval_outcome"] == "allow"
+    assert result["auto_approved"] is True
+    tasks = await _tasks(db_session, workspace)
+    assert all("automation_origin" not in task.details for task in tasks.values())
 
 
 # ── reason_code vocabulary is enforced ────────────────────────────────
@@ -1294,31 +1565,38 @@ async def test_decide_items_rejects_unknown_reason_code(db_session):
         )
 
 
-# ── flag off → legacy path untouched ──────────────────────────────────
+# ── flag off → identical authorization and durable approval ─────────
 
-async def test_flag_off_creates_no_proposal_rows(db_session, monkeypatch):
+async def test_flag_off_creates_governed_proposal_rows(db_session, monkeypatch):
     workspace = await _seed_workspace(db_session)
     result = await _run_v2_review(db_session, monkeypatch, workspace, flag=False)
 
     assert not result.get("skipped")
     assert result["task_count"] == 2
-    assert result["review_id"].startswith("rv_")
-    assert "approval_outcome" not in result
-    assert "proposal_id" not in result
+    assert result["approval_outcome"] == "needs_human"
+    assert result["proposal_id"]
+
+    review = await db_session.get(ReviewRun, result["review_id"])
+    assert review is not None
+    assert review.workspace_id == workspace.id
+    assert review.status == "succeeded"
 
     records = list((await db_session.execute(
         select(ProposalRecord).where(ProposalRecord.workspace_id == workspace.id)
     )).scalars().all())
-    assert records == []
+    assert len(records) == 1
+    assert records[0].id == result["proposal_id"]
     item_rows = list((await db_session.execute(
         select(ProposalItemRecord).where(ProposalItemRecord.workspace_id == workspace.id)
     )).scalars().all())
-    assert item_rows == []
+    assert len(item_rows) == 2
+    assert {item.status for item in item_rows} == {"proposed"}
 
     reqs = list((await db_session.execute(
         select(HitlRequest).where(HitlRequest.workspace_id == workspace.id)
     )).scalars().all())
-    assert reqs == []
+    assert len(reqs) == 1
+    assert reqs[0].status == "pending"
 
     tasks = await _tasks(db_session, workspace)
     assert {t.status for t in tasks.values()} == {"proposed"}

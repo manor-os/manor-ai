@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.celery_app import celery_app
 from packages.core.models.document import Document, VectorStatus
+from packages.core.models.user import Entity
 from packages.core.services.embedding_service import EMBEDDING_PROCESSING_STALE_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,6 @@ async def recover_stale_embedding_documents(
     processing_stale_before = checked_at - timedelta(seconds=max(1, processing_stale_seconds))
     pending_stale_before = checked_at - timedelta(seconds=max(1, pending_stale_seconds))
     pending_age = func.coalesce(Document.updated_at, Document.created_at)
-    blocked_reason = Document.metadata_["indexing"]["blocked_reason"].astext
     heartbeat_epoch = Document.metadata_["indexing"]["heartbeat_epoch"]
     heartbeat_at = case(
         (
@@ -67,9 +67,12 @@ async def recover_stale_embedding_documents(
 
     stale_result = await db.execute(
         select(Document)
+        .join(Entity, Entity.id == Document.entity_id)
         .where(
             Document.vector_status == VectorStatus.PROCESSING,
             Document.is_trashed.is_(False),
+            Document.quarantine_status == "clean",
+            Entity.deleted_at.is_(None),
             processing_age < processing_stale_before,
         )
         .order_by(processing_age.asc())
@@ -130,11 +133,12 @@ async def recover_stale_embedding_documents(
     if remaining:
         pending_result = await db.execute(
             select(Document)
+            .join(Entity, Entity.id == Document.entity_id)
             .where(
                 Document.vector_status == VectorStatus.PENDING,
                 Document.is_trashed.is_(False),
-                func.coalesce(blocked_reason, "")
-                != _WORKSPACE_DELETED_BLOCK_REASON,
+                Document.quarantine_status == "clean",
+                Entity.deleted_at.is_(None),
                 pending_age < pending_stale_before,
                 Document.id.not_in(requeued) if requeued else True,
             )
@@ -156,6 +160,9 @@ async def recover_stale_embedding_documents(
             indexing.pop("run_id", None)
             indexing.pop("heartbeat_at", None)
             indexing.pop("heartbeat_epoch", None)
+            if indexing.get("blocked_reason") == _WORKSPACE_DELETED_BLOCK_REASON:
+                indexing.pop("blocked_reason", None)
+                indexing.pop("blocked_at", None)
             metadata["indexing"] = indexing
             doc.metadata_ = metadata
             requeued.append(doc.id)

@@ -12,6 +12,30 @@
 
 FROM node:22-bookworm-slim AS node-runtime
 
+# Dependency manifests of every Skill shipped in this repository, keyed by the
+# sha256 of the manifest bytes (first 16 hex chars). The sandbox service hashes
+# a Skill's requirements.txt / package.json the same way and skips the
+# create-time install when the image already holds that exact manifest, so a
+# shipped Skill never installs into the memory-backed tmpfs of a running
+# sandbox. Only the collected manifests reach the final stage, so editing a
+# Skill's text does not invalidate the dependency layers below.
+FROM python:3.12-slim-bookworm AS skill-manifests
+COPY packages/core/ai/ /src/ai/
+RUN set -eu; \
+    mkdir -p /out/python /out/node; \
+    for manifest in /src/ai/*/*/requirements.txt; do \
+      [ -f "$manifest" ] || continue; \
+      digest="$(sha256sum "$manifest" | cut -c1-16)"; \
+      cp "$manifest" "/out/python/${digest}.txt"; \
+    done; \
+    for manifest in /src/ai/*/*/package.json; do \
+      [ -f "$manifest" ] || continue; \
+      digest="$(sha256sum "$manifest" | cut -c1-16)"; \
+      mkdir -p "/out/node/${digest}"; \
+      cp "$manifest" "/out/node/${digest}/package.json"; \
+    done; \
+    ls -R /out
+
 FROM python:3.12-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -34,12 +58,18 @@ RUN apt-get update \
     chromium \
     curl \
     ffmpeg \
+    gcc \
     git \
     jq \
+    libreoffice-calc \
     libreoffice-impress \
+    libreoffice-writer \
     librsvg2-bin \
+    pandoc \
     poppler-utils \
+    qpdf \
     ripgrep \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/* \
     && chromium --version
 
@@ -74,6 +104,26 @@ RUN apt-get update \
 
 COPY docker/fontconfig/70-manor-office-fonts.conf /etc/fonts/conf.d/70-manor-office-fonts.conf
 RUN fc-cache -f
+
+# Shipped Skills' dependencies, installed once into the image (see the
+# skill-manifests stage). Python packages share the system site-packages and
+# must resolve together; each distinct package.json gets its own read-only
+# node_modules that the sandbox service links into the Skill workdir.
+COPY --from=skill-manifests /out /opt/manor/skill-deps
+RUN set -eu; \
+    requirements=""; \
+    for manifest in /opt/manor/skill-deps/python/*.txt; do \
+      [ -f "$manifest" ] && requirements="$requirements -r $manifest"; \
+    done; \
+    if [ -n "$requirements" ]; then pip install --no-cache-dir $requirements; fi; \
+    pip check
+RUN set -eu; \
+    for project in /opt/manor/skill-deps/node/*/; do \
+      [ -f "${project}package.json" ] || continue; \
+      (cd "$project" && npm install --no-fund --no-audit --omit=dev); \
+    done; \
+    npm cache clean --force; \
+    rm -rf /root/.npm
 
 USER sandbox
 WORKDIR /skill

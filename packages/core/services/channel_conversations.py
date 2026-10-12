@@ -6,6 +6,7 @@ from typing import Optional
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.ai.runtime.output_policy import runtime_visitor_assistant_message_content
 from packages.core.constants.agents import is_master_agent
 from packages.core.models.task import Conversation, Message
 from packages.core.services.reusable_resource_locks import (
@@ -136,11 +137,18 @@ async def load_recent_channel_messages(
     conversation_id: str,
     *,
     limit: int = CHANNEL_HISTORY_LIMIT,
+    exclude_message_id: str | None = None,
 ) -> list[dict]:
-    """Return recent channel turns as plain chat-completion messages."""
+    """Return recent channel turns as plain chat-completion messages.
+
+    ``exclude_message_id`` is the inbound turn being answered: the agent loop
+    appends it as the current user message, so it must not also be history.
+    """
+    query = select(Message).where(Message.conversation_id == conversation_id)
+    if exclude_message_id:
+        query = query.where(Message.id != exclude_message_id)
     rows = (await db.execute(
-        select(Message)
-        .where(Message.conversation_id == conversation_id)
+        query
         .order_by(desc(Message.created_at))
         .limit(limit)
     )).scalars().all()
@@ -197,9 +205,16 @@ async def list_public_webchat_messages(
         {
             "id": message.id,
             "role": message.role,
-            "content": message.content,
+            "content": (
+                runtime_visitor_assistant_message_content(message.content, message.meta, message.tool_calls)
+                if message.role == "assistant" else message.content
+            ),
             "created_at": message.created_at.isoformat() if message.created_at else None,
-            "stream_status": (message.meta or {}).get("stream_status"),
+            "stream_status": (
+                "error"
+                if message.role == "assistant" and (message.meta or {}).get("stop_reason") == "error"
+                else (message.meta or {}).get("stream_status")
+            ),
             "client_turn_id": (message.meta or {}).get("client_turn_id"),
             "attachments": (
                 (message.attachments or {}).get("items")
@@ -221,6 +236,7 @@ async def add_channel_inbound_message(
     chat_id: Optional[str],
     content: str,
     attachments: list[dict] | None = None,
+    meta: dict | None = None,
 ) -> Message:
     """Persist an inbound channel turn in the conversation transcript."""
     message = Message(
@@ -233,6 +249,7 @@ async def add_channel_inbound_message(
             "sender_id": sender_id,
             "sender_name": sender_name,
             "chat_id": chat_id,
+            **dict(meta or {}),
         },
     )
     db.add(message)
@@ -253,6 +270,11 @@ async def add_channel_assistant_message(
     author_subscription_id: str | None = None,
 ) -> Message:
     """Persist an assistant/system channel transcript row."""
+    from packages.core.services.webchat_resident import authorize_private_persistence
+
+    # Keep the resident generation fence locked until the caller commits the
+    # assistant message and its outbound log in this same transaction.
+    await authorize_private_persistence(db, conversation_id)
     meta = {
         "channel_type": channel_type,
         "chat_id": chat_id,

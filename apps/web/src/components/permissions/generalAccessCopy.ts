@@ -16,8 +16,7 @@
  *   1. internal — who inside the organization can access (from visibility)
  *   2. link     — the state of link sharing (from the share mode)
  *
- * Kept DOM-free so it can be unit-tested via
- * apps/web/scripts/share-dialog-general-access.test.mjs.
+ * Kept DOM-free so the copy-selection contract can be tested independently.
  */
 import type { Visibility } from "../../lib/types";
 

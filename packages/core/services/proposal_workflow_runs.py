@@ -87,8 +87,8 @@ async def _dispatch_user(
 ) -> User:
     from packages.core.services.workspace_access import user_can_write_workspace_artifacts
 
-    candidate_ids = [
-        str(actor_id or "").strip(),
+    explicit_actor_id = str(actor_id or "").strip()
+    candidate_ids = [explicit_actor_id] if explicit_actor_id else [
         str((workspace.settings or {}).get("created_by_user_id") or "").strip(),
     ]
     for user_id in dict.fromkeys(value for value in candidate_ids if value):
@@ -96,6 +96,8 @@ async def _dispatch_user(
         if (
             user is not None
             and user.entity_id == workspace.entity_id
+            and user.status == "active"
+            and user.deleted_at is None
             and await user_can_write_workspace_artifacts(
                 db,
                 workspace_id=workspace.id,
@@ -104,6 +106,8 @@ async def _dispatch_user(
             )
         ):
             return user
+    if explicit_actor_id:
+        raise ProposalWorkflowRunError("The requesting user cannot dispatch this Flow")
     user = (await db.execute(
         select(User)
         .where(
@@ -275,6 +279,7 @@ async def dispatch_workflow_run_item(
             "run_key": payload.get("run_key"),
         },
         transaction_owner="caller",
+        user_requested=bool(str(actor_id or "").strip()),
     )
     run = launched.run
     if declaration is not None:
@@ -362,12 +367,11 @@ async def sync_proposal_workflow_run_item(
         return item
 
     business_outcome, retry_state = _workflow_business_state(run)
-    retry_from_step_id = str(
-        retry_state.get("retry_from_step_id")
-        or run.effective_retry_from_step_id
-        or run.current_step_id
-        or ""
-    ).strip()
+    from packages.core.services.workflow_chat_projection import (
+        workflow_retry_from_step_id as projected_retry_from_step_id,
+    )
+
+    retry_from_step_id = projected_retry_from_step_id(run, retry_state)
     actionable_completed = (
         run.status == WorkflowRunStatus.COMPLETED
         and business_outcome in {"needs_input", "revision_required"}

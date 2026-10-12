@@ -43,8 +43,14 @@ async def test_leasing_sandbox_demo_seeds_full_workspace_runtime(
     ids = create.json()
     workspace_id = ids["workspace_id"]
 
+    approval = await client.get(f"/api/v1/approval-settings/workspaces/{workspace_id}", headers=headers)
+    assert approval.status_code == 200, approval.text
+    assert approval.json()["policy"] == {"mode": None, "rules": []}
+    assert approval.json()["inherited_mode"] == "risk_based"
+
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == workspace_id))).scalar_one()
     entity_id = workspace.entity_id
+    creator_id = workspace.settings["created_by_user_id"]
     assert workspace.kind == "leasing"
     assert workspace.settings["sandbox"] is True
     assert workspace.name == "Leasing Consultant — Workspace Simulation"
@@ -131,8 +137,11 @@ async def test_leasing_sandbox_demo_seeds_full_workspace_runtime(
     )
     assert {cfg.channel_type for cfg in channel_configs} >= {"webchat", "internal_chat"}
     assert any((cfg.config or {}).get("public_token") for cfg in channel_configs)
+    webchat = next(cfg for cfg in channel_configs if cfg.channel_type == "webchat")
+    assert webchat.owner_user_id == creator_id
 
     bindings = (await db_session.execute(select(Channel).where(Channel.workspace_id == workspace_id))).scalars().all()
+    assert next(binding for binding in bindings if binding.type == "webchat").user_id == webchat.owner_user_id
     assert {binding.type for binding in bindings} >= {"webchat", "internal_chat"}
     assert all(binding.agent_subscription_id for binding in bindings)
 
@@ -339,6 +348,11 @@ async def test_social_sandbox_demo_seeds_visible_approval_card(
     workspace_id = create.json()["workspace_id"]
     task_id = create.json()["task_id"]
 
+    approval = await client.get(f"/api/v1/approval-settings/workspaces/{workspace_id}", headers=headers)
+    assert approval.status_code == 200, approval.text
+    assert approval.json()["policy"] == {"mode": None, "rules": []}
+    assert approval.json()["inherited_mode"] == "risk_based"
+
     channel_config = (
         await db_session.execute(select(ChannelConfig).where(ChannelConfig.workspace_id == workspace_id))
     ).scalar_one()
@@ -455,7 +469,12 @@ async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, mo
 
     from sqlalchemy import select
 
-    from packages.core.governance import WorkspacePolicy, check_step_policy, update_policy
+    from dataclasses import replace
+    from packages.core.governance import check_step_policy, get_policy, update_policy
+    from packages.core.models.user import User, UserMembership
+    from tests.approval_settings_test_utils import (
+        action_rule, initialize_test_approval_owners, set_workspace_test_approval,
+    )
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import (
         Document,
@@ -530,17 +549,25 @@ async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, mo
         settings={"demo": "solo_founder_content_engine"},
     )
     db_session.add(workspace)
-
+    actor_id = generate_ulid()
+    db_session.add_all([User(id=actor_id, entity_id=entity_id,
+        email=f"{actor_id}@example.test", password_hash="test-only", role="owner"),
+        UserMembership(user_id=actor_id, entity_id=entity_id, role="owner",
+            status="active", is_primary=True)])
+    await db_session.flush()
+    await initialize_test_approval_owners(db_session, workspace, user_id=actor_id)
+    await set_workspace_test_approval(db_session, workspace_id=workspace_id,
+        entity_id=entity_id, actor_id=actor_id,
+        user_rules=[action_rule(key, effect="ask") for key in
+            ("social_post.publish", "external_message.send")] +
+            [action_rule(key) for key in ("generate_file", "workspace_search", "analytics.report")])
+    current = await get_policy(db_session, workspace_id)
     await update_policy(
         db_session,
         entity_id=entity_id,
         workspace_id=workspace_id,
-        policy=WorkspacePolicy(
-            hitl_required_actions=["social_post.publish", "external_message.send"],
-            auto_approve_actions=["generate_file", "workspace_search", "analytics.report"],
-            budget_caps_per_kind={"action": 1200},
-        ),
-        changed_by="demo-test",
+        policy=replace(current, budget_caps_per_kind={"action": 1200}),
+        changed_by=actor_id,
         change_summary="Founder must approve public publishing.",
     )
 
@@ -809,7 +836,7 @@ async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, mo
     )
     assert publish_decision.allowed is False
     assert publish_decision.pause_for_hitl is True
-    assert publish_decision.matched_rule == "social_post.publish"
+    assert publish_decision.matched_rule == "founder_review_before_publish"
 
     draft_decision = await check_step_policy(
         db_session,
@@ -913,6 +940,7 @@ async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, mo
             assert calls[0]["kwargs"]["kwargs"] == {
                 "trigger_kind": "event",
                 "trigger_detail": f"work batch completed: {batch_id}",
+                "user_id": None,
             }
 
     artifact_search = await chat_context.workspace_search(
@@ -956,7 +984,8 @@ async def test_solo_founder_content_engine_can_finish_a_work_wave(db_session, mo
         query="publish",
     )
     assert "Public X/LinkedIn posts must be approved" in rules_search
-    assert "Approval required: social_post.publish, external_message.send" in rules_search
+    assert "ask: social_post.publish" in rules_search
+    assert "ask: external_message.send" in rules_search
 
     runtime_search = await chat_context.workspace_search(
         db_session,

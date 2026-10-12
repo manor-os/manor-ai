@@ -363,6 +363,21 @@ function _formatMs(ms: number): string {
   return `${m}m ${(s - m * 60).toFixed(0)}s`;
 }
 
+function _hasCompletedDraftTurn(
+  messages: WorkspaceDraftMessage[],
+  userMessage: string,
+): boolean {
+  if (messages.length < 2) return false;
+  const assistant = messages[messages.length - 1];
+  const user = messages[messages.length - 2];
+  return (
+    user.role === "user" &&
+    user.content.trim() === userMessage.trim() &&
+    assistant.role === "assistant" &&
+    assistant.content.trim().length > 0
+  );
+}
+
 const DRAFT_ID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 function createClientDraftId(): string {
@@ -379,11 +394,12 @@ function createClientDraftId(): string {
 
 /* ── Page ──────────────────────────────────────────────────────────── */
 
-export default function WorkspaceDraftChat() {
+export default function WorkspaceDraftChat({ embeddedInChat = false }: { embeddedInChat?: boolean }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const exitPath = embeddedInChat ? "/chat" : "/workspaces";
 
   const draftIdParam = searchParams.get("draft");
   const resumingOpening = searchParams.get("opening") === "1" && !!draftIdParam;
@@ -489,7 +505,7 @@ export default function WorkspaceDraftChat() {
 
   /* ── Mutations ── */
   const createMutation = useMutation({
-    mutationFn: async (initial_brief?: string) => {
+    mutationFn: async ({ initial_brief, document_ids }: { initial_brief?: string; document_ids?: string[] } = {}) => {
       setStartError(null);
       setStreaming(true);
       liveEventsRef.current = [];
@@ -507,6 +523,7 @@ export default function WorkspaceDraftChat() {
         return await api.workspaceDrafts.createStream(
           {
             ...(initial_brief ? { initial_brief } : {}),
+            ...(document_ids && document_ids.length ? { document_ids } : {}),
             draft_id: requestedDraftId,
           },
           {
@@ -533,7 +550,8 @@ export default function WorkspaceDraftChat() {
       setStartError(null);
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
-      setSearchParams({ draft: turn.draft.id }, { replace: true });
+      const readyParams = embeddedInChat ? new URLSearchParams({ new: "workspace", draft: turn.draft.id }) : new URLSearchParams({ draft: turn.draft.id });
+      setSearchParams(readyParams, { replace: true });
       setDraftId(turn.draft.id);
       openingDraftIdRef.current = null;
     },
@@ -561,26 +579,33 @@ export default function WorkspaceDraftChat() {
       // mutation; otherwise its observer can remain stuck in pending state.
       const startTimer = window.setTimeout(() => {
         startedRef.current = true;
-        createMutation.mutate(initialBriefParam || undefined);
+        createMutation.mutate({ initial_brief: initialBriefParam || undefined });
       }, 0);
       return () => window.clearTimeout(startTimer);
     }
   }, [draftId, initialBriefParam, createMutation.mutate, createMutation.isPending]);
 
   const sendMutation = useMutation({
-    mutationFn: async ({ id, message }: { id: string; message: string }) => {
+    mutationFn: async ({
+      id,
+      message,
+      document_ids,
+      displayText,
+    }: { id: string; message: string; document_ids?: string[]; displayText?: string }) => {
       setStreaming(true);
       liveEventsRef.current = [];
       setLiveEvents([]);
       setMessages((prev) => [
         ...prev,
-        { role: "user", content: message },
+        { role: "user", content: displayText ?? message },
         { role: "assistant", content: "" },
       ]);
       try {
-        return await api.workspaceDrafts.sendMessageStream(id, message, {
-          onToken: appendToken, onReset: resetStreamBuffer, onToolStart, onToolEnd, onTurnMeta,
-        });
+        return await api.workspaceDrafts.sendMessageStream(
+          id,
+          { message, ...(document_ids && document_ids.length ? { document_ids } : {}) },
+          { onToken: appendToken, onReset: resetStreamBuffer, onToolStart, onToolEnd, onTurnMeta },
+        );
       } finally {
         setStreaming(false);
       }
@@ -589,9 +614,23 @@ export default function WorkspaceDraftChat() {
       flushLiveEventsToLastAssistant();
       setDraft(turn.draft);
     },
-    onError: (err: Error) => {
+    onError: (err: Error, { id, message }) => {
       toast.error(t("page.workspace_draft_chat.send_failed"), err.message);
       setMessages((prev) => prev.slice(0, -2));
+      // The server did not acknowledge this turn with ``done``. Put the
+      // exact text back in the composer so a transport failure cannot make
+      // the user's input disappear, then reconcile any state that committed
+      // before the connection ended.
+      setInput((current) => current.trim() ? current : message);
+      void api.workspaceDrafts.get(id).then((freshDraft) => {
+        setDraft(freshDraft);
+        if (_hasCompletedDraftTurn(freshDraft.messages, message)) {
+          setMessages(freshDraft.messages.map((entry) => ({ ...entry })));
+          setInput((current) => current === message ? "" : current);
+        }
+      }).catch(() => {
+        // Keep the original send error and retryable composer text visible.
+      });
       liveEventsRef.current = [];
       setLiveEvents([]);
     },
@@ -631,7 +670,7 @@ export default function WorkspaceDraftChat() {
       // they see the Strategist countdown, then navigate.
       const eta = res.strategist_eta_seconds ?? 5;
       setTimeout(() => {
-        navigate(`/workspaces/${res.workspace_id}?created=1`);
+        navigate(embeddedInChat ? `/chat?workspace=${encodeURIComponent(res.workspace_id)}` : `/workspaces/${res.workspace_id}?created=1`);
       }, Math.max(2000, eta * 1000));
     },
     onError: (err: Error) => {
@@ -667,37 +706,59 @@ export default function WorkspaceDraftChat() {
     focusComposer();
   }
 
-  function formatComposerMessage(
-    rawText: string,
-    attachments: AttachedItem[] = [],
-    manualSkills: ManualSkillItem[] = [],
-  ) {
+  function formatComposerMessage(rawText: string, manualSkills: ManualSkillItem[] = []) {
     const text = stripManualSkillTokens(rawText, manualSkills).trim();
-    const attachmentText = attachments.length > 0
-      ? `[${t("component.workspace_chat.attached")}: ${attachments.map((f) => f.name).join(", ")}]`
-      : "";
     const skillText = manualSkills.length > 0
       ? `[${t("component.chat_input_footer.skill")}: ${manualSkills.map(manualSkillLabel).join(", ")}]`
       : "";
-    return [text, attachmentText, skillText].filter(Boolean).join("\n\n").trim();
+    return [text, skillText].filter(Boolean).join("\n\n").trim();
   }
 
-  function send(
+  /** Attachments reach the architect as document ids: local files are uploaded
+   *  first, knowledge items already have ids. Never silently drop a file. */
+  async function resolveAttachmentDocumentIds(attachments: AttachedItem[]): Promise<string[]> {
+    const ids: string[] = [];
+    for (const item of attachments) {
+      if (item.type === "knowledge" && item.id) {
+        ids.push(item.id);
+        continue;
+      }
+      if (item.file) {
+        const uploaded = await api.documents.upload(item.file);
+        ids.push(uploaded.id);
+        continue;
+      }
+      if (item.id) ids.push(item.id);
+    }
+    return Array.from(new Set(ids));
+  }
+
+  async function send(
     rawText = input,
     attachments: AttachedItem[] = [],
     manualSkills: ManualSkillItem[] = [],
   ) {
-    const v = formatComposerMessage(rawText, attachments, manualSkills);
+    const v = formatComposerMessage(rawText, manualSkills);
     if (!v || createMutation.isPending || sendMutation.isPending || streaming) return;
+    let document_ids: string[] = [];
+    try {
+      document_ids = await resolveAttachmentDocumentIds(attachments);
+    } catch (err) {
+      toast.error(t("page.workspace_draft_chat.send_failed"), (err as Error).message);
+      return;
+    }
+    const displayText = attachments.length > 0
+      ? `${v}\n[${t("component.workspace_chat.attached")}: ${attachments.map((f) => f.name).join(", ")}]`
+      : v;
     if (!draftId || !draft) {
       setInput("");
       startedRef.current = true;
-      createMutation.mutate(v);
+      createMutation.mutate({ initial_brief: v, document_ids });
       return;
     }
     if (draft.status !== "active" && draft.status !== "ready") return;
     setInput("");
-    sendMutation.mutate({ id: draftId, message: v });
+    sendMutation.mutate({ id: draftId, message: v, document_ids, displayText });
   }
 
   /* Derived */
@@ -790,7 +851,7 @@ export default function WorkspaceDraftChat() {
                 <Button variant="outline" onClick={() => navigate("/workspaces")}>
                   {t("page.workspace_draft_chat.manage_workspaces")}
                 </Button>
-                <Button variant="ghost" onClick={() => navigate("/workspaces")}>
+                <Button variant="ghost" onClick={() => navigate(exitPath)}>
                   {t("action.cancel")}
                 </Button>
               </div>
@@ -816,7 +877,7 @@ export default function WorkspaceDraftChat() {
               queryClient.invalidateQueries({ queryKey: ["workspace-drafts"] });
               toast.success(t("page.workspace_draft_chat.draft_saved"), t("page.workspace_draft_chat.resume_from_workspaces_page_anytime"));
             }
-            navigate("/workspaces");
+            navigate(exitPath);
           }}
         >
           {draft && editable ? t("page.workspace_draft_chat.save_and_exit") : t("action.cancel")}
@@ -849,7 +910,7 @@ export default function WorkspaceDraftChat() {
                     disabled={createMutation.isPending}
                     onClick={() => {
                       startedRef.current = true;
-                      createMutation.mutate(initialBriefParam || undefined);
+                      createMutation.mutate({ initial_brief: initialBriefParam || undefined });
                     }}
                   >
                     {t("component.chat_message_actions.retry")}
@@ -980,13 +1041,16 @@ export default function WorkspaceDraftChat() {
           </div>
 
           <ChatInputFooter
+            attachments="documents"
             value={input}
             onChange={setInput}
             enterToSend
             streaming={sendMutation.isPending || streaming}
             disabled={Boolean(draftId) && (!draft || !editable)}
             showStopButton={false}
-            onSend={send}
+            onSend={(text, attachments, skills) => {
+              void send(text, attachments, skills);
+            }}
             onStop={() => {}}
             placeholder={
               finalized
@@ -1055,10 +1119,20 @@ function FinalizeProgressOverlay({
   strategistEta: number | null;
   warning: string | null;
 }) {
-  const visibleSteps = autonomous
+  const seenKeys = new Set(steps
+    .filter((step) => step.step !== "agent_bindings_repair_done" || step.payload.ready === true)
+    .map((step) => step.step));
+  const provisioningSteps = autonomous
     ? FINALIZE_STEPS
     : FINALIZE_STEPS.filter((step) => !["runtime_scheduled", "strategist_dispatched"].includes(step.key));
-  const seenKeys = new Set(steps.map((s) => s.step));
+  const visibleSteps = seenKeys.has("agent_bindings_repair_started")
+    ? [{
+      key: "agent_bindings_repair_done",
+      label: seenKeys.has("agent_bindings_repair_done")
+        ? t("page.workspace_draft_chat.agent_bindings_repaired")
+        : t("page.workspace_draft_chat.repairing_agent_bindings"),
+    }, ...provisioningSteps]
+    : provisioningSteps;
   const lastAgent = [...steps].reverse().find((s) => s.step === "agent_provisioned");
   const teamPayload = steps.find((s) => s.step === "team_and_knowledge_done")?.payload as
     | { staff?: number; knowledge?: number; channels?: number }

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import json
 from contextvars import ContextVar
-from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any
 
@@ -99,11 +98,57 @@ RUN_WORKFLOW_SCHEMA = _schema(
 )
 LIST_DEFINITIONS_SCHEMA = _schema(
     "list_workflow_definitions",
-    "List editable workflow definitions in the current Manor entity, including draft and inactive workflows.",
+    (
+        "Query editable workflow definitions in one call, including drafts and "
+        "inactive workflows. Values within a plural filter are ORed; different "
+        "filters and inclusive ranges are ANDed before pagination. Total is exact."
+    ),
     {
         "query": {"type": "string", "description": "Optional name/description search."},
-        "status": {"type": "string", "description": "Optional exact status filter."},
+        "status": {"type": "string", "description": "Legacy single exact status filter."},
+        "statuses": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 20,
+            "uniqueItems": True,
+            "description": "Match any listed status (OR).",
+        },
+        "categories": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 30,
+            "uniqueItems": True,
+        },
+        "workspace_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": True,
+        },
+        "created_by_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": True,
+        },
+        "active": {"type": "boolean"},
+        "version_min": {"type": "integer", "minimum": 1},
+        "version_max": {"type": "integer", "minimum": 1},
+        **{
+            field: {"type": "string", "format": "date-time"}
+            for field in (
+                "created_after",
+                "created_before",
+                "updated_after",
+                "updated_before",
+            )
+        },
         "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 25},
+        "offset": {"type": "integer", "minimum": 0, "default": 0},
     },
 )
 GET_WORKFLOW_SCHEMA = _schema(
@@ -216,13 +261,75 @@ TEST_NODE_SCHEMA = _schema(
 )
 LIST_RUNS_SCHEMA = _schema(
     "list_workflow_runs",
-    "List workflow execution history in the current entity.",
+    (
+        "Query workflow execution history in one call. Values within a plural "
+        "filter are ORed; different filters and inclusive ranges are ANDed before "
+        "pagination. Total is exact."
+    ),
     {
         "workflow": {"type": "string", "description": "Optional workflow id or exact name."},
+        "workflow_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": True,
+        },
         "target_workspace_id": {"type": "string"},
+        "workspace_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": True,
+        },
         "binding_id": {"type": "string"},
-        "status": {"type": "string"},
+        "binding_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": True,
+        },
+        "status": {"type": "string", "description": "Legacy single status filter."},
+        "statuses": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 20,
+            "uniqueItems": True,
+        },
+        "trigger_sources": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 20,
+            "uniqueItems": True,
+        },
+        "started_by_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 50,
+            "uniqueItems": True,
+        },
+        "attempt_number_min": {"type": "integer", "minimum": 1},
+        "attempt_number_max": {"type": "integer", "minimum": 1},
+        **{
+            field: {"type": "string", "format": "date-time"}
+            for field in (
+                "created_after",
+                "created_before",
+                "updated_after",
+                "updated_before",
+                "started_after",
+                "started_before",
+                "completed_after",
+                "completed_before",
+            )
+        },
         "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
+        "offset": {"type": "integer", "minimum": 0, "default": 0},
     },
 )
 GET_RUN_SCHEMA = _schema(
@@ -267,6 +374,46 @@ def _dump(payload: Any) -> str:
 
 def _error(message: str, **extra: Any) -> str:
     return _dump({"ok": False, "error": message, **extra})
+
+
+def _query_string_values(
+    kwargs: dict[str, Any],
+    plural_field: str,
+    *,
+    singular_field: str | None = None,
+    maximum: int = 50,
+) -> list[str]:
+    raw = kwargs.get(plural_field)
+    if raw in (None, ""):
+        values: list[Any] = []
+    elif isinstance(raw, (list, tuple, set, frozenset)):
+        values = list(raw)
+    else:
+        raise ValueError(f"{plural_field} must be an array")
+    if singular_field:
+        single = kwargs.get(singular_field)
+        if single not in (None, ""):
+            values.insert(0, single)
+    normalized: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+        if len(normalized) >= maximum:
+            break
+    return normalized
+
+
+def _query_optional_int(value: Any, field_name: str) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative")
+    return parsed
 
 
 def _workflow_dict(wf, *, include_steps: bool = True) -> dict:
@@ -669,9 +816,12 @@ async def _start_workspace_flow(
             return _error("origin_message_not_found")
 
         entrypoint, binding, _workflow, workspace, descriptor = matches[0]
+        user_requested = await _workflow_tool_user_requested(
+            db, entity_id=entity_id, workspace_id=workspace.id, kwargs=kwargs,
+        )
         launched = await launch_workspace_flow(
             db,
-            source="global_chat",
+            source="global_chat" if user_requested and _global_flow_context(kwargs) else "mcp",
             entrypoint=entrypoint,
             binding=binding,
             entity_id=entity_id,
@@ -685,6 +835,7 @@ async def _start_workspace_flow(
                 if isinstance(kwargs.get("inputs"), dict) else None
             ),
             starter_policy="always_review",
+            user_requested=user_requested,
         )
         return _dump({
             "ok": True,
@@ -697,17 +848,52 @@ async def _start_workspace_flow(
 async def _list_workflow_definitions(entity_id: str = "", **kwargs: Any) -> str:
     from packages.core.services import workflow_service as svc
 
-    query = str(kwargs.get("query") or "").strip().lower()
-    status = str(kwargs.get("status") or "").strip().lower()
-    limit = max(1, min(int(kwargs.get("limit") or 25), 100))
+    try:
+        limit = max(1, min(int(kwargs.get("limit") or 25), 100))
+        offset = max(0, int(kwargs.get("offset") or 0))
+        filters = {
+            "query": str(kwargs.get("query") or "").strip() or None,
+            "statuses": _query_string_values(
+                kwargs,
+                "statuses",
+                singular_field="status",
+                maximum=20,
+            ),
+            "categories": _query_string_values(kwargs, "categories", maximum=30),
+            "workspace_ids": _query_string_values(kwargs, "workspace_ids"),
+            "created_by_ids": _query_string_values(kwargs, "created_by_ids"),
+            "active": kwargs.get("active") if isinstance(kwargs.get("active"), bool) else None,
+            "created_after": kwargs.get("created_after"),
+            "created_before": kwargs.get("created_before"),
+            "updated_after": kwargs.get("updated_after"),
+            "updated_before": kwargs.get("updated_before"),
+            "version_min": _query_optional_int(kwargs.get("version_min"), "version_min"),
+            "version_max": _query_optional_int(kwargs.get("version_max"), "version_max"),
+        }
+    except (TypeError, ValueError) as exc:
+        return _error(str(exc), code="invalid_workflow_filters")
     async with async_session() as db:
-        workflows = await svc.list_workflows(db, entity_id)
-        if query:
-            workflows = [wf for wf in workflows if query in f"{wf.name} {wf.description or ''}".lower()]
-        if status:
-            workflows = [wf for wf in workflows if str(wf.status).lower() == status]
-        items = [_workflow_dict(wf, include_steps=False) for wf in workflows[:limit]]
-        return _dump({"ok": True, "workflows": items, "count": len(items)})
+        try:
+            workflows, total = await svc.query_workflows(
+                db,
+                entity_id,
+                **filters,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            return _error(str(exc), code="invalid_workflow_filters")
+        items = [_workflow_dict(wf, include_steps=False) for wf in workflows]
+        return _dump({
+            "ok": True,
+            "workflows": items,
+            "total": total,
+            "count": len(items),
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(items) < total,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+        })
 
 
 async def _get_workflow(entity_id: str = "", **kwargs: Any) -> str:
@@ -738,7 +924,10 @@ async def _create_workflow(entity_id: str = "", **kwargs: Any) -> str:
         if not prompt:
             return _error("Provide either 'prompt' or a complete 'steps' graph")
         try:
-            generated = await generate_workflow(prompt, None, entity_id)
+            generated = await generate_workflow(
+                prompt, None, entity_id,
+                user_id=str(kwargs.get("user_id") or "").strip() or None,
+            )
         except Exception as exc:
             return _error(f"AI workflow generation failed: {exc}")
         steps = generated.get("steps")
@@ -784,7 +973,10 @@ async def _ai_edit_workflow(entity_id: str = "", **kwargs: Any) -> str:
         if expected is not None and int(expected) != int(wf.version or 1):
             return _error("Workflow version conflict", expected_version=int(expected), current_version=int(wf.version or 1))
         try:
-            generated = await generate_workflow(prompt, list(wf.steps or []), entity_id)
+            generated = await generate_workflow(
+                prompt, list(wf.steps or []), entity_id,
+                user_id=str(kwargs.get("user_id") or "").strip() or None,
+            )
         except Exception as exc:
             return _error(f"AI workflow edit failed: {exc}")
         validation = svc.validate_workflow_steps(generated.get("steps"))
@@ -879,16 +1071,19 @@ async def _deploy_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any
             cron = str(kwargs.get("cron") or (kwargs.get("trigger_config") or {}).get("cron") or "").strip()
             if not cron:
                 return _error("Scheduled deployment requires cron")
-            job = await svc.schedule_workflow(
-                db,
-                entity_id=entity_id,
-                workflow_id=wf.id,
-                cron=cron,
-                name=str(kwargs.get("name") or wf.name),
-                workspace_id=workspace_id,
-                timezone_str=str(kwargs.get("timezone") or "UTC"),
-                created_by=user_id or None,
-            )
+            try:
+                job = await svc.schedule_workflow(
+                    db,
+                    entity_id=entity_id,
+                    workflow_id=wf.id,
+                    cron=cron,
+                    name=str(kwargs.get("name") or wf.name),
+                    workspace_id=workspace_id,
+                    timezone_str=str(kwargs.get("timezone") or "UTC"),
+                    created_by=user_id or None,
+                )
+            except svc.ScheduledWorkflowInputsError as exc:
+                return _error(str(exc), required_inputs=exc.labels)
             await db.commit()
             return _dump({"ok": True, "kind": "automation", "scheduled_job_id": job.id, "workflow_id": wf.id})
 
@@ -944,6 +1139,14 @@ async def _execute_run(run_id: str) -> None:
     from packages.core.ai.workflow_runner import WorkflowRunner
 
     await WorkflowRunner().run(run_id)
+
+
+async def _workflow_tool_user_requested(db, *, entity_id: str, workspace_id: str | None, kwargs: dict) -> bool:
+    from packages.core.ai.runtime.execution_origin import runtime_tool_is_user_requested
+
+    return await runtime_tool_is_user_requested(
+        db, entity_id=entity_id, workspace_id=workspace_id, kwargs=kwargs,
+    )
 
 
 async def _run_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
@@ -1021,6 +1224,9 @@ async def _run_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) -
             trigger_source="mcp",
             started_by=user_id or None,
             execution_workspace_id=execution_workspace_id,
+            user_requested=await _workflow_tool_user_requested(
+                db, entity_id=entity_id, workspace_id=execution_workspace_id, kwargs=kwargs,
+            ),
         )
         conversation_id = runtime_context.get("conversation_id")
         if conversation_id:
@@ -1111,27 +1317,22 @@ async def _test_workflow(entity_id: str = "", user_id: str = "", **kwargs: Any) 
 
 
 async def _test_workflow_node(entity_id: str = "", user_id: str = "", **kwargs: Any) -> str:
-    from packages.core.ai.workflow_runner import WorkflowRunner
-    from packages.core.models.workflow import WorkflowRun
-
     step = kwargs.get("step")
     if not isinstance(step, dict):
         return _error("step must be an object")
     inputs = kwargs.get("inputs") if isinstance(kwargs.get("inputs"), dict) else {}
-    run = WorkflowRun(
-        id="adhoc",
-        workflow_id="adhoc",
-        entity_id=entity_id,
-        status="running",
-        variables=dict(inputs),
-        step_results={},
-        trigger_data={},
-        started_by=user_id or None,
-    )
+    from packages.core.services.workflow_service import execute_node_test
+
     started = perf_counter()
     async with async_session() as db:
         try:
-            result = await WorkflowRunner()._execute_step_safe(step, run, db)
+            result = await execute_node_test(
+                db,
+                entity_id=entity_id,
+                user_id=user_id or None,
+                step=step,
+                variables=inputs,
+            )
         except Exception as exc:
             return _error(str(exc), step_id=step.get("id"), duration_ms=round((perf_counter() - started) * 1000, 2))
     return _dump({"ok": result.get("status") != "failed", "step_id": step.get("id"), "result": result, "duration_ms": round((perf_counter() - started) * 1000, 2)})
@@ -1140,23 +1341,82 @@ async def _test_workflow_node(entity_id: str = "", user_id: str = "", **kwargs: 
 async def _list_workflow_runs(entity_id: str = "", **kwargs: Any) -> str:
     from packages.core.services import workflow_service as svc
 
-    workflow_id = None
+    try:
+        limit = max(1, min(int(kwargs.get("limit") or 20), 100))
+        offset = max(0, int(kwargs.get("offset") or 0))
+        filters = {
+            "workflow_ids": _query_string_values(kwargs, "workflow_ids"),
+            "workspace_ids": _query_string_values(
+                kwargs,
+                "workspace_ids",
+                singular_field="target_workspace_id",
+            ),
+            "binding_ids": _query_string_values(
+                kwargs,
+                "binding_ids",
+                singular_field="binding_id",
+            ),
+            "statuses": _query_string_values(
+                kwargs,
+                "statuses",
+                singular_field="status",
+                maximum=20,
+            ),
+            "trigger_sources": _query_string_values(
+                kwargs,
+                "trigger_sources",
+                maximum=20,
+            ),
+            "started_by_ids": _query_string_values(kwargs, "started_by_ids"),
+            "created_after": kwargs.get("created_after"),
+            "created_before": kwargs.get("created_before"),
+            "updated_after": kwargs.get("updated_after"),
+            "updated_before": kwargs.get("updated_before"),
+            "started_after": kwargs.get("started_after"),
+            "started_before": kwargs.get("started_before"),
+            "completed_after": kwargs.get("completed_after"),
+            "completed_before": kwargs.get("completed_before"),
+            "attempt_number_min": _query_optional_int(
+                kwargs.get("attempt_number_min"),
+                "attempt_number_min",
+            ),
+            "attempt_number_max": _query_optional_int(
+                kwargs.get("attempt_number_max"),
+                "attempt_number_max",
+            ),
+        }
+    except (TypeError, ValueError) as exc:
+        return _error(str(exc), code="invalid_workflow_run_filters")
     async with async_session() as db:
         if kwargs.get("workflow"):
             wf = await _resolve_workflow(db, entity_id, kwargs.get("workflow"))
             if wf is None:
                 return _error("Workflow not found")
-            workflow_id = wf.id
-        runs = await svc.list_runs(
-            db,
-            entity_id,
-            workflow_id=workflow_id,
-            workspace_id=str(kwargs.get("target_workspace_id") or "").strip() or None,
-            binding_id=str(kwargs.get("binding_id") or "").strip() or None,
-            status=str(kwargs.get("status") or "").strip() or None,
-            limit=max(1, min(int(kwargs.get("limit") or 20), 100)),
-        )
-        return _dump({"ok": True, "runs": [_run_dict(run, detailed=False) for run in runs], "count": len(runs)})
+            filters["workflow_ids"] = list(dict.fromkeys([
+                wf.id,
+                *filters["workflow_ids"],
+            ]))
+        try:
+            runs, total = await svc.query_runs(
+                db,
+                entity_id,
+                **filters,
+                limit=limit,
+                offset=offset,
+            )
+        except ValueError as exc:
+            return _error(str(exc), code="invalid_workflow_run_filters")
+        items = [_run_dict(run, detailed=False) for run in runs]
+        return _dump({
+            "ok": True,
+            "runs": items,
+            "total": total,
+            "count": len(items),
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(items) < total,
+            "next_offset": offset + len(items) if offset + len(items) < total else None,
+        })
 
 
 async def _user_can_read_workflow_run(db, *, run, entity_id: str, user_id: str) -> bool:
@@ -1221,8 +1481,28 @@ async def _cancel_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
             return _error("Workflow run not found")
         if run.status in {"completed", "cancelled", "failed"}:
             return _error(f"Run is already {run.status}", run=_run_dict(run, detailed=False))
-        run.status = "cancelled"
-        run.completed_at = datetime.now(timezone.utc)
+        from packages.core.services.workflow_run_control import (
+            active_subworkflow_descendant_ids,
+            cancel_active_subworkflow_descendants,
+            cancel_run,
+        )
+
+        descendant_run_ids = await active_subworkflow_descendant_ids(db, run)
+        cancel_run(run, actor_id=user_id)
+        cancelled_children = await cancel_active_subworkflow_descendants(
+            db,
+            run,
+            actor_id=user_id,
+            descendant_run_ids=descendant_run_ids,
+        )
+        from packages.core.services.workflow_run_execution_claim import (
+            revoke_workflow_run_execution_claims,
+        )
+
+        await revoke_workflow_run_execution_claims(
+            db,
+            [run.id, *descendant_run_ids],
+        )
         from packages.core.ai.workflow_runner import (
             finalize_workflow_terminal_effects_best_effort,
             mark_workflow_terminal_effects_pending,
@@ -1232,6 +1512,8 @@ async def _cancel_workflow_run(entity_id: str = "", user_id: str = "", **kwargs:
         )
 
         mark_workflow_terminal_effects_pending(run)
+        for child in cancelled_children:
+            mark_workflow_terminal_effects_pending(child)
         await project_workflow_run_status(db, run=run)
         await db.commit()
         response = _dump({"ok": True, "run": _run_dict(run)})

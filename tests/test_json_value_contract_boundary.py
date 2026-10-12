@@ -14,7 +14,7 @@ from packages.core.dispatcher import MISSING_RESULT, Dispatcher
 from packages.core.dispatcher.output_coercion import coerce_step_output_for_schema
 from packages.core.dispatcher.service import _attach_knowledge_artifacts_for_contract
 from packages.core.models.execution import ExecutionStep
-from packages.core.models.worker import WorkLease
+from packages.core.models.worker import WorkLease, Worker
 from packages.core.workers import internal
 from packages.core.plans.executor import PlanExecutor
 from packages.core.plans.schema import Plan, PlanStep
@@ -50,7 +50,7 @@ async def test_action_worker_keeps_native_provider_payload(monkeypatch, value) -
         "packages.core.workers.internal.importlib.import_module",
         lambda _name: _Adapter(),
     )
-    out = await internal._exec_action({
+    out = await internal._call_action_adapter({
         "provider": "fake_provider",
         "action_key": "return_value",
         "execution_mode": "dry_run",
@@ -79,6 +79,22 @@ def test_python_worker_coercion_keeps_native_json_values_and_presence() -> None:
     explicit_null = LeaseResultFactory.from_handler_output(LeaseResult(result=None))
     assert "result" in explicit_null.model_fields_set
     assert explicit_null.result is None
+
+
+def test_worker_sdk_and_api_preserve_the_same_structured_evidence_contract() -> None:
+    evidence = ["s3://legacy/screenshot", {"kind": "tool_effect", "effect": "action",
+                 "fields": {"provider": "twitter_x", "action_key": "create_tweet"}},
+                {"kind": "tool_effect", "effect": "publish",
+                 "fields": {"tweet_id": "123", "delivery_confirmed": True}}]
+    result = LeaseResult(result={"tweet_id": "123"}, evidence_refs=evidence)
+    direct = CompleteLeaseRequest.model_validate(result.model_dump())
+    assert direct.evidence_refs == evidence
+    payload = {"lease_id": "lease", "status": "done", **result.model_dump()}
+    from packages.worker_sdk.types import HeartbeatCompletedLease as SDKCompletedLease
+
+    heartbeat = SDKCompletedLease.model_validate(payload)
+    accepted = HeartbeatCompletedLease.model_validate(heartbeat.model_dump())
+    assert accepted.evidence_refs == evidence
 
 
 def test_api_models_accept_bare_json_values_and_track_null_presence() -> None:
@@ -249,15 +265,24 @@ def test_python_client_restores_explicit_null_in_heartbeat_payload(monkeypatch) 
 
 
 class _EmptyDbResult:
+    def __init__(self, value=None):
+        self.value = value
+
     def scalar_one_or_none(self):
-        return None
+        return self.value
 
     def first(self):
         return None
 
 
 class _NoopDb:
-    async def execute(self, _statement):
+    def __init__(self, worker=None):
+        self.worker = worker
+
+    async def execute(self, statement):
+        descriptions = getattr(statement, "column_descriptions", ())
+        if any(item.get("entity") is Worker for item in descriptions):
+            return _EmptyDbResult(self.worker)
         return _EmptyDbResult()
 
     def add(self, _row):
@@ -266,10 +291,12 @@ class _NoopDb:
     async def commit(self):
         return None
 
+    async def refresh(self, _row):
+        return None
+
 
 def test_complete_endpoint_passes_task_output_kind_to_dispatcher(monkeypatch) -> None:
     from apps.api.routers import workers as workers_api
-    from packages.core.plans import wakeup
 
     captured: list[dict] = []
 
@@ -283,7 +310,6 @@ def test_complete_endpoint_passes_task_output_kind_to_dispatcher(monkeypatch) ->
 
     monkeypatch.setattr(workers_api, "Dispatcher", _Dispatcher)
     monkeypatch.setattr(workers_api, "_ensure_lease_belongs_to_worker", _allow)
-    monkeypatch.setattr(wakeup, "wake_plan_cycle", lambda _plan_id: None)
 
     asyncio.run(workers_api.lease_complete(
         "lease",
@@ -296,6 +322,7 @@ def test_complete_endpoint_passes_task_output_kind_to_dispatcher(monkeypatch) ->
     ))
 
     assert captured[0]["task_output_value_kind"] is TaskOutputValueKind.STEP_RESULT_FAILURE
+    assert captured[0]["expected_worker_id"] == "worker"
 
     asyncio.run(workers_api.lease_complete(
         "payload-lease",
@@ -308,12 +335,12 @@ def test_complete_endpoint_passes_task_output_kind_to_dispatcher(monkeypatch) ->
     ))
 
     assert captured[1]["task_output_value_kind"] is TaskOutputValueKind.TASK_PAYLOAD
+    assert captured[1]["expected_worker_id"] == "worker"
 
 
 def test_heartbeat_passes_task_output_kind_to_dispatcher(monkeypatch) -> None:
     from apps.api.routers import workers as workers_api
     from packages.core.models.worker import Worker
-    from packages.core.plans import wakeup
 
     captured: list[dict] = []
 
@@ -323,7 +350,6 @@ def test_heartbeat_passes_task_output_kind_to_dispatcher(monkeypatch) -> None:
             return SimpleNamespace(plan_id="plan", step_id="step", worker_id="worker")
 
     monkeypatch.setattr(workers_api, "Dispatcher", _Dispatcher)
-    monkeypatch.setattr(wakeup, "wake_plan_cycle", lambda _plan_id: None)
     worker = Worker(
         id="worker",
         entity_id="entity",
@@ -350,10 +376,79 @@ def test_heartbeat_passes_task_output_kind_to_dispatcher(monkeypatch) -> None:
         capacity=workers_api.HeartbeatCapacity(can_accept_leases=0),
     )
 
-    asyncio.run(workers_api._heartbeat_inner(request, worker, _NoopDb()))
+    asyncio.run(workers_api._heartbeat_inner(request, worker, _NoopDb(worker)))
 
     assert captured[0]["task_output_value_kind"] is TaskOutputValueKind.STEP_RESULT_FAILURE
     assert captured[1]["task_output_value_kind"] is TaskOutputValueKind.TASK_PAYLOAD
+    assert all(item["expected_worker_id"] == "worker" for item in captured)
+
+
+def test_heartbeat_commits_each_completion_before_processing_the_next(
+    monkeypatch,
+) -> None:
+    from apps.api.routers import workers as workers_api
+    from packages.core.models.worker import Worker
+
+    events: list[str] = []
+
+    class _CountingDb(_NoopDb):
+        def __init__(self, worker):
+            super().__init__(worker)
+            self.commit_count = 0
+
+        async def commit(self):
+            self.commit_count += 1
+            events.append("commit")
+
+    class _Dispatcher:
+        async def complete_lease(self, db, lease_id, **_kwargs):
+            events.append(f"complete:{lease_id}:after:{db.commit_count}")
+            return SimpleNamespace(
+                plan_id=f"plan-{lease_id}",
+                step_id=f"step-{lease_id}",
+                worker_id="worker",
+            )
+
+    monkeypatch.setattr(workers_api, "Dispatcher", _Dispatcher)
+    worker = Worker(
+        id="worker",
+        entity_id="entity",
+        kind="external",
+        display_name="External worker",
+        status="active",
+        capabilities={},
+    )
+    request = workers_api.HeartbeatRequest(
+        completed_since_last=[
+            workers_api.HeartbeatCompletedLease(
+                lease_id="lease-1",
+                status="done",
+                result={"value": 1},
+                task_output_value_kind=TaskOutputValueKind.TASK_PAYLOAD,
+            ),
+            workers_api.HeartbeatCompletedLease(
+                lease_id="lease-2",
+                status="done",
+                result={"value": 2},
+                task_output_value_kind=TaskOutputValueKind.TASK_PAYLOAD,
+            ),
+        ],
+        capacity=workers_api.HeartbeatCapacity(can_accept_leases=0),
+    )
+    db = _CountingDb(worker)
+
+    asyncio.run(workers_api._heartbeat_inner(request, worker, db))
+
+    assert events[:4] == [
+        "complete:lease-1:after:0",
+        "commit",
+        "complete:lease-2:after:1",
+        "commit",
+    ]
+    # Two terminal reports commit independently, worker bookkeeping commits
+    # before checkout to preserve lock order, and the checkout phase owns its
+    # final transaction boundary even when capacity is zero.
+    assert db.commit_count == 4
 
 
 def test_plan_executor_keeps_nullable_bare_null_for_downstream_refs() -> None:
@@ -442,27 +537,44 @@ def test_native_contract_knowledge_projection_only_adds_declared_fields() -> Non
 
 def test_dispatcher_turns_hard_result_omission_into_controlled_schema_failure() -> None:
     dispatcher = Dispatcher()
-    lease = SimpleNamespace(step_id="step", result=None)
+    lease = SimpleNamespace(id="lease", step_id="step", result=None)
     step = SimpleNamespace(
+        id="step",
+        plan_id="plan",
         step_key="deliver",
         kind="subagent",
+        params={},
+        runtime_checkpoint=None,
+        evidence_refs=[],
         expected_output_schema=plan_output_contract_schema({"type": "null"}),
         result=None,
+        # Grant state: the lease owns the running step. A report through a
+        # lease the step no longer points at is refused as superseded.
+        step_status="running",
+        current_lease_id="lease",
     )
     failed: dict = {}
 
-    async def get_lease(_db, _lease_id):
-        return lease
-
-    async def get_step(_db, _step_id):
-        return step
+    async def lock_active_execution(
+        _db,
+        _lease_id,
+        *,
+        expected_worker_id=None,
+        expected_execution_claim_id=None,
+        require_execution_claim_id_if_present=False,
+        lock_workspace=False,
+    ):
+        assert expected_worker_id is None
+        assert expected_execution_claim_id is None
+        assert require_execution_claim_id_if_present is False
+        assert lock_workspace is True
+        return lease, step
 
     async def fail_lease(_db, _lease_id, *, error, **_kwargs):
         failed.update(error)
         return lease
 
-    dispatcher._get_active_lease = get_lease
-    dispatcher._get_step = get_step
+    dispatcher._lock_active_execution = lock_active_execution
     dispatcher.fail_lease = fail_lease
 
     asyncio.run(

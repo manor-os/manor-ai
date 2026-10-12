@@ -6,6 +6,7 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
+from apps.api.routers.integrations import _is_hidden_catalog_server_key
 from packages.core.ai.mcp import manor_mcp_calendar
 from packages.core.ai.tools import mcp_builtin
 from packages.core.models.base import generate_ulid
@@ -78,6 +79,11 @@ def test_manor_mcp_calendar_tools_are_registered_in_mcp_catalog():
     assert "mcp__manor_mcp_calendar__create_booking_link" in registered
 
 
+def test_manor_calendar_catalog_rows_are_hidden():
+    assert _is_hidden_catalog_server_key("manor_calendar") is True
+    assert _is_hidden_catalog_server_key("manor_mcp_calendar") is True
+
+
 def test_manor_mcp_calendar_preserves_booking_host_identity():
     booking = manor_mcp_calendar._booking_record({
         "id": "booking-id",
@@ -147,14 +153,16 @@ def test_manor_mcp_calendar_preserves_per_link_availability():
 
 
 @pytest.mark.asyncio
-async def test_manor_mcp_calendar_is_internal_mcp_not_external_integration(client: AsyncClient):
+async def test_manor_mcp_calendar_is_hidden_from_integrations(client: AsyncClient):
     headers, _user_id, _entity_id = await _register_owner(client, "manor_mcp_calendar_catalog")
 
     await _ensure_manor_mcp_calendar_server()
 
-    external_only = await client.get("/api/v1/integrations/mcp-servers", headers=headers)
-    assert external_only.status_code == 200, external_only.text
-    assert "manor_mcp_calendar" not in {row["server_key"] for row in external_only.json()}
+    catalog_response = await client.get("/api/v1/integrations/mcp-servers", headers=headers)
+    assert catalog_response.status_code == 200, catalog_response.text
+    catalog = {row["server_key"]: row for row in catalog_response.json()}
+    assert "manor_calendar" not in catalog
+    assert "manor_mcp_calendar" not in catalog
 
 
 @pytest.mark.asyncio
@@ -164,6 +172,11 @@ async def test_manor_mcp_calendar_permission_is_first_party(client: AsyncClient)
     import packages.core.database as dbmod
 
     async with dbmod.async_session() as db:
+        user = (
+            await db.execute(select(User).where(User.id == user_id))
+        ).scalar_one()
+        user.preferences = {"builtin_plugins": {"manor_calendar": False}}
+        await db.flush()
         decision = await can_use_integration(
             db,
             user_id=user_id,

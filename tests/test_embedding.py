@@ -7,6 +7,7 @@ if the vector extension is unavailable.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch, MagicMock
@@ -20,8 +21,19 @@ from packages.core.models.base import Base
 import packages.core.models  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _exercise_enabled_embedding_implementation(monkeypatch):
+    from packages.core.services import embedding_service
+
+    monkeypatch.setattr(
+        embedding_service,
+        "_EMBEDDINGS_TEMPORARILY_PAUSED",
+        False,
+    )
+
+
 @pytest.mark.asyncio
-async def test_index_document_defers_deleted_workspace_before_read_or_provider(
+async def test_index_document_keeps_retained_deleted_workspace_document_indexable(
     db_session,
     monkeypatch,
 ):
@@ -29,10 +41,12 @@ async def test_index_document_defers_deleted_workspace_before_read_or_provider(
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document, DocumentFolder, VectorStatus
+    from packages.core.models.user import Entity
     from packages.core.models.workspace import Workspace
     from packages.core.services import embedding_service
 
     entity_id = generate_ulid()
+    entity = Entity(id=entity_id, name="Retained knowledge entity")
     root = DocumentFolder(
         id=generate_ulid(),
         entity_id=entity_id,
@@ -55,21 +69,18 @@ async def test_index_document_defers_deleted_workspace_before_read_or_provider(
         vector_status=VectorStatus.PENDING,
         metadata_={"content_text": "private deleted Workspace content"},
     )
-    session.add_all([root, workspace, document])
+    session.add_all([entity, root, workspace, document])
     await session.commit()
-    read_content = AsyncMock(side_effect=AssertionError("deleted Workspace content was read"))
-    monkeypatch.setattr(embedding_service, "_read_document_content", read_content)
     monkeypatch.setattr(
         embedding_service,
-        "generate_embeddings_batch",
-        AsyncMock(side_effect=AssertionError("embedding provider was called")),
+        "_resolve_embedding_config",
+        AsyncMock(return_value=None),
     )
 
     assert await embedding_service.index_document(session, document.id) is True
     await session.refresh(document)
-    assert document.vector_status == VectorStatus.PENDING
-    assert document.metadata_["indexing"]["blocked_reason"] == "workspace_deleted"
-    read_content.assert_not_awaited()
+    assert document.vector_status == VectorStatus.READY
+    assert "indexing" not in document.metadata_
 
 
 @pytest.mark.asyncio
@@ -81,6 +92,7 @@ async def test_index_document_releases_workspace_lock_before_file_and_provider_i
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document, DocumentFolder, VectorStatus
+    from packages.core.models.user import Entity
     from packages.core.models.workspace import Workspace
     from packages.core.services import embedding_service
 
@@ -101,7 +113,7 @@ async def test_index_document_releases_workspace_lock_before_file_and_provider_i
         mime_type="text/markdown",
         vector_status=VectorStatus.PENDING,
     )
-    session.add_all([root, workspace, document])
+    session.add_all([Entity(id=entity_id, name="Active indexing entity"), root, workspace, document])
     await session.commit()
 
     async def fake_read(_document):
@@ -126,6 +138,121 @@ async def test_index_document_releases_workspace_lock_before_file_and_provider_i
     )
 
     assert await embedding_service.index_document(session, document.id) is False
+
+
+@pytest.mark.asyncio
+async def test_indexing_entity_read_lock_serializes_entity_deletion(db_session):
+    """An Entity delete cannot pass the final indexing eligibility fence."""
+    session, _has_vector = db_session
+
+    from sqlalchemy import update
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document
+    from packages.core.models.user import Entity
+    from packages.core.services.embedding_service import _document_entity_is_unavailable
+
+    entity = Entity(id=generate_ulid(), name="Entity lifecycle fence")
+    document = Document(
+        id=generate_ulid(),
+        entity_id=entity.id,
+        name="fenced.md",
+        vector_status="processing",
+    )
+    session.add_all([entity, document])
+    await session.commit()
+
+    assert not await _document_entity_is_unavailable(
+        session,
+        document,
+        lock_for_read=True,
+    )
+
+    sessions = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+    async with sessions() as deleting_session:
+        deleting = asyncio.create_task(
+            deleting_session.execute(
+                update(Entity)
+                .where(Entity.id == entity.id)
+                .values(deleted_at=datetime.now(timezone.utc))
+            )
+        )
+        await asyncio.sleep(0.1)
+        assert not deleting.done()
+
+        await session.commit()
+        await asyncio.wait_for(deleting, timeout=2)
+        await deleting_session.commit()
+
+    await session.refresh(entity)
+    assert entity.deleted_at is not None
+
+
+@pytest.mark.asyncio
+async def test_index_document_stops_before_final_store_after_entity_deletion(
+    db_session,
+    monkeypatch,
+):
+    """A deletion committed during provider work wins the final publish gate."""
+    session, _has_vector = db_session
+
+    from sqlalchemy import update
+
+    from packages.core.models.base import generate_ulid
+    from packages.core.models.document import Document, VectorStatus
+    from packages.core.models.user import Entity
+    from packages.core.services import embedding_service
+
+    entity = Entity(id=generate_ulid(), name="Deleted during indexing")
+    document = Document(
+        id=generate_ulid(),
+        entity_id=entity.id,
+        name="stopped-before-store.md",
+        vector_status=VectorStatus.PENDING,
+    )
+    session.add_all([entity, document])
+    await session.commit()
+
+    sessions = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
+
+    async def generate_after_entity_delete(_chunks, **_kwargs):
+        async with sessions() as deleting_session:
+            await deleting_session.execute(
+                update(Entity)
+                .where(Entity.id == entity.id)
+                .values(deleted_at=datetime.now(timezone.utc))
+            )
+            await deleting_session.commit()
+        return [[0.0, 0.0, 0.0]]
+
+    monkeypatch.setattr(
+        embedding_service,
+        "_resolve_embedding_config",
+        AsyncMock(return_value={
+            "api_key": "test",
+            "base_url": "https://embedding.invalid/v1",
+            "model": "test-embedding",
+            "dimensions": 3,
+        }),
+    )
+    monkeypatch.setattr(
+        embedding_service,
+        "_read_document_content",
+        AsyncMock(return_value="Entity lifecycle must fence final storage."),
+    )
+    monkeypatch.setattr(
+        embedding_service,
+        "generate_embeddings_batch",
+        generate_after_entity_delete,
+    )
+
+    assert await embedding_service.index_document(session, document.id) is True
+    await session.refresh(document)
+    assert document.vector_status == VectorStatus.PROCESSING
+    assert await session.scalar(
+        text("SELECT COUNT(*) FROM document_chunks WHERE document_id = :document_id"),
+        {"document_id": document.id},
+    ) == 0
 
 
 @pytest.mark.asyncio
@@ -370,6 +497,7 @@ async def test_index_document_mock(db_session):
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document
+    from packages.core.models.user import Entity
     from packages.core.services.embedding_service import index_document
 
     doc_id = generate_ulid()
@@ -379,7 +507,7 @@ async def test_index_document_mock(db_session):
         name="Test document about quantum computing",
         vector_status="pending",
     )
-    session.add(doc)
+    session.add_all([Entity(id="ent_test", name="Embedding test entity"), doc])
     await session.flush()
 
     mock_resp = _mock_embedding_response()
@@ -416,6 +544,7 @@ async def test_index_document_missing_fs_path_is_skipped_not_ready_or_failed(
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document
+    from packages.core.models.user import Entity
     from packages.core.services import embedding_service
     from packages.core.services.embedding_service import index_document
 
@@ -432,7 +561,7 @@ async def test_index_document_missing_fs_path_is_skipped_not_ready_or_failed(
         file_type="md",
         vector_status="pending",
     )
-    session.add(doc)
+    session.add_all([Entity(id=entity_id, name="Missing file entity"), doc])
     await session.flush()
 
     resolver = AsyncMock(return_value=None)
@@ -487,6 +616,7 @@ async def test_index_document_reads_xlsx_extracted_text_beyond_500_rows(db_sessi
     from openpyxl import Workbook
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document
+    from packages.core.models.user import Entity
     from packages.core.services.embedding_service import index_document
 
     entity_id = generate_ulid()
@@ -505,16 +635,19 @@ async def test_index_document_reads_xlsx_extracted_text_beyond_500_rows(db_sessi
     _set_manor_fs_root(monkeypatch, tmp_path)
 
     doc_id = generate_ulid()
-    session.add(
-        Document(
-            id=doc_id,
-            entity_id=entity_id,
-            name=rel_path,
-            fs_path=rel_path,
-            file_type="xlsx",
-            mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            vector_status="pending",
-        )
+    session.add_all(
+        [
+            Entity(id=entity_id, name="Spreadsheet entity"),
+            Document(
+                id=doc_id,
+                entity_id=entity_id,
+                name=rel_path,
+                fs_path=rel_path,
+                file_type="xlsx",
+                mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                vector_status="pending",
+            ),
+        ]
     )
     await session.flush()
 
@@ -564,6 +697,7 @@ async def test_index_document_reads_docx_and_pptx_extracted_text(db_session, tmp
     from pptx.util import Inches
     from packages.core.models.base import generate_ulid
     from packages.core.models.document import Document
+    from packages.core.models.user import Entity
     from packages.core.services.embedding_service import index_document
 
     entity_id = generate_ulid()
@@ -590,6 +724,7 @@ async def test_index_document_reads_docx_and_pptx_extracted_text(db_session, tmp
     deck_doc_id = generate_ulid()
     session.add_all(
         [
+            Entity(id=entity_id, name="Office document entity"),
             Document(
                 id=word_doc_id,
                 entity_id=entity_id,

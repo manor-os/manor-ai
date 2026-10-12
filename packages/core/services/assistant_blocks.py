@@ -1,19 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+import time
+from copy import deepcopy
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import PurePath
-from typing import Any
+from typing import Any, Literal
+
+from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
 
 
 ASSISTANT_BLOCKS_SCHEMA = "v1"
+AssistantProcessLifecycle = Literal["running", "completed", "failed", "cancelled", "waiting"]
 ASSISTANT_PROCESS_TOOL_KEY_PREFIX = "component.assistant_process.tool"
 ASSISTANT_STRUCTURED_RESULT_TOOLS = frozenset({
+    "invoke_skill",
+    "search_tools",
     "query_ledger",
     "visualize_workspace_ledgers",
     "render_response_surface",
 })
+_SKILL_ID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$", re.IGNORECASE)
 _LEDGER_COUNT_METRICS = {"count"}
 _LEDGER_FINANCE_METRICS = _LEDGER_COUNT_METRICS | {
     "sum_amount_minor",
@@ -22,6 +32,20 @@ _LEDGER_FINANCE_METRICS = _LEDGER_COUNT_METRICS | {
     "sum_inflow_minor",
     "sum_outflow_minor",
 }
+
+
+def assistant_tool_uses_structured_result(name: str, arguments: Any = None) -> bool:
+    """Return whether a tool result must bypass the lossy preview path."""
+
+    args = arguments if isinstance(arguments, dict) else {}
+    canonical_call = RuntimeCompositeToolCallFactory.create(name, args)
+    if canonical_call.tool_name in ASSISTANT_STRUCTURED_RESULT_TOOLS or canonical_call.tool_name.startswith("mcp__chrome__"):
+        return True
+    return (
+        canonical_call.tool_name == "workspace_agent"
+        and str(canonical_call.arguments.get("action") or "").strip().lower()
+        in {"visualize_ledgers", "operation"}
+    )
 
 
 def _ledger_metric_types(contract_id: Any) -> set[str]:
@@ -339,6 +363,17 @@ def _display_name(name: str) -> str:
     return (name or "tool").replace("_", " ").strip().capitalize()
 
 
+def _pretty_skill_slug(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return text
+    lowered = text.casefold()
+    if lowered.startswith(("mcp_", "mcp-")):
+        text = text[4:]
+    pretty = _pretty_identifier(text).strip()
+    return pretty[:1].upper() + pretty[1:] if pretty else str(value or "").strip()
+
+
 def _param_text(value: Any, *, max_chars: int = 80) -> str:
     return _compact_text(value, max_chars=max_chars)
 
@@ -438,6 +473,7 @@ def _mcp_display_metadata(
     arguments: dict[str, Any],
     *,
     summary: str = "",
+    result: Any = None,
 ) -> dict[str, Any]:
     server_pretty = _pretty_identifier(server)
     tool_pretty = _pretty_identifier(tool)
@@ -482,7 +518,26 @@ def _mcp_display_metadata(
             "display_params": {"target": display_target},
         }
 
-    if lower_server in {"chrome", "local_browser"} or "browser" in lower_server:
+    if lower_server == "chrome" or "browser" in lower_server:
+        parsed = _parse_preview_json(result) if isinstance(result, str) else result
+        parsed = parsed if isinstance(parsed, dict) else {}
+        resolution = parsed.get("target_resolution")
+        resolution = resolution if isinstance(resolution, dict) else {}
+        semantic = arguments.get("target")
+        semantic = semantic if isinstance(semantic, dict) else {}
+        label = _param_text(resolution.get("label") or resolution.get("name") or semantic.get("name") or "")
+        action = {"upload": "upload", "fill_or_select": "fill", "click_element": "click", "hover": "hover"}.get(lower_tool)
+        if action:
+            if action == "upload":
+                files = parsed.get("submitted_files")
+                names = [_path_basename(item.get("name")) for item in files if isinstance(item, dict)] if isinstance(files, list) else []
+                label = _param_text(", ".join(name for name in names if name) or _path_basename(arguments.get("source")))
+            return {
+                "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.browser.{action}{'' if label else '_generic'}",
+                "display_params": {"target": label} if label else {},
+            }
+        if lower_tool == "finalize_tabs":
+            return {"display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.browser.finalize", "display_params": {}}
         if any(token in lower_tool for token in ("open", "goto", "navigate")):
             key = "browser.open"
         elif lower_tool in {"read_page", "get_interactive_elements"}:
@@ -655,6 +710,24 @@ def _mcp_display_metadata(
     }
 
 
+# The sandbox carries a display-only ``description``: the chat guidance asks
+# the model for a few words on what the call does and why.
+_DESCRIBED_TOOLS = frozenset({"sandbox"})
+_MAX_STEP_DESCRIPTION_CHARS = 120
+
+
+def _step_description(name: str, args: dict[str, Any]) -> str:
+    if name.lower() not in _DESCRIBED_TOOLS:
+        return ""
+    value = args.get("description")
+    if not isinstance(value, str):
+        return ""
+    text = " ".join(value.split())
+    if len(text) > _MAX_STEP_DESCRIPTION_CHARS:
+        text = text[: _MAX_STEP_DESCRIPTION_CHARS - 1] + "…"
+    return text
+
+
 def _tool_display_metadata(
     name: str,
     arguments: Any,
@@ -664,8 +737,18 @@ def _tool_display_metadata(
     skill_display_names: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     normalized_name = (name or "tool").strip()
-    lower_name = normalized_name.lower()
     args = arguments if isinstance(arguments, dict) else {}
+    described = _step_description(normalized_name, args)
+    if described:
+        # The model's own words for this step beat a command excerpt.
+        return {
+            "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.described",
+            "display_params": {"target": described},
+        }
+    canonical_call = RuntimeCompositeToolCallFactory.create(normalized_name, args)
+    normalized_name = canonical_call.tool_name
+    lower_name = normalized_name.lower()
+    args = canonical_call.arguments
     target = summary
 
     if lower_name == "manor":
@@ -683,17 +766,17 @@ def _tool_display_metadata(
                 or _first_argument(manor_params, "path", "file", "filename", "name")
             )
         )
-        if action in {"list_tasks", "tasks"}:
+        if action == "list_tasks":
             return {
                 "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.manor.list_tasks",
                 "display_params": {"target": "tasks"},
             }
-        if action in {"create_task", "add_task"}:
+        if action == "create_task":
             return {
                 "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.manor.create_task",
                 "display_params": {"target": target or "task"},
             }
-        if action in {"update_task", "complete_task", "delete_task"}:
+        if action == "update_task":
             return {
                 "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.manor.update_task",
                 "display_params": {"target": target or "task"},
@@ -735,11 +818,18 @@ def _tool_display_metadata(
     mcp = _mcp_parts(lower_name)
     if mcp:
         server, tool = mcp
-        return _mcp_display_metadata(server, tool, args, summary=target)
+        return _mcp_display_metadata(server, tool, args, summary=target, result=result)
 
     if lower_name == "invoke_skill":
-        skill = _param_text(_first_argument(args, "slug", "skill", "name") or target)
-        display_skill = (skill_display_names or {}).get(skill.casefold(), skill)
+        skill = _param_text(_first_argument(args, "skill", "skill_id", "slug", "name") or target)
+        parsed = _parse_preview_json(result) if isinstance(result, str) else result
+        result_name = parsed.get("skill") if isinstance(parsed, dict) else None
+        result_name = _param_text(result_name) if isinstance(result_name, str) else ""
+        display_skill = (skill_display_names or {}).get(skill.casefold())
+        if not display_skill and result_name and not _SKILL_ID_RE.fullmatch(result_name):
+            display_skill = result_name
+        if not display_skill and not _SKILL_ID_RE.fullmatch(skill):
+            display_skill = _pretty_skill_slug(skill)
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.skill",
             "display_params": {"target": display_skill or "skill"},
@@ -784,23 +874,40 @@ def _tool_display_metadata(
             "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
         }
     if lower_name.startswith("workspace_"):
-        if lower_name in {"workspace_search", "workspace_list_knowledge"} or lower_name == "rag":
+        workspace_action = (
+            str(args.get("action") or "").strip().lower()
+            if lower_name == "workspace_agent"
+            else ""
+        )
+        workspace_args = (
+            args.get("params")
+            if workspace_action and isinstance(args.get("params"), dict)
+            else args
+        )
+        if lower_name in {"workspace_search", "workspace_list_knowledge"} or workspace_action in {
+            "search",
+            "list_knowledge",
+            "get_goal_status",
+            "visualize_ledgers",
+        }:
             key = "workspace.search"
-        elif lower_name == "workspace_create_task":
+        elif lower_name == "workspace_create_task" or workspace_action == "create_task":
             key = "workspace.create_task"
-        elif lower_name == "workspace_update_task_runtime":
+        elif lower_name == "workspace_update_task_runtime" or workspace_action == "update_task_runtime":
             key = "workspace.update_task"
-        elif "knowledge" in lower_name:
+        elif "knowledge" in lower_name or "knowledge" in workspace_action:
             key = "workspace.knowledge"
-        elif "rule" in lower_name:
+        elif "rule" in lower_name or "rule" in workspace_action:
             key = "workspace.rule"
-        elif "review" in lower_name:
+        elif "review" in lower_name or "review" in workspace_action:
             key = "workspace.review"
         else:
             key = "workspace.operate"
         return {
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.{key}",
-            "display_params": {"target": _tool_target(args, fallback=target or "workspace")},
+            "display_params": {
+                "target": _tool_target(workspace_args, fallback=target or "workspace")
+            },
         }
     if lower_name.startswith("ws_"):
         if "search" in lower_name:
@@ -955,10 +1062,19 @@ def _tool_display_metadata(
             "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.automation.manage",
             "display_params": {"target": _tool_target(args, fallback=target or "automation")},
         }
+    if lower_name == "generate_file":
+        handoff = _parse_preview_json(result) if isinstance(result, str) else result
+        if isinstance(handoff, dict) and handoff.get("status") == "sandbox_ready":
+            skill = _param_text(handoff.get("skill"))
+            return {
+                "display_key": f"{ASSISTANT_PROCESS_TOOL_KEY_PREFIX}.skill.prepare",
+                "display_params": {"target": skill.upper() if skill in {"docx", "pdf", "pptx", "xlsx"} else _pretty_skill_slug(skill) or "skill"},
+            }
     if lower_name in {
         "generate_file",
         "generate_image",
         "generate_video",
+        "import_free_music",
         "wait_media_jobs",
         "merge_videos",
         "align_subtitles",
@@ -1007,6 +1123,166 @@ def _tool_display_metadata(
     }
 
 
+def _discovered_skill_display_names(result: Any) -> dict[str, str]:
+    """Read identity from the authorized discovery receipt, before preview loss."""
+    payload = _parse_preview_json(result) if isinstance(result, str) else result
+    matches = payload.get("matches") if isinstance(payload, dict) else None
+    names: dict[str, str] = {}
+    for match in matches if isinstance(matches, list) else ():
+        if not isinstance(match, dict) or match.get("kind") != "skill":
+            continue
+        label = next((
+            value.strip() for key in ("display_name", "slug", "name")
+            if isinstance(value := match.get(key), str)
+            and value.strip() and not _SKILL_ID_RE.fullmatch(value.strip())
+        ), "")
+        if label:
+            for key in ("skill_id", "slug", "name"):
+                ref = match.get(key)
+                if isinstance(ref, str) and ref.strip():
+                    names[ref.strip().casefold()] = label
+    return names
+
+
+def _chrome_step_presentation(name: str, result: Any) -> dict[str, str] | None:
+    from packages.core.ai.chrome_results import normalize_chrome_result
+
+    payload = _parse_preview_json(result) if isinstance(result, str) else result
+    if not isinstance(payload, dict):
+        return None
+    payload = normalize_chrome_result(payload)
+    if payload.get("ok") is not False or payload.get("pending_verification") or payload.get("action_verification"):
+        return None
+    receipt = payload.get("action_receipt")
+    if receipt is not None and (
+        not isinstance(receipt, dict)
+        or receipt.get("contract") != "chrome_action_v1"
+        or receipt.get("execution") != "not_executed"
+        or receipt.get("verification") != "failed"
+    ):
+        return None
+    if (
+        name == "mcp__chrome__wait" and payload.get("status") == "timeout"
+        and payload.get("next_required_tool") in ("read_page", "mcp__chrome__read_page")
+        and (payload.get("action_executed") is None or payload.get("action_executed") is False)
+    ):
+        return {"kind": "chrome_wait_observation_timeout", "tone": "neutral"}
+    if (
+        name == "mcp__chrome__click_element" and payload.get("status") == "read_page_required"
+        and payload.get("reason") == "snapshot_mismatch" and payload.get("action_executed") is False
+    ):
+        return {"kind": "chrome_stale_snapshot_rejection", "tone": "neutral"}
+    return None
+
+
+def _process_outcome_status(outcome: Any) -> str | None:
+    status = outcome.get("status") if isinstance(outcome, dict) else None
+    return status if isinstance(status, str) and status in {
+        "answered", "completed", "partial", "blocked", "not_attempted",
+    } else None
+
+
+def project_process_outcome(blocks: Any, outcome: Any) -> Any:
+    """Project the host-validated message outcome, never infer it from attempts."""
+    status = _process_outcome_status(outcome)
+    if not isinstance(blocks, list) or status is None:
+        return blocks
+    projected = deepcopy(blocks)
+    for block in projected:
+        if isinstance(block, dict) and block.get("type") == "process" and block.get("lifecycle_status") == "completed":
+            block["outcome_status"] = status
+    return projected
+
+
+def project_browser_display_names(blocks: Any, tool_calls: Any) -> Any:
+    """Re-render public diagnostics and Chrome labels from aligned receipts."""
+    if not isinstance(blocks, list) or not isinstance(tool_calls, list):
+        return blocks
+    projected = deepcopy(blocks)
+    steps = [step for block in projected if isinstance(block, dict)
+             for step in block.get("steps", []) if isinstance(step, dict)]
+    if len(steps) != len(tool_calls) or any(
+        not isinstance(call, dict) or not isinstance(call.get("name"), str)
+        or step.get("name") != call.get("name")
+        for step, call in zip(steps, tool_calls)
+    ):
+        return blocks
+    for step, call in zip(steps, tool_calls):
+        if step.get("status") == "error" and call.get("raw_result"):
+            from packages.core.ai.runtime.streams import runtime_tool_result_for_chat
+
+            step["result_preview"] = _preview_json(
+                runtime_tool_result_for_chat(call["name"], call["raw_result"]), max_chars=500,
+            )
+        if str(call.get("name", "")).startswith("mcp__chrome__"):
+            step.update(_tool_display_metadata(call["name"], call.get("arguments"),
+                        result=call.get("raw_result") or call.get("result")))
+            if step.get("status") == "error":
+                presentation = _chrome_step_presentation(call["name"], call.get("raw_result") or call.get("result"))
+                if presentation is not None:
+                    step["presentation"] = presentation
+    return projected
+
+
+def project_skill_display_names(blocks: Any, tool_calls: Any) -> Any:
+    """Repair historical ID labels from execution receipts without rewriting history."""
+    if not isinstance(blocks, list):
+        return blocks
+    names: dict[str, str] = {}
+    for call in tool_calls if isinstance(tool_calls, list) else ():
+        if not isinstance(call, dict):
+            continue
+        if call.get("name") == "search_tools":
+            names.update(_discovered_skill_display_names(call.get("raw_result") or call.get("result")))
+        if call.get("name") != "invoke_skill":
+            continue
+        args = call.get("arguments")
+        if not isinstance(args, dict):
+            continue
+        ref = _param_text(_first_argument(args, "skill", "skill_id", "slug", "name"))
+        label = _tool_display_metadata(
+            "invoke_skill", args, result=call.get("raw_result") or call.get("result"),
+            skill_display_names=names,
+        )["display_params"]["target"]
+        if label != "skill":
+            names[ref.casefold()] = label
+    projected = deepcopy(blocks)
+    steps = [step for block in projected
+             if isinstance(block, dict) and isinstance(block.get("steps"), list)
+             for step in block["steps"] if isinstance(step, dict)]
+    calls = tool_calls if isinstance(tool_calls, list) else []
+    if len(steps) == len(calls) and all(
+        isinstance(call, dict) and step.get("name") == call.get("name")
+        for step, call in zip(steps, calls)
+    ):
+        # Historical process blocks carry lossy previews. Re-project only
+        # display fields from the exact corresponding execution receipt.
+        for step, call in zip(steps, calls):
+            name = str(call.get("name") or "")
+            result = call.get("raw_result") or call.get("result")
+            if name == "generate_file":
+                step.update(_tool_display_metadata(name, call.get("arguments"), result=result))
+            args = call.get("arguments")
+            canonical = RuntimeCompositeToolCallFactory.create(name, args if isinstance(args, dict) else {})
+            if result is not None and result != "" and step.get("status") == "error" and canonical.tool_name == "sandbox_exec":
+                from packages.core.ai.runtime.streams import runtime_tool_result_for_chat
+                step["result_preview"] = _preview_json(runtime_tool_result_for_chat(name, result), max_chars=500)
+    for block in projected:
+        if not isinstance(block, dict) or not isinstance(block.get("steps"), list):
+            continue
+        for step in block["steps"]:
+            if not isinstance(step, dict) or step.get("name") != "invoke_skill":
+                continue
+            current = (step.get("display_params") or {}).get("target")
+            if current and current != "skill" and not _SKILL_ID_RE.fullmatch(str(current)):
+                continue
+            step.update(_tool_display_metadata(
+                "invoke_skill", _parse_preview_json(step.get("arguments_preview")),
+                result=step.get("result_preview"), summary=str(current or ""), skill_display_names=names,
+            ))
+    return projected
+
+
 def _tool_summary(name: str, arguments: Any) -> str:
     if not isinstance(arguments, dict):
         return _preview_json(arguments, max_chars=96)
@@ -1026,10 +1302,91 @@ def _tool_summary(name: str, arguments: Any) -> str:
     return _compact_text(target, max_chars=96)
 
 
+def _conversion_retry_key(name: str, arguments: Any, result: Any = None) -> str | None:
+    """Match retries of one immutable source into one named output only."""
+    if name != "generate_file" or not isinstance(arguments, dict):
+        return None
+    params = arguments.get("params")
+    args = {**(params if isinstance(params, dict) else {}), **arguments}
+    source = args.get("source")
+    output = str(args.get("name") or "").strip()
+    if not isinstance(source, dict) or not output or not source.get("path") or not source.get("expected_sha256"):
+        return None
+    target = str(args.get("file_type") or PurePath(output).suffix.lstrip(".")).lower()
+    if not target:
+        return None
+    scope = args.get("storage_scope") or "task"
+    payload = _parse_preview_json(result) if isinstance(result, str) else result
+    if isinstance(payload, dict) and payload.get("error") == "storage_scope=workspace requires an active Workspace context":
+        scope = "task"  # The rejected scope has no destination in this runtime.
+    identity = [output, target, source["path"], source["expected_sha256"], scope]
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
+def _workspace_operation_review_token(operation: dict) -> str:
+    draft_id = str(operation.get("draft_id") or "")
+    fingerprint = operation.get("review_fingerprint")
+    return f"workspace_operation:{draft_id}:{fingerprint}" if fingerprint else draft_id
+
+
+def project_workspace_draft_retry_recovery(blocks: Any, tool_calls: Any, hitl_requests: Any) -> Any:
+    """Read-only legacy projection: audit results stay server-side, only links leave."""
+    projected = deepcopy(blocks)
+    if not isinstance(projected, list) or not isinstance(tool_calls, list):
+        return projected
+    processes = [block for block in projected if isinstance(block, dict) and block.get("type") == "process"]
+    if len(processes) != 1:
+        return projected
+    steps = processes[0].get("steps")
+    if not isinstance(steps, list) or not steps or len(steps) != len(tool_calls):
+        return projected
+    # Require the complete ordered tool/argument correspondence. Truncated or
+    # mismatched evidence is not enough to repair a historical process.
+    for index, (step, call) in enumerate(zip(steps, tool_calls, strict=True)):
+        if (
+            not isinstance(step, dict) or not isinstance(call, dict)
+            or step.get("seq") != index + 1 or step.get("name") != call.get("name")
+            or _parse_preview_json(step.get("arguments_preview")) != call.get("arguments")
+            or step.get("status") != call.get("status")
+        ):
+            return projected
+    builder = AssistantBlocksBuilder()
+    for call in tool_calls:
+        builder.end_tool(
+            call["name"], arguments=call.get("arguments"), status=call.get("status"),
+            result=call.get("result"), structured_result=call.get("raw_result"),
+        )
+    rebuilt = builder.blocks()[0]["steps"]
+    requests = {
+        item.get("id"): item for item in (hitl_requests or [])
+        if isinstance(item, dict) and item.get("type") == "approval"
+    }
+    id_map = {item["id"]: steps[index]["id"] for index, item in enumerate(rebuilt)}
+    valid_gates = set()
+    for index, item in enumerate(rebuilt):
+        token = item.get("approval_request_id")
+        request = requests.get(token)
+        if (
+            request and isinstance(request.get("operation"), dict)
+            and _workspace_operation_review_token(request["operation"]) == token
+        ):
+            steps[index]["approval_request_id"] = token
+            valid_gates.add(item["id"])
+    for index, item in enumerate(rebuilt):
+        recovered_by = item.get("recovered_by_step_id")
+        if recovered_by in valid_gates:
+            steps[index]["recovered_by_step_id"] = id_map[recovered_by]
+    return projected
+
+
 class AssistantBlocksBuilder:
     """Build UI-oriented assistant content blocks from stream text and tool events."""
 
-    def __init__(self, *, skill_display_names: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self, *, skill_display_names: Mapping[str, str] | None = None,
+        workspace_id: str | None = None,
+        started_at_ms: int | None = None,
+    ) -> None:
         self._blocks: list[dict[str, Any]] = []
         self._skill_display_names = {
             str(key).strip().casefold(): str(value).strip()
@@ -1045,11 +1402,23 @@ class AssistantBlocksBuilder:
         self._process: dict[str, Any] | None = None
         self._bound_opening_text_chars = 0
         self._has_final_text = False
+        self._tool_arguments: dict[str, Any] = {}
+        self._conversion_retry_keys: dict[str, str | None] = {}
+        self._workspace_id = str(workspace_id or "")
+        self._empty_draft_retry_keys: dict[str, tuple[str, str]] = {}
+        self._started_at_ms = started_at_ms
+        self._lifecycle_status: AssistantProcessLifecycle = "running"
+        self._ended_at_ms: int | None = None
+        self._finished_duration_ms: int | None = None
+        # Tool calls still being written: stream key -> step id.
+        self._drafts: dict[str, str] = {}
+        if started_at_ms is not None:
+            self._ensure_process()
 
     def append_text(self, text: str, *, phase: str = "opening", after_step_seq: int | None = None) -> None:
         if not text:
             return
-        if phase == "opening" and self._process is not None:
+        if phase == "opening" and self._process is not None and self._process.get("steps"):
             phase = "final"
         if self._has_final_text and phase not in {"final", "progress"}:
             phase = "final"
@@ -1073,11 +1442,110 @@ class AssistantBlocksBuilder:
         self._blocks.append(block)
         self._active_text = block
 
-    def reset_text(self) -> None:
-        self._blocks = [block for block in self._blocks if block.get("type") != "text"]
+    def reset_text(self, *, preserve_progress: bool = False) -> None:
+        self._blocks = [block for block in self._blocks if block.get("type") != "text" or (
+            preserve_progress and block.get("phase") in {"opening", "progress"}
+        )]
         self._active_text = None
-        self._text_seq = 0
-        self._bound_opening_text_chars = 0
+        if not preserve_progress:
+            self._text_seq = 0
+            self._bound_opening_text_chars = 0
+
+    def _trailing_candidate_blocks(self) -> list[dict[str, Any]]:
+        """Text written after the last tool step: the current reply candidate.
+
+        With steps, that is the progress keyed to the last step (and any
+        final draft); before any step, the opening text.
+        """
+        steps = len((self._process or {}).get("steps") or [])
+        if not steps:
+            return [block for block in self._blocks
+                    if block.get("type") == "text" and block.get("phase") in {"opening", "final"}]
+        return [
+            block for block in self._blocks
+            if block.get("type") == "text" and (
+                block.get("phase") == "final"
+                or (block.get("phase") == "progress" and block.get("after_step_seq") == steps)
+            )
+        ]
+
+    def promote_trailing_progress_to_final(self) -> None:
+        """Re-label the streamed text after the last step as the final answer.
+
+        Idempotent: with nothing trailing, or once promoted, nothing changes.
+        """
+        steps = len((self._process or {}).get("steps") or [])
+        trailing = [block for block in self._trailing_candidate_blocks()
+                    if block.get("phase") == "progress"] if steps else []
+        if not trailing:
+            return
+        text = "".join(str(block.get("text") or "") for block in trailing)
+        self._blocks = [block for block in self._blocks if not any(block is item for item in trailing)]
+        self._active_text = next(
+            (block for block in self._blocks if block.get("type") == "text" and block.get("phase") == "final"),
+            None,
+        )
+        if self._active_text is not None:
+            self._active_text["text"] = f"{text}{self._active_text.get('text', '')}"
+        elif text.strip():
+            self._active_text = None
+            self.append_text(text, phase="final")
+        self._has_final_text = True
+        self._refresh_process_status(force_completed=True)
+
+    def discard_candidate_text(self) -> None:
+        """Drop a reply candidate the host did not accept; keep earlier progress."""
+        trailing = self._trailing_candidate_blocks()
+        if not trailing:
+            return
+        self._blocks = [block for block in self._blocks if not any(block is item for item in trailing)]
+        self._active_text = None
+        self._has_final_text = False
+
+    def draft_tool(
+        self,
+        key: str,
+        name: str,
+        arguments: Any = None,
+        *,
+        preview: str = "",
+        now_ms: int | None = None,
+    ) -> None:
+        """Show a tool call the model is still writing, updated as it grows.
+
+        The step is marked ``drafting``; when the finished call starts it
+        becomes that call's step (start_tool), and a draft that never runs is
+        dropped when the turn finishes.
+        """
+        step_id = self._drafts.get(key)
+        step = next((item for item in (self._process or {}).get("steps") or ()
+                     if item.get("id") == step_id), None) if step_id else None
+        if step is None:
+            self.start_tool(name, arguments, now_ms=now_ms, _draft=True)
+            step = self._process["steps"][-1]
+            self._drafts[key] = step["id"]
+            return
+        self._apply_tool_arguments(step, name, arguments)
+        if preview:
+            step["draft_preview"] = preview
+        else:
+            step.pop("draft_preview", None)
+        self._refresh_process_status()
+
+    def _apply_tool_arguments(self, step: dict[str, Any], name: str, arguments: Any) -> None:
+        for key in ("summary", "display_key", "display_params", "display_label"):
+            step.pop(key, None)
+        step["arguments_preview"] = _preview_json(arguments)
+        summary = _tool_summary(name or "tool", arguments)
+        if summary:
+            step["summary"] = summary
+        step.update({
+            key: value for key, value in _tool_display_metadata(
+                name or "tool", arguments, summary=summary,
+                skill_display_names=self._skill_display_names,
+            ).items() if value not in ("", None)
+        })
+        self._tool_arguments[step["id"]] = arguments
 
     def start_tool(
         self,
@@ -1086,9 +1554,29 @@ class AssistantBlocksBuilder:
         *,
         now_ms: int | None = None,
         assistant_text: str | None = None,
+        _draft: bool = False,
     ) -> None:
         process = self._ensure_process()
         self._active_text = None
+        if not _draft:
+            # The finished call continues the step that showed it being written.
+            drafts = [item for item in process.get("steps") or () if item.get("drafting")]
+            draft = next((item for item in drafts if item.get("name") == (name or "tool")), None)
+            if draft is None and len(drafts) == 1:
+                # A gateway call can start under its inner tool's name.
+                draft = drafts[0]
+            if draft is not None:
+                draft["name"] = name or "tool"
+                draft["display_name"] = _display_name(name or "tool")
+                draft.pop("drafting", None)
+                draft.pop("draft_preview", None)
+                self._drafts = {key: value for key, value in self._drafts.items() if value != draft["id"]}
+                self._apply_tool_arguments(draft, name, arguments)
+                bound = assistant_text.strip() if assistant_text else ""
+                if bound:
+                    draft["assistant_text"] = bound
+                self._refresh_process_status()
+                return
         self._step_seq += 1
         step = {
             "id": f"step_{self._step_seq}",
@@ -1098,6 +1586,7 @@ class AssistantBlocksBuilder:
             "display_name": _display_name(name or "tool"),
             "status": "running",
             "arguments_preview": _preview_json(arguments),
+            **({"drafting": True} if _draft else {}),
         }
         summary = _tool_summary(name or "tool", arguments)
         if summary:
@@ -1115,6 +1604,11 @@ class AssistantBlocksBuilder:
         )
         if now_ms is not None:
             step["started_at_ms"] = int(now_ms)
+            if self._started_at_ms is None and self._lifecycle_status == "running":
+                self._started_at_ms = int(now_ms)
+            if self._started_at_ms is not None:
+                process["started_at_ms"] = self._started_at_ms
+        self._tool_arguments[step["id"]] = arguments
         process["steps"].append({key: value for key, value in step.items() if value not in ("", None)})
         self._refresh_process_status()
 
@@ -1131,27 +1625,51 @@ class AssistantBlocksBuilder:
     ) -> None:
         process = self._ensure_process()
         wanted = name or "tool"
+        if wanted == "search_tools":
+            self._skill_display_names.update(_discovered_skill_display_names(
+                structured_result if structured_result is not None else result,
+            ))
         step = None
         for candidate in reversed(process["steps"]):
-            if candidate.get("name") == wanted and candidate.get("status") == "running":
+            if (
+                candidate.get("name") == wanted and candidate.get("status") == "running"
+                and (arguments is None or self._tool_arguments.get(candidate["id"]) == arguments)
+            ):
                 step = candidate
                 break
         if step is None:
             self.start_tool(wanted, arguments)
             step = process["steps"][-1]
         step["status"] = status or "success"
-        preview = _preview_json(result, max_chars=500)
+        from packages.core.constants.hitl_envelope import parse_hitl_envelope
+
+        envelope = parse_hitl_envelope(structured_result if structured_result is not None else result)
+        hitl = envelope.get("hitl") if envelope is not None else None
+        if isinstance(hitl, dict) and hitl.get("type") == "approval" and hitl.get("id"):
+            step["approval_request_id"] = hitl["id"]
+        self._apply_chrome_action_receipt(step, wanted, structured_result if structured_result is not None else result)
+        if step["status"] == "error":
+            presentation = _chrome_step_presentation(wanted, structured_result if structured_result is not None else result)
+            if presentation is not None:
+                step["presentation"] = presentation
+        preview_result = result
+        preview_arguments = arguments if arguments is not None else self._tool_arguments.get(step["id"])
+        canonical = RuntimeCompositeToolCallFactory.create(wanted, preview_arguments if isinstance(preview_arguments, dict) else {})
+        if result is not None and step["status"] == "error" and canonical.tool_name == "sandbox_exec":
+            from packages.core.ai.runtime.streams import runtime_tool_result_for_chat
+            preview_result = runtime_tool_result_for_chat(wanted, result)
+        preview = _preview_json(preview_result, max_chars=500)
         if preview:
             step["result_preview"] = preview
         display_arguments = arguments
         if display_arguments is None:
-            display_arguments = _parse_preview_json(step.get("arguments_preview"))
+            display_arguments = self._tool_arguments.get(step["id"])
         summary = step.get("summary") or _tool_summary(wanted, display_arguments)
         step.update(
             _tool_display_metadata(
                 wanted,
                 display_arguments,
-                result=result,
+                result=structured_result if structured_result is not None else result,
                 summary=str(summary or ""),
                 skill_display_names=self._skill_display_names,
             )
@@ -1160,10 +1678,80 @@ class AssistantBlocksBuilder:
             step["duration_ms"] = int(duration_ms)
         if now_ms is not None:
             step["ended_at_ms"] = int(now_ms)
+        retry_key = _conversion_retry_key(wanted, display_arguments, result)
+        self._conversion_retry_keys[step["id"]] = retry_key
+        if step["status"] == "success" and retry_key:
+            for previous in process["steps"]:
+                if (
+                    previous["seq"] < step["seq"] and previous.get("status") == "error"
+                    and self._conversion_retry_keys.get(previous["id"]) == retry_key
+                ):
+                    previous["recovered_by_step_id"] = step["id"]
+        canonical_call = RuntimeCompositeToolCallFactory.create(
+            wanted,
+            display_arguments if isinstance(display_arguments, dict) else {},
+        )
+        # Only the missing-patches preflight exits before creating any draft.
+        # A valid review for the same workspace/title proves that retry recovered;
+        # keep the original error step, and do not infer recovery for other errors.
+        if (
+            canonical_call.tool_name == "workspace_agent"
+            and canonical_call.arguments.get("action") == "operation"
+        ):
+            params = canonical_call.arguments.get("params")
+            params = params if isinstance(params, dict) else {}
+            title = str(params.get("title") or "").strip()
+            scope = str(params.get("workspace_id") or self._workspace_id)
+            payload = structured_result if structured_result is not None else result
+            payload = _parse_preview_json(payload) if isinstance(payload, str) else payload
+            if (
+                step["status"] == "success" and isinstance(payload, dict)
+                and isinstance(payload.get("state"), dict) and payload.get("workspace_id")
+            ):
+                self._workspace_id = str(payload["workspace_id"])
+                scope = str(params.get("workspace_id") or self._workspace_id)
+            if title and scope and isinstance(payload, dict):
+                identity = (scope, title)
+                if (
+                    step["status"] == "error"
+                    and str(payload.get("error") or "").startswith(
+                        "create_draft requires patches as [{op, payload}] "
+                        "(keys accepted: patches, operations, ops). "
+                    )
+                    and not payload.get("draft")
+                ):
+                    self._empty_draft_retry_keys[step["id"]] = identity
+                operation = payload.get("operation")
+                operation = operation if isinstance(operation, dict) else {}
+                validation = operation.get("validation")
+                if (
+                    step["status"] == "success" and payload.get("__hitl__") is True
+                    and operation.get("kind") == "workspace_operation_review"
+                    and operation.get("workspace_id") == scope
+                    and operation.get("draft_id")
+                    and payload.get("approval_token") == _workspace_operation_review_token(operation)
+                    and operation.get("status") == "open"
+                    and isinstance(operation.get("patches"), list) and operation["patches"]
+                    and isinstance(validation, dict) and validation.get("valid") is True
+                    and validation.get("errors") == []
+                ):
+                    step["approval_request_id"] = payload["approval_token"]
+                    for previous in process["steps"]:
+                        if (
+                            previous["seq"] < step["seq"] and previous.get("status") == "error"
+                            and self._empty_draft_retry_keys.get(previous["id"]) == identity
+                        ):
+                            previous["recovered_by_step_id"] = step["id"]
         expected_visualization_kind = {
             "visualize_workspace_ledgers": "workspace_ledger_overview",
             "query_ledger": "ledger_query_result",
-        }.get(wanted)
+        }.get(canonical_call.tool_name)
+        if (
+            canonical_call.tool_name == "workspace_agent"
+            and str(canonical_call.arguments.get("action") or "").strip().lower()
+            == "visualize_ledgers"
+        ):
+            expected_visualization_kind = "workspace_ledger_overview"
         if expected_visualization_kind:
             visualization = _workspace_ledger_visualization(
                 structured_result if structured_result is not None else result,
@@ -1267,6 +1855,7 @@ class AssistantBlocksBuilder:
         return True
 
     def set_final_text(self, text: str) -> None:
+        """Replace streamed final drafts with the authoritative completed text."""
         if not text:
             return
         final_text = text.strip()
@@ -1281,32 +1870,26 @@ class AssistantBlocksBuilder:
             for block in self._blocks
             if block.get("type") == "text" and block.get("phase") == "final"
         ]
-        existing_final_text = "".join(str(block.get("text") or "") for block in existing_final_blocks)
-        if existing_final_text.strip() == final_text:
-            self._active_text = existing_final_blocks[-1] if existing_final_blocks else None
-            self._has_final_text = True
-            self._refresh_process_status(force_completed=True)
-            return
-        if existing_final_blocks and final_text.startswith(existing_final_text.strip()):
-            first = existing_final_blocks[0]
-            first["text"] = final_text
-            for block in existing_final_blocks[1:]:
-                block["text"] = ""
+        if existing_final_blocks:
+            # A later model round may revise a streamed summary. Finalization
+            # is called by both stream flush and persistence, so appending on
+            # a mismatch duplicates the answer again on every call. Keep one
+            # stable block identity after the retained process/progress blocks.
+            final = existing_final_blocks[-1]
+            final["text"] = final_text
             self._blocks = [
                 block
                 for block in self._blocks
                 if not (
                     block.get("type") == "text"
                     and block.get("phase") == "final"
-                    and not str(block.get("text") or "")
                 )
             ]
-            self._active_text = first
-            self._has_final_text = True
-            self._refresh_process_status(force_completed=True)
-            return
-        self._active_text = None
-        self.append_text(final_text, phase="final")
+            self._blocks.append(final)
+            self._active_text = final
+        else:
+            self._active_text = None
+            self.append_text(final_text, phase="final")
         self._has_final_text = True
         self._refresh_process_status(force_completed=True)
 
@@ -1314,6 +1897,47 @@ class AssistantBlocksBuilder:
         self._active_text = None
         self._has_final_text = True
         self._refresh_process_status(force_completed=True)
+
+    def finish(
+        self,
+        status: AssistantProcessLifecycle,
+        *,
+        now_ms: int | None = None,
+        outcome: Any = None,
+    ) -> None:
+        """Freeze this turn's lifecycle from runtime outcome, never model prose.
+
+        The step aggregate remains independent: a completed turn can retain
+        failed attempts or unverified effects without claiming they recovered.
+        Repeated persistence/stream finalization must not advance the clock.
+        """
+        if status == "running" or self._lifecycle_status != "running":
+            return
+        self._drop_unrun_drafts()
+        # Pure prose has a runtime lifecycle too. Retain its real clock without
+        # inventing tool steps or changing live opening/progress classification.
+        process = self._ensure_process()
+        outcome_status = _process_outcome_status(outcome) if status == "completed" else None
+        if outcome_status is not None:
+            process["outcome_status"] = outcome_status
+        self._lifecycle_status = status
+        self._ended_at_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        self._finished_duration_ms = (
+            max(0, self._ended_at_ms - self._started_at_ms)
+            if self._started_at_ms is not None
+            else int((self._process or {}).get("duration_ms") or 0)
+        )
+        self._refresh_process_status(force_completed=True)
+
+    def _drop_unrun_drafts(self) -> None:
+        """A drafted call that never started did not happen; it leaves no step."""
+        if self._process is None:
+            return
+        steps = self._process.get("steps") or []
+        kept = [step for step in steps if not step.get("drafting")]
+        if len(kept) != len(steps):
+            self._process["steps"] = kept
+        self._drafts.clear()
 
     def set_process_note(self, text: str | None) -> None:
         note = str(text or "").strip()
@@ -1328,6 +1952,12 @@ class AssistantBlocksBuilder:
 
     def meta(self) -> dict[str, Any]:
         blocks = self.blocks()
+        if self._lifecycle_status == "failed":
+            # Failed turns retain their execution record, not interactive
+            # surfaces or preliminary prose that may imply successful delivery.
+            blocks = [block for block in blocks if block.get("type") == "process" or (
+                block.get("type") == "text" and block.get("phase") == "final"
+            )]
         if not blocks:
             return {}
         return {
@@ -1343,10 +1973,16 @@ class AssistantBlocksBuilder:
                 "type": "process",
                 "title": "Processing",
                 "status": "running",
+                "lifecycle_status": self._lifecycle_status,
                 "default_collapsed": False,
                 "steps": [],
             }
-            self._blocks.append(self._process)
+            final_index = next((index for index, block in enumerate(self._blocks)
+                                if block.get("type") == "text" and block.get("phase") == "final"),
+                               len(self._blocks))
+            self._blocks.insert(final_index, self._process)
+            if self._started_at_ms is not None:
+                self._process["started_at_ms"] = self._started_at_ms
         return self._process
 
     def _opening_text(self) -> str:
@@ -1395,19 +2031,56 @@ class AssistantBlocksBuilder:
         if self._active_text and self._active_text not in self._blocks:
             self._active_text = None
 
+    def _apply_chrome_action_receipt(self, step: dict, tool: str, payload: Any) -> None:
+        if not tool.startswith("mcp__chrome__"):
+            return
+        from packages.core.ai.runtime.chrome_action_outcomes import CONTRACT, pending_action_receipt
+
+        payload = _parse_preview_json(payload) if isinstance(payload, str) else payload
+        if not isinstance(payload, dict):
+            return
+        receipt = payload.get("action_receipt")
+        if isinstance(receipt, dict) and receipt.get("contract") == CONTRACT:
+            step["action_id"] = receipt.get("action_id")
+            if pending_action_receipt(payload):
+                step["status"] = "unverified"
+        proof = payload.get("action_verification")
+        if (
+            not isinstance(proof, dict) or proof.get("contract") != CONTRACT
+            or proof.get("status") not in {"verified", "failed"} or not proof.get("snapshot_id")
+            or step["status"] != "success"
+        ):
+            return
+        for previous in self._process.get("steps", []):
+            if previous.get("action_id") == proof.get("action_id") and previous.get("status") == "unverified":
+                if proof["status"] == "failed":
+                    previous["status"] = "error"
+                    previous["failed_by_step_id"] = step["id"]
+                else:
+                    previous["verified_by_step_id"] = step["id"]
+
     def _refresh_process_status(self, *, force_completed: bool = False) -> None:
         process = self._process
         if not process:
             return
         steps = process.get("steps") or []
+        process["lifecycle_status"] = self._lifecycle_status
+        if self._ended_at_ms is not None:
+            process["ended_at_ms"] = self._ended_at_ms
         has_running = any(step.get("status") == "running" for step in steps)
-        has_error = any(step.get("status") == "error" for step in steps)
+        has_error = any(
+            step.get("status") == "error" and not step.get("recovered_by_step_id")
+            for step in steps
+        )
         if has_error:
             process["status"] = "error"
             process["default_collapsed"] = bool(force_completed or self._has_final_text)
-        elif has_running and not force_completed:
+        elif (has_running or (not steps and self._lifecycle_status == "running" and not self._has_final_text)) and not force_completed:
             process["status"] = "running"
             process["default_collapsed"] = False
+        elif any(step.get("status") == "unverified" and not step.get("verified_by_step_id") for step in steps):
+            process["status"] = "unverified"
+            process["default_collapsed"] = bool(force_completed or self._has_final_text)
         else:
             process["status"] = "completed"
             process["default_collapsed"] = bool(force_completed or self._has_final_text)
@@ -1422,12 +2095,28 @@ class AssistantBlocksBuilder:
             if isinstance(step.get("started_at_ms"), int | float)
             and isinstance(step.get("ended_at_ms"), int | float)
         ]
-        if steps and len(timestamped_steps) == len(steps):
+        if self._finished_duration_ms is not None:
+            process["duration_ms"] = self._finished_duration_ms
+        elif steps and len(timestamped_steps) == len(steps):
             started_at_ms = min(int(step["started_at_ms"]) for step in timestamped_steps)
             ended_at_ms = max(int(step["ended_at_ms"]) for step in timestamped_steps)
             process["duration_ms"] = max(0, ended_at_ms - started_at_ms)
         elif durations and not timestamped_steps:
             process["duration_ms"] = sum(durations)
+        elif self._started_at_ms is not None:
+            # Keep a durable elapsed floor while a later/outer tool is running.
+            # Clients calculate live time from started_at_ms, not from mounting
+            # time or a sum that double-counts overlapping nested tools.
+            observed_at_ms = max(
+                (
+                    int(step[field])
+                    for step in steps
+                    for field in ("started_at_ms", "ended_at_ms")
+                    if isinstance(step.get(field), int | float)
+                ),
+                default=self._started_at_ms,
+            )
+            process["duration_ms"] = max(0, observed_at_ms - self._started_at_ms)
         else:
             process.pop("duration_ms", None)
 
@@ -1435,3 +2124,38 @@ class AssistantBlocksBuilder:
 def assistant_blocks_stream_payload(builder: AssistantBlocksBuilder) -> dict[str, Any]:
     """Return the current assistant block state for SSE payloads."""
     return builder.meta()
+
+
+def project_failed_assistant_blocks(
+    blocks: Any, content: str | None, *, tool_calls: Any = None,
+    lifecycle: str = "failed",
+) -> list[dict] | None:
+    """Keep historical execution facts, replacing all answer/surface candidates."""
+    processes = [deepcopy(block) for block in (blocks or [])
+                 if isinstance(block, dict) and block.get("type") == "process"] if isinstance(blocks, list) else []
+    if not processes and not blocks and isinstance(tool_calls, list) and tool_calls:
+        # Read-only compatibility for turns whose old failure path discarded
+        # blocks. Tool durations cannot reconstruct total loop time.
+        builder = AssistantBlocksBuilder()
+        for call in tool_calls:
+            if isinstance(call, dict) and call.get("name"):
+                builder.end_tool(
+                    str(call["name"]), arguments=call.get("arguments"),
+                    result=call.get("result"), structured_result=call.get("raw_result"),
+                    status=call.get("status") or "unknown", duration_ms=call.get("duration_ms"),
+                )
+        processes = [deepcopy(block) for block in builder.blocks() if block.get("type") == "process"]
+        for process in processes:
+            for key in ("started_at_ms", "ended_at_ms", "duration_ms"):
+                process.pop(key, None)
+    if not processes:
+        return None
+    for process in processes:
+        process["lifecycle_status"] = lifecycle
+        process["status"] = "error"
+        # Old snapshots may lack a terminal clock. Never restart their timer.
+        if not process.get("ended_at_ms"):
+            process.pop("started_at_ms", None)
+    if content:
+        processes.append({"id": "blk_failure_summary", "type": "text", "phase": "final", "text": content})
+    return processes

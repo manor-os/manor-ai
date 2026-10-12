@@ -11,7 +11,7 @@ export interface ReadOnlyPreviewSource {
   contentUrl: string;
   getPages?: () => Promise<{ pages: PreviewPage[]; total?: number; version?: string }>;
   getSlides?: () => Promise<{ slides: PreviewPage[]; total?: number; version?: string }>;
-  fetchBinary?: () => Promise<Blob>;
+  fetchBinary?: (signal: AbortSignal) => Promise<Blob>;
 }
 
 export interface ReadOnlyFilePreviewProps {

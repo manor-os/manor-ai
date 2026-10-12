@@ -173,6 +173,7 @@ export interface WorkflowHistoryRun {
   capabilities?: { can_control?: boolean };
   business_outcome?: string;
   intervention?: WorkflowRunAction | null;
+  resume_action?: WorkflowRunAction | null;
   processed_count?: number;
   total_count?: number;
   artifact_count?: number | null;
@@ -223,8 +224,8 @@ const PROCESSED_STATUSES = new Set<WorkflowRunStatus>([
   "completed",
   "failed",
   "cancelled",
+  "skipped",
 ]);
-const PROGRESS_EXCLUDED_NODE_TYPES = new Set(["end"]);
 const EDITABLE_SCHEMA_TYPES = new Set(["string", "number", "integer", "boolean", "array", "object"]);
 const EDITABLE_SCHEMA_COMMON_KEYS = [
   "$schema",
@@ -232,6 +233,7 @@ const EDITABLE_SCHEMA_COMMON_KEYS = [
   "title",
   "description",
   "enum",
+  "x-enum-labels",
   "const",
   "default",
   "x-workflow-type",
@@ -252,6 +254,8 @@ const EDITABLE_SCHEMA_UI_KEYS = new Set([
   "collapsible",
   "collapsed",
   "order",
+  "project_type",
+  "allowed_stages",
 ]);
 const EDITABLE_SCHEMA_MAX_DEPTH = 12;
 const ERROR_TEXT_BYTES = 8 * 1024;
@@ -348,10 +352,24 @@ function editableSchemaUiIsCompatible(
   ) return false;
   if (
     ui.control !== undefined
-    && !["textarea", "line_list"].includes(String(ui.control))
+    && !["textarea", "line_list", "workflow_project_select", "documents"].includes(String(ui.control))
   ) return false;
   if (ui.control === "line_list" && schemaType !== "array") return false;
+  if (ui.control === "documents" && schemaType !== "array") return false;
   if (ui.control === "textarea" && !["string", "array"].includes(schemaType)) return false;
+  if (ui.control === "workflow_project_select") {
+    if (schemaType !== "string") return false;
+    if (typeof ui.project_type !== "string" || !ui.project_type.trim()) return false;
+    if (
+      !Array.isArray(ui.allowed_stages)
+      || ui.allowed_stages.length === 0
+      || ui.allowed_stages.length > 20
+      || ui.allowed_stages.some((stage) => typeof stage !== "string" || !stage.trim())
+      || new Set(ui.allowed_stages).size !== ui.allowed_stages.length
+    ) return false;
+  } else if (ui.project_type !== undefined || ui.allowed_stages !== undefined) {
+    return false;
+  }
   if (
     ui.rows !== undefined
     && (!Number.isInteger(ui.rows) || Number(ui.rows) < 1)
@@ -389,6 +407,15 @@ function editableSchemaFieldIsCompatible(value: unknown, depth: number): boolean
     && (
       !Array.isArray(schema.enum)
       || schema.enum.some((item) => !["string", "number", "boolean"].includes(typeof item) && item !== null)
+    )
+  ) return false;
+  if (
+    schema["x-enum-labels"] !== undefined
+    && (
+      !Array.isArray(schema.enum)
+      || !Array.isArray(schema["x-enum-labels"])
+      || schema["x-enum-labels"].length !== schema.enum.length
+      || schema["x-enum-labels"].some((item) => typeof item !== "string")
     )
   ) return false;
   if (
@@ -824,6 +851,105 @@ export function workflowRunStatusPresentation(
   };
 }
 
+export interface WorkflowRunFailure {
+  /** Node the run stopped on; retrying from it keeps every earlier result. */
+  stepId: string;
+  stepName: string;
+  /** Where a retry should restart; the failed node unless it names another. */
+  retryFromStepId: string;
+  title: string;
+  detail: string;
+  /** Short "what to change" hint before retrying, when the cause is known. */
+  hint: string;
+}
+
+const INSUFFICIENT_CREDITS = /insufficient credits:\s*required\s*([\d.,]+)\s*,\s*available\s*([\d.,-]+)/i;
+
+function formatCredits(raw: string): string {
+  const value = Number(raw.replace(/,/g, ""));
+  return Number.isFinite(value) ? Math.round(value).toLocaleString("en-US") : raw;
+}
+
+/**
+ * Explain a failed run in terms of the node it stopped on. Falls back to the
+ * failed node's own error when the run-level error is empty, so a failure is
+ * never shown without a reason.
+ */
+/**
+ * Canvas status for one node result. A node paused on background work (a
+ * rendering video, a timer, a child flow) is still working, so it shows as
+ * running; only waits for a person stay paused.
+ */
+export function workflowNodeDisplayStatus(result: {
+  status?: unknown;
+  wait_type?: unknown;
+  subrun_id?: unknown;
+}): string {
+  const status = String(result.status || "");
+  if (status !== "paused") return status;
+  const waitType = String(result.wait_type || "");
+  if (waitType === "media_job" || waitType === "timer" || (!waitType && result.subrun_id)) return "running";
+  return status;
+}
+
+/**
+ * What a paused run is waiting on when nobody needs to act: rendering media,
+ * a timer, or a child flow. Null when the pause waits for a person.
+ */
+export function workflowRunBackgroundWait(
+  run: { status?: string; current_step_id?: string | null; step_results?: Record<string, unknown> | null } | null | undefined,
+): string | null {
+  if (!run || run.status !== "paused") return null;
+  const result = asRecord((run.step_results || {})[String(run.current_step_id || "")]);
+  if (!result || workflowNodeDisplayStatus(result) !== "running") return null;
+  const waitType = String(result.wait_type || "");
+  if (waitType === "media_job") return "Rendering media · continues on its own";
+  if (waitType === "timer") return "Waiting on a timer · continues on its own";
+  return "Waiting on a sub-flow · continues on its own";
+}
+
+export function workflowRunFailure(
+  run: {
+    status?: string;
+    error?: unknown;
+    current_step_id?: string | null;
+    step_results?: Record<string, unknown> | null;
+  } | null | undefined,
+  steps: ReadonlyArray<{ id: string; name?: string }> = [],
+): WorkflowRunFailure | null {
+  if (!run || run.status !== "failed") return null;
+  const results = run.step_results || {};
+  const failedStepId = String(run.current_step_id || "").trim()
+    || Object.entries(results).reverse().find(([, value]) => asRecord(value)?.status === "failed")?.[0]
+    || "";
+  const stepResult = asRecord(results[failedStepId]);
+  const stepName = steps.find((step) => step.id === failedStepId)?.name?.trim() || failedStepId;
+  const rawError = formatWorkflowError(run.error, "…")
+    || formatWorkflowError(stepResult?.error, "…");
+  const retryFromStepId = String(stepResult?.retry_from_step_id || "").trim() || failedStepId;
+  const credits = INSUFFICIENT_CREDITS.exec(rawError);
+  if (credits) {
+    return {
+      stepId: failedStepId,
+      stepName,
+      retryFromStepId,
+      title: "Not enough credits",
+      detail: `${stepName ? `“${stepName}” needs` : "This step needs"} ${formatCredits(credits[1])} credits, `
+        + `but your balance is ${formatCredits(credits[2])}.`,
+      hint: "Add credits and retry from this step (earlier results are kept), "
+        + "or edit the inputs, for example a shorter video, and run again.",
+    };
+  }
+  return {
+    stepId: failedStepId,
+    stepName,
+    retryFromStepId,
+    title: stepName ? `“${stepName}” failed` : "Run failed",
+    detail: rawError || "The run stopped without reporting an error.",
+    hint: failedStepId ? "Retry from this step to keep the earlier results." : "",
+  };
+}
+
 function identityValue(value: unknown): string {
   return typeof value === "string" || typeof value === "number" ? `${value}`.trim() : "";
 }
@@ -838,6 +964,363 @@ export function actionIdentity(action: WorkflowRunAction): string {
   ]);
 }
 
+export interface WorkflowEditorStep {
+  id: string;
+  name?: string;
+  type?: string;
+  next?: string[];
+  true_next?: string[];
+  false_next?: string[];
+  config?: {
+    cases?: { next?: string[] }[];
+    default_next?: string[];
+    [key: string]: unknown;
+  };
+}
+
+export interface WorkflowFinalResult {
+  stepId: string | null;
+  stepName: string;
+  output: unknown;
+}
+
+export interface WorkflowFinalOutputField {
+  key: string;
+  label: string;
+  value: string;
+  structured: boolean;
+  /** Openable file reference when the raw value was a storage URL. */
+  reference?: string;
+  /** Redacted, bounded structured value for the readable view. */
+  raw?: unknown;
+}
+
+const STORAGE_FILE_URL = /^\/api\/v1\/fs\/[^/?#]+\/[^?#]+$/;
+const WORKSPACE_STORAGE_PATH = /^Workspaces\/_by_id\/[^/]+(?:\/|$)/;
+
+function lastPathSegment(value: string): string {
+  const segment = value.split(/[?#]/)[0].split("/").filter(Boolean).pop() || "";
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/** Storage URLs and `_by_id` paths are routing details, not display copy. */
+function storageFieldDisplay(value: string): { value: string; reference?: string } | null {
+  const text = value.trim();
+  if (STORAGE_FILE_URL.test(text)) {
+    const name = lastPathSegment(text);
+    return name ? { value: name, reference: text } : null;
+  }
+  if (WORKSPACE_STORAGE_PATH.test(text)) {
+    const name = lastPathSegment(text);
+    return name && !/^_by_id$/.test(name) ? { value: name } : null;
+  }
+  return null;
+}
+
+const FINAL_OUTPUT_WRAPPERS = new Set(["data", "output", "result", "state"]);
+const FINAL_OUTPUT_FIELD_LIMIT = 16;
+
+function workflowFinalOutputLabel(key: string): string {
+  const words = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/[._-]+/g, " ")
+    .trim()
+    .toLowerCase();
+  const label = words ? `${words.charAt(0).toUpperCase()}${words.slice(1)}` : "Value";
+  return label
+    .replace(/\bid\b/gi, "ID")
+    .replace(/\burl\b/gi, "URL")
+    .replace(/\buri\b/gi, "URI")
+    .replace(/\bmp4\b/gi, "MP4")
+    .replace(/\byoutube\b/gi, "YouTube");
+}
+
+function unwrapWorkflowFinalOutput(value: unknown): Record<string, unknown> | null {
+  let record = asRecord(value);
+  for (let depth = 0; record && depth < 2; depth += 1) {
+    const entries = Object.entries(record).filter(([, fieldValue]) => fieldValue !== undefined);
+    if (entries.length !== 1 || !FINAL_OUTPUT_WRAPPERS.has(entries[0][0])) break;
+    const nested = asRecord(entries[0][1]);
+    if (!nested) break;
+    record = nested;
+  }
+  return record;
+}
+
+const HEADLINE_TITLE_KEYS = ["title", "name", "headline"];
+const HEADLINE_SUMMARY_KEYS = ["summary", "description", "message"];
+
+/** The title/summary a final result leads with, taken from any flow's output. */
+export function workflowFinalHeadline(
+  output: unknown,
+): { title?: string; summary?: string; keys: string[] } | null {
+  const record = unwrapWorkflowFinalOutput(output);
+  if (!record) return null;
+  const pick = (candidates: string[]) => candidates.find((key) => (
+    typeof record[key] === "string" && String(record[key]).trim()
+  ));
+  const titleKey = pick(HEADLINE_TITLE_KEYS);
+  const summaryKey = pick(HEADLINE_SUMMARY_KEYS);
+  if (!titleKey && !summaryKey) return null;
+  return {
+    ...(titleKey ? { title: redactSensitiveText(String(record[titleKey]).trim()) } : {}),
+    ...(summaryKey ? { summary: redactSensitiveText(String(record[summaryKey]).trim()) } : {}),
+    keys: [titleKey, summaryKey].filter((key): key is string => Boolean(key)),
+  };
+}
+
+function locatesAFile(value: unknown): boolean {
+  const record = asRecord(value);
+  return !!record && ["document_id", "fs_path", "path", "url", "reference"].some((key) => (
+    typeof record[key] === "string" && String(record[key]).trim()
+  ));
+}
+
+/** Output keys whose value is only a list of files (shown as file cards). */
+export function workflowFinalFileListKeys(output: unknown): string[] {
+  const record = unwrapWorkflowFinalOutput(output);
+  if (!record) return [];
+  return Object.entries(record)
+    .filter(([, value]) => Array.isArray(value) && value.length > 0 && value.every(locatesAFile))
+    .map(([key]) => key);
+}
+
+/** README files lead a result's file list; everything else keeps output order. */
+export function orderWorkflowFinalArtifacts(refs: WorkflowArtifactRef[]): WorkflowArtifactRef[] {
+  const isReadme = (ref: WorkflowArtifactRef) => /^readme(\.|$)/i.test(
+    workflowArtifactLabel(ref, ""),
+  );
+  return [...refs.filter(isReadme), ...refs.filter((ref) => !isReadme(ref))];
+}
+
+export function workflowFinalOutputFields(
+  output: unknown,
+  { omitKeys = [] }: { omitKeys?: string[] } = {},
+): WorkflowFinalOutputField[] | null {
+  const record = unwrapWorkflowFinalOutput(output);
+  if (!record) return null;
+  const omitted = new Set(omitKeys);
+  const entries = Object.entries(record).filter(([key, value]) => value !== undefined && !omitted.has(key));
+  if (omitted.size && !entries.length) return null;
+  const orderedEntries = [
+    ...entries.filter(([, value]) => value === null || typeof value !== "object"),
+    ...entries.filter(([, value]) => value !== null && typeof value === "object"),
+  ];
+  const fields = orderedEntries.slice(0, FINAL_OUTPUT_FIELD_LIMIT).map(([key, value]) => {
+    const structured = value !== null && typeof value === "object";
+    let displayValue: string;
+    if (structured) displayValue = readableJson(value);
+    else if (typeof value === "boolean") displayValue = value ? "Yes" : "No";
+    else if (value === null) displayValue = "None";
+    else if (typeof value === "string") {
+      const storage = storageFieldDisplay(value);
+      if (storage) {
+        return {
+          key,
+          label: workflowFinalOutputLabel(key),
+          value: storage.value,
+          structured,
+          ...(storage.reference ? { reference: storage.reference } : {}),
+        };
+      }
+      displayValue = redactSensitiveText(value);
+    }
+    else if (typeof value === "number" || typeof value === "bigint") displayValue = `${value}`;
+    else displayValue = readableJson(value);
+    return {
+      key,
+      label: workflowFinalOutputLabel(key),
+      value: displayValue,
+      structured,
+      ...(structured ? { raw: boundedJsonPreview(value) } : {}),
+    };
+  });
+  if (entries.length > FINAL_OUTPUT_FIELD_LIMIT) {
+    fields.push({
+      key: "__additional_fields",
+      label: "Additional fields",
+      value: `${entries.length - FINAL_OUTPUT_FIELD_LIMIT} more`,
+      structured: false,
+    });
+  }
+  return fields;
+}
+
+export function workflowFinalArtifactRefs(output: unknown, limit = 6): WorkflowArtifactRef[] {
+  const refs: WorkflowArtifactRef[] = [];
+  const identities = new Set<string>();
+  const visited = new WeakSet<object>();
+  const boundedLimit = Math.max(0, Math.min(limit, 50));
+  const visit = (value: unknown, depth: number) => {
+    if (value == null || refs.length >= boundedLimit || depth > 6) return;
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    const record = asRecord(value);
+    if (!record || visited.has(record)) return;
+    visited.add(record);
+    // Only records that locate a file are artifacts. A result object's own
+    // `status`/`name` must not become a nameless, unopenable "File 1" that
+    // also dedupes every real file away under the empty identity.
+    const viewerDocumentId = [record.reference, record.viewer_url, record.url]
+      .map((candidate) => (typeof candidate === "string"
+        ? /^\/viewer\/([A-Za-z0-9._:-]+)\/?$/.exec(candidate.trim())?.[1]
+        : undefined))
+      .find(Boolean);
+    const [artifact] = normalizeWorkflowArtifactRefs({
+      ...record,
+      document_id: record.document_id ?? viewerDocumentId,
+      name: record.name ?? record.filename,
+    }).filter((ref) => ref.document_id || ref.fs_path);
+    if (artifact) {
+      const identity = JSON.stringify([artifact.document_id || "", artifact.fs_path || ""]);
+      if (!identities.has(identity)) {
+        identities.add(identity);
+        refs.push(artifact);
+      }
+    }
+    for (const [key, nested] of Object.entries(record)) {
+      if (!SENSITIVE_JSON_KEY.test(key)) visit(nested, depth + 1);
+    }
+  };
+  visit(output, 0);
+  return refs;
+}
+
+function routeTargets(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.map((item) => String(item || "").trim()).filter(Boolean);
+}
+
+/**
+ * Every node a step can route to, matching the runner's declared routes:
+ * `next`, `true_next`, `false_next`, switch `cases` / `default_next` /
+ * `output_next`, and `config.error_next` for handled failures.
+ */
+export function workflowStepTargets(step: {
+  next?: unknown;
+  true_next?: unknown;
+  false_next?: unknown;
+  config?: Record<string, unknown> | null;
+}): string[] {
+  const cases = Array.isArray(step.config?.cases) ? step.config.cases : [];
+  const outputNext = Array.isArray(step.config?.output_next) ? step.config.output_next : [];
+  return [...new Set([
+    ...routeTargets(step.next),
+    ...routeTargets(step.true_next),
+    ...routeTargets(step.false_next),
+    ...cases.flatMap((item) => routeTargets((item as { next?: unknown } | null)?.next)),
+    ...routeTargets(step.config?.default_next),
+    ...outputNext.flatMap((value) => routeTargets(Array.isArray(value) ? value : [value])),
+    ...routeTargets(step.config?.error_next),
+  ])];
+}
+
+function workflowEditorTargets(step: WorkflowEditorStep): string[] {
+  return workflowStepTargets(step);
+}
+
+function hasWorkflowOutput(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
+}
+
+// Gates only route the run; their true/false is never the run's result.
+const WORKFLOW_ROUTING_STEP_TYPES = new Set(["condition", "switch"]);
+
+export function resolveWorkflowFinalResult(
+  steps: WorkflowEditorStep[],
+  run: {
+    status?: string;
+    current_step_id?: string | null;
+    variables?: Record<string, unknown>;
+    step_results?: Record<string, unknown>;
+  },
+): WorkflowFinalResult | null {
+  const durableResult = run.variables?.__result;
+  if (hasWorkflowOutput(durableResult)) {
+    return { stepId: null, stepName: "Workflow", output: durableResult };
+  }
+
+  const results = run.step_results || {};
+  const terminals = steps.filter(
+    (step) => step.type === "end" || (
+      workflowEditorTargets(step).length === 0 && !WORKFLOW_ROUTING_STEP_TYPES.has(step.type || "")
+    ),
+  );
+  for (const terminal of terminals) {
+    const terminalResult = asRecord(results[terminal.id]);
+    const terminalReached = terminalResult !== null
+      || (run.status === "completed" && run.current_step_id === terminal.id);
+    if (!terminalReached) continue;
+    const output = terminalResult?.output;
+    if (hasWorkflowOutput(output) && output !== terminal.name) {
+      return { stepId: terminal.id, stepName: terminal.name || "End", output };
+    }
+    const predecessor = [...steps].reverse().find((step) => {
+      const result = asRecord(results[step.id]);
+      return workflowEditorTargets(step).includes(terminal.id)
+        && !WORKFLOW_ROUTING_STEP_TYPES.has(step.type || "")
+        && result?.status === "completed"
+        && result.skipped !== true
+        && hasWorkflowOutput(result.output);
+    });
+    if (predecessor) {
+      const result = asRecord(results[predecessor.id])!;
+      return {
+        stepId: predecessor.id,
+        stepName: predecessor.name || predecessor.id,
+        output: result.output,
+      };
+    }
+  }
+
+  for (const [stepId, rawResult] of Object.entries(results).reverse()) {
+    const step = steps.find((candidate) => candidate.id === stepId);
+    const result = asRecord(rawResult);
+    if (
+      !step
+      || !result
+      || ["trigger", "webhook", "end", "note"].includes(step.type || "")
+      || WORKFLOW_ROUTING_STEP_TYPES.has(step.type || "")
+    ) {
+      continue;
+    }
+    if (result.status === "completed" && result.skipped !== true && hasWorkflowOutput(result.output)) {
+      return { stepId, stepName: step.name || stepId, output: result.output };
+    }
+  }
+  return null;
+}
+
+export function workflowEditorRunProgress(
+  steps: Pick<WorkflowEditorStep, "id" | "type">[],
+  statusById: Record<string, string>,
+  run?: { status?: string; processed_count?: number | null } | null,
+): { processed: number; total: number } {
+  const executableSteps = steps.filter((step) => step.type !== "note");
+  const observed = executableSteps.reduce(
+    (count, step) => count + (PROCESSED_STATUSES.has(statusById[step.id] as WorkflowRunStatus) ? 1 : 0),
+    0,
+  );
+  const persisted = Number.isInteger(run?.processed_count)
+    ? Math.max(0, Number(run?.processed_count))
+    : 0;
+  const processed = Math.max(observed, persisted);
+  // A completed run executed its whole path (branches skip the rest), so it
+  // reads N/N. A failed or cancelled run stopped early; keep the graph size
+  // as the denominator so "3/3" doesn't read as "all done".
+  const completed = String(run?.status || "") === "completed";
+  return {
+    processed,
+    total: completed ? processed : Math.max(executableSteps.length, processed),
+  };
+}
+
 export function processedNodeCount(nodes: WorkflowRunNode[]): number {
   return nodes.reduce(
     (count, node) => count + (PROCESSED_STATUSES.has(node.status) ? 1 : 0),
@@ -846,16 +1329,11 @@ export function processedNodeCount(nodes: WorkflowRunNode[]): number {
 }
 
 export function workflowProgressNodes(nodes: WorkflowRunNode[]): WorkflowRunNode[] {
-  return nodes.filter((node) => (
-    !PROGRESS_EXCLUDED_NODE_TYPES.has(String(node.type || "").trim().toLowerCase())
-  ));
+  return nodes;
 }
 
 export function progressNodeCount(nodes: WorkflowRunNode[]): number {
-  return nodes.reduce(
-    (count, node) => count + (node.status === "skipped" ? 0 : 1),
-    0,
-  );
+  return nodes.length;
 }
 
 export function notReachedNodeCount(nodes: WorkflowRunNode[]): number {
@@ -866,18 +1344,35 @@ export function notReachedNodeCount(nodes: WorkflowRunNode[]): number {
 }
 
 export function workflowCurrentStepLabelKey(
-  run: Pick<WorkflowRunView, "action" | "status">,
+  run: Pick<WorkflowRunView, "action" | "status" | "businessOutcome">,
 ): "current_step" | "retry_from" | "continue_from" {
   if (run.action?.kind !== "workflow_retry") return "current_step";
+  if (workflowRunNeedsInput(run)) return "continue_from";
   return "retry_from";
 }
 
+export function workflowRunNeedsInput(
+  run: Pick<WorkflowRunView, "status" | "businessOutcome" | "action">,
+): boolean {
+  return run.status === "completed"
+    && (run.businessOutcome || run.action?.business_outcome) === "needs_input";
+}
+
+/** Readable input guidance; structured error payloads belong in run details. */
+export function workflowInputGuidance(action: WorkflowRunAction): string[] {
+  const value = action.required_change || action.observed_problem || action.prompt || action.description;
+  const items = Array.isArray(value) ? value : [value];
+  return items.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    .map((item) => action.editable_input_schema?.properties?.[item]?.title || item);
+}
+
 export function workflowRunActionLabelKey(
-  run: Pick<WorkflowRunView, "status">,
+  run: Pick<WorkflowRunView, "status" | "businessOutcome" | "action">,
   option: string,
 ): string | null {
   const normalized = option.toLowerCase().replace(/[-\s]+/g, "_");
   if (["retry", "retry_now"].includes(normalized)) {
+    if (workflowRunNeedsInput(run)) return "component.workflow_run.action.continue";
     return "component.workflow_run.action.retry";
   }
   const keyByOption: Record<string, string> = {
@@ -1013,15 +1508,8 @@ function workflowFamilyProgress(run: WorkflowHistoryRun): {
   processedCount: number;
   totalCount: number;
 } {
-  const snapshotNodes = run.definition_snapshot?.nodes || [];
-  const visibleNodes = snapshotNodes.filter((node) => (
-    String(node.type || "").toLowerCase() !== "end"
-    && (node.chat_projection || node.config?.chat_projection) !== "hidden"
-  ));
-  const results = run.step_results || {};
   if (
-    visibleNodes.length === 0
-    && Number.isFinite(run.processed_count)
+    Number.isFinite(run.processed_count)
     && Number.isFinite(run.total_count)
   ) {
     return {
@@ -1029,32 +1517,62 @@ function workflowFamilyProgress(run: WorkflowHistoryRun): {
       totalCount: Math.max(0, Number(run.total_count)),
     };
   }
-  if (visibleNodes.length === 0 && run.execution_trace?.length) {
+  const snapshotNodes = run.definition_snapshot?.nodes || [];
+  const visibleNodeIds = new Set(snapshotNodes.filter((node) => (
+    (node.chat_projection || node.config?.chat_projection) !== "hidden"
+  )).map((node) => node.id));
+  const hasVisibilityContract = snapshotNodes.length > 0;
+  if (run.execution_trace?.length) {
     const latestTraceByNode = new Map<string, WorkflowTraceEntry>();
     for (const entry of [...run.execution_trace].sort((left, right) => (
       Number(left.sequence || 0) - Number(right.sequence || 0)
     ))) {
-      if (String(entry.node_type || "").toLowerCase() !== "end") {
+      if (!hasVisibilityContract || visibleNodeIds.has(entry.node_id)) {
         latestTraceByNode.set(entry.node_id, entry);
       }
     }
-    const traceEntries = [...latestTraceByNode.values()];
+    const reachedStatuses = new Map<string, string>(
+      [...latestTraceByNode].map(([nodeId, entry]) => [nodeId, String(entry.status || "")]),
+    );
+    const results = run.step_results || {};
+    for (const [nodeId, rawResult] of Object.entries(results)) {
+      if (hasVisibilityContract && !visibleNodeIds.has(nodeId)) continue;
+      const result = asRecord(rawResult);
+      if (!result) continue;
+      reachedStatuses.set(
+        nodeId,
+        result.skipped === true
+          ? "skipped"
+          : String(result.status || (result.error ? "failed" : "completed")),
+      );
+    }
+    const currentNodeId = String(run.current_step_id || "").trim();
+    if (
+      currentNodeId
+      && (!hasVisibilityContract || visibleNodeIds.has(currentNodeId))
+      && !reachedStatuses.has(currentNodeId)
+    ) {
+      reachedStatuses.set(currentNodeId, run.status);
+    }
     return {
-      processedCount: traceEntries.filter((entry) => (
-        ["completed", "failed", "cancelled"].includes(String(entry.status || "").toLowerCase())
+      processedCount: [...reachedStatuses.values()].filter((status) => (
+        ["completed", "failed", "cancelled", "skipped"].includes(
+          status.toLowerCase(),
+        )
       )).length,
-      totalCount: traceEntries.length,
+      totalCount: reachedStatuses.size,
     };
   }
-  const nodeIds = visibleNodes.length > 0
-    ? visibleNodes.map((node) => node.id)
-    : Object.keys(results);
+  const results = run.step_results || {};
+  const nodeIds = Object.keys(results).filter((nodeId) => (
+    !hasVisibilityContract || visibleNodeIds.has(nodeId)
+  ));
   const processedCount = nodeIds.reduce((count, nodeId) => {
     const result = results[nodeId];
     if (!result || typeof result !== "object" || Array.isArray(result)) return count;
     const record = result as Record<string, unknown>;
     const status = String(record.status || "").toLowerCase();
-    return !record.skipped && ["completed", "failed", "cancelled"].includes(status)
+    return (record.skipped === true || ["completed", "failed", "cancelled", "skipped"].includes(status))
       ? count + 1
       : count;
   }, 0);

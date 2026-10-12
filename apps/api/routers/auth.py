@@ -11,9 +11,12 @@ from urllib.parse import quote
 import httpx
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from packages.core.database import get_db
 from packages.core.models.base import generate_ulid
@@ -42,10 +45,10 @@ from packages.core.services.totp_service import (
     verify_2fa_login,
     verify_and_enable_2fa,
 )
-from apps.api.deps import get_current_user, require_plan
+from apps.api.deps import get_current_user, require_plan, security
+from packages.core.services import browser_session
 from packages.core.i18n import SUPPORTED_LOCALES, get_locale
 from packages.core.permissions import (
-    _get_role_permissions,
     legacy_role_for_staff_role,
     user_effective_permission_keys,
     user_staff_role_summary,
@@ -62,6 +65,9 @@ from packages.core.services.email_verification_service import (
     verify_email,
 )
 from packages.core.services.email_service import send_verification_email
+from packages.core.services.user_email_proof import (
+    email_is_verified, mark_email_verified, provider_verified_claim,
+)
 from packages.core.services.settings_service import update_user_preferences
 from packages.core.config import get_settings
 from apps.api.middleware.rate_limit import client_ip
@@ -76,6 +82,8 @@ router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
 # ── Schemas ──
 
+
+
 class RegisterRequest(BaseModel):
     username: str | None = None
     email: str
@@ -84,6 +92,7 @@ class RegisterRequest(BaseModel):
     captcha_token: str | None = None
     invitation_code: str | None = None
     invite_token: str | None = None
+    chat_invite_token: str | None = None
     """Required when the platform feature flag
     ``require_invitation_code`` is on. When omitted/empty in that mode,
     the endpoint returns 403. Optional codes still work for bonus
@@ -105,6 +114,7 @@ class TokenResponse(BaseModel):
     user_id: str
     entity_id: str
     role: str
+    is_new: bool = False
 
 
 class MfaStepUpRequest(BaseModel):
@@ -117,6 +127,7 @@ class UserResponse(BaseModel):
     id: str
     username: str | None = None
     email: str
+    email_verified: bool = False
     display_name: str | None = None
     first_name: str | None = None
     last_name: str | None = None
@@ -168,6 +179,7 @@ def _user_response(
         username=_username_for(user),
         display_name=user.display_name,
         email=user.email,
+        email_verified=email_is_verified(user),
         first_name=user.first_name,
         last_name=user.last_name,
         phone=user.phone,
@@ -274,6 +286,10 @@ async def _register_from_staff_invite(
 
 
 
+
+
+
+
 @router.post("/register")
 async def register(req: RegisterRequest, request: Request, db: AsyncSession = Depends(get_db)):
     """Register a new user + entity. If email verification is enabled, returns pending status.
@@ -297,9 +313,12 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         if not await verify_captcha(req.captcha_token, remote_ip):
             raise HTTPException(400, "Captcha verification failed")
 
+
     if (req.invite_token or "").strip():
         user, entity = await _register_from_staff_invite(db, req=req)
+        user.locale = get_locale()
         mark_user_login(user, source="auth.register_invite")
+        # A following request must see the account before we issue its token.
         await db.commit()
         token = create_access_token(
             user.id, entity.id, user.role, token_version=user.token_version,
@@ -309,6 +328,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
             user_id=user.id,
             entity_id=entity.id,
             role=user.role,
+            is_new=True,
         )
 
     # ── Invitation code gate (validate up front) ──────────────────────
@@ -320,13 +340,20 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
     )
     invite_row = None
     code_str = (req.invitation_code or "").strip()
+    chat_invite_token = (req.chat_invite_token or "").strip()
+    allow_chat_signup = False
+    if chat_invite_token:
+        from packages.core.services.chat_room_invites import valid_chat_registration_invite
+        allow_chat_signup = await valid_chat_registration_invite(db, chat_invite_token, req.email)
+        if not allow_chat_signup:
+            raise HTTPException(403, "Chat invitation is invalid or does not match this email")
     must_have_code = await invite_required(db)
     if code_str:
         try:
             invite_row = await validate_invite(db, code_str)
         except InvitationCodeError as e:
             raise HTTPException(403, str(e))
-    elif must_have_code:
+    elif must_have_code and not allow_chat_signup:
         raise HTTPException(
             403,
             "Registration is invite-only right now. Enter your invitation code to continue.",
@@ -340,6 +367,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
             entity_name=req.entity_name,
             display_name=(req.username or "").strip(),
         )
+        user.locale = get_locale()
     except ValueError as e:
         # If email already registered but pending verification, resend code
         if "already registered" in str(e) and _CLOUD_FEATURES_ENABLED:
@@ -378,6 +406,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
                 await send_verification_email(existing.email, code)
                 return {
                     "requires_verification": True,
+                    "is_new": False,
                     "email": existing.email,
                     "message": "Verification code resent to your email",
                 }
@@ -398,6 +427,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
 
     if _CLOUD_FEATURES_ENABLED:
         user.status = "pending"
+        # Verification must not become usable before its account is committed.
         await db.commit()
         code = await create_verification(
             user.email,
@@ -407,11 +437,13 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         await send_verification_email(user.email, code)
         return {
             "requires_verification": True,
+            "is_new": True,
             "email": user.email,
             "message": "Verification code sent to your email",
         }
 
     mark_user_login(user, source="auth.register")
+    # get_db's teardown can run after the success response has been sent.
     await db.commit()
     token = create_access_token(
         user.id, entity.id, user.role, token_version=user.token_version,
@@ -421,6 +453,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
         user_id=user.id,
         entity_id=entity.id,
         role=user.role,
+        is_new=True,
     )
 
 
@@ -429,6 +462,7 @@ async def register(req: RegisterRequest, request: Request, db: AsyncSession = De
 class VerifyEmailRequest(BaseModel):
     email: str
     code: str
+    remember_me: bool = False
 
 
 class ResendVerificationRequest(BaseModel):
@@ -440,6 +474,8 @@ class ResendVerificationRequest(BaseModel):
 @router.post("/verify-email")
 async def verify_email_endpoint(
     req: VerifyEmailRequest,
+    request: Request,
+    response: Response,
     db: AsyncSession = Depends(get_db),
 ):
     """Verify email with an 8-character alphanumeric code and return a JWT."""
@@ -453,7 +489,8 @@ async def verify_email_endpoint(
         raise HTTPException(400, "User not found")
 
     mark_user_login(user, source="auth.verify_email")
-    # The activation must be durable before issuing a token or sending welcome.
+    await browser_session.issue_session(db, request, response, user, remember=req.remember_me)
+    # Activation must be durable and visible before issuing a token or sending welcome.
     await db.commit()
 
     from packages.core.services.email_service import send_welcome_email
@@ -491,8 +528,73 @@ async def resend_verification_endpoint(
     return {"message": "If that email is pending verification, a new code has been sent."}
 
 
+class ConfirmCurrentEmailRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(min_length=1, max_length=64)
+
+
+def _email_proof_response(user: User) -> dict:
+    return {"email": user.email, "email_verified": email_is_verified(user)}
+
+
+def _email_proof_error(exc) -> HTTPException:
+    headers = {"Cache-Control": "no-store"}
+    if exc.retry_after:
+        headers["Retry-After"] = str(exc.retry_after)
+    return HTTPException(exc.status, exc.code, headers=headers)
+
+
+@router.get("/me/email-verification")
+async def current_email_verification(
+    response: Response, user: User = Depends(get_current_user),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return _email_proof_response(user)
+
+
+@router.post("/me/email-verification/send")
+async def send_current_email_verification(
+    request: Request, response: Response,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    from packages.core.services import authenticated_email_verification as proof
+
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        current, code = await proof.issue(db, user, client_ip(request))
+    except proof.EmailProofError as exc:
+        raise _email_proof_error(exc) from None
+    await db.commit()
+    if code:
+        try:
+            sent = await send_verification_email(current.email, code)
+        except Exception:
+            sent = False
+        if not sent:
+            raise HTTPException(503, "email_verification_delivery_unavailable",
+                                headers={"Cache-Control": "no-store"})
+    return {**_email_proof_response(current), "sent": bool(code)}
+
+
+@router.post("/me/email-verification/confirm")
+async def confirm_current_email_verification(
+    req: ConfirmCurrentEmailRequest, request: Request, response: Response,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    from packages.core.services import authenticated_email_verification as proof
+
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        current = await proof.confirm(db, user, client_ip(request), req.code)
+    except proof.EmailProofError as exc:
+        raise _email_proof_error(exc) from None
+    await db.commit()
+    # This endpoint never changes status, authenticates an MFA challenge, or mints JWTs.
+    return _email_proof_response(current)
+
+
 @router.post("/login")
-async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(get_db)):
+async def login(req: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """Authenticate and return JWT. If 2FA is enabled, requires totp_code."""
     if CAPTCHA_ENABLED:
         if not req.captcha_token:
@@ -560,6 +662,9 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
 
     # Check email verification
     if _CLOUD_FEATURES_ENABLED and user.status == "pending":
+        from packages.core.database_runtime import release_read_transaction
+
+        await release_read_transaction(db)
         code = await create_verification(
             user.email,
             user.id,
@@ -578,6 +683,7 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
 
     await clear_login_failures(login_id)
     mark_user_login(user, source="auth.login")
+    await browser_session.issue_session(db, request, response, user, remember=req.remember_me, mfa_authenticated=bool(user.totp_enabled))
     token = create_access_token(
         user.id,
         user.entity_id,
@@ -594,15 +700,65 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
     )
 
 
-@router.post("/logout", status_code=204)
-async def logout(
-    user: User = Depends(get_current_user),
+class RefreshSessionRequest(BaseModel):
+    entity_id: str | None = None
+
+
+@router.post("/session/refresh", response_model=TokenResponse)
+async def refresh_browser_session(
+    req: RefreshSessionRequest, request: Request, response: Response,
     db: AsyncSession = Depends(get_db),
 ):
-    """Revoke every bearer token issued before this logout."""
-    user.token_version = int(user.token_version or 0) + 1
-    await db.flush()
-    return Response(status_code=204)
+    try:
+        session, user, secret = await browser_session.rotate_session(db, request)
+        if req.entity_id:
+            session.entity_id = req.entity_id
+        # Reuse the normal live account, membership, entity and MFA admission.
+        probe = create_access_token(user.id, session.entity_id, user.role,
+                                    token_version=user.token_version,
+                                    mfa_authenticated=session.mfa_authenticated)
+        current = await get_current_user(request, HTTPAuthorizationCredentials(scheme="Bearer", credentials=probe), db)
+        token = create_access_token(current.id, current.entity_id, current.role,
+                                    token_version=current.token_version,
+                                    mfa_authenticated=session.mfa_authenticated)
+        await db.commit()
+        browser_session.set_cookie(request, response, session, secret)
+        return TokenResponse(access_token=token, user_id=current.id, entity_id=current.entity_id, role=current.role)
+    except HTTPException as error:
+        await db.rollback()
+        failed = JSONResponse({"detail": error.detail}, status_code=error.status_code)
+        browser_session.clear_cookie(failed)
+        return failed
+
+
+@router.post("/logout", status_code=204)
+async def logout(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke login authority even after the browser's access token expires."""
+    user = None
+    if credentials:
+        try:
+            user = await get_current_user(request, credentials, db)
+        except HTTPException as error:
+            if error.status_code != 401:
+                raise
+    if user is None and request.cookies.get(browser_session.COOKIE):
+        browser_session.require_browser_origin(request)
+        try:
+            _, user, _, _ = await browser_session.load_session(db, request)
+        except HTTPException:
+            user = None
+    if user is not None:
+        # Lock and update the actual User row, never the selected-company overlay.
+        version = await db.scalar(select(User.token_version).where(User.id == user.id).with_for_update())
+        user.token_version = int(version or 0) + 1
+        await db.commit()
+    response = Response(status_code=204)
+    browser_session.clear_cookie(response)
+    return response
 
 
 @router.post("/renew", response_model=TokenResponse)
@@ -622,9 +778,9 @@ async def renew_session(
     if claims.get("typ") == "impersonation":
         raise HTTPException(403, "Support sessions cannot be renewed")
 
-    # ``get_current_user`` activates the membership carried by the token, so
-    # these values reflect current server-side membership data rather than
-    # trusting possibly stale role claims during renewal.
+    # ``get_current_user`` resolves the membership carried by the token without
+    # mutating it, so these values reflect current server-side membership data
+    # rather than trusting possibly stale role claims during renewal.
     entity_id = str(user.entity_id)
     role = str(user.role)
     mfa_authenticated = "mfa" in {
@@ -735,7 +891,18 @@ class UpdateProfileRequest(BaseModel):
     phone: str | None = None
     timezone: str | None = None
     locale: str | None = None
+    expected_locale: str | None = None
     llm_model: str | None = None
+
+    @field_validator("locale", "expected_locale")
+    @classmethod
+    def validate_locale(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        locale = value.strip().lower().replace("_", "-").split("-", 1)[0]
+        if locale not in SUPPORTED_LOCALES:
+            raise ValueError("Unsupported language")
+        return locale
 
 
 # ── Profile Update Endpoints ──
@@ -747,9 +914,11 @@ async def update_profile(
     db: AsyncSession = Depends(get_db),
 ):
     """Update the current user's profile."""
-    updates = req.model_dump(exclude_none=True)
+    updates = req.model_dump(exclude_none=True, exclude={"expected_locale"})
     if not updates:
         raise HTTPException(400, "No fields to update")
+    if req.expected_locale is not None and "locale" not in updates:
+        raise HTTPException(400, "Expected language requires a language update")
     if "timezone" in updates:
         from packages.core.services.calendar_settings_lock import (
             lock_calendar_settings_user,
@@ -759,6 +928,19 @@ async def update_profile(
         if not locked_user:
             raise HTTPException(404, "User not found")
         user = locked_user
+    if req.expected_locale is not None:
+        # Device-language sync must not overwrite a choice made after its GET /me.
+        current_locale = await db.scalar(
+            select(User.locale)
+            .where(User.id == user.id, User.deleted_at.is_(None))
+            .with_for_update()
+        )
+        if current_locale is None:
+            raise HTTPException(404, "User not found")
+        if current_locale != req.expected_locale:
+            raise HTTPException(409, "The account language changed")
+        # Refresh only locale: auth binds entity/role to the current membership.
+        set_committed_value(user, "locale", current_locale)
     for key, value in updates.items():
         setattr(user, key, value)
     await db.flush()
@@ -822,7 +1004,9 @@ async def upload_avatar(
                 503,
                 f"Entity filesystem is not available: {exc}",
             ) from exc
-        avatar_url = f"/api/v1/fs/{user.entity_id}/avatars/{fname}"
+        from packages.core.services.generated_file_refs import entity_fs_open_url
+
+        avatar_url = entity_fs_open_url(user.entity_id, f"avatars/{fname}")
     else:
         import base64
         b64 = base64.b64encode(content).decode()
@@ -1262,6 +1446,7 @@ async def _probe_media_role_key(
         "atlascloud": "Atlas Cloud",
         "zyphra": "Zyphra",
         "sesame": "OpenRouter / Sesame",
+        "suno": "Suno",
     }
     label = provider_labels.get(provider or "", provider or "provider")
 
@@ -1297,7 +1482,7 @@ async def _probe_media_role_key(
         supported_providers = {
             "image": {"openai", "google"},
             "voice": {"google", "zyphra", "sesame"},
-            "audio": {"google", "openai"},
+            "audio": {"google", "openai", "suno"},
             "sfx": {"openai"},
             "stt": {"openai", "groq"},
         }
@@ -1307,7 +1492,11 @@ async def _probe_media_role_key(
                 detail=f"Model {model} does not have a supported native BYOK route.",
             )
         resolved_base = resolve_llm_provider_base_url(model, api_key, base_url).rstrip("/")
-        if provider == "zyphra":
+        if provider == "suno":
+            # Read-only auth probe: never create (and potentially charge for)
+            # an audio generation during Account model testing.
+            targets = [f"{resolved_base}/account/usage"]
+        elif provider == "zyphra":
             provider_model = model
             headers = {"Authorization": f"Bearer {api_key}"}
             try:
@@ -1363,7 +1552,7 @@ async def _probe_media_role_key(
                     detail=f"Zyphra could not find model {model}.",
                 )
             return
-        if provider == "sesame":
+        elif provider == "sesame":
             provider_model = model
             sesame_base = resolved_base.rstrip("/")
             target = f"{sesame_base}/models/{quote(provider_model, safe='/')}/endpoints"
@@ -1392,18 +1581,19 @@ async def _probe_media_role_key(
                     ),
                 )
             return
-        provider_model = normalize_llm_model_for_provider(model, resolved_base)
-        if role == "image":
-            from packages.core.services.model_provider_handlers import (
-                native_catalog_model_id,
-            )
-
-            provider_model = native_catalog_model_id(model)
-        if provider == "google":
-            google_base = resolved_base.removesuffix("/openai")
-            targets = [f"{google_base}/models/{quote(provider_model, safe='')}"]
         else:
-            targets = [f"{resolved_base}/models/{quote(provider_model, safe='')}"]
+            provider_model = normalize_llm_model_for_provider(model, resolved_base)
+            if role == "image":
+                from packages.core.services.model_provider_handlers import (
+                    native_catalog_model_id,
+                )
+
+                provider_model = native_catalog_model_id(model)
+            if provider == "google":
+                google_base = resolved_base.removesuffix("/openai")
+                targets = [f"{google_base}/models/{quote(provider_model, safe='')}"]
+            else:
+                targets = [f"{resolved_base}/models/{quote(provider_model, safe='')}"]
     else:
         raise HTTPException(
             status_code=400,
@@ -1761,9 +1951,11 @@ def _validate_role_api_key_for_model(role: str, api_key: str, model: str) -> Non
             return
         if model_provider == "openai" and provider == "openai":
             return
+        if model_provider == "suno" and provider == "suno":
+            return
         raise HTTPException(
             status_code=400,
-            detail=f"Audio model {model} requires the matching native Google or OpenAI API key.",
+            detail=f"Audio model {model} requires the matching native Google, OpenAI, or Suno API key.",
         )
 
     if role == "sfx":
@@ -2302,12 +2494,20 @@ class PermissionsResponse(BaseModel):
 
 
 @router.get("/permissions", response_model=PermissionsResponse)
-async def get_permissions(user: User = Depends(get_current_user)):
+async def get_permissions(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get the current user's role and all their permissions."""
-    perms = _get_role_permissions(user.role)
+    perms = await user_effective_permission_keys(
+        db,
+        user.id,
+        user.entity_id,
+        user.role,
+    )
     return PermissionsResponse(
         role=user.role,
-        permissions=sorted(p.value for p in perms),
+        permissions=sorted(perms),
     )
 
 
@@ -2327,6 +2527,7 @@ class OAuthGoogleRequest(BaseModel):
     redirect_uri: str
     invitation_code: str | None = None
     team_invite_token: str | None = None
+    chat_invite_token: str | None = None
     oauth_session: str | None = None  # Opaque token for retry with invite code
     public_chat_token: str | None = None
     remember_me: bool = False
@@ -2351,7 +2552,7 @@ async def oauth_google_config(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/oauth/google")
-async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_db)):
+async def oauth_google(req: OAuthGoogleRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     """Exchange Google auth code for JWT. Creates or links user account.
 
     Two-step flow when invitation code is required for new users:
@@ -2437,7 +2638,13 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
 
     team_invite_token = (req.team_invite_token or "").strip()
     if team_invite_token:
+        if not provider_verified_claim(info.get("email_verified")):
+            raise HTTPException(400, "provider_email_verification_required")
         from packages.core.services.team_invite_service import accept_team_invite_with_oauth
+
+        existing_team_user_id = await db.scalar(
+            select(User.id).where(func.lower(User.email) == info.get("email", "").lower())
+        )
 
         accepted = await accept_team_invite_with_oauth(
             db,
@@ -2451,8 +2658,12 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             avatar_url=info.get("picture"),
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
+            locale=get_locale(),
         )
+        if provider_verified_claim(info.get("email_verified")):
+            mark_email_verified(accepted.user, info["email"])
         mark_user_login(accepted.user, source="auth.oauth.google.team_invite")
+        await browser_session.issue_session(db, request, response, accepted.user, remember=req.remember_me)
         token = create_access_token(
             accepted.user.id,
             accepted.user.entity_id,
@@ -2465,6 +2676,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             user_id=accepted.user.id,
             entity_id=accepted.user.entity_id,
             role=accepted.user.role,
+            is_new=existing_team_user_id is None,
         )
 
     # ── Invitation code gate (only for NEW users) ──────────────────
@@ -2482,8 +2694,12 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
     else:
         existing_user = True
 
+    if not existing and not provider_verified_claim(info.get("email_verified")):
+        raise HTTPException(400, "provider_email_verification_required")
+
     invite_row = None
     allow_public_customer_signup = False
+    allow_chat_signup = False
     if not existing and not existing_user:
         from packages.core.services.invitation_codes import (
             InvitationCodeError,
@@ -2492,6 +2708,11 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
             redeem_code as redeem_invite,
         )
         code_str = (req.invitation_code or "").strip()
+        if req.chat_invite_token:
+            from packages.core.services.chat_room_invites import valid_chat_registration_invite
+            allow_chat_signup = await valid_chat_registration_invite(db, req.chat_invite_token, info["email"])
+            if not allow_chat_signup:
+                raise HTTPException(403, "Chat invitation is invalid or does not match this email")
         if req.public_chat_token:
             from packages.core.models.channel import ChannelConfig
             public_chat = (await db.execute(
@@ -2502,7 +2723,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
                 )
             )).scalar_one_or_none()
             allow_public_customer_signup = bool(public_chat and (public_chat.config or {}).get("login_required"))
-        must_have_code = False if allow_public_customer_signup else await invite_required(db)
+        must_have_code = False if (allow_public_customer_signup or allow_chat_signup) else await invite_required(db)
         if code_str:
             try:
                 invite_row = await validate_invite(db, code_str)
@@ -2511,7 +2732,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         elif must_have_code:
             # Return 403 with a signed session so the frontend can retry
             session_token = _sign_session({
-                "info": {k: info.get(k) for k in ("sub", "email", "name", "given_name", "family_name", "picture")},
+                "info": {k: info.get(k) for k in ("sub", "email", "email_verified", "name", "given_name", "family_name", "picture")},
                 "tokens": {"access_token": tokens.get("access_token"), "refresh_token": tokens.get("refresh_token")},
             })
             raise HTTPException(
@@ -2527,12 +2748,14 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         provider="google",
         provider_user_id=info["sub"],
         email=info.get("email", ""),
+        email_verified=provider_verified_claim(info.get("email_verified")),
         display_name=info.get("name"),
         first_name=info.get("given_name"),
         last_name=info.get("family_name"),
         avatar_url=info.get("picture"),
         access_token=tokens.get("access_token"),
         refresh_token=tokens.get("refresh_token"),
+        locale=get_locale(),
     )
     if _is_new and allow_public_customer_signup:
         user.role = "external"
@@ -2547,6 +2770,12 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         # Don't catch — if redemption fails, let the error propagate
         # so the user sees it and can retry. Silent failures = lost credits.
 
+
+    mark_user_login(user, source="auth.oauth.google")
+    await browser_session.issue_session(db, request, response, user, remember=req.remember_me)
+    # Persist signup/login before waiting on the external welcome email.
+    await db.commit()
+
     if _is_new:
         # Welcome email for new OAuth users (verification is skipped)
         try:
@@ -2555,7 +2784,6 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         except Exception:
             pass  # non-fatal
 
-    mark_user_login(user, source="auth.oauth.google")
     token = create_access_token(
         user.id,
         user.entity_id,
@@ -2568,6 +2796,7 @@ async def oauth_google(req: OAuthGoogleRequest, db: AsyncSession = Depends(get_d
         user_id=user.id,
         entity_id=user.entity_id,
         role=user.role,
+        is_new=_is_new,
     )
 
 

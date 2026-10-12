@@ -405,6 +405,7 @@ async def test_resend_existing_unlinked_staff_invite_generates_accept_link_witho
         "packages.core.services.email_service.send_staff_invite_email",
         fake_send_staff_invite_email,
     )
+    monkeypatch.setenv("APP_URL", "https://invite.test")
 
     headers = await _auth(client, "resend_staff_invite")
     user_resp = await client.post(
@@ -434,7 +435,7 @@ async def test_resend_existing_unlinked_staff_invite_generates_accept_link_witho
     assert data["status"] == "invited"
     assert data["email_sent"] is True
     assert len(data["invite_token"]) > 20
-    assert data["invite_url"].startswith("http://localhost:3010/login?")
+    assert data["invite_url"].startswith("https://invite.test/login?")
     assert f"invite_token={data['invite_token']}" in data["invite_url"]
     assert "email=resend.existing.staff%40test.com" in data["invite_url"]
     assert sent and sent[0]["to"] == "resend.existing.staff@test.com"

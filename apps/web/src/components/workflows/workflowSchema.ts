@@ -7,6 +7,7 @@ export interface WorkflowInputSchema {
   minLength?: number;
   maxLength?: number;
   enum?: unknown[];
+  "x-enum-labels"?: string[];
   const?: unknown;
   default?: unknown;
   properties?: Record<string, WorkflowInputSchema>;
@@ -23,11 +24,14 @@ export interface WorkflowInputSchema {
   "x-workflow-type"?: "json";
   "x-ui"?: {
     hidden?: boolean;
-    control?: "textarea" | "line_list";
+    control?: "textarea" | "line_list" | "workflow_project_select" | "documents" | "knowledge_file";
+    file_kind?: "audio" | "image";
     rows?: number;
     collapsible?: boolean;
     collapsed?: boolean;
     order?: string[];
+    project_type?: string;
+    allowed_stages?: string[];
   };
 }
 
@@ -148,6 +152,26 @@ export function workflowValueAtPath(value: unknown, path: string[]): unknown {
     current = record[part];
   }
   return current;
+}
+
+export function workflowSchemaSelectValue(
+  schema: WorkflowInputSchema,
+  value: unknown,
+): string {
+  const selected = String(value ?? "");
+  if (!schema.enum) return selected;
+  return schema.enum.some((option) => String(option) === selected) ? selected : "";
+}
+
+export function workflowSchemaOptionLabel(
+  schema: WorkflowInputSchema,
+  option: unknown,
+  fallback: (value: string) => string,
+): string {
+  const labels = schema["x-enum-labels"];
+  const index = schema.enum ? schema.enum.findIndex((candidate) => String(candidate) === String(option)) : -1;
+  const label = index >= 0 && Array.isArray(labels) ? labels[index] : undefined;
+  return typeof label === "string" && label.trim() ? label : fallback(String(option));
 }
 
 export function setWorkflowValueAtPath(
@@ -291,7 +315,10 @@ export function parseWorkflowSchemaDraft(
   const raw = String(draft ?? "").trim();
   if (!raw) {
     if (required) errors[path] = messages.required;
-    return required ? undefined : "";
+    else if (schemaType === "string" && (schema.minLength || 0) > 0) {
+      errors[path] = messages.minLength(schema.minLength!);
+    }
+    return errors[path] ? undefined : "";
   }
   if (schemaType === "string") {
     const length = Array.from(raw).length;

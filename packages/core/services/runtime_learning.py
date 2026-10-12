@@ -10,6 +10,7 @@ import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -19,7 +20,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.ai.runtime import RUNTIME_CHAT_SOURCE
 from packages.core.ai.runtime.skill_forcing import runtime_message_text_for_intent
+from packages.core.ai.runtime.streams import (
+    RUNTIME_UNFINISHED_TOOL_STATUSES,
+    runtime_tool_path_memory_outcome,
+)
 from packages.core.ai.terminal_stops import is_terminal_success_stop_reason
+from packages.core.constants.agents import MANOR_AGENT_FS_ID, MANOR_AGENT_IDS
 from packages.core.models.base import generate_ulid
 from packages.core.models.runtime_learning import AgentLearningCandidate, RuntimeEvidence
 from packages.core.models.workspace import Agent, Workspace
@@ -34,6 +40,16 @@ _AGENT_PROFILE_CUE_RE = re.compile(
     r"(你是|你的职责|你负责|作为.*agent|作为.*智能体|lease consultant|leasing consultant|"
     r"role|responsibilit(?:y|ies)|capabilit(?:y|ies)|speciali[sz]e|agent profile|"
     r"work style|工作方式|职责|定位|身份|专门负责)",
+    re.IGNORECASE,
+)
+_DURABLE_GUIDANCE_RE = re.compile(
+    r"记住|以后|今后|长期|默认|每次|下次|总是|一直|偏好|"
+    r"\b(?:remember|always|never|prefer|from now on|in future|by default)\b",
+    re.IGNORECASE,
+)
+_TEMPORARY_GUIDANCE_RE = re.compile(
+    r"本轮|本次|这轮|这次|仅当前|仅这条|只在这条|"
+    r"\b(?:this (?:turn|request|task|time|message)|for now|just for today|only today)\b",
     re.IGNORECASE,
 )
 _LOW_SIGNAL_TOOLS = {"search_tools", "workspace_search", "rag"}
@@ -75,6 +91,8 @@ class LearningCandidateDraft:
 def runtime_status_from_stop_reason(stop_reason: str | None, *, has_content: bool = False) -> str:
     """Normalize agentic-loop stop reasons into evidence status."""
     reason = (stop_reason or "completed").strip().lower()
+    if reason in {"cancelled", "canceled"}:
+        return "cancelled"
     if reason == "completed":
         return "succeeded"
     # A terminal-tool policy (submit_result, skill terminals, media generation,
@@ -82,11 +100,90 @@ def runtime_status_from_stop_reason(stop_reason: str | None, *, has_content: boo
     # run, not a partial/failed one.
     if is_terminal_success_stop_reason(reason):
         return "succeeded"
-    if reason in {"credit_exhausted", "blocked", "hitl_required"}:
+    if reason in {"credit_exhausted", "blocked", "hitl_required", "needs_hitl"}:
         return "blocked"
     if has_content:
         return "partial"
     return "failed"
+
+
+def chat_tool_outcome(item: dict[str, Any]) -> str:
+    """Interpret complete receipts before redaction/truncation for evidence."""
+    raw = item.get("raw_result", item.get("result"))
+    if raw is None or raw == "":
+        return "unknown"
+    text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+    outcome = runtime_tool_path_memory_outcome(text)
+    if outcome == "failure":
+        return "failed"
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        status = str(parsed.get("status") or "").lower()
+        if status in RUNTIME_UNFINISHED_TOOL_STATUSES:
+            return "unknown"
+        if parsed.get("success") is False or parsed.get("ok") is False:
+            return "failed"
+    if item.get("status") == "error":
+        return "failed"
+    if outcome is None:
+        return "blocked"
+    return "succeeded"
+
+
+def chat_learning_outcome(
+    *, stop_reason: str | None, has_content: bool, error: str | None,
+    tools: list[str], tool_results: list[dict[str, Any]],
+    outcome: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, int]]:
+    """A final answer is not proof that the requested tool work succeeded."""
+    receipts = [item for item in tool_results if isinstance(item, dict)]
+    counts = Counter(chat_tool_outcome(item) for item in receipts)
+    missing = Counter(tools) - Counter(str(item.get("name") or "") for item in receipts)
+    counts["unknown"] += sum(missing.values())
+    status = runtime_status_from_stop_reason(stop_reason, has_content=has_content)
+    if status == "succeeded":
+        if error:
+            status = "partial" if counts["succeeded"] else "failed"
+        elif counts["failed"]:
+            status = "partial" if counts["succeeded"] or counts["unknown"] else "failed"
+        elif counts["unknown"]:
+            status = "partial"
+        elif counts["blocked"]:
+            status = "partial" if counts["succeeded"] else "blocked"
+    # A normal loop exit does not promote an explicitly unfinished goal to
+    # success. Host failures/cancellation and concrete receipts retain priority.
+    if status == "succeeded" and outcome:
+        status = {"partial": "partial", "not_attempted": "partial", "blocked": "blocked"}.get(
+            outcome.get("status"), status,
+        )
+    return status, {key: counts[key] for key in ("succeeded", "failed", "blocked", "unknown")}
+
+
+def _durable_user_guidance(message: str) -> str:
+    """Extract bounded explicit future guidance, never a truncated instruction.
+
+    This deliberately conservative filter is not a semantic classifier. Quoted
+    documents/code need an explicit reviewed edit, not automatic role changes.
+    The original request remains in the conversation/evidence for review.
+    """
+    if re.search(r"```|^\s*>|示例|引用|以下文档|\b(?:example|quotation|quoted)\b", message, re.I | re.M):
+        return ""
+    kept: list[str] = []
+    durable = False
+    temporary = False
+    for clause in re.findall(r"[^，,。.!?！？；;\n]+[，,。.!?！？；;\n]*", message):
+        if _TEMPORARY_GUIDANCE_RE.search(clause):
+            temporary = True
+        elif _DURABLE_GUIDANCE_RE.search(clause):
+            durable, temporary = True, False
+        if durable and not temporary:
+            kept.append(clause)
+    guidance = " ".join("".join(kept).split()).strip("，,；; ")
+    # Prefix clipping can erase qualifications or turn a negation into a rule.
+    return guidance if len(guidance) <= _MAX_EXCERPT_CHARS else ""
 
 
 def _setting_explicitly_disabled(value: Any) -> bool:
@@ -209,6 +306,7 @@ def build_chat_learning_candidate_drafts(
     stop_reason: str | None,
     repeated_tool_pattern_count: int = 0,
     repeated_failure_count: int = 0,
+    tool_results: list[dict[str, Any]] | None = None,
 ) -> list[LearningCandidateDraft]:
     """Derive conservative learning candidates from a chat-run summary.
 
@@ -217,12 +315,13 @@ def build_chat_learning_candidate_drafts(
     """
     drafts: list[LearningCandidateDraft] = []
     message = _compact_text(user_message)
+    guidance = _durable_user_guidance(user_message)
     content = _compact_text(assistant_content)
     tools = _normalize_tool_names(tool_calls_made)
-    tool_pattern = _tool_pattern_key(tools)
+    tool_pattern = _tool_pattern_key(tools, tool_results)
 
-    if message and _MEMORY_CUE_RE.search(message):
-        memory_type = "instruction" if _looks_like_instruction(message) else "preference"
+    if guidance and _MEMORY_CUE_RE.search(guidance):
+        memory_type = "instruction" if _looks_like_instruction(guidance) else "preference"
         drafts.append(LearningCandidateDraft(
             candidate_type="memory",
             scope="user",
@@ -233,16 +332,16 @@ def build_chat_learning_candidate_drafts(
             ),
             payload={
                 "memory_type": memory_type,
-                "content": message,
+                "content": guidance,
                 "source": "runtime_evidence",
                 "apply_target": "agent_memory",
             },
             risk_level="low",
             confidence=0.72,
-            dedupe_key=f"memory:{_stable_hash(message.lower())}",
+            dedupe_key=f"memory:{_stable_hash(guidance.lower())}",
         ))
 
-    if message and _looks_like_agent_profile_update(message):
+    if guidance and _looks_like_agent_profile_update(guidance):
         drafts.append(LearningCandidateDraft(
             candidate_type="agent_profile_patch",
             scope="agent",
@@ -252,14 +351,14 @@ def build_chat_learning_candidate_drafts(
                 "that should shape how this agent presents itself and handles future work."
             ),
             payload={
-                "profile_update": message,
+                "profile_update": guidance,
                 "source": "runtime_evidence",
                 "apply_target": "AGENT.md",
-                "auto_apply_eligible": True,
+                "auto_apply_eligible": status == "succeeded",
             },
             risk_level="low",
             confidence=0.68,
-            dedupe_key=f"agent_profile:{_stable_hash(message.lower())}",
+            dedupe_key=f"agent_profile:{_stable_hash(guidance.lower())}",
         ))
 
     meaningful_tools = [t for t in tools if t not in _LOW_SIGNAL_TOOLS]
@@ -540,6 +639,8 @@ async def record_chat_run_evidence(
     error: str | None = None,
     runtime_profile: str | None = None,
     allowed_tool_names: list[str] | None = None,
+    context_sources: list[dict[str, Any]] | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> tuple[RuntimeEvidence | None, list[AgentLearningCandidate]]:
     """Persist one chat-run evidence row and candidate learnings.
 
@@ -550,13 +651,27 @@ async def record_chat_run_evidence(
         return None, []
 
     tools = _normalize_tool_names(tool_calls_made)
-    status = runtime_status_from_stop_reason(stop_reason, has_content=bool((assistant_content or "").strip()))
-    tool_pattern = _tool_pattern_key(tools)
+    status, tool_outcomes = chat_learning_outcome(
+        stop_reason=stop_reason, has_content=bool((assistant_content or "").strip()),
+        error=error, tools=tools, tool_results=tool_results or [],
+        outcome=outcome,
+    )
+    outcome_reason = stop_reason or "completed"
+    if status != "succeeded" and runtime_status_from_stop_reason(outcome_reason) == "succeeded":
+        outcome_reason = (
+            "tool_execution_failed" if tool_outcomes["failed"] else
+            "tool_outcome_unknown" if tool_outcomes["unknown"] else
+            "tool_execution_blocked" if tool_outcomes["blocked"] else
+            "goal_" + str(outcome["status"]) if outcome else "runtime_error"
+        )
+    tool_pattern = _tool_pattern_key(tools, tool_results or [])
     usage = usage or {}
     metrics = _usage_metrics(usage)
     metrics.update({
         "rounds": int(rounds or 0),
         "tool_call_count": len(tools),
+        "tool_outcomes": tool_outcomes,
+        "context_window": usage.get("context_window_last") or {},
     })
     if error:
         metrics["error"] = str(error)[:500]
@@ -567,7 +682,17 @@ async def record_chat_run_evidence(
         "tool_calls_made": tools,
         "tool_pattern_key": tool_pattern,
         "tool_results": _compact_tool_results(tool_results),
+        "outcome_version": 2,
+        "validated_outcome": outcome,
+        "context_sources": [
+            {key: item[key] for key in (
+                "key", "category", "source", "source_digest", "source_tokens",
+                "loaded_tokens", "loaded", "compacted", "policy", "storage",
+            ) if key in item}
+            for item in (context_sources or []) if isinstance(item, dict)
+        ],
         "stop_reason": stop_reason or "completed",
+        "outcome_reason": outcome_reason,
         "runtime_profile": runtime_profile,
         "allowed_tool_names": list((allowed_tool_names or [])[:80]),
     }
@@ -607,7 +732,7 @@ async def record_chat_run_evidence(
             entity_id=entity_id,
             workspace_id=workspace_id,
             agent_id=agent_id,
-            stop_reason=stop_reason or status,
+            stop_reason=outcome_reason,
         )
     except Exception:
         logger.debug("runtime learning pattern counts skipped", exc_info=True)
@@ -617,9 +742,10 @@ async def record_chat_run_evidence(
         assistant_content=assistant_content,
         tool_calls_made=tools,
         status=status,
-        stop_reason=stop_reason,
+        stop_reason=outcome_reason,
         repeated_tool_pattern_count=repeated_tool_count,
         repeated_failure_count=repeated_failure_count,
+        tool_results=tool_results or [],
     )
     candidates: list[AgentLearningCandidate] = []
     new_candidate_count = 0
@@ -1115,6 +1241,14 @@ async def record_chat_runtime_learning(
     if not db or not entity_id or not result:
         return []
     try:
+        from packages.core.ai.runtime.context_window import context_source_manifest, context_tool_manifest
+
+        sources = getattr(ctx, "context_sources", None)
+        if sources is None:
+            sources = context_source_manifest(getattr(ctx, "runtime_context_sections", []) or [])
+        sources = [*sources, *context_tool_manifest(
+            getattr(ctx, "tools", []) or [], set(getattr(ctx, "allowed_tool_names", []) or []),
+        )]
         _evidence, candidates = await record_chat_run_evidence(
             db,
             entity_id=entity_id,
@@ -1135,6 +1269,8 @@ async def record_chat_runtime_learning(
             error=getattr(result, "error", None),
             runtime_profile=getattr(ctx, "runtime_profile", None),
             allowed_tool_names=sorted(getattr(ctx, "allowed_tool_names", None) or []),
+            context_sources=sources,
+            outcome=getattr(result, "outcome", None),
         )
         return queued_learning_candidate_ids(candidates)
     except Exception:
@@ -1423,41 +1559,16 @@ def _workspace_memory_scope(memory_type: str) -> str:
     mt = (memory_type or "").strip().lower()
     if mt == "preference":
         return "preference"
-    if mt == "fact":
-        return "fact"
+    if mt in {"fact", "decision"}:
+        return mt
     if mt == "learning":
         return "learning"
     return "guidance"
 
 
 def _workspace_memory_filename(memory_type: str, content: str | None = None) -> str:
-    mt = (memory_type or "").strip().lower()
-    text = _compact_text(content or "", max_chars=600).lower()
-    if mt == "instruction" or _looks_rule_like(text):
-        return "RULES.md"
-    if mt == "learning":
-        return "LEARNINGS.md"
-    return "MEMORY.md"
-
-
-def _looks_rule_like(text: str) -> bool:
-    if not text:
-        return False
-    return any(token in text for token in [
-        "必须",
-        "不要",
-        "不能",
-        "不准",
-        "审核",
-        "批准",
-        "同意",
-        "must",
-        "never",
-        "do not",
-        "approval",
-        "approve",
-        "permission",
-    ])
+    from packages.core.memory.policy import canonical_filename
+    return canonical_filename((memory_type or "").strip().lower(), content or "")
 
 
 async def _record_step_summary_evidence(
@@ -1764,7 +1875,7 @@ async def _recent_failure_count(
         1
         for ev in rows
         if ev.status in {"failed", "blocked", "partial"}
-        and str((ev.details or {}).get("stop_reason") or ev.status).strip().lower() == reason
+        and str((ev.details or {}).get("outcome_reason") or (ev.details or {}).get("stop_reason") or ev.status).strip().lower() == reason
     )
 
 
@@ -1921,7 +2032,7 @@ async def _ensure_agent_access(
     entity_id: str,
     agent_id: str | None,
 ) -> None:
-    if not agent_id:
+    if not agent_id or agent_id in MANOR_AGENT_IDS or agent_id == MANOR_AGENT_FS_ID:
         return
     from packages.core.models.workspace import Agent
 
@@ -2008,13 +2119,15 @@ async def _apply_workspace_memory_candidate(
     content: str,
     memory_type: str,
 ) -> dict[str, Any]:
-    from packages.core.memory.service import record_memory
+    from packages.core.memory.service import record_memory, _mirror_entry_to_canonical
 
     workspace_id = candidate.workspace_id
     if not workspace_id:
         raise ValueError("Workspace memory candidate requires workspace_id")
-    scope = _workspace_memory_scope(memory_type)
     filename = _workspace_memory_filename(memory_type, content)
+    scope = _workspace_memory_scope(memory_type)
+    if scope == "guidance" and filename == "MEMORY.md":
+        scope = "decision"
     entry = await record_memory(
         db,
         entity_id=entity_id,
@@ -2029,11 +2142,7 @@ async def _apply_workspace_memory_candidate(
         importance=7,
         mirror_to_canonical=False,
     )
-    file_result = _apply_workspace_file_candidate(
-        candidate,
-        entity_id=entity_id,
-        filename=filename,
-    )
+    file_result = _mirror_entry_to_canonical(entry)
     return {
         "kind": "workspace_memory",
         "memory_id": entry.frontmatter.id,
@@ -2321,7 +2430,8 @@ def _compact_agent_file_content(existing: str, *, filename: str) -> tuple[str, d
     without_summary = _RUNTIME_LEARNING_SUMMARY_RE.sub("", text)
     blocks = list(_RUNTIME_LEARNING_BLOCK_RE.finditer(without_summary))
     managed_summaries = [_summarize_runtime_learning_block(match.group(0)) for match in blocks]
-    managed_summaries = [s for s in managed_summaries if s]
+    from packages.core.memory.learning_summary import merge_learning_entries
+    managed_summaries = merge_learning_entries(text, [s for s in managed_summaries if s])
     user_authored = _RUNTIME_LEARNING_BLOCK_RE.sub("", without_summary).rstrip()
     summary = _runtime_learning_summary_block(
         managed_summaries,
@@ -2348,7 +2458,9 @@ def _summarize_runtime_learning_block(block: str) -> str:
     text = detail or title
     if not text:
         return ""
-    return _compact_text(text, max_chars=220)
+    marker = re.search(r"<!--\s*(runtime-learning:[^>]+?)\s*-->", block)
+    detail = _compact_text(text, max_chars=220)
+    return f"{marker.group(1)}: {detail}" if marker else detail
 
 
 def _runtime_learning_summary_block(
@@ -2357,7 +2469,7 @@ def _runtime_learning_summary_block(
     compacted_count: int,
     filename: str,
 ) -> str:
-    kept = summaries[-12:]
+    kept = summaries
     lines = [
         "<!-- runtime-learning-summary -->",
         "## Runtime Learning Summary",
@@ -2437,6 +2549,8 @@ def _compact_tool_results(tool_results: list[dict[str, Any]] | None) -> list[dic
             continue
         compact.append({
             "name": str(item.get("name") or "")[:120],
+            "action": _tool_action(item),
+            "outcome": chat_tool_outcome(item),
             "result": _compact_text(item.get("result"), max_chars=500),
         })
     return compact
@@ -2451,7 +2565,27 @@ def _normalize_tool_names(tool_calls_made: list[str] | None) -> list[str]:
     return out
 
 
-def _tool_pattern_key(tools: list[str]) -> str:
+def _tool_action(item: dict[str, Any]) -> str:
+    arguments = item.get("arguments") or item.get("args")
+    if not isinstance(arguments, dict):
+        return ""
+    action = str(arguments.get("action") or "")[:120]
+    params = arguments.get("params")
+    if item.get("name") == "manor" and action == "workspace" and isinstance(params, dict):
+        action += "." + str(params.get("action") or "")[:120]
+    return action
+
+
+def _tool_pattern_key(tools: list[str], tool_results: list[dict[str, Any]] | None = None) -> str:
+    if tool_results is not None:
+        # Version the receipt-backed keys so old stop-reason-only successes do
+        # not seed skills. Multiplexed tools must distinguish their operations.
+        operations = sorted({
+            (str(item.get("name") or ""), _tool_action(item))
+            for item in tool_results if isinstance(item, dict)
+            and item.get("name") not in _LOW_SIGNAL_TOOLS
+        })
+        return _stable_hash("receipts:v2:" + json.dumps(operations, ensure_ascii=False))
     meaningful = [t for t in tools if t not in _LOW_SIGNAL_TOOLS]
     base = ",".join(sorted(set(meaningful or tools)))
     return _stable_hash(base or "no_tools")
@@ -2518,6 +2652,8 @@ def _merge_candidate_payload(existing: dict[str, Any], incoming: dict[str, Any],
         if key not in merged or not merged.get(key):
             merged[key] = value
     merged["evidence_count"] = evidence_count
+    if "observed_successes" in incoming:
+        merged["observed_successes"] = incoming["observed_successes"]
     return _json_safe(merged)
 
 

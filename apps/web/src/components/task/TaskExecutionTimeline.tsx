@@ -48,6 +48,25 @@ const STEP_STATUS_META: Record<string, { label: string; color: string; bg: strin
   paused: { label: t("page.workspaces.filter_paused"), color: "#6f4ba8", bg: "#ece9f5", Icon: IconWarning },
 };
 
+// A done step whose StepResult envelope landed `partial` is not a full
+// success: the dispatcher records it done (partial output is usable output),
+// but showing a plain "Done" hides that the deliverable is incomplete — the
+// operator then reads a downstream failure with no idea why. Only envelope
+// rows carry `summary` next to `status`, so a provider receipt that reports
+// status="partial" as data is left alone.
+const PARTIAL_STEP_META = {
+  label: t("component.task_execution_timeline.partial"),
+  color: "#b27c34",
+  bg: "#f3ecd6",
+  Icon: IconWarning,
+};
+
+function isPartialStepResult(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  const record = result as Record<string, unknown>;
+  return record.status === "partial" && typeof record.summary === "string";
+}
+
 function shortId(value?: string | null) {
   return value ? value.slice(-6) : "";
 }
@@ -528,7 +547,10 @@ export default function TaskExecutionTimeline({
         ) : (
           <div style={{ display: "flex", flexDirection: "column" }}>
             {steps.map((step, index) => {
-              const meta = STEP_STATUS_META[step.step_status] || STEP_STATUS_META.pending;
+              const meta =
+                step.step_status === "done" && isPartialStepResult(step.result)
+                  ? PARTIAL_STEP_META
+                  : STEP_STATUS_META[step.step_status] || STEP_STATUS_META.pending;
               const Icon = meta.Icon;
               const canRetryStep = RETRYABLE_STEP_STATUSES.has(step.step_status) && retrySurfaceAvailable && !!onRetryStep;
               const output = extractOutputSummary(step.result);
@@ -733,8 +755,16 @@ export default function TaskExecutionTimeline({
                         background: "#f8f0ef", border: "1px solid #ecc8c5",
                         color: "#883a35", fontSize: 11, lineHeight: 1.45,
                       }}>
-                        {formatUserFacingLabel(String((step.error as any).error_type || (step.error as any).type || t("component.task_execution_timeline.error")))}
-                        {((step.error as any).message || (step.error as any).error) ? `: ${formatUserFacingStructuredText((step.error as any).message || (step.error as any).error)}` : ""}
+                        <strong>{formatUserFacingLabel(String((step.error as any).error_type || (step.error as any).type || t("component.task_execution_timeline.error")))}</strong>
+                        {((step.error as any).message || (step.error as any).error) ? (
+                          // Same renderer as the step summary: a pre-flight or governance
+                          // failure carries Markdown links (Settings → Integrations, the
+                          // rules page) that must be clickable, not shown as raw brackets.
+                          <ChatMarkdown
+                            content={formatUserFacingStructuredText((step.error as any).message || (step.error as any).error)}
+                            enableFileCards={false}
+                          />
+                        ) : null}
                       </div>
                     )}
                     {step.human_input_prompt && (

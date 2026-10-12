@@ -398,6 +398,7 @@ def test_render_first_page_copies_office_file_to_hint_extension_for_libreoffice(
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     rendered = _render_first_page_sync(str(source_path), str(out_dir), 150, source_ext=".pptx")
 
@@ -433,6 +434,7 @@ def test_render_slides_uses_lossless_png(tmp_path, monkeypatch):
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     rendered = _render_sync(str(source_path), str(out_dir), 150)
 
@@ -471,6 +473,7 @@ def test_render_slides_rejects_decks_over_page_budget_before_rasterizing(
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     with pytest.raises(OfficeRenderLimitError, match="slide limit"):
         _render_sync(str(source_path), str(out_dir), 150)
@@ -510,6 +513,7 @@ def test_render_slides_rejects_oversized_later_page_before_rasterizing(
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     with pytest.raises(OfficeRenderLimitError, match="render size limit"):
         _render_sync(str(source_path), str(out_dir), 150)
@@ -548,6 +552,7 @@ def test_render_slides_rejects_total_pixel_budget_before_rasterizing(
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
     monkeypatch.setattr(
         "packages.core.services.slide_renderer.SLIDE_RENDER_MAX_TOTAL_PIXELS",
         1,
@@ -589,6 +594,7 @@ def test_render_slides_stops_rasterizing_when_cumulative_output_is_too_large(
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
     monkeypatch.setattr("packages.core.services.slide_renderer.SLIDE_RENDER_MAX_BYTES", 5)
 
     with pytest.raises(OfficeRenderLimitError, match="rendered file size limit"):
@@ -619,6 +625,7 @@ def test_render_first_page_rejects_oversized_page_before_rasterizing(
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     with pytest.raises(OfficeRenderLimitError, match="render size limit"):
         _render_first_page_sync(
@@ -980,6 +987,7 @@ def test_render_document_pages_publishes_complete_lossless_cache(tmp_path, monke
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     rendered = _render_document_pages_sync(
         str(source_path),
@@ -1035,6 +1043,7 @@ def test_render_document_pages_accepts_concurrent_macos_cache_publish(tmp_path, 
         raise OSError(errno.ENOTEMPTY, "Directory not empty", destination)
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
     monkeypatch.setattr("packages.core.services.slide_renderer.os.rename", concurrent_publish)
 
     rendered = _render_document_pages_sync(
@@ -1068,6 +1077,7 @@ def test_render_document_pages_rejects_documents_over_page_budget(tmp_path, monk
         raise AssertionError(f"unexpected command: {args}")
 
     monkeypatch.setattr("packages.core.services.slide_renderer.subprocess.run", fake_run)
+    monkeypatch.setattr("packages.core.services.slide_renderer.run_in_process_group", fake_run)
 
     with pytest.raises(OfficeRenderLimitError, match="page limit"):
         _render_document_pages_sync(
@@ -1331,3 +1341,105 @@ async def test_render_document_pages_admits_before_copying_snapshots(
     finally:
         release.set()
         await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_render_slides_admission_timeout_raises_busy_without_rendering(
+    tmp_path,
+    monkeypatch,
+):
+    from packages.core.services import slide_renderer
+
+    source_path = tmp_path / "Busy.pptx"
+    source_path.write_bytes(b"deck")
+    cache_dir = tmp_path / ".slide-cache" / "document"
+    cache_dir.mkdir(parents=True)
+    lock_dir = slide_renderer._document_page_render_lock_dir(str(cache_dir))
+    held = [
+        slide_renderer._try_document_page_file_lock(lock_dir / f"slot-{index}.lock")
+        for index in range(slide_renderer.DOCUMENT_PAGE_RENDER_MAX_CONCURRENCY)
+    ]
+    assert all(handle is not None for handle in held)
+    rendered = []
+    monkeypatch.setattr(
+        "packages.core.services.slide_renderer._render_sync",
+        lambda *args: rendered.append(args) or [],
+    )
+    try:
+        started = time.monotonic()
+        with pytest.raises(slide_renderer.OfficeRenderBusyError):
+            await render_slides(
+                str(source_path),
+                str(cache_dir),
+                admission_timeout=0.1,
+            )
+        assert time.monotonic() - started < 2
+    finally:
+        for handle in held:
+            slide_renderer._release_document_page_file_lock(handle)
+    assert rendered == []
+
+
+@pytest.mark.asyncio
+async def test_render_slides_without_admission_timeout_waits_for_a_slot(tmp_path, monkeypatch):
+    from packages.core.services import slide_renderer
+
+    source_path = tmp_path / "Queued.pptx"
+    source_path.write_bytes(b"deck")
+    cache_dir = tmp_path / ".slide-cache" / "document"
+    cache_dir.mkdir(parents=True)
+    lock_dir = slide_renderer._document_page_render_lock_dir(str(cache_dir))
+    held = [
+        slide_renderer._try_document_page_file_lock(lock_dir / f"slot-{index}.lock")
+        for index in range(slide_renderer.DOCUMENT_PAGE_RENDER_MAX_CONCURRENCY)
+    ]
+
+    def fake_render(_snapshot_path, slide_dir, _dpi):
+        target = Path(slide_dir)
+        target.mkdir(parents=True)
+        output = target / "slide-1.png"
+        output.write_bytes(b"png")
+        (target / ".complete").write_text("1", encoding="utf-8")
+        return [str(output)]
+
+    monkeypatch.setattr("packages.core.services.slide_renderer._render_sync", fake_render)
+    task = asyncio.create_task(render_slides(str(source_path), str(cache_dir)))
+    await asyncio.sleep(0.15)
+    assert not task.done()
+    for handle in held:
+        slide_renderer._release_document_page_file_lock(handle)
+    rendered = await asyncio.wait_for(task, 5)
+    assert [Path(path).name for path in rendered] == ["slide-1.png"]
+
+
+@pytest.mark.asyncio
+async def test_render_slides_skips_render_when_requester_abandoned(tmp_path, monkeypatch):
+    from packages.core.services import slide_renderer
+
+    source_path = tmp_path / "Gone.pptx"
+    source_path.write_bytes(b"deck")
+    cache_dir = tmp_path / ".slide-cache" / "document"
+    rendered = []
+    monkeypatch.setattr(
+        "packages.core.services.slide_renderer._render_sync",
+        lambda *args: rendered.append(args) or [],
+    )
+
+    async def disconnected():
+        return True
+
+    with pytest.raises(slide_renderer.OfficeRenderAbandonedError):
+        await render_slides(str(source_path), str(cache_dir), should_abandon=disconnected)
+    assert rendered == []
+
+
+def test_read_png_dimensions_reads_ihdr_and_rejects_non_png(tmp_path):
+    from packages.core.services.slide_renderer import read_png_dimensions
+
+    png_path = tmp_path / "slide.png"
+    Image.new("RGB", (1500, 1125), "white").save(png_path, format="PNG")
+    assert read_png_dimensions(str(png_path)) == (1500, 1125)
+    not_png = tmp_path / "slide-2.png"
+    not_png.write_bytes(b"png")
+    assert read_png_dimensions(str(not_png)) is None
+    assert read_png_dimensions(str(tmp_path / "missing.png")) is None

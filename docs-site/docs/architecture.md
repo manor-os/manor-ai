@@ -60,6 +60,7 @@ The split keeps a handful of long-running agent steps from stalling
 scheduling. Both workers mount the entity filesystem and share the API's
 codebase and configuration model.
 
+
 ## Isolation Boundaries
 
 - The [sandbox service](operations/sandbox.md) executes code in per-run
@@ -69,8 +70,9 @@ codebase and configuration model.
   JuiceFS.
 - Tool access is constrained by agent settings and
   [HITL governance](concepts/hitl-governance.md).
-- Everything is entity-scoped (single-tenant per deployment in OSS mode),
-  with workspace-level permissions inside the entity.
+- Data and credentials are Entity-scoped, with Workspace permissions inside
+  each Entity. One self-hosted operator may manage multiple Entities without
+  merging their data or permissions.
 
 ## Data Stores
 

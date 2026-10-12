@@ -32,6 +32,9 @@ _EPHEMERAL_KEYS = frozenset(
         "claim_token",
         "approvalToken",
         "approval_token",
+        "approvalId",
+        "approval_id",
+        "provider_approval_id",
     }
 )
 _MAX_DEPTH = 5
@@ -99,6 +102,9 @@ class ChromeSkillOutcome:
     tabs: list[dict[str, Any]] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    retryable: bool = False
+    do_not_replay: bool = False
+    terminal_uncertainty: bool = False
 
     @classmethod
     def from_state(
@@ -111,6 +117,9 @@ class ChromeSkillOutcome:
         tabs: list[dict[str, Any]] | None = None,
         artifacts: list[dict[str, Any]] | None = None,
         error: str | None = None,
+        retryable: bool = False,
+        do_not_replay: bool = False,
+        terminal_uncertainty: bool = False,
     ) -> "ChromeSkillOutcome":
         return cls(
             status=state.status,
@@ -124,6 +133,9 @@ class ChromeSkillOutcome:
             tabs=list(tabs or []),
             artifacts=list(artifacts or []),
             error=error,
+            retryable=retryable,
+            do_not_replay=do_not_replay,
+            terminal_uncertainty=terminal_uncertainty,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -139,7 +151,20 @@ class ChromeSkillOutcome:
             "browser_group": _bounded_public_value(self.browser_group),
             "tabs": _bounded_public_value(self.tabs),
             "artifacts": _bounded_public_value(self.artifacts),
+            "retryable": self.retryable,
+            "do_not_replay": self.do_not_replay,
         }
+        if self.terminal_uncertainty:
+            payload.update(
+                {
+                    "stop_parent": True,
+                    "stop_reason": "uncertain_result",
+                    "terminal_failure": True,
+                    "action_executed": "unknown",
+                    "retryable": False,
+                    "do_not_replay": True,
+                }
+            )
         if self.error:
             payload["error"] = self.error[:_MAX_STRING_LENGTH]
         return payload
@@ -198,25 +223,64 @@ def chrome_outcome_for_result(
     content: Any,
     stop_reason: Any,
     error: Any = None,
+    control: dict[str, Any] | None = None,
 ) -> ChromeSkillOutcome:
     """Translate child-loop and Harness state into a parent-facing outcome."""
 
     contract = ensure_chrome_run_state(metadata if isinstance(metadata, dict) else {}, goal=goal)
     pending_confirmation = contract.get("pending_chrome_confirmation")
+    if (
+        isinstance(pending_confirmation, dict)
+        and str(pending_confirmation.get("tool_name") or "").strip()
+        in {"mcp__chrome__claim_tab", "claim_tab"}
+    ):
+        contract.pop("pending_chrome_confirmation", None)
+        pending_confirmation = None
     interruption = contract.get("control_interruption")
     normalized_stop_reason = str(stop_reason or "").strip().lower()
-    if error or normalized_stop_reason in {"error", "credit_exhausted"}:
+    do_not_replay = bool(
+        (isinstance(control, dict) and control.get("do_not_replay") is True)
+        or normalized_stop_reason
+        in {"uncertain_result", "max_rounds", "cancelled", "canceled"}
+    )
+    terminal_uncertainty = normalized_stop_reason == "uncertain_result"
+    capability_blocked = (
+        isinstance(control, dict)
+        and control.get("kind") in {"capability_blocked", "tool_error"}
+        and control.get("blocked_capability") == "chrome"
+    )
+    if error or normalized_stop_reason in {
+        "error",
+        "credit_exhausted",
+        "uncertain_result",
+    }:
         status: ChromeSkillStatus = "failed"
     elif isinstance(pending_confirmation, dict):
         status = "needs_approval"
     elif isinstance(interruption, dict):
         status = "needs_user"
-    elif normalized_stop_reason in {"max_rounds", "cancelled", "canceled"}:
+    elif capability_blocked or normalized_stop_reason in {
+        "max_rounds",
+        "cancelled",
+        "canceled",
+    }:
         status = "blocked"
     else:
         status = "completed"
 
     contract["status"] = status
+    explicit_retryable = (
+        control.get("retryable")
+        if isinstance(control, dict) and isinstance(control.get("retryable"), bool)
+        else None
+    )
+    retryable = (
+        False
+        if do_not_replay
+        else explicit_retryable
+        if explicit_retryable is not None
+        else status in {"needs_approval", "needs_user", "blocked"}
+    )
     pending_action = pending_confirmation if isinstance(pending_confirmation, dict) else interruption
     resume_context = {
         "next": (
@@ -227,6 +291,22 @@ def chrome_outcome_for_result(
             else None
         ),
         "stop_reason": str(stop_reason or "").strip() or None,
+        "block_reason": (
+            str(
+                control.get("block_reason")
+                or control.get("error_reason")
+                or ""
+            ).strip()
+            or None
+            if capability_blocked
+            else None
+        ),
+        "setup_url": (
+            str(control.get("setup_url") or "").strip() or None
+            if capability_blocked
+            else None
+        ),
+        "replay_allowed": retryable,
     }
     state = ChromeSkillRunState(
         run_id=str(contract.get("run_id") or ""),
@@ -241,19 +321,33 @@ def chrome_outcome_for_result(
         pending_action=pending_action,
         resume_context=resume_context,
     )
+    last_action = contract.get("last_action_result")
+    if isinstance(last_action, dict):
+        receipt = last_action.get("action_receipt") or {}
+        record = contract.get("action_receipts", {}).get(receipt.get("action_id"))
+        if isinstance(record, dict):
+            last_action = {**last_action, "action_receipt": record["receipt"]}
+            if record.get("evidence"):
+                last_action["action_verification"] = record["evidence"]
     outcome = ChromeSkillOutcome.from_state(
         state,
         summary=str(content or ""),
-        goal_status=status,
+        # Ending the model loop (or finalizing tabs) is not proof that its
+        # business goal was achieved. The parent must assess browser evidence.
+        goal_status="unverified" if status == "completed" else status,
         evidence=[
             {
                 "kind": "chrome_runtime",
                 "last_tool": contract.get("last_tool"),
                 "chrome_call_count": contract.get("chrome_call_count", 0),
                 "read_page_call_count": contract.get("read_page_call_count", 0),
+                "tabs_finalized": contract.get("finalized") is True,
             }
-        ],
+        ] + ([last_action] if isinstance(last_action, dict) else []),
         error=str(error) if error else None,
+        retryable=retryable,
+        do_not_replay=do_not_replay,
+        terminal_uncertainty=terminal_uncertainty,
     )
     outcome.skill = skill or "chrome"
     return outcome

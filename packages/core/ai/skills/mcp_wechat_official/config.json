@@ -13,5 +13,9 @@
     "mcp__wechat_official__upload_media",
     "mcp__wechat_official__get_follower_info",
     "mcp__wechat_official__list_followers"
-  ]
+  ],
+  "search": {
+    "terms": ["weixin", "wechat oa", "official account", "followers", "customer service reply", "china social", "subscription account"],
+    "examples": ["send wechat template message to follower", "upload image to wechat official account", "get wechat follower info", "reply to customer on wechat"]
+  }
 }

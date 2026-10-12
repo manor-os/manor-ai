@@ -48,6 +48,15 @@ def test_subagent_artifact_path_parser_prefers_save_target():
 
 
 @pytest.mark.asyncio
+async def test_unscoped_subagent_default_is_a_root_file():
+    from packages.core.workers.internal import _workspace_scoped_artifact_path
+
+    assert await _workspace_scoped_artifact_path(
+        {"entity_id": "entity1", "step_key": "draft_pack"}, "Create a draft."
+    ) == "draft_pack.md"
+
+
+@pytest.mark.asyncio
 async def test_subagent_text_artifact_materializes_under_workspace_folder(db_session, monkeypatch):
     from packages.core.workers.internal import _persist_subagent_text_artifact
 
@@ -88,7 +97,7 @@ async def test_subagent_text_artifact_materializes_under_workspace_folder(db_ses
         {
             "entity_id": entity_id,
             "workspace_id": workspace_id,
-            "task_id": "task_1",
+            "task_id": "01TASK1",
             "conversation_id": "conversation_1",
             "resolved_agent_id": "agent_1",
             "step_key": "draft_pack",
@@ -105,7 +114,7 @@ async def test_subagent_text_artifact_materializes_under_workspace_folder(db_ses
 
     artifact_folder_id = artifact_folder_id_from_storage_path(str(captured["rel_path"]))
     assert artifact_folder_id
-    expected_path = f"{workspace_artifact_storage_base(artifact_folder_id)}/artifacts/draft_pack.md"
+    expected_path = f"{workspace_artifact_storage_base(artifact_folder_id)}/tasks/01TASK1/artifacts/draft_pack.md"
     assert captured["rel_path"] == expected_path
     assert result["fs_path"] == expected_path
     assert result["files"][0]["fs_path"] == expected_path

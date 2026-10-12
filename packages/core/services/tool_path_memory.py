@@ -1,8 +1,8 @@
 """Intent→path memory: cache-first tool routing (spec §A3).
 
-Layering: Redis blob per user (via packages.core.cache) over the
-tool_intent_paths table. All writes fire-and-forget from the caller's
-perspective; all reads degrade to "no hint" on any failure.
+Layering: Redis blob per entity/user over the tool_intent_paths table.
+Standalone reads degrade to "no hint" on failure. Borrowed transactions stay
+owned by the caller, including rollback after a failed read or write.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.cache import cache
+from packages.core.read_cache import get_or_load, invalidate_after_commit
 from packages.core.models.base import generate_ulid
 from packages.core.models.tool_path_memory import ToolIntentPath
 
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 MAX_TERMS = 12
 ROW_CAP = 200
 REDIS_TTL_SECONDS = 15 * 60
+REDIS_MAX_TTL_SECONDS = 60 * 60
 SUPPRESS_FAILURES = 2
 MATCH_THRESHOLD = 2          # min overlap score to count as a "strong" match
 HINT_MAX_PATHS = 3
@@ -165,9 +166,10 @@ async def _record(
             row.last_failure_at = now
         await db.flush()
         await _enforce_row_cap(db, entity_id=entity_id, user_id=user_id)
-        await cache.delete(_cache_key(entity_id, user_id))  # write-through-lite: invalidate
+        invalidate_after_commit(db, _cache_key(entity_id, user_id))
     except Exception:
         logger.warning("tool_path_memory record failed", exc_info=True)
+        raise  # the transaction owner must roll back a failed write
 
 
 async def _enforce_row_cap(db: AsyncSession, *, entity_id: str, user_id: str) -> None:
@@ -192,28 +194,16 @@ async def _enforce_row_cap(db: AsyncSession, *, entity_id: str, user_id: str) ->
         await db.delete(r)
 
 
-async def _load_user_paths(entity_id: str, user_id: str) -> list[IntentPath]:
-    key = _cache_key(entity_id, user_id)
-    cached = await cache.get(key)
-    if isinstance(cached, list):
-        try:
-            return [IntentPath(**item) for item in cached]
-        except Exception:
-            await cache.delete(key)
-    from packages.core.database import async_session
-    try:
-        async with async_session() as db:
-            rows = (await db.execute(
-                select(ToolIntentPath).where(
-                    ToolIntentPath.entity_id == entity_id,
-                    ToolIntentPath.user_id == user_id,
-                )
-            )).scalars().all()
-    except Exception:
-        logger.warning("tool_path_memory load failed", exc_info=True)
-        return []
-    paths = [
-        IntentPath(
+async def _query_user_paths(db: AsyncSession, entity_id: str, user_id: str) -> list[dict]:
+    with db.no_autoflush:
+        rows = (await db.execute(
+            select(ToolIntentPath).where(
+                ToolIntentPath.entity_id == entity_id,
+                ToolIntentPath.user_id == user_id,
+            )
+        )).scalars().all()
+    return [
+        dict(
             provider=r.provider, tool_name=r.tool_name,
             success_count=r.success_count, failure_count=r.failure_count,
             last_success_at=r.last_success_at.isoformat() if r.last_success_at else None,
@@ -222,13 +212,35 @@ async def _load_user_paths(entity_id: str, user_id: str) -> list[IntentPath]:
         )
         for r in rows
     ]
-    await cache.set(key, [p.__dict__ for p in paths], ttl=REDIS_TTL_SECONDS)
-    return paths
+
+
+async def _load_user_paths(entity_id: str, user_id: str, *, db: AsyncSession | None = None) -> list[IntentPath]:
+    if db is not None:
+        # No Redis wait or second transaction while the owner holds a permit.
+        # Never publish potentially uncommitted rows to a shared cache.
+        data = await _query_user_paths(db, entity_id, user_id)
+    else:
+        async def load():
+            from packages.core.database import create_worker_session
+
+            factory = create_worker_session()
+            try:
+                async with factory() as session:
+                    return await _query_user_paths(session, entity_id, user_id)
+            finally:
+                await factory.kw["bind"].dispose()
+
+        data = await get_or_load(
+            _cache_key(entity_id, user_id), load,
+            ttl=REDIS_TTL_SECONDS, max_ttl=REDIS_MAX_TTL_SECONDS,
+        )
+    return [IntentPath(**item) for item in data]
 
 
 async def lookup_paths(
     *, entity_id: str, user_id: str, user_message: str,
     limit: int = HINT_MAX_PATHS,
+    db: AsyncSession | None = None,
 ) -> list[IntentPath]:
     """Cache-first lookup: strongest-overlap, non-suppressed, ranked paths."""
     try:
@@ -236,7 +248,7 @@ async def lookup_paths(
         if not sig:
             return []
         candidates = []
-        for p in await _load_user_paths(entity_id, user_id):
+        for p in await _load_user_paths(entity_id, user_id, db=db):
             score = overlap_score(sig, p.intent_signature)
             if score >= MATCH_THRESHOLD and not p.suppressed:
                 candidates.append((score, p.rank(), p))
@@ -251,6 +263,8 @@ async def lookup_paths(
                 break
         return out
     except Exception:
+        if db is not None:
+            raise
         logger.warning("tool_path_memory lookup failed", exc_info=True)
         return []
 
@@ -284,5 +298,5 @@ def format_hint(paths: list[IntentPath]) -> str:
     return (
         "Tasks like this previously succeeded via: "
         f"{parts} — try these first (load with search_tools "
-        "query='select:<name>')."
+        "mode='exact' and exact_names=['<name>'])."
     )

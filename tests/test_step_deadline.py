@@ -125,6 +125,10 @@ async def _seed_lease(
     step_id = generate_ulid()
     lease_id = generate_ulid()
     worker_id = generate_ulid()
+    from tests.approval_settings_test_utils import action_rule, initialize_test_account_approval
+
+    await initialize_test_account_approval(db, entity_id=entity_id,
+        user_rules=[action_rule("unclassified.action")])
     now = datetime.now(timezone.utc)
 
     db.add_all([
@@ -314,8 +318,8 @@ async def test_deadline_failure_flows_through_the_retry_policy(db_session, monke
     assert step.finished_at is not None
     assert step.error["type"] == "StepDeadlineExceeded"
 
-    # Attempts exhausted under auto_human_on_exhausted → waiting_human.
-    to_human = await _seed_lease(
+    # A retry-policy flag cannot turn a runtime deadline into a user question.
+    flagged = await _seed_lease(
         db_session,
         params={
             "max_runtime_seconds": 0.05,
@@ -324,10 +328,12 @@ async def test_deadline_failure_flows_through_the_retry_policy(db_session, monke
         attempt_count=1,
         max_attempts=1,
     )
-    await internal.execute_lease_inproc(to_human["lease_id"])
-    step, _lease = await _reload(db_session, to_human)
-    assert step.step_status == "waiting_human"
-    assert "StepDeadlineExceeded" in (step.human_input_prompt or "")
+    await internal.execute_lease_inproc(flagged["lease_id"])
+    step, _lease = await _reload(db_session, flagged)
+    assert step.step_status == "failed"
+    assert step.finished_at is not None
+    assert step.human_input_prompt is None
+    assert step.error["type"] == "StepDeadlineExceeded"
 
 
 @pytest.mark.asyncio

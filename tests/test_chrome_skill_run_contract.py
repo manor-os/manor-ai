@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 from packages.core.ai.runtime.chrome_run import (
     ChromeSkillOutcome,
@@ -16,10 +18,14 @@ from packages.core.ai.runtime.skills import (
     _prompt_skill_runtime_envelope,
     runtime_format_invoke_skill_result,
 )
-from packages.core.ai.runtime.surfaces import ChatSurface
-from packages.core.ai.runtime.tool_availability import (
-    runtime_mcp_credentials_unavailable_result,
+from packages.core.ai.runtime.skill_capability_companion import (
+    trusted_skill_capability_companion,
 )
+from packages.core.ai.runtime.surfaces import ChatSurface
+
+
+
+
 
 
 def _envelope(metadata: dict) -> RuntimeEnvelope:
@@ -50,6 +56,8 @@ def test_chrome_skill_outcome_serializes_resumable_run_without_ephemeral_refs() 
             "action_signature": "sig-1",
             "target_fingerprint": {"role": "button", "name": "发布"},
             "approval_id": "approval-1",
+            "approvalId": "approval-2",
+            "provider_approval_id": "approval-3",
         },
         resume_context={"next": "confirm_action_then_retry_once"},
     )
@@ -63,7 +71,9 @@ def test_chrome_skill_outcome_serializes_resumable_run_without_ephemeral_refs() 
 
     assert payload["status"] == "needs_approval"
     assert payload["run_id"] == "chrome-run-1"
-    assert payload["pending_action"]["approval_id"] == "approval-1"
+    assert "approval_id" not in payload["pending_action"]
+    assert "approvalId" not in payload["pending_action"]
+    assert "provider_approval_id" not in payload["pending_action"]
     assert "ref" not in json.dumps(payload)
     assert "snapshot_id" not in json.dumps(payload)
 
@@ -135,37 +145,143 @@ def test_runtime_format_chrome_outcome_preserves_terminal_harness_control() -> N
     assert payload["control"]["source_tool"] == "mcp__chrome__read_page"
 
 
-def test_chrome_terminal_failure_never_becomes_completed() -> None:
+def test_runtime_format_chrome_outcome_does_not_propagate_capability_blocker() -> None:
+    result = runtime_format_invoke_skill_result(
+        "chrome",
+        {
+            "skill": "chrome",
+            "stop_reason": "completed",
+            "stop_parent": False,
+            "control": {
+                "kind": "tool_error",
+                "blocked_capability": "chrome",
+                "error_reason": "chrome_cli_worker_not_paired",
+                "setup_url": "/integrations?provider=chrome",
+            },
+            "chrome_outcome": {
+                "status": "blocked",
+                "run_id": "chrome-run-blocked",
+            },
+        },
+    )
+
+    payload = json.loads(result)
+
+    assert payload["status"] == "blocked"
+    assert payload["stop_parent"] is False
+    assert payload["stop_reason"] == "completed"
+    assert payload["control"]["kind"] == "tool_error"
+
+
+def test_completed_chrome_turn_preserves_blocked_capability_outcome() -> None:
     outcome = chrome_outcome_for_result(
         {},
         skill="chrome",
-        goal="检查 LinkedIn",
-        content="Chrome requires a paired local worker.",
-        stop_reason="chrome_cli_worker_not_paired",
-        error="Chrome requires a paired local worker.",
+        goal="打开网页",
+        content="请先重新连接 Chrome。",
+        stop_reason="completed",
+        control={
+            "kind": "tool_error",
+            "blocked_capability": "chrome",
+            "error_reason": "chrome_cli_worker_not_paired",
+            "setup_url": "/integrations?provider=chrome",
+        },
     )
 
-    payload = outcome.to_dict()
+    assert outcome.status == "blocked"
+    assert outcome.goal_status == "blocked"
+    assert outcome.retryable is True
+    assert outcome.do_not_replay is False
+    assert outcome.resume_context["stop_reason"] == "completed"
+    assert outcome.resume_context["block_reason"] == "chrome_cli_worker_not_paired"
+    assert outcome.resume_context["setup_url"] == "/integrations?provider=chrome"
+    assert outcome.resume_context["replay_allowed"] is True
 
-    assert payload["status"] == "failed"
-    assert payload["goal_status"] == "failed"
-    assert payload["error"] == "Chrome requires a paired local worker."
+
+def test_incomplete_chrome_run_is_not_replayed_without_explicit_recovery() -> None:
+    for stop_reason in ("max_rounds", "cancelled"):
+        outcome = chrome_outcome_for_result(
+            {},
+            skill="chrome",
+            goal="Upload the approved video",
+            content="",
+            stop_reason=stop_reason,
+        ).to_dict()
+
+        assert outcome["status"] == "blocked"
+        assert outcome["retryable"] is False
+        assert outcome["do_not_replay"] is True
+        assert outcome["resume_context"]["replay_allowed"] is False
 
 
-def test_chrome_credentials_unavailable_is_an_explicit_terminal_failure() -> None:
-    payload = json.loads(
-        runtime_mcp_credentials_unavailable_result(
-            provider="chrome",
-            tool_name="open_or_reuse",
-            reason="Chrome requires a paired local worker.",
-        )
-    )
+def test_explicit_uncertain_chrome_effect_is_not_replayable() -> None:
+    outcome = chrome_outcome_for_result(
+        {},
+        skill="chrome",
+        goal="Upload the approved video",
+        content="The upload result is uncertain.",
+        stop_reason="uncertain_result",
+        control={"retryable": False},
+    ).to_dict()
 
-    assert payload["status"] == "failed"
-    assert payload["stop_parent"] is True
-    assert payload["stop_reason"] == "chrome_cli_worker_not_paired"
-    assert payload["terminal_failure"] is True
-    assert payload["retryable"] is False
+    assert outcome["status"] == "failed"
+    assert outcome["retryable"] is False
+    assert outcome["do_not_replay"] is True
+    assert outcome["resume_context"]["replay_allowed"] is False
+
+
+def test_claim_tab_leftover_pending_does_not_pause_completed_chrome_run() -> None:
+    metadata = {
+        "chrome_runtime_contract_v1": {
+            "run_id": "chrome-run-claim",
+            "last_tool": "mcp__chrome__finalize_tabs",
+            "pending_chrome_confirmation": {
+                "approval_id": "",
+                "tool_name": "mcp__chrome__claim_tab",
+                "confirmation_mode": "no_confirmation",
+                "policy_category": "ordinary_page_action",
+            },
+        }
+    }
+
+    outcome = chrome_outcome_for_result(
+        metadata,
+        skill="chrome",
+        goal="Save the approved YouTube draft",
+        content="Video saved.",
+        stop_reason="completed",
+    ).to_dict()
+
+    assert outcome["status"] == "completed"
+    assert outcome["pending_action"] is None
+    assert outcome["retryable"] is False
+    assert metadata["chrome_runtime_contract_v1"].get("pending_chrome_confirmation") is None
+
+
+def test_real_publish_pending_still_needs_approval_after_completed_stop_reason() -> None:
+    outcome = chrome_outcome_for_result(
+        {
+            "chrome_runtime_contract_v1": {
+                "run_id": "chrome-run-publish",
+                "pending_chrome_confirmation": {
+                    "approval_id": "approval-publish-1",
+                    "tool_name": "mcp__chrome__click_element",
+                    "confirmation_mode": "always_action_time",
+                    "policy_category": "representational_communication",
+                },
+            }
+        },
+        skill="chrome",
+        goal="Publish the approved YouTube draft",
+        content="Waiting for Publish confirmation.",
+        stop_reason="completed",
+    ).to_dict()
+
+    assert outcome["status"] == "needs_approval"
+    assert outcome["pending_action"]["tool_name"] == "mcp__chrome__click_element"
+    assert outcome["pending_action"]["confirmation_mode"] == "always_action_time"
+    assert outcome["retryable"] is True
+    assert outcome["resume_context"]["next"] == "confirm_action_then_retry_once"
 
 
 def test_chrome_child_state_is_committed_back_to_the_parent_harness() -> None:

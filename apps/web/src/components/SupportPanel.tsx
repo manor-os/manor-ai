@@ -101,13 +101,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 async function fetchSupportUnreadCount(): Promise<{ count: number }> {
-  const tickets = await apiFetch<TicketSummary[]>("/tickets");
-  return {
-    count: tickets.reduce(
-      (total, ticket) => total + Math.max(0, ticket.unread_user_count || 0),
-      0,
-    ),
-  };
+  return apiFetch<{ count: number }>("/unread-count");
 }
 
 

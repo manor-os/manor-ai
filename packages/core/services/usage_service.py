@@ -6,7 +6,9 @@ Primary API for callers:
 """
 from __future__ import annotations
 
+import os
 import logging
+from hashlib import sha256
 from typing import Any, Optional
 
 from sqlalchemy import func, select, text
@@ -19,6 +21,11 @@ from packages.core.services.timezone_utils import user_range_start_utc
 logger = logging.getLogger(__name__)
 _token_usage_context_breakdown_exists: Optional[bool] = None
 _token_usage_column_exists: dict[str, bool] = {}
+
+LLM_RESERVATION_MAX_OUTPUT_TOKENS = int(
+    os.getenv("CHAT_LLM_RESERVATION_MAX_OUTPUT_TOKENS", "8192") or 8192
+)
+_CREDIT_RESERVATION_SOURCE_ID_MAX_LENGTH = 100
 
 
 def _usage_is_byok(usage: dict) -> bool:
@@ -77,6 +84,165 @@ def chat_llm_usage_to_credits(usage: dict) -> int:
     except Exception:
         logger.debug("Failed to estimate chat LLM usage credits", exc_info=True)
         return 0
+
+
+def durable_llm_call_source_id(source_prefix: str, round_num: int) -> str:
+    """Return a bounded idempotency key for one provider call.
+
+    ``source_prefix`` identifies one *actual loop invocation*. Callers that
+    restart a loop after a crash must use a new invocation nonce: the provider
+    request may really be sent again and therefore must be charged again. A
+    retry of the settlement callback for that same request keeps this key.
+    """
+
+    prefix = str(source_prefix or "").strip()
+    if not prefix:
+        raise ValueError("source_prefix is required")
+    candidate = f"{prefix}:{int(round_num)}"
+    if len(candidate) <= _CREDIT_RESERVATION_SOURCE_ID_MAX_LENGTH:
+        return candidate
+    namespace = prefix.partition(":")[0][:20] or "llm"
+    digest = sha256(candidate.encode("utf-8")).hexdigest()[:48]
+    return f"{namespace}:{digest}:{int(round_num)}"
+
+
+def build_durable_llm_billing_callbacks(
+    *,
+    source_prefix: str,
+    entity_id: str | None,
+    user_id: str | None,
+    agent_id: str | None,
+    workspace_id: str | None,
+    conversation_id: str | None,
+    fallback_model: str | None,
+    byok: bool = False,
+):
+    """Build per-provider-call reserve/settle callbacks for an agentic loop.
+
+    Reservations are committed before provider I/O. Settlement, ledger and
+    reservation consumption share a later transaction. The reservation row is
+    the idempotency fence for duplicate settlement callbacks. ``byok`` calls do
+    not reserve Manor credits; without a reservation their analytics remain
+    best-effort and cannot use this fence.
+
+    Child-cost projection intentionally remains outside this helper. Coupling
+    child execution locks to the reservation/entity/workspace lock chain needs
+    an explicit global lock-order design rather than an arbitrary callback.
+    """
+
+    # Validate eagerly, while still deriving the final bounded id per round.
+    durable_llm_call_source_id(source_prefix, 0)
+    source_ids: dict[int, str] = {}
+
+    def source_id(round_num: int) -> str:
+        return durable_llm_call_source_id(source_prefix, round_num)
+
+    async def reserve_llm_call(
+        round_num: int,
+        model: str | None,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None,
+    ) -> None:
+        call_source_id = source_id(round_num)
+        source_ids[round_num] = call_source_id
+        if not entity_id or byok or chat_llm_usage_is_byok():
+            return
+
+        from packages.core.ai.agentic_loop import _estimate_tokens
+        from packages.core.ai.llm_client import CreditExhaustedError
+        from packages.core.database import async_session
+        from packages.core.services.billing_service import tokens_to_credits
+        from packages.core.services.credit_reservations import (
+            CreditReservationError,
+            reserve_credits,
+        )
+
+        output_tokens = int(max_tokens or 0)
+        if output_tokens <= 0:
+            output_tokens = LLM_RESERVATION_MAX_OUTPUT_TOKENS
+        try:
+            estimate = max(
+                1,
+                int(tokens_to_credits(_estimate_tokens(messages), output_tokens, model)),
+            )
+            async with async_session() as db:
+                await reserve_credits(
+                    db,
+                    entity_id=entity_id,
+                    amount_credits=estimate,
+                    source_kind="chat_llm_call",
+                    source_id=call_source_id,
+                    reason="LLM call estimate",
+                    workspace_id=workspace_id,
+                    agent_id=agent_id,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    metadata={"round": round_num, "model": model or ""},
+                )
+                await db.commit()
+        except CreditReservationError as exc:
+            raise CreditExhaustedError(str(exc)) from exc
+        except Exception as exc:
+            raise CreditExhaustedError(
+                "Unable to reserve credits for this request. Please try again shortly."
+            ) from exc
+
+    async def settle_llm_call(
+        round_num: int,
+        duration_ms: float,
+        usage: dict[str, Any],
+    ) -> None:
+        if not entity_id:
+            return
+
+        from packages.core.database import async_session
+        from packages.core.services.credit_reservations import (
+            resize_reservation_by_source,
+        )
+
+        call_source_id = source_ids.pop(round_num, source_id(round_num))
+        billed_usage = dict(usage or {})
+        billed_usage.setdefault("model", fallback_model or "")
+        usage_is_byok = byok or chat_llm_usage_is_byok(billed_usage)
+        if usage_is_byok:
+            billed_usage.setdefault("byok", True)
+            billed_usage.setdefault("billing_mode", "byok")
+            billed_usage.setdefault("api_key_source", "byok")
+        actual_credits = 0 if usage_is_byok else chat_llm_usage_to_credits(billed_usage)
+
+        if not usage_is_byok and actual_credits > 0:
+            # Persist actual provider cost before the ledger write. If the
+            # latter fails, an active reservation still blocks escaped spend.
+            async with async_session() as db:
+                await resize_reservation_by_source(
+                    db,
+                    source_kind="chat_llm_call",
+                    source_id=call_source_id,
+                    amount_credits=actual_credits,
+                    allow_overdraft=True,
+                )
+                await db.commit()
+
+        async with async_session() as db:
+            try:
+                await settle_chat_llm_call_usage(
+                    db,
+                    entity_id=entity_id,
+                    source_id=call_source_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=workspace_id,
+                    conversation_id=conversation_id,
+                    usage=billed_usage,
+                    duration_ms=int(duration_ms),
+                    consumed_credits=actual_credits,
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    return reserve_llm_call, settle_llm_call
 
 
 async def _token_usage_has_context_breakdown(db: AsyncSession) -> bool:
@@ -536,25 +702,33 @@ async def record_llm_usage(
                     from packages.core.budget import accumulate_workspace_ai_cost
                     from packages.core.services.credit_service import credits_to_usd
 
-                    await accumulate_workspace_ai_cost(
-                        db,
-                        workspace_id=workspace_id,
-                        # Cloud billing returns the authoritative, margin-
-                        # adjusted credit charge.  The OSS facade deliberately
-                        # returns no billing row; local workspaces must still
-                        # account for provider-reported spend instead of
-                        # silently leaving their budget at zero.
-                        cost_usd=(
-                            credits_to_usd(int(billing_log.total_credit or 0))
-                            if billing_log is not None
-                            else provider_cost
-                        ),
-                    )
+                    # Non-strict observers may keep the ledger write when a
+                    # workspace projection is temporarily unavailable, but
+                    # the spend/state/message projection itself must remain
+                    # atomic. Strict Runtime settlement propagates the error
+                    # so its caller rolls the whole provider settlement back.
+                    async with db.begin_nested():
+                        await accumulate_workspace_ai_cost(
+                            db,
+                            workspace_id=workspace_id,
+                            # Cloud billing returns the authoritative, margin-
+                            # adjusted credit charge.  The OSS facade deliberately
+                            # returns no billing row; local workspaces must still
+                            # account for provider-reported spend instead of
+                            # silently leaving their budget at zero.
+                            cost_usd=(
+                                credits_to_usd(int(billing_log.total_credit or 0))
+                                if billing_log is not None
+                                else provider_cost
+                            ),
+                        )
                 except Exception:
                     logger.warning(
                         "record_llm_usage: workspace budget accumulation failed",
                         exc_info=True,
                     )
+                    if strict:
+                        raise
             from packages.core.services.plan_enforcement import record_ai_cost
             await record_ai_cost(db, entity_id, provider_cost, model_name)
     except Exception:
@@ -636,13 +810,66 @@ async def settle_chat_llm_call_usage(
     usage: dict,
     duration_ms: int,
     consumed_credits: int | None = None,
-) -> None:
+) -> bool:
     """Write one completed chat LLM call and consume its durable reservation.
 
     The caller must commit this transaction. If it fails, the separately
     committed active reservation continues to block further billable work.
+    The reservation row is also the idempotency fence: a concurrent retry or
+    a retry after a lost commit acknowledgement observes ``consumed`` and
+    must not write the ledger/workspace cost a second time.
+
+    Return ``True`` only when this transaction transitions a durable
+    reservation from active to consumed. BYOK calls deliberately may have no
+    reservation and therefore only retain best-effort analytics semantics;
+    they do not consume credits or workspace budget, but their token analytics
+    are not deduplicated here.
     """
-    from packages.core.services.credit_reservations import consume_reservation_by_source
+    from packages.core.models.billing import CreditReservation
+    from packages.core.services.credit_reservations import (
+        RESERVATION_STATUS_ACTIVE,
+        RESERVATION_STATUS_CONSUMED,
+        CreditReservationError,
+        _lock_entity,
+        consume_reservation,
+    )
+
+    byok = chat_llm_usage_is_byok(usage)
+    # Keep the same Entity -> reservation order as reserve/resize. Two
+    # callbacks for one provider response can otherwise deadlock when one is
+    # resizing the active reservation while the other starts settlement.
+    await _lock_entity(db, entity_id)
+    reservation = (
+        await db.execute(
+            select(CreditReservation)
+            .where(
+                CreditReservation.source_kind == "chat_llm_call",
+                CreditReservation.source_id == source_id,
+            )
+            .order_by(
+                (CreditReservation.status == RESERVATION_STATUS_ACTIVE).desc(),
+                CreditReservation.created_at.desc(),
+                CreditReservation.id.desc(),
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().first()
+    if reservation is not None:
+        if reservation.entity_id != entity_id:
+            raise CreditReservationError(
+                f"chat settlement {source_id!r} crosses entity scope"
+            )
+        if reservation.status == RESERVATION_STATUS_CONSUMED:
+            return False
+        if reservation.status != RESERVATION_STATUS_ACTIVE:
+            raise CreditReservationError(
+                f"chat settlement {source_id!r} reservation is {reservation.status!r}"
+            )
+    elif not byok:
+        raise CreditReservationError(
+            f"chat settlement {source_id!r} has no durable reservation"
+        )
 
     await record_chat_llm_usage(
         db,
@@ -656,12 +883,14 @@ async def settle_chat_llm_call_usage(
         operation_id=source_id,
         strict=True,
     )
-    await consume_reservation_by_source(
-        db,
-        source_kind="chat_llm_call",
-        source_id=source_id,
-        consumed_credits=consumed_credits,
-    )
+    if reservation is not None:
+        await consume_reservation(
+            db,
+            reservation_id=reservation.id,
+            consumed_credits=consumed_credits,
+        )
+        return True
+    return False
 
 
 # ── Tool-call logging ────────────────────────────────────────────────
@@ -734,6 +963,7 @@ async def record_media_usage(
     duration_ms: Optional[int] = None,
     source: str = "tool",
     byok: bool = False,
+    strict: bool = False,
 ) -> bool:
     """Record a non-token-based LLM-style call (image / video / TTS /
     Whisper / embedding).
@@ -750,9 +980,9 @@ async def record_media_usage(
     count) — written into the log row for analytics but not billed
     again here.
 
-    Caller MUST commit. Failure is logged but not raised — billing is
-    a best-effort observer of the underlying API call, never a gate
-    that should fail the user-visible operation.
+    Caller MUST commit. Failure is logged but not raised by default. Durable
+    reservation settlement can pass ``strict=True`` so a caller-owned rollback
+    keeps the ledger, workspace budget state, and threshold alert atomic.
     """
     if cost_usd is None or cost_usd <= 0:
         return False
@@ -797,6 +1027,8 @@ async def record_media_usage(
         await db.flush()
     except Exception:
         logger.warning("record_media_usage: log failed", exc_info=True)
+        if strict:
+            raise
         return False
 
     # 2. Mirror credit total onto Entity.settings.used_credits
@@ -812,13 +1044,37 @@ async def record_media_usage(
             await db.flush()
     except Exception:
         logger.warning("record_media_usage: used_credits update failed", exc_info=True)
+        if strict:
+            raise
 
-    # 3. AI budget (ai_usage_usd)
+    # 3. Workspace monthly budget uses the same credit charge as the ledger.
+    if workspace_id:
+        try:
+            from packages.core.budget import accumulate_workspace_ai_cost
+            from packages.core.services.credit_service import credits_to_usd
+
+            async with db.begin_nested():
+                await accumulate_workspace_ai_cost(
+                    db,
+                    workspace_id=workspace_id,
+                    cost_usd=credits_to_usd(credits),
+                )
+        except Exception:
+            logger.warning(
+                "record_media_usage: workspace budget accumulation failed",
+                exc_info=True,
+            )
+            if strict:
+                raise
+
+    # 4. Entity AI budget (ai_usage_usd)
     try:
         from packages.core.services.plan_enforcement import record_ai_cost
         await record_ai_cost(db, entity_id, float(cost_usd), model)
     except Exception:
         logger.warning("record_media_usage: budget update failed", exc_info=True)
+        if strict:
+            raise
 
     return True
 

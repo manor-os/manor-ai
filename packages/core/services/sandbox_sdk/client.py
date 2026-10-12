@@ -25,6 +25,9 @@ from .models import (
     ContainerConfig,
     CreateSandboxResult,
     ExecResult,
+    ExecutionEventResult,
+    ExecutionResponseResult,
+    ExecutionStatusResult,
     FileReadBase64Result,
     FileReadResult,
     FileWriteResult,
@@ -44,6 +47,7 @@ def _config_payload(config: Optional[ContainerConfig | dict]) -> dict | None:
 
 DEFAULT_BASE_URL = "http://localhost:8000"
 DEFAULT_TIMEOUT = 120.0
+DEFAULT_PROVISION_TIMEOUT = 360.0
 
 
 def _parse_skill(data: dict) -> SkillManifest:
@@ -91,6 +95,7 @@ def _parse_sandbox_info(d: dict) -> SandboxInfo:
         last_used_at=d["last_used_at"],
         config=d.get("config", {}),
         active_command=d.get("active_command"),
+        active_execution_id=d.get("active_execution_id"),
         expires_at=d.get("expires_at"),
     )
 
@@ -136,6 +141,15 @@ class SandboxClient:
                 f"Cannot connect to Sandbox Service at {self._base_url}: {exc}"
             ) from exc
 
+    def _provision_timeout(self) -> httpx.Timeout:
+        # Creating/loading a skill includes Docker setup and dependency installs.
+        # Keep normal reads short while allowing that bounded provisioning work.
+        timeout = self._http.timeout
+        read = timeout.read
+        if read is not None:
+            read = max(read, DEFAULT_PROVISION_TIMEOUT)
+        return httpx.Timeout(connect=timeout.connect, read=read, write=timeout.write, pool=timeout.pool)
+
     async def create_from_files(
         self,
         skill_name: str,
@@ -160,7 +174,9 @@ class SandboxClient:
             body["config_overrides"] = config_payload
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
-        resp = await self._http.post("/api/v1/sandbox/create-from-files", json=body)
+        resp = await self._http.post(
+            "/api/v1/sandbox/create-from-files", json=body, timeout=self._provision_timeout()
+        )
         _raise_for_status(resp)
         data = resp.json()
         return CreateSandboxResult(
@@ -170,6 +186,7 @@ class SandboxClient:
             skill=_parse_skill(data["skill"]),
             workdir=data["workdir"],
             env_blocked=data.get("env_blocked", []),
+            env_injection=str(data.get("env_injection") or "create"),
         )
 
     async def create_from_builtin(
@@ -196,7 +213,9 @@ class SandboxClient:
             body["config_overrides"] = config_payload
         if idempotency_key is not None:
             body["idempotency_key"] = idempotency_key
-        resp = await self._http.post("/api/v1/sandbox/create-from-builtin", json=body)
+        resp = await self._http.post(
+            "/api/v1/sandbox/create-from-builtin", json=body, timeout=self._provision_timeout()
+        )
         _raise_for_status(resp)
         data = resp.json()
         return CreateSandboxResult(
@@ -206,6 +225,7 @@ class SandboxClient:
             skill=_parse_skill(data["skill"]),
             workdir=data["workdir"],
             env_blocked=data.get("env_blocked", []),
+            env_injection=str(data.get("env_injection") or "create"),
         )
 
     async def load_skill(
@@ -216,9 +236,13 @@ class SandboxClient:
         auto_install: bool = True,
         idle_threshold: int = 30,
         source: str = "workspace",
+        env: dict[str, str] | None = None,
+        allowed_sensitive_keys: list[str] | None = None,
     ) -> LoadSkillResult:
         """Load a new skill into an existing idle sandbox (reuse mode).
 
+        ``env`` replaces the skill env later exec calls receive (an empty
+        mapping clears the previous skill's credentials).
         Raises SandboxError(status_code=409) if the sandbox is busy.
         """
         body: dict = {
@@ -227,14 +251,19 @@ class SandboxClient:
             "auto_install": auto_install,
             "idle_threshold": idle_threshold,
             "source": source,
+            "env": env or {},
+            "allowed_sensitive_keys": list(allowed_sensitive_keys or []),
         }
-        resp = await self._http.post(f"/api/v1/sandbox/{sandbox_id}/load-skill", json=body)
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/load-skill", json=body, timeout=self._provision_timeout()
+        )
         _raise_for_status(resp)
         data = resp.json()
         return LoadSkillResult(
             sandbox_id=data["sandbox_id"],
             skill=_parse_skill(data["skill"]),
             reused=data.get("reused", True),
+            env_blocked=list(data.get("env_blocked") or []),
         )
 
     async def list(self) -> list[SandboxInfo]:
@@ -251,6 +280,7 @@ class SandboxClient:
                 last_used_at=d["last_used_at"],
                 config=d.get("config", {}),
                 active_command=d.get("active_command"),
+                active_execution_id=d.get("active_execution_id"),
                 expires_at=d.get("expires_at"),
             )
             for d in resp.json()
@@ -314,6 +344,98 @@ class SandboxClient:
             sandbox_id=data["sandbox_id"],
             execution_id=data["execution_id"],
             cancelled=bool(data["cancelled"]),
+        )
+
+    @staticmethod
+    def _parse_execution_status(data: dict) -> ExecutionStatusResult:
+        events = [
+            ExecutionEventResult(
+                sequence=int(event["sequence"]),
+                event_id=event["event_id"],
+                type=event["type"],
+                message=event.get("message", ""),
+                payload=dict(event.get("payload") or {}),
+                requires_response=bool(event.get("requires_response", False)),
+                responded=bool(event.get("responded", False)),
+                created_at=float(event.get("created_at") or 0.0),
+            )
+            for event in data.get("events", [])
+        ]
+        return ExecutionStatusResult(
+            sandbox_id=data["sandbox_id"],
+            execution_id=data["execution_id"],
+            status=data["status"],
+            created_at=data["created_at"],
+            started_at=data.get("started_at"),
+            finished_at=data.get("finished_at"),
+            stdout=data.get("stdout"),
+            stderr=data.get("stderr"),
+            exit_code=data.get("exit_code"),
+            error=data.get("error"),
+            events=events,
+            next_sequence=int(data.get("next_sequence") or 0),
+            waiting_for_response=bool(data.get("waiting_for_response", False)),
+        )
+
+    async def start_exec(
+        self,
+        sandbox_id: str,
+        command: str,
+        timeout: int = 60,
+        workdir: str | None = None,
+        execution_id: str | None = None,
+    ) -> ExecutionStatusResult:
+        body: dict = {"command": command, "timeout": timeout}
+        if workdir:
+            body["workdir"] = workdir
+        if execution_id is not None:
+            body["execution_id"] = execution_id
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/exec/start",
+            json=body,
+        )
+        _raise_for_status(resp)
+        return self._parse_execution_status(resp.json())
+
+    async def execution_status(
+        self,
+        sandbox_id: str,
+        execution_id: str,
+        after_sequence: int = 0,
+    ) -> ExecutionStatusResult:
+        params = {"after_sequence": max(0, int(after_sequence))} if after_sequence else None
+        resp = await self._http.get(
+            f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}",
+            params=params,
+        )
+        _raise_for_status(resp)
+        return self._parse_execution_status(resp.json())
+
+    async def send_execution_response(
+        self,
+        sandbox_id: str,
+        execution_id: str,
+        event_id: str,
+        *,
+        payload: dict | None = None,
+        message: str = "",
+    ) -> ExecutionResponseResult:
+        resp = await self._http.post(
+            f"/api/v1/sandbox/{sandbox_id}/executions/{execution_id}/responses",
+            json={
+                "event_id": event_id,
+                "payload": dict(payload or {}),
+                "message": message,
+            },
+        )
+        _raise_for_status(resp)
+        data = resp.json()
+        return ExecutionResponseResult(
+            sandbox_id=data["sandbox_id"],
+            execution_id=data["execution_id"],
+            event_id=data["event_id"],
+            accepted=bool(data["accepted"]),
+            duplicate=bool(data.get("duplicate", False)),
         )
 
     async def read_file(

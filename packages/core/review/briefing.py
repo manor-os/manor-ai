@@ -132,9 +132,11 @@ class DecisionDigest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     task_id: str
+    task_title: Optional[str] = None
     review_id: Optional[str] = None
     decision: ProposalDecisionKind
     reason: Optional[str] = None
+    reason_code: Optional[str] = None
     decided_at: Optional[str] = None
 
 
@@ -333,11 +335,15 @@ async def _previous_decisions(
             else ProposalDecisionKind.REJECTED
         )
         reason = payload.get("rejection_reason")
+        reason_code = payload.get("rejection_reason_code") or payload.get("reason_code")
+        title = payload.get("title")
         digests.append(DecisionDigest(
             task_id=event.source_id,
+            task_title=str(title).strip()[:240] if title is not None else None,
             review_id=event.causation_id,
             decision=decision,
             reason=str(reason) if reason is not None else None,
+            reason_code=str(reason_code).strip()[:64] if reason_code is not None else None,
             decided_at=_iso(event.occurred_at),
         ))
     return digests

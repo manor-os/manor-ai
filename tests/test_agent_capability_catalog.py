@@ -721,7 +721,7 @@ async def test_agent_ai_factory_serializes_catalog_provider_calls(
 
 
 @pytest.mark.asyncio
-async def test_workspace_custom_agent_resolves_exact_catalog_ids(db_session) -> None:
+async def test_workspace_custom_agent_resolves_exact_catalog_ids(db_session, monkeypatch) -> None:
     from packages.core.ai.tools.workspace_arch_tools import (
         _request_custom_agent,
         _search_capabilities,
@@ -761,6 +761,7 @@ async def test_workspace_custom_agent_resolves_exact_catalog_ids(db_session) -> 
     )
     db_session.add_all([user, skill, draft])
     await db_session.flush()
+
 
     payload = await _search_capabilities(
         db_session,

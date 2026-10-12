@@ -12,7 +12,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
@@ -22,12 +22,75 @@ from packages.core.constants.blueprints import (
     BlueprintInstallTodoKind,
     installed_blueprint_job_id,
 )
+from packages.core.constants.task import TaskStatus
 from packages.core.models.channel import ChannelConfig
 from packages.core.models.goal import Goal
+from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+from packages.core.models.task import Task
 from packages.core.models.workspace import AgentSubscription, Workspace
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 
 BUILT_IN_CHANNEL_TYPES = {"webchat", "internal_chat", "in_app"}
+
+# Channel types the architect may declare for a platform Manor has no channel
+# adapter for. There is no account of this type to attach, so a declaration
+# is a statement of intent about a platform, not a connection requirement:
+# agents reach such a platform through a dedicated integration or through the
+# Chrome extension, and the declaration is optional unless the author says
+# otherwise.
+UNBACKED_CHANNEL_TYPES = frozenset({"other"})
+
+
+def channel_type_has_account_model(channel_type: object) -> bool:
+    """Whether a ``ChannelConfig`` of this type can exist at all.
+
+    Built-in surfaces always do. Anything else needs a registered channel
+    adapter; ``other`` never has one, and neither does a made-up type.
+    """
+    text = str(channel_type or "").strip()
+    if not text:
+        return False
+    if text in BUILT_IN_CHANNEL_TYPES:
+        return True
+    if text in UNBACKED_CHANNEL_TYPES:
+        return False
+    from packages.core.services.channels.base import get_adapter
+
+    return get_adapter(text) is not None
+
+
+def unbacked_channel_platform(block: dict[str, Any] | None) -> str:
+    """The platform an ``other`` declaration is about, as the author named it."""
+    block = block if isinstance(block, dict) else {}
+    for key in ("provider", "platform", "name", "label"):
+        text = str(block.get(key) or "").strip()
+        if text and text.lower() not in UNBACKED_CHANNEL_TYPES:
+            return text
+    return ""
+
+
+def describe_unbacked_channel(block: dict[str, Any] | None) -> tuple[str, str]:
+    """Label and explanation for a declared platform with no channel adapter.
+
+    The old projection labelled such a row "Other" and asked the operator to
+    "Attach an active other channel account" — a requirement nothing could
+    satisfy, because no such account type exists. Say what the row actually
+    is and what would satisfy it.
+    """
+    block = block if isinstance(block, dict) else {}
+    platform = unbacked_channel_platform(block)
+    purpose = str(block.get("purpose") or "").strip()
+    name = platform or "This platform"
+    label = f"{platform} (no built-in channel)" if platform else "Unnamed platform (no built-in channel)"
+    reason = (
+        f"{name} has no built-in channel adapter, so there is no channel account to attach. "
+        "Optional: agents can work on it through a dedicated integration or through the "
+        "Chrome extension. Connect either under Integrations; connecting both is best."
+    )
+    if purpose:
+        reason = f"Declared for: {purpose}. " + reason
+    return label, reason
 
 
 def iter_declared_service_keys(operating_model: dict[str, Any] | None) -> set[str]:
@@ -115,6 +178,190 @@ def normalize_workspace_setup_task_key(value: object) -> str:
 
     base = re.sub(r"[^a-zA-Z0-9_]+", "_", str(value or "").strip().lower())
     return re.sub(r"_+", "_", base).strip("_")[:80]
+
+
+def workspace_materials_check_accepts_text(value: Any) -> bool:
+    """Whether a declared materials check can be satisfied by a user answer."""
+    if isinstance(value, dict):
+        return "fulfilled_input_regex" in value or any(
+            workspace_materials_check_accepts_text(part) for part in value.values()
+        )
+    if isinstance(value, list):
+        return any(workspace_materials_check_accepts_text(part) for part in value)
+    return False
+
+
+async def evaluate_workspace_automatic_setup_status(
+    db: AsyncSession,
+    workspace: Workspace,
+    incomplete_checks: Iterable[dict[str, Any]],
+) -> tuple[str | None, str | None]:
+    """Project actual setup occurrences and their scoped Task into the UI."""
+
+    base_job_ids = list(dict.fromkeys(
+        str(check.get("setup_job_id") or "").strip()
+        for check in incomplete_checks
+        if isinstance(check, dict)
+        and str(check.get("setup_job_id") or "").strip()
+    ))
+    if not base_job_ids:
+        return None, None
+
+    scoped_job_ids = [
+        installed_blueprint_job_id(job_id, workspace.id)
+        for job_id in base_job_ids
+    ]
+    jobs = list((await db.execute(
+        select(ScheduledJob).where(
+            ScheduledJob.entity_id == workspace.entity_id,
+            ScheduledJob.workspace_id == workspace.id,
+            ScheduledJob.job_id.in_(scoped_job_ids),
+        )
+    )).scalars().all())
+    jobs_by_id = {job.job_id: job for job in jobs}
+    runs = list((await db.execute(
+        select(ScheduledJobRun)
+        .where(ScheduledJobRun.job_id.in_(scoped_job_ids))
+        .distinct(ScheduledJobRun.job_id)
+        .order_by(
+            ScheduledJobRun.job_id,
+            ScheduledJobRun.created_at.desc(),
+            ScheduledJobRun.id.desc(),
+        )
+    )).scalars().all())
+    runs_by_job = {run.job_id: run for run in runs}
+    task_id = None
+    states: list[str] = []
+    for job_id in scoped_job_ids:
+        job = jobs_by_id.get(job_id)
+        if job is None:
+            states.append("failed")
+            continue
+        run = runs_by_job.get(job_id)
+        result = run.result if run and isinstance(run.result, dict) else {}
+        if task_id is None and result.get("scheduled_child_kind") == "agent_task":
+            child = await db.get(Task, str(result.get("scheduled_child_id") or ""))
+            if child is not None and child.workspace_id == workspace.id and child.entity_id == workspace.entity_id:
+                task_id = child.id
+        last_status = str(run.status if run else job.last_status or "").strip().lower()
+        if not job.enabled:
+            states.append("failed")
+        elif last_status in {"running", "dispatched", "prepared"}:
+            states.append("running")
+        elif job.enabled and last_status == "error":
+            states.append("retrying")
+        elif job.enabled and not last_status:
+            states.append("pending")
+        else:
+            # A terminal run that did not satisfy readiness, or a disabled
+            # setup job, cannot truthfully remain in the preparing state.
+            states.append("failed")
+
+    for state in ("failed", "running", "retrying", "pending"):
+        if state in states:
+            return state, task_id
+    return "failed", task_id
+
+
+async def evaluate_workspace_automatic_setup_state(
+    db: AsyncSession,
+    workspace: Workspace,
+    incomplete_checks: Iterable[dict[str, Any]],
+) -> str | None:
+    state, _task_id = await evaluate_workspace_automatic_setup_status(db, workspace, incomplete_checks)
+    return state
+
+
+async def task_is_authorized_workspace_setup(
+    db: AsyncSession,
+    task: Task | None,
+) -> bool:
+    """Accept only the exact child of a live, Blueprint-declared setup run.
+
+    Task details are lookup hints, never authority. The protected installed
+    contract, current job revision, active subscription and server-owned child
+    receipt must agree before setup may enter the ordinary Plan runtime.
+    """
+    from packages.core.services.blueprint_startup_service import blueprint_startup_contract_fingerprint
+
+    if task is None or not task.workspace_id or task.status != TaskStatus.IN_PROGRESS:
+        return False
+    details = task.details if isinstance(task.details, dict) else {}
+    run_id = str(details.get("scheduled_run_id") or "").strip()
+    job_id = str(details.get("scheduled_job_id") or "").strip()
+    if not run_id or not job_id:
+        return False
+    workspace = (await db.execute(select(Workspace).where(
+        Workspace.id == task.workspace_id,
+        Workspace.entity_id == task.entity_id,
+        Workspace.deleted_at.is_(None),
+    ).execution_options(populate_existing=True))).scalar_one_or_none()
+    if workspace is None or workspace.status != "active":
+        return False
+    settings = workspace.settings if isinstance(workspace.settings, dict) else {}
+    setup = settings.get("blocking_setup")
+    record = settings.get("_blueprint")
+    if settings.get("sandbox") or not isinstance(setup, dict) or not isinstance(record, dict):
+        return False
+    if (
+        not (record.get("blueprint_id") or record.get("blueprint_slug"))
+        or "blocking_setup" not in (record.get("portable_setting_keys") or [])
+        or not isinstance(record.get("live_setup_requirements"), list)
+        or (record.get("runtime_contract_fingerprints") or {}).get("blocking_setup")
+        != blueprint_startup_contract_fingerprint(setup)
+    ):
+        return False
+    allowed_jobs = {
+        installed_blueprint_job_id(check["setup_job_id"], workspace.id)
+        for check in setup.get("checks") or []
+        if isinstance(check, dict) and check.get("blocking", True) and check.get("setup_job_id")
+    }
+    if job_id not in allowed_jobs:
+        return False
+    job = (await db.execute(select(ScheduledJob).where(
+        ScheduledJob.job_id == job_id,
+        ScheduledJob.entity_id == task.entity_id,
+        ScheduledJob.workspace_id == task.workspace_id,
+        ScheduledJob.enabled.is_(True),
+    ).execution_options(populate_existing=True))).scalar_one_or_none()
+    run = (await db.execute(select(ScheduledJobRun).where(
+        ScheduledJobRun.id == run_id, ScheduledJobRun.job_id == job_id,
+        ScheduledJobRun.status == "running",
+    ).execution_options(populate_existing=True))).scalar_one_or_none()
+    if job is None or run is None or job.execution_type != "agent" or job.agent_id != task.agent_id:
+        return False
+    result = run.result if isinstance(run.result, dict) else {}
+    dispatch = result.get("dispatch")
+    ledger = result.get("dispatch_ledger")
+    if not isinstance(dispatch, dict) or not isinstance(ledger, dict):
+        return False
+    kwargs = dispatch.get("kwargs")
+    if not isinstance(kwargs, dict):
+        return False
+    if (
+        result.get("scheduled_child_kind") != "agent_task"
+        or result.get("scheduled_child_id") != task.id
+        or dispatch.get("kind") != "agent_task"
+        or dispatch.get("args") != [task.id, task.agent_id]
+        or kwargs.get("scheduled_run_id") != run.id
+        or kwargs.get("scheduled_job_id") != job.job_id
+        or ledger.get("revision") != job.revision
+    ):
+        return False
+    subscription = (await db.execute(select(AgentSubscription).where(
+        AgentSubscription.id == task.owner_subscription_id,
+        AgentSubscription.entity_id == task.entity_id,
+        AgentSubscription.workspace_id == task.workspace_id,
+        AgentSubscription.agent_id == task.agent_id,
+        AgentSubscription.status == "active",
+    ).execution_options(populate_existing=True))).scalar_one_or_none()
+    target = job.execution_target if isinstance(job.execution_target, dict) else {}
+    return bool(subscription is not None and (
+        not target.get("agent_subscription_id")
+        or target["agent_subscription_id"] == subscription.id
+    ) and (
+        not target.get("service_key") or target["service_key"] == subscription.service_key
+    ))
 
 
 WORKSPACE_READINESS_PARTS: tuple[WorkspaceReadinessPartSpec, ...] = (
@@ -220,12 +467,16 @@ def declared_channel_requirements(operating_model: dict[str, Any] | None) -> lis
         if key in seen:
             continue
         seen.add(key)
+        # A platform with no channel adapter has nothing to configure here;
+        # it is optional unless the author explicitly required it.
+        unbacked = channel_type in UNBACKED_CHANNEL_TYPES
         requirements.append({
             "role": role,
             "channel_type": channel_type,
             "provider": provider,
             "purpose": block.get("purpose") or "",
             "linked_service_key": block.get("linked_service_key") or "",
+            "required": bool(block.get("required", not unbacked)),
         })
     return requirements
 
@@ -244,6 +495,8 @@ def missing_required_channels(
     }
     missing: list[dict[str, Any]] = []
     for requirement in declared_channel_requirements(operating_model):
+        if not requirement.get("required", True):
+            continue
         req_type = str(requirement.get("channel_type") or "").strip()
         req_provider = str(requirement.get("provider") or req_type).strip()
         if (req_type, req_provider) in configured_pairs or any(pair[0] == req_type for pair in configured_pairs):
@@ -565,6 +818,12 @@ async def evaluate_workspace_blocking_setup(
     cannot bypass the gate.
     """
 
+    from packages.core.services.workspace_integration_scope import (
+        disabled_workspace_providers,
+        integration_provider_for_requirement,
+    )
+
+    disabled_providers = disabled_workspace_providers(workspace.operating_model)
     settings = workspace.settings or {}
     setup = settings.get("blocking_setup")
     setup = setup if isinstance(setup, dict) else {}
@@ -601,6 +860,11 @@ async def evaluate_workspace_blocking_setup(
             or str(check.get("key") or "").strip() in check_keys
         )
     ]
+    has_declared_checks = bool(selected_checks)
+    selected_checks = [
+        check for check in selected_checks
+        if integration_provider_for_requirement(check) not in disabled_providers
+    ]
     if not selected_checks and not install_todos and not missing_live_contract:
         return None
 
@@ -624,6 +888,7 @@ async def evaluate_workspace_blocking_setup(
         if str(todo.get("kind") or "").strip() == BlueprintInstallTodoKind.MISSING_INTEGRATION.value
         and isinstance(todo.get("payload"), dict)
         and str((todo.get("payload") or {}).get("provider") or "").strip()
+        and integration_provider_for_requirement(todo) not in disabled_providers
     ]
     declared_integration_providers = {
         str(check.get("provider") or "").strip()
@@ -665,6 +930,12 @@ async def evaluate_workspace_blocking_setup(
         kind = str(check.get("kind") or "").strip()
         if kind == "workspace_identity_assets":
             result = _workspace_identity_setup_result(workspace, check)
+        elif kind == "workspace_user_materials":
+            result = await _workspace_user_materials_setup_result(
+                db,
+                workspace,
+                check,
+            )
         elif kind == "integration_provider":
             provider = canonical_provider_key(check.get("provider"))
             state = integration_states.get(provider)
@@ -694,7 +965,10 @@ async def evaluate_workspace_blocking_setup(
             "blocking": bool(check.get("blocking", True)),
             "setup_task_key": str(check.get("setup_task_key") or "").strip(),
             "setup_job_id": str(check.get("setup_job_id") or "").strip(),
+            "question": str(check.get("question") or "").strip(),
         })
+        if kind == "workspace_user_materials":
+            result["accepts_text"] = workspace_materials_check_accepts_text(check)
         results.append(result)
 
     configured_channels = (
@@ -707,6 +981,10 @@ async def evaluate_workspace_blocking_setup(
     )
     used_channel_accounts: set[str] = set()
     for index, todo in enumerate(install_todos):
+        # Keep the durable requirement's index stable for connection-status
+        # and setup-task references while applying the live Workspace policy.
+        if integration_provider_for_requirement(todo) in disabled_providers:
+            continue
         todo_kind = str(todo.get("kind") or "").strip()
         todo_payload = todo.get("payload")
         todo_payload = todo_payload if isinstance(todo_payload, dict) else {}
@@ -734,7 +1012,7 @@ async def evaluate_workspace_blocking_setup(
             continue
         if (
             todo_kind == BlueprintInstallTodoKind.BLOCKING_SETUP.value
-            and selected_checks
+            and has_declared_checks
         ):
             continue
         available_channels = [
@@ -1126,9 +1404,11 @@ async def _blueprint_install_todo_result(
                 ),
                 AgentSkillBinding.status == "active",
                 Skill.status == "active",
+                or_(Skill.entity_id == workspace.entity_id,
+                    and_(Skill.entity_id.is_(None), Skill.is_public.is_(True))),
             )
         )).all())
-        ready = False
+        candidates = []
         for _binding, agent, skill in rows:
             if installed_agent_id:
                 if str(agent.id) != installed_agent_id:
@@ -1143,26 +1423,26 @@ async def _blueprint_install_todo_result(
                     continue
             elif str(agent.slug or "").strip() != agent_slug:
                 continue
-            source_skill_id = str(
-                (skill.config or {}).get("source_skill_id") or ""
-            ).strip()
-            source_component_key = str(
-                (skill.config or {}).get("source_blueprint_component_key") or ""
-            ).strip()
-            if installed_skill_id:
-                identity_matches = str(skill.id) == installed_skill_id
-            elif marketplace_skill_id:
-                identity_matches = (
-                    str(skill.id) == marketplace_skill_id
-                    or source_skill_id == marketplace_skill_id
-                )
-            elif skill_component_key:
-                identity_matches = source_component_key == skill_component_key
-            else:
-                identity_matches = str(skill.slug or "").strip() == skill_slug
-            if identity_matches:
-                ready = True
-                break
+            candidates.append(skill)
+        # Exact local IDs cannot bypass the source contract. Legacy receipts
+        # omitted marketplace_source; only unique bound provenance can recover it.
+        marketplace_source = str(payload.get("marketplace_source") or "").strip()
+        if marketplace_skill_id:
+            from packages.core.services.marketplace_skill_service import resolve_bound_blueprint_skill
+
+            resolved = await resolve_bound_blueprint_skill(
+                db, entity_id=workspace.entity_id, skills=candidates,
+                marketplace_id=marketplace_skill_id,
+                marketplace_source=marketplace_source or None,
+            )
+            ready = bool(resolved and (not installed_skill_id or resolved == installed_skill_id))
+        else:
+            matches = {str(skill.id) for skill in candidates if (
+                str(skill.id) == installed_skill_id if installed_skill_id else
+                str((skill.config or {}).get("source_blueprint_component_key") or "").strip() == skill_component_key
+                if skill_component_key else str(skill.slug or "").strip() == skill_slug
+            )}
+            ready = len(matches) == 1
         return {"ready": ready, "reason": "Skill binding is active." if ready else detail}
 
     # Unknown future todo kinds remain fail-closed until a concrete evaluator
@@ -1189,7 +1469,7 @@ async def evaluate_current_workspace_blocking_setup(
     if entity_id:
         stmt = stmt.where(Workspace.entity_id == entity_id)
     workspace = (await db.execute(stmt)).scalar_one_or_none()
-    if workspace is None or str(getattr(workspace, "status", "active") or "") != "active":
+    if not workspace_allows_manual_work(workspace):
         spec = next(
             spec for spec in WORKSPACE_READINESS_PARTS
             if spec.key == "blocking_setup"
@@ -1202,6 +1482,282 @@ async def evaluate_current_workspace_blocking_setup(
             details={"ready": False, "incomplete_checks": []},
         )
     return await evaluate_workspace_blocking_setup(db, workspace)
+
+
+_BLUEPRINT_DOCUMENT_SOURCE = "blueprint"
+
+
+class _WorkspaceMaterialRecord:
+    __slots__ = ("name", "mime", "path")
+
+    def __init__(self, name: str = "", mime: str = "", path: str = "") -> None:
+        self.name = name
+        self.mime = mime
+        self.path = path
+
+
+def _compile_optional_regex(pattern: str) -> re.Pattern[str] | None:
+    text = str(pattern or "").strip()
+    if not text:
+        return None
+    try:
+        return re.compile(text, re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def _material_name_suffix(name: str, path: str) -> str:
+    for value in (name, path):
+        text = str(value or "").strip().rsplit("?", 1)[0].rsplit("#", 1)[0]
+        if "." not in text:
+            continue
+        ext = text.rsplit(".", 1)[-1].strip().lower()
+        if ext:
+            return f".{ext}"
+    return ""
+
+
+def _document_matches_material_spec(
+    record: _WorkspaceMaterialRecord,
+    spec: dict[str, Any],
+) -> bool:
+    mime_prefixes = [
+        str(item).strip().lower()
+        for item in (spec.get("mime_prefixes") or [])
+        if str(item).strip()
+    ]
+    suffixes: list[str] = []
+    for item in spec.get("suffixes") or []:
+        text = str(item).strip().lower()
+        if not text:
+            continue
+        suffixes.append(text if text.startswith(".") else f".{text}")
+    name_pattern = str(spec.get("name_regex") or "").strip()
+    compiled = _compile_optional_regex(name_pattern) if name_pattern else True
+    if name_pattern and compiled is None:
+        return False
+
+    mime = str(record.mime or "").strip().lower()
+    name = str(record.name or "")
+    path = str(record.path or "")
+    suffix = _material_name_suffix(name, path)
+    type_ok = True
+    if mime_prefixes or suffixes:
+        mime_ok = any(mime.startswith(prefix) for prefix in mime_prefixes)
+        suffix_ok = suffix in suffixes
+        type_ok = mime_ok or suffix_ok
+    name_ok = True
+    if compiled is not True:
+        name_ok = bool(compiled.search(name) or compiled.search(path))
+    return type_ok and name_ok
+
+
+def _documents_satisfy_material_spec(
+    records: list[_WorkspaceMaterialRecord],
+    spec: Any,
+) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    try:
+        min_count = int(spec.get("min_count") or 1)
+    except (TypeError, ValueError):
+        min_count = 1
+    if min_count < 1:
+        min_count = 1
+    matched = [
+        record
+        for record in records
+        if _document_matches_material_spec(record, spec)
+    ]
+    return len(matched) >= min_count
+
+
+def _texts_satisfy_material_spec(texts: list[str], spec: dict[str, Any]) -> bool:
+    compiled = _compile_optional_regex(str(spec.get("fulfilled_input_regex") or ""))
+    if compiled is None:
+        return False
+    try:
+        min_chars = int(spec.get("min_chars") or 0)
+    except (TypeError, ValueError):
+        min_chars = 0
+    try:
+        min_lines = int(spec.get("min_lines") or 0)
+    except (TypeError, ValueError):
+        min_lines = 0
+    for text in texts:
+        if not compiled.search(text):
+            continue
+        if min_chars and len(text) < min_chars:
+            continue
+        if min_lines and len(text.splitlines()) < min_lines:
+            continue
+        return True
+    return False
+
+
+def _evaluate_workspace_material_clause(
+    clause: Any,
+    records: list[_WorkspaceMaterialRecord],
+    texts: list[str],
+) -> bool:
+    if not isinstance(clause, dict):
+        return False
+    if "all_of" in clause:
+        items = clause.get("all_of")
+        return (
+            isinstance(items, list)
+            and bool(items)
+            and all(
+                _evaluate_workspace_material_clause(item, records, texts)
+                for item in items
+            )
+        )
+    if "any_of" in clause:
+        items = clause.get("any_of")
+        return (
+            isinstance(items, list)
+            and bool(items)
+            and any(
+                _evaluate_workspace_material_clause(item, records, texts)
+                for item in items
+            )
+        )
+    has_constraint = False
+    ready = True
+    if "documents" in clause:
+        has_constraint = True
+        ready = ready and _documents_satisfy_material_spec(
+            records,
+            clause.get("documents"),
+        )
+    if clause.get("fulfilled_input_regex"):
+        has_constraint = True
+        ready = ready and _texts_satisfy_material_spec(texts, clause)
+    return bool(has_constraint and ready)
+
+
+def _material_record_from_document(document: Any) -> _WorkspaceMaterialRecord:
+    return _WorkspaceMaterialRecord(
+        name=str(getattr(document, "name", None) or ""),
+        mime=str(
+            getattr(document, "mime_type", None)
+            or getattr(document, "file_type", None)
+            or ""
+        ),
+        path=str(getattr(document, "fs_path", None) or ""),
+    )
+
+
+def _material_record_from_attachment(item: Any) -> _WorkspaceMaterialRecord | None:
+    if not isinstance(item, dict):
+        return None
+    name = str(item.get("name") or "").strip()
+    path = str(item.get("fs_path") or item.get("path") or "").strip()
+    mime = str(item.get("mime_type") or item.get("mime") or "").strip()
+    if not name and not path:
+        return None
+    return _WorkspaceMaterialRecord(name=name, mime=mime, path=path)
+
+
+def _fulfilled_input_texts(response: Any) -> list[str]:
+    if not isinstance(response, dict):
+        return []
+    texts: list[str] = []
+    for key in ("text", "answer"):
+        value = response.get(key)
+        if isinstance(value, str) and value.strip():
+            texts.append(value.strip())
+    return texts
+
+
+async def _load_workspace_material_records(
+    db: AsyncSession,
+    workspace: Workspace,
+) -> list[_WorkspaceMaterialRecord]:
+    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+
+    rows = (await db.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .join(DocumentGroup, DocumentGroup.id == DocumentGroupMember.group_id)
+        .where(
+            DocumentGroup.workspace_id == workspace.id,
+            DocumentGroup.entity_id == workspace.entity_id,
+            Document.entity_id == workspace.entity_id,
+            Document.is_trashed.is_(False),
+        )
+    )).scalars().unique().all()
+    records: list[_WorkspaceMaterialRecord] = []
+    seen: set[str] = set()
+    for document in rows:
+        if str(document.source or "").strip().lower() == _BLUEPRINT_DOCUMENT_SOURCE:
+            continue
+        if document.id in seen:
+            continue
+        seen.add(document.id)
+        records.append(_material_record_from_document(document))
+    return records
+
+
+async def _load_fulfilled_input_evidence(
+    db: AsyncSession,
+    workspace: Workspace,
+    *,
+    check_key: str,
+) -> tuple[list[str], list[_WorkspaceMaterialRecord]]:
+    from packages.core.models.participant import HumanCommitment
+
+    rows = (await db.execute(
+        select(HumanCommitment).where(
+            HumanCommitment.workspace_id == workspace.id,
+            HumanCommitment.entity_id == workspace.entity_id,
+            HumanCommitment.request_kind == "input",
+            HumanCommitment.status == "fulfilled",
+        )
+    )).scalars().all()
+    texts: list[str] = []
+    attachments: list[_WorkspaceMaterialRecord] = []
+    for commitment in rows:
+        response = commitment.response if isinstance(commitment.response, dict) else {}
+        setup_check_key = str(response.get("setup_check_key") or "").strip()
+        if setup_check_key and setup_check_key != check_key:
+            continue
+        texts.extend(_fulfilled_input_texts(commitment.response))
+        items = response.get("attachments")
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            record = _material_record_from_attachment(item)
+            if record is not None:
+                attachments.append(record)
+    return texts, attachments
+
+
+async def _workspace_user_materials_setup_result(
+    db: AsyncSession,
+    workspace: Workspace,
+    check: dict[str, Any],
+) -> dict[str, Any]:
+    """Evaluate Blueprint-owned Knowledge / Need Input evidence."""
+
+    records = await _load_workspace_material_records(db, workspace)
+    key = str(check.get("key") or "workspace_user_materials").strip()
+    texts, attachments = await _load_fulfilled_input_evidence(
+        db, workspace, check_key=key,
+    )
+    ready = _evaluate_workspace_material_clause(
+        check,
+        [*records, *attachments],
+        texts,
+    )
+    return {
+        "ready": ready,
+        "reason": (
+            f"Workspace materials check {key!r} is ready."
+            if ready
+            else f"Workspace materials check {key!r} is incomplete."
+        ),
+    }
 
 
 def _workspace_identity_setup_result(

@@ -51,17 +51,23 @@ def test_workspace_history_projects_merged_subagent_events_without_private_detai
 
 
 async def channel_fixture(db, channel_type):
+    from approval_settings_test_utils import initialize_test_approval_owners
+    from packages.core.models.user import User, UserMembership
     from packages.core.services.agent_runtime_config import normalize_agent_runtime_config
 
     entity_id, user_id = generate_ulid(), generate_ulid()
+    user = User(id=user_id, entity_id=entity_id, email=f"{user_id}@example.test",
+        password_hash="x", role="owner", status="active")
     workspace = Workspace(entity_id=entity_id, name="Channel review", status="active", settings={"access_mode": "members_only"})
     agent = Agent(entity_id=entity_id, name="Support", status="active", config=normalize_agent_runtime_config({}))
     account = ChannelConfig(
         entity_id=entity_id, owner_user_id=user_id, channel_type=channel_type,
         provider=channel_type, name="Support account", status="active",
     )
-    db.add_all([workspace, agent, account])
+    db.add_all([user, workspace, agent, account])
     await db.flush()
+    db.add(UserMembership(user_id=user_id, entity_id=entity_id, role="owner", status="active", is_primary=True))
+    await initialize_test_approval_owners(db, workspace, user_id=user_id)
     subscription = AgentSubscription(
         entity_id=entity_id, workspace_id=workspace.id, agent_id=agent.id,
         service_key="support", status="active",
@@ -103,9 +109,14 @@ async def test_blueprint_channel_export_preserves_shared_account_and_service(db_
 
 async def test_legacy_channel_does_not_pick_an_arbitrary_service(db_session):
     workspace, account, subscription = await channel_fixture(db_session, "telegram")
+    agent = Agent(
+        entity_id=workspace.entity_id, name="Sales", status="active", config={},
+    )
+    db_session.add(agent)
+    await db_session.flush()
     db_session.add(AgentSubscription(
         entity_id=workspace.entity_id, workspace_id=workspace.id,
-        agent_id=subscription.agent_id, service_key="sales", status="active",
+        agent_id=agent.id, service_key="sales", status="active",
     ))
     await db_session.flush()
     await _bind_blueprint_channel_configs(
@@ -129,7 +140,14 @@ async def test_live_template_cannot_reassign_a_shared_document(db_session, keyed
         entity_id=entity_id, name="guide.md", metadata_={
             "content_text": "Operator edits",
             "origin": {"workspace_id": workspaces[0].id},
-            **({"blueprint_document_key": "guide"} if keyed else {}),
+            **(
+                {"blueprint_document_key": "guide"}
+                if keyed
+                else {
+                    "blueprint_knowledge_pack_slug": "guide",
+                    "blueprint_starter_path": "guide.md",
+                }
+            ),
         },
     )
     db_session.add_all([*groups, document])

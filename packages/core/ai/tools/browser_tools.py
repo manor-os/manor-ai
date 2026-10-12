@@ -157,24 +157,34 @@ async def _browse_web(entity_id: str = "", **kwargs: Any) -> str:
 
     try:
         session = await _get_or_create_session(entity_id)
-        nav_result = await session.navigate(url)
+        async with session.operation_lock:
+            nav_result = await session.navigate(url)
 
-        result: dict[str, Any] = {
-            "url": nav_result["url"],
-            "title": nav_result.get("title", ""),
-            "status": nav_result.get("status"),
-        }
+            result: dict[str, Any] = {
+                "url": nav_result["url"],
+                "title": nav_result.get("title", ""),
+                "status": nav_result.get("status"),
+            }
 
-        if extract_content:
-            content = await session.get_content()
-            if len(content) > max_chars:
-                content = content[:max_chars] + "\n\n... [content truncated]"
-            result["content"] = content
+            if extract_content:
+                content = await session.get_content()
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "\n\n... [content truncated]"
+                result["content"] = content
 
         return json.dumps(result, ensure_ascii=False)
 
     except RuntimeError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        message = str(e)
+        payload = {"error": message, "retryable": False, "tool": "browse_web"}
+        if "playwright is not installed" in message.lower():
+            payload["unavailable"] = True
+            payload["error"] = (
+                "browse_web is unavailable because Playwright is not installed. "
+                "Do not retry browse_web. Use workspace documents and skills; "
+                "use web_search only for public facts that are not already in the workspace."
+            )
+        return json.dumps(payload, ensure_ascii=False)
     except Exception as e:
         logger.error("browse_web failed: %s", e)
         return json.dumps({"error": f"Failed to browse {url}: {e}"}, ensure_ascii=False)
@@ -195,14 +205,15 @@ async def _take_screenshot(entity_id: str = "", **kwargs: Any) -> str:
         if not session:
             return json.dumps({"error": "Browser session not found"})
 
-        png_bytes = await session.screenshot(full_page=full_page)
-        b64 = base64.b64encode(png_bytes).decode("ascii")
+        async with session.operation_lock:
+            png_bytes = await session.screenshot(full_page=full_page)
+            b64 = base64.b64encode(png_bytes).decode("ascii")
 
-        return json.dumps({
-            "image_base64": b64,
-            "format": "png",
-            "url": session.current_url,
-        })
+            return json.dumps({
+                "image_base64": b64,
+                "format": "png",
+                "url": session.current_url,
+            })
 
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
@@ -228,30 +239,31 @@ async def _interact_with_page(entity_id: str = "", **kwargs: Any) -> str:
         if not session:
             return json.dumps({"error": "Browser session not found"})
 
-        if action == "click":
-            selector = (kwargs.get("selector") or "").strip()
-            if not selector:
-                return json.dumps({"error": "selector is required for click"})
-            await session.click(selector)
-            return json.dumps({"action": "click", "selector": selector, "result": "ok"})
+        async with session.operation_lock:
+            if action == "click":
+                selector = (kwargs.get("selector") or "").strip()
+                if not selector:
+                    return json.dumps({"error": "selector is required for click"})
+                await session.click(selector)
+                return json.dumps({"action": "click", "selector": selector, "result": "ok"})
 
-        elif action == "fill":
-            selector = (kwargs.get("selector") or "").strip()
-            value = kwargs.get("value", "")
-            if not selector:
-                return json.dumps({"error": "selector is required for fill"})
-            await session.fill(selector, value)
-            return json.dumps({"action": "fill", "selector": selector, "result": "ok"})
+            elif action == "fill":
+                selector = (kwargs.get("selector") or "").strip()
+                value = kwargs.get("value", "")
+                if not selector:
+                    return json.dumps({"error": "selector is required for fill"})
+                await session.fill(selector, value)
+                return json.dumps({"action": "fill", "selector": selector, "result": "ok"})
 
-        elif action == "evaluate":
-            script = (kwargs.get("script") or "").strip()
-            if not script:
-                return json.dumps({"error": "script is required for evaluate"})
-            result = await session.evaluate(script)
-            return json.dumps({"action": "evaluate", "result": str(result) if result is not None else None})
+            elif action == "evaluate":
+                script = (kwargs.get("script") or "").strip()
+                if not script:
+                    return json.dumps({"error": "script is required for evaluate"})
+                result = await session.evaluate(script)
+                return json.dumps({"action": "evaluate", "result": str(result) if result is not None else None})
 
-        else:
-            return json.dumps({"error": f"Unknown action: {action}. Use click, fill, or evaluate."})
+            else:
+                return json.dumps({"error": f"Unknown action: {action}. Use click, fill, or evaluate."})
 
     except RuntimeError as e:
         return json.dumps({"error": str(e)})

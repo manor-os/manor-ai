@@ -45,6 +45,70 @@ class FlowTemplateSpec:
 
 
 
+def _standalone_service_agents(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Tools and instructions of each Blueprint service's agent, by service key.
+
+    A Workspace run resolves a step's ``service_key`` to the Workspace's
+    subscribed agent. A template installed on its own has no Workspace, so the
+    step carries what that agent would bring (its declared tool allowlist and
+    instructions) and the runner uses it when no agent resolves.
+    """
+    recipe = payload.get("recipe") if isinstance(payload.get("recipe"), dict) else {}
+    embedded = payload.get("embedded") if isinstance(payload.get("embedded"), dict) else {}
+    agents = {
+        str(agent.get("slug")): agent
+        for agent in embedded.get("agents") or []
+        if isinstance(agent, dict) and agent.get("slug")
+    }
+    services: dict[str, dict[str, Any]] = {}
+    for subscription in recipe.get("subscriptions") or []:
+        if not isinstance(subscription, dict):
+            continue
+        service_key = str(subscription.get("service_key") or "").strip()
+        agent = agents.get(str(subscription.get("agent_slug") or ""))
+        if not service_key or agent is None:
+            continue
+        tools: list[str] = []
+        for binding in agent.get("mcp_bindings") or []:
+            if isinstance(binding, dict):
+                tools.extend(str(name) for name in binding.get("allowed_tools") or [] if name)
+        for binding in agent.get("tool_bindings") or []:
+            name = binding.get("tool_name") if isinstance(binding, dict) else binding
+            if name:
+                tools.append(str(name))
+        instructions = "\n\n".join(
+            part for part in (
+                str(agent.get("system_prompt") or "").strip(),
+                str(subscription.get("custom_prompt") or "").strip(),
+            ) if part
+        )
+        services[service_key] = {
+            "tools": list(dict.fromkeys(tools)),
+            "system_prompt": instructions,
+        }
+    return services
+
+
+def _with_standalone_service_agents(
+    values: dict[str, Any],
+    services: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    for step in values.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        config = step.get("config")
+        if not isinstance(config, dict) or config.get("agent_id") or "tools" in config:
+            continue
+        service = services.get(str(config.get("service_key") or "").strip())
+        if not service:
+            continue
+        if service["tools"]:
+            config.setdefault("standalone_tools", list(service["tools"]))
+        if service["system_prompt"]:
+            config.setdefault("standalone_system_prompt", service["system_prompt"])
+    return values
+
+
 @lru_cache(maxsize=1)
 def _template_specs() -> dict[str, FlowTemplateSpec]:
     specs: dict[str, FlowTemplateSpec] = {}

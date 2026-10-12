@@ -43,6 +43,8 @@ class PendingActionKind(str, Enum):
     TASK_APPROVAL = "task_approval"
     #: A Task stopped and needs retry/cancel guidance from an operator.
     TASK_RECOVERY = "task_recovery"
+    #: An external write crossed I/O but its final outcome is ambiguous.
+    EFFECT_RECONCILIATION = "effect_reconciliation"
 
     # ── Strategist review loop ──
     #: A proposal cohort is waiting on approve / reject.

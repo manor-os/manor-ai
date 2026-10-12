@@ -1,0 +1,23 @@
+{
+  "id": "remotion-saas",
+  "name": "remotion-saas",
+  "display_name": "Remotion SaaS",
+  "type": "sandbox",
+  "plugin_key": "remotion",
+  "description": "Build apps that preview and render videos.",
+  "category": "video",
+  "output_format": "file",
+  "tags": [
+    "remotion",
+    "saas",
+    "video",
+    "react",
+    "sandbox",
+    "builtin",
+    "plugin"
+  ],
+  "search": {
+    "terms": ["video app", "render api", "video editor app", "lambda render", "player embed", "templated video", "personalized video", "batch render"],
+    "examples": ["build web app that renders videos", "preview remotion composition with player", "render video from user inputs", "server side video render endpoint"]
+  }
+}

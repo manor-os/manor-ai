@@ -44,6 +44,15 @@ const REQUIRED: Record<string, { key: string; level: IssueLevel; label: string }
   notify: [{ key: "message", level: "warning", label: "message" }],
 };
 
+// Keep aligned with workflow_service._required_step_config_fields: project
+// persistence has an operation-specific contract even before a run exists.
+const PROJECT_REQUIRED: Record<string, string[]> = {
+  create: ["project_type", "schema_version", "state_schema"],
+  claim: ["project_type", "project_key", "schema_version", "state_schema"],
+  get: ["project_id", "project_type", "schema_version", "state_schema"],
+  patch: ["project_id", "project_type", "schema_version", "expected_revision", "state_schema"],
+};
+
 function isEmpty(v: any): boolean {
   return v === undefined || v === null || (typeof v === "string" && v.trim() === "") ||
     (Array.isArray(v) && v.length === 0);
@@ -58,14 +67,20 @@ export function validateWorkflow(steps: Step[]): ValidationIssue[] {
   const executableSteps = steps.filter((step) => step.type !== "note");
   const ids = new Set(executableSteps.map((s) => s.id));
   const name = (s: Step) => s.name || s.type;
+  // Every route the runner follows, including handled-failure `error_next`.
   const outEdges = (s: Step) => [
     ...(s.next || []),
     ...(s.true_next || []),
     ...(s.false_next || []),
     ...(s.type === "switch"
-      ? [...((s.config?.cases || []).flatMap((c: any) => c?.next || [])), ...(s.config?.default_next || [])]
+      ? [
+        ...((s.config?.cases || []).flatMap((c: any) => c?.next || [])),
+        ...(s.config?.default_next || []),
+        ...((s.config?.output_next || []) as unknown[]).flat(),
+      ]
       : []),
-  ];
+    ...(s.config?.error_next || []),
+  ] as string[];
 
   // 1) Entry point.
   if (!executableSteps.some((s) => ENTRY_TYPES.has(s.type))) {
@@ -93,6 +108,14 @@ export function validateWorkflow(steps: Step[]): ValidationIssue[] {
       ) continue;
       if (isEmpty(s.config?.[req.key])) {
         issues.push({ level: req.level, nodeId: s.id, nodeName: name(s), message: `"${name(s)}" is missing ${req.label}.` });
+      }
+    }
+    if (s.type === "workflow_project") {
+      const operation = String(s.config?.operation || "").trim().toLowerCase();
+      for (const key of PROJECT_REQUIRED[operation] || ["operation"]) {
+        if (isEmpty(s.config?.[key])) {
+          issues.push({ level: "error", nodeId: s.id, nodeName: name(s), message: `"${name(s)}" is missing config.${key}.` });
+        }
       }
     }
     if (s.type === "switch" && isEmpty(s.config?.cases)) {

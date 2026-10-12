@@ -1,4 +1,14 @@
 export type ConnectorAccessState = "usable" | "repair" | "connect";
+export type IntegrationSetupState = "ready" | "checking" | "unavailable";
+
+export interface IntegrationSetupSource {
+  setup_pending?: boolean | null;
+  setup_unavailable?: boolean | null;
+}
+
+export function integrationSetupState(
+  server: IntegrationSetupSource | null | undefined,
+): IntegrationSetupState;
 
 export interface IntegrationUsabilitySource {
   agent_can_use?: boolean | null;

@@ -29,7 +29,7 @@ case "$MODE" in
     # one worker per role; local dev keeps a single process, and without this
     # it would consume only the default (control) queue and no plan step would
     # ever execute.
-    PYTHONPATH=. celery -A packages.core.celery_app worker -B -l info -c 2 -Q celery,interactive,heavy,work,recovery-v2
+    PYTHONPATH=. celery -A packages.core.celery_app worker -B -l info -c 2 -Q celery,interactive,heavy,work,recovery-v2,ops
     ;;
   infra)
     echo -e "${BLUE}Starting infrastructure (postgres, redis, minio)...${NC}"

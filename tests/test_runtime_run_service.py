@@ -197,7 +197,6 @@ async def test_cancel_cascades_but_never_rewrites_terminal_children(db_session) 
 async def test_cancel_releases_local_sandbox_lease_when_runner_already_removed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import packages.core.database
 
     run = SimpleNamespace(
         id="run_missing_remote_sandbox",
@@ -251,6 +250,10 @@ async def test_cancel_releases_local_sandbox_lease_when_runner_already_removed(
         released.append(sandbox_id)
         return True
 
+    # Import and patch the database module before stubbing get_settings: the
+    # string target imports packages.core.database, whose module-level
+    # settings read would otherwise run against the stub.
+    monkeypatch.setattr("packages.core.database.async_session", lambda: next(sessions))
     monkeypatch.setattr(
         "packages.core.config.get_settings",
         lambda: SimpleNamespace(
@@ -258,7 +261,6 @@ async def test_cancel_releases_local_sandbox_lease_when_runner_already_removed(
             SANDBOX_API_TOKEN="token",
         ),
     )
-    monkeypatch.setattr("packages.core.database.async_session", lambda: next(sessions))
     monkeypatch.setattr(
         "packages.core.services.sandbox_sdk.SandboxClient",
         MissingSandboxClient,
@@ -271,3 +273,96 @@ async def test_cancel_releases_local_sandbox_lease_when_runner_already_removed(
     await cancel_runtime_run_resources(run)
 
     assert released == ["sandbox_already_removed"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_leaves_a_warm_registered_sandbox_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container the owner registry keeps warm is reused by later turns; a
+    run cancel (a completed run's included) must release the run's
+    accounting but not destroy it."""
+    run = SimpleNamespace(
+        id="run_warm",
+        root_run_id="root_warm",
+        active_sandbox_id="sandbox_warm",
+        active_execution_id="exec_1",
+    )
+    instance = SimpleNamespace(sandbox_id="sandbox_warm")
+    runner = SimpleNamespace(base_url="http://runner.internal:8000")
+
+    class QuerySession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, _statement):
+            return SimpleNamespace(all=lambda: [(instance, runner)])
+
+    class ReleaseSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def commit(self):
+            return None
+
+    sessions = iter([QuerySession(), ReleaseSession()])
+    calls: list[str] = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def cancel_execution(self, sandbox_id, execution_id):
+            calls.append(f"cancel:{sandbox_id}:{execution_id}")
+
+        async def destroy(self, sandbox_id):
+            calls.append(f"destroy:{sandbox_id}")
+
+    released: list[str] = []
+
+    async def release_local_lease(_db, *, sandbox_id: str):
+        released.append(sandbox_id)
+        return True
+
+    async def kept_warm(sandbox_id: str) -> bool:
+        return sandbox_id == "sandbox_warm"
+
+    restored: list[str] = []
+
+    async def restore(_db, *, sandbox_id: str, now=None):
+        restored.append(sandbox_id)
+        return True
+
+    monkeypatch.setattr(
+        "packages.core.services.sandbox_queue_service.restore_consumed_reservation", restore,
+    )
+    monkeypatch.setattr("packages.core.database.async_session", lambda: next(sessions))
+    monkeypatch.setattr(
+        "packages.core.config.get_settings",
+        lambda: SimpleNamespace(SANDBOX_COORDINATION_MODE="external-runner", SANDBOX_API_TOKEN="token"),
+    )
+    monkeypatch.setattr("packages.core.services.sandbox_sdk.SandboxClient", Client)
+    monkeypatch.setattr("packages.core.services.sandbox_queue_service.release_sandbox_instance", release_local_lease)
+    monkeypatch.setattr("packages.core.services.sandbox_session_service.is_sandbox_kept_warm", kept_warm)
+
+    await cancel_runtime_run_resources(run)
+
+    assert calls == ["cancel:sandbox_warm:exec_1"], "the running execution is cancelled, the container is not destroyed"
+    # The instance row is the container's routing record; releasing it would
+    # make every later exec in the reused container unroutable.
+    assert released == []
+    # The cancel had marked the ticket release_pending (a slot-pinning state);
+    # a kept container is a consumed ticket again.
+    assert restored == ["sandbox_warm"]

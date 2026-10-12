@@ -9,9 +9,11 @@ import {
   fileNameFromReference,
   fileReferenceKind,
   fileReferenceTypeLabel,
+  isInternalFileTarget,
   isOpenableFileReference,
   legacyViewerFileCandidates,
   looksLikeFileReference,
+  parseFileReference,
   viewerPathForDocumentId,
   type FileReferenceKind,
 } from "../lib/fileReferences";
@@ -48,9 +50,10 @@ function sameOriginPath(reference: string): string {
 }
 
 function fsPathFromReference(reference: string): string | null {
+  if (isInternalFileTarget(reference)) return null;
+  const parsed = parseFileReference(reference);
+  if (parsed?.kind === "fs") return parsed.fs_path;
   const pathname = sameOriginPath(reference);
-  const apiMatch = pathname.match(/^\/api\/v1\/fs\/[^/]+\/(.+)$/);
-  if (apiMatch?.[1]) return decodeUrlPathPart(apiMatch[1]).replace(/^\/+/, "");
   const legacyViewerMatch = pathname.match(/^\/viewer\/(.+)$/);
   if (legacyViewerMatch?.[1]) {
     const legacyPath = decodeUrlPathPart(legacyViewerMatch[1]).replace(/^\/+/, "");
@@ -136,6 +139,7 @@ export default function InlineFileReferenceCard({
   trustedReference = false,
   fileType,
   mimeType,
+  description,
   navigationState,
   sourceAnchorId,
 }: {
@@ -149,6 +153,7 @@ export default function InlineFileReferenceCard({
   trustedReference?: boolean;
   fileType?: string;
   mimeType?: string;
+  description?: string;
   /** Additional viewer state, such as an unsynced Task output preview. */
   navigationState?: Record<string, unknown>;
   /** Stable element id used to restore the exact source position on return. */
@@ -257,8 +262,11 @@ export default function InlineFileReferenceCard({
       return;
     }
 
-    const idMatch = decoded.match(/\/documents\/([^/]+)/) || decoded.match(/^([0-9A-HJKMNP-TV-Z]{26})(?:$|[?#])/i);
-    const documentPath = idMatch?.[1] ? viewerPathForDocumentId(decodeUrlPathPart(idMatch[1])) : null;
+    const parsedReference = parseFileReference(decoded);
+    const idMatch = decoded.match(/^([0-9A-HJKMNP-TV-Z]{26})(?:$|[?#])/i);
+    const documentPath = viewerPathForDocumentId(
+      parsedReference?.kind === "document" ? parsedReference.document_id : idMatch?.[1],
+    );
     if (!isExternal && documentPath) {
       preserveReturnToInHistory(currentReturnTo);
       navigate(documentPath, { state: viewerNavigationState });
@@ -345,7 +353,7 @@ export default function InlineFileReferenceCard({
         title={resolvedFileName}
         subtitle={unresolved
           ? unavailableDetail
-          : (decodedFsPath || decoded)}
+          : (description || decodedFsPath || decoded)}
         meta={isResolving ? "…" : typeLabel}
         onClick={() => void openReference()}
       />

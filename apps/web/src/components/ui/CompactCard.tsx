@@ -30,6 +30,7 @@ interface CompactCardProps {
   onClick?: () => void;
   /** Opens contextual card actions without triggering the primary click. */
   onContextMenu?: (event: MouseEvent<HTMLDivElement>) => void;
+  ariaLabel?: string;
   className?: string;
 }
 
@@ -43,6 +44,7 @@ export default function CompactCard({
   selected = false,
   onClick,
   onContextMenu,
+  ariaLabel,
   className = "",
 }: CompactCardProps) {
   const handleKey = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -59,6 +61,7 @@ export default function CompactCard({
     <div
       role={onClick ? "button" : undefined}
       tabIndex={onClick ? 0 : undefined}
+      aria-label={onClick ? ariaLabel : undefined}
       onClick={onClick}
       onContextMenu={onContextMenu}
       onKeyDown={handleKey}

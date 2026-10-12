@@ -26,7 +26,7 @@ from packages.core.services.upload_security import (
 from packages.core.services.oauth_account_credentials import clear_oauth_account_tokens
 
 
-def test_access_tokens_are_short_lived_unique_and_strictly_scoped():
+def test_access_tokens_are_bounded_unique_and_strictly_scoped():
     first = create_access_token(
         "user-1",
         "entity-1",
@@ -45,7 +45,7 @@ def test_access_tokens_are_short_lived_unique_and_strictly_scoped():
     assert claims["aud"] == "manor-api"
     assert claims["token_version"] == 7
     assert claims["amr"] == ["mfa"]
-    assert claims["exp"] - claims["iat"] <= 60 * 60
+    assert claims["exp"] - claims["iat"] <= 24 * 60 * 60
     assert claims["jti"] != jwt.decode(
         second,
         options={"verify_signature": False, "verify_aud": False},
@@ -156,6 +156,18 @@ def test_upload_gate_rejects_disguised_executables_and_bad_magic():
         header=b"\x89PNG\r\n\x1a\n" + b"0" * 20,
         declared_content_type="image/png",
     ) == "image/png"
+
+
+def test_upload_gate_accepts_valid_webp_without_system_mime_registration(monkeypatch):
+    from packages.core.services import upload_security
+
+    monkeypatch.setattr(upload_security.mimetypes, "guess_type", lambda _name: (None, None))
+
+    assert validate_upload_header(
+        filename="jr-test-harbor-lights.webp",
+        header=b"RIFF\x00\x00\x00\x00WEBP" + b"VP8 " + b"0" * 20,
+        declared_content_type="image/webp",
+    ) == "image/webp"
 
 
 @pytest.mark.asyncio

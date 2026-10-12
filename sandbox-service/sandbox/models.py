@@ -24,6 +24,29 @@ class SandboxStatus(str, Enum):
     DESTROYED = "destroyed"
 
 
+class ExecutionStatus(str, Enum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @classmethod
+    def terminal(cls) -> set["ExecutionStatus"]:
+        return {cls.COMPLETED, cls.FAILED, cls.CANCELLED}
+
+
+class ExecutionEventType(str, Enum):
+    PROGRESS = "progress"
+    WARNING = "warning"
+    ERROR = "error"
+    NEED_INPUT = "need_input"
+    NEED_FILE = "need_file"
+    NEED_TOOL = "need_tool"
+    NEED_CREDENTIAL = "need_credential"
+    RESULT = "result"
+
+
 class WorkspaceAccess(str, Enum):
     NONE = "none"
     RO = "ro"
@@ -66,6 +89,7 @@ class ContainerConfig(BaseModel):
     )
     cap_drop: list[str] = Field(default_factory=lambda: ["ALL"])
     container_prefix: str = "skill-sbx-"
+    service_scope: str = "1"
     workdir: str = "/skill"
     install_timeout: int = 120
     exec_timeout: int = 60
@@ -85,6 +109,7 @@ class SandboxInfo(BaseModel):
     last_used_at: float
     config: ContainerConfig
     active_command: Optional[str] = None
+    active_execution_id: Optional[str] = None
     expires_at: Optional[float] = None
 
 
@@ -113,6 +138,13 @@ class CreateSandboxResponse(BaseModel):
     skill: SkillManifest
     workdir: str
     env_blocked: list[str] = Field(default_factory=list)
+    env_injection: str = Field(
+        "exec",
+        description=(
+            "How skill env reaches processes: 'exec' means it is handed to each "
+            "docker exec and replaced by load_skill, never baked into the container"
+        ),
+    )
 
 
 class ExecRequest(BaseModel):
@@ -127,6 +159,47 @@ class ExecResponse(BaseModel):
     stderr: str
     exit_code: int
     execution_id: Optional[str] = None
+
+
+class ExecutionStatusResponse(BaseModel):
+    sandbox_id: str
+    execution_id: str
+    status: ExecutionStatus
+    created_at: float
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
+    exit_code: Optional[int] = None
+    error: Optional[str] = None
+    events: list["ExecutionEvent"] = Field(default_factory=list)
+    next_sequence: int = 0
+    waiting_for_response: bool = False
+
+
+class ExecutionEvent(BaseModel):
+    sequence: int = Field(..., ge=1)
+    event_id: str = Field(..., min_length=1, max_length=128)
+    type: ExecutionEventType
+    message: str = Field("", max_length=2000)
+    payload: dict = Field(default_factory=dict)
+    requires_response: bool = False
+    responded: bool = False
+    created_at: float
+
+
+class ExecutionResponseRequest(BaseModel):
+    event_id: str = Field(..., min_length=1, max_length=128)
+    payload: dict = Field(default_factory=dict)
+    message: str = Field("", max_length=2000)
+
+
+class ExecutionResponseAck(BaseModel):
+    sandbox_id: str
+    execution_id: str
+    event_id: str
+    accepted: bool
+    duplicate: bool = False
 
 
 class CancelExecutionResponse(BaseModel):
@@ -218,11 +291,20 @@ class LoadSkillRequest(BaseModel):
     auto_install: bool = Field(True, description="Re-run pip install if requirements.txt changed")
     idle_threshold: int = Field(30, description="Seconds of inactivity required before loading is allowed", ge=0)
     source: str = Field("workspace", description="Origin of skill files: 'workspace' or 'builtin'")
+    env: dict[str, str] = Field(
+        default_factory=dict,
+        description="Skill env for later exec calls; replaces the previous skill's env entirely",
+    )
+    allowed_sensitive_keys: list[str] = Field(
+        default_factory=list,
+        description="Sensitive env keys the caller explicitly allows (same policy as create)",
+    )
 
 
 class LoadSkillResponse(BaseModel):
     sandbox_id: str
     skill: SkillManifest
+    env_blocked: list[str] = Field(default_factory=list)
     reused: bool = True
 
 

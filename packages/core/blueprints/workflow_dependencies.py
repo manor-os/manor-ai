@@ -2,7 +2,126 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import re
 from typing import Any, Mapping
+
+from packages.core.services.reusable_resource_locks import is_reusable_resource_local_id
+
+
+class WorkflowSkillDependencyFactory:
+    """Preserve nested Skill arguments through portable, exact identities."""
+
+    FIELDS = frozenset({"skill", "skill_id"})
+
+    @classmethod
+    def has_portable_refs(cls, node: Any) -> bool:
+        if isinstance(node, list):
+            return any(cls.has_portable_refs(item) for item in node)
+        return isinstance(node, dict) and (
+            "skill_refs" in node or any(cls.has_portable_refs(value) for value in node.values())
+        )
+
+    @classmethod
+    def local_ids(cls, node: Any) -> set[str]:
+        if isinstance(node, list):
+            return set().union(*(cls.local_ids(item) for item in node))
+        if not isinstance(node, dict):
+            return set()
+        return {
+            str(value).strip()
+            for key, value in node.items()
+            if key in cls.FIELDS and is_reusable_resource_local_id(value)
+        } | set().union(*(cls.local_ids(value) for value in node.values()))
+
+    @classmethod
+    def to_portable(cls, node: Any, *, skill_ref_by_id: Mapping[str, dict]) -> Any:
+        if isinstance(node, list):
+            return [cls.to_portable(item, skill_ref_by_id=skill_ref_by_id) for item in node]
+        if not isinstance(node, dict):
+            return deepcopy(node)
+        projected = {}
+        refs = []
+        for key, value in node.items():
+            if key in cls.FIELDS and is_reusable_resource_local_id(value):
+                ref = skill_ref_by_id.get(str(value).strip())
+                if not ref:
+                    raise WorkflowDependencyError("Workflow Skill has no portable dependency")
+                refs.append({"field": key, "target": dict(ref)})
+            else:
+                projected[key] = cls.to_portable(value, skill_ref_by_id=skill_ref_by_id)
+        if refs:
+            if "skill_refs" in projected:
+                raise WorkflowDependencyError("Workflow Skill references conflict with runtime arguments")
+            projected["skill_refs"] = refs
+        return projected
+
+
+class WorkflowDocumentDependencyFactory:
+    """Map exact Knowledge IDs to included starter keys without copying row IDs."""
+
+    @classmethod
+    def local_ids(cls, node: Any) -> set[str]:
+        if isinstance(node, list):
+            return set().union(*(cls.local_ids(item) for item in node))
+        if not isinstance(node, dict):
+            return set()
+        own = {node["document_id"]} if is_reusable_resource_local_id(node.get("document_id")) else set()
+        return own | set().union(*(cls.local_ids(value) for value in node.values()))
+
+    @classmethod
+    def portable_keys(cls, node: Any) -> set[str]:
+        if isinstance(node, list):
+            return set().union(*(cls.portable_keys(item) for item in node))
+        if not isinstance(node, dict):
+            return set()
+        keys = set()
+        if "knowledge_document_key" in node:
+            key = node["knowledge_document_key"]
+            if not isinstance(key, str) or not key.strip() or "document_id" in node or "path" in node:
+                raise WorkflowDependencyError("Workflow Knowledge reference is invalid or conflicts with a file locator")
+            keys.add(key)
+        return keys | set().union(*(cls.portable_keys(value) for value in node.values()))
+
+    @classmethod
+    def to_portable(cls, node: Any, *, document_key_by_id: Mapping[str, str]) -> Any:
+        if isinstance(node, list):
+            return [cls.to_portable(item, document_key_by_id=document_key_by_id) for item in node]
+        if not isinstance(node, dict):
+            return deepcopy(node)
+        result = {key: cls.to_portable(value, document_key_by_id=document_key_by_id) for key, value in node.items()}
+        document_id = node.get("document_id")
+        if (
+            isinstance(document_id, str)
+            and re.search(r"[0-9A-HJKMNP-TV-Z]{26}", document_id)
+            and not is_reusable_resource_local_id(document_id)
+        ):
+            raise WorkflowDependencyError("Workflow Knowledge locator mixes a local ID with runtime text")
+        if is_reusable_resource_local_id(document_id):
+            key = document_key_by_id.get(document_id)
+            if not key:
+                raise WorkflowDependencyError("Workflow reads a Knowledge document not included in this Blueprint. Include its safe starter content or remove the fixed file dependency before exporting.")
+            if "knowledge_document_key" in node:
+                raise WorkflowDependencyError("Workflow Knowledge reference conflicts with a runtime document")
+            if "path" in node:
+                raise WorkflowDependencyError("Workflow Knowledge dependency must use an exact document_id without a deployment-local path")
+            result.pop("document_id")
+            result["knowledge_document_key"] = key
+        return result
+
+    @classmethod
+    def to_runtime(cls, node: Any, *, document_id_by_key: Mapping[str, str]) -> Any:
+        cls.portable_keys(node)
+        if isinstance(node, list):
+            return [cls.to_runtime(item, document_id_by_key=document_id_by_key) for item in node]
+        if not isinstance(node, dict):
+            return deepcopy(node)
+        result = {key: cls.to_runtime(value, document_id_by_key=document_id_by_key) for key, value in node.items()}
+        if "knowledge_document_key" in result:
+            key = result.pop("knowledge_document_key")
+            if key not in document_id_by_key:
+                raise WorkflowDependencyError("Workflow Knowledge starter is missing from this installed Workspace")
+            result["document_id"] = document_id_by_key[key]
+        return result
 
 
 class WorkflowDependencyError(ValueError):

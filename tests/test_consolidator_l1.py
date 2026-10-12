@@ -387,7 +387,7 @@ async def test_edit_pattern_payload_is_field_counts_only(db_session, monkeypatch
         f"human_contribution:{c.id}" for c in contributions
     }
     assert report.coverage.sources["l1"] == "used"
-    assert report.analyzer_version == "human_participation-consolidator-v4"
+    assert report.analyzer_version == "human_participation-consolidator-v5"
     # Privacy blacklist still enforced on the L1-augmented report.
     ConsolidationReportModel(**report.model_dump())
 

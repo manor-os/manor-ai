@@ -30,6 +30,50 @@ class ChannelAgentRunResult:
     content: str
     runtime_meta: dict[str, Any] | None = None
     runtime_envelope: Any | None = None
+    stop_reason: str | None = None
+    # What to append to the conversation transcript once the reply is saved.
+    transcript: Any | None = None
+    transcript_initial_messages: list[dict] | None = None
+    transcript_final_messages: list[dict] | None = None
+
+
+async def _load_channel_transcript(
+    scope: Any, *, history: list[dict], origin_message_id: str | None,
+) -> list[dict] | None:
+    """The conversation transcript for this Agent, or None to use ``history``."""
+    from packages.core.services.conversation_transcript import load_or_import_transcript
+
+    async def rendered() -> list[dict]:
+        return [dict(message) for message in history]
+
+    try:
+        async with async_session() as db:
+            return await load_or_import_transcript(
+                db, scope, legacy_history=rendered,
+                exclude_message_ids={origin_message_id} if origin_message_id else set(),
+            )
+    except Exception:
+        logger.warning("Channel transcript unavailable; using recent messages", exc_info=True)
+        return None
+
+
+async def append_channel_transcript(result: ChannelAgentRunResult, *, user_message_id: str | None, assistant_message_id: str) -> None:
+    """Append a run whose reply was saved; never fails the turn."""
+    if result.transcript is None or not result.transcript_final_messages:
+        return
+    from packages.core.services.conversation_transcript import append_run_transcript
+
+    try:
+        async with async_session() as db:
+            await append_run_transcript(
+                db, result.transcript, run_id=None,
+                initial_messages=result.transcript_initial_messages or [],
+                final_messages=result.transcript_final_messages,
+                user_message_id=user_message_id, assistant_message_id=assistant_message_id,
+            )
+    except Exception:
+        # Saved rows are synced in on the next turn instead.
+        logger.warning("Channel transcript append failed", exc_info=True)
 
 
 async def run_channel_agent_turn(
@@ -44,8 +88,13 @@ async def run_channel_agent_turn(
     subscription: Optional[ResolvedSubscription] = None,
     reply_route: dict[str, Any] | None = None,
     runtime_metadata: dict[str, Any] | None = None,
+    origin_message_id: str | None = None,
 ) -> Optional[ChannelAgentRunResult]:
-    """Run the bound channel agent through the Runtime Harness."""
+    """Run the bound channel agent through the Runtime Harness.
+
+    ``origin_message_id`` is the saved inbound row this turn answers; with it
+    the turn reads and later appends the conversation transcript.
+    """
     from packages.core.constants.agents import is_master_agent
     from packages.core.services.workspace_runtime import resolve_workspace_runtime
 
@@ -132,6 +181,10 @@ async def run_channel_agent_turn(
             bound_tool_names=runtime.bound_tool_names,
             is_master=runtime.is_master,
             mcp_allowed_names=runtime.mcp_allowed_names,
+            mcp_provider_scopes=getattr(runtime, "mcp_provider_scopes", ()),
+            mcp_scope_unrestricted=bool(
+                getattr(runtime, "mcp_scope_unrestricted", False)
+            ),
             active_user_message=current_message,
             legacy_extra_context=runtime.extra_context,
             extra_tool_schemas=extra_tool_schemas,
@@ -152,6 +205,63 @@ async def run_channel_agent_turn(
 
     system_prompt = runtime_merge_prompt_appendix(base_prompt, appendix)
 
+    is_cancelled = None
+    if (
+        (runtime_metadata or {}).get("voice_session_mode") == "chat_gateway"
+        and (runtime_metadata or {}).get("voice_origin_message_id")
+    ):
+        from packages.core.services.voice.work_queue import (
+            voice_work_was_interrupted,
+        )
+
+        voice_origin_message_id = str(
+            (runtime_metadata or {}).get("voice_origin_message_id")
+        )
+        twilio_call_session_id = str(
+            (runtime_metadata or {}).get("twilio_call_session_id") or ""
+        ).strip()
+
+        async def voice_turn_cancelled() -> bool:
+            async with async_session() as cancel_db:
+                interrupted = await voice_work_was_interrupted(
+                    cancel_db,
+                    message_id=voice_origin_message_id,
+                    conversation_id=conversation_id,
+                )
+                if interrupted or not twilio_call_session_id:
+                    return interrupted
+                from packages.core.services.voice.binding import (
+                    twilio_call_binding_is_valid,
+                )
+
+                return not await twilio_call_binding_is_valid(
+                    cancel_db,
+                    twilio_call_session_id,
+                    conversation_id=conversation_id,
+                )
+
+        is_cancelled = voice_turn_cancelled
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+    from packages.core.services.conversation_transcript import (
+        TRANSCRIPT_TOOL_RESULT_MAX_CHARS,
+        transcript_scope_for_turn,
+    )
+
+    transcript = (
+        transcript_scope_for_turn(
+            ChatSurface.EXTERNAL_CHANNEL_CHAT, entity_id=entity_id, conversation_id=conversation_id,
+            user_id=None, agent_id=resolved_agent_id, workspace_id=runtime.workspace_id,
+        )
+        if origin_message_id else None
+    )
+    initial_messages = (
+        await _load_channel_transcript(transcript, history=history, origin_message_id=origin_message_id)
+        if transcript is not None else None
+    )
+    if initial_messages is None:
+        transcript, initial_messages = None, list(history or [])
+
     result = await runtime_execute_channel_agent_loop(
         runtime_envelope=runtime_envelope,
         system_prompt=system_prompt,
@@ -170,20 +280,29 @@ async def run_channel_agent_turn(
         temperature=agent_config.temperature,
         max_tokens=agent_config.max_tokens,
         max_rounds=_MAX_AGENTIC_ROUNDS,
-        initial_messages=history or None,
+        initial_messages=initial_messages or None,
+        carry_previous_checkpoint=transcript is None,
+        tool_result_max_chars=TRANSCRIPT_TOOL_RESULT_MAX_CHARS if transcript is not None else None,
         dynamic_tool_handlers=(
             {RUNTIME_CHANNEL_ATTACHMENT_TOOL_NAME: attachment_handler}
             if attachment_handler is not None
             else None
         ),
+        is_cancelled=is_cancelled,
     )
     content = (result.content or "").strip()
-    if not content:
+    stop_reason = str(getattr(result, "stop_reason", "") or "").strip() or None
+    if not content and stop_reason not in {"cancelled", "canceled"}:
         return None
+    finished = transcript is not None and stop_reason not in {"cancelled", "canceled", "error"}
     return ChannelAgentRunResult(
         content=content,
         runtime_meta=runtime_envelope_meta(runtime_envelope),
         runtime_envelope=runtime_envelope,
+        stop_reason=stop_reason,
+        transcript=transcript if finished else None,
+        transcript_initial_messages=initial_messages if finished else None,
+        transcript_final_messages=list(getattr(result, "messages", None) or []) if finished else None,
     )
 
 

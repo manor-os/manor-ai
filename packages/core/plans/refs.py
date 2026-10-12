@@ -106,31 +106,42 @@ def extract_step_ref_paths(value: Any) -> list[tuple[str, str | None]]:
     return refs
 
 
-def resolve_refs(value: Any, prior_results: dict[str, Any]) -> Any:
+def resolve_refs(
+    value: Any,
+    prior_results: dict[str, Any],
+    *,
+    strict: bool = False,
+) -> Any:
     """Recursively resolve refs inside arbitrary JSON-shaped data.
 
     ``prior_results`` is ``{step_key: <result dict-or-value>}``.
     Step results that don't exist raise ReferenceError — fail fast at
-    dispatch time instead of giving the underlying adapter garbage."""
+    dispatch time instead of giving the underlying adapter garbage.
+
+    ``strict=True`` also turns the missing-field / scalar-descent degrade
+    paths into ReferenceError. Consumers whose params feed an external
+    publish (``expects: ["publish"]``) must use it: a degraded value there
+    means posting a JSON dump or a sibling field to a real audience.
+    """
     if isinstance(value, dict):
-        return {k: resolve_refs(v, prior_results) for k, v in value.items()}
+        return {k: resolve_refs(v, prior_results, strict=strict) for k, v in value.items()}
     if isinstance(value, list):
-        return [resolve_refs(v, prior_results) for v in value]
+        return [resolve_refs(v, prior_results, strict=strict) for v in value]
     if isinstance(value, str):
-        return _resolve_string(value, prior_results)
+        return _resolve_string(value, prior_results, strict=strict)
     return value
 
 
-def _resolve_string(s: str, prior_results: dict[str, Any]) -> Any:
+def _resolve_string(s: str, prior_results: dict[str, Any], *, strict: bool = False) -> Any:
     bare = _BARE_REF_RE.match(s)
     if bare:
         # Whole-string ref — preserve type.
         step_key, path = bare.group(1), bare.group(2)
-        return _lookup(prior_results, step_key, path)
+        return _lookup(prior_results, step_key, path, strict=strict)
 
     # Embedded — substitute every match with its string form.
     def _sub(m: re.Match) -> str:
-        v = _lookup(prior_results, m.group(1), m.group(2))
+        v = _lookup(prior_results, m.group(1), m.group(2), strict=strict)
         if isinstance(v, str):
             return v
         return json.dumps(v, ensure_ascii=False, default=str)
@@ -142,6 +153,8 @@ def _lookup(
     prior_results: dict[str, Any],
     step_key: str,
     path: str | None,
+    *,
+    strict: bool = False,
 ) -> Any:
     if step_key not in prior_results:
         raise ReferenceError(
@@ -172,6 +185,12 @@ def _lookup(
                 ) from None
         elif isinstance(cursor, dict):
             if part not in cursor:
+                if strict:
+                    raise ReferenceError(
+                        f"step {step_key} path .{path}: key {part!r} missing on "
+                        "dict result (strict: publish consumers never receive a "
+                        "degraded value)"
+                    )
                 # The producer (often a free-form subagent / search step) returned
                 # an object without the referenced field — historically a hard
                 # ReferenceError that killed the whole task. Degrade to a usable
@@ -184,6 +203,12 @@ def _lookup(
                 return _degrade_missing_field(cursor)
             cursor = cursor[part]
         else:
+            if strict:
+                raise ReferenceError(
+                    f"step {step_key} path .{path}: cannot descend into "
+                    f"{type(cursor).__name__} (strict: publish consumers never "
+                    "receive a degraded value)"
+                )
             # A scalar where the ref expected a structured object — degrade to
             # its string form rather than crash the consumer.
             logger.warning(

@@ -43,6 +43,7 @@ async def generate_briefing_via_llm(
     goals_snapshot: list[dict],
     entity_id: str | None = None,
     workspace_id: str | None = None,
+    user_id: str | None = None,
     workspace_summary: Optional[dict] = None,
 ) -> Briefing:
     """Single Runtime text completion with one repair retry. Falls back to a
@@ -66,6 +67,7 @@ async def generate_briefing_via_llm(
         user_prompt,
         entity_id=entity_id,
         workspace_id=workspace_id,
+        user_id=user_id,
     )
     if raw is None:
         logger.warning("briefing: LLM unavailable — falling back to rule-based stub")
@@ -86,6 +88,7 @@ async def generate_briefing_via_llm(
         repair,
         entity_id=entity_id,
         workspace_id=workspace_id,
+        user_id=user_id,
     )
     parsed2 = _parse_briefing(raw2 or "", briefing_id=briefing_id)
     if parsed2 is not None:
@@ -103,6 +106,7 @@ async def _safe_runtime_completion(
     *,
     entity_id: str | None = None,
     workspace_id: str | None = None,
+    user_id: str | None = None,
 ) -> Optional[str]:
     try:
         completion = await runtime_execute_briefing_completion(
@@ -110,6 +114,7 @@ async def _safe_runtime_completion(
             user_prompt,
             entity_id=entity_id,
             workspace_id=workspace_id,
+            user_id=user_id,
         )
         return completion.content
     except Exception as exc:

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import logging
 import secrets
@@ -159,6 +160,7 @@ async def _store_pending(
     entity_id: str | None = None,
     return_to: str | None = None,
     connection_id: str | None = None,
+    config_fingerprint: str | None = None,
 ) -> None:
     pending = {
         "user_id": user_id,
@@ -171,6 +173,8 @@ async def _store_pending(
         pending["entity_id"] = entity_id
     if connection_id:
         pending["connection_id"] = connection_id
+    if config_fingerprint:
+        pending["config_fingerprint"] = config_fingerprint
     redis = await _redis_client()
     if redis is None:
         if _shared_state_store_required():
@@ -237,6 +241,11 @@ async def get_pending_state(state: str, *, server_key: str) -> Dict[str, str]:
     if not pending or pending.get("server_key") != server_key:
         raise OAuthFlowError(400, "Invalid or expired OAuth state")
     return pending
+
+
+async def consume_pending_state(state: str, *, server_key: str) -> Dict[str, str]:
+    """Validate and consume a provider callback, including user cancellation."""
+    return await _pop_pending(state, server_key=server_key)
 
 
 async def validate_pending_state(state: str, *, server_key: str) -> None:
@@ -311,6 +320,7 @@ async def begin_authorization(
         entity_id=entity_id,
         return_to=return_to,
         connection_id=connection_id,
+        config_fingerprint=_manor_oauth_config_fingerprint(config, redirect_uri),
     )
 
     params: Dict[str, str] = {
@@ -342,6 +352,22 @@ async def begin_authorization(
 # ── Callback step ──────────────────────────────────────────────────────────
 
 
+def _manor_oauth_config_fingerprint(config: Any, redirect_uri: str) -> str | None:
+    from packages.core.services.manor_integration_oauth import is_manor_oauth_provider, manor_mcp_endpoint
+
+    if config.server_key == "lark":
+        payload = [config.client_id, config.authorize_url, config.token_url, redirect_uri, config.scopes]
+        return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+    if not is_manor_oauth_provider(config.server_key):
+        return None
+    try:
+        mcp_url = manor_mcp_endpoint(config.server_key)
+    except ValueError as exc:
+        raise OAuthFlowError(503, "OAuth deployment configuration is invalid; contact the administrator.") from exc
+    payload = [config.client_id, config.authorize_url, config.token_url, redirect_uri, mcp_url]
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
 async def complete_authorization(
     *,
     server_key: str,
@@ -359,6 +385,9 @@ async def complete_authorization(
     reused from CLI tools / tests.
     """
     pending = await _pop_pending(state, server_key=server_key)
+    fingerprint = _manor_oauth_config_fingerprint(config, redirect_uri)
+    if fingerprint and pending.get("config_fingerprint") != fingerprint:
+        raise OAuthFlowError(400, "OAuth deployment configuration changed; start the connection again.")
     user_id = pending["user_id"]
     code_verifier = pending.get("code_verifier", "")
 
@@ -380,7 +409,7 @@ async def complete_authorization(
     headers, body = build_token_request_auth(config, body)
 
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             if server_key == "facebook":
                 # Meta documents the server-side code exchange as a GET to
                 # /oauth/access_token. Keep secrets out of logs at the caller
@@ -390,7 +419,7 @@ async def complete_authorization(
                     params=body,
                     headers=headers,
                 )
-            elif server_key == "notion":
+            elif server_key in {"notion", "lark"}:
                 resp = await client.post(
                     config.token_url,
                     json=body,
@@ -403,13 +432,12 @@ async def complete_authorization(
                     headers=headers,
                 )
     except Exception as exc:
-        raise OAuthFlowError(502, f"Token exchange failed: {exc}") from exc
+        raise OAuthFlowError(502, "OAuth token exchange is unavailable; start the connection again.") from exc
 
-    if resp.status_code >= 400:
+    if not 200 <= resp.status_code < 300:
         raise OAuthFlowError(
             400,
-            f"{server_key} token exchange returned {resp.status_code}: "
-            f"{resp.text[:200]}",
+            f"{server_key} token exchange returned HTTP {resp.status_code}.",
         )
 
     try:
@@ -417,11 +445,29 @@ async def complete_authorization(
     except Exception as exc:
         raise OAuthFlowError(502, "Provider returned non-JSON token response") from exc
 
+    if not isinstance(data, dict):
+        raise OAuthFlowError(502, "Provider returned an invalid token response.")
+    if server_key == "lark":
+        from packages.core.services.lark_oauth import lark_token_response_is_valid
+
+        if not lark_token_response_is_valid(data, scopes=config.scopes):
+            raise OAuthFlowError(502, "Lark returned an incomplete or rejected OAuth grant; reconnect.")
     access_token = data.get("access_token")
     if not access_token:
         raise OAuthFlowError(
-            400, f"Provider did not return an access_token: {data}",
+            400, "Provider did not return an access token.",
         )
+    from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
+    if is_manor_oauth_provider(server_key):
+        if (
+            not isinstance(access_token, str) or not access_token.isascii()
+            or any(char.isspace() for char in access_token)
+            or not isinstance(data.get("refresh_token"), str) or not data["refresh_token"]
+            or not set(config.scopes.split()).issubset(str(data.get("scope") or "").split())
+            or not isinstance(data.get("expires_in"), int) or isinstance(data["expires_in"], bool)
+            or data["expires_in"] <= 0
+        ):
+            raise OAuthFlowError(502, "Provider returned an incomplete OAuth grant.")
 
     if server_key == "facebook":
         # The first token is short-lived. Exchange it immediately so Page,
@@ -641,6 +687,8 @@ async def resolve_oauth_identity(
     a non-reversible token fingerprint keeps separate connections distinct;
     explicit reconnect state still targets the original row.
     """
+    if server_key == "lark":
+        return await _resolve_lark_oauth_identity(tokens, application_id=application_id, timeout=timeout)
     raw_payload = tokens.raw or {}
     provider_user_id, profile = _identity_from_payload(raw_payload)
     if server_key == "slack":
@@ -698,6 +746,40 @@ async def resolve_oauth_identity(
     return provider_user_id, profile
 
 
+async def _resolve_lark_oauth_identity(
+    tokens: TokenSet, *, application_id: str | None, timeout: float,
+) -> tuple[str, dict[str, Any]]:
+    from packages.core.services.lark_oauth import LARK_USER_INFO_URL
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            response = await client.get(
+                LARK_USER_INFO_URL,
+                headers={"Authorization": f"Bearer {tokens.access_token}"},
+            )
+        payload = response.json()
+    except Exception as exc:
+        raise OAuthFlowError(502, "Could not verify the Lark user identity; reconnect.") from exc
+    data = payload.get("data") if isinstance(payload, dict) else None
+    open_id = data.get("open_id") if isinstance(data, dict) else None
+    if (
+        response.status_code != 200 or not isinstance(payload, dict)
+        or payload.get("code") not in (0, "0")
+        or not isinstance(open_id, str) or not open_id.strip() or not application_id
+    ):
+        raise OAuthFlowError(502, "Could not verify the Lark user identity; reconnect.")
+    open_id = open_id.strip()
+    profile = {
+        "platform": "lark", "app_id": application_id, "open_id": open_id,
+        "scope": str((tokens.raw or {}).get("scope") or ""),
+    }
+    for source, target in (("name", "display_name"), ("email", "email"), ("tenant_key", "tenant_key")):
+        value = data.get(source)
+        if isinstance(value, str) and value.strip():
+            profile[target] = value.strip()
+    return f"lark:{application_id}:user:{open_id}", profile
+
+
 # ── User-facing error page ─────────────────────────────────────────────────
 
 
@@ -714,6 +796,9 @@ def render_oauth_error_page(
         "redirected here without finishing the flow."
     )
     title = (error or "no_code").replace("_", " ")
+    server_key = html.escape(server_key)
+    title = html.escape(title)
+    msg = html.escape(msg)
     return HTMLResponse(
         f"""<!doctype html><html><head><meta charset="utf-8"><title>{server_key} OAuth failed</title></head>
         <body style="font-family:-apple-system,Segoe UI,sans-serif;padding:32px;max-width:560px;margin:auto">

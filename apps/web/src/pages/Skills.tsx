@@ -1,6 +1,8 @@
+import { invalidateCatalogQueries } from "../lib/catalogInvalidation";
 import React, { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
+import { agentListQueryOptions, skillListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { t } from "../lib/i18n";
 import { useToastStore } from "../stores/toast";
 import { useAuthStore } from "../stores/auth";
@@ -56,6 +58,7 @@ function skillDisplayName(skill: any): string {
 
 export default function Skills() {
   const queryClient = useQueryClient();
+  const catalogScope = useCatalogScope();
   const toast = useToastStore();
   const authToken = useAuthStore((s) => s.token);
   const authLoading = useAuthStore((s) => s.isLoading);
@@ -84,16 +87,14 @@ export default function Skills() {
   /* ── Data fetching ── */
 
   const { data: allSkills = [], isLoading: skillsLoading } = useQuery({
-    queryKey: ["skills", "my"],
-    queryFn: () => api.skills.list(),
-    enabled: privateApiEnabled,
+    ...skillListQueryOptions(catalogScope),
+    enabled: privateApiEnabled && !!catalogScope,
   });
 
 
   const { data: agents = [], isLoading: agentsLoading } = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api.agents.list(),
-    enabled: privateApiEnabled && scope === "agent",
+    ...agentListQueryOptions(catalogScope),
+    enabled: privateApiEnabled && !!catalogScope && scope === "agent",
   });
 
   const { data: agentBoundSkills = [], isLoading: agentSkillsLoading } =
@@ -114,7 +115,8 @@ export default function Skills() {
   const deleteMutation = useMutation({
     mutationFn: (id: string) => api.skills.delete(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["skills"] });
+      invalidateCatalogQueries(queryClient, "skills");
+      invalidateCatalogQueries(queryClient, "agents");
       toast.success(t("page.skills.skill_deleted"));
     },
   });
@@ -124,6 +126,8 @@ export default function Skills() {
       api.skills.bindSkill(agentId, skillId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["skills", "agent"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
       queryClient.invalidateQueries({
         queryKey: ["skills", "agent-available"],
       });
@@ -137,6 +141,8 @@ export default function Skills() {
       api.skills.unbindSkill(agentId, skillId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["skills", "agent"] });
+      invalidateCatalogQueries(queryClient, "agents");
+      invalidateCatalogQueries(queryClient, "skills", { queryKey: ["skills", "list"] });
       queryClient.invalidateQueries({
         queryKey: ["skills", "agent-available"],
       });
@@ -729,7 +735,7 @@ export default function Skills() {
         open={showImportModal}
         onClose={() => setShowImportModal(false)}
         onImported={() =>
-          queryClient.invalidateQueries({ queryKey: ["skills"] })
+          invalidateCatalogQueries(queryClient, "skills")
         }
       />
 

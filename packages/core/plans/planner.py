@@ -10,11 +10,11 @@ Flow:
   1. Resolve workspace context — subscriptions, allowed actions per
      subscription, recent relevant memory.
   2. Build the system + user prompt.
-  3. Single Claude call returning JSON.
-  4. ``Plan.model_validate_json`` — on failure, one re-prompt with
-     the validation error attached.
-  5. Cross-check against workspace allowlists (service_keys, actions)
-     so the Planner can't conjure capabilities the workspace lacks.
+  3. Bounded model/tool loop returning a structured Plan candidate.
+  4. Normalize the candidate, bind the Task's exact output contract, and
+     validate its schema, references, and service/action allowlists.
+  5. Return a rejected candidate's diagnostics in the same conversation so
+     the Planner can correct it before any acceptance or persistence.
   6. Persist via ``plans.service.create_plan_from_dag``.
 
 If the LLM is unreachable / no API key, falls back to a tiny
@@ -26,11 +26,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 from collections.abc import Awaitable, Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from pydantic import ValidationError
 from sqlalchemy import or_, select
@@ -47,9 +49,9 @@ from packages.core.ai.runtime import (
     runtime_execute_planner_tool_call,
     runtime_current_billing_context,
     runtime_planner_assistant_message,
-    runtime_planner_action_specs_from_tools_cached,
     runtime_planner_action_binding_for,
     runtime_planner_llm_billing_context,
+    runtime_planner_capability_catalog,
     runtime_planner_system_prompt,
     runtime_planner_task_prompt,
     runtime_planner_tool_schemas,
@@ -60,10 +62,20 @@ from packages.core.ai.llm_client import (
     CreditCheckUnavailableError,
     CreditExhaustedError,
 )
-from packages.core.constants.task import TaskStatus, TaskType
+from packages.core.ai.runtime.task_requirements import (
+    task_runtime_capabilities_from_context,
+)
+from packages.core.ai.runtime.planning import runtime_planner_validation_feedback
+from packages.core.services.agent_effective_capabilities import (
+    AgentEffectiveCapabilityFactory,
+    EffectiveAgentCapabilities,
+    _filter_service_provider_actions_to_runtime_scope as _filter_service_provider_actions_to_runtime_scope,
+)
+from packages.core.constants.task import TaskRuntimeKind, TaskStatus
 from packages.core.models.execution import ExecutionPlan
 from packages.core.models.task import Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace
+from packages.core.plans.dispatchability import plan_dispatch_preflight
 from packages.core.plans.schema import Plan, PlanStep
 from packages.core.plans.refs import extract_step_refs
 from packages.core.plans.service import (
@@ -77,6 +89,11 @@ from packages.core.services.integration_account_service import (
     IntegrationAccountSelectionMode,
 )
 from packages.core.services.official_remote_mcp import MCPActionEffect
+from packages.core.services.task_execution_origin import (
+    record_manual_task_execution,
+    task_has_manual_execution,
+)
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 from packages.core.services.workflow_run_execution_claim import (
     commit_fenced_execution_boundary,
     task_plan_execution_claim,
@@ -84,8 +101,23 @@ from packages.core.services.workflow_run_execution_claim import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from packages.core.services.task_coordinator_wakeup import TaskCoordinatorClaim
+
 
 PLANNER_VERSION = "v0.1-demo-a"
+
+#: Opt-in for the rule-based planner stub on a first-turn provider failure.
+#: Unset (production): the outage surfaces as ``PlannerError`` and the Celery
+#: task retries with backoff instead of running a placeholder plan.
+PLANNER_FALLBACK_STUB_ENV = "MANOR_PLANNER_FALLBACK_STUB"
+_PLANNER_FALLBACK_STUB_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _planner_fallback_stub_enabled() -> bool:
+    """Whether ``MANOR_PLANNER_FALLBACK_STUB`` opts into the dev/CI stub."""
+    value = str(os.environ.get(PLANNER_FALLBACK_STUB_ENV, "") or "").strip().lower()
+    return value in _PLANNER_FALLBACK_STUB_TRUTHY
 
 
 class PlannerError(Exception):
@@ -102,10 +134,34 @@ class TaskPlanAdmissionError(PlannerError):
         super().__init__(reason)
 
 
+class TaskPlanOwnedByCoordinatorError(TaskPlanAdmissionError):
+    """A queued V2 Plan start lost ownership to the durable Task loop."""
+
+
 class CapabilityError(Exception):
     """Planner produced a plan referencing capabilities not in the
     workspace's allowlists. Should never happen if the prompt was
     followed; we re-validate as a safety net."""
+
+
+class TaskCapabilityGapError(CapabilityError):
+    """Selected Task services cannot meet its persisted runtime requirements."""
+
+    def __init__(
+        self,
+        task_id: str,
+        missing_capabilities: tuple[str, ...],
+        affected_agents: tuple[dict[str, str | None], ...] = (),
+    ) -> None:
+        self.task_id = task_id
+        self.missing_capabilities = missing_capabilities
+        self.affected_agents = affected_agents
+        super().__init__(
+            "Task required capabilities unavailable to its selected Agent services: "
+            + ", ".join(missing_capabilities)
+            + ". Bind the necessary tool or integration to a selected Agent "
+            "and retry; Task requirements do not grant tools."
+        )
 
 
 class TaskPlanClaimHeldError(RuntimeError):
@@ -116,10 +172,12 @@ class TaskPlanClaimHeldError(RuntimeError):
         super().__init__(f"task {task_id} is already being planned")
 
 
+class WorkspaceAutonomyPausedError(PlannerError):
+    """Automatic planning is deferred until Workspace automatic running resumes."""
+
+
 def task_plan_admission_error(task: Task) -> str | None:
-    """Return why this Task cannot enter the background Plan runtime."""
-    if getattr(task, "task_type", None) == TaskType.INTERACTIVE.value:
-        return "interactive tasks run through Task Session, not Plans"
+    """Return lifecycle-only admission errors before factory resolution."""
     status = getattr(task, "status", None)
     if status != TaskStatus.IN_PROGRESS.value:
         return (
@@ -127,6 +185,43 @@ def task_plan_admission_error(task: Task) -> str | None:
             f"expected {TaskStatus.IN_PROGRESS.value!r}"
         )
     return None
+
+
+async def _require_coordinated_plan_execution(
+    db: AsyncSession,
+    task: Task,
+    *,
+    expected_selection=None,
+    lock_subscriptions: bool = False,
+):
+    """Resolve the factory and require coordinator for Workspace Plan work."""
+
+    from packages.core.services.task_execution import resolve_task_execution
+
+    execution = await resolve_task_execution(
+        db,
+        task,
+        lock_subscriptions=lock_subscriptions,
+    )
+    if not task.workspace_id:
+        # Entity-level legacy Tasks retain their established Plan/Agent
+        # compatibility path. Coordinator folding is a Workspace invariant.
+        return execution
+    if expected_selection is not None:
+        expected_selection.require_current(execution.coordinator)
+    if (
+        execution.runtime_kind is not TaskRuntimeKind.COORDINATED_PLAN
+        or execution.coordinator is None
+    ):
+        raise TaskPlanAdmissionError(
+            task.id,
+            str(task.status) if task.status is not None else None,
+            (
+                f"task runtime {execution.runtime_kind.value!r} cannot start "
+                "a new Plan"
+            ),
+        )
+    return execution
 
 
 @dataclass(frozen=True)
@@ -138,6 +233,9 @@ class _TaskPlanningScope:
 async def _lock_task_planning_origin(
     db: AsyncSession,
     task_id: str,
+    *,
+    manual_user_id: str | None = None,
+    task_coordinator_claim: TaskCoordinatorClaim | None = None,
 ) -> tuple[Task, _TaskPlanningScope]:
     """Lock Workspace -> Task and validate one planning admission snapshot."""
     task_scope = (await db.execute(
@@ -152,6 +250,7 @@ async def _lock_task_planning_origin(
             str(task_scope.workspace_id) if task_scope.workspace_id else None
         ),
     )
+    workspace = None
     if scope.workspace_id:
         from packages.core.services.workspace_access import (
             lock_workspace_access_boundary,
@@ -162,12 +261,8 @@ async def _lock_task_planning_origin(
             workspace_id=scope.workspace_id,
             entity_id=scope.entity_id,
         )
-        if (
-            workspace is None
-            or workspace.deleted_at is not None
-            or workspace.status != "active"
-        ):
-            raise PlannerError("Workspace is not active for planning")
+        if not workspace_allows_manual_work(workspace):
+            raise PlannerError("Workspace is unavailable for planning")
 
     task = (await db.execute(
         select(Task)
@@ -187,6 +282,19 @@ async def _lock_task_planning_origin(
             str(task.status) if task.status is not None else None,
             admission_error,
         )
+    if (
+        workspace is not None and workspace.status == "paused"
+        and not manual_user_id and not task_has_manual_execution(task)
+    ):
+        raise WorkspaceAutonomyPausedError("Workspace automatic running is paused")
+    if scope.workspace_id and task_coordinator_claim is None:
+        # All NEW Workspace Plans belong to V3, even before its Run exists.
+        # Existing V2 Plans resume their saved Steps; they do not re-enter this
+        # new-plan provider path through a legacy API or queue message.
+        raise TaskPlanOwnedByCoordinatorError(
+            task_id, str(task.status),
+            "Workspace Task planning requires its Task coordinator; submit a planning request instead",
+        )
     await raise_for_active_task_plan(
         db,
         task_id=str(task.id),
@@ -198,6 +306,9 @@ async def _lock_task_planning_origin(
 async def _admit_task_without_holding_locks(
     db: AsyncSession,
     task_id: str,
+    *,
+    manual_user_id: str | None = None,
+    task_coordinator_claim: TaskCoordinatorClaim | None = None,
 ) -> _TaskPlanningScope:
     """Validate admission under row locks, then release them before LLM I/O.
 
@@ -207,12 +318,18 @@ async def _admit_task_without_holding_locks(
     """
     begin_nested = getattr(db, "begin_nested", None)
     if not callable(begin_nested):
-        _task, scope = await _lock_task_planning_origin(db, task_id)
+        _task, scope = await _lock_task_planning_origin(
+            db, task_id, manual_user_id=manual_user_id,
+            task_coordinator_claim=task_coordinator_claim,
+        )
         return scope
 
     savepoint = await begin_nested()
     try:
-        _task, scope = await _lock_task_planning_origin(db, task_id)
+        _task, scope = await _lock_task_planning_origin(
+            db, task_id, manual_user_id=manual_user_id,
+            task_coordinator_claim=task_coordinator_claim,
+        )
         return scope
     finally:
         if savepoint.is_active:
@@ -260,6 +377,7 @@ def _planning_task_fingerprint(task: Task) -> str:
 async def _assert_workspace_setup_allows_planning(
     db: AsyncSession,
     context,
+    task: Task | None = None,
 ) -> None:
     context_workspace = getattr(context, "workspace", None)
     if context_workspace is None:
@@ -267,6 +385,7 @@ async def _assert_workspace_setup_allows_planning(
 
     from packages.core.services.workspace_readiness import (
         evaluate_current_workspace_blocking_setup,
+        task_is_authorized_workspace_setup,
     )
 
     setup_status = await evaluate_current_workspace_blocking_setup(
@@ -279,10 +398,98 @@ async def _assert_workspace_setup_allows_planning(
         ),
     )
     if setup_status is not None and setup_status.blocks_work:
+        if (
+            task is not None
+            and task.workspace_id == context_workspace.id
+            and task.entity_id == context_workspace.entity_id
+            and await task_is_authorized_workspace_setup(db, task)
+        ):
+            return
         raise PlannerError(
             "Workspace setup is incomplete; automated setup must run through "
             "the Blueprint's authorized setup job before Tasks may be planned"
         )
+
+
+async def _raise_if_not_dispatchable(db: AsyncSession, *, plan: Plan, task: Any) -> None:
+    """Reject a plan the dispatcher could never lease (Section P2)."""
+    errors = await plan_dispatch_preflight(db, plan=plan, task=task)
+    if errors:
+        raise CapabilityError("plan is not dispatchable: " + "; ".join(errors))
+
+
+async def admit_manual_task_plan(
+    db: AsyncSession,
+    *,
+    task_id: str,
+    submission_id: str,
+    task_coordinator_claim: TaskCoordinatorClaim,
+) -> ExecutionPlan:
+    """Persist a frozen V3 manual DAG through the Planner's final authority gates.
+
+    No provider call occurs. Workspace -> Task -> subscription -> Run locks stay
+    held until the caller commits the Plan and consumed submission together.
+    """
+    from packages.core.services.task_execution import task_execution_intent_generation
+    from packages.core.services.task_plan_submission import pending_task_plan_submission
+    from packages.core.models.task_plan_submission import (
+        TaskPlanSubmission,
+        TaskPlanSubmissionKind,
+    )
+
+    requested = await db.get(TaskPlanSubmission, submission_id)
+    if (
+        requested is None
+        or requested.task_id != task_id
+        or requested.request_kind != TaskPlanSubmissionKind.MANUAL.value
+    ):
+        raise TaskPlanAdmissionError(task_id, None, "Manual Plan submission is unavailable")
+
+    task, _scope = await _lock_task_planning_origin(
+        db,
+        task_id,
+        manual_user_id=requested.requested_by_user_id,
+        task_coordinator_claim=task_coordinator_claim,
+    )
+    submission = await pending_task_plan_submission(db, task=task)
+    if (
+        submission is None
+        or submission.id != submission_id
+        or submission.lifecycle_generation != task_execution_intent_generation(task)
+    ):
+        raise TaskPlanAdmissionError(
+            task_id, str(task.status), "Manual Plan submission is no longer current",
+        )
+    candidate = Plan.model_validate(submission.plan_dag)
+    execution = await _require_coordinated_plan_execution(
+        db, task, lock_subscriptions=True,
+    )
+    context = await _gather_context(db, task)
+    await _assert_workspace_setup_allows_planning(db, context, task)
+    _require_task_capabilities(task, context)
+    candidate = _apply_replan_approval_constraints(task, candidate)
+    candidate = bind_task_output_contract(candidate, task.expected_output)
+    _enforce_planner_acceptance_contract(candidate, task)
+    _enforce_allowlists(candidate, context)
+    await _raise_if_not_dispatchable(db, plan=candidate, task=task)
+    required_step_errors = _required_plan_step_errors(task, candidate)
+    if required_step_errors:
+        raise PlannerError(
+            "required plan steps were not satisfied: " + "; ".join(required_step_errors)
+        )
+    return await create_plan_from_dag(
+        db,
+        entity_id=task.entity_id,
+        workspace_id=task.workspace_id,
+        task_id=task.id,
+        agent_subscription_id=execution.coordinator.root.subscription_id,
+        plan=candidate,
+        execution_mode=submission.execution_mode,
+        approval_required=submission.approval_required,
+        enforce_contract=True,
+        expected_selection=execution.coordinator,
+        task_coordinator_claim=task_coordinator_claim,
+    )
 
 
 # ── Public entry point ────────────────────────────────────────────────
@@ -292,9 +499,11 @@ async def plan_task(
     task_id: str,
     *,
     execution_mode: Optional[str] = None,
+    manual_user_id: str | None = None,
     before_provider: (
         Callable[[], Awaitable[RuntimeResolvedBillingScope | None]] | None
     ) = None,
+    task_coordinator_claim: TaskCoordinatorClaim | None = None,
 ) -> ExecutionPlan:
     """Generate + persist a Plan for ``task_id``. Raises if the task
     doesn't exist or the Planner can't produce a valid plan.
@@ -304,7 +513,10 @@ async def plan_task(
     workspaces get ``live``. Callers can still force a specific mode
     (eg. UI "Run as dry-run preview" button)."""
     requested_execution_mode = execution_mode
-    task_scope = await _admit_task_without_holding_locks(db, task_id)
+    task_scope = await _admit_task_without_holding_locks(
+        db, task_id, manual_user_id=manual_user_id,
+        task_coordinator_claim=task_coordinator_claim,
+    )
 
     # Reload after rolling back the admission savepoint: ORM state loaded in a
     # rolled-back savepoint may be expired, and no live row should be handed to
@@ -325,10 +537,31 @@ async def plan_task(
             str(task.status) if task.status is not None else None,
             admission_error,
         )
-
     planning_task_fingerprint = _planning_task_fingerprint(task)
     context = await _gather_context(db, task)
-    await _assert_workspace_setup_allows_planning(db, context)
+    await _assert_workspace_setup_allows_planning(db, context, task)
+    context_selection = None
+    if task.workspace_id:
+        from packages.core.services.task_execution import (
+            CoordinatorRuntimeSelection,
+        )
+
+        context_selection = CoordinatorRuntimeSelection.from_subscriptions(
+            context.subscriptions
+        )
+    # Freeze the exact root/service deployment identity that will shape this
+    # provider turn. Subscription locks are short-lived and released by the
+    # commit immediately before provider I/O.
+    planning_execution = await _require_coordinated_plan_execution(
+        db,
+        task,
+        lock_subscriptions=True,
+    )
+    planning_selection = planning_execution.coordinator
+    if task.workspace_id:
+        if planning_selection is not None:
+            planning_selection.require_current(context_selection)
+        context.coordinator = planning_selection
     planning_task = _planning_task_snapshot(task)
 
     if execution_mode is None:
@@ -337,6 +570,10 @@ async def plan_task(
             default_execution_mode(context.workspace)
             if context.workspace else "live"
         )
+    await _prepare_task_capability_requirements(
+        db, task=task, ctx=context, execution_mode=execution_mode,
+        claim=task_coordinator_claim,
+    )
 
     billing_scope = await before_provider() if before_provider is not None else None
     if billing_scope is None:
@@ -371,11 +608,13 @@ async def plan_task(
         getattr(planning_task, "expected_output", None),
     )
     _enforce_allowlists(plan, context)
+    await _raise_if_not_dispatchable(db, plan=plan, task=planning_task)
 
     gaps = plan_contract_gaps(
         plan.topo_order(),
         task_expected_output=getattr(planning_task, "expected_output", None),
         require_explicit_agent_outputs=True,
+        require_explicit_execution_contract=True,
     )
     required_step_errors = _required_plan_step_errors(planning_task, plan)
     generated_replan_updates: dict[str, Any] | None = None
@@ -409,6 +648,10 @@ async def plan_task(
                 "_replan_context": replan_ctx,
             },
         )
+        # The first candidate's dispatchability checks opened a read
+        # transaction. Release that connection before a second provider turn;
+        # only detached Task/context snapshots cross provider I/O.
+        await db.commit()
         async with runtime_planner_llm_billing_context(
             entity_id=planning_task.entity_id,
             workspace_id=planning_task.workspace_id,
@@ -421,10 +664,12 @@ async def plan_task(
             getattr(planning_task, "expected_output", None),
         )
         _enforce_allowlists(plan, context)
+        await _raise_if_not_dispatchable(db, plan=plan, task=planning_task)
         gaps = plan_contract_gaps(
             plan.topo_order(),
             task_expected_output=getattr(planning_task, "expected_output", None),
             require_explicit_agent_outputs=True,
+            require_explicit_execution_contract=True,
         )
         required_step_errors = _required_plan_step_errors(planning_task, plan)
         if gaps or required_step_errors:
@@ -438,7 +683,10 @@ async def plan_task(
     # Provider work runs without lifecycle locks. Reacquire Workspace -> Task,
     # then rebuild every mutable authorization/contract input immediately
     # before persistence. No provider I/O occurs in this final critical section.
-    task, final_scope = await _lock_task_planning_origin(db, task_id)
+    task, final_scope = await _lock_task_planning_origin(
+        db, task_id, manual_user_id=manual_user_id,
+        task_coordinator_claim=task_coordinator_claim,
+    )
     if final_scope != task_scope:
         raise PlannerError("Task scope changed while planning")
     if _planning_task_fingerprint(task) != planning_task_fingerprint:
@@ -458,15 +706,35 @@ async def plan_task(
             "_replan_context": merged_context,
         }
 
+    await _require_coordinated_plan_execution(
+        db,
+        task,
+        expected_selection=planning_selection,
+        lock_subscriptions=True,
+    )
     final_context = await _gather_context(db, task)
-    await _assert_workspace_setup_allows_planning(db, final_context)
+    if task.workspace_id:
+        final_context.coordinator = planning_selection
+    await _assert_workspace_setup_allows_planning(db, final_context, task)
+    if requested_execution_mode is None:
+        from packages.core.workspaces import default_execution_mode
+        execution_mode = (
+            default_execution_mode(final_context.workspace)
+            if final_context.workspace else "live"
+        )
+    await _prepare_task_capability_requirements(
+        db, task=task, ctx=final_context, execution_mode=execution_mode,
+        claim=task_coordinator_claim,
+    )
     plan = _apply_replan_approval_constraints(task, plan)
     plan = bind_task_output_contract(plan, getattr(task, "expected_output", None))
     _enforce_allowlists(plan, final_context)
+    await _raise_if_not_dispatchable(db, plan=plan, task=task)
     final_gaps = plan_contract_gaps(
         plan.topo_order(),
         task_expected_output=getattr(task, "expected_output", None),
         require_explicit_agent_outputs=True,
+        require_explicit_execution_contract=True,
     )
     final_required_step_errors = _required_plan_step_errors(task, plan)
     if final_gaps or final_required_step_errors:
@@ -476,24 +744,30 @@ async def plan_task(
                 + "; ".join(final_required_step_errors)
             )
         raise PlanContractError(final_gaps)
-    if requested_execution_mode is None:
-        from packages.core.workspaces import default_execution_mode
-        execution_mode = (
-            default_execution_mode(final_context.workspace)
-            if final_context.workspace else "live"
+
+    plan_agent_subscription_id = task.owner_subscription_id
+    if task.workspace_id:
+        plan_agent_subscription_id = (
+            planning_selection.root.subscription_id
         )
+
+    if manual_user_id:
+        record_manual_task_execution(task, user_id=manual_user_id, action="plan_task")
+        await db.flush()
 
     return await create_plan_from_dag(
         db,
         entity_id=task.entity_id,
         workspace_id=task.workspace_id,
         task_id=task.id,
-        agent_subscription_id=task.owner_subscription_id,
+        agent_subscription_id=plan_agent_subscription_id,
         plan=plan,
         planner_version=PLANNER_VERSION,
         parent_plan_id=_replan_parent_plan_id(task),
         execution_mode=execution_mode,
         enforce_contract=True,
+        expected_selection=planning_selection,
+        task_coordinator_claim=task_coordinator_claim,
     )
 
 
@@ -502,6 +776,7 @@ async def plan_task_and_commit(
     task_id: str,
     *,
     execution_mode: Optional[str] = None,
+    manual_user_id: str | None = None,
     before_provider: (
         Callable[[], Awaitable[RuntimeResolvedBillingScope | None]] | None
     ) = None,
@@ -522,6 +797,7 @@ async def plan_task_and_commit(
             db,
             task_id,
             execution_mode=execution_mode,
+            manual_user_id=manual_user_id,
             before_provider=before_provider,
         )
         if before_commit is not None:
@@ -659,6 +935,10 @@ class _Context:
         staff: list[dict] | None = None,
         agent_tool_names: dict[str, list[str]] | None = None,
         agent_skill_names: dict[str, list[dict]] | None = None,
+        service_tool_names: dict[str, list[str]] | None = None,
+        service_mcp_tool_names: dict[str, list[str]] | None = None,
+        coordinator: Any | None = None,
+        service_capabilities: dict[str, EffectiveAgentCapabilities] | None = None,
     ):
         self.workspace = workspace
         self.subscriptions = subscriptions
@@ -671,7 +951,172 @@ class _Context:
         self.document_groups = document_groups or []
         self.staff = staff or []
         self.agent_tool_names = agent_tool_names or {}
+        self.service_tool_names = service_tool_names
+        self.service_mcp_tool_names = service_mcp_tool_names or {}
+        self.coordinator = coordinator
         self.agent_skill_names = agent_skill_names or {}
+        self.service_capabilities = service_capabilities
+        self.capability_acquisition: dict[str, Any] = {}
+        self.capability_acquisition_targets: dict[str, dict[str, str]] = {}
+
+
+def _capability_assignment_targets(ctx: _Context) -> dict[str, dict[str, str]]:
+    """Exact selected worker deployments, never a configuration catalog."""
+    targets = {}
+    for service_key in ctx.allowed_service_keys:
+        subscriptions = [sub for sub in ctx.subscriptions if sub.service_key == service_key]
+        scope = (ctx.service_capabilities or {}).get(service_key)
+        if len(subscriptions) != 1 or scope is None or not scope.available:
+            continue
+        sub = subscriptions[0]
+        agent = ctx.agents_by_id.get(sub.agent_id)
+        if (
+            sub.status != "active" or agent is None or agent.status != "active"
+            or agent.deleted_at is not None
+            or (scope.subscription_id, scope.agent_id) != (sub.id, sub.agent_id)
+        ):
+            continue
+        targets[service_key] = {
+            "service_key": service_key, "subscription_id": sub.id,
+            "agent_id": sub.agent_id,
+        }
+    return targets
+
+
+async def _can_defer_task_capability_gap(
+    db: AsyncSession, *, task: Task, ctx: _Context,
+    execution_mode: str, claim: TaskCoordinatorClaim | None,
+) -> bool:
+    # OSS and execution origins without the installed worker acquisition path
+    # retain the strict pre-Plan requirement boundary.
+    return False
+
+
+async def _prepare_task_capability_requirements(
+    db: AsyncSession, *, task: Task, ctx: _Context,
+    execution_mode: str, claim: TaskCoordinatorClaim | None,
+) -> None:
+    """Describe a recoverable gap without granting tools or inventing Steps."""
+    if hasattr(ctx, "capability_acquisition"):
+        ctx.capability_acquisition = {}
+        ctx.capability_acquisition_targets = {}
+    gap = None
+    try:
+        _require_task_capabilities(task, ctx)
+    except TaskCapabilityGapError as exc:
+        if exc.__cause__ is not None:
+            raise
+        gap = exc
+    if await _can_defer_task_capability_gap(
+        db, task=task, ctx=ctx, execution_mode=execution_mode, claim=claim,
+    ):
+        ctx.capability_acquisition_targets = _capability_assignment_targets(ctx)
+    elif gap is not None:
+        raise gap
+
+
+def _enforce_capability_assignments(plan: Plan, ctx: _Context) -> None:
+    assigned: set[str] = set()
+    targets = getattr(ctx, "capability_acquisition_targets", {})
+    for step in plan.steps:
+        if "required_capabilities" not in step.params:
+            continue
+        values = step.params["required_capabilities"]
+        if (
+            not isinstance(values, list) or not 1 <= len(values) <= 24
+            or any(not isinstance(value, str) or not value.strip() for value in values)
+        ):
+            raise CapabilityError(f"step {step.key}: required_capabilities must be a list of 1 to 24 capability IDs")
+        try:
+            required = task_runtime_capabilities_from_context(
+                {"required_capabilities": values}, strict=True,
+            )
+        except ValueError as exc:
+            raise CapabilityError(f"step {step.key}: {exc}") from exc
+        if (
+            step.kind != "subagent" or step.params.get("_coordinator") is True
+            or step.service_key not in targets
+            or targets.get(step.service_key) != _capability_assignment_targets(ctx).get(step.service_key)
+        ):
+            raise CapabilityError(f"step {step.key}: capability requirements need one current ordinary subagent deployment")
+        assigned.update(required)
+    observation = getattr(ctx, "capability_acquisition", {})
+    missing = set(observation.get("missing_capabilities") or []) - assigned
+    if missing:
+        raise CapabilityError(
+            "Missing Task capabilities must be assigned through subagent params.required_capabilities: "
+            + ", ".join(sorted(missing))
+        )
+
+
+def _require_task_capabilities(task: Task, ctx: _Context) -> None:
+    """Check requirements against selected services, never as a tool grant.
+
+    The Planner's union catalog is useful for discovery but not authority for
+    an individual service. Use only each selected subscription's effective
+    scheduled-run tool surface and its own action/Skill bindings.
+    """
+    details = getattr(task, "details", None)
+    runtime_context = details.get("runtime_context") if isinstance(details, dict) else None
+    try:
+        required = task_runtime_capabilities_from_context(
+            runtime_context, strict=True,
+        )
+    except ValueError as exc:
+        raise TaskCapabilityGapError(str(task.id), (f"invalid requirement: {exc}",)) from exc
+    if not required:
+        return
+
+    available: set[str] = set()
+    service_tools = ctx.service_tool_names or {}
+    from packages.core.services.agent_permission_service import parse_mcp_tool_name
+
+    for sub in ctx.subscriptions:
+        service_key = str(getattr(sub, "service_key", "") or "")
+        if service_key not in ctx.allowed_service_keys:
+            continue
+        if ctx.service_capabilities is not None:
+            scope = ctx.service_capabilities.get(service_key)
+            if scope is not None:
+                available.update(scope.capability_ids)
+            continue
+        tools = service_tools.get(service_key, ())
+        skills = (
+            ctx.agent_skill_names.get(str(getattr(sub, "agent_id", "") or ""), ())
+            if "invoke_skill" in tools else ()
+        )
+        provider_actions = {
+            provider: list(actions)
+            for provider, actions in ctx.service_provider_actions.get(service_key, {}).items()
+        }
+        # Deployment bindings are part of the Agent's effective scope too.
+        # The provider-action catalog alone only reads reusable Agent bindings
+        # and must not misclassify a valid Workspace deployment as a gap.
+        for name in ctx.service_mcp_tool_names.get(service_key, ()):
+            if parsed := parse_mcp_tool_name(name):
+                provider, action = parsed
+                provider_actions.setdefault(provider, []).append(action)
+        available.update(
+            entry.capability_id
+            for entry in runtime_planner_capability_catalog(
+                provider_actions=provider_actions,
+                provider_action_specs=ctx.service_provider_action_specs.get(service_key, {}),
+                platform_tools=tools,
+                skills=skills,
+            )
+        )
+
+    missing = tuple(capability_id for capability_id in required if capability_id not in available)
+    if missing:
+        raise TaskCapabilityGapError(
+            str(task.id), missing,
+            affected_agents=tuple({
+                "service_key": sub.service_key,
+                "subscription_id": sub.id,
+                "agent_id": sub.agent_id,
+                "agent_name": str(getattr(ctx.agents_by_id.get(sub.agent_id), "name", "") or ""),
+            } for sub in ctx.subscriptions if sub.service_key in ctx.allowed_service_keys),
+        )
 
 
 async def _gather_context(db: AsyncSession, task: Task) -> _Context:
@@ -684,29 +1129,15 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
             )
         )).scalar_one_or_none()
 
-    subs: list[AgentSubscription] = []
-    if task.workspace_id:
-        subs = list((await db.execute(
-            select(AgentSubscription).where(
-                AgentSubscription.entity_id == task.entity_id,
-                AgentSubscription.workspace_id == task.workspace_id,
-                AgentSubscription.status == "active",
-            )
-        )).scalars().all())
+    from packages.core.services.task_execution import task_plan_subscriptions
 
-    # Allowlist of service_keys = task.owner_service_key + delegates.
-    # Falls back to "all subscriptions in the workspace" if the task
-    # didn't pin an owner (legacy tasks during the migration window).
-    explicit = set(task.delegate_service_keys or [])
-    if task.owner_service_key:
-        explicit.add(task.owner_service_key)
-    allowed_service_keys = explicit if explicit else {
-        s.service_key for s in subs if s.service_key
-    }
-    subs = [
-        s for s in subs
-        if getattr(s, "service_key", None) in allowed_service_keys
-    ]
+    subs = await task_plan_subscriptions(db, task)
+    allowed_service_keys = {s.service_key for s in subs if s.service_key}
+    seen_services: set[str] = set()
+    for sub in subs:
+        if sub.service_key in seen_services:
+            raise CapabilityError(f"service_key={sub.service_key!r} has ambiguous active subscriptions")
+        seen_services.add(sub.service_key)
 
     agent_ids = [s.agent_id for s in subs if s.agent_id]
     agents_by_id: dict[str, Agent] = {}
@@ -736,16 +1167,6 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
         )
         actor_user_id = None
 
-    service_provider_actions, service_provider_action_specs = await _compute_service_provider_actions(
-        db,
-        subscriptions=subs,
-        agents_by_id=agents_by_id,
-        actor_user_id=actor_user_id,
-        entity_id=task.entity_id,
-    )
-    provider_actions = _union_provider_actions(service_provider_actions)
-    provider_action_specs = _union_provider_action_specs(service_provider_action_specs)
-
     # Workspace-scoped documents + staff — so Planner knows what's available
     doc_groups: list[dict] = []
     staff_list: list[dict] = []
@@ -762,43 +1183,37 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
         )).scalars().all())
         staff_list = [{"staff_id": s.staff_id, "role": s.role} for s in staff_rows]
 
-    # Per-agent platform tool bindings + skill bindings — so the Planner
-    # knows each agent's capabilities beyond MCP actions (e.g. write_file,
-    # generate_document_file, invoke_skill, web_search).
+    service_capabilities = await AgentEffectiveCapabilityFactory.create(
+        db, entity_id=task.entity_id, user_id=actor_user_id,
+        workspace_id=task.workspace_id, subscriptions=subs,
+        agents_by_id=agents_by_id, task_id=task.id,
+        conversation_id=task.conversation_id,
+    )
+    service_tool_names = {
+        key: list(scope.tool_names) for key, scope in service_capabilities.items()
+    }
+    service_mcp_tool_names = {
+        key: list(scope.mcp_tool_names) for key, scope in service_capabilities.items()
+    }
+    service_provider_actions = {
+        key: scope.provider_actions for key, scope in service_capabilities.items()
+        if scope.provider_actions
+    }
+    service_provider_action_specs = {
+        key: scope.provider_action_specs for key, scope in service_capabilities.items()
+        if scope.provider_actions
+    }
     agent_tool_names: dict[str, list[str]] = {}
     agent_skill_names: dict[str, list[dict]] = {}
-    if agent_ids:
-        from packages.core.models.workspace import AgentToolBinding, ToolDefinition
-        from packages.core.models.skill import AgentSkillBinding, Skill
-
-        # Tool bindings — join to ToolDefinition to get human-readable names
-        tool_binding_rows = list((await db.execute(
-            select(AgentToolBinding.agent_id, ToolDefinition.name).join(
-                ToolDefinition, ToolDefinition.id == AgentToolBinding.tool_id,
-            ).where(AgentToolBinding.agent_id.in_(agent_ids))
-        )).all())
-        for agent_id_val, tool_name in tool_binding_rows:
-            agent_tool_names.setdefault(agent_id_val, []).append(tool_name)
-
-        # Skill bindings
-        skill_binding_rows = list((await db.execute(
-            select(AgentSkillBinding).where(AgentSkillBinding.agent_id.in_(agent_ids))
-        )).scalars().all())
-        skill_ids = [sb.skill_id for sb in skill_binding_rows]
-        skill_map: dict[str, Skill] = {}
-        if skill_ids:
-            skill_rows = list((await db.execute(
-                select(Skill).where(Skill.id.in_(skill_ids))
-            )).scalars().all())
-            skill_map = {s.id: s for s in skill_rows}
-        for sb in skill_binding_rows:
-            sk = skill_map.get(sb.skill_id)
-            if sk:
-                agent_skill_names.setdefault(sb.agent_id, []).append({
-                    "slug": sk.slug or sk.name,
-                    "name": sk.name,
-                    "description": (sk.description or "")[:150],
-                })
+    for scope in service_capabilities.values():
+        if scope.agent_id:
+            agent_tool_names[scope.agent_id] = sorted(
+                set(agent_tool_names.get(scope.agent_id, ())) | set(scope.tool_names)
+            )
+            if scope.skills:
+                agent_skill_names[scope.agent_id] = list(scope.skills)
+    provider_actions = _union_provider_actions(service_provider_actions)
+    provider_action_specs = _union_provider_action_specs(service_provider_action_specs)
 
     return _Context(
         workspace=workspace,
@@ -812,168 +1227,11 @@ async def _gather_context(db: AsyncSession, task: Task) -> _Context:
         document_groups=doc_groups,
         staff=staff_list,
         agent_tool_names=agent_tool_names,
+        service_tool_names=service_tool_names,
+        service_mcp_tool_names=service_mcp_tool_names,
         agent_skill_names=agent_skill_names,
+        service_capabilities=service_capabilities,
     )
-
-
-async def _compute_service_provider_actions(
-    db: AsyncSession,
-    *,
-    subscriptions: list[AgentSubscription],
-    agents_by_id: dict[str, Agent],
-    actor_user_id: str | None,
-    entity_id: str,
-) -> tuple[
-    dict[str, dict[str, list[str]]],
-    dict[str, dict[str, dict[str, dict[str, Any]]]],
-]:
-    """Derive {service_key: {provider_key: [allowed_action_keys, ...]}}.
-
-    Reads agent_mcp_bindings + mcp_servers.tools_cached. Empty when no
-    bindings exist — Planner gets an empty action menu for that service and
-    produces a pure-LLM/subagent plan, which is the right behaviour."""
-    if not agents_by_id or not subscriptions:
-        return {}, {}
-
-    service_keys_by_agent: dict[str, set[str]] = {}
-    for subscription in subscriptions:
-        agent_id = getattr(subscription, "agent_id", None)
-        service_key = str(getattr(subscription, "service_key", "") or "").strip()
-        if agent_id in agents_by_id and service_key:
-            service_keys_by_agent.setdefault(agent_id, set()).add(service_key)
-    if not service_keys_by_agent:
-        return {}, {}
-
-    from packages.core.models.mcp import AgentMCPBinding, MCPServer
-
-    bindings = list((await db.execute(
-        select(AgentMCPBinding).where(
-            AgentMCPBinding.agent_id.in_(list(service_keys_by_agent.keys())),
-            AgentMCPBinding.status == "active",
-        )
-    )).scalars().all())
-    if not bindings:
-        return {}, {}
-
-    server_ids = {b.mcp_server_id for b in bindings}
-    servers = {
-        s.id: s for s in (await db.execute(
-            select(MCPServer).where(
-                MCPServer.id.in_(server_ids),
-                MCPServer.status == "active",
-            )
-        )).scalars().all()
-    }
-    from packages.core.services.mcp_account_tool_catalog import (
-        actor_provider_mcp_tool_caches,
-    )
-    from packages.core.services.official_remote_mcp import OfficialRemoteMCPProvider
-
-    official_providers = {item.value for item in OfficialRemoteMCPProvider}
-    provider_endpoints = {
-        server.server_key: server.endpoint
-        for server in servers.values()
-        if server.server_key in official_providers and server.endpoint
-    }
-    try:
-        discovered_tool_caches = await actor_provider_mcp_tool_caches(
-            db,
-            provider_endpoints=provider_endpoints,
-            user_id=str(actor_user_id or ""),
-            entity_id=entity_id,
-        )
-    except Exception:
-        logger.warning(
-            "Planner could not load actor-scoped MCP account catalogs; using server fallback",
-            exc_info=True,
-        )
-        discovered_tool_caches = {}
-
-    out: dict[str, dict[str, list[str]]] = {}
-    spec_out: dict[str, dict[str, dict[str, dict[str, Any]]]] = {}
-    for b in bindings:
-        srv = servers.get(b.mcp_server_id)
-        if not srv:
-            continue
-        tool_specs = runtime_planner_action_specs_from_tools_cached(
-            discovered_tool_caches.get(srv.server_key) or srv.tools_cached or []
-        )
-        all_tool_names = list(tool_specs)
-        configured_allowed = b.allowed_tools if b.allowed_tools is not None else srv.default_allowed_tools
-        if configured_allowed is not None:
-            allowed_set = {str(n) for n in configured_allowed if str(n or "").strip()}
-            allowed = [n for n in all_tool_names if n in allowed_set or f"mcp__{srv.server_key}__{n}" in allowed_set]
-        else:
-            allowed = all_tool_names
-        if not allowed:
-            continue
-        for service_key in service_keys_by_agent.get(b.agent_id, set()):
-            service_actions = out.setdefault(service_key, {}).setdefault(srv.server_key, [])
-            service_specs = spec_out.setdefault(service_key, {}).setdefault(srv.server_key, {})
-            for n in allowed:
-                if n not in service_actions:
-                    service_actions.append(n)
-                service_specs.setdefault(n, tool_specs.get(n, {}))
-    from packages.core.services.agent_permission_service import resolve_agent_direct_mcp_actions
-
-    direct_by_provider: dict[str, set[str]] = {}
-    for agent_id in service_keys_by_agent:
-        direct_actions = await resolve_agent_direct_mcp_actions(db, agent_id)
-        for provider, actions in direct_actions.items():
-            direct_by_provider.setdefault(provider, set()).update(actions)
-    if direct_by_provider:
-        direct_servers = {
-            s.server_key: s for s in (await db.execute(
-                select(MCPServer).where(
-                    MCPServer.server_key.in_(list(direct_by_provider)),
-                    MCPServer.status == "active",
-                )
-            )).scalars().all()
-        }
-        missing_discovery_providers = set(direct_servers) - set(discovered_tool_caches)
-        if missing_discovery_providers:
-            missing_endpoints = {
-                provider: direct_servers[provider].endpoint
-                for provider in missing_discovery_providers
-                if (
-                    provider in official_providers
-                    and direct_servers[provider].endpoint
-                )
-            }
-            try:
-                discovered_tool_caches.update(
-                    await actor_provider_mcp_tool_caches(
-                        db,
-                        provider_endpoints=missing_endpoints,
-                        user_id=str(actor_user_id or ""),
-                        entity_id=entity_id,
-                    )
-                )
-            except Exception:
-                logger.warning(
-                    "Planner could not load direct actor MCP catalogs; using server fallback",
-                    exc_info=True,
-                )
-        for agent_id, service_keys in service_keys_by_agent.items():
-            direct_actions = await resolve_agent_direct_mcp_actions(db, agent_id)
-            for provider, actions in direct_actions.items():
-                srv = direct_servers.get(provider)
-                if not srv:
-                    continue
-                tool_specs = runtime_planner_action_specs_from_tools_cached(
-                    discovered_tool_caches.get(srv.server_key) or srv.tools_cached or []
-                )
-                allowed = [action for action in sorted(actions) if action in tool_specs]
-                if not allowed:
-                    continue
-                for service_key in service_keys:
-                    service_actions = out.setdefault(service_key, {}).setdefault(provider, [])
-                    service_specs = spec_out.setdefault(service_key, {}).setdefault(provider, {})
-                    for action in allowed:
-                        if action not in service_actions:
-                            service_actions.append(action)
-                        service_specs.setdefault(action, tool_specs.get(action, {}))
-    return out, spec_out
 
 
 def _union_provider_actions(
@@ -1004,14 +1262,21 @@ def _union_provider_action_specs(
 # ── LLM call + validation ─────────────────────────────────────────────
 
 async def _generate_plan(task: Task, ctx: _Context) -> Plan:
-    """Multi-turn agent loop — the Planner researches context and tools
+    """Multi-turn agent loop — the Planner selects Agent delegation contracts
     before committing to a plan. Up to MAX_PLANNER_TURNS turns.
 
     Available tools:
-      list_tools(service_key)   — see what actions an agent can perform
-      get_tool_schema(provider, action_key) — input/output schema for a tool
+      get_agent_schema(service_key) — introduction and delegation contract
+      get_task_context(section, field) — retrieve only needed inputs/resources
+      list_tools/get_tool_schema — exact bindings for typed action steps only
       submit_plan(plan_json)    — finalize and validate the plan DAG
+
+    score_goals is a fixed persist-only plan. Do not spend LLM turns on it.
     """
+    if _is_goal_scoring_task(task):
+        logger.info("Planner: skipping LLM for score_goals; using deterministic persist plan")
+        return _build_validated_goal_scoring_plan(task, ctx)
+
     MAX_PLANNER_TURNS = 8
 
     system_prompt = runtime_planner_system_prompt(
@@ -1023,14 +1288,38 @@ async def _generate_plan(task: Task, ctx: _Context) -> Plan:
         document_groups=ctx.document_groups,
         staff=ctx.staff,
         agent_tool_names=ctx.agent_tool_names,
+        service_tool_names=ctx.service_tool_names,
         agent_skill_names=ctx.agent_skill_names,
     )
     user_prompt = runtime_planner_task_prompt(task)
+    if getattr(ctx, "capability_acquisition", None):
+        user_prompt += "\n\nCurrent capability readiness:\n" + json.dumps(
+            ctx.capability_acquisition, ensure_ascii=False,
+        )
     tools = runtime_planner_tool_schemas()
 
     messages: list[dict[str, Any]] = [runtime_planner_user_message(user_prompt)]
 
     submitted_plan: Optional[Plan] = None
+
+    def parse_candidate(text: str) -> Plan:
+        plan = Plan.model_validate_json(_strip_code_fence(text))
+        plan = _normalize_plan_for_task(task, plan)
+        plan = _apply_replan_approval_constraints(task, plan)
+        plan = bind_task_output_contract(plan, getattr(task, "expected_output", None))
+        _enforce_allowlists(plan, ctx)
+        gaps = plan_contract_gaps(
+            plan.topo_order(),
+            task_expected_output=getattr(task, "expected_output", None),
+            require_explicit_agent_outputs=True,
+            require_explicit_execution_contract=True,
+        )
+        if gaps:
+            raise PlanContractError(gaps)
+        required_step_errors = _required_plan_step_errors(task, plan)
+        if required_step_errors:
+            raise PlannerError("required plan steps were not satisfied: " + "; ".join(required_step_errors))
+        return plan
 
     for turn in range(MAX_PLANNER_TURNS):
         try:
@@ -1046,8 +1335,15 @@ async def _generate_plan(task: Task, ctx: _Context) -> Plan:
         except Exception as exc:
             logger.warning("Planner LLM call failed on turn %d: %s", turn, exc)
             if turn == 0:
-                logger.warning("Planner: LLM unavailable, using fallback stub")
-                return _fallback_plan(task, ctx)
+                if _planner_fallback_stub_enabled():
+                    logger.warning(
+                        "Planner: LLM unavailable, using fallback stub (%s is set)",
+                        PLANNER_FALLBACK_STUB_ENV,
+                    )
+                    return _fallback_plan(task, ctx)
+                # A provider outage is transient: let the Celery task retry
+                # with backoff rather than persisting a placeholder plan.
+                raise PlannerError(f"Planner LLM unavailable: {exc}") from exc
             break
 
         # Handle tool calls
@@ -1055,26 +1351,40 @@ async def _generate_plan(task: Task, ctx: _Context) -> Plan:
             messages.append(runtime_planner_assistant_message(response))
             for tc in response.tool_calls:
                 tool_name = tc.get("name") or (tc.get("function") or {}).get("name", "")
-                raw_args = tc.get("arguments") or (tc.get("function") or {}).get("arguments", "{}")
-                try:
-                    args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
+                from packages.core.ai.runtime.tool_error_contract import model_tool_error_result, TOOL_ERROR_MAX_CHARS
+                from packages.core.ai.runtime.tool_input_validation import runtime_tool_input_validation_result
 
-                result = runtime_execute_planner_tool_call(
+                raw_args = tc["arguments"] if "arguments" in tc else (tc.get("function") or {}).get("arguments", {})
+                if isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except json.JSONDecodeError:
+                        args = {"_raw": raw_args}
+                else:
+                    args = raw_args
+                # Validate the argument envelope without guessing missing data.
+                # Nested Plan validation remains with parse_candidate, which
+                # also reads historical JSON-string Plan payloads.
+                input_error = runtime_tool_input_validation_result(
+                    tool_name=tool_name, arguments=args, tool_schema={"type": "object"},
+                )
+
+                result = input_error if input_error is not None else runtime_execute_planner_tool_call(
                     tool_name,
                     args,
                     context=ctx,
-                    parse_plan=_parse_plan,
-                    enforce_plan=lambda plan: _enforce_allowlists(plan, ctx),
+                    task=task,
+                    parse_plan=parse_candidate,
                 )
 
                 # Check if submit_plan returned a valid plan
                 if tool_name == "submit_plan" and isinstance(result, dict) and result.get("_plan"):
-                    submitted_plan = _normalize_plan_for_task(task, result["_plan"])
+                    submitted_plan = result["_plan"]
                     result_text = result.get("message", "Plan accepted.")
                 else:
-                    result_text = json.dumps(result, ensure_ascii=False, default=str) if isinstance(result, dict) else str(result)
+                    result_text = model_tool_error_result(tool_name, result, max_chars=TOOL_ERROR_MAX_CHARS)
+                    if result_text is None:
+                        result_text = json.dumps(result, ensure_ascii=False, default=str) if isinstance(result, dict) else str(result)
 
                 messages.append(runtime_planner_tool_message(
                     result_text,
@@ -1087,13 +1397,19 @@ async def _generate_plan(task: Task, ctx: _Context) -> Plan:
 
         # No tool calls — try to parse as direct plan JSON (fallback for simple tasks)
         if response.content:
-            plan = _parse_plan(response.content)
-            if plan:
-                return _normalize_plan_for_task(task, plan)
-            # Ask to use submit_plan tool
+            try:
+                return parse_candidate(response.content)
+            except (ValidationError, ValueError, PlanContractError, PlannerError, CapabilityError) as exc:
+                from packages.core.ai.runtime.tool_error_contract import model_tool_error_result, TOOL_ERROR_MAX_CHARS
+
+                feedback = model_tool_error_result("submit_plan", runtime_planner_validation_feedback(
+                    exc, _strip_code_fence(response.content),
+                ), max_chars=TOOL_ERROR_MAX_CHARS)
+            # Keep the rejected candidate and its exact diagnostic together so
+            # the next model turn can repair it within this bounded loop.
             messages.append(runtime_planner_assistant_message(response))
             messages.append(runtime_planner_user_message(
-                "Please use the submit_plan tool to submit your plan as valid JSON."
+                feedback + "\nPlease correct the plan and submit it with submit_plan."
             ))
             continue
 
@@ -1125,31 +1441,332 @@ _EXPLICIT_SAVED_ARTIFACT_TERMS = (
 
 def _normalize_plan_for_task(task: Task, plan: Plan) -> Plan:
     """Normalize planner overreach before materializing executable steps."""
+    plan = _normalize_required_skill_steps(task, plan)
+    plan = _normalize_goal_scoring_plan(task, plan)
     plan = _normalize_internal_agent_high_risk_steps(plan)
     plan = _normalize_planner_hard_approval_steps(plan)
-    if not _task_requests_text_report_only(task):
-        return plan
+    if _task_requests_text_report_only(task):
+        depended_on = {dep for step in plan.steps for dep in step.depends_on}
+        removable_keys = {
+            step.key
+            for step in plan.steps
+            if step.key not in depended_on
+            and _is_unrequested_text_report_file_write_step(step)
+        }
+        if removable_keys and len(removable_keys) < len(plan.steps):
+            metadata = plan.metadata.model_dump()
+            contract = metadata.get("acceptance_contract")
+            if isinstance(contract, dict):
+                for criterion in contract.get("criteria") or []:
+                    if isinstance(criterion, dict):
+                        criterion["evidence_step_keys"] = [
+                            key for key in criterion.get("evidence_step_keys") or []
+                            if key not in removable_keys
+                        ]
+                if any(
+                    not criterion.get("evidence_step_keys")
+                    for criterion in contract.get("criteria") or []
+                    if isinstance(criterion, dict)
+                ):
+                    metadata["acceptance_contract"] = None
+            plan = Plan.model_validate({
+                "steps": [
+                    step.model_dump()
+                    for step in plan.steps
+                    if step.key not in removable_keys
+                ],
+                "metadata": metadata,
+            })
+            try:
+                plan.metadata.normalized_removed_steps = sorted(removable_keys)
+                plan.metadata.normalization_reason = "unrequested_text_report_file_write"
+            except Exception:
+                pass
 
-    depended_on = {dep for step in plan.steps for dep in step.depends_on}
-    removable_keys = {
-        step.key
-        for step in plan.steps
-        if step.key not in depended_on
-        and _is_unrequested_text_report_file_write_step(step)
-    }
-    if not removable_keys or len(removable_keys) >= len(plan.steps):
-        return plan
+    plan = _normalize_planner_acceptance_contract(plan, task)
+    _enforce_planner_acceptance_contract(plan, task)
+    return plan
 
-    normalized = Plan(
-        steps=[step for step in plan.steps if step.key not in removable_keys],
-        metadata=plan.metadata,
+
+def _is_goal_scoring_task(task: Task) -> bool:
+    """True for Strategist-injected Goal measurement persistence."""
+    details = getattr(task, "details", None) or {}
+    if not isinstance(details, dict):
+        return False
+    return str(details.get("strategist_task_key") or "").strip() == "score_goals"
+
+
+def _build_validated_goal_scoring_plan(task: Task, ctx: _Context) -> Plan:
+    """Build the persist-only score_goals plan without an LLM candidate."""
+    owner_service_key = str(getattr(task, "owner_service_key", "") or "").strip()
+    prompt = str(getattr(task, "description", "") or "").strip()
+    if not owner_service_key or not prompt:
+        raise PlannerError("score_goals requires owner_service_key and description")
+    seed = Plan(
+        steps=[
+            PlanStep(
+                key="goal_measurements",
+                kind="subagent",
+                service_key=owner_service_key,
+                output_shape="TextResult",
+                execution_contract={"delivery": "inline", "effects": "authorized"},
+                params={"prompt": prompt},
+                description="Persist each Goal current_value via update_goal_value.",
+                risk_level="low",
+                requires_approval=False,
+            )
+        ]
     )
-    try:
-        normalized.metadata.normalized_removed_steps = sorted(removable_keys)
-        normalized.metadata.normalization_reason = "unrequested_text_report_file_write"
-    except Exception:
-        pass
+    plan = _normalize_goal_scoring_plan(task, seed)
+    plan = _apply_replan_approval_constraints(task, plan)
+    plan = bind_task_output_contract(plan, getattr(task, "expected_output", None))
+    _enforce_allowlists(plan, ctx)
+    gaps = plan_contract_gaps(
+        plan.topo_order(),
+        task_expected_output=getattr(task, "expected_output", None),
+        require_explicit_agent_outputs=True,
+        require_explicit_execution_contract=True,
+    )
+    if gaps:
+        raise PlanContractError(gaps)
+    required_step_errors = _required_plan_step_errors(task, plan)
+    if required_step_errors:
+        raise PlannerError(
+            "required plan steps were not satisfied: " + "; ".join(required_step_errors)
+        )
+    return plan
+
+
+def _normalize_goal_scoring_plan(task: Task, plan: Plan) -> Plan:
+    """Keep score_goals as one persist step; inventory/skill plans never write Goal rows."""
+    if not _is_goal_scoring_task(task):
+        return plan
+    owner_service_key = str(getattr(task, "owner_service_key", "") or "").strip()
+    prompt = str(getattr(task, "description", "") or "").strip()
+    if not owner_service_key or not prompt:
+        return plan
+
+    current = list(plan.steps)
+    current_prompt = str((current[0].params or {}).get("prompt") or "").strip() if current else ""
+    already_ok = (
+        len(current) == 1
+        and current[0].kind in {"llm", "subagent"}
+        and str(current[0].service_key or "").strip() == owner_service_key
+        and not (current[0].params or {}).get("skill_refs")
+        and current_prompt == prompt
+        and current[0].output_shape == "TextResult"
+        and current[0].execution_contract is not None
+        and current[0].execution_contract.model_dump(mode="json") == {
+            "delivery": "inline", "effects": "authorized",
+        }
+    )
+    if already_ok:
+        return plan
+
+    step = PlanStep(
+        key="goal_measurements",
+        kind="subagent",
+        service_key=owner_service_key,
+        output_shape="TextResult",
+        execution_contract={"delivery": "inline", "effects": "authorized"},
+        params={"prompt": prompt},
+        description="Persist each Goal current_value via update_goal_value.",
+        risk_level="low",
+        requires_approval=False,
+    )
+    metadata = plan.metadata.model_dump()
+    metadata["acceptance_contract"] = None
+    metadata["normalization_reason"] = "goal_scoring_persist_only"
+    metadata["normalized_removed_steps"] = [item.key for item in current]
+    return Plan(steps=[step], metadata=metadata)
+
+
+def _normalize_required_skill_steps(task: Task, plan: Plan) -> Plan:
+    """Bind required owner-service Skills to executable subagent steps."""
+    if _is_goal_scoring_task(task):
+        return plan
+    required_skills = [
+        str(value).strip()
+        for value in (getattr(task, "required_skills", None) or [])
+        if str(value or "").strip()
+    ]
+    owner_service_key = str(
+        getattr(task, "owner_service_key", "") or ""
+    ).strip()
+    if not required_skills or not owner_service_key:
+        return plan
+
+    file_producer_keys = {
+        step.key for step in plan.steps
+        if step.service_key == owner_service_key
+        and step.kind in {"llm", "subagent"}
+        and "files" in (step.expects or [])
+    }
+    file_only = bool(file_producer_keys) and any(
+        item.get("kind") == "file" for item in _task_acceptance_deliverables(task)
+    )
+    changed: list[str] = []
+    steps: list[PlanStep] = []
+    for step in plan.steps:
+        if (
+            step.service_key == owner_service_key
+            and step.kind in {"llm", "subagent"}
+        ):
+            params = deepcopy(step.params)
+            if file_only and step.key not in file_producer_keys:
+                remaining = [
+                    ref for ref in (params.get("skill_refs") or [])
+                    if ref not in required_skills
+                ]
+                if remaining:
+                    params["skill_refs"] = remaining
+                else:
+                    params.pop("skill_refs", None)
+                steps.append(step.model_copy(update={"params": params}))
+                continue
+            params["skill_refs"] = list(dict.fromkeys([
+                *list(params.get("skill_refs") or []),
+                *required_skills,
+            ]))
+            steps.append(step.model_copy(update={
+                "kind": "subagent",
+                "params": params,
+            }))
+            changed.append(step.key)
+        else:
+            steps.append(step)
+    if not changed:
+        return plan
+    normalized = Plan(steps=steps, metadata=plan.metadata)
+    normalized.metadata.normalized_required_skill_steps = changed
     return normalized
+
+
+def _task_acceptance_deliverables(task: Task) -> list[dict[str, Any]]:
+    expected_output = getattr(task, "expected_output", None)
+    if not isinstance(expected_output, dict):
+        return []
+    return [
+        item for item in (expected_output.get("deliverables") or [])
+        if isinstance(item, dict) and str(item.get("name") or "").strip()
+    ]
+
+
+def _acceptance_evidence_step_key(
+    deliverable_name: str,
+    steps: list[PlanStep],
+) -> str:
+    """Choose the narrowest step whose authored intent names a deliverable."""
+    needle = deliverable_name.strip().lower().replace("-", "_").replace(" ", "_")
+    for step in reversed(steps):
+        searchable = " ".join((
+            step.key,
+            str(step.description or ""),
+            str(step.params.get("prompt") or ""),
+        )).lower().replace("-", "_").replace(" ", "_")
+        if needle and needle in searchable:
+            return step.key
+    return steps[-1].key
+
+
+def _fallback_acceptance_contract(task: Task, plan: Plan) -> dict[str, Any] | None:
+    deliverables = _task_acceptance_deliverables(task)
+    if not deliverables:
+        return None
+    criteria = []
+    used_keys: set[str] = set()
+    for index, deliverable in enumerate(deliverables, 1):
+        name = str(deliverable["name"]).strip()
+        base_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or f"deliverable_{index}"
+        key = f"{base_key}_accepted"
+        if key in used_keys:
+            key = f"{key}_{index}"
+        used_keys.add(key)
+        criteria.append({
+            "key": key,
+            "deliverable_name": name,
+            "description": str(
+                deliverable.get("acceptance")
+                or f"The {name} deliverable is produced."
+            ).strip(),
+            "evidence_step_keys": [
+                _acceptance_evidence_step_key(name, plan.steps)
+            ],
+        })
+    return {
+        "expected_result": str(
+            getattr(task, "description", None)
+            or getattr(task, "title", None)
+            or "The task deliverables are produced."
+        ).strip(),
+        "criteria": criteria,
+    }
+
+
+def _collapse_duplicate_acceptance_criteria(
+    criteria: list[Any],
+) -> list[Any]:
+    """Keep the first criterion for each named deliverable."""
+    seen: set[str] = set()
+    collapsed: list[Any] = []
+    for item in criteria:
+        if not isinstance(item, dict):
+            collapsed.append(item)
+            continue
+        name = str(item.get("deliverable_name") or "").strip()
+        if name:
+            if name in seen:
+                continue
+            seen.add(name)
+        collapsed.append(item)
+    return collapsed
+
+
+def _normalize_planner_acceptance_contract(task_plan: Plan, task: Task) -> Plan:
+    contract = task_plan.metadata.acceptance_contract
+    contract_payload = (
+        contract.model_dump() if contract is not None
+        else _fallback_acceptance_contract(task, task_plan)
+    )
+    if contract_payload is None:
+        return task_plan
+    raw_criteria = contract_payload.get("criteria")
+    if isinstance(raw_criteria, list):
+        contract_payload["criteria"] = _collapse_duplicate_acceptance_criteria(
+            raw_criteria
+        )
+    expected_output = getattr(task, "expected_output", None)
+    contract_payload["task_expected_output"] = (
+        deepcopy(expected_output) if isinstance(expected_output, dict) else None
+    )
+    payload = task_plan.model_dump()
+    payload.setdefault("metadata", {})["acceptance_contract"] = contract_payload
+    return Plan.model_validate(payload)
+
+
+def _enforce_planner_acceptance_contract(plan: Plan, task: Task) -> None:
+    """Require each named Task deliverable to have one acceptance criterion."""
+    deliverable_names = [
+        str(item["name"]).strip() for item in _task_acceptance_deliverables(task)
+    ]
+    if not deliverable_names:
+        return
+    contract = plan.metadata.acceptance_contract
+    if contract is None:
+        raise PlannerError("plan is missing the required acceptance contract")
+    criterion_names = [criterion.deliverable_name for criterion in contract.criteria]
+    missing = [name for name in deliverable_names if criterion_names.count(name) == 0]
+    duplicates = [name for name in deliverable_names if criterion_names.count(name) > 1]
+    if missing:
+        raise PlannerError(
+            "acceptance contract is missing required criteria for: "
+            + ", ".join(missing)
+        )
+    if duplicates:
+        raise PlannerError(
+            "acceptance contract has duplicate criteria for: "
+            + ", ".join(duplicates)
+        )
 
 
 def _required_plan_step_errors(task: Task, plan: Plan) -> list[str]:
@@ -1378,6 +1995,7 @@ def _ctx_provider_action_specs_for_step(
 
 
 def _enforce_allowlists(plan: Plan, ctx: _Context) -> None:
+    _enforce_capability_assignments(plan, ctx)
     for s in plan.steps:
         if s.service_key and s.service_key not in ctx.allowed_service_keys:
             raise CapabilityError(
@@ -1481,10 +2099,24 @@ def _fallback_plan(task: Task, ctx: _Context) -> Plan:
 
     Used when AIEngine.chat raises (no API key, network down). Lets
     Demo A v0 smoke tests run end-to-end without hitting the LLM.
+    score_goals still uses the persist-only plan.
     """
-    primary_service = task.owner_service_key or next(
-        iter(ctx.allowed_service_keys), None
-    )
+    if _is_goal_scoring_task(task):
+        return _build_validated_goal_scoring_plan(task, ctx)
+    if getattr(task, "workspace_id", None):
+        coordinator = getattr(ctx, "coordinator", None)
+        if coordinator is None:
+            raise PlannerError(
+                "Workspace fallback planning requires a factory-owned "
+                "coordinator selection"
+            )
+        primary_service = coordinator.root.service_key
+    else:
+        # Standalone entity Tasks retain the legacy smoke-test fallback. They
+        # do not have a Workspace coordinator selection by definition.
+        primary_service = task.owner_service_key or next(
+            iter(ctx.allowed_service_keys), None
+        )
     if not primary_service:
         # No services at all — emit a single human step so the user
         # sees something instead of nothing.
@@ -1506,6 +2138,7 @@ def _fallback_plan(task: Task, ctx: _Context) -> Plan:
                 kind="llm",
                 service_key=primary_service,
                 output_shape="TextResult",
+                execution_contract={"delivery": "inline", "effects": "read_only"},
                 params={"prompt": f"Think out loud about how to do this task:\n\n{task_prompt}"},
                 description="Reason about the task.",
             ),
@@ -1514,6 +2147,7 @@ def _fallback_plan(task: Task, ctx: _Context) -> Plan:
                 kind="llm",
                 service_key=primary_service,
                 output_shape="TextResult",
+                execution_contract={"delivery": "inline", "effects": "read_only"},
                 params={
                     "prompt": "Summarise the conclusion and any runtime requirements used in 3 bullet points: ${{ steps.think.result.text }}"
                 },

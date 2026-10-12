@@ -20,11 +20,6 @@ from packages.core.blueprints.simulation import resolve_simulation_experience
 FROZEN_AT = "2026-08-02"
 CONFIG_DIR = Path(__file__).with_name("configs") / "solo_company"
 CONFIG_ORDER = (
-    "solo-video-account-studio-v1.json",
-    "solo-creator-fundraising-room-v1.json",
-    "solo-creator-partnership-studio-v1.json",
-    "solo-productized-service-os-v1.json",
-    "solo-digital-product-store-v1.json",
 )
 
 

@@ -3,7 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager, closing, suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import pytest
@@ -21,11 +21,274 @@ from apps.api.routers.ws import (
 )
 from packages.core import database as db_module
 from packages.core.models.staff import Staff
+from packages.core.models.chat_room import ChatRoomMember
+from packages.core.models.base import generate_ulid
 from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Workspace
 from packages.core.services.auth_service import create_access_token, decode_token
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.asyncio
+async def test_chat_room_ws_relay_sends_id_only_to_current_connected_scopes(monkeypatch):
+    class Result:
+        def all(self):
+            # Already filtered by the room/member/account/Entity query.
+            now = datetime.now(UTC)
+            return [("owner", 3, "entity-a", now), ("guest", 5, "entity-b", now)]
+
+    class FakeDb:
+        async def execute(self, _query):
+            return Result()
+
+    @asynccontextmanager
+    async def fake_session():
+        yield FakeDb()
+
+    deliveries: list[tuple] = []
+
+    async def capture(entity_id, event, data, *, user_ids, token_versions):
+        deliveries.append((entity_id, event, data, user_ids, token_versions))
+
+    monkeypatch.setattr(ws_router.db_module, "async_session", fake_session)
+    monkeypatch.setattr(ws_router.manager, "_connections", {
+        "owner": [object()], "guest": [object()], "outsider": [object()],
+    })
+    monkeypatch.setattr(
+        ws_router.manager, "connected_entity_ids_for_user",
+        lambda user_id: {"owner": {"entity-a"}, "guest": {"entity-b"}, "outsider": {"entity-c"}}[user_id],
+    )
+    monkeypatch.setattr(ws_router.manager, "broadcast_to_entity", capture)
+    await ws_router._relay_chat_room_target({
+        "room_id": "room-1", "event": "chat_room_changed",
+        "data": {"content": "must not be relayed"},
+    })
+    assert deliveries == [
+        ("entity-a", "chat_room_changed", {"room_id": "room-1", "kind": "changed"}, {"owner"}, {"owner": 3}),
+        ("entity-b", "chat_room_changed", {"room_id": "room-1", "kind": "changed"}, {"guest"}, {"guest": 5}),
+    ]
+    deliveries.clear()
+    await ws_router._relay_chat_room_target({
+        "room_id": "room-1", "event": "chat_room_changed",
+        "data": {"kind": "retracted", "content": "must not be relayed"},
+    })
+    assert [data for _, _, data, _, _ in deliveries] == [
+        {"room_id": "room-1", "kind": "retracted"},
+        {"room_id": "room-1", "kind": "retracted"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_room_ws_message_respects_each_members_visibility_floor(monkeypatch):
+    now = datetime.now(UTC)
+
+    class Result:
+        def all(self):
+            return [
+                ("early", 1, "entity-a", now - timedelta(minutes=2)),
+                ("late", 2, "entity-b", now - timedelta(seconds=10)),
+                ("rejoined", 3, "entity-c", now + timedelta(seconds=1)),
+            ]
+
+    class FakeDb:
+        async def execute(self, _query):
+            return Result()
+
+    @asynccontextmanager
+    async def fake_session():
+        yield FakeDb()
+
+    async def snapshot(_db, _room_id, _message_id):
+        return ({
+            "id": "message-1", "room_id": "room-1", "created_at": now.isoformat(),
+            "sender_user_id": "early", "content": "hello", "attachments": [],
+        }, ("previous-1", now - timedelta(minutes=1)), now - timedelta(minutes=1), {
+            "id": "previous-1", "sender_name": "early", "content": "private before join",
+        })
+
+    deliveries = []
+
+    async def capture(entity_id, event, data, *, user_ids, token_versions):
+        deliveries.append((entity_id, event, data, user_ids))
+
+    monkeypatch.setattr(ws_router.db_module, "async_session", fake_session)
+    monkeypatch.setattr(ws_router, "_room_message_snapshot", snapshot)
+    monkeypatch.setattr(ws_router.manager, "_connections", {
+        user_id: [object()] for user_id in ("early", "late", "rejoined", "outsider")
+    })
+    monkeypatch.setattr(ws_router.manager, "connected_entity_ids_for_user", lambda user_id: {
+        "early": {"entity-a"}, "late": {"entity-b"},
+        "rejoined": {"entity-c"}, "outsider": {"entity-d"},
+    }[user_id])
+    monkeypatch.setattr(ws_router.manager, "broadcast_to_entity", capture)
+    await ws_router._relay_chat_room_target({
+        "room_id": "room-1", "event": "chat_room_changed",
+        "data": {"kind": "message", "message_id": "message-1"},
+    })
+    assert {entity_id for entity_id, _, _, _ in deliveries} == {"entity-a", "entity-b"}
+    early = next(data for entity_id, _, data, _ in deliveries if entity_id == "entity-a")
+    late = next(data for entity_id, _, data, _ in deliveries if entity_id == "entity-b")
+    assert early["previous_message_id"] == "previous-1"
+    assert early["message"]["reply_to"]["content"] == "private before join"
+    assert late["previous_message_id"] is None
+    assert late["message"]["reply_to"] is None
+
+
+@pytest.mark.asyncio
+async def test_chat_room_ws_reads_one_snapshot_for_hundred_recipients(monkeypatch):
+    now = datetime.now(UTC)
+    users = [f"member-{index}" for index in range(100)]
+
+    class Result:
+        def all(self):
+            return [(user_id, 0, "entity-a", now - timedelta(seconds=1)) for user_id in users]
+
+    class FakeDb:
+        async def execute(self, _query):
+            return Result()
+
+    @asynccontextmanager
+    async def fake_session():
+        yield FakeDb()
+
+    snapshots = []
+
+    async def snapshot(_db, room_id, message_id):
+        snapshots.append((room_id, message_id))
+        return ({
+            "id": message_id, "room_id": room_id, "created_at": now.isoformat(),
+            "sender_user_id": users[0], "content": "one committed message", "attachments": [],
+        }, None, None, None)
+
+    deliveries = []
+
+    async def capture(entity_id, event, data, *, user_ids, token_versions):
+        deliveries.append((entity_id, event, data, user_ids))
+
+    monkeypatch.setattr(ws_router.db_module, "async_session", fake_session)
+    monkeypatch.setattr(ws_router, "_room_message_snapshot", snapshot)
+    monkeypatch.setattr(ws_router.manager, "_connections", {user_id: [object()] for user_id in users})
+    monkeypatch.setattr(ws_router.manager, "connected_entity_ids_for_user", lambda _user_id: {"entity-a"})
+    monkeypatch.setattr(ws_router.manager, "broadcast_to_entity", capture)
+    await ws_router._relay_chat_room_target({
+        "room_id": "room-1", "event": "chat_room_changed",
+        "data": {"kind": "message", "message_id": "message-1"},
+    })
+    assert snapshots == [("room-1", "message-1")]
+    assert len(deliveries) == 1
+    assert deliveries[0][3] == set(users)
+
+
+@pytest.mark.asyncio
+async def test_chat_room_ws_relay_is_cross_entity_and_excludes_removed_members(
+    client, db_session, monkeypatch,
+):
+    from tests.test_chat_rooms import _register
+
+    owner_headers, owner = await _register(client, "ws_room_owner")
+    _, guest = await _register(client, "ws_room_guest")
+    _, outsider = await _register(client, "ws_room_outsider")
+    created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
+        "kind": "group", "title": "WS scope", "owner_scope": "personal",
+        "recipient_email": guest["email"],
+    })
+    assert created.status_code == 201, created.text
+    room_id = created.json()["id"]
+    guest_member = ChatRoomMember(
+        id=generate_ulid(), room_id=room_id, user_id=guest["id"],
+        role="member", status="active", visible_from=datetime.now(UTC),
+    )
+    db_session.add(guest_member)
+    await db_session.commit()
+
+    entity_by_user = {
+        user["id"]: user["entity_id"] for user in (owner, guest, outsider)
+    }
+    deliveries: list[tuple[str, set[str], dict]] = []
+
+    monkeypatch.setattr(ws_router.manager, "_connections", {
+        user_id: [object()] for user_id in entity_by_user
+    })
+    monkeypatch.setattr(
+        ws_router.manager, "connected_entity_ids_for_user",
+        lambda user_id: {entity_by_user[user_id]},
+    )
+
+    async def capture(entity_id, event, data, *, user_ids, token_versions):
+        assert event == "chat_room_changed"
+        assert data == {"room_id": room_id, "kind": "changed"}
+        deliveries.append((entity_id, user_ids, token_versions))
+
+    monkeypatch.setattr(ws_router.manager, "broadcast_to_entity", capture)
+    payload = {"target": "chat_room", "room_id": room_id, "event": "chat_room_changed"}
+    await ws_router._relay_chat_room_target(payload)
+    assert {entity_id: users for entity_id, users, _ in deliveries} == {
+        owner["entity_id"]: {owner["id"]},
+        guest["entity_id"]: {guest["id"]},
+    }
+
+    guest_member.status = "left"
+    await db_session.commit()
+    deliveries.clear()
+    await ws_router._relay_chat_room_target(payload)
+    assert deliveries == [(owner["entity_id"], {owner["id"]}, {owner["id"]: 0})]
+
+
+@pytest.mark.asyncio
+async def test_chat_room_ws_pushes_committed_message_only_to_members_who_can_see_it(
+    client, db_session, monkeypatch,
+):
+    from tests.test_chat_rooms import _register
+
+    owner_headers, owner = await _register(client, "ws_message_owner")
+    _, guest = await _register(client, "ws_message_guest")
+    _, outsider = await _register(client, "ws_message_outsider")
+    created = await client.post("/api/v1/chat/rooms", headers=owner_headers, json={
+        "kind": "group", "title": "WS message", "owner_scope": "personal",
+        "recipient_email": guest["email"],
+    })
+    assert created.status_code == 201, created.text
+    room_id = created.json()["id"]
+    guest_member = ChatRoomMember(
+        id=generate_ulid(), room_id=room_id, user_id=guest["id"],
+        role="member", status="active", visible_from=datetime.now(UTC) - timedelta(seconds=1),
+    )
+    db_session.add(guest_member)
+    await db_session.commit()
+    posted = await client.post(f"/api/v1/chat/rooms/{room_id}/messages", headers=owner_headers, json={
+        "content": "committed body", "mentioned_user_ids": [], "mentioned_agent_binding_ids": [],
+    })
+    assert posted.status_code == 201, posted.text
+    message_id = posted.json()["id"]
+
+    entities = {user["id"]: user["entity_id"] for user in (owner, guest, outsider)}
+    monkeypatch.setattr(ws_router.manager, "_connections", {user_id: [object()] for user_id in entities})
+    monkeypatch.setattr(ws_router.manager, "connected_entity_ids_for_user", lambda user_id: {entities[user_id]})
+    deliveries = []
+
+    async def capture(entity_id, event, data, *, user_ids, token_versions):
+        deliveries.append((entity_id, event, data, user_ids))
+
+    monkeypatch.setattr(ws_router.manager, "broadcast_to_entity", capture)
+    signal = {"room_id": room_id, "event": "chat_room_changed", "data": {
+        "kind": "message", "message_id": message_id, "content": "ignored Redis body",
+    }}
+    await ws_router._relay_chat_room_target(signal)
+    assert {entity_id: users for entity_id, _, _, users in deliveries} == {
+        owner["entity_id"]: {owner["id"]}, guest["entity_id"]: {guest["id"]},
+    }
+    assert all(event == "chat_room_changed" for _, event, _, _ in deliveries)
+    assert all(data["kind"] == "message" and data["message"]["content"] == "committed body"
+               and data["message"]["id"] == message_id for _, _, data, _ in deliveries)
+
+    guest_member.visible_from = datetime.now(UTC) + timedelta(seconds=1)
+    await db_session.commit()
+    deliveries.clear()
+    await ws_router._relay_chat_room_target(signal)
+    assert [(entity_id, users) for entity_id, _, _, users in deliveries] == [
+        (owner["entity_id"], {owner["id"]}),
+    ]
 
 
 def _make_app_and_client():
@@ -242,6 +505,39 @@ def test_ws_closes_connection_when_current_identity_is_revoked(monkeypatch):
     assert exc_info.value.code == 4003
 
 
+@pytest.mark.asyncio
+async def test_entity_recipient_lookup_propagates_transient_database_failure(monkeypatch):
+    from packages.core.database_runtime import DatabaseBusyError
+
+    @asynccontextmanager
+    async def busy_session():
+        raise DatabaseBusyError("Database admission queue is full")
+        yield
+
+    monkeypatch.setattr(ws_router.db_module, "async_session", busy_session)
+    with pytest.raises(DatabaseBusyError):
+        await _entity_broadcast_recipients(entity_id="entity", candidate_user_ids={"user"})
+
+
+def test_ws_busy_identity_check_is_retryable_not_revoked(monkeypatch):
+    from packages.core.database_runtime import DatabaseBusyError
+
+    _stub_active_ws_identity(monkeypatch)
+
+    async def busy_recipients(**_kwargs):
+        raise DatabaseBusyError("Database admission queue is full")
+
+    monkeypatch.setattr(ws_router, "_entity_broadcast_recipients", busy_recipients)
+    token = create_access_token(user_id="user-busy", entity_id="ent-1", role="owner")
+    with closing(_make_app_and_client()) as client:
+        with client.websocket_connect(f"/ws?token={token}") as ws:
+            assert ws.receive_json()["event"] == "connected"
+            ws.send_json({"type": "ping"})
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+    assert exc_info.value.code == 1013
+
+
 def test_ws_ping_pong(monkeypatch):
     """Client sending ping should receive pong."""
     _stub_active_ws_identity(monkeypatch)
@@ -362,6 +658,184 @@ async def test_connection_manager_scopes_sessions_and_tokens_by_entity():
     assert manager.pop_session_id("entity-1", "user-1") == "session-1"
     assert manager.get_session_id("entity-2", "user-1") == "session-2"
     assert manager.disconnect("user-1", second_entity)
+
+
+@pytest.mark.asyncio
+async def test_slow_socket_does_not_block_healthy_group_members():
+    manager = ConnectionManager(send_concurrency=4, send_timeout=0.05)
+    healthy_delivered = asyncio.Event()
+    stalled = asyncio.Event()
+    delivered: list[int] = []
+
+    class Socket:
+        closed = False
+
+        def __init__(self, index):
+            self.index = index
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, _message):
+            if self.index == 0:
+                stalled.set()
+                await asyncio.Event().wait()
+            delivered.append(self.index)
+            if len(delivered) == 99:
+                healthy_delivered.set()
+
+        async def close(self, **_kwargs):
+            self.closed = True
+            await asyncio.Event().wait()  # close must also have a deadline
+
+    sockets = [Socket(index) for index in range(100)]
+    for index, socket in enumerate(sockets):
+        await manager.connect(f"user-{index}", "entity", 0, socket)
+    broadcast = asyncio.create_task(manager.broadcast_to_entity("entity", "chat_room_changed", {}))
+    try:
+        await asyncio.wait_for(stalled.wait(), 1)
+        await asyncio.wait_for(healthy_delivered.wait(), 1)
+        await asyncio.wait_for(broadcast, 1)
+        assert len(delivered) == 99 and sockets[0].closed
+        assert manager._connection_entities[sockets[0]] == "entity"
+    finally:
+        broadcast.cancel()
+        await asyncio.gather(broadcast, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entity_count", [1, 10])
+async def test_thousand_socket_fanout_bounds_workers_sends_and_cancellation(entity_count):
+    manager = ConnectionManager(send_concurrency=8, send_timeout=1)
+    active = peak = 0
+    pause = None
+
+    class Socket:
+        def __init__(self):
+            self.messages = []
+            self.sending = False
+
+        async def accept(self):
+            pass
+
+        async def send_text(self, message):
+            nonlocal active, peak
+            assert not self.sending
+            self.sending = True
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0)
+                if pause is not None:
+                    await pause.wait()
+                self.messages.append(json.loads(message))
+            finally:
+                active -= 1
+                self.sending = False
+
+    sockets = [Socket() for _ in range(1000)]
+    entities = [f"entity-{index}" for index in range(entity_count)]
+    for index, socket in enumerate(sockets):
+        await manager.connect(f"user-{index}", entities[index % entity_count], 0, socket)
+
+    async def broadcast_all(event, data):
+        await asyncio.gather(*[
+            manager.broadcast_to_entity(entity, event, {**data, "entity": entity})
+            for entity in entities
+        ])
+
+    await asyncio.gather(*[
+        broadcast_all("chat_room_changed", {"sequence": sequence})
+        for sequence in range(3)
+    ])
+    assert peak <= 8 and active == 0
+    assert all(len(socket.messages) == 3 for socket in sockets)
+    assert all({message["data"]["sequence"] for message in socket.messages} == {0, 1, 2} for socket in sockets)
+    assert all(
+        all(message["data"]["entity"] == entities[index % entity_count] for message in socket.messages)
+        for index, socket in enumerate(sockets)
+    )
+
+    pause = asyncio.Event()
+    broadcast = asyncio.create_task(broadcast_all("paused", {}))
+    try:
+        async with asyncio.timeout(1):
+            while active == 0:
+                await asyncio.sleep(0)
+        broadcast.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await broadcast
+        assert active == 0
+        pause = None
+        await broadcast_all("recovered", {})
+        assert all(socket.messages[-1]["event"] == "recovered" for socket in sockets)
+    finally:
+        broadcast.cancel()
+        await asyncio.gather(broadcast, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_entity_connection_index_tracks_tabs_scopes_and_disconnects():
+    manager = ConnectionManager()
+
+    class Socket:
+        async def accept(self):
+            pass
+
+    first, second, other_scope, outsider = (Socket() for _ in range(4))
+    await manager.connect("user", "entity-a", 1, first)
+    await manager.connect("user", "entity-a", 1, second)
+    await manager.connect("user", "entity-b", 1, other_scope)
+    await manager.connect("outsider", "entity-c", 1, outsider)
+
+    class Connections(dict):
+        def items(self):
+            raise AssertionError("entity lookup must not scan platform connections")
+
+        def values(self):
+            raise AssertionError("connection count must not scan platform connections")
+
+    manager._connections = Connections(manager._connections)
+    assert manager.count == 4
+    audience = manager.connected_user_ids_for_entity("entity-a")
+    assert audience == {"user"}
+    audience.clear()  # a returned snapshot cannot mutate the live index
+    assert set(manager._entity_connection_snapshot("entity-a")) == {
+        ("user", first), ("user", second),
+    }
+    assert not manager.disconnect("user", first)
+    assert manager.connected_user_ids_for_entity("entity-a") == {"user"}
+    assert manager.disconnect("user", second)
+    assert manager.connected_user_ids_for_entity("entity-a") == set()
+    assert manager.connected_user_ids_for_entity("entity-b") == {"user"}
+    assert manager.disconnect("user", other_scope)
+    assert manager.disconnect("outsider", outsider)
+    assert manager.count == 0 and manager._entity_users == {}
+    manager.disconnect("outsider", outsider)  # repeated cleanup is harmless
+    assert manager.count == 0
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_websocket_delivery_deadline_must_be_finite_positive(timeout):
+    with pytest.raises(ValueError, match="positive limits"):
+        ConnectionManager(send_timeout=timeout)
+
+
+@pytest.mark.asyncio
+async def test_scoped_fanout_does_not_scan_unrelated_platform_connections():
+    manager = ConnectionManager()
+
+    class Connections(dict):
+        def items(self):
+            raise AssertionError("a scoped audience must not scan every connection")
+
+    socket = object()
+    manager._connections = Connections({"recipient": [socket]})
+    manager._connection_entities[socket] = "entity"
+    manager._connection_token_versions[socket] = 2
+    assert manager._entity_connection_snapshot(
+        "entity", user_ids={"recipient"}, token_versions={"recipient": 2},
+    ) == [("recipient", socket)]
 
 
 @pytest.mark.asyncio

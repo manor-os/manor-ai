@@ -1,0 +1,20 @@
+{
+  "id": "mcp_suno",
+  "name": "mcp_suno",
+  "type": "runtime_guidance",
+  "description": "Generate original songs, instrumentals, covers, and mashups through Suno, then inspect generation status and account usage.",
+  "category": "media-generation",
+  "output_format": "guidance",
+  "tags": ["suno", "music-generation", "audio", "ai-media", "runtime-guidance", "builtin", "mcp"],
+  "tools": [
+    "mcp__suno__generate_music",
+    "mcp__suno__get_generation",
+    "mcp__suno__create_cover",
+    "mcp__suno__create_mashup",
+    "mcp__suno__get_usage"
+  ],
+  "search": {
+    "terms": ["ai song", "ai music", "lyrics", "remix", "song", "track", "background music", "audio generation"],
+    "examples": ["generate original song about summer", "make cover of existing track", "mashup two songs with suno", "check suno credits remaining"]
+  }
+}

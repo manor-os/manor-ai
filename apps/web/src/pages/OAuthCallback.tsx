@@ -48,6 +48,8 @@ export default function OAuthCallback() {
     sessionStorage.removeItem("oauth_invitation_code");
     const savedTeamInvite = sessionStorage.getItem("oauth_team_invite") || undefined;
     sessionStorage.removeItem("oauth_team_invite");
+    const savedChatInvite = sessionStorage.getItem("oauth_chat_invite") || undefined;
+    sessionStorage.removeItem("oauth_chat_invite");
     publicChatTokenRef.current = sessionStorage.getItem("oauth_public_chat_token");
     rememberMeRef.current = sessionStorage.getItem("oauth_remember_me") === "1";
 
@@ -60,11 +62,13 @@ export default function OAuthCallback() {
         redirectUri,
         invitationCode: savedInvite,
         teamInviteToken: savedTeamInvite,
+        chatInviteToken: savedChatInvite,
         publicChatToken: publicChatTokenRef.current || undefined,
         rememberMe: rememberMeRef.current,
       })
       .then((res) => {
-        localStorage.setItem("manor_token", res.access_token);
+        localStorage.removeItem("manor_session_signed_out");
+      localStorage.setItem("manor_token", res.access_token);
         sessionStorage.removeItem("oauth_public_chat_token");
         sessionStorage.removeItem("oauth_remember_me");
         return checkAuth();
@@ -111,6 +115,7 @@ export default function OAuthCallback() {
         publicChatToken: publicChatTokenRef.current || undefined,
         rememberMe: rememberMeRef.current,
       });
+      localStorage.removeItem("manor_session_signed_out");
       localStorage.setItem("manor_token", res.access_token);
       sessionStorage.removeItem("oauth_public_chat_token");
       sessionStorage.removeItem("oauth_remember_me");

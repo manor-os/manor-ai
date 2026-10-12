@@ -1,0 +1,23 @@
+{
+  "id": "marketing-campaign",
+  "name": "marketing-campaign",
+  "display_name": "Marketing Campaign",
+  "type": "runtime_guidance",
+  "description": "Plan and produce marketing from natural-language requests for promotion, leads, reservations, orders, launches, content, ads, SEO or CRM (营销、推广、宣传、引流、获客). Select platform × industry × method and produce channel-native deliverables.",
+  "category": "marketing",
+  "output_format": "file",
+  "tags": ["marketing", "campaign", "promotion", "platform", "industry", "method", "营销", "推广", "引流", "获客", "runtime-guidance", "builtin"],
+  "bundle_roots": ["references"],
+  "invocation_policy": {
+    "mode": "required_before_answer",
+    "semantic_trigger": "the user requests broader marketing strategy, a multi-asset campaign, lead or reservation generation, ads, SEO, or CRM. For a single video from an open brief or approved script, including choosing its destination or adapting it to a platform, invoke video-production directly; it combines marketing-platform guidance as needed. Invoke marketing-campaign first only when the user also requests broader campaign planning or execution",
+    "result_authority": "primary_source"
+  },
+  "tools": ["read_file", "list_files", "list_skills", "invoke_skill", "generate_file", "generate_image", "manor", "search_tools"],
+  "max_rounds": 24,
+  "temperature": 0.2,
+  "search": {
+    "terms": ["promotion", "ad campaign", "go to market", "content plan", "social media plan", "brand awareness", "promote business", "online marketing"],
+    "examples": ["plan marketing campaign for new product", "multi platform promotion plan for launch", "build content calendar for campaign", "how to promote my business online"]
+  }
+}

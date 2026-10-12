@@ -1,4 +1,5 @@
 interface TextareaProps {
+  id?: string;
   label?: string;
   error?: string;
   value: string;
@@ -6,18 +7,21 @@ interface TextareaProps {
   placeholder?: string;
   rows?: number;
   disabled?: boolean;
+  required?: boolean;
   className?: string;
   onBlur?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
   onFocus?: (e: React.FocusEvent<HTMLTextAreaElement>) => void;
   onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   textareaRef?: React.Ref<HTMLTextAreaElement>;
   ariaLabel?: string;
+  ariaDescribedBy?: string;
   ariaControls?: string;
   ariaExpanded?: boolean;
   ariaAutocomplete?: "none" | "inline" | "list" | "both";
 }
 
 export default function Textarea({
+  id,
   label,
   error,
   value,
@@ -25,12 +29,14 @@ export default function Textarea({
   placeholder,
   rows = 4,
   disabled = false,
+  required = false,
   className = "",
   onBlur,
   onFocus,
   onKeyDown,
   textareaRef,
   ariaLabel,
+  ariaDescribedBy,
   ariaControls,
   ariaExpanded,
   ariaAutocomplete,
@@ -38,21 +44,24 @@ export default function Textarea({
   return (
     <div className={className}>
       {label && (
-        <label className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
+        <label htmlFor={id} className="block text-xs font-semibold text-stone-500 uppercase tracking-wide mb-1.5">
           {label}
         </label>
       )}
       <textarea
+        id={id}
         ref={textareaRef}
         value={value}
         onChange={onChange}
         placeholder={placeholder}
         rows={rows}
         disabled={disabled}
+        required={required}
         onBlur={onBlur}
         onFocus={onFocus}
         onKeyDown={onKeyDown}
         aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
         aria-controls={ariaControls}
         aria-expanded={ariaExpanded}
         aria-autocomplete={ariaAutocomplete}

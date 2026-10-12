@@ -1,9 +1,11 @@
+import ApprovalSettingsPanel from "../components/approvals/ApprovalSettingsPanel";
 import { useState, useRef, useEffect, useMemo } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../lib/api";
 import type { BookingLink, BookingTimeExclusion, CalendarConflictSource, CalendarConnectionOption, CalendarSettings, CalendarWorkingHourWindow, PeopleContext, PeopleContextActionResponse } from "../lib/types";
 import { useToastStore } from "../stores/toast";
+import { useDisplayPreferences } from "../stores/displayPreferences";
 import StatusBadge from "../components/ui/StatusBadge";
 import LoadingSpinner from "../components/ui/LoadingSpinner";
 import Modal from "../components/ui/Modal";
@@ -124,6 +126,8 @@ const AI_EDIT_DISPLAY_OPTIONS: AiEditDisplayOption[] = [
 export function AppearanceSection({ embedded = false }: { embedded?: boolean }) {
   const queryClient = useQueryClient();
   const toast = useToastStore();
+  const interfaceMode = useDisplayPreferences((state) => state.interfaceMode);
+  const setInterfaceMode = useDisplayPreferences((state) => state.setInterfaceMode);
   const [themePreference, setThemePreference] = useState<ThemePreference>(
     getStoredThemePreference,
   );
@@ -218,6 +222,32 @@ export function AppearanceSection({ embedded = false }: { embedded?: boolean }) 
       <div className="account-ai-edit-section">
         <div className="account-ai-edit-heading">
           <div className="account-appearance-icon" aria-hidden="true">
+            <IconPalette size={18} />
+          </div>
+          <div>
+            <h3>{t("page.account.interface_mode")}</h3>
+            <p>{t("page.account.interface_mode_saved_locally")}</p>
+          </div>
+        </div>
+        <Select
+          value={interfaceMode}
+          onChange={(mode) => setInterfaceMode(mode === "simple" ? "simple" : "professional")}
+          ariaLabel={t("page.account.interface_mode")}
+          options={[
+            { value: "simple", label: t("page.account.interface_mode_simple") },
+            { value: "professional", label: t("page.account.interface_mode_professional") },
+          ]}
+        />
+        <p className="text-xs text-stone-500" aria-live="polite">
+          {t(interfaceMode === "simple"
+            ? "page.account.interface_mode_simple_description"
+            : "page.account.interface_mode_professional_description")}
+        </p>
+      </div>
+
+      <div className="account-ai-edit-section">
+        <div className="account-ai-edit-heading">
+          <div className="account-appearance-icon" aria-hidden="true">
             <IconEdit size={18} />
           </div>
           <div>
@@ -304,13 +334,6 @@ const MODEL_ROLES: ModelRole[] = [
     desc: t("page.account.summaries_classification_automations_simple_jobs"),
     icon: "M3.75 13.5l10.5-11.25L12 10.5h8.25L9.75 21.75 12 13.5H3.75z",
     color: "#4f7d75",
-  },
-  {
-    key: "embedding",
-    label: t("page.account.embedding"),
-    desc: t("page.account.text_embeddings_for_knowledge_base_search_rag"),
-    icon: "M4.5 6.75A2.25 2.25 0 016.75 4.5h10.5a2.25 2.25 0 012.25 2.25v10.5a2.25 2.25 0 01-2.25 2.25H6.75a2.25 2.25 0 01-2.25-2.25V6.75zm4.5 2.25h6m-6 3h6m-6 3h3",
-    color: "#9079c2",
   },
   {
     key: "image",
@@ -1378,15 +1401,17 @@ export function AIModelSection({
   };
   const modelPrice: Record<
     string,
-    { in?: number; out?: number; unit?: "token" | "second" }
+    { in?: number; out?: number; unit?: "token" | "second" | "asset" }
   > = {
     // Keep in sync with OFFICIAL_TOKEN_PRICES in
     // packages/core/services/model_pricing.py — these drive the $–$$$$ badge.
     "anthropic/claude-sonnet-4.6": { in: 3.0, out: 15.0, unit: "token" },
+    "anthropic/claude-opus-5.5": { in: 4.0, out: 20.0, unit: "token" },
     "anthropic/claude-opus-5": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-opus-4.7": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-opus-4.6": { in: 5.0, out: 25.0, unit: "token" },
     "anthropic/claude-haiku-4.5": { in: 1.0, out: 5.0, unit: "token" },
+    "openai/gpt-6-astra": { in: 10.0, out: 50.0, unit: "token" },
     "openai/gpt-5.6-sol": { in: 5.0, out: 30.0, unit: "token" },
     "openai/gpt-5.6-terra": { in: 2.0, out: 12.0, unit: "token" },
     "openai/gpt-5.6-luna": { in: 0.2, out: 1.2, unit: "token" },
@@ -1428,8 +1453,11 @@ export function AIModelSection({
     "openai/gpt-4o-audio-preview": { in: 2.5, out: 10.0, unit: "token" },
     "openai/gpt-audio-mini": { in: 0.6, out: 2.4, unit: "token" },
     "openai/gpt-audio": { in: 2.5, out: 10.0, unit: "token" },
+    "suno/music": { in: 0.10, unit: "asset" },
+    "bytedance/seedance-2.5": { in: 0.231, unit: "second" },
     "bytedance/seedance-2.0": { in: 0.134, unit: "second" },
     "bytedance/seedance-2.0-fast": { in: 0.107, unit: "second" },
+    "bytedance/seedance-v1.0-pro-fast": { in: 0.0097, unit: "second" },
     "kwaivgi/kling-v3.0-std": { in: 0.168, unit: "second" },
     "kwaivgi/kling-v3.0-pro": { in: 0.224, unit: "second" },
     "mxbai-embed-large": { in: 0, out: 0, unit: "token" },
@@ -1464,7 +1492,7 @@ export function AIModelSection({
         return "Self-hosted speech-to-text needs a matching OpenAI or Groq speech API key from your provider account.";
       }
       if (roleKey === "audio") {
-        return "Self-hosted audio generation needs the matching Google or OpenAI API key from your provider account.";
+        return "Self-hosted audio generation needs the matching Google, OpenAI, or Suno API key from your provider account.";
       }
       if (roleKey === "sfx") {
         return "Self-hosted sound-effects generation needs the matching OpenAI API key from your provider account.";
@@ -1491,6 +1519,7 @@ export function AIModelSection({
     qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
     zyphra: "https://api.zyphracloud.com/api/v1",
     sesame: "https://openrouter.ai/api/v1",
+    suno: "https://api.suno.com/v0",
   };
 
   const inferBaseUrl = (modelId: string, roleKey = ""): string => {
@@ -3650,165 +3679,10 @@ export function CalendarBookingSection({ user }: { user: any }) {
   );
 }
 
-/* ─── AI File Permissions ─── */
-type FilePermissionMode = "approval" | "always_approve" | "deny";
-
-const FILE_PERMISSION_OPTIONS: Array<{
-  value: FilePermissionMode;
-  label: string;
-  description: string;
-  tone: string;
-}> = [
-  {
-    value: "approval",
-    label: t("page.account.ask_every_time"),
-    description: t(
-      "page.account.ai_must_ask_before_creating_editing_deleting_or_saving",
-    ),
-    tone: "#4f7d75",
-  },
-  {
-    value: "always_approve",
-    label: t("page.account.always_approve"),
-    description: t(
-      "page.account.ai_may_change_user_visible_files_without_a_prompt_inte",
-    ),
-    tone: "#b27c34",
-  },
-  {
-    value: "deny",
-    label: t("page.account.deny"),
-    description: t(
-      "page.account.ai_cannot_change_user_visible_files_reading_and_intern",
-    ),
-    tone: "#c14a44",
-  },
-];
-
+/* Account defaults also serve the legacy File permissions URL. */
 export function FilePermissionSection() {
-  const queryClient = useQueryClient();
-  const [saving, setSaving] = useState<FilePermissionMode | null>(null);
-  const { data: preferences } = useQuery({
-    queryKey: ["preferences"],
-    queryFn: () => api.admin.getPreferences(),
-  });
-
-  const rawMode = String((preferences as any)?.ai_file_permission || "approval")
-    .toLowerCase()
-    .replace("-", "_");
-  const currentMode: FilePermissionMode =
-    rawMode === "deny"
-      ? "deny"
-      : rawMode === "always_approve" ||
-          rawMode === "always_approval" ||
-          rawMode === "always approval"
-        ? "always_approve"
-        : "approval";
-
-  const handleSelect = async (mode: FilePermissionMode) => {
-    setSaving(mode);
-    try {
-      await api.admin.updatePreferences({ ai_file_permission: mode });
-      queryClient.invalidateQueries({ queryKey: ["preferences"] });
-    } finally {
-      setSaving(null);
-    }
-  };
-
-  return (
-    <div
-      style={{
-        marginTop: 32,
-        paddingTop: 28,
-        borderTop: "1px solid rgba(28,25,23,0.06)",
-      }}
-    >
-      <h3 className="manor-section-title">
-        {t("page.account.ai_file_permissions")}
-      </h3>
-      <p className="manor-section-subtitle">
-        {t("page.account.controls_ai_changes_to_user_visible_knowledge_fi")}
-      </p>
-      <div
-        style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 180px), 1fr))",
-          gap: 10,
-          maxWidth: 680,
-        }}
-      >
-        {FILE_PERMISSION_OPTIONS.map((option) => {
-          const active = currentMode === option.value;
-          const isSaving = saving === option.value;
-          return (
-            <button
-              key={option.value}
-              type="button"
-              onClick={() => handleSelect(option.value)}
-              disabled={!!saving}
-              style={{
-                textAlign: "left",
-                padding: "14px 16px",
-                borderRadius: 14,
-                border: active
-                  ? `2px solid ${option.tone}`
-                  : "1px solid rgba(231,229,228,0.7)",
-                background: active
-                  ? `${option.tone}08`
-                  : "rgba(255,255,255,0.72)",
-                color: "#1c1917",
-                cursor: saving ? "wait" : "pointer",
-                opacity: saving && !isSaving ? 0.55 : 1,
-                transition: "all 0.15s ease",
-              }}
-            >
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 8,
-                }}
-              >
-                <span
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 800,
-                    color: active ? option.tone : "#1c1917",
-                  }}
-                >
-                  {option.label}
-                </span>
-                {active && (
-                  <span
-                    style={{
-                      fontSize: 10,
-                      fontWeight: 800,
-                      color: option.tone,
-                    }}
-                  >
-                    {isSaving
-                      ? t("page.account.saving")
-                      : t("page.workspaces.filter_active")}
-                  </span>
-                )}
-              </div>
-              <p
-                style={{
-                  margin: "7px 0 0",
-                  fontSize: 11,
-                  lineHeight: 1.45,
-                  color: "#78716c",
-                }}
-              >
-                {option.description}
-              </p>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
+  const user = useAuthStore(state => state.user);
+  return user ? <ApprovalSettingsPanel scope={{ kind: "account", id: user.entity_id }} showOverrides /> : null;
 }
 
 /* ─── Security Section ─── */

@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.blueprints.installer import (
     InstallError,
     InstallMode,
+    _blueprint_workflow_definition_values,
     _install_workflow_binding,
     install_blueprint,
 )
@@ -96,6 +97,42 @@ def _base_payload(**overrides) -> dict:
             cur = cur.setdefault(s, {})
         cur[path[-1]] = v
     return payload
+
+
+def test_blueprint_condition_routes_do_not_duplicate_dependency_edges():
+    values = _blueprint_workflow_definition_values({
+        "slug": "condition-routes",
+        "steps": [
+            {"id": "produce", "type": "agent"},
+            {
+                "id": "check",
+                "type": "condition",
+                "depends_on": ["produce"],
+                "true_next": ["ready"],
+                "false_next": ["failed"],
+            },
+            {"id": "failed", "type": "stop", "depends_on": ["check"]},
+            {"id": "ready", "type": "end", "depends_on": ["check"]},
+        ],
+    })
+
+    steps = {step["id"]: step for step in values["steps"]}
+    assert steps["produce"]["next"] == ["check"]
+    assert steps["check"]["next"] == []
+    assert steps["check"]["true_next"] == ["ready"]
+    assert steps["check"]["false_next"] == ["failed"]
+
+
+def test_blueprint_workflow_install_preserves_canvas_positions():
+    position = {"x": 320, "y": 140}
+    values = _blueprint_workflow_definition_values({
+        "slug": "positioned-workflow",
+        "steps": [{"id": "render", "type": "agent", "position": position}],
+    })
+
+    render = next(step for step in values["steps"] if step["id"] == "render")
+    assert render["position"] == position
+    assert "position" not in render["config"]
 
 
 async def test_install_preflight_resolves_creator_declared_account_requirements(
@@ -883,6 +920,10 @@ async def test_runtime_start_is_deferred_for_blocking_install(
         calls.append("post_commit")
         return {"strategist_dispatched": False}
 
+    async def greetings(*_args, **_kwargs):
+        calls.append("greetings")
+        return {"agent_greetings_dispatched": True}
+
     async def reconcile(*_args, **_kwargs):
         calls.append("reconcile")
         return None
@@ -891,6 +932,11 @@ async def test_runtime_start_is_deferred_for_blocking_install(
         workspace_setup_service,
         "dispatch_workspace_post_commit",
         post_commit,
+    )
+    monkeypatch.setattr(
+        workspace_setup_service,
+        "dispatch_workspace_agent_greetings_once",
+        greetings,
     )
     monkeypatch.setattr(
         blueprint_startup_service,
@@ -902,7 +948,7 @@ async def test_runtime_start_is_deferred_for_blocking_install(
         result=result,
         entity_id=entity_id,
     )
-    assert calls == ["reconcile"]
+    assert calls == ["reconcile", "greetings"]
 
 
 async def test_declared_ready_startup_replaces_generic_post_commit_start(
@@ -928,6 +974,10 @@ async def test_declared_ready_startup_replaces_generic_post_commit_start(
         calls.append("post_commit")
         return {"strategist_dispatched": True}
 
+    async def greetings(*_args, **_kwargs):
+        calls.append("greetings")
+        return {"agent_greetings_dispatched": True}
+
     async def reconcile(*_args, **_kwargs):
         calls.append("reconcile")
         return blueprint_startup_service.BlueprintStartupResult(
@@ -941,6 +991,11 @@ async def test_declared_ready_startup_replaces_generic_post_commit_start(
         post_commit,
     )
     monkeypatch.setattr(
+        workspace_setup_service,
+        "dispatch_workspace_agent_greetings_once",
+        greetings,
+    )
+    monkeypatch.setattr(
         blueprint_startup_service,
         "reconcile_blueprint_startup",
         reconcile,
@@ -952,7 +1007,7 @@ async def test_declared_ready_startup_replaces_generic_post_commit_start(
         entity_id=entity_id,
     )
 
-    assert calls == ["reconcile"]
+    assert calls == ["reconcile", "greetings"]
 
 
 async def test_blueprint_without_declared_startup_keeps_generic_post_commit_start(
@@ -978,6 +1033,10 @@ async def test_blueprint_without_declared_startup_keeps_generic_post_commit_star
         calls.append("post_commit")
         return {"strategist_dispatched": True}
 
+    async def greetings(*_args, **_kwargs):
+        calls.append("greetings")
+        return {"agent_greetings_dispatched": True}
+
     async def reconcile(*_args, **_kwargs):
         calls.append("reconcile")
         return blueprint_startup_service.BlueprintStartupResult(
@@ -988,6 +1047,11 @@ async def test_blueprint_without_declared_startup_keeps_generic_post_commit_star
         workspace_setup_service,
         "dispatch_workspace_post_commit",
         post_commit,
+    )
+    monkeypatch.setattr(
+        workspace_setup_service,
+        "dispatch_workspace_agent_greetings_once",
+        greetings,
     )
     monkeypatch.setattr(
         blueprint_startup_service,
@@ -1075,6 +1139,60 @@ async def test_blocking_live_install_keeps_schedules_dormant_and_rejects_flows(
 
 
 # ── Workflow translation ─────────────────────────────────────────────
+
+
+@pytest.mark.oss_regression
+@pytest.mark.parametrize("mode", [InstallMode.SIMULATE, InstallMode.LIVE])
+async def test_finalization_workflow_contract_roundtrips(db_session, entity_id, mode):
+    from packages.core.blueprints.exporter import _export_workflows
+
+    # Exercise this Workflow component and its service dependency without
+    # unrelated Workspace setup jobs or any external business execution.
+    workflow = {
+        "slug": "finalization-contract",
+        "name": "Finalization contract",
+        "version": 1,
+        "trigger_type": "manual",
+        "trigger_config": {},
+        "variables": [],
+        "steps": [
+            {
+                "id": "prepare",
+                "type": "agent",
+                "config": {
+                    "service_key": "test.finalizer",
+                    "prompt": "Prepare the reviewed result.",
+                },
+                "next": ["finalize"],
+            },
+            {
+                "id": "finalize",
+                "type": "agent",
+                "depends_on": ["prepare"],
+                "config": {
+                    "service_key": "test.finalizer",
+                    "prompt": "The saved result is verified; no new Save or Publish click is required.",
+                },
+                "next": [],
+            },
+        ],
+    }
+    payload = _base_payload(**{
+        "recipe.workflows": [workflow],
+        "embedded.agents": [{"slug": "finalizer", "name": "Finalizer"}],
+        "recipe.subscriptions": [{"service_key": "test.finalizer", "agent_slug": "finalizer"}],
+    })
+    installed = await install_blueprint(db_session, entity_id=entity_id, payload=payload, mode=mode)
+    assert not [todo for todo in installed.todos if todo.blocking]
+    exported = await _export_workflows(db_session, entity_id, installed.workspace_id)
+    assert len(exported.payloads) == 1
+    expected = _blueprint_workflow_definition_values(workflow)
+    assert exported.payloads[0]["steps"] == expected["steps"]
+    finalization = next(step for step in exported.payloads[0]["steps"]
+                        if step["id"] == "finalize")
+    assert "no new Save or Publish click is required" in finalization["config"]["prompt"]
+
+
 
 
 async def test_workflow_dependency_inversion(
@@ -1936,6 +2054,124 @@ async def test_legacy_entity_agent_subscription_ignores_scoped_slug_collision(
     assert subscription is not None
     assert subscription.agent_id == entity_agent.id
     assert not [todo for todo in result.todos if todo.kind == "post_install_check"]
+
+
+async def test_installer_selected_agent_binds_service_and_automation(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    user_id = generate_ulid()
+    chosen_agent = Agent(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        owner_user_id=user_id,
+        name="Recipient's Agent",
+        slug=f"recipient-{entity_id}",
+        visibility=Visibility.PRIVATE,
+        status="active",
+    )
+    db_session.add(chosen_agent)
+    await db_session.flush()
+    payload = _base_payload(**{
+        "embedded.agents": [{
+            "slug": "source-author-agent",
+            "name": "Author's Agent",
+            "system_prompt": "Research for the author.",
+            "config": {},
+            "tool_bindings": [],
+            "mcp_bindings": [],
+            "skill_bindings": [],
+            "starter_memory": [],
+        }],
+        "recipe.subscriptions": [{
+            "service_key": "daily.research",
+            "agent_slug": "source-author-agent",
+            "custom_prompt": None,
+            "config": {},
+        }],
+        "recipe.scheduled_jobs": [{
+            "job_id": "daily-research",
+            "name": "Daily research",
+            "schedule_kind": "cron",
+            "cron_expr": "0 8 * * *",
+            "execution_type": "agent_message",
+            "execution_target": {"service_key": "daily.research"},
+            "payload_message": "Research today's topic",
+        }],
+    })
+
+    result = await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        user_id=user_id,
+        payload=payload,
+        agent_ids_by_service_key={"daily.research": chosen_agent.id},
+    )
+
+    subscription = await db_session.get(AgentSubscription, result.subscription_ids[0])
+    job = (await db_session.execute(select(ScheduledJob).where(
+        ScheduledJob.workspace_id == result.workspace_id,
+        ScheduledJob.execution_type == "agent",
+    ))).scalar_one()
+    assert subscription.agent_id == chosen_agent.id
+    assert job.agent_id == chosen_agent.id
+    assert job.execution_target["agent_subscription_id"] == subscription.id
+    assert job.execution_target["service_key"] == "daily.research"
+    assert (await db_session.execute(select(Agent).where(
+        Agent.workspace_id == result.workspace_id,
+        Agent.slug == "source-author-agent",
+    ))).scalar_one().id != chosen_agent.id
+
+
+@pytest.mark.parametrize("unavailable", ["other_entity", "inactive", "not_readable"])
+async def test_installer_rejects_unavailable_selected_agent(
+    db_session: AsyncSession,
+    entity_id: str,
+    unavailable: str,
+):
+    user_id = generate_ulid()
+    chosen_agent = Agent(
+        id=generate_ulid(),
+        entity_id=generate_ulid() if unavailable == "other_entity" else entity_id,
+        owner_user_id=generate_ulid() if unavailable == "not_readable" else user_id,
+        name="Unavailable Agent",
+        slug=f"unavailable-{generate_ulid()}",
+        visibility=Visibility.PRIVATE,
+        status="inactive" if unavailable == "inactive" else "active",
+    )
+    db_session.add(chosen_agent)
+    await db_session.flush()
+
+    with pytest.raises(InstallError, match="selected Agent.*unavailable"):
+        await install_blueprint(
+            db_session,
+            entity_id=entity_id,
+            user_id=user_id,
+            payload=_base_payload(**{
+                "recipe.subscriptions": [{
+                    "service_key": "research",
+                    "agent_slug": "source-author-agent",
+                }],
+            }),
+            agent_ids_by_service_key={"research": chosen_agent.id},
+        )
+
+
+async def test_installer_rejects_unknown_service_selection_before_creating_workspace(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    with pytest.raises(InstallError, match="Agent selections must name"):
+        await install_blueprint(
+            db_session,
+            entity_id=entity_id,
+            user_id=generate_ulid(),
+            payload=_base_payload(),
+            agent_ids_by_service_key={"not-in-blueprint": generate_ulid()},
+        )
+    assert not (await db_session.execute(select(Workspace).where(
+        Workspace.entity_id == entity_id,
+    ))).scalars().all()
 
 
 async def test_check_agent_callable_fail(

@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import DateTime, Index, Integer, String, Text, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -45,6 +45,7 @@ class MediaJob(Base, TimestampMixin):
         Index("ix_media_jobs_entity", "entity_id"),
         Index("ix_media_jobs_status", "entity_id", "status"),
         Index("ix_media_jobs_conversation", "conversation_id"),
+        Index("ix_media_jobs_room_agent_run", "room_agent_run_id"),
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
@@ -52,9 +53,14 @@ class MediaJob(Base, TimestampMixin):
     user_id: Mapped[Optional[str]] = mapped_column(String(26))
     agent_id: Mapped[Optional[str]] = mapped_column(String(26))
     conversation_id: Mapped[Optional[str]] = mapped_column(String(26))
+    # Server-authored origin for an approved group Agent tool call. Never infer
+    # group publication from conversation_id or an arbitrary model-provided URL.
+    room_agent_run_id: Mapped[Optional[str]] = mapped_column(
+        String(26), ForeignKey("chat_room_agent_runs.id", ondelete="SET NULL")
+    )
 
     # Job type and status
-    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # "video", "image"
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # "video", "image", "audio"
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     # pending → processing → completed / failed
 
@@ -68,7 +74,7 @@ class MediaJob(Base, TimestampMixin):
     result_url: Mapped[Optional[str]] = mapped_column(Text)  # local URL after download
     source_url: Mapped[Optional[str]] = mapped_column(Text)  # original provider URL
     error: Mapped[Optional[str]] = mapped_column(Text)
-    file_size: Mapped[Optional[int]] = mapped_column(Integer)
+    file_size: Mapped[Optional[int]] = mapped_column(BigInteger)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer)
 
     # Billing

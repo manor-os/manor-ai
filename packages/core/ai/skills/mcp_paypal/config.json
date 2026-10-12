@@ -38,5 +38,9 @@
     "mcp__paypal__update_shipment_tracking",
     "mcp__paypal__list_transactions",
     "mcp__paypal__get_merchant_insights"
-  ]
+  ],
+  "search": {
+    "terms": ["payment", "checkout", "merchant", "billing", "chargeback", "payout", "paypal invoice", "subscription plan"],
+    "examples": ["send paypal invoice to customer", "refund a paypal payment", "list recent paypal transactions", "respond to paypal dispute"]
+  }
 }

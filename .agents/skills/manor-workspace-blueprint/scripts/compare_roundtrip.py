@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import sys
 from pathlib import Path
@@ -92,9 +93,33 @@ def _normalize_installed_job_ids(source: Any, installed: Any) -> None:
                 break
 
 
+def _normalize_external_skill_aliases(payload: dict[str, Any]) -> dict[str, Any]:
+    """Compare external bindings by exact source identity, not installed aliases."""
+    result = deepcopy(payload)
+    embedded = result.get("embedded") or {}
+    embedded_slugs = {item.get("slug") for item in embedded.get("skills") or []}
+    for agent in embedded.get("agents") or []:
+        refs = agent.get("skill_binding_refs") or []
+        aliases: dict[str, str] = {}
+        for ref in refs:
+            slug = ref.get("slug")
+            source, source_id = ref.get("marketplace_source"), ref.get("marketplace_id")
+            if not slug or slug in embedded_slugs or not source or not source_id:
+                continue
+            if sum(item.get("slug") == slug for item in refs) != 1:
+                continue
+            aliases[slug] = json.dumps([source, source_id], separators=(",", ":"))
+        for ref in refs:
+            if ref.get("slug") in aliases:
+                ref["slug"] = aliases[ref["slug"]]
+        if "skill_bindings" in agent:
+            agent["skill_bindings"] = [aliases.get(slug, slug) for slug in agent["skill_bindings"]]
+    return result
+
+
 def compare(left: dict[str, Any], right: dict[str, Any]) -> list[str]:
-    a = _normalize(_runtime_projection(left))
-    b = _normalize(_runtime_projection(right))
+    a = _normalize(_runtime_projection(_normalize_external_skill_aliases(left)))
+    b = _normalize(_runtime_projection(_normalize_external_skill_aliases(right)))
     _normalize_installed_job_ids(a, b)
     if a == b:
         return []

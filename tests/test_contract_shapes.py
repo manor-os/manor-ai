@@ -44,6 +44,28 @@ def test_text_result_folds_content_alias():
     assert out["text"] == "hello"
 
 
+def test_text_result_folds_structured_object_into_text():
+    raw = {
+        "rights_clearance_ready": 90,
+        "distribution_package_ready": 88,
+        "handoff_ready": 83,
+    }
+    out = get_shape("TextResult").normalize(raw)
+    assert out["rights_clearance_ready"] == 90
+    assert out["text"].startswith("{")
+    assert "handoff_ready" in out["text"]
+
+
+def test_text_result_does_not_turn_control_only_output_into_deliverable():
+    shape = get_shape("TextResult")
+    assert shape.normalize({"summary": "drafted the response"}) == {"summary": "drafted the response"}
+    assert shape.normalize({"status": "failed", "error": "tool unavailable"}) == {
+        "status": "failed",
+        "error": "tool unavailable",
+    }
+    assert shape.normalize({}) == {}
+
+
 def test_list_result_unwraps_data_alias():
     out = get_shape("ListResult").normalize({"data": [1, 2, 3]})
     assert out["items"] == [1, 2, 3]
@@ -96,3 +118,28 @@ def test_draftpack_normalizes_posts_alias():
     out = coerce_to_shape("DraftPack", {"posts": [{"draft": "hi", "label": "P1"}]})
     assert out["drafts"][0]["text"] == "hi"
     assert out["drafts"][0]["label"] == "P1"
+
+
+
+def test_artifact_shape_drops_incomplete_files_when_complete_item_remains():
+    complete = {
+        "name": "handoff.md",
+        "fs_path": "Workspaces/_by_id/ws/documents/handoff.md",
+    }
+    extra = {
+        "type": "document_id",
+        "source": "document_id",
+        "document_id": "01DOCIDONLY000000000000001",
+    }
+    out = coerce_to_shape("ArtifactResult", {"files": [complete, extra]})
+    assert out["files"] == [complete]
+
+
+def test_artifact_shape_keeps_incomplete_files_when_nothing_satisfies():
+    extra = {
+        "type": "document_id",
+        "source": "document_id",
+        "document_id": "01DOCIDONLY000000000000001",
+    }
+    out = coerce_to_shape("ArtifactResult", {"files": [extra]})
+    assert out["files"] == [extra]

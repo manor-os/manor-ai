@@ -69,4 +69,7 @@ async def test_platform_wide_source_query_uses_the_new_index(db_session):
     ))).fetchall()
     plan_text = "\n".join(r[0] for r in plan_rows)
     assert "Seq Scan" not in plan_text
-    assert "Index Scan" in plan_text or "Bitmap Index Scan" in plan_text
+    # A covering index can answer this query without reading heap pages.
+    assert any(
+        scan in plan_text for scan in ("Index Scan", "Index Only Scan", "Bitmap Index Scan")
+    ), plan_text

@@ -1,4 +1,11 @@
 {
+  "remotion": {
+    "source": "https://github.com/openai/plugins/blob/main/plugins/remotion/.codex-plugin/assets/composer-icon.svg",
+    "upstream": "Official OpenAI Remotion plugin",
+    "guidelines": "https://www.remotion.dev/brand",
+    "format": "Original provider SVG",
+    "file": "assets/remotion.svg"
+  },
   "googlenews": {
     "source": "https://www.gstatic.com/marketing-cms/assets/images/ec/ca/17131dff4c4fa87ba0491b991ae3/news.png",
     "upstream": "Google official product artwork",
@@ -164,6 +171,10 @@
     "upstream": "simple-icons@16.23.0",
     "guidelines": "https://elevenlabs.io/brand"
   },
+  "suno": {
+    "source": "https://suno.com",
+    "upstream": "simple-icons@16.23.0"
+  },
   "claude": {
     "source": "https://claude.ai",
     "upstream": "simple-icons@16.23.0"
@@ -257,6 +268,10 @@
   "postgresql": {
     "source": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/postgresql.svg",
     "upstream": "https://raw.githubusercontent.com/simple-icons/simple-icons/11.15.0/icons/postgresql.svg"
+  },
+  "apify": {
+    "source": "https://apify.com/icon0.svg",
+    "format": "Original provider SVG icon; stored locally"
   },
   "tavily": {
     "source": "https://raw.githubusercontent.com/lobehub/lobe-icons/4aaf4ee1fb2678a7f989ea570f0f6ce14a9abf75/src/Tavily/components/Mono.tsx",
@@ -397,10 +412,24 @@
     "source": "https://tiktok.com",
     "upstream": "Existing vendored Simple Icons mark"
   },
+  "siInstagram": {
+    "source": "https://about.meta.com/brand/resources/instagram",
+    "guidelines": "https://about.meta.com/brand/resources/instagram",
+    "upstream": "Simple Icons 16.23.0; monochrome mark on neutral surfaces"
+  },
   "siFacebook": {
     "source": "https://about.meta.com/brand/resources/facebook/logo",
     "guidelines": "https://about.meta.com/brand/resources/facebook/logo",
     "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siMessenger": {
+    "source": "https://www.meta.com/brand/resources/facebook/messenger-icon/",
+    "guidelines": "https://www.meta.com/brand/resources/facebook/messenger-icon/",
+    "upstream": "Existing vendored Simple Icons mark"
+  },
+  "siMeta": {
+    "source": "https://github.com/simple-icons/simple-icons",
+    "upstream": "Simple Icons 16.23.0; monochrome mark on neutral surfaces"
   },
   "siSquare": {
     "source": "https://squareup.com",
@@ -437,5 +466,26 @@
   "siRobinhood": {
     "source": "https://press.robinhood.com",
     "upstream": "Simple Icons 16.23.0; monochrome mark on light surfaces"
+  },
+  "larkMark": {
+    "source": "https://lf-package-sg.larksuitecdn.com/obj/lark-static-sgsaas/lark/open/website/favicon-logo.svg",
+    "upstream": "Official Lark Developer website favicon",
+    "format": "Original provider SVG",
+    "file": "assets/lark.svg"
+  },
+  "manorMark": {
+    "source": "Manor-owned artwork; approved monochrome application family",
+    "asset": "assets/manor.svg",
+    "format": "Local SVG; black mark with dark-mode inversion"
+  },
+  "manorPmsMark": {
+    "source": "Manor-owned artwork; approved monochrome application family",
+    "asset": "assets/manor-pms.svg",
+    "format": "Local SVG; black mark with dark-mode inversion"
+  },
+  "manorMinutesMark": {
+    "source": "Manor-owned artwork; approved monochrome application family",
+    "asset": "assets/manor-minutes.svg",
+    "format": "Local SVG; black mark with dark-mode inversion"
   }
 }

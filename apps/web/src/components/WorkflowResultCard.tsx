@@ -2,17 +2,13 @@ import { useLocation, useNavigate } from "react-router-dom";
 import type { WorkflowResultReference } from "../lib/chatStream";
 import { preserveReturnToInHistory } from "../lib/chatRouteReferences";
 import { t } from "../lib/i18n";
+import { workflowReferencePath } from "../lib/workflowRoutes";
 import { IconFlow } from "./icons";
 import CompactCard from "./ui/CompactCard";
 import IconTile from "./ui/IconTile";
 
 function workflowResultHref(result: WorkflowResultReference): string {
-  const declared = String(result.url || "").trim();
-  if (/^\/flows(?:[?#]|$)/.test(declared)) return declared;
-  const query = new URLSearchParams();
-  query.set("workflow", result.workflow_id);
-  if (result.run_id) query.set("run", result.run_id);
-  return `/flows?${query.toString()}`;
+  return workflowReferencePath(result);
 }
 
 export default function WorkflowResultCard({

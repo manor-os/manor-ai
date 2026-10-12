@@ -28,6 +28,30 @@ _redis = None
 _redis_loop = None
 _redis_by_loop = {}
 
+# Cache is optional; a black-holed Redis must not pin an API transaction.
+# Bound optional cache operations, not lease acquisition/heartbeats: an
+# uncertain lock write must not become permission to proceed unlocked.
+# Also preserve the shared client's legitimate BLPOP/XREAD and Pub/Sub waits.
+_CACHE_IO_TIMEOUT_SECONDS = 1.0
+
+
+def _bounded_cache_io(fallback=None, *, fallback_factory=None):
+    def decorate(method):
+        @wraps(method)
+        async def bounded(*args, **kwargs):
+            try:
+                async with asyncio.timeout(_CACHE_IO_TIMEOUT_SECONDS):
+                    return await method(*args, **kwargs)
+            except TimeoutError:
+                logger.debug("Cache %s exceeded its I/O deadline", method.__name__)
+                if fallback_factory is not None:
+                    return fallback_factory(*args, **kwargs)
+                return fallback
+
+        return bounded
+
+    return decorate
+
 _INCREMENT_WITH_TTL_SCRIPT = """
 local count = redis.call('INCR', KEYS[1])
 local ttl = redis.call('TTL', KEYS[1])
@@ -116,6 +140,7 @@ async def _get_redis():
             await client.aclose()
         except Exception:
             pass
+    redis = None
     try:
         import redis.asyncio as aioredis
 
@@ -129,7 +154,19 @@ async def _get_redis():
             "Redis cache connected: %s",
             url.split("@")[-1] if "@" in url else url,
         )
-    except Exception as e:
+    except BaseException as e:
+        # Failed/cancelled initial pings never enter the per-loop registry.
+        # Close that otherwise untracked pool before returning or propagating.
+        if redis is not None:
+            try:
+                async with asyncio.timeout(
+                    0.05 if isinstance(e, asyncio.CancelledError) else _CACHE_IO_TIMEOUT_SECONDS
+                ):
+                    await redis.aclose()
+            except Exception:
+                pass
+        if not isinstance(e, Exception):
+            raise
         logger.warning("Redis not available for caching: %s", e)
         redis = None
     return redis
@@ -140,6 +177,7 @@ class Cache:
 
     PREFIX = "manor:"
 
+    @_bounded_cache_io()
     async def get(self, key: str) -> Optional[Any]:
         """Get a value from cache. Returns None if not found or Redis unavailable."""
         r = await _get_redis()
@@ -152,6 +190,7 @@ class Cache:
             logger.debug("Cache get error for %s: %s", key, e)
             return None
 
+    @_bounded_cache_io(False)
     async def set(self, key: str, value: Any, ttl: int = 300) -> bool:
         """Set a value in cache with TTL (seconds). Returns True on success."""
         r = await _get_redis()
@@ -234,6 +273,7 @@ class Cache:
             logger.debug("Cache lease extend error for %s: %s", key, e)
             return None
 
+    @_bounded_cache_io(fallback_factory=lambda self, keys: [None] * len(keys))
     async def get_many(self, keys: list[str]) -> list[Any | None]:
         """Fetch several JSON values in one Redis round trip."""
         if not keys:
@@ -257,6 +297,7 @@ class Cache:
             logger.debug("Cache multi-get error: %s", e)
             return [None] * len(keys)
 
+    @_bounded_cache_io(False)
     async def set_many(self, values: dict[str, Any], ttl: int = 300) -> bool:
         """Store several JSON values with one non-transactional pipeline."""
         if not values:
@@ -278,6 +319,7 @@ class Cache:
             logger.debug("Cache multi-set error: %s", e)
             return False
 
+    @_bounded_cache_io(False)
     async def delete(self, key: str) -> bool:
         """Delete a key from cache."""
         r = await _get_redis()
@@ -289,6 +331,7 @@ class Cache:
         except Exception:
             return False
 
+    @_bounded_cache_io(False)
     async def touch(self, key: str, ttl: int) -> bool:
         """Extend a cache entry's TTL without downloading or rewriting it."""
         if ttl <= 0:
@@ -302,6 +345,7 @@ class Cache:
             logger.debug("Cache touch error for %s: %s", key, e)
             return False
 
+    @_bounded_cache_io()
     async def incr(self, key: str, amount: int = 1, ttl: int | None = None) -> int | None:
         """Increment an integer key. Returns the new value, or None when Redis is unavailable."""
         r = await _get_redis()
@@ -317,6 +361,7 @@ class Cache:
             logger.debug("Cache incr error for %s: %s", key, e)
             return None
 
+    @_bounded_cache_io(0)
     async def delete_pattern(self, pattern: str) -> int:
         """Delete all keys matching a pattern. Returns count deleted."""
         r = await _get_redis()

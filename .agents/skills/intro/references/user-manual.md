@@ -5,6 +5,7 @@
 ## Contents
 
 - [Getting started](#getting-started)
+- [Interface mode](#interface-mode)
 - [Primary navigation](#primary-navigation)
 - [Chat](#chat)
 - [Workspaces](#workspaces)
@@ -25,7 +26,11 @@
 3. Confirm that the Workspace or feature you need is visible.
 4. Start with a small request whose result is easy to verify.
 
-A practical first sequence is:
+For a chat-first start, choose Simple mode and use **Install Workspace** when
+you need a packaged Workspace. For the configuration steps below, choose
+Professional mode under Settings → Appearance → Interface mode.
+
+A practical first sequence in Professional mode is:
 
 1. Send a short request to Manor AI.
 2. Create a small Workspace.
@@ -34,9 +39,38 @@ A practical first sequence is:
 5. Add the Agent to the Workspace.
 6. Create a Task and review its progress.
 
+## Interface mode
+
+Entry: More → User Guide.
+
+A saved choice is kept. Without one, existing users default to **Professional**
+without a first-use prompt; new users see User Guide with **Simple** preselected.
+Select **Start** to save and begin the tour. Reopen it from More → User Guide,
+or change mode in Settings → Appearance → Interface mode. Your choice is saved
+in this browser.
+
+| Area | Simple | Professional |
+| --- | --- | --- |
+| Navigation | Chats and Install Workspace | Chat and Workspace navigation, with management pages |
+| Workspace Chat team | Member count, Manor AI, and Agent avatars and names; Agent labels are read-only | Agent labels also open the existing detail view |
+| Chat composer | Text, attachments, # file references, voice, send, and stop when available | Additional mode, Agent mention, Skill, Flow, connector, and Task controls when available |
+| Execution information | Results, files, running or failed states, approvals, and available retry or cancel actions | Additional process and activity details |
+
+Simple mode keeps required connection and setup prompts available. It hides
+completed process details and general Workspace management pages. If a link
+opens a Professional-mode notice, select **Open display settings**, switch to
+Professional, and use **Back to app** to return.
+
+Both modes use the same Workspaces and conversations. Switching modes does not
+change permissions, approvals, configured Agents, or ongoing work. Conversation
+history and unsent text drafts remain available when returning to Chat.
+
+The management procedures below use Professional mode unless a Simple-mode
+entry is stated. Display mode does not grant access to a feature or Workspace.
+
 ## Primary navigation
 
-Manor AI uses two navigation modes:
+In Professional interface mode, there are two navigation areas:
 
 - Chat mode for Manor AI, Workspace conversations, and Agent conversations.
 - Workspace mode for operating and configuring work.
@@ -49,29 +83,33 @@ Common Workspace-mode entries:
 | Operate | Tasks | Use Board, Calendar, and Automations |
 | Library | Workspaces | Manage businesses, projects, and operating areas |
 | Library | Knowledge | Manage files, documents, retrieval, and Wiki content |
+| Library | Team & Clients | Manage internal members and roles, and company clients with multiple contacts |
 | Configure | Agents | Create and configure Agents |
 | Configure | Integrations | Connect applications and channels |
 | Configure | Skills | Create, test, and add Skills |
 
 The profile and More menus provide account options, Settings, Help, Chat History, and language choices. The bell opens Notifications.
 
-Only use entries visible to the current user. If an entry is absent, check the selected navigation mode and Workspace access.
+Only use entries visible to the current user. If an entry is absent, check
+Interface mode first, then the selected navigation area and Workspace access.
 
 ## Chat
 
 ### Start a conversation
 
-Entry: Chat mode → Manor AI.
+Entry: Chat sidebar → Manor AI.
 
 1. State the goal, relevant context, expected output, and constraints.
 2. Use the attachment menu to add a local file or select a Knowledge document.
 3. Type # to reference an available file.
-4. Type / to select an available Skill.
-5. Type @ to select an Agent or member when mentions are supported.
-6. Send the request.
-7. Review progress cards, approvals, and generated artifacts.
+4. In Professional mode, type / to select an available Skill.
+5. In Professional mode, type @ to select an Agent or member when mentions are supported.
+6. In Professional mode, type % to select a Flow when available.
+7. Send the request.
+8. Review progress cards, approvals, and generated artifacts.
 
-Verify the result in the relevant page. For example, confirm that a requested Task appears in Tasks or a requested document appears in Knowledge.
+In Simple mode, verify results and generated files in Chat. In Professional
+mode, you can also check the relevant Tasks or Knowledge page.
 
 ### Choose the right conversation
 
@@ -79,10 +117,12 @@ Verify the result in the relevant page. For example, confirm that a requested Ta
 | --- | --- |
 | General research, planning, or cross-Workspace work | Manor AI |
 | Work that depends on one Workspace | Workspace Chat |
-| Work for one specific AI role | Agent conversation or an Agent mention |
+| Work for one specific AI role | Agent conversation or an Agent mention in Professional mode |
 | Visitor conversation | Public Webchat when enabled |
 
 ### Use a Skill
+
+Use Professional mode for the manual Skill selector.
 
 1. Type / and a Skill keyword in Chat Composer.
 2. Select the Skill.
@@ -118,9 +158,37 @@ Entry: More → Chat History.
 
 ## Workspaces
 
+### Collaborate and privately deliver a Workspace
+
+Entry: Workspaces → open a Workspace → Collaboration. This tab requires Workspace management access. It contains testing/acceptance controls, external collaborator invitations and an optional shortcut to an existing Group.
+
+To deliver a configuration privately:
+
+1. Add the client company and its contact email in Team & Clients → Clients.
+2. Open the source Workspace and choose Deliver to a client.
+3. Select the client company, contact and Customer testing or Direct delivery. The current Workspace is already selected.
+4. Choose Send delivery invitation. Manor reads the customer account’s current language (English if unavailable), emails the selected contact in that language and shows the sending result. If sending fails, resend the invitation email; resending replaces the previous private link.
+5. The customer opens the link, verifies the matching email and accepts in their own company as Workspace Owner. The received Workspace starts paused.
+
+Only configuration is copied. Add product materials and connect accounts in the customer Workspace. Conversations and generated files stay with the source. Delivery records are available in the client's Delivery section; the provider has no access to the customer's Workspace by default.
+
+
+### Install a Workspace in Simple mode
+
+Entry: Chat sidebar → Install Workspace.
+
+1. Select **Import Workspace**.
+2. Choose a trusted Blueprint JSON file and review its displayed name and options.
+3. Complete the import. The installed Workspace opens in Workspace Chat.
+4. Follow any required connection or setup prompts, then send a small test request.
+5. Review the result and any approval request in Chat.
+
+For custom Workspace creation or general configuration, switch to Professional
+mode and follow the procedures below.
+
 ### Create a Workspace
 
-Entry: Workspaces → New workspace.
+Entry: Professional mode → Workspaces → New workspace.
 
 1. Describe the business, project, or operating area.
 2. State the people served and primary outcome.
@@ -468,6 +536,9 @@ When Reports is visible:
 ### Settings
 
 Common visible areas include Appearance, AI models, Calendar, File permissions, Notifications, and Security.
+
+Use Appearance → Interface mode to switch between Simple and Professional.
+The choice applies immediately and is saved in the current browser.
 
 Use only controls presented to the current user.
 

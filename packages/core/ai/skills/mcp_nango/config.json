@@ -10,5 +10,9 @@
     "mcp__nango__nango_list_providers",
     "mcp__nango__nango_list_connections",
     "mcp__nango__nango_proxy"
-  ]
+  ],
+  "search": {
+    "terms": ["integration", "connector", "api proxy", "saas apps", "third party app", "oauth connection", "other apps"],
+    "examples": ["connect to app without dedicated mcp", "find nango provider for hubspot", "call third party api via nango", "check if connection exists for app"]
+  }
 }

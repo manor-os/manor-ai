@@ -14,6 +14,80 @@ function wavClip(seconds = 1) {
   return bytes.toString("base64");
 }
 
+test("live call streams user transcription and assistant output in place", async ({ page }) => {
+  let wire: any;
+  await page.routeWebSocket(/\/api\/v1\/audio\/live$/, socket => {
+    wire = socket;
+    socket.onMessage(data => {
+      if (JSON.parse(String(data)).type === "start") {
+        socket.send(JSON.stringify({
+          type: "ready",
+          generation: 0,
+          conversation_id: "conversation-one",
+        }));
+      }
+    });
+  });
+  await setup(page, "chat", true);
+  await page.getByRole("button", { name: "Start voice call", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Voice call" });
+  const log = dialog.getByRole("log");
+  const userRow = log.locator(".live-chat-call__user");
+  await expect(dialog.getByRole("status")).toHaveText("Listening");
+
+  wire.send(JSON.stringify({
+    type: "transcript_delta",
+    role: "user",
+    item_id: "input-one",
+    delta: "做加",
+    generation: 0,
+  }));
+  await expect(userRow).toContainText("做加");
+  wire.send(JSON.stringify({
+    type: "transcript_delta",
+    role: "user",
+    item_id: "input-one",
+    delta: "州的贷款生意",
+    generation: 0,
+  }));
+  await expect(userRow).toContainText("做加州的贷款生意");
+  await expect(userRow).toHaveCount(1);
+  wire.send(JSON.stringify({
+    type: "transcript",
+    role: "user",
+    item_id: "input-one",
+    text: "做加州的贷款生意。",
+    generation: 0,
+  }));
+  await expect(userRow).toContainText("做加州的贷款生意。");
+
+  wire.send(JSON.stringify({
+    type: "caption",
+    item_id: "reply-one",
+    delta: "加州房贷",
+    generation: 0,
+  }));
+  const assistantRow = log.locator("p").nth(1);
+  await expect(assistantRow).toContainText("加州房贷");
+  wire.send(JSON.stringify({
+    type: "caption",
+    item_id: "reply-one",
+    delta: "业务通常包括购房和再融资。",
+    generation: 0,
+  }));
+  const answer = "加州房贷业务通常包括购房和再融资。";
+  await expect(assistantRow).toContainText(answer);
+  wire.send(JSON.stringify({
+    type: "turn",
+    conversation_id: "conversation-one",
+    text: answer,
+    generation: 0,
+  }));
+  await expect(log.locator("p")).toHaveCount(2);
+  await expect(log.locator("p").filter({ hasText: answer })).toHaveCount(1);
+  await dialog.getByRole("button", { name: "End call", exact: true }).click();
+});
+
 for (const surface of ["chat", "workspace", "public"]) {
   test(`${surface}: empty speech resumes paused audio and keeps completed replies inside the call`, async ({ page }) => {
     let wire: any;
@@ -379,7 +453,7 @@ test("real WorkspaceChat keeps the call and audible reply across persisted messa
   });
   // This fixture mounts the complete WorkspaceChat with its real query and
   // stream stores, unlike the small composer fixture used in unit flows.
-  await page.goto("/e2e/fixtures/chat-voice-workspace.html");
+  await page.goto("/e2e/fixtures/workspace-proposal-approval.html");
   await expect(page.locator("#workspace-chat-message-welcome").getByText("Workspace ready.", { exact: true })).toBeVisible();
   await page.evaluate(() => {
     const connect = AudioNode.prototype.connect;
@@ -422,7 +496,7 @@ test("real browser PCM and gateway WebSocket suppress echo and resume after manu
   test.skip(!process.env.VOICE_GATEWAY_E2E, "Requires the isolated tests.voice_browser_server fixture");
   await setup(page, "workspace", true);
   await page.unroute("**/api/v1/**");
-  await page.goto("/e2e/fixtures/chat-voice-workspace.html");
+  await page.goto("/e2e/fixtures/workspace-proposal-approval.html");
   await expect(page.locator("#workspace-chat-message-welcome").getByText("Workspace ready.", { exact: true })).toBeVisible();
   await page.evaluate(() => {
     const connect = AudioNode.prototype.connect;
@@ -447,7 +521,7 @@ test("real browser PCM and gateway WebSocket suppress echo and resume after manu
   await page.evaluate(encoded => (window as any).voiceFixture.startInput(encoded), speech);
   await expect(dialog.getByRole("status")).toHaveText("AI is speaking");
   await expect.poll(async () => page.evaluate(() => (window as any).outputPeak)).toBeGreaterThan(0.005);
-  const answer = "你好，我能听到你的声音，现在测试中文语音回复。";
+  const answer = "我查完了：APR 是 6.25%，最终以核保为准；完整报告已经放在聊天里。";
   await expect(dialog.getByRole("log")).toContainText(answer);
   await expect(dialog.getByRole("button", { name: "Interrupt", exact: true })).toBeVisible();
   const beforeEcho = await (await page.request.get("/api/v1/voice-test-observations")).json();
@@ -466,10 +540,22 @@ test("real browser PCM and gateway WebSocket suppress echo and resume after manu
     return (await result.json()).inputs;
   }).toBe(2);
   await expect(dialog.getByRole("log")).toContainText("继续");
+  await expect.poll(async () => {
+    const observation = await page.request.get("/api/v1/voice-test-observations");
+    return (await observation.json()).events.filter(
+      (type: string) => type === "turn",
+    ).length;
+  }).toBe(1);
   const result = await (await page.request.get("/api/v1/voice-test-observations")).json();
+  expect(result.previews).toBeGreaterThan(0);
   expect(result.received.filter((type: string) => type === "stop_reply")).toHaveLength(1);
-  expect(result.events.filter((type: string) => type === "turn")).toHaveLength(2);
+  // The first reply was manually interrupted: its streamed caption remains
+  // readable, but only the uninterrupted second reply emits a completed turn.
+  expect(result.events.filter((type: string) => type === "turn")).toHaveLength(1);
   await expect(dialog.getByRole("log")).toContainText(answer);
+  await expect(page.locator("#workspace-chat-message-reply")).toContainText(
+    "完整分析：报告已经生成，共 42 行；APR 为 6.25%，最终以核保为准。"
+  );
   await dialog.getByRole("button", { name: "End call", exact: true }).click();
 });
 
@@ -502,9 +588,19 @@ test("gateway audio decoded after interruption never resumes playback", async ({
 
 async function setup(page: Page, surface = "chat", live = false, locale = "en", empty = false) {
   await page.addInitScript((live) => {
-    const state = { stoppedTracks: 0, uploads: 0, plays: 0, pauses: 0, deny: false, pending: false,
-      audio: null as any, resolve: null as null | (() => void), constraints: null as any };
+    const state = { stoppedTracks: 0, uploads: 0, sourceStarts: 0, sourceStops: 0, deny: false, pending: false,
+      resolve: null as null | (() => void), constraints: null as any };
     (window as any).voiceFixture = state;
+    const sourceStart = AudioBufferSourceNode.prototype.start;
+    const sourceStop = AudioBufferSourceNode.prototype.stop;
+    AudioBufferSourceNode.prototype.start = function (...args) {
+      state.sourceStarts++;
+      return sourceStart.apply(this, args);
+    };
+    AudioBufferSourceNode.prototype.stop = function (...args) {
+      state.sourceStops++;
+      return sourceStop.apply(this, args);
+    };
     Object.defineProperty(navigator, "mediaDevices", { value: {
       getSupportedConstraints: () => ({ voiceIsolation: true }),
       getUserMedia: async (constraints: MediaStreamConstraints) => {
@@ -549,22 +645,11 @@ async function setup(page: Page, surface = "chat", live = false, locale = "en", 
       }
     }
     (window as any).MediaRecorder = Recorder;
-    class Audio {
-      constructor() { state.audio = this; }
-      src = "";
-      onended: any;
-      onerror: any;
-      async play() { state.plays++; }
-      pause() { state.pauses++; }
-      removeAttribute() { this.src = ""; }
-      load() {}
-    }
-    (window as any).Audio = Audio;
   }, live);
   await page.route("**/config", (route) => route.fulfill({ json: {} }));
   await page.route("**/api/v1/**", (route) => {
     const path = new URL(route.request().url()).pathname;
-    const info = { channel_name: "Voice demo", agent_name: "Assistant", language: "en", welcome_message: "Welcome", login_required: false };
+    const info = { channel_name: "Voice demo", agent_name: "Assistant", language: locale, welcome_message: "Welcome", login_required: false };
     let body: unknown = [];
     if (path.endsWith("/voice-demo")) body = info;
     if (path.endsWith("/session")) body = { session_id: "voice-session", conversation_id: "public-conversation" };
@@ -631,17 +716,32 @@ for (const surface of ["chat", "workspace", "public"]) {
     const requests: any[] = [];
     await page.route(/\/(?:tts|audio\/speech)$/, (route) => {
       requests.push(route.request().postDataJSON());
-      return route.fulfill({ contentType: "audio/mpeg", body: "audio" });
+      return route.fulfill({ contentType: "audio/wav", body: Buffer.from(wavClip(), "base64") });
     });
     await page.getByRole("button", { name: "Read aloud · AI voice", exact: true }).first().focus();
     await page.getByRole("button", { name: "Read aloud · AI voice", exact: true }).first().click();
     await expect(page.getByRole("button", { name: "Stop AI voice" })).toBeVisible();
-    if (surface === "public") expect(requests[0]).toMatchObject({ session_id: "voice-session", message_id: "reply" });
-    else expect(requests[0]).toMatchObject({ conversation_id: "conversation-one" });
+    await expect.poll(() => page.evaluate(() => (window as any).voiceFixture.sourceStarts)).toBe(1);
+    if (surface === "public") expect(requests[0]).toMatchObject({ session_id: "voice-session", message_id: "reply", language: "en" });
+    else expect(requests[0]).toMatchObject({ conversation_id: "conversation-one", language: "en" });
     await page.getByRole("button", { name: "Stop AI voice" }).click();
-    await expect.poll(() => page.evaluate(() => (window as any).voiceFixture.pauses)).toBeGreaterThan(0);
+    await expect.poll(() => page.evaluate(() => (window as any).voiceFixture.sourceStops)).toBeGreaterThan(0);
   });
 }
+
+test("read aloud follows the user's configured language", async ({ page }) => {
+  await setup(page, "chat", false, "zh");
+  let request: any;
+  await page.route("**/chat/tts", (route) => {
+    request = route.request().postDataJSON();
+    return route.fulfill({ contentType: "audio/wav", body: Buffer.from(wavClip(), "base64") });
+  });
+  const play = page.getByRole("button", { name: "朗读回复 · AI 语音", exact: true }).first();
+  await play.focus();
+  await play.click();
+  await expect.poll(() => request?.language).toBe("zh");
+  await expect.poll(() => page.evaluate(() => (window as any).voiceFixture.sourceStarts)).toBe(1);
+});
 
 test("permission failure preserves the draft and delayed permission is cancelled", async ({ page }) => {
   await setup(page);
@@ -772,7 +872,7 @@ test("conversation change discards a late transcript and stops playback", async 
   await page.getByRole("button", { name: "Switch conversation" }).click();
   finish();
   await expect(page.getByTestId("draft")).toHaveText("New draft");
-  await page.route("**/chat/tts", (route) => route.fulfill({ body: "audio", contentType: "audio/mpeg" }));
+  await page.route("**/chat/tts", (route) => route.fulfill({ body: Buffer.from(wavClip(), "base64"), contentType: "audio/wav" }));
   await page.getByRole("button", { name: "Read aloud · AI voice", exact: true }).first().focus();
     await page.getByRole("button", { name: "Read aloud · AI voice", exact: true }).first().click();
   await expect(page.getByRole("button", { name: "Stop AI voice" })).toHaveCount(1);
@@ -805,16 +905,14 @@ test("public long replies continue with Unicode-safe offsets", async ({ page }) 
   const requests: any[] = [];
   await page.route("**/audio/speech", (route) => {
     requests.push(route.request().postDataJSON());
-    return route.fulfill({ body: "audio", contentType: "audio/mpeg" });
+    return route.fulfill({ body: Buffer.from(wavClip(), "base64"), contentType: "audio/wav" });
   });
   await page.getByRole("button", { name: "Read aloud · AI voice", exact: true }).click();
   await expect(page.getByRole("button", { name: "Stop AI voice" })).toBeVisible();
   expect(requests[0]).toMatchObject({ message_id: "long-reply", offset: 0, length: 3000 });
-  await page.evaluate(() => (window as any).voiceFixture.audio.onended());
   await expect.poll(() => requests.length).toBe(2);
   expect(requests[1]).toMatchObject({ offset: 3000, length: 105 });
-  await expect.poll(() => page.evaluate(() => (window as any).voiceFixture.plays)).toBe(2);
-  await page.evaluate(() => (window as any).voiceFixture.audio.onended());
+  await expect.poll(() => page.evaluate(() => (window as any).voiceFixture.sourceStarts)).toBe(2);
   await expect(page.getByRole("button", { name: "Stop AI voice" })).toHaveCount(0);
 });
 
@@ -835,6 +933,107 @@ test("cancelled speech never plays late audio and page exit releases the microph
   await expect(page.getByRole("button", { name: "Finish recording" })).toBeVisible();
   await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
   await expect(page.getByRole("button", { name: "Finish recording" })).toHaveCount(0);
-  expect(await page.evaluate(() => (window as any).voiceFixture.plays)).toBe(0);
+  expect(await page.evaluate(() => (window as any).voiceFixture.sourceStarts)).toBe(0);
   expect(await page.evaluate(() => (window as any).voiceFixture.stoppedTracks)).toBeGreaterThan(0);
+});
+
+test("native late bridge reuses recorded ASR and drains audio through one Main result", async ({ page }, testInfo) => {
+  test.skip(!process.env.VOICE_NATIVE_E2E, "Requires the isolated tests.voice_native_browser_server fixture");
+  await setup(page, "workspace", true);
+  await page.unroute("**/api/v1/**");
+  await page.goto("/e2e/fixtures/workspace-proposal-approval.html");
+  await expect(page.locator("#workspace-chat-message-welcome")).toContainText("Workspace ready.");
+  await page.evaluate(() => {
+    const outputContexts = new Set<BaseAudioContext>();
+    const output = { starts: 0, stops: 0, ended: 0, peak: 0 };
+    (window as any).nativeOutput = output;
+    const connect = AudioNode.prototype.connect;
+    AudioNode.prototype.connect = function (destination: any, ...args: any[]) {
+      if (destination instanceof AudioDestinationNode) {
+        outputContexts.add(this.context);
+        const meter = this.context.createAnalyser();
+        connect.call(this, meter);
+        setInterval(() => {
+          const values = new Float32Array(meter.fftSize);
+          meter.getFloatTimeDomainData(values);
+          output.peak = Math.max(output.peak, ...values.map(Math.abs));
+        }, 20);
+      }
+      return (connect as any).call(this, destination, ...args);
+    } as typeof connect;
+    const start = AudioBufferSourceNode.prototype.start;
+    const stop = AudioBufferSourceNode.prototype.stop;
+    AudioBufferSourceNode.prototype.start = function (...args) {
+      if (outputContexts.has(this.context)) {
+        output.starts++;
+        this.addEventListener("ended", () => { output.ended++; }, { once: true });
+      }
+      return start.apply(this, args);
+    };
+    AudioBufferSourceNode.prototype.stop = function (...args) {
+      if (outputContexts.has(this.context)) output.stops++;
+      return stop.apply(this, args);
+    };
+  });
+  await page.getByRole("button", { name: "Start voice call", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Voice call" });
+  const log = dialog.getByRole("log");
+  await expect(dialog.getByRole("status")).toHaveText("Listening");
+  await page.evaluate(encoded => (window as any).voiceFixture.startInput(encoded), wavClip());
+  const observations = async () => (await page.request.get("/api/v1/voice-native-test-observations")).json();
+  await expect(log.locator(".live-chat-call__user")).toContainText("请查询波音工厂");
+  await expect(log).toContainText("我来查一下。");
+  await expect.poll(() => page.evaluate(() => (window as any).nativeOutput.peak)).toBeGreaterThan(0.005);
+  expect((await page.request.post("/api/v1/voice-native-test-delegate")).ok()).toBe(true);
+  await expect.poll(async () => (await observations()).order.filter(
+    (stage: string) => stage === "provider:response.done"
+  ).length).toBe(2);
+  const before = await observations();
+  expect(before.shared_capabilities).toBe(true);
+  expect(before.inherited_context).toBe(true);
+  expect(before.admitted).toEqual([]);
+  expect(before.order.filter((stage: string) => stage === "provider:response.done")).toHaveLength(2);
+  expect(before.truncates).toEqual([]);
+  expect(before.events.filter((event: any) => event.type === "interrupt")).toEqual([]);
+  expect(await page.evaluate(() => (window as any).nativeOutput.stops)).toBe(0);
+  await page.evaluate(() => { (window as any).nativeOutput.peak = 0; });
+  expect((await page.request.post("/api/v1/voice-native-test-finalize")).ok()).toBe(true);
+  const source = "请查询波音工厂明天的开放时间，并规划午餐和下午的步道。";
+  const answer = "我查完了：上午参观工厂，中午在海边吃饭，下午走附近的步道。";
+  await expect(log.locator(".live-chat-call__user")).toHaveCount(1);
+  await expect(log.locator(".live-chat-call__user")).toContainText(source);
+  await expect(log.locator("p").filter({ hasText: answer })).toHaveCount(1);
+  await expect.poll(async () => (await observations()).events.filter((event: any) => event.type === "turn").length).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as any).nativeOutput.peak)).toBeGreaterThan(0.005);
+  const after = await observations();
+  expect(after.admitted).toEqual([source]);
+  expect(after.source_message_ids).toEqual([["native-user"]]);
+  expect(after.executed).toEqual(["native-work"]);
+  expect(after.results).toHaveLength(1);
+  expect(after.results[0]).toMatchObject({ result: "work_finished", status: "ok", work_id: "native-work", request: source });
+  expect(after.results[0].response_text).toContain("完整分析：上午参观工厂");
+  expect(after.recorded).toEqual([[source, ""]]);
+  const order = after.order;
+  expect(order.indexOf("provider:response.done")).toBeLessThan(order.indexOf("provider:conversation.item.input_audio_transcription.completed"));
+  expect(order.indexOf("provider:conversation.item.input_audio_transcription.completed")).toBeLessThan(order.indexOf("record"));
+  expect(order.indexOf("record")).toBeLessThan(order.indexOf("admit"));
+  expect(order.indexOf("execute")).toBeLessThan(order.indexOf("main_result_to_live"));
+  expect(order.indexOf("main_result_to_live")).toBeLessThan(order.indexOf("live_result_presentation"));
+  expect(after.events.filter((event: any) => event.type === "audio")).toHaveLength(2);
+  expect(await page.evaluate(() => (window as any).nativeOutput.starts)).toBe(2);
+  await expect.poll(() => page.evaluate(() => (window as any).nativeOutput.ended)).toBe(2);
+  expect(await page.evaluate(() => (window as any).nativeOutput.stops)).toBe(0);
+  expect((await observations()).truncates).toEqual([]);
+  expect(after.events.filter((event: any) => event.type === "interrupt")).toEqual([]);
+  await expect(page.locator("#workspace-chat-message-native-user")).toHaveCount(1);
+  await expect(page.locator("#workspace-chat-message-native-user")).toContainText(source);
+  await expect(page.locator("#workspace-chat-message-native-main-result")).toContainText("完整分析：上午参观工厂");
+  await expect(dialog.getByRole("status")).toHaveText("Listening");
+  await testInfo.attach("native-provider-observations", { body: JSON.stringify(after, null, 2), contentType: "application/json" });
+  await page.screenshot({ path: testInfo.outputPath("native-live-result.png"), fullPage: true });
+  await log.evaluate(element => { element.scrollTop = 0; });
+  await page.screenshot({ path: testInfo.outputPath("native-live-transcript.png"), fullPage: true });
+  await dialog.getByRole("button", { name: "End call", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(await page.evaluate(() => (window as any).voiceFixture.stoppedTracks)).toBeGreaterThanOrEqual(1);
 });

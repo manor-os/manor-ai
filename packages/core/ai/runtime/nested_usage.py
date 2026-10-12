@@ -33,3 +33,10 @@ def runtime_finish_nested_usage_collection(
     result = tuple(dict(usage) for usage in collected)
     _nested_usage_collector.reset(token)
     return result
+
+
+def runtime_snapshot_nested_usage_collection() -> tuple[dict[str, Any], ...]:
+    """Copy usage accumulated by completed child loops without ending scope."""
+
+    collected: Iterable[dict[str, Any]] = _nested_usage_collector.get() or ()
+    return tuple(dict(usage) for usage in collected)

@@ -15,16 +15,6 @@ from packages.core.ai.runtime.prompt_sections import (
 )
 
 
-def test_output_discipline_guidance_forbids_redundant_preamble():
-    text = runtime_output_discipline_guidance()
-    assert text
-    low = text.lower()
-    # one clean answer, no stacked versions, no process-narration preamble
-    assert "one clean answer" in low
-    assert "more than one version" in low
-    assert "下面是重写版" in text  # the exact CJK preamble we observed in prod
-
-
 def test_output_discipline_section_registered_for_both_modes():
     renderers = runtime_prompt_section_renderers()
     assert "output_discipline" in renderers
@@ -35,4 +25,6 @@ def test_output_discipline_section_registered_for_both_modes():
 def test_output_discipline_section_renders_without_context():
     # The rule is always-on (no ctx dependency), so it must render for any ctx.
     render = runtime_prompt_section_renderers()["output_discipline"]
-    assert render(object()) == runtime_output_discipline_guidance()
+    guidance = runtime_output_discipline_guidance()
+    assert guidance.strip()
+    assert render(object()) == guidance

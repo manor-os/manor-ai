@@ -7,6 +7,7 @@ export interface WorkspacePresentationRule {
 }
 
 export interface WorkspacePresentationHaystackSource {
+  id?: string | null;
   name?: string | null;
   description?: string | null;
   category?: string | null;
@@ -23,6 +24,16 @@ export const WORKSPACE_PRESENTATION_RULES: WorkspacePresentationRule[];
 export function matchesWorkspaceTerm(haystack: string, term: string): boolean;
 
 export function workspaceHaystack(ws: WorkspacePresentationHaystackSource): string;
+
+export function workspaceMainIconName(
+  ws: WorkspacePresentationHaystackSource,
+  semanticIconKey?: string | null,
+): string;
+
+export function workspaceMainIconIndex(
+  ws: WorkspacePresentationHaystackSource,
+  semanticIconKey?: string | null,
+): number;
 
 export function matchWorkspacePresentationRule(
   ws: WorkspacePresentationHaystackSource,

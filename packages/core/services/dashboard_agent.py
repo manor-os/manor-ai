@@ -190,7 +190,7 @@ async def run_dashboard_agent_turn(
         current=meta,
         extra={"dashboard_module_id": module_id} if module_id else None,
     )
-    await add_message(
+    user_message = await add_message(
         db,
         conv.id,
         role="user",
@@ -232,6 +232,8 @@ async def run_dashboard_agent_turn(
                 ),
                 "extra_tool_names": [DASHBOARD_SUBMIT_TOOL_NAME],
                 "dashboard_module_id": module_id,
+                # The run writes this turn to the transcript itself.
+                "origin_user_message_id": user_message.id,
             },
         )
 

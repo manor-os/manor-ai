@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
-import re
 from typing import Any
 
+from packages.core.ai.runtime.composite_tools import RuntimeCompositeToolCallFactory
 from packages.core.services.file_type_detection import mime_for_extension
+from packages.core.services.file_refs import parse_file_reference
 from packages.core.services.generated_file_refs import (
     canonical_generated_file_ref,
     dedupe_generated_file_refs,
+    entity_fs_open_url,
 )
 
 _COLLECTION_KEYS = (
@@ -65,6 +67,7 @@ _GENERATING_TOOL_NAMES = {
     "generate_file",
     "generate_image",
     "generate_video",
+    "import_free_music",
     "merge_videos",
     "normalize_audio_loudness",
     "align_subtitles",
@@ -137,9 +140,9 @@ def _first_text(obj: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
-def _entity_url_prefix_from_value(value: Any) -> str:
-    match = re.match(r"^(/api/v1/fs/[^/]+/)", _text(value))
-    return match.group(1) if match else ""
+def _entity_id_from_value(value: Any) -> str:
+    file_ref = parse_file_reference(_text(value))
+    return file_ref.entity_id if file_ref is not None else ""
 
 
 def _extension_from_name(name: str) -> str:
@@ -242,11 +245,11 @@ def _has_creation_signal(obj: dict[str, Any], *, tool_name: str, inherited: bool
     }
 
 
-def _canonical_url(url: str, fs_path: str, entity_prefix: str) -> str:
+def _canonical_url(url: str, fs_path: str, entity_id: str) -> str:
     if url:
         return url
-    if fs_path and entity_prefix and not fs_path.startswith(("http://", "https://", "/api/")):
-        return entity_prefix + fs_path.lstrip("/")
+    if fs_path and entity_id and not fs_path.startswith(("http://", "https://", "/api/")):
+        return entity_fs_open_url(entity_id, fs_path)
     return ""
 
 
@@ -256,7 +259,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
     if not tool_results:
         return []
 
-    entity_prefix = ""
+    entity_id = ""
     for item in tool_results:
         if not isinstance(item, dict):
             continue
@@ -265,12 +268,12 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
         while stack:
             current = stack.pop()
             if isinstance(current, str):
-                entity_prefix = entity_prefix or _entity_url_prefix_from_value(current)
+                entity_id = entity_id or _entity_id_from_value(current)
                 continue
             if not isinstance(current, dict):
                 continue
             for key in (*_URL_KEYS, *_PATH_KEYS):
-                entity_prefix = entity_prefix or _entity_url_prefix_from_value(current.get(key))
+                entity_id = entity_id or _entity_id_from_value(current.get(key))
             for key in _COLLECTION_KEYS:
                 value = current.get(key)
                 if isinstance(value, list):
@@ -282,7 +285,6 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
                 stack.append(document)
 
     canonical_refs: list[dict[str, Any]] = []
-    entity_id = entity_prefix.removeprefix("/api/v1/fs/").strip("/")
 
     def add_from_obj(
         obj: dict[str, Any],
@@ -351,7 +353,7 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             return
         mime_type = _mime_type(name, obj.get("mime_type") or obj.get("mimeType"))
         file_type = _file_type(name, mime_type, obj.get("file_type") or obj.get("fileType"))
-        preview_url = _canonical_url(url, fs_path, entity_prefix)
+        preview_url = _canonical_url(url, fs_path, entity_id)
         canonical = canonical_generated_file_ref({
             "name": name,
             "document_id": document_id,
@@ -370,7 +372,16 @@ def chat_attachments_from_tool_results(tool_results: list[dict] | None) -> list[
             continue
         payload = _parse_json(item.get("raw_result", item.get("result")))
         if isinstance(payload, dict):
-            add_from_obj(payload, tool_name=_text(item.get("name")), inherited_created=False)
+            arguments = item.get("arguments")
+            canonical_call = RuntimeCompositeToolCallFactory.create(
+                _text(item.get("name")),
+                arguments if isinstance(arguments, dict) else {},
+            )
+            add_from_obj(
+                payload,
+                tool_name=canonical_call.tool_name,
+                inherited_created=False,
+            )
 
     attachments: list[dict[str, Any]] = []
     for ref in dedupe_generated_file_refs(canonical_refs, entity_id=entity_id)[:12]:

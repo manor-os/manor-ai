@@ -40,13 +40,12 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response as RawResponse
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import or_, select, update
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import (
     authenticated_user_credential_from_claims,
     get_current_user,
-    require_workspace_readable,
 )
 from apps.api.file_responses import (
     EntitySnapshotFileResponse as _ReadLockedFileResponse,
@@ -87,13 +86,14 @@ from packages.core.services.entity_fs import (
     append_log,
     write_entity_file_atomic,
 )
+from packages.core.services.file_refs import chat_upload_access
 from packages.core.services.knowledge_visibility import (
     is_user_visible_folder_path,
     is_user_visible_path,
     normalize_rel_path,
 )
 from packages.core.services.file_access_tokens import verify_file_access_token
-from packages.core.permissions import user_is_effective_entity_admin
+from packages.core.permissions import Permission, effective_user_has_permission
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +496,28 @@ async def _assert_path_readable(
         raise _file_not_found()
 
 
+async def _assert_raw_file_openable(
+    db: AsyncSession,
+    entity_id: str,
+    rel_path: str,
+    user: User,
+    *,
+    credential: AuthenticatedUserCredential | None = None,
+) -> None:
+    """A raw file opens when visible and Document-readable, or as a chat upload.
+
+    Chat uploads live in the hidden ``uploads/`` area, but the address handed
+    out for them must open: for the user who attached it, or under the
+    Document ACL when the upload is projected into Knowledge.
+    """
+    access = await chat_upload_access(db, entity_id=entity_id, user_id=user.id, fs_path=rel_path)
+    if access == "uploader":
+        return
+    if access is None and not is_user_visible_path(rel_path):
+        raise HTTPException(403, "Access denied")
+    await _assert_path_readable(db, entity_id, rel_path, user, credential=credential)
+
+
 _PUBLIC_RAW_PREFIXES: tuple[str, ...] = (
     "avatars/",
     # Files under this prefix are explicit Marketplace publication copies,
@@ -756,7 +778,8 @@ async def read_file(
     full = _resolve(user.entity_id, path)
     root = _entity_root(user.entity_id)
     rel = normalize_rel_path(os.path.relpath(full, root))
-    _assert_user_visible_rel(rel, is_dir=False, action="read")
+    if await chat_upload_access(db, entity_id=user.entity_id, user_id=user.id, fs_path=rel) is None:
+        _assert_user_visible_rel(rel, is_dir=False, action="read")
     def _read():
         if not os.path.isfile(full):
             return None
@@ -780,13 +803,13 @@ async def read_file(
         return {**meta, "content": base64.b64encode(data).decode("ascii"), "encoding": "base64"}
 
     async with _entity_filesystem_read_boundary(root):
-        await _assert_path_readable(
+        await _assert_raw_file_openable(
             db, user.entity_id, rel, user, credential=credential,
         )
         result = await asyncio.to_thread(_read)
         if result is None:
             raise HTTPException(404, f"File not found: {path}")
-        await _assert_path_readable(
+        await _assert_raw_file_openable(
             db, user.entity_id, rel, user, credential=credential,
         )
         return result
@@ -1066,7 +1089,11 @@ async def move_file(
                     detail="Move destination already exists; delete it explicitly before replacing it",
                 )
             if (
-                not await user_is_effective_entity_admin(db, user)
+                not await effective_user_has_permission(
+                    db,
+                    user,
+                    Permission.DOCS_MANAGE_ALL,
+                )
                 and os.path.dirname(src_rel) != os.path.dirname(dest_rel)
             ):
                 raise HTTPException(
@@ -1509,404 +1536,6 @@ async def resolve_wiki_links(
         return {"links": resolved, "file": path, "count": len(resolved)}
 
 
-def _looks_like_markdown_doc(*, name: str | None, file_type: str | None, mime_type: str | None = None, fs_path: str | None = None) -> bool:
-    ext_source = (fs_path or name or "").lower()
-    normalized_type = (file_type or "").lower().lstrip(".")
-    normalized_mime = (mime_type or "").lower()
-    return (
-        normalized_type in {"md", "markdown"}
-        or normalized_mime == "text/markdown"
-        or ext_source.endswith(".md")
-        or ext_source.endswith(".markdown")
-    )
-
-
-def _document_wiki_path(doc: Any) -> str | None:
-    fs_path = normalize_rel_path(getattr(doc, "fs_path", None) or "")
-    if fs_path:
-        return fs_path if is_user_visible_path(fs_path) else None
-
-    raw_name = normalize_rel_path(getattr(doc, "name", None) or "")
-    filename = os.path.basename(raw_name) or f"{getattr(doc, 'id', 'document')}.md"
-    if not filename.lower().endswith((".md", ".markdown")):
-        filename = f"{filename}.md"
-    if not is_user_visible_path(filename):
-        filename = f"{getattr(doc, 'id', 'document')}.md"
-    return normalize_rel_path(f"db-docs/{getattr(doc, 'id', 'document')}/{filename}")
-
-
-def _document_inline_markdown(doc: Any) -> str:
-    meta = getattr(doc, "metadata_", None)
-    if not isinstance(meta, dict):
-        return ""
-    for key in ("content", "content_text"):
-        value = meta.get(key)
-        if isinstance(value, str):
-            return value
-    return ""
-
-
-def _wiki_index_keys(*values: str | None) -> list[str]:
-    keys: list[str] = []
-    for value in values:
-        raw = normalize_rel_path(str(value or "").strip())
-        if not raw:
-            continue
-        variants = {raw, raw[:-3] if raw.lower().endswith(".md") else raw}
-        basename = os.path.basename(raw)
-        if basename:
-            variants.add(basename)
-            root, ext = os.path.splitext(basename)
-            if ext:
-                variants.add(root)
-        for variant in variants:
-            key = variant.strip().lower()
-            if key and key not in keys:
-                keys.append(key)
-    return keys
-
-
-def _merge_document_markdown_pages(graph: dict[str, Any], docs: list[Any]) -> None:
-    """Merge DB-backed markdown documents into the user-visible wiki graph."""
-    from packages.core.services.wiki_service import extract_wiki_links
-
-    raw_pages = graph.get("pages") if isinstance(graph, dict) else []
-    page_rows = [page for page in raw_pages if isinstance(page, dict)]
-    pages_by_path: dict[str, dict[str, Any]] = {
-        normalize_rel_path(str(page.get("path") or "")): page
-        for page in page_rows
-        if page.get("path")
-    }
-
-    for doc in docs:
-        if not _looks_like_markdown_doc(
-            name=getattr(doc, "name", None),
-            file_type=getattr(doc, "file_type", None),
-            mime_type=getattr(doc, "mime_type", None),
-            fs_path=getattr(doc, "fs_path", None),
-        ):
-            continue
-        path = _document_wiki_path(doc)
-        if not path:
-            continue
-        title = os.path.splitext(os.path.basename(getattr(doc, "name", None) or path))[0] or path
-        page = pages_by_path.get(path)
-        if page is None:
-            page = {
-                "path": path,
-                "title": title,
-                "links": [],
-                "backlinks": [],
-                "_inline_markdown": _document_inline_markdown(doc),
-            }
-            pages_by_path[path] = page
-        else:
-            page.setdefault("_inline_markdown", _document_inline_markdown(doc))
-        page["document_id"] = getattr(doc, "id", None)
-        page["document_name"] = getattr(doc, "name", None)
-        page["file_type"] = getattr(doc, "file_type", None)
-        page["vector_status"] = getattr(doc, "vector_status", None)
-
-    page_index: dict[str, str] = {}
-    for path, page in pages_by_path.items():
-        for key in _wiki_index_keys(path, page.get("title"), page.get("document_name")):
-            page_index.setdefault(key, path)
-
-    def resolve_target(target: str | None) -> str | None:
-        for key in _wiki_index_keys(target):
-            resolved = page_index.get(key)
-            if resolved:
-                return resolved
-        return None
-
-    for path, page in pages_by_path.items():
-        inline_markdown = page.pop("_inline_markdown", "")
-        if inline_markdown:
-            page["links"] = []
-            for target, display in extract_wiki_links(inline_markdown):
-                resolved_path = resolve_target(target)
-                page["links"].append({
-                    "target": target,
-                    "display": display,
-                    "resolved_path": resolved_path,
-                    "exists": resolved_path is not None,
-                })
-        else:
-            links = page.get("links") if isinstance(page.get("links"), list) else []
-            for link in links:
-                if not isinstance(link, dict):
-                    continue
-                if not link.get("resolved_path"):
-                    link["resolved_path"] = resolve_target(link.get("target"))
-                link["exists"] = bool(link.get("resolved_path") in pages_by_path)
-            page["links"] = links
-        page["backlinks"] = []
-
-    missing_by_target: dict[str, dict[str, Any]] = {}
-    link_count = 0
-    for path, page in pages_by_path.items():
-        for link in page.get("links", []):
-            if not isinstance(link, dict):
-                continue
-            link_count += 1
-            resolved_path = normalize_rel_path(str(link.get("resolved_path") or ""))
-            target_page = pages_by_path.get(resolved_path)
-            if target_page:
-                link["exists"] = True
-                link["resolved_path"] = resolved_path
-                link["document_id"] = target_page.get("document_id")
-                link["document_name"] = target_page.get("document_name")
-                backlink = {"source_path": path, "source_title": page.get("title")}
-                backlinks = target_page.setdefault("backlinks", [])
-                if backlink not in backlinks:
-                    backlinks.append(backlink)
-            else:
-                link["exists"] = False
-                target = str(link.get("target") or "").strip()
-                if target:
-                    row = missing_by_target.setdefault(target, {"target": target, "count": 0, "sources": []})
-                    row["count"] = int(row["count"]) + 1
-                    row["sources"].append({"path": path, "title": page.get("title")})
-
-    orphaned_pages = [
-        path
-        for path, page in pages_by_path.items()
-        if not page.get("backlinks") and os.path.basename(path) not in ("MANOR.md", "index.md", "log.md")
-    ]
-
-    graph["pages"] = sorted(pages_by_path.values(), key=lambda page: str(page.get("title") or "").lower())
-    graph["missing_links"] = sorted(missing_by_target.values(), key=lambda row: (-int(row["count"]), str(row["target"]).lower()))
-    graph["orphaned_pages"] = sorted(orphaned_pages)
-    graph["page_count"] = len(pages_by_path)
-    graph["link_count"] = link_count
-    graph["missing_count"] = len(missing_by_target)
-    graph["orphaned_count"] = len(orphaned_pages)
-
-
-@router.get("/wiki-index")
-async def wiki_index(
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-    net_id: str | None = Query(None, description="Optional Knowledge Net id. Alias for group_id."),
-    group_id: str | None = Query(None, description="Optional DocumentGroup/Knowledge Net id."),
-    workspace_id: str | None = Query(None, description="Optional workspace scope; uses that workspace's Knowledge Nets."),
-):
-    """Return the user-visible markdown wiki graph for navigation/search."""
-    credential = AuthenticatedUserCredential.from_user(user)
-    await require_workspace_readable(db, user, workspace_id)
-    _require_fs()
-    async with _entity_filesystem_read_boundary(_entity_root(user.entity_id)):
-        return await _wiki_index_consistent(
-            user=user,
-            db=db,
-            net_id=net_id,
-            group_id=group_id,
-            workspace_id=workspace_id,
-            credential=credential,
-        )
-
-
-async def _wiki_index_consistent(
-    *,
-    user: User,
-    db: AsyncSession,
-    net_id: str | None,
-    group_id: str | None,
-    workspace_id: str | None,
-    credential: AuthenticatedUserCredential | None = None,
-):
-    """Build the graph while its Document paths and physical files are stable."""
-
-    from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
-    from packages.core.services.document_access import DocumentAccessContext
-    from packages.core.services.wiki_service import build_wiki_graph
-
-    credential = credential or AuthenticatedUserCredential.from_user(user)
-    actor = await resolve_current_user_actor(db, credential)
-    if actor is None:
-        raise HTTPException(404, "Workspace not found")
-
-    def _split_ids(value: str | None) -> list[str]:
-        return [item.strip() for item in (value or "").split(",") if item.strip()]
-
-    requested_net_ids = list(dict.fromkeys([*_split_ids(net_id), *_split_ids(group_id)]))
-    if workspace_id and await ResourcePermissionGate.authorize_workspace_read(
-        db,
-        credential=credential,
-        workspace_id=workspace_id,
-    ) is None:
-        raise HTTPException(404, "Workspace not found")
-
-    access_ctx = await DocumentAccessContext.load(
-        db,
-        entity_id=user.entity_id,
-        user_id=user.id,
-        role=user.role,
-        _actor=actor,
-    )
-    allowed_paths: set[str] | None = None
-    allowed_doc_ids: set[str] | None = None
-    scope_group_ids: list[str] = []
-    if requested_net_ids or workspace_id:
-        group_stmt = select(DocumentGroup).where(DocumentGroup.entity_id == user.entity_id)
-        if requested_net_ids:
-            group_stmt = group_stmt.where(DocumentGroup.id.in_(requested_net_ids))
-        if workspace_id:
-            group_stmt = group_stmt.where(DocumentGroup.workspace_id == workspace_id)
-        groups = (await db.execute(group_stmt)).scalars().all()
-        for scoped_workspace_id in {
-            str(group.workspace_id)
-            for group in groups
-            if group.workspace_id
-        }:
-            if await ResourcePermissionGate.authorize_workspace_read(
-                db,
-                credential=credential,
-                workspace_id=scoped_workspace_id,
-            ) is None:
-                raise HTTPException(404, "Workspace not found")
-        scope_group_ids = [
-            group.id for group in groups
-            if not (group.settings or {}).get("workspace_file_bucket")
-        ]
-        if requested_net_ids and len(scope_group_ids) != len(requested_net_ids):
-            raise HTTPException(404, "Knowledge Net not found")
-        if scope_group_ids:
-            doc_rows = (await db.execute(
-                select(Document.id, Document.fs_path, Document.name, Document.file_type, Document.mime_type)
-                .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
-                .where(
-                    Document.entity_id == user.entity_id,
-                    DocumentGroupMember.group_id.in_(scope_group_ids),
-                    Document.is_trashed.is_(False),
-                )
-            )).all()
-            allowed_doc_ids = {
-                doc_id
-                for doc_id, fs_path, name, file_type, mime_type in doc_rows
-                if _looks_like_markdown_doc(name=name, file_type=file_type, mime_type=mime_type, fs_path=fs_path)
-            }
-            allowed_paths = {
-                normalize_rel_path(path)
-                for _doc_id, path, name, file_type, mime_type in doc_rows
-                if path and _looks_like_markdown_doc(name=name, file_type=file_type, mime_type=mime_type, fs_path=path)
-            }
-        else:
-            allowed_doc_ids = set()
-            allowed_paths = set()
-
-    graph = await asyncio.to_thread(build_wiki_graph, user.entity_id, allowed_paths=allowed_paths)
-    # Drop pages backed by a Knowledge document the caller cannot read, so the
-    # wiki graph never exposes a private document's name, links, or inline
-    # markdown to a same-entity member.
-    _graph_pages = graph.get("pages") if isinstance(graph, dict) else None
-    if isinstance(_graph_pages, list) and _graph_pages:
-        _page_paths = [
-            p.get("path") for p in _graph_pages if isinstance(p, dict) and p.get("path")
-        ]
-        _blocked_pages = await _unreadable_doc_paths(
-            db, user.entity_id, _page_paths, user, credential=credential,
-        )
-        if _blocked_pages:
-            readable_page_paths = {
-                normalize_rel_path(str(page.get("path") or ""))
-                for page in _graph_pages
-                if isinstance(page, dict)
-                and normalize_rel_path(str(page.get("path") or "")) not in _blocked_pages
-            }
-            # Rebuild instead of removing only page rows: backlinks, missing
-            # links, orphan paths, and counts are all derived from the page set.
-            graph = await asyncio.to_thread(
-                build_wiki_graph,
-                user.entity_id,
-                allowed_paths=readable_page_paths,
-            )
-    if requested_net_ids or workspace_id:
-        graph["scope"] = {
-            "kind": "knowledge_net" if requested_net_ids else "workspace",
-            "net_ids": scope_group_ids,
-            "workspace_id": workspace_id,
-        }
-    pages = graph.get("pages") if isinstance(graph, dict) else []
-    page_rows = pages if isinstance(pages, list) else []
-    paths = {
-        page.get("path")
-        for page in page_rows
-        if isinstance(page, dict) and page.get("path")
-    }
-    for page in page_rows:
-        if not isinstance(page, dict):
-            continue
-        for link in page.get("links", []):
-            if isinstance(link, dict) and link.get("resolved_path"):
-                paths.add(link["resolved_path"])
-
-    docs_by_path: dict[str, Any] = {}
-    if paths:
-        docs = (await db.execute(
-            select(Document).where(
-                Document.entity_id == user.entity_id,
-                Document.fs_path.in_(sorted(paths)),
-                Document.is_trashed.is_(False),
-            )
-        )).scalars().all()
-        await access_ctx.preload_documents(db, list(docs))
-        docs = [
-            doc
-            for doc in docs
-            if await access_ctx.can_read_document(db, doc)
-        ]
-        docs_by_path = {doc.fs_path: doc for doc in docs if doc.fs_path}
-
-    for page in page_rows:
-        if not isinstance(page, dict):
-            continue
-        doc = docs_by_path.get(page.get("path"))
-        if doc:
-            page["document_id"] = doc.id
-            page["document_name"] = doc.name
-            page["file_type"] = doc.file_type
-            page["vector_status"] = doc.vector_status
-        for link in page.get("links", []):
-            if not isinstance(link, dict):
-                continue
-            link_doc = docs_by_path.get(link.get("resolved_path"))
-            if link_doc:
-                link["document_id"] = link_doc.id
-                link["document_name"] = link_doc.name
-
-    doc_stmt = select(Document).where(
-        Document.entity_id == user.entity_id,
-        Document.is_trashed.is_(False),
-        or_(
-            Document.file_type.in_(("md", "markdown")),
-            Document.mime_type == "text/markdown",
-            Document.name.ilike("%.md"),
-            Document.name.ilike("%.markdown"),
-            Document.fs_path.ilike("%.md"),
-            Document.fs_path.ilike("%.markdown"),
-        ),
-    )
-    if allowed_doc_ids is not None:
-        if allowed_doc_ids:
-            doc_stmt = doc_stmt.where(Document.id.in_(allowed_doc_ids))
-        else:
-            doc_stmt = None
-    markdown_docs = (await db.execute(doc_stmt)).scalars().all() if doc_stmt is not None else []
-    await access_ctx.preload_documents(db, list(markdown_docs))
-    markdown_docs = [
-        doc
-        for doc in markdown_docs
-        if await access_ctx.can_read_document(db, doc, allow_redacted=False)
-    ]
-    _merge_document_markdown_pages(graph, list(markdown_docs))
-
-    if await resolve_current_user_actor(db, credential) != actor:
-        raise HTTPException(404, "Workspace not found")
-
-    return graph
-
-
 @router.get("/lint")
 async def lint_knowledge_base(
     user: User = Depends(get_current_user),
@@ -1914,8 +1543,8 @@ async def lint_knowledge_base(
 ):
     """Run knowledge base health check."""
     _require_fs()
-    if not await user_is_effective_entity_admin(db, user):
-        raise HTTPException(403, "Entity admin access required")
+    if not await effective_user_has_permission(db, user, Permission.DOCS_READ_ALL):
+        raise HTTPException(403, "Global Knowledge read permission required")
     from packages.core.services.wiki_service import lint_entity
     async with _entity_filesystem_read_boundary(_entity_root(user.entity_id)):
         result = await asyncio.to_thread(lint_entity, user.entity_id)
@@ -1965,6 +1594,17 @@ async def _assert_signed_entity_file_readable(
     payload = verify_file_access_token(token)
     if not payload:
         raise HTTPException(403, "Invalid or expired file token")
+    from packages.core.services.ai_file_permissions import guard_ai_file_read_access
+
+    if "conversation_id" in payload:
+        denied = await guard_ai_file_read_access(
+            entity_id=payload["entity_id"], user_id=payload["user_id"],
+            conversation_id=payload["conversation_id"], workspace_id=payload.get("workspace_id"),
+            tool_name="signed_chat_attachment", paths=[payload["path"]],
+        )
+        if denied:
+            raise _file_not_found()
+        return
     user_id = str(payload.get("user_id") or "").strip()
     if not user_id:
         # Legacy provider/media tokens remain exact-path, short-lived bearer
@@ -1983,6 +1623,33 @@ async def _assert_signed_entity_file_readable(
         raise _file_not_found()
 
 
+def _signed_chat_file_payload(token: str) -> dict[str, Any] | None:
+    payload = verify_file_access_token(token)
+    if not payload:
+        raise HTTPException(403, "Invalid or expired file token")
+    return payload if "conversation_id" in payload else None
+
+
+@asynccontextmanager
+async def _signed_chat_file_read_boundary(token: str, payload: dict[str, Any], db: AsyncSession):
+    """Pin approved bytes until the response has made its private snapshot."""
+    from packages.core.services.entity_fs import (
+        EntityFilesystemError, canonical_entity_root, open_entity_file_snapshot,
+    )
+
+    _require_fs()
+    async with _entity_filesystem_read_boundary(canonical_entity_root(payload["entity_id"])):
+        await _assert_signed_entity_file_readable(token, db)
+        try:
+            with open_entity_file_snapshot(
+                payload["entity_id"], payload["path"],
+                expected_content_sha256=payload["source_sha256"],
+            ) as snapshot:
+                yield snapshot
+        except (EntityFilesystemError, FileNotFoundError):
+            raise _file_not_found()
+
+
 @router.head("/public/{token}")
 @router.head("/public/{token}/{filename:path}")
 async def head_signed_entity_file(
@@ -1991,6 +1658,14 @@ async def head_signed_entity_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Allow media providers to preflight signed image URLs before GET."""
+    payload = _signed_chat_file_payload(token)
+    if payload:
+        async with _signed_chat_file_read_boundary(token, payload, db) as snapshot:
+            file_path = _Path(payload["path"])
+            content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            response_type, headers = _signed_file_response_metadata(file_path, content_type)
+            headers.update({"Cache-Control": "private, no-store", "Content-Length": str(snapshot.stat.st_size)})
+            return RawResponse(status_code=200, media_type=response_type, headers=headers)
     file_path, content_type, file_size = _resolve_signed_entity_file(token)
     await _assert_signed_entity_file_readable(token, db)
     response_type, headers = _signed_file_response_metadata(file_path, content_type)
@@ -2010,6 +1685,22 @@ async def serve_signed_entity_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Serve a short-lived signed file URL for external media providers."""
+    payload = _signed_chat_file_payload(token)
+    if payload:
+        read_boundary = _signed_chat_file_read_boundary(token, payload, db)
+        snapshot = await read_boundary.__aenter__()
+        try:
+            file_path = _Path(payload["path"])
+            content_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+            response_type, headers = _signed_file_response_metadata(file_path, content_type)
+            headers["Cache-Control"] = "private, no-store"
+            return _ReadLockedFileResponse(
+                path=snapshot.descriptor_path, media_type=response_type,
+                headers=headers, read_boundary=read_boundary,
+            )
+        except BaseException:
+            await read_boundary.__aexit__(None, None, None)
+            raise
     file_path, content_type, _file_size = _resolve_signed_entity_file(token)
     await _assert_signed_entity_file_readable(token, db)
     response_type, headers = _signed_file_response_metadata(file_path, content_type)
@@ -2076,7 +1767,9 @@ async def serve_entity_file(
         user, credential = authenticated
         if user.entity_id != entity_id:
             raise HTTPException(403, "Access denied")
-        if not is_user_visible_path(rel_path):
+        if not is_user_visible_path(rel_path) and await chat_upload_access(
+            db, entity_id=entity_id, user_id=user.id, fs_path=rel_path,
+        ) is None:
             raise HTTPException(403, "Access denied")
         read_boundary = _entity_filesystem_read_boundary(str(entity_root))
         await read_boundary.__aenter__()
@@ -2086,7 +1779,7 @@ async def serve_entity_file(
             # A Knowledge document served as raw bytes must still honor
             # Document.visibility — otherwise a same-entity member could fetch a
             # private file directly by URL.
-            await _assert_path_readable(
+            await _assert_raw_file_openable(
                 db,
                 entity_id,
                 rel_path,

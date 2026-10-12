@@ -1008,7 +1008,11 @@ def entity_account_display_name(row: Integration) -> str:
 
 
 def entity_account_has_credentials(row: Integration) -> bool:
-    return bool(row.credentials or row.credential_ref or entity_account_nango_connection_id(row))
+    return bool(
+        row.credentials or row.credential_ref or entity_account_nango_connection_id(row)
+        or (row.provider == "chrome" and (row.config or {}).get("transport") == "extension")
+    )
+
 
 
 def entity_account_nango_connection_id(row: Integration) -> str | None:
@@ -1397,6 +1401,15 @@ async def set_default_runtime_integration_account(
             account_id=account_id,
         ),
     )
+    if (
+        canonical_provider in {"email", "gmail", "outlook"}
+        and target.ownership is IntegrationAccountOwnership.MINE
+    ):
+        # One sender preference spans mail providers and connection storage types.
+        await _write_runtime_integration_account_preference(
+            db, user_id=user_id, entity_id=entity_id, provider="email_sender",
+            preference=RuntimeIntegrationAccountPreference(kind=resolved_kind, account_id=account_id),
+        )
     return True
 
 
@@ -1409,6 +1422,8 @@ async def _load_preferred_shared_runtime_account(
     provider: str,
 ) -> RuntimeIntegrationAccount | None:
     """Resolve an explicit shared default without promoting unrelated rows."""
+    if canonical_provider_key(provider) == "chrome":
+        return None
     if preference is None or not user_id:
         return None
     aliases = provider_key_aliases(canonical_provider_key(provider))
@@ -1781,10 +1796,18 @@ async def _load_runtime_integration_registry(
     entity_by_provider: dict[str, list[Integration]] = defaultdict(list)
     for row in oauth_rows:
         provider = canonical_provider_key(row.provider)
+        from packages.core.services.manor_integration_oauth import manor_oauth_account_matches
+
+        if provider == "chrome":
+            continue
+        if not manor_oauth_account_matches(row, entity_id=entity_id):
+            continue
         if provider and (requested is None or provider in requested):
             oauth_by_provider[provider].append(row)
     for row in entity_rows:
         provider = canonical_provider_key(row.provider)
+        if provider == "chrome" and row.owner_user_id != user_id:
+            continue
         if provider and (requested is None or provider in requested):
             entity_by_provider[provider].append(row)
 
@@ -2176,6 +2199,12 @@ async def load_integration_catalog_accounts(
         if row.id in known_ids:
             continue
         provider = canonical_provider_key(row.provider)
+        from packages.core.services.manor_integration_oauth import is_manor_oauth_provider, manor_oauth_binding
+
+        if provider == "chrome":
+            continue
+        if is_manor_oauth_provider(provider) and manor_oauth_binding(row).get("entity_id") != entity_id:
+            continue
         if not provider or (requested is not None and provider not in requested):
             continue
         if row.user_id != user_id and row.user_id not in active_shared_owner_ids:
@@ -2208,6 +2237,8 @@ async def load_integration_catalog_accounts(
         if row.id in known_ids:
             continue
         provider = canonical_provider_key(row.provider)
+        if provider == "chrome" and row.owner_user_id != user_id:
+            continue
         if not provider or (requested is not None and provider not in requested):
             continue
         if row.owner_user_id != user_id and row.owner_user_id not in active_shared_owner_ids:

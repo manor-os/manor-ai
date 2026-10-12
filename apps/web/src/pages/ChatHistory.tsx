@@ -1,3 +1,4 @@
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
 import { useState, useMemo, useRef, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
@@ -103,6 +104,7 @@ interface DetailMessage {
   content: string;
   tool_calls?: any[];
   assistant_blocks?: any[] | null;
+  hitl_requests?: Array<Record<string, any>> | null;
   stop_reason?: string | null;
   limit_detail?: any;
   timestamp?: string;
@@ -150,6 +152,7 @@ function MessagePanel({
             content: m.content || "",
             tool_calls: parseToolCalls(m.tool_calls),
             assistant_blocks: Array.isArray((m as any).assistant_blocks) ? (m as any).assistant_blocks : undefined,
+            hitl_requests: m.hitl_requests,
             stop_reason: m.stop_reason,
             limit_detail: m.limit_detail,
             timestamp: m.created_at,
@@ -341,6 +344,7 @@ function MessagePanel({
                           content={msg.content}
                           keyPrefix={`history-${i}`}
                           sourceMessageId={msg.id}
+                          hitlRequests={msg.hitl_requests}
                           responseSurfaceSubmissionReceipts={responseSurfaceSubmissionReceipts}
                         />
                       </div>
@@ -394,6 +398,7 @@ function ConversationSkeleton() {
 /* ── Main component — split layout ──────────────────────────────── */
 
 export default function ChatHistory() {
+  const catalogScope = useCatalogScope();
   const queryClient = useQueryClient();
 
   const [search, setSearch] = useState("");
@@ -413,8 +418,7 @@ export default function ChatHistory() {
 
   /* Fetch agents to resolve avatars & names in the list */
   const { data: agents = [] } = useQuery({
-    queryKey: ["agents"],
-    queryFn: () => api.agents.list(),
+    ...agentListQueryOptions(catalogScope),
   });
   const agentMap = useMemo(() => {
     const map: Record<string, { id: string; name: string; avatar_url?: string }> = {};

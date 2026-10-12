@@ -112,7 +112,10 @@ async def test_entity_settings_crud(client: AsyncClient):
     # New entities carry the default OSS/free plan setting.
     resp = await client.get("/api/v1/admin/settings", headers=headers)
     assert resp.status_code == 200
-    assert resp.json()["settings"] == {"plan": DEFAULT_PLAN_ID}
+    initial = resp.json()["settings"]
+    assert initial == {"plan": DEFAULT_PLAN_ID, "approval_defaults": {
+        "revision": 1, "policy": {"mode": "risk_based", "rules": []},
+    }}
 
     # Set some values
     resp = await client.put(
@@ -124,7 +127,7 @@ async def test_entity_settings_crud(client: AsyncClient):
         },
     )
     assert resp.status_code == 200
-    assert resp.json()["settings"] == {"plan": DEFAULT_PLAN_ID, "theme": "dark", "language": "en"}
+    assert resp.json()["settings"] == {**initial, "theme": "dark", "language": "en"}
 
     # Read back
     resp = await client.get("/api/v1/admin/settings", headers=headers)
@@ -204,10 +207,15 @@ async def test_entity_settings_are_read_from_the_transaction_not_cache(
 async def test_user_preferences_crud(client: AsyncClient):
     headers = await _auth(client)
 
-    # Initially empty
+    # Creation provisions one inherited personal approval branch.
     resp = await client.get("/api/v1/admin/preferences", headers=headers)
     assert resp.status_code == 200
-    assert resp.json()["preferences"] == {}
+    initial = resp.json()["preferences"]
+    assert set(initial) == {"approval_policy"}
+    branches = initial["approval_policy"]
+    assert len(branches) == 1
+    entity_id, binding = next(iter(branches.items()))
+    assert binding == {"root_entity_id": entity_id, "revision": 1, "policy": {"mode": None, "rules": []}}
 
     # Set preferences
     resp = await client.put(
@@ -220,6 +228,7 @@ async def test_user_preferences_crud(client: AsyncClient):
     )
     assert resp.status_code == 200
     prefs = resp.json()["preferences"]
+    assert prefs["approval_policy"] == initial["approval_policy"]
     assert prefs["sidebar_collapsed"] is True
     assert prefs["font_size"] == 14
 

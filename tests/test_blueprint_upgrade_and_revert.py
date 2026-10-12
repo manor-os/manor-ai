@@ -32,6 +32,8 @@ from packages.core.blueprints.freshness import (
     BLUEPRINT_SETTINGS_KEY,
     BLUEPRINT_VERSION_KEY,
     CONTENT_FINGERPRINT_KEY,
+    LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY,
+    LAST_PARTIAL_UPGRADE_VERSION_KEY,
     MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY,
     UPGRADE_UNSUPPORTED_FINGERPRINT_KEY,
     BlueprintFreshness,
@@ -39,12 +41,12 @@ from packages.core.blueprints.freshness import (
     blueprint_freshness,
     blueprint_upgrade_unsupported_fingerprint,
 )
-from packages.core.blueprints.solo_company import get_solo_company_blueprint
+from tests.blueprint_test_payload import load_upgrade_blueprint as load_test_blueprint
 from packages.core.blueprints.upgrade import (
+    RESTORE_POINT_KEY,
     BlueprintUpgradeAccessDeniedError,
     BlueprintUpgradeIncompleteError,
     BlueprintUpgradePlanChangedError,
-    RESTORE_POINT_KEY,
     UpgradeAction,
     apply,
     plan,
@@ -53,7 +55,13 @@ from packages.core.blueprints.upgrade import (
 from packages.core.models.base import generate_ulid
 from packages.core.models.blueprint import WorkspaceBlueprint
 from packages.core.models.channel import ChannelConfig
-from packages.core.models.document import Channel, Document, DocumentGroup, DocumentGroupMember
+from packages.core.models.document import (
+    Channel,
+    Document,
+    DocumentFolder,
+    DocumentGroup,
+    DocumentGroupMember,
+)
 from packages.core.models.skill import Skill
 from packages.core.models.workflow import (
     WorkflowBinding,
@@ -62,7 +70,8 @@ from packages.core.models.workflow import (
 )
 from packages.core.models.workspace import AgentSubscription, Workspace
 
-SLUG = "solo-video-account-studio-v1"
+SLUG = "test-workspace-upgrade"
+load_upgrade_blueprint = load_test_blueprint
 STALE_PROMPT = "You are a professional AI video producer specialising in stickman videos."
 
 
@@ -89,7 +98,7 @@ def test_workflow_reconcile_locks_mapping_and_definition_before_authorizing():
 
 @pytest.fixture
 def payload():
-    return get_solo_company_blueprint(SLUG)
+    return load_upgrade_blueprint(SLUG)
 
 
 async def _workspace(db_session, entity_id, *, installed_from):
@@ -161,6 +170,25 @@ async def test_unsupported_configuration_allows_safe_partial_component_upgrade(
     assert persisted[CONTENT_FINGERPRINT_KEY] == blueprint_content_fingerprint(
         scenario["older"]
     )
+    assert persisted[LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY] == (
+        blueprint_content_fingerprint(current)
+    )
+    assert persisted[LAST_PARTIAL_UPGRADE_VERSION_KEY] == "1.0.1"
+    assert blueprint_freshness(
+        workspace.settings,
+        current,
+        current_version="1.0.1",
+    ) is BlueprintFreshness.RECONFIGURE_REQUIRED
+
+    await revert(db_session, workspace=workspace)
+    reverted_record = workspace.settings[BLUEPRINT_SETTINGS_KEY]
+    assert LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY not in reverted_record
+    assert LAST_PARTIAL_UPGRADE_VERSION_KEY not in reverted_record
+    assert blueprint_freshness(
+        workspace.settings,
+        current,
+        current_version="1.0.1",
+    ) is BlueprintFreshness.UPDATE_AVAILABLE
 
 
 async def test_legacy_unknown_baseline_allows_safe_partial_upgrade(
@@ -328,6 +356,7 @@ async def _skill(db_session, entity_id, spec, *, prompt, revision=1):
         tools=list(spec.get("tools") or []),
         input_schema=dict(spec.get("input_schema") or {}),
         output_format=spec.get("output_format") or "text",
+        version=spec.get("version") or "1.0.0",
         config=dict(spec.get("config") or {}),
         revision=revision,
         status="active",
@@ -337,13 +366,246 @@ async def _skill(db_session, entity_id, spec, *, prompt, revision=1):
     return row
 
 
+async def _installed_workflows(
+    db_session,
+    *,
+    entity_id,
+    workspace,
+    workflow_specs,
+    source_blueprint_id,
+):
+    from packages.core.blueprints.installer import (
+        _install_workflow,
+        _install_workflow_binding,
+        blueprint_workflow_installation_source_id,
+    )
+    from packages.core.blueprints.workflow_dependencies import (
+        WorkflowDependencyFactory,
+    )
+
+    source_template_id = blueprint_workflow_installation_source_id(
+        source_blueprint_id,
+        workspace.id,
+    )
+    workflow_id_by_key = {}
+    for workflow_spec in workflow_specs:
+        workflow_id_by_key[workflow_spec["slug"]] = await _install_workflow(
+            db_session,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+            w=workflow_spec,
+            source_template_id=source_template_id,
+            source_version="1.0.0",
+            installed_by=None,
+            adopt_unmapped=False,
+        )
+
+    for workflow_spec in workflow_specs:
+        resolved_spec = copy.deepcopy(workflow_spec)
+        if WorkflowDependencyFactory.has_dependencies(
+            list(workflow_spec.get("steps") or [])
+        ):
+            resolved_spec["steps"] = WorkflowDependencyFactory.to_runtime(
+                list(workflow_spec.get("steps") or []),
+                workflow_id_by_key=workflow_id_by_key,
+            )
+            await _install_workflow(
+                db_session,
+                entity_id=entity_id,
+                workspace_id=workspace.id,
+                w=resolved_spec,
+                source_template_id=source_template_id,
+                source_version="1.0.0",
+                installed_by=None,
+                adopt_unmapped=False,
+            )
+        if workflow_spec.get("internal") is True:
+            continue
+        await _install_workflow_binding(
+            db_session,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+            workflow_id=workflow_id_by_key[workflow_spec["slug"]],
+            w=resolved_spec,
+            source_template_id=source_blueprint_id,
+        )
+
+
+def _single_workflow_payload(payload, *, version):
+    workflow = copy.deepcopy(payload["recipe"]["workflows"][0])
+    workflow["version"] = version
+    return {
+        "manifest": copy.deepcopy(payload["manifest"]),
+        "contract": {},
+        "embedded": {"skills": [], "agents": [], "knowledge_packs": []},
+        "recipe": {"workflows": [workflow]},
+        "policy": {},
+    }
+
+
+async def test_legacy_component_version_fingerprint_uses_installed_workflow_version(
+    db_session,
+    payload,
+):
+    older = _single_workflow_payload(payload, version=9)
+    current = _single_workflow_payload(payload, version=11)
+    workspace = await _workspace(
+        db_session,
+        "01TESTENTITY0000000000000L",
+        installed_from=older,
+    )
+    settings = copy.deepcopy(workspace.settings)
+    settings[BLUEPRINT_SETTINGS_KEY][UPGRADE_UNSUPPORTED_FINGERPRINT_KEY] = (
+        blueprint_upgrade_unsupported_fingerprint(
+            older,
+            include_component_versions=True,
+        )
+    )
+    workspace.settings = settings
+    await _installed_workflows(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace=workspace,
+        workflow_specs=older["recipe"]["workflows"],
+        source_blueprint_id=f"builtin:{SLUG}",
+    )
+    await db_session.flush()
+
+    preview = await plan(db_session, workspace=workspace, payload=current)
+
+    assert preview["unsupported_changes"] is False
+
+
+async def test_legacy_component_version_fingerprint_keeps_other_changes_unsupported(
+    db_session,
+    payload,
+):
+    older = _single_workflow_payload(payload, version=9)
+    current = _single_workflow_payload(payload, version=11)
+    current["policy"] = {"governance": {"max_risk_level": "low"}}
+    workspace = await _workspace(
+        db_session,
+        "01TESTENTITY0000000000000O",
+        installed_from=older,
+    )
+    settings = copy.deepcopy(workspace.settings)
+    settings[BLUEPRINT_SETTINGS_KEY][UPGRADE_UNSUPPORTED_FINGERPRINT_KEY] = (
+        blueprint_upgrade_unsupported_fingerprint(
+            older,
+            include_component_versions=True,
+        )
+    )
+    workspace.settings = settings
+    await _installed_workflows(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace=workspace,
+        workflow_specs=older["recipe"]["workflows"],
+        source_blueprint_id=f"builtin:{SLUG}",
+    )
+    await db_session.flush()
+
+    preview = await plan(db_session, workspace=workspace, payload=current)
+
+    assert preview["unsupported_changes"] is True
+
+
+async def test_blueprint_workflow_update_advances_version_and_revert_restores_it(
+    db_session,
+    payload,
+):
+    older = _single_workflow_payload(payload, version=9)
+    current = _single_workflow_payload(payload, version=11)
+    current["recipe"]["workflows"][0]["variables"].append({
+        "key": "release_marker",
+        "default": "v11",
+    })
+    workspace = await _workspace(
+        db_session,
+        "01TESTENTITY0000000000000M",
+        installed_from=older,
+    )
+    await _installed_workflows(
+        db_session,
+        entity_id=workspace.entity_id,
+        workspace=workspace,
+        workflow_specs=older["recipe"]["workflows"],
+        source_blueprint_id=f"builtin:{SLUG}",
+    )
+    await db_session.flush()
+
+    result = await apply(
+        db_session,
+        workspace=workspace,
+        payload=current,
+        current_version="1.0.1",
+    )
+    workflow = (await db_session.execute(
+        select(WorkflowDefinition).where(
+            WorkflowDefinition.workspace_id == workspace.id,
+        )
+    )).scalar_one()
+
+    assert result["fully_synchronized"] is True
+    assert workflow.version == 11
+
+    await revert(db_session, workspace=workspace)
+
+    assert workflow.version == 9
+
+
+async def test_blueprint_skill_update_reconciles_release_label_without_revision_bump(
+    db_session,
+    payload,
+):
+    skill_spec = copy.deepcopy(payload["embedded"]["skills"][0])
+    older = {
+        "manifest": copy.deepcopy(payload["manifest"]),
+        "contract": {},
+        "embedded": {
+            "skills": [{**skill_spec, "version": "1.0.0"}],
+            "agents": [],
+            "knowledge_packs": [],
+        },
+        "recipe": {"workflows": []},
+        "policy": {},
+    }
+    current = copy.deepcopy(older)
+    current["embedded"]["skills"][0]["version"] = "2.0.0"
+    workspace = await _workspace(
+        db_session,
+        "01TESTENTITY0000000000000N",
+        installed_from=older,
+    )
+    skill = await _skill(
+        db_session,
+        workspace.entity_id,
+        older["embedded"]["skills"][0],
+        prompt=skill_spec["system_prompt"],
+    )
+    skill.version = "1.0.0"
+    await db_session.flush()
+
+    result = await apply(
+        db_session,
+        workspace=workspace,
+        payload=current,
+        current_version="1.0.1",
+    )
+
+    assert result["fully_synchronized"] is True
+    assert skill.version == "2.0.0"
+    assert skill.revision == 1
+
+    await revert(db_session, workspace=workspace)
+
+    assert skill.version == "1.0.0"
+    assert skill.revision == 1
+
+
 @pytest.fixture
 async def scenario(db_session, payload):
     """The production shape: blueprint corrected, workspace still on the stub."""
-    from packages.core.blueprints.installer import (
-        _blueprint_workflow_definition_values,
-    )
-
     entity_id = "01TESTENTITY0000000000000A"
     older = copy.deepcopy(payload)
     older["embedded"]["skills"][0]["system_prompt"] = STALE_PROMPT
@@ -352,37 +614,13 @@ async def scenario(db_session, payload):
     skill = await _skill(
         db_session, entity_id, older["embedded"]["skills"][0], prompt=STALE_PROMPT,
     )
-    for workflow_spec in payload["recipe"]["workflows"]:
-        definition = WorkflowDefinition(
-            entity_id=entity_id,
-            revision=1,
-            **_blueprint_workflow_definition_values(workflow_spec),
-        )
-        db_session.add(definition)
-        await db_session.flush()
-        db_session.add(WorkflowTemplateInstallation(
-            entity_id=entity_id,
-            template_id=f"builtin:{SLUG}",
-            component_key=workflow_spec["slug"],
-            workflow_id=definition.id,
-            installed_version="1.0.0",
-            source_type="workspace_blueprint",
-            installation_metadata={"source_workflow_key": workflow_spec["slug"]},
-        ))
-        db_session.add(WorkflowBinding(
-            entity_id=entity_id,
-            workspace_id=ws.id,
-            workflow_id=definition.id,
-            name=workflow_spec.get("name") or workflow_spec["slug"],
-            trigger_type=workflow_spec["trigger_type"],
-            config={
-                "source": "blueprint",
-                "source_template_id": f"builtin:{SLUG}",
-                "workspace_blueprint_workflow_slug": workflow_spec["slug"],
-            },
-            enabled=True,
-            status="active",
-        ))
+    await _installed_workflows(
+        db_session,
+        entity_id=entity_id,
+        workspace=ws,
+        workflow_specs=older["recipe"]["workflows"],
+        source_blueprint_id=f"builtin:{SLUG}",
+    )
     await db_session.flush()
     return {"entity_id": entity_id, "workspace": ws, "skill": skill, "older": older}
 
@@ -763,7 +1001,7 @@ async def test_personalization_drift_outside_upgrade_scope_stays_partial(
 
 @pytest.fixture
 def opc_payload():
-    return get_solo_company_blueprint(SLUG)
+    return load_upgrade_blueprint(SLUG)
 
 
 @pytest.fixture
@@ -874,6 +1112,30 @@ async def test_an_archived_exact_blueprint_is_not_an_upgrade_release(
     assert resolved == {}
 
 
+@pytest.mark.parametrize("status", ["draft", "archived"])
+async def test_nonpublished_exact_blueprint_is_not_an_upgrade_release(
+    db_session, opc_payload, status,
+):
+    """A durable source must be published; slug aliases cannot reopen it."""
+    from apps.api.routers.workspaces import _blueprint_payloads_for
+
+    blueprint_id = f"01{status.upper():0<24}"
+    row = WorkspaceBlueprint(
+        id=blueprint_id, entity_id="01TESTENTITY0000000000000G", slug=SLUG,
+        title="Withdrawn Blueprint", payload=opc_payload, status=status,
+    )
+    workspace = Workspace(
+        entity_id="01TESTENTITY0000000000000G", name="Withdrawn source",
+        settings={BLUEPRINT_SETTINGS_KEY: {
+            BLUEPRINT_ID_KEY: blueprint_id, "blueprint_slug": SLUG,
+        }},
+    )
+    db_session.add_all([row, workspace])
+    await db_session.flush()
+
+    assert await _blueprint_payloads_for(db_session, [workspace]) == {}
+
+
 @pytest.mark.asyncio
 async def test_a_live_exact_blueprint_id_wins_over_a_matching_platform_slug(
     db_session, opc_payload,
@@ -923,29 +1185,280 @@ async def test_a_live_exact_blueprint_id_wins_over_a_matching_platform_slug(
 
 
 @pytest.mark.asyncio
-async def test_a_legacy_slug_only_install_gets_an_upgrade_plan(
-    db_session, workflow_scenario, opc_payload,
+async def test_a_legacy_slug_only_install_is_rejected_without_mutation(
+    db_session, workflow_scenario, monkeypatch,
 ):
-    """The API resolves the payload from the legacy slug and repairs its id
-    on apply; preview must not discard that already-resolved payload."""
+    """A display slug cannot authorize an upgrade or repair persisted state."""
+    from fastapi import HTTPException
+    from apps.api.routers import workspaces as routes
+
     workspace = workflow_scenario["workspace"]
     settings = copy.deepcopy(workspace.settings)
     settings[BLUEPRINT_SETTINGS_KEY].pop(BLUEPRINT_ID_KEY)
     workspace.settings = settings
     await db_session.flush()
-
-    result = await plan(
-        db_session,
-        workspace=workspace,
-        payload=opc_payload,
-        source_blueprint_id=f"builtin:{SLUG}",
+    before = copy.deepcopy(workspace.settings)
+    monkeypatch.setattr(
+        routes,
+        "_require_workspace_manage",
+        AsyncMock(return_value=workspace),
     )
 
-    workflow_item = next(
-        item for item in result["items"]
-        if item["slug"] == workflow_scenario["spec"]["slug"]
+    request = routes.BlueprintUpgradeApplyRequest(
+        expected_blueprint_fingerprint="reviewed-source",
     )
-    assert workflow_item["action"] == UpgradeAction.UPDATE.value
+    with pytest.raises(HTTPException) as error:
+        await routes.apply_blueprint_upgrade(
+            workspace.id,
+            request,
+            SimpleNamespace(id=generate_ulid(), entity_id=workspace.entity_id),
+            db_session,
+        )
+
+    assert error.value.status_code == 409
+    assert workspace.settings == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "blueprint_id", "published_status"),
+    [
+        ("raw_payload", "01RAWBLUEPRINT000000000001", None),
+        (None, None, None),
+        ("marketplace", None, None),
+        ("marketplace", "01MISSINGBLUEPRINT000000001", None),
+        ("marketplace", "01DRAFTBLUEPRINT00000000001", "draft"),
+        ("marketplace", "01ARCHIVEDBLUEPRINT000000001", "archived"),
+    ],
+)
+async def test_unbound_upgrade_endpoints_reject_before_planning_or_mutation(
+    db_session,
+    workflow_scenario,
+    opc_payload,
+    monkeypatch,
+    source,
+    blueprint_id,
+    published_status,
+):
+    """Only a published, durable source id can authorize any upgrade protocol."""
+    from fastapi import HTTPException
+    from apps.api.routers import workspaces as routes
+    from packages.core.blueprints import reconfigure, upgrade
+    from packages.core.services import reusable_resource_locks
+
+    workspace = workflow_scenario["workspace"]
+    record = copy.deepcopy(workspace.settings[BLUEPRINT_SETTINGS_KEY])
+    if source is None:
+        record.pop("source", None)
+    else:
+        record["source"] = source
+    if blueprint_id is None:
+        record.pop(BLUEPRINT_ID_KEY, None)
+    else:
+        record[BLUEPRINT_ID_KEY] = blueprint_id
+    workspace.settings = {BLUEPRINT_SETTINGS_KEY: record}
+    if published_status:
+        db_session.add(WorkspaceBlueprint(
+            id=blueprint_id,
+            entity_id=None,
+            slug=SLUG,
+            title="Unavailable Blueprint",
+            payload=opc_payload,
+            status=published_status,
+        ))
+    await db_session.flush()
+
+    before_settings = copy.deepcopy(workspace.settings)
+    before_steps = copy.deepcopy(workflow_scenario["definition"].steps)
+    plan = AsyncMock(return_value={})
+    apply = AsyncMock(return_value={})
+    invalidate = AsyncMock()
+    preflight = AsyncMock(return_value={"ready": True, "requirements": []})
+    monkeypatch.setattr(routes, "_require_workspace_read", AsyncMock(return_value=workspace))
+    monkeypatch.setattr(routes, "_require_workspace_manage", AsyncMock(return_value=workspace))
+    monkeypatch.setattr(reusable_resource_locks, "lock_reusable_resource_lifecycle", AsyncMock())
+    monkeypatch.setattr(upgrade, "plan", plan)
+    monkeypatch.setattr(upgrade, "apply", apply)
+    monkeypatch.setattr(reconfigure, "plan", plan)
+    monkeypatch.setattr(reconfigure, "apply", apply)
+    monkeypatch.setattr(routes, "_blueprint_upgrade_setup_preflight", preflight)
+    monkeypatch.setattr(reconfigure, "invalidate_after_legacy_upgrade", invalidate)
+    user = SimpleNamespace(id=generate_ulid(), entity_id=workspace.entity_id)
+    legacy_request = routes.BlueprintUpgradeApplyRequest(
+        expected_blueprint_fingerprint="reviewed-source",
+    )
+    v3_request = routes.BlueprintReconfigurationApplyRequest(
+        expected_blueprint_fingerprint="reviewed-source",
+        expected_plan_fingerprint="reviewed-plan",
+    )
+
+    endpoint_calls = [
+        lambda: routes.preview_blueprint_upgrade(workspace.id, user, db_session),
+        lambda: routes.preview_blueprint_upgrade_with_variables(
+            workspace.id,
+            routes.BlueprintUpgradePreviewRequest(),
+            user,
+            db_session,
+        ),
+        lambda: routes.apply_blueprint_upgrade(workspace.id, legacy_request, user, db_session),
+        lambda: routes.preview_blueprint_reconfiguration(workspace.id, user, db_session),
+        lambda: routes.preview_blueprint_reconfiguration_with_variables(
+            workspace.id,
+            routes.BlueprintUpgradePreviewRequest(),
+            user,
+            db_session,
+        ),
+        lambda: routes.apply_blueprint_reconfiguration(workspace.id, v3_request, user, db_session),
+    ]
+    for endpoint_call in endpoint_calls:
+        with pytest.raises(HTTPException) as error:
+            await endpoint_call()
+        assert error.value.status_code == 409
+        assert error.value.detail == "The source Blueprint is no longer available."
+
+    await db_session.refresh(workspace)
+    await db_session.refresh(workflow_scenario["definition"])
+    assert workspace.settings == before_settings
+    assert workflow_scenario["definition"].steps == before_steps
+    assert plan.await_count == 0
+    assert apply.await_count == 0
+    assert preflight.await_count == 0
+    assert invalidate.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_payload", [True, False])
+async def test_unbound_upgrade_http_endpoints_reject_without_persisted_mutation(
+    client,
+    db_session,
+    opc_payload,
+    raw_payload,
+):
+    """The routed API rejects unbound sources before any upgrade side effect."""
+    from packages.core.blueprints.installer import (
+        _blueprint_workflow_definition_values,
+    )
+
+    username = f"unbound-upgrade-http-{'raw' if raw_payload else 'legacy'}"
+    registration = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": username,
+            "email": f"{username}@test.local",
+            "password": "pass123",
+            "entity_name": "Unbound upgrade HTTP",
+        },
+    )
+    assert registration.status_code in (200, 201), registration.text
+    headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+    created = await client.post(
+        "/api/v1/workspaces",
+        headers=headers,
+        json={"name": "Unbound upgrade HTTP Workspace"},
+    )
+    assert created.status_code == 201, created.text
+    workspace = await db_session.get(Workspace, created.json()["id"])
+    assert workspace is not None
+    if raw_payload:
+        source_id = "01RAWHTTPBLUEPRINT0000000001"
+        workspace.settings = {
+            BLUEPRINT_SETTINGS_KEY: {
+                "source": "raw_payload",
+                BLUEPRINT_ID_KEY: source_id,
+            },
+        }
+        db_session.add(WorkspaceBlueprint(
+            id=source_id,
+            entity_id=workspace.entity_id,
+            slug="unbound-http-source",
+            title="Raw payload must remain unbound",
+            payload=opc_payload,
+            content_version="1.0.0",
+            status="published",
+        ))
+    else:
+        workspace.settings = {
+            BLUEPRINT_SETTINGS_KEY: {
+                BLUEPRINT_ID_KEY: None,
+                "blueprint_slug": SLUG,
+                BLUEPRINT_VERSION_KEY: "1.0.0",
+            },
+        }
+    definition = WorkflowDefinition(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        revision=1,
+        **_blueprint_workflow_definition_values(opc_payload["recipe"]["workflows"][0]),
+    )
+    db_session.add(definition)
+    await db_session.commit()
+    before_settings = copy.deepcopy(workspace.settings)
+    before_version = definition.version
+    before_steps = copy.deepcopy(definition.steps)
+
+    responses = [
+        await client.get(f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade", headers=headers),
+        await client.post(
+            f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade/preview",
+            headers=headers,
+            json={},
+        ),
+        await client.post(
+            f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade",
+            headers=headers,
+            json={"expected_blueprint_fingerprint": "reviewed-source"},
+        ),
+        await client.get(f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade/v3", headers=headers),
+        await client.post(
+            f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade/v3/preview",
+            headers=headers,
+            json={},
+        ),
+        await client.post(
+            f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade/v3",
+            headers=headers,
+            json={
+                "expected_blueprint_fingerprint": "reviewed-source",
+                "expected_plan_fingerprint": "reviewed-plan",
+            },
+        ),
+    ]
+    for response in responses:
+        assert response.status_code == 409, response.text
+        assert response.json()["detail"] == "The source Blueprint is no longer available."
+
+    await db_session.refresh(workspace)
+    await db_session.refresh(definition)
+    assert workspace.settings == before_settings
+    assert definition.version == before_version
+    assert definition.steps == before_steps
+
+
+@pytest.mark.asyncio
+async def test_explicit_builtin_id_resolves_a_legacy_platform_row(
+    db_session, opc_payload,
+):
+    """A stored builtin identity may find the platform's older stable row."""
+    from apps.api.routers.workspaces import _blueprint_payloads_for
+
+    legacy_id = "01LEGACYPLATFORMBLUEPRINT01"
+    legacy = WorkspaceBlueprint(
+        id=legacy_id, entity_id=None, slug=SLUG,
+        title="Legacy platform row", payload=opc_payload,
+        content_version="1.0.1", status="published",
+    )
+    workspace = Workspace(
+        entity_id=generate_ulid(), name="Stored builtin identity",
+        settings={BLUEPRINT_SETTINGS_KEY: {
+            BLUEPRINT_ID_KEY: f"builtin:{SLUG}", "blueprint_slug": "unrelated-display-slug",
+        }},
+    )
+    db_session.add_all([legacy, workspace])
+    await db_session.flush()
+
+    assert await _blueprint_payloads_for(db_session, [workspace]) == {
+        workspace.id: (opc_payload, "1.0.1", legacy_id),
+    }
 
 
 @pytest.mark.asyncio
@@ -1302,17 +1815,6 @@ async def test_an_unchanged_item_offers_nothing_to_read(db_session, scenario, pa
     assert item["new_content"] == {}
 
 
-def test_the_dialog_shows_the_new_version():
-    """The content has to reach the person confirming, not just the API."""
-    from pathlib import Path
-
-    body = Path(
-        "apps/web/src/components/blueprints/BlueprintUpgradeDialog.tsx"
-    ).read_text(encoding="utf-8")
-    assert "item.new_content" in body
-    assert "upgrade_show_new" in body
-
-
 @pytest.mark.asyncio
 async def test_the_plan_includes_stale_blueprint_workflows(
     db_session, workflow_scenario, opc_payload,
@@ -1427,6 +1929,13 @@ async def test_a_new_blueprint_workflow_is_installed_and_bound_on_upgrade(
         entity_id,
         installed_from=older,
     )
+    await _installed_workflows(
+        db_session,
+        entity_id=entity_id,
+        workspace=workspace,
+        workflow_specs=older["recipe"]["workflows"],
+        source_blueprint_id=f"builtin:{SLUG}",
+    )
 
     preview = await plan(
         db_session,
@@ -1437,6 +1946,7 @@ async def test_a_new_blueprint_workflow_is_installed_and_bound_on_upgrade(
         entry
         for entry in preview["items"]
         if entry["kind"] == "workflow"
+        and entry["slug"] == workflow_spec["slug"]
     )
     assert item["action"] == UpgradeAction.MISSING.value
     assert item["changes"] == ["installs Blueprint Flow and Workspace binding"]
@@ -1491,6 +2001,8 @@ async def test_a_new_blueprint_workflow_is_installed_and_bound_on_upgrade(
     assert await db_session.get(WorkflowDefinition, definition.id) is None
     assert await db_session.get(WorkflowBinding, binding.id) is None
     assert await db_session.get(WorkflowTemplateInstallation, installation.id) is None
+
+
 
 
 # ── Applying ──────────────────────────────────────────────────────────
@@ -2400,7 +2912,10 @@ async def test_applying_moves_the_installed_version_too(db_session, scenario, pa
     ws = scenario["workspace"]
     settings = dict(ws.settings)
     settings[BLUEPRINT_SETTINGS_KEY] = {
-        **settings[BLUEPRINT_SETTINGS_KEY], BLUEPRINT_VERSION_KEY: "1.0.0",
+        **settings[BLUEPRINT_SETTINGS_KEY],
+        BLUEPRINT_VERSION_KEY: "1.0.0",
+        LAST_PARTIAL_UPGRADE_VERSION_KEY: "1.0.1",
+        LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY: "previous-partial-release",
     }
     ws.settings = settings
 
@@ -2412,6 +2927,8 @@ async def test_applying_moves_the_installed_version_too(db_session, scenario, pa
 
     record = ws.settings[BLUEPRINT_SETTINGS_KEY]
     assert record[BLUEPRINT_VERSION_KEY] == "1.0.2"
+    assert LAST_PARTIAL_UPGRADE_FINGERPRINT_KEY not in record
+    assert LAST_PARTIAL_UPGRADE_VERSION_KEY not in record
     assert blueprint_freshness(
         ws.settings, payload, current_version="1.0.2",
     ) is BlueprintFreshness.CURRENT
@@ -2510,8 +3027,12 @@ async def test_upgrade_materializes_and_can_revert_legacy_inline_knowledge(
         .where(DocumentGroupMember.group_id == group.id)
     )).scalars().all())
     assert {row.name for row in rows} == {
+        document["path"].rsplit("/", 1)[-1] for document in pack["starter_documents"]
+    }
+    assert {row.metadata_["blueprint_starter_path"] for row in rows} == {
         document["path"] for document in pack["starter_documents"]
     }
+    assert all(row.folder_id for row in rows)
     assert all(row.metadata_.get("content_text") for row in rows)
 
     reverted = await revert(db_session, workspace=scenario["workspace"])
@@ -2525,7 +3046,7 @@ async def test_upgrade_materializes_and_can_revert_legacy_inline_knowledge(
 
 
 @pytest.mark.asyncio
-async def test_upgrade_binds_live_knowledge_template_without_overwriting_document(
+async def test_upgrade_binds_live_knowledge_template_to_legacy_marked_document(
     db_session, scenario, payload,
 ):
     """A Blueprint update may attach a renderer, but never replace operator text."""
@@ -2555,7 +3076,11 @@ async def test_upgrade_binds_live_knowledge_template_without_overwriting_documen
         entity_id=scenario["entity_id"],
         name=template_document["path"],
         source="blueprint",
-        metadata_={"content_text": "# Operator-owned Ledger notes"},
+        metadata_={
+            "content_text": "# Operator-owned Ledger notes",
+            "blueprint_knowledge_pack_slug": pack["slug"],
+            "blueprint_starter_path": template_document["path"],
+        },
     )
     db_session.add(legacy)
     await db_session.flush()
@@ -2586,6 +3111,263 @@ async def test_upgrade_binds_live_knowledge_template_without_overwriting_documen
     await revert(db_session, workspace=scenario["workspace"])
     assert legacy.metadata_["content_text"] == "# Operator-owned Ledger notes"
     assert "blueprint_template" not in legacy.metadata_
+
+
+@pytest.mark.asyncio
+async def test_upgrade_rejects_unproven_same_path_knowledge_document(
+    db_session, scenario, payload,
+):
+    """A filename alone cannot transfer Blueprint starter ownership."""
+    from packages.core.blueprints.installer import InstallError
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+
+    knowledge_payload = copy.deepcopy(payload)
+    knowledge_payload["embedded"]["skills"] = []
+    knowledge_payload["embedded"]["agents"] = []
+    knowledge_payload["recipe"]["workflows"] = []
+    pack = knowledge_payload["embedded"]["knowledge_packs"][0]
+    template_document = copy.deepcopy(pack["starter_documents"][0])
+    template_document["path"] = "notes.md"
+    template_document["template"] = {
+        "id": "unproven-live-projection",
+        "mode": "live_projection",
+        "renderer": "upgrade_test_projection",
+        "version": 1,
+    }
+    pack["starter_documents"] = [template_document]
+    group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    await ensure_workspace_document_folder(
+        db=db_session,
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        rel_path="other/notes.md",
+    )
+    unproven = Document(
+        entity_id=scenario["entity_id"],
+        name=template_document["path"],
+        folder_id=scenario["workspace"].artifact_folder_id,
+        source="blueprint",
+        metadata_={"content_text": "# Operator-owned Ledger notes"},
+    )
+    db_session.add_all([group, unproven])
+    await db_session.flush()
+    preview = await plan(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+    [knowledge_item] = [
+        item for item in preview["items"] if item["kind"] == "knowledge_document"
+    ]
+    assert knowledge_item["action"] == UpgradeAction.UPDATE.value
+
+    with pytest.raises(InstallError, match="occupied"):
+        await apply(
+            db_session,
+            workspace=scenario["workspace"],
+            payload=knowledge_payload,
+    )
+
+    assert unproven.metadata_ == {"content_text": "# Operator-owned Ledger notes"}
+    rows = list((await db_session.execute(
+        select(Document)
+        .where(
+            Document.entity_id == scenario["entity_id"],
+            Document.name == template_document["path"],
+        )
+    )).scalars().all())
+    assert rows == [unproven]
+
+
+@pytest.mark.asyncio
+async def test_upgrade_rejects_unproven_path_in_owned_target_folder(
+    db_session, scenario, payload,
+):
+    """Canonical path lookup follows the installer into an owned folder."""
+    from packages.core.blueprints.installer import InstallError
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+
+    knowledge_payload = copy.deepcopy(payload)
+    knowledge_payload["embedded"]["skills"] = []
+    knowledge_payload["embedded"]["agents"] = []
+    knowledge_payload["recipe"]["workflows"] = []
+    pack = knowledge_payload["embedded"]["knowledge_packs"][0]
+    template_document = copy.deepcopy(pack["starter_documents"][0])
+    template_document["path"] = "starter/notes.md"
+    pack["starter_documents"] = [template_document]
+    group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    await ensure_workspace_document_folder(
+        db=db_session,
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        rel_path="other/notes.md",
+    )
+    owned_folder = DocumentFolder(
+        id=generate_ulid(),
+        entity_id=scenario["entity_id"],
+        name="starter",
+        parent_id=scenario["workspace"].artifact_folder_id,
+        owner_id=generate_ulid(),
+        visibility="workspace",
+    )
+    unproven = Document(
+        entity_id=scenario["entity_id"],
+        name="notes.md",
+        folder_id=owned_folder.id,
+        source="blueprint",
+        metadata_={"content_text": "# Operator-owned notes"},
+    )
+    db_session.add_all([group, owned_folder, unproven])
+    await db_session.flush()
+
+    with pytest.raises(InstallError, match="occupied"):
+        await apply(
+            db_session,
+            workspace=scenario["workspace"],
+            payload=knowledge_payload,
+        )
+
+    assert unproven.metadata_ == {"content_text": "# Operator-owned notes"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_group", [True, False])
+async def test_upgrade_legacy_unprojected_path_stays_with_its_group(
+    db_session, scenario, payload, same_group,
+):
+    """A legacy full-path row is only an occupied path in its own pack."""
+    from packages.core.blueprints.installer import InstallError
+
+    knowledge_payload = copy.deepcopy(payload)
+    knowledge_payload["embedded"]["skills"] = []
+    knowledge_payload["embedded"]["agents"] = []
+    knowledge_payload["recipe"]["workflows"] = []
+    pack = knowledge_payload["embedded"]["knowledge_packs"][0]
+    template_document = copy.deepcopy(pack["starter_documents"][0])
+    template_document["path"] = "legacy/notes.md"
+    template_document["template"] = {
+        "id": "legacy-unprojected-path",
+        "mode": "live_projection",
+        "renderer": "upgrade_test_projection",
+        "version": 1,
+    }
+    pack["starter_documents"] = [template_document]
+    group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    other_group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name="Other legacy notes",
+        settings={"mode": "inline_text"},
+    )
+    legacy = Document(
+        entity_id=scenario["entity_id"],
+        name=template_document["path"],
+        metadata_={"content_text": "# Operator-owned legacy notes"},
+    )
+    db_session.add_all([group, other_group, legacy])
+    await db_session.flush()
+    db_session.add(DocumentGroupMember(
+        document_id=legacy.id,
+        group_id=group.id if same_group else other_group.id,
+    ))
+    await db_session.flush()
+
+    if same_group:
+        with pytest.raises(InstallError, match="occupied"):
+            await apply(
+                db_session,
+                workspace=scenario["workspace"],
+                payload=knowledge_payload,
+            )
+        assert legacy.metadata_ == {"content_text": "# Operator-owned legacy notes"}
+        return
+
+    await apply(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+    await db_session.refresh(legacy)
+    assert legacy.metadata_ == {"content_text": "# Operator-owned legacy notes"}
+    target_rows = list((await db_session.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(DocumentGroupMember.group_id == group.id)
+    )).scalars().all())
+    [starter] = target_rows
+    assert starter.id != legacy.id
+    assert starter.metadata_["blueprint_starter_path"] == template_document["path"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("starter_path", ["notes.md", "starter/notes.md"])
+async def test_upgrade_does_not_confuse_nested_starter_with_same_basename(
+    db_session, scenario, payload, starter_path,
+):
+    """A different folder's basename does not occupy the starter path."""
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+
+    knowledge_payload = copy.deepcopy(payload)
+    knowledge_payload["embedded"]["skills"] = []
+    knowledge_payload["embedded"]["agents"] = []
+    knowledge_payload["recipe"]["workflows"] = []
+    pack = knowledge_payload["embedded"]["knowledge_packs"][0]
+    template_document = copy.deepcopy(pack["starter_documents"][0])
+    template_document["path"] = starter_path
+    pack["starter_documents"] = [template_document]
+    group = DocumentGroup(
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    other_folder_id = await ensure_workspace_document_folder(
+        db=db_session,
+        entity_id=scenario["entity_id"],
+        workspace_id=scenario["workspace"].id,
+        rel_path="other/notes.md",
+    )
+    unproven = Document(
+        entity_id=scenario["entity_id"],
+        name="notes.md",
+        folder_id=other_folder_id,
+        source="blueprint",
+        metadata_={"content_text": "# Operator-owned notes"},
+    )
+    db_session.add_all([group, unproven])
+    await db_session.flush()
+    db_session.add(DocumentGroupMember(document_id=unproven.id, group_id=group.id))
+    await db_session.flush()
+
+    await apply(
+        db_session,
+        workspace=scenario["workspace"],
+        payload=knowledge_payload,
+    )
+
+    rows = list((await db_session.execute(
+        select(Document)
+        .join(DocumentGroupMember, DocumentGroupMember.document_id == Document.id)
+        .where(DocumentGroupMember.group_id == group.id)
+    )).scalars().all())
+    starter = next(row for row in rows if row.id != unproven.id)
+    assert unproven.metadata_ == {"content_text": "# Operator-owned notes"}
+    assert starter.metadata_["blueprint_starter_path"] == starter_path
 
 
 @pytest.mark.asyncio
@@ -2735,3 +3517,106 @@ async def test_reverting_a_preversion_restore_point_falls_back_to_fingerprints(
     assert blueprint_freshness(
         ws.settings, payload, current_version="1.0.2",
     ) is BlueprintFreshness.UPDATE_AVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_upgrade_http_collision_returns_conflict_and_rolls_back_prior_skill(
+    client, db_session, payload,
+):
+    """A routed collision rolls back an earlier component update."""
+    from packages.core.services.workspace_artifacts import ensure_workspace_document_folder
+
+    username = "blueprint-upgrade-collision"
+    registration = await client.post(
+        "/api/v1/auth/register",
+        json={
+            "username": username,
+            "email": f"{username}@test.local",
+            "password": "pass123",
+            "entity_name": "Blueprint upgrade collision",
+        },
+    )
+    assert registration.status_code in (200, 201), registration.text
+    headers = {"Authorization": f"Bearer {registration.json()['access_token']}"}
+    created = await client.post(
+        "/api/v1/workspaces", headers=headers, json={"name": "Collision Workspace"},
+    )
+    assert created.status_code == 201, created.text
+    workspace = await db_session.get(Workspace, created.json()["id"])
+    assert workspace is not None
+
+    source = copy.deepcopy(payload)
+    source["embedded"]["agents"] = []
+    source["recipe"]["workflows"] = []
+    pack = source["embedded"]["knowledge_packs"][0]
+    pack["starter_documents"] = [copy.deepcopy(pack["starter_documents"][0])]
+    pack["starter_documents"][0]["path"] = "notes.md"
+    older = copy.deepcopy(source)
+    stale_prompt = "Preserve this prompt when the request rolls back."
+    older["embedded"]["skills"][0]["system_prompt"] = stale_prompt
+    source_id = generate_ulid()
+    workspace.settings = {BLUEPRINT_SETTINGS_KEY: {
+        BLUEPRINT_ID_KEY: source_id,
+        "blueprint_slug": source["manifest"]["slug"],
+        CONTENT_FINGERPRINT_KEY: blueprint_content_fingerprint(older),
+    }}
+    db_session.add(WorkspaceBlueprint(
+        id=source_id,
+        entity_id=workspace.entity_id,
+        slug=source["manifest"]["slug"],
+        title="Collision source",
+        payload=source,
+        content_version="1.0.1",
+        status="published",
+    ))
+    skill = await _skill(
+        db_session,
+        workspace.entity_id,
+        source["embedded"]["skills"][0],
+        prompt=stale_prompt,
+    )
+    group = DocumentGroup(
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        name=pack["title"],
+        settings={"mode": "inline_text", "installed_from_blueprint_slug": pack["slug"]},
+    )
+    await ensure_workspace_document_folder(
+        db=db_session,
+        entity_id=workspace.entity_id,
+        workspace_id=workspace.id,
+        rel_path="other/notes.md",
+    )
+    occupant = Document(
+        entity_id=workspace.entity_id,
+        name="notes.md",
+        folder_id=workspace.artifact_folder_id,
+        metadata_={"content_text": "# Operator-owned collision"},
+    )
+    db_session.add_all([group, occupant])
+    await db_session.commit()
+    before_settings = copy.deepcopy(workspace.settings)
+
+    response = await client.post(
+        f"/api/v1/workspaces/{workspace.id}/blueprint/upgrade",
+        headers=headers,
+        json={"expected_blueprint_fingerprint": blueprint_content_fingerprint(source)},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "starter path 'notes.md'" in response.json()["detail"]
+    assert "occupied by an unproven document" in response.json()["detail"]
+    await db_session.refresh(skill)
+    await db_session.refresh(workspace)
+    await db_session.refresh(occupant)
+    assert skill.system_prompt == stale_prompt
+    assert workspace.settings == before_settings
+    assert occupant.metadata_ == {"content_text": "# Operator-owned collision"}
+    assert occupant.folder_id == workspace.artifact_folder_id
+    assert occupant.owner_id is None
+    assert not list((await db_session.execute(
+        select(DocumentGroupMember).where(DocumentGroupMember.group_id == group.id)
+    )).scalars().all())
+    assert not list((await db_session.execute(
+        select(DocumentGroupMember).where(DocumentGroupMember.document_id == occupant.id)
+    )).scalars().all())

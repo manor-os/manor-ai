@@ -6,9 +6,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
+from httpx import AsyncClient
 
+import packages.core.database as db_module
 from packages.core.blueprints.freshness import (
     BLUEPRINT_SETTINGS_KEY,
+    BLUEPRINT_VERSION_KEY,
     CONTENT_FINGERPRINT_KEY,
     MATERIALIZED_UPGRADE_UNSUPPORTED_FINGERPRINT_KEY,
     UPGRADE_UNSUPPORTED_FINGERPRINT_KEY,
@@ -34,6 +37,219 @@ from test_blueprint_draft_capabilities import _payload
 from test_blueprint_installer_workflows import _base_payload
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("status", ["draft", "archived"])
+async def test_raw_payload_same_slug_never_adopts_unpublished_platform_source(
+    db_session, status,
+):
+    """Raw JSON has no durable source unless it exactly matches a release."""
+    from apps.api.routers.blueprints import _published_platform_blueprint_matching_payload
+
+    payload = _base_payload()
+    payload["manifest"]["slug"] = "raw-source-test"
+    row = WorkspaceBlueprint(
+        id="builtin:raw-source-test", entity_id=None, slug="raw-source-test",
+        title="Raw source test", payload=copy.deepcopy(payload), status=status,
+    )
+    db_session.add(row)
+    await db_session.flush()
+
+    assert await _published_platform_blueprint_matching_payload(db_session, payload) is None
+
+
+async def test_raw_install_stays_unbound_when_a_platform_slug_is_published_later(
+    db_session,
+):
+    """Raw imports must not acquire an upgrade source from a display slug."""
+    from apps.api.routers.workspaces import _blueprint_payloads_for
+
+    entity_id = generate_ulid()
+    slug = "raw-install-no-source"
+    raw_payload = _base_payload()
+    raw_payload["manifest"]["slug"] = slug
+    raw_payload["recipe"]["operating_model"] = {"context": "Raw local setup"}
+    installed = await install_blueprint(
+        db_session, entity_id=entity_id, user_id=generate_ulid(),
+        payload=raw_payload, mode=InstallMode.SIMULATE, blueprint_slug=slug,
+    )
+    workspace = await db_session.get(Workspace, installed.workspace_id)
+    assert workspace.settings[BLUEPRINT_SETTINGS_KEY]["source"] == "raw_payload"
+
+    published_payload = copy.deepcopy(raw_payload)
+    published_payload["recipe"]["operating_model"] = {"context": "Published later"}
+    db_session.add(WorkspaceBlueprint(
+        id=f"builtin:{slug}", entity_id=None, slug=slug,
+        title="Published after raw import", payload=published_payload,
+        status="published",
+    ))
+    await db_session.flush()
+
+    assert await _blueprint_payloads_for(db_session, [workspace]) == {}
+
+
+@pytest.mark.parametrize("source", [None, "marketplace"])
+async def test_legacy_null_id_record_stays_unbound(
+    db_session, source,
+):
+    """No source marker can prove a null-ID record's release provenance."""
+    from apps.api.routers.workspaces import (
+        _blueprint_payloads_for,
+        _workspace_blueprint_id,
+    )
+
+    slug = "legacy-raw-source-collision"
+    raw_payload = _base_payload()
+    raw_payload["manifest"]["slug"] = slug
+    workspace = Workspace(
+        entity_id=generate_ulid(),
+        name="Legacy raw import",
+        settings={BLUEPRINT_SETTINGS_KEY: {
+            "blueprint_id": None, "blueprint_slug": slug,
+            **({"source": source} if source is not None else {}),
+        }},
+    )
+    published = WorkspaceBlueprint(
+        id=f"builtin:{slug}", entity_id=None, slug=slug,
+        title="Unrelated published release", payload=_base_payload(), status="published",
+    )
+    db_session.add_all([workspace, published])
+    await db_session.flush()
+
+    assert _workspace_blueprint_id(workspace.settings) == ""
+    assert await _blueprint_payloads_for(db_session, [workspace]) == {}
+
+
+@pytest.mark.parametrize("edited_section", ["recipe", "manifest"])
+async def test_install_payload_binds_only_an_exact_published_platform_release(
+    client: AsyncClient,
+    db_session,
+    edited_section,
+):
+    """Raw HTTP imports record provenance only for an exact public release."""
+    from packages.core.models.user import Entity
+    from test_document_permissions import _create_entity_user
+
+    slug = "exact-public-release"
+    release_id = f"builtin:{slug}"
+    release_payload = _base_payload(**{
+        "manifest.slug": slug,
+        "recipe.operating_model": {"context": "Published release"},
+    })
+    entity = Entity(name="Exact public payload", plan_id="plan_pro")
+    db_session.add_all([
+        entity,
+        WorkspaceBlueprint(
+            id=release_id,
+            entity_id=None,
+            slug=slug,
+            title="Exact public release",
+            payload=copy.deepcopy(release_payload),
+            content_version="2.4.6",
+            status="published",
+        ),
+    ])
+    await db_session.commit()
+
+    actor = await _create_entity_user(
+        entity.id,
+        "exact_public_payload",
+        role="owner",
+    )
+    headers = actor["headers"]
+    exact = await client.post(
+        "/api/v1/blueprints/install-payload",
+        headers=headers,
+        json={"payload": release_payload, "mode": "simulate"},
+    )
+    assert exact.status_code == 201, exact.text
+    assert exact.json()["blueprint_id"] == release_id
+
+    exact_workspace = await db_session.get(Workspace, exact.json()["workspace_id"])
+    exact_record = exact_workspace.settings[BLUEPRINT_SETTINGS_KEY]
+    assert exact_record["blueprint_id"] == release_id
+    assert exact_record["source"] == "marketplace"
+    assert exact_record[BLUEPRINT_VERSION_KEY] == "2.4.6"
+
+    edited_payload = copy.deepcopy(release_payload)
+    if edited_section == "manifest":
+        edited_payload["manifest"]["kind"] = "edited-kind"
+    else:
+        edited_payload["recipe"]["operating_model"] = {"context": "Edited raw import"}
+    edited = await client.post(
+        "/api/v1/blueprints/install-payload",
+        headers=headers,
+        json={"payload": edited_payload, "mode": "simulate"},
+    )
+    assert edited.status_code == 201, edited.text
+    assert edited.json()["blueprint_id"] is None
+
+    edited_workspace = await db_session.get(Workspace, edited.json()["workspace_id"])
+    assert edited_workspace.kind == edited_payload["manifest"]["kind"]
+    edited_record = edited_workspace.settings[BLUEPRINT_SETTINGS_KEY]
+    assert edited_record["blueprint_id"] is None
+    assert edited_record["blueprint_slug"] == slug
+    assert edited_record["source"] == "raw_payload"
+    assert edited_record[BLUEPRINT_VERSION_KEY] is None
+
+
+async def test_payload_preflight_validates_typed_setup_without_creating_workspace(
+    client: AsyncClient,
+):
+    """The preview is read-only, and install repeats its account validation."""
+    from test_document_permissions import _auth
+
+    headers = await _auth(client, "payload_preflight_contract")
+    me = await client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200, me.text
+    user = me.json()
+    payload = _base_payload(**{
+        "contract.variables": [
+            {"key": "workspace_name", "label": "Workspace name", "required": True},
+            {"key": "team_size", "label": "Team size", "default": 1},
+        ],
+        "contract.channels": [{
+            "channel_type": "telegram", "provider": "telegram", "required": True,
+        }],
+    })
+    async with db_module.async_session() as db:
+        account = ChannelConfig(
+            entity_id=user["entity_id"], owner_user_id=user["id"],
+            channel_type="telegram", provider="telegram", status="active",
+        )
+        db.add(account)
+        await db.commit()
+        account_id = account.id
+
+    missing = await client.post(
+        "/api/v1/blueprints/install-payload-preflight", headers=headers,
+        json={"payload": payload, "mode": "live"},
+    )
+    assert missing.status_code == 400, missing.text
+
+    selected = {"channel:0:telegram": account_id}
+    preview = await client.post(
+        "/api/v1/blueprints/install-payload-preflight", headers=headers,
+        json={"payload": payload, "mode": "live", "variable_values": {"workspace_name": "Support", "team_size": 2}, "channel_config_ids": selected},
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["ready"] is True
+    assert preview.json()["requirements"][0]["resource_id"] == account_id
+
+    async with db_module.async_session() as db:
+        account = await db.get(ChannelConfig, account_id)
+        account.status = "inactive"
+        await db.commit()
+
+    install = await client.post(
+        "/api/v1/blueprints/install-payload", headers=headers,
+        json={"payload": payload, "mode": "live", "variable_values": {"workspace_name": "Support", "team_size": 2}, "channel_config_ids": selected},
+    )
+    assert install.status_code == 409, install.text
+    async with db_module.async_session() as db:
+        assert not (await db.execute(select(Workspace.id).where(
+            Workspace.entity_id == user["entity_id"],
+        ))).scalars().all()
 
 
 @pytest.mark.parametrize("materialize", [True, False])

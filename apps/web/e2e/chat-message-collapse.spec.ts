@@ -6,17 +6,17 @@ test.beforeEach(async ({ page }) => {
 });
 
 test("short rendered replies stay open and both authors use reversible long-message controls", async ({ page }) => {
-  for (const id of ["short-ai", "long-source", "responsive", "streaming", "async"]) {
+  for (const id of ["short-ai", "moderate-ai", "long-source", "responsive", "streaming", "async"]) {
     await expect(page.locator(`#${id}`).getByRole("button")).toHaveCount(0);
   }
   for (const id of ["long-ai", "long-user"]) {
     const row = page.locator(`#${id}`);
-    const body = row.locator(".chat-sent-message-collapse__body");
+    const root = row.locator(".chat-sent-message-collapse");
     await expect(row.getByRole("button", { name: "Show all", exact: true })).toBeVisible();
-    const collapsedHeight = await body.evaluate((el) => el.clientHeight);
+    const collapsedHeight = await root.evaluate((el) => el.getBoundingClientRect().height);
     await row.getByRole("button", { name: "Show all", exact: true }).click();
     await expect(row.getByRole("button", { name: "Show less", exact: true })).toHaveAttribute("aria-expanded", "true");
-    expect(await body.evaluate((el) => el.clientHeight)).toBeGreaterThan(collapsedHeight);
+    expect(await root.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(collapsedHeight);
     await row.getByRole("button", { name: "Show less", exact: true }).click();
     await expect(row.getByRole("button", { name: "Show all", exact: true })).toHaveAttribute("aria-expanded", "false");
   }
@@ -55,4 +55,53 @@ test("long-message controls support keyboard activation", async ({ page }) => {
   await expect(row.getByRole("button", { name: "Show less", exact: true })).toHaveAttribute("aria-expanded", "true");
   await page.keyboard.press("Space");
   await expect(row.getByRole("button", { name: "Show all", exact: true })).toHaveAttribute("aria-expanded", "false");
+});
+
+for (const width of [1280, 390]) {
+  test(`historical final snapshots render once after refresh and expansion at ${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 });
+    const row = page.locator("#historical-final");
+    for (let load = 0; load < 2; load += 1) {
+      if (load) await page.reload();
+      await expect(row.locator(".chat-sent-message-collapse")).toHaveCount(1);
+      await expect(row.getByText("Canonical final answer.", { exact: true })).toHaveCount(1);
+      await expect(row.getByText("Obsolete working summary.", { exact: true })).toHaveCount(0);
+      await expect(row.getByText("Inspecting the brief.", { exact: true })).toBeVisible();
+      await expect(row.getByText("The brief has been checked.", { exact: true })).toBeVisible();
+      await row.getByRole("button", { name: "Show all", exact: true }).click();
+      await expect(row.getByRole("button", { name: "Show less", exact: true })).toHaveCount(1);
+      await expect(row.getByText("Canonical final answer.", { exact: true })).toHaveCount(1);
+      await row.getByRole("button", { name: "Show less", exact: true }).click();
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+    await row.screenshot({ path: testInfo.outputPath(`historical-final-${width}.png`) });
+  });
+}
+
+test("medium single-paragraph messages collapse without duplicating the middle", async ({ page }) => {
+  const row = page.locator("#medium-overlap");
+  const root = row.locator(".chat-sent-message-collapse");
+  await expect(row.getByRole("button", { name: "Show all", exact: true })).toBeVisible();
+  await expect(row.locator(".chat-sent-message-collapse__tail")).toBeHidden();
+  const collapsedText = await root.evaluate((el) => (el as HTMLElement).innerText);
+  expect((collapsedText.match(/ISRC\/UPC：未知/g) || []).length).toBe(1);
+  expect((collapsedText.match(/目标日：2026-10-25/g) || []).length).toBe(1);
+  const collapsedHeight = await root.evaluate((el) => el.getBoundingClientRect().height);
+  await row.getByRole("button", { name: "Show all", exact: true }).click();
+  await expect(row.getByRole("button", { name: "Show less", exact: true })).toHaveAttribute("aria-expanded", "true");
+  const expandedText = await root.evaluate((el) => (el as HTMLElement).innerText);
+  expect((expandedText.match(/ISRC\/UPC：未知/g) || []).length).toBe(1);
+  expect((expandedText.match(/目标日：2026-10-25/g) || []).length).toBe(1);
+  expect(await root.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(collapsedHeight);
+});
+
+test("collapsed preview keeps the trailing action block visible", async ({ page }) => {
+  const row = page.locator("#trailing-cta");
+  await expect(row.getByRole("button", { name: "Show all", exact: true })).toBeVisible();
+  const tail = row.locator(".chat-sent-message-collapse__tail");
+  await expect(tail).toBeVisible();
+  await expect(tail.getByText("Reply with the next file, or tell me to skip this step.", { exact: true })).toBeVisible();
+  await row.getByRole("button", { name: "Show all", exact: true }).click();
+  await expect(row.locator(".chat-sent-message-collapse__tail")).toHaveCount(0);
+  await expect(row.getByText("Reply with the next file, or tell me to skip this step.", { exact: true })).toBeVisible();
 });

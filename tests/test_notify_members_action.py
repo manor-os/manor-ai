@@ -55,15 +55,17 @@ def _make_member(entity_id: str, email: str) -> User:
     )
 
 
-@pytest.mark.asyncio
-async def test_notify_members_is_implemented_and_advertised():
+def test_notify_members_is_implemented_and_advertised():
     """Platform 'no placeholder tools' rule: the action must be dispatchable
     and surfaced by search (both derive from the same dispatcher source)."""
-    from packages.core.ai.tools.manor_tool import _ALL_ACTIONS, _search_actions
+    from packages.core.ai.tools.manor_tool import _ALL_ACTIONS, manor_action_manifests
 
     assert "notify_members" in _ALL_ACTIONS
     assert "notify_members" in _IMPLEMENTED_ACTIONS
-    surfaced = {hit["action"] for hit in _search_actions("notify members", max_results=50)}
+    surfaced = {
+        item["invoke_with"]["arguments"]["action"]
+        for item in manor_action_manifests()
+    }
     assert "notify_members" in surfaced
 
 

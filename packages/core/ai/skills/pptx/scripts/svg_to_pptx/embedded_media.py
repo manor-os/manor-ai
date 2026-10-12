@@ -147,6 +147,8 @@ def _resolve_local_path(value: Any, manifest_dir: Path, field: str) -> Path:
     if not path.is_absolute():
         path = manifest_dir / path
     path = path.resolve()
+    if not path.is_relative_to(manifest_dir.resolve()):
+        raise EmbeddedMediaSpecError(f"Video {field} must stay inside the current project")
     if not path.is_file():
         raise EmbeddedMediaSpecError(f"Video {field} does not exist: {path}")
     return path

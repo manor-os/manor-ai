@@ -1,8 +1,69 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from packages.core.ai.mcp import file_registrar
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_id", "workspace_id", "expected_visibility"),
+    [
+        ("user-1", None, "private"),
+        ("", "workspace-1", "private"),
+        ("", None, "private"),
+    ],
+)
+async def test_generated_url_visibility_matches_its_destination(
+    monkeypatch, user_id, workspace_id, expected_visibility,
+):
+    from packages.core import database
+    from packages.core.services import document_service, workspace_artifacts
+
+    captured = {}
+
+    class Db:
+        async def execute(self, _statement):
+            return self
+
+        def scalar_one_or_none(self):
+            return None
+
+        async def commit(self):
+            return None
+
+    class SessionContext:
+        async def __aenter__(self):
+            return Db()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def create_document(_db, _entity_id, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id="generated-document", vector_status=None)
+
+    async def ensure_workspace_folder(**_kwargs):
+        return "workspace-folder"
+
+    monkeypatch.setattr(database, "async_session", SessionContext)
+    monkeypatch.setattr(document_service, "create_document", create_document)
+    monkeypatch.setattr(
+        workspace_artifacts,
+        "ensure_workspace_document_folder",
+        ensure_workspace_folder,
+    )
+
+    assert await file_registrar._register_url(
+        "https://example.com/generated.pdf",
+        entity_id="entity-1",
+        user_id=user_id,
+        source="mcp",
+        origin={"workspace_id": workspace_id} if workspace_id else {},
+    )
+    assert captured["owner_id"] == (user_id or None)
+    assert captured["visibility"] == expected_visibility
 
 
 def test_extract_naming_context_prefers_tool_args_title() -> None:

@@ -25,6 +25,10 @@ import {
 import type { Agent, Task, User } from "../../lib/types";
 import { t } from "../../lib/i18n";
 import { formatUserFacingLabel, formatUserFacingStructuredText, friendlyPersonName, isAutomationIdentity } from "../../lib/taskDisplay";
+import { taskBlockerFromLog, taskBlockerView } from "../../lib/taskBlocker";
+import TaskBlockerNotice from "./TaskBlockerNotice";
+import TaskCommentResult from "./TaskCommentResult";
+import { taskCommentResult } from "../../lib/taskCommentDisplay";
 
 
 type Variant = "compact" | "full";
@@ -357,10 +361,13 @@ export default function TaskLogItem({
   const isReplan     = log.log_type === "ai_needs_replan";
   const isAIDone     = log.log_type === "ai_execution_completed";
   const isAIFail     = log.log_type === "ai_execution_failed";
+  const blocker = taskBlockerFromLog(log, task);
+  const blockerView = blocker ? taskBlockerView(blocker) : null;
   const isAIEvent    = isHitlReq || isHitlReminder || isHitlResume || isReplan || isAIDone || isAIFail;
   const lcfg = LOG_ICONS[log.log_type] || LOG_ICONS.comment;
 
-  const eventBadge = isHitlReq    ? { text: t("component.task_log_item.needs_input"), color: "#b27c34", bg: "#f3ecd6" }
+  const eventBadge = blockerView ? { text: blockerView.label, color: "var(--text-muted)", bg: "var(--chip-neutral-bg)" }
+                  : isHitlReq    ? { text: t("component.task_log_item.needs_input"), color: "#b27c34", bg: "#f3ecd6" }
                   : isHitlReminder ? { text: t("component.task_log_item.reminder"), color: "#b27c34", bg: "#f3ecd6" }
                   : isHitlResume ? { text: t("component.task_log_item.resumed"), color: "#4f7d75", bg: "#e5eeeb" }
                   : isReplan     ? { text: t("component.task_log_item.needs_replan"), color: "#b66a3c", bg: "#ffedd5" }
@@ -370,6 +377,7 @@ export default function TaskLogItem({
 
   const skipContent = log.content && log.content.startsWith("Attached ") && log.attachments?.length > 0;
   const diagnostics = diagnosticItems(log.meta);
+  const commentResult = taskCommentResult(log);
 
   return (
     <div id={sourceAnchorId} ref={rowRef} style={{
@@ -399,7 +407,9 @@ export default function TaskLogItem({
         {/* Header row: name · badges · timestamp */}
         <div style={{ display: "flex", alignItems: "center", gap: v.rowGap - 2, marginBottom: 3, flexWrap: "wrap" }}>
           <span style={{ fontSize: v.fontMeta, fontWeight: 600, color: "#292524" }}>
-            {isAIEvent && author.kind !== "agent" && author.kind !== "manor" ? t("page.workspace_detail.agent") : author.name}
+            {blocker && taskActorFromLog(log) === TASK_ACTORS.SYSTEM
+              ? t("component.task_blocker.system_check")
+              : isAIEvent && author.kind !== "agent" && author.kind !== "manor" ? t("page.workspace_detail.agent") : author.name}
           </span>
           {isStatus && (
             <span style={{ fontSize: 10, fontWeight: 600, color: lcfg.color, padding: "1px 6px", borderRadius: 4, background: `${lcfg.color}0d`, textTransform: "uppercase", letterSpacing: "0.03em" }}>
@@ -447,20 +457,25 @@ export default function TaskLogItem({
         )}
 
         {/* Content — markdown for non-status, italic for status events */}
-        {log.content && !skipContent && (
+        {blocker && <TaskBlockerNotice blocker={blocker} technicalReason={log.content} showStatus={false} />}
+        {!blocker && log.content && !skipContent && (
           isStatus ? (
             <p style={{ fontSize: v.fontMain, color: "#78716c", margin: 0, lineHeight: 1.5, fontStyle: "italic" }}>
               {formatUserFacingStructuredText(log.content)}
             </p>
           ) : (
             <div style={{ fontSize: v.fontMain, color: "#57534e", lineHeight: 1.6 }}>
-              <ChatMarkdown content={formatUserFacingStructuredText(log.content)} returnTo={sourceReturnTo} />
+              {commentResult ? (
+                <TaskCommentResult result={commentResult} raw={log.content} files={Array.isArray(task?.actual_output?.files) ? task.actual_output.files : []} returnTo={sourceReturnTo} />
+              ) : (
+                <ChatMarkdown content={formatUserFacingStructuredText(log.content)} returnTo={sourceReturnTo} />
+              )}
             </div>
           )
         )}
 
         {/* Execution diagnostics — only shown when backend emits correlation metadata. */}
-        {diagnostics.length > 0 && (
+        {!blocker && diagnostics.length > 0 && (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 4, marginTop: 6 }}>
             {diagnostics.map((item) => (
               <span

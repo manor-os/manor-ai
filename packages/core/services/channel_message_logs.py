@@ -20,8 +20,11 @@ async def create_channel_outbound_log(
     conversation_id: str | None = None,
     from_address: str | None = None,
     status: str = "queued",
+    flush: bool = True,
 ) -> MessageLog:
-    """Create the queued outbound log shared by channel delivery paths."""
+    """Stage a queued outbound log. Defer flush while awaiting a provider to
+    avoid checking out a connection before the receipt can be completed.
+    """
     log = MessageLog(
         entity_id=entity_id,
         channel_config_id=channel_config_id,
@@ -34,7 +37,8 @@ async def create_channel_outbound_log(
         status=status,
     )
     db.add(log)
-    await db.flush()
+    if flush:
+        await db.flush()
     return log
 
 

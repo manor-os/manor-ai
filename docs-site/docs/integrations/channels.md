@@ -15,7 +15,7 @@ same channel.
 | --- | --- | --- |
 | Telegram | Webhook **or** long-polling | `TELEGRAM_MODE=webhook\|polling\|auto`; `auto` uses webhooks when `PUBLIC_BASE_URL` is HTTPS, otherwise polls — so Telegram works on a laptop with no public URL. |
 | WhatsApp Business | Meta Cloud API webhook | Customer-owned WABA and business number through Meta Embedded Signup. |
-| SMS / Voice (Twilio) | Webhooks + Media Streams | Voice calls stream audio over a websocket to a live voice agent (Deepgram STT + TTS — see [Configuration](../configuration#channel-integrations)). |
+| SMS / Voice (Twilio) | Webhooks + Media Streams | Voice calls use native OpenAI Realtime over a WebSocket. Configure the Entity's **Primary AI** BYOK in Account → Models — see [Configuration](../configuration#live-voice-calls). |
 | WeChat Official Account | Fixed callback URL | Customer-service and template messages through the WeChat OA API. Configure the callback in plain-text mode with the complete URL shown on the Integration health card: `https://<public-host>/api/v1/channels/wechat/callback?config_id=<ChannelConfig ID>`. |
 | WeChat Personal | `wechat-runner` callback | The `wechat-runner` service bridges a personal-style WeChat session (scan the QR at `http://localhost:8801/qr.png`). |
 | Facebook Pages / Messenger | HMAC-verified webhook | Requires Meta app review for production scopes. |
@@ -31,6 +31,12 @@ by a Manor user and assigned a role (`external`, `member`, `admin`), which
 governs what tools the agent may use in that conversation. Some channels allow
 contact-level routing; WhatsApp Business always uses the one exact active
 Agent Binding for its connected number.
+
+Browser voice and Twilio voice use the same Entity BYOK model policy as Chat.
+Configure the speech providers as well as the model; a platform-only key does
+not make self-hosted voice healthy. Without SMTP, outbound email is unavailable
+but local documents, signatures and collaboration remain usable. Health/setup
+checks do not grant channel or tool permissions.
 
 ## WhatsApp Business Setup
 

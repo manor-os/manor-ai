@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from apps.api.deps import get_current_user
 from packages.core.constants.approvals import ApprovalStatus, is_governance_hitl
+from packages.core.constants.execution import COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY
 from packages.core.database import get_db
 from packages.core.humans import (
     get_or_create_profile,
@@ -57,6 +58,10 @@ from packages.core.models.user import User
 from packages.core.models.workspace import WorkspaceStaff
 from packages.core.models.workspace_event import WorkspaceEvent
 from packages.core.services.entity_service import get_workspace
+from packages.core.services.human_queue_resume import (
+    dispatch_strategist_for_cleared_human_queue as _dispatch_strategist_for_cleared_human_queue,
+    workspace_awaits_proposal_decision as _workspace_awaits_proposal_decision,
+)
 from packages.core.services.task_state_machine import TERMINAL_STATUSES
 
 # Rolling windows for the M14 view — both capped so the card stays light.
@@ -305,8 +310,23 @@ async def get_human_queue(
             HitlRequest.entity_id == user.entity_id,
             HitlRequest.workspace_id == workspace_id,
             HitlRequest.status == ApprovalStatus.PENDING,
+            ~HitlRequest.context.has_key(  # type: ignore[attr-defined]
+                COORDINATOR_OUTER_APPROVAL_CONTEXT_KEY
+            ),
         ).order_by(HitlRequest.created_at.asc())
     )).scalars().all())
+    # A coordinator child Runtime request is hidden from generic human queues
+    # even during the mint -> outer-card linking window. Its server-authored
+    # Step origin is durable before the context marker exists.
+    from packages.core.governance.approvals import (
+        is_coordinator_owned_nested_approval_durable,
+    )
+
+    approvals = [
+        request
+        for request in approvals
+        if not await is_coordinator_owned_nested_approval_durable(db, request)
+    ]
 
     assigned = list((await db.execute(
         select(Task).where(
@@ -608,7 +628,7 @@ async def respond_to_commitment(
             HumanCommitment.id == commitment_id,
             HumanCommitment.workspace_id == workspace_id,
             HumanCommitment.entity_id == user.entity_id,
-        ).limit(1)
+        ).limit(1).with_for_update().execution_options(populate_existing=True)
     )).scalar_one_or_none()
     if commitment is None:
         raise HTTPException(404, "Commitment not found")
@@ -635,14 +655,38 @@ async def respond_to_commitment(
                 f"(role_required={commitment.role_required})",
             )
 
+    status = "fulfilled" if req.action == "fulfill" else "declined"
     commitment = await resolve_commitment(
         db,
         commitment,
-        status="fulfilled" if req.action == "fulfill" else "declined",
+        status=status,
         response={"text": req.response} if req.response else None,
         participant_id=user.id,
     )
+    remaining_waiting = (await db.execute(
+        select(func.count()).select_from(HumanCommitment).where(
+            HumanCommitment.workspace_id == workspace_id,
+            HumanCommitment.entity_id == user.entity_id,
+            HumanCommitment.status == "waiting",
+        )
+    )).scalar_one()
+    awaits_proposal_decision = False
+    if remaining_waiting == 0:
+        awaits_proposal_decision = await _workspace_awaits_proposal_decision(
+            db, workspace_id,
+        )
     await db.commit()
+
+    if (
+        remaining_waiting == 0
+        and not awaits_proposal_decision
+    ):
+        _dispatch_strategist_for_cleared_human_queue(
+            workspace_id=workspace_id,
+            user_id=user.id,
+            commitment_id=commitment.id,
+            status=status,
+        )
 
     return CommitmentDigest(
         id=commitment.id,

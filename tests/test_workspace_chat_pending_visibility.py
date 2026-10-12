@@ -88,7 +88,9 @@ async def test_old_plan_thread_card_survives_main_chat_pagination(
         headers=headers, params={"limit": 75},
     )
     assert resp.status_code == 200, resp.text
-    items = resp.json()["items"]
+    body = resp.json()
+    assert body["conversation_id"] == main_id
+    items = body["items"]
 
     ids = {row["id"] for row in items}
     assert card_id in ids, "unresolved approval card was truncated off the first page"
@@ -137,6 +139,7 @@ async def test_plan_thread_card_is_visible_before_main_conversation_exists(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
+    assert body["conversation_id"] is None
     assert [row["id"] for row in body["items"]] == [card_id]
     assert body["open_action_count"] == 1
     assert body["open_actions_complete"] is True

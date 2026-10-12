@@ -96,7 +96,7 @@ function collectMediaCandidates(value: unknown, output: MediaCandidate[], depth 
   };
   if (candidate.url || candidate.documentId || candidate.jobId) output.push(candidate);
 
-  for (const key of ["result", "output", "artifact", "artifacts", "files", "images", "videos", "attachments", "data", "document", "params"]) {
+  for (const key of ["tool_call", "tool_calls", "result", "output", "artifact", "artifacts", "jobs", "files", "images", "videos", "attachments", "data", "document", "params"]) {
     if (record[key] != null) collectMediaCandidates(record[key], output, depth + 1);
   }
 }
@@ -107,6 +107,7 @@ async function readChatMediaStream(response: Response, signal?: AbortSignal) {
   const decoder = new TextDecoder();
   let buffer = "";
   let text = "";
+  let eventType = "";
   const candidates: MediaCandidate[] = [];
   const cancel = () => { void reader.cancel(); };
   signal?.addEventListener("abort", cancel, { once: true });
@@ -120,15 +121,27 @@ async function readChatMediaStream(response: Response, signal?: AbortSignal) {
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
+        if (line.startsWith("event: ")) {
+          eventType = line.slice(7).trim();
+          continue;
+        }
+        if (!line.trim()) {
+          eventType = "";
+          continue;
+        }
         if (!line.startsWith("data: ")) continue;
         const data = line.slice(6).trim();
         if (!data || data === "[DONE]") continue;
         try {
           const parsed = JSON.parse(data) as Record<string, unknown>;
+          if (eventType === "error") {
+            throw new Error(firstString(parsed, ["message", "error"]) || "Media generation failed.");
+          }
           const token = parsed.text_delta ?? parsed.token ?? parsed.content;
           if (typeof token === "string") text += token;
           collectMediaCandidates(parsed, candidates);
-        } catch {
+        } catch (error) {
+          if (eventType === "error") throw error;
           // A malformed progress frame must not discard a completed artifact.
         }
       }
@@ -188,6 +201,7 @@ export async function generateInsertableMedia(
   kind: InsertableMediaKind,
   prompt: string,
   signal?: AbortSignal,
+  videoAspectRatio: "16:9" | "9:16" | "1:1" = "16:9",
 ): Promise<InsertableMediaAsset> {
   const startedAt = Date.now();
   const response = await api.chat.stream(prompt.trim(), undefined, {
@@ -202,17 +216,25 @@ export async function generateInsertableMedia(
         model: "image_5_lite",
       }
       : {
-        generation_mode: VideoGenerationMode.AUTO,
-        aspect_ratio: "16:9",
+        // This dialog inserts one generated clip. AUTO may invoke the full
+        // video-edit skill and return a plan without creating a media job.
+        generation_mode: VideoGenerationMode.AI_VIDEO,
+        aspect_ratio: videoAspectRatio,
         resolution: "720p",
         clip_duration_seconds: 5,
         audio_policy: "native_if_supported",
         generate_audio: true,
       },
-    ephemeral: true,
+    // Ephemeral chat uses the restricted file-editor tool profile, which
+    // cannot call generate_file for video. A normal owner chat turn retains
+    // the media tool policy and records the generation request for recovery.
+    ephemeral: false,
   });
   const stream = await readChatMediaStream(response, signal);
   const candidates = [...stream.candidates];
+  if (candidates.length === 0) {
+    throw new Error("Manor did not start a media generation job. No video was created.");
+  }
   const jobId = [...candidates].reverse().find((candidate) => candidate.jobId)?.jobId;
   if (jobId) candidates.push(await pollMediaJob(jobId, signal));
   const document = await resolveGeneratedDocument(kind, candidates, startedAt);

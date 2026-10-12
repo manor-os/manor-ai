@@ -9,6 +9,24 @@ from packages.core.ai.runtime.profiles import RuntimeProfile
 
 RiskLevel = Literal["safe", "write", "external", "destructive", "financial", "admin"]
 
+# Canonical registry of the management tool *family*.  This is used to keep
+# capability visibility, approval policy, runtime-envelope injection, and
+# self-management blocking in sync.  It is not an Agent instance, schedule,
+# subscription, or delivery-destination configuration.
+AGENT_INITIATIVE_TOOL_NAMES = (
+    "create_agent_initiative",
+    "list_agent_initiatives",
+    "get_agent_initiative",
+    "update_agent_initiative",
+    "mute_agent_initiative",
+    "unmute_agent_initiative",
+    "pause_agent_initiative",
+    "resume_agent_initiative",
+    "delete_agent_initiative",
+    "run_agent_initiative_now",
+    "list_agent_initiative_runs",
+)
+
 _INTERNAL_PROFILES = (
     RuntimeProfile.OWNER_COPILOT,
     RuntimeProfile.AGENT_DELEGATE,
@@ -27,6 +45,18 @@ _VOICE_AND_EDITOR_PROFILES = (
     RuntimeProfile.VOICE_SAFE,
 )
 _ALL_RUNTIME_PROFILES = _INTERNAL_PROFILES + _CUSTOMER_SAFE_PROFILES + _VOICE_AND_EDITOR_PROFILES
+
+_TOOL_CAPABILITY_ALIAS_TARGETS = {
+    "sandbox_create": "sandbox",
+    "sandbox_exec": "sandbox",
+    "sandbox_status": "sandbox",
+    "sandbox_respond": "sandbox",
+    "sandbox_cancel": "sandbox",
+    "sandbox_read_file": "sandbox",
+    "sandbox_write_file": "sandbox",
+    "sandbox_save_result": "sandbox",
+    "sandbox_destroy": "sandbox",
+}
 
 
 @dataclass(frozen=True)
@@ -60,7 +90,14 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="runtime.discovery",
         name="Runtime discovery",
         description="Discover tools and skills that are visible in this runtime surface.",
-        tool_names=("search_tools", "list_skills", "get_skill_details"),
+        tool_names=("search_tools", "call_tool", "list_skills", "get_skill_details"),
+        profiles=_ALL_RUNTIME_PROFILES,
+    ),
+    "human.input": BusinessCapability(
+        id="human.input",
+        name="Ask the user",
+        description="Pause the current work to ask the user a question and continue with the answer.",
+        tool_names=("request_input",),
         profiles=_ALL_RUNTIME_PROFILES,
     ),
     "web.safe_search": BusinessCapability(
@@ -125,7 +162,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="workspace.operate",
         name="Workspace operation",
         description="Create tasks, update workspace rules, and request strategist review.",
-        tool_names=("workspace_agent", "workspace_operation", "workspace_resolve_hitl", "answer_task_blocker", "workspace_create_task"),
+        tool_names=("workspace_agent", "workspace_operation", "workspace_resolve_hitl", "answer_task_blocker", "workspace_create_task", "delegate_to_agent"),
         profiles=(RuntimeProfile.WORKSPACE_OPERATOR,),
         risk_level="write",
         required_approval=True,
@@ -263,7 +300,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="file.read",
         name="File read",
         description="Inspect files and locate matching file paths.",
-        tool_names=("read_file", "list_files", "glob_files", "grep_files"),
+        tool_names=("read_file", "list_files", "glob_files", "grep_files", "search_free_music"),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
             RuntimeProfile.AGENT_DELEGATE,
@@ -277,7 +314,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         id="file.write",
         name="File write",
         description="Create, edit, or generate workspace files.",
-        tool_names=("write_file", "edit_file", "patch_file", "generate_file"),
+        tool_names=("generate_file", "patch_file", "replace_file", "import_free_music"),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
             RuntimeProfile.AGENT_DELEGATE,
@@ -294,14 +331,8 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         name="Sandbox execution",
         description="Run isolated sandbox commands and exchange sandbox files.",
         tool_names=(
-            "sandbox_create",
-            "sandbox_exec",
-            "sandbox_read_file",
-            "sandbox_write_file",
-            "sandbox_save_result",
-            "sandbox_destroy",
+            "sandbox",
             "video_edit",
-            "coding_based_video",
         ),
         profiles=(
             RuntimeProfile.OWNER_COPILOT,
@@ -317,10 +348,16 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
     "automation.manage": BusinessCapability(
         id="automation.manage",
         name="Automation management",
-        description="Create, list, run, toggle, or cancel scheduled jobs.",
+        description=(
+            "Find eligible Agents and create, list/query, run, toggle, or cancel "
+            "background scheduled jobs. "
+            "Conversation-bound proactive updates are Agent Initiatives."
+        ),
         tool_names=(
+            "query_entity_agents",
             "create_scheduled_job",
             "list_scheduled_jobs",
+            "query_scheduled_jobs",
             "cancel_scheduled_job",
             "toggle_scheduled_job",
             "run_scheduled_job_now",
@@ -332,6 +369,19 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
             RuntimeProfile.WORKFLOW_STEP,
             RuntimeProfile.BACKGROUND_WORKER,
         ),
+        risk_level="admin",
+        required_approval=True,
+    ),
+    "initiative.manage": BusinessCapability(
+        id="initiative.manage",
+        name="Agent Initiative management",
+        description="Manage proactive rules for a private Agent or Manor Chat.",
+        tool_names=AGENT_INITIATIVE_TOOL_NAMES,
+        # Tool visibility uses one eager baseline for internal non-master
+        # agents. Non-chat runtime surfaces still fail closed in the handler,
+        # and Initiative-owned scheduled runs additionally block every
+        # mutation name in their durable driver envelope.
+        profiles=(RuntimeProfile.OWNER_COPILOT, RuntimeProfile.AGENT_DELEGATE),
         risk_level="admin",
         required_approval=True,
     ),
@@ -425,7 +475,6 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
         name="Workspace architect typed tools",
         description="Use typed draft-construction tools for workspace setup and repair.",
         tool_names=(
-            "ws_commit_creator_method",
             "ws_commit_basics",
             "ws_propose_service",
             "ws_propose_goal",
@@ -440,6 +489,7 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
             "ws_search_blueprints",
             "ws_suggest_blueprint",
             "ws_get_draft",
+            "ws_read_source",
             "ws_lint_draft",
             "ws_mark_ready",
         ),
@@ -450,10 +500,27 @@ CORE_CAPABILITIES: dict[str, BusinessCapability] = {
     "file.patch": BusinessCapability(
         id="file.patch",
         name="File patch proposal",
-        description="Inspect the current file context and propose a UI-confirmed patch.",
-        tool_names=("read_file", "list_files", "glob_files", "grep_files"),
+        description="Inspect the current file context and its native file-engine operations.",
+        tool_names=(
+            "read_file",
+            "list_files",
+            "glob_files",
+            "grep_files",
+            "inspect_file_engine",
+        ),
         profiles=(RuntimeProfile.FILE_EDITOR_PATCH,),
         risk_level="safe",
+    ),
+    "file.editor_write": BusinessCapability(
+        id="file.editor_write",
+        name="File editor write",
+        description=(
+            "Apply an approval-gated native patch to the exact file mounted by the active editor."
+        ),
+        tool_names=("patch_file",),
+        profiles=(RuntimeProfile.FILE_EDITOR_PATCH,),
+        risk_level="write",
+        required_approval=True,
     ),
 }
 
@@ -474,11 +541,15 @@ def capabilities_for_tool_names(
     *,
     profile: RuntimeProfile | None = None,
 ) -> list[BusinessCapability]:
+    canonical_names = {
+        _TOOL_CAPABILITY_ALIAS_TARGETS.get(name, name)
+        for name in tool_names
+    }
     matches: list[BusinessCapability] = []
     for capability in CORE_CAPABILITIES.values():
         if profile is not None and capability.profiles and profile not in capability.profiles:
             continue
-        if tool_names.intersection(capability.tool_names):
+        if canonical_names.intersection(capability.tool_names):
             matches.append(capability)
     return matches
 
@@ -512,7 +583,12 @@ def classified_tool_names_for_profile(
 ) -> set[str]:
     names: set[str] = set()
     for capability in capabilities_for_tool_names(tool_names, profile=profile):
-        names.update(name for name in capability.tool_names if name in tool_names)
+        names.update(
+            name
+            for name in tool_names
+            if _TOOL_CAPABILITY_ALIAS_TARGETS.get(name, name)
+            in capability.tool_names
+        )
     return names
 
 

@@ -7,12 +7,20 @@ from typing import Any
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.models.agent_initiative import (
+    AgentInitiative,
+    AgentInitiativeDelivery,
+    AgentInitiativeRun,
+    AgentInitiativeState,
+)
+from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig, ChannelContact
 from packages.core.models.notification import Notification, NotificationOutboxEvent
-from packages.core.models.workspace import Workspace
+from packages.core.models.task import Conversation, Message, Task
+from packages.core.models.workspace import Agent, AgentSubscription, Workspace
 from packages.core.services import notify as notify_module
 from packages.core.services import notification_scheduler
 from packages.core.services.channels import ADAPTERS
@@ -90,7 +98,258 @@ async def _link_telegram(db: AsyncSession, *, entity_id: str, user_id: str) -> C
     return contact
 
 
+async def _seed_agent_initiative_notification(
+    db: AsyncSession,
+    *,
+    ctx: dict,
+    initiative_status: str = "active",
+    workspace_status: str | None = None,
+    trigger_type: str = "scheduled",
+) -> dict[str, Any]:
+    """Persist one exact personal-Initiative Chat + Notification lineage."""
+
+    now = datetime.now(timezone.utc)
+    agent_id = generate_ulid()
+    subscription_id = generate_ulid()
+    conversation_id = generate_ulid()
+    initiative_id = generate_ulid()
+    run_id = generate_ulid()
+    task_id = generate_ulid()
+    message_id = generate_ulid()
+    notification_key = f"agent-initiative:{run_id}:notification"
+    workspace_id = None
+    if workspace_status:
+        workspace = Workspace(
+            entity_id=ctx["entity_id"], name="Initiative notification Workspace",
+            status=workspace_status,
+        )
+        db.add(workspace)
+        await db.flush()
+        workspace_id = workspace.id
+    agent = Agent(
+        id=agent_id,
+        entity_id=ctx["entity_id"],
+        owner_user_id=ctx["user_id"],
+        visibility="private",
+        name="Notification authority agent",
+        status="active",
+    )
+    subscription = AgentSubscription(
+        id=subscription_id,
+        entity_id=ctx["entity_id"],
+        agent_id=agent_id,
+        owner_user_id=ctx["user_id"],
+        workspace_id=workspace_id,
+        name="Notification authority deployment",
+        status="active",
+    )
+    conversation = Conversation(
+        id=conversation_id,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        agent_id=agent_id,
+        agent_subscription_id=subscription_id,
+        channel="web",
+        workspace_id=workspace_id,
+        scope="workspace_main" if workspace_id else "channel",
+        status="active",
+    )
+    initiative = AgentInitiative(
+        id=initiative_id,
+        entity_id=ctx["entity_id"],
+        agent_subscription_id=subscription_id,
+        owner_user_id=ctx["user_id"],
+        workspace_id=workspace_id,
+        name="External update",
+        instruction="Report a material update.",
+        trigger_kind="interval",
+        trigger_config={
+            "version": "1",
+            "kind": "interval",
+            "every_seconds": 3600,
+            "timezone": "UTC",
+        },
+        condition_config={"version": "1"},
+        decision_policy={"version": "1", "mode": "always"},
+        delivery_policy={
+            "version": "1",
+            "surface": {
+                "kind": "conversation",
+                "conversation_id": conversation_id,
+            },
+            "notification": {
+                "enabled": True,
+                "channels": ["telegram"],
+            },
+        },
+        interruption_policy={
+            "version": "1",
+            "quiet_hours": {"mode": "none"},
+        },
+        status=initiative_status,
+        revision=1,
+    )
+    run = AgentInitiativeRun(
+        id=run_id,
+        initiative_id=initiative_id,
+        task_id=task_id,
+        occurrence_key=f"{trigger_type}:{run_id}",
+        trigger_type=trigger_type,
+        status="succeeded",
+        candidate_decision={
+            "version": "1",
+            "decision": "notify",
+            "message": "Material update.",
+            "reason_code": "material_update",
+        },
+        final_decision="notify",
+        message="Material update.",
+        completed_at=now,
+        created_at=now,
+    )
+    task = Task(
+        id=task_id,
+        entity_id=ctx["entity_id"],
+        title="Agent Initiative run",
+        status="completed",
+        creator_id=ctx["user_id"],
+        workspace_id=workspace_id,
+        owner_subscription_id=subscription_id,
+        conversation_id=conversation_id,
+        details={
+            "agent_initiative": {
+                "version": "1",
+                "initiative_id": initiative_id,
+                "initiative_run_id": run_id,
+                "initiative_revision": 1,
+                "agent_subscription_id": subscription_id,
+                "owner_user_id": ctx["user_id"],
+            }
+        },
+    )
+    message = Message(
+        id=message_id,
+        conversation_id=conversation_id,
+        role="assistant",
+        content="Material update.",
+        meta={
+            "agent_initiative": True,
+            "initiative_id": initiative_id,
+            "initiative_run_id": run_id,
+            "decision": "notify",
+            "trigger_type": trigger_type,
+            "task_id": task_id,
+        },
+        response_surface_event_id=f"agent-initiative-run:{run_id}",
+        author_kind="agent",
+        author_subscription_id=subscription_id,
+        message_kind="agent_update",
+    )
+    surface = AgentInitiativeDelivery(
+        id=generate_ulid(),
+        initiative_run_id=run_id,
+        kind="conversation",
+        recipient_user_id=ctx["user_id"],
+        status="delivered",
+        idempotency_key=f"agent-initiative:{run_id}:conversation",
+        message_id=message_id,
+        attempt_count=1,
+        next_attempt_at=now,
+        delivered_at=now,
+    )
+    notification_delivery = AgentInitiativeDelivery(
+        id=generate_ulid(),
+        initiative_run_id=run_id,
+        kind="notification",
+        recipient_user_id=ctx["user_id"],
+        status="accepted",
+        idempotency_key=notification_key,
+        attempt_count=1,
+        next_attempt_at=now,
+        delivered_at=now,
+    )
+    db.add_all([agent, subscription, conversation])
+    await db.flush()
+    db.add(initiative)
+    await db.flush()
+    db.add_all([
+        AgentInitiativeState(initiative_id=initiative_id, version=1),
+        run,
+        task,
+        message,
+    ])
+    await db.flush()
+    db.add_all([surface, notification_delivery])
+    await db.commit()
+    await _link_telegram(
+        db,
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+    )
+
+    future = now + timedelta(minutes=10)
+    meta = {
+        "agent_id": agent_id,
+        "agent_subscription_id": subscription_id,
+        "initiative_id": initiative_id,
+        "initiative_run_id": run_id,
+        "message_id": message_id,
+        "task_id": task_id,
+    }
+    await notify_module.notify(
+        entity_id=ctx["entity_id"],
+        user_id=ctx["user_id"],
+        type="agent_initiative_update",
+        title="External update",
+        body="Material update.",
+        meta=meta,
+        channels=["telegram"],
+        deliver_at=future,
+        idempotency_key=notification_key,
+        workspace_id=workspace_id,
+    )
+    notification = (await db.execute(
+        select(Notification).where(Notification.idempotency_key == notification_key)
+    )).scalar_one()
+    outbox = (await db.execute(
+        select(NotificationOutboxEvent).where(
+            NotificationOutboxEvent.notification_id == notification.id,
+        )
+    )).scalar_one()
+    notification_delivery.notification_id = notification.id
+    await db.commit()
+    return {
+        "future": future,
+        "initiative": initiative,
+        "message": message,
+        "notification": notification,
+        "outbox": outbox,
+    }
+
+
 # ── Scheduling ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trigger_type", ["manual", "scheduled"])
+async def test_paused_workspace_only_delivers_exact_manual_initiative(
+    client, db_session, fake_telegram, trigger_type,
+):
+    ctx = await _register(client, f"initiative_paused_{trigger_type}")
+    seeded = await _seed_agent_initiative_notification(
+        db_session, ctx=ctx, workspace_status="paused", trigger_type=trigger_type,
+    )
+    claims, _ = await notification_scheduler._claim_outbox_events(
+        db_session, when=seeded["future"] + timedelta(seconds=1), batch_size=1,
+        notification_id=seeded["notification"].id,
+    )
+    event_id, token = claims[0]
+    outcome = await notification_scheduler._process_claimed_event(
+        db_session, event_id=event_id, claim_token=token,
+        when=seeded["future"] + timedelta(seconds=1),
+    )
+    assert outcome == ("dispatched" if trigger_type == "manual" else "canceled")
+    assert len(fake_telegram.sent) == (1 if trigger_type == "manual" else 0)
 
 
 @pytest.mark.asyncio
@@ -923,3 +1182,176 @@ async def test_cancel_scheduled_returns_false_for_already_dispatched(
         notification_id=row.id,
     )
     assert ok is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initiative_status", "expected_outcome", "expected_sends"),
+    [("active", "dispatched", 1), ("muted", "canceled", 0)],
+)
+async def test_agent_initiative_external_delivery_rechecks_lifecycle(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _Adapter,
+    initiative_status: str,
+    expected_outcome: str,
+    expected_sends: int,
+):
+    ctx = await _register(client, f"initiative_outbox_{initiative_status}")
+    seeded = await _seed_agent_initiative_notification(
+        db_session,
+        ctx=ctx,
+        initiative_status=initiative_status,
+    )
+    claims, _ = await notification_scheduler._claim_outbox_events(
+        db_session,
+        when=seeded["future"] + timedelta(seconds=1),
+        batch_size=1,
+        notification_id=seeded["notification"].id,
+    )
+    event_id, claim_token = claims[0]
+
+    outcome = await notification_scheduler._process_claimed_event(
+        db_session,
+        event_id=event_id,
+        claim_token=claim_token,
+        when=seeded["future"] + timedelta(seconds=1),
+    )
+
+    await db_session.refresh(seeded["notification"])
+    await db_session.refresh(seeded["outbox"])
+    assert outcome == expected_outcome
+    assert len(fake_telegram.sent) == expected_sends
+    assert seeded["notification"].dispatch_status == "dispatched"
+    assert seeded["outbox"].status == (
+        "delivered" if initiative_status == "active" else "canceled"
+    )
+    if initiative_status == "muted":
+        assert "initiative_muted" in (seeded["outbox"].last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_agent_initiative_external_delivery_rejects_forged_metadata(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _Adapter,
+):
+    ctx = await _register(client, "initiative_outbox_forged_meta")
+    seeded = await _seed_agent_initiative_notification(db_session, ctx=ctx)
+    forged_meta = dict(seeded["notification"].meta or {})
+    forged_meta["agent_subscription_id"] = generate_ulid()
+    seeded["notification"].meta = forged_meta
+    await db_session.commit()
+    claims, _ = await notification_scheduler._claim_outbox_events(
+        db_session,
+        when=seeded["future"] + timedelta(seconds=1),
+        batch_size=1,
+        notification_id=seeded["notification"].id,
+    )
+    event_id, claim_token = claims[0]
+
+    outcome = await notification_scheduler._process_claimed_event(
+        db_session,
+        event_id=event_id,
+        claim_token=claim_token,
+        when=seeded["future"] + timedelta(seconds=1),
+    )
+
+    await db_session.refresh(seeded["notification"])
+    await db_session.refresh(seeded["outbox"])
+    assert outcome == "canceled"
+    assert fake_telegram.sent == []
+    assert seeded["notification"].dispatch_status == "dispatched"
+    assert seeded["outbox"].status == "canceled"
+    assert "initiative_notification_lineage_mismatch" in (
+        seeded["outbox"].last_error or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_initiative_external_delivery_requires_durable_chat_message(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _Adapter,
+):
+    ctx = await _register(client, "initiative_outbox_missing_message")
+    seeded = await _seed_agent_initiative_notification(db_session, ctx=ctx)
+    await db_session.delete(seeded["message"])
+    await db_session.commit()
+    claims, _ = await notification_scheduler._claim_outbox_events(
+        db_session,
+        when=seeded["future"] + timedelta(seconds=1),
+        batch_size=1,
+        notification_id=seeded["notification"].id,
+    )
+    event_id, claim_token = claims[0]
+
+    outcome = await notification_scheduler._process_claimed_event(
+        db_session,
+        event_id=event_id,
+        claim_token=claim_token,
+        when=seeded["future"] + timedelta(seconds=1),
+    )
+
+    await db_session.refresh(seeded["outbox"])
+    assert outcome == "canceled"
+    assert fake_telegram.sent == []
+    assert seeded["outbox"].status == "canceled"
+    assert "initiative_notification_lineage_mismatch" in (
+        seeded["outbox"].last_error or ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_initiative_external_cancel_cannot_overwrite_newer_outbox_claim(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_telegram: _Adapter,
+    monkeypatch,
+):
+    from packages.core.services import agent_initiative_delivery as delivery_service
+
+    ctx = await _register(client, "initiative_outbox_stale_claim")
+    seeded = await _seed_agent_initiative_notification(db_session, ctx=ctx)
+    claims, _ = await notification_scheduler._claim_outbox_events(
+        db_session,
+        when=seeded["future"] + timedelta(seconds=1),
+        batch_size=1,
+        notification_id=seeded["notification"].id,
+    )
+    event_id, stale_token = claims[0]
+    successor_token = generate_ulid()
+
+    async def replace_claim_then_deny(db, **_kwargs):
+        await db.execute(
+            update(NotificationOutboxEvent)
+            .where(
+                NotificationOutboxEvent.id == event_id,
+                NotificationOutboxEvent.claim_token == stale_token,
+            )
+            .values(
+                status="processing",
+                claim_token=successor_token,
+                locked_until=seeded["future"] + timedelta(minutes=5),
+            )
+        )
+        await db.commit()
+        return False, "initiative_muted"
+
+    monkeypatch.setattr(
+        delivery_service,
+        "lock_agent_initiative_notification_delivery_authority",
+        replace_claim_then_deny,
+    )
+    outcome = await notification_scheduler._process_claimed_event(
+        db_session,
+        event_id=event_id,
+        claim_token=stale_token,
+        when=seeded["future"] + timedelta(seconds=1),
+    )
+
+    await db_session.refresh(seeded["outbox"])
+    assert outcome == "canceled"
+    assert fake_telegram.sent == []
+    assert seeded["outbox"].status == "processing"
+    assert seeded["outbox"].claim_token == successor_token

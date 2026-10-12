@@ -50,13 +50,13 @@ def test_french_locale_is_registered_globally() -> None:
     timestamp_source = (ROOT / "apps" / "web" / "src" / "components" / "chat" / "ChatTimestamp.tsx").read_text(encoding="utf-8")
     format_source = (ROOT / "apps" / "web" / "src" / "lib" / "format.ts").read_text(encoding="utf-8")
 
-    assert 'import fr from "./i18n/fr";' in source
+    assert 'fr: () => import("./i18n/fr")' in source
     assert '{ code: "fr", name: "Fran\\u00E7ais"' in source
     assert "normalizeLocale(localStorage.getItem" in api_source
     assert 'fr: "fr-FR"' in timestamp_source
     assert 'fr: "fr-FR"' in format_source
     assert 'fr: "fr"' in layout_source
-    assert '<span>{t("nav.support")}</span>' in layout_source
+    assert '<span>{t("component.user_guide.title")}</span>' in layout_source
 
 
 def test_french_core_ui_has_native_translations() -> None:

@@ -844,9 +844,11 @@ async def test_mcp_catalog_requires_reconnect_when_nango_connection_is_missing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot", [False, True])
 async def test_mcp_catalog_hides_private_accounts_until_the_owner_shares_them(
     client: AsyncClient,
     monkeypatch,
+    snapshot,
 ):
     from apps.api.routers import integrations as integration_router
     import packages.core.database as dbmod
@@ -855,6 +857,8 @@ async def test_mcp_catalog_hides_private_accounts_until_the_owner_shares_them(
     from packages.core.models.user import OAuthAccount, User, UserMembership
     from packages.core.services.auth_service import create_access_token, hash_password
     from packages.core.services.integration_access import grant_connection_use
+
+    catalog_url = "/api/v1/integrations/mcp-servers" + ("?snapshot=true" if snapshot else "")
 
     async def _no_nango_provider_configs(*args, **kwargs):
         return {}
@@ -917,7 +921,7 @@ async def test_mcp_catalog_hides_private_accounts_until_the_owner_shares_them(
 
         other_token = create_access_token(other_id, owner["entity_id"], "owner")
         before_share = await client.get(
-            "/api/v1/integrations/mcp-servers",
+            catalog_url,
             headers={"Authorization": f"Bearer {other_token}"},
         )
         assert before_share.status_code == 200, before_share.text
@@ -950,7 +954,7 @@ async def test_mcp_catalog_hides_private_accounts_until_the_owner_shares_them(
         await db.commit()
 
         after_share = await client.get(
-            "/api/v1/integrations/mcp-servers",
+            catalog_url,
             headers={"Authorization": f"Bearer {other_token}"},
         )
         shared_integrations = await client.get(
@@ -992,7 +996,7 @@ async def test_mcp_catalog_hides_private_accounts_until_the_owner_shares_them(
     assert selected.status_code == 204, selected.text
 
     selected_catalog = await client.get(
-        "/api/v1/integrations/mcp-servers",
+        catalog_url,
         headers={"Authorization": f"Bearer {other_token}"},
     )
     selected_linkedin = next(
@@ -1334,9 +1338,11 @@ async def test_mcp_catalog_lists_failed_entity_projection_for_management(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot", [False, True])
 async def test_mcp_catalog_lists_permission_blocked_entity_account(
     client: AsyncClient,
     monkeypatch,
+    snapshot,
 ):
     from apps.api.routers import integrations as integration_router
     import packages.core.database as dbmod
@@ -1382,7 +1388,7 @@ async def test_mcp_catalog_lists_permission_blocked_entity_account(
         await db.commit()
 
     response = await client.get(
-        "/api/v1/integrations/mcp-servers",
+        "/api/v1/integrations/mcp-servers" + ("?snapshot=true" if snapshot else ""),
         headers={"Authorization": f"Bearer {owner['access_token']}"},
     )
 

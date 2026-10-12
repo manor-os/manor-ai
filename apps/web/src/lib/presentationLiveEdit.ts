@@ -4,12 +4,22 @@ import {
   type PresentationTextEditSpan,
   type PresentationTextSourceMap,
 } from "./presentationTextEdits";
+import { isPresentationEditablePreset } from "./presentationPresetGeometry";
+import { isPresentationStrokeDash } from "./presentationShapeStyle";
 
-export const PRESENTATION_LIVE_EDIT_FORMAT = "manor-presentation-edit-v1";
+export const PRESENTATION_LIVE_EDIT_FORMAT = "manor-presentation-edit-v2";
+
+/** Browser-previewable insert subset, using canonical native operation identifiers. */
+export enum PresentationLiveInsertOperation {
+  TextboxInsert = "textbox.insert",
+  ShapeInsert = "shape.insert",
+  TableInsert = "table.insert",
+}
 
 export interface PresentationLiveEditText {
   text: string;
   sourceMap?: PresentationTextSourceMap;
+  sourceContainsField?: boolean;
   bold?: boolean;
   italic?: boolean;
   underline?: boolean;
@@ -33,17 +43,86 @@ export interface PresentationLiveEditText {
   }>;
   align?: string;
   bullet?: string;
+  indent?: number;
+  indentRight?: number;
+  hanging?: number;
+  lineSpacing?: number;
+  spaceBefore?: number;
+  spaceAfter?: number;
 }
 
 export interface PresentationLiveEditTableCell {
   text: string;
   sourceMap?: PresentationTextSourceMap;
+  bold?: boolean;
+  italic?: boolean;
+  fontSize?: number;
+  fontFamily?: string;
+  color?: string;
+  fill?: string;
+  gridSpan?: number;
+  vMerge?: boolean;
+}
+
+interface PresentationLiveGradient {
+  angle: number;
+  stops: Array<{ pos: number; color: string; alpha: number }>;
+}
+
+interface PresentationLiveShapeFormat {
+  fill?: string | null;
+  gradientFill?: PresentationLiveGradient | null;
+  opacity?: number;
+  stroke?: string | null;
+  strokeWidth?: number;
+  strokeDash?: string | null;
+  preset?: string;
+  borderRadius?: number;
+  shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number } | null;
+  verticalAlignment?: "top" | "middle" | "bottom";
+  wordWrap?: boolean;
+  padding?: { l: number; t: number; r: number; b: number };
 }
 
 interface PresentationLiveTextEdit {
   start: number;
   end: number;
   text: string;
+}
+
+interface PresentationLiveTextFormat {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  fontSize?: number;
+  color?: string;
+  fontFamily?: string;
+  align?: string;
+  bullet?: string | null;
+  indent?: number;
+  indentRight?: number;
+  hanging?: number;
+  lineSpacing?: number;
+  spaceBefore?: number;
+  spaceAfter?: number;
+  baseline?: number;
+  spacing?: number;
+}
+
+interface PresentationLiveParagraphState {
+  index: number;
+  text: string;
+  edits?: PresentationLiveTextEdit[];
+  format?: PresentationLiveTextFormat;
+}
+
+interface PresentationLiveTableCellState {
+  row: number;
+  column: number;
+  text: string;
+  edits?: PresentationLiveTextEdit[];
+  format?: Pick<PresentationLiveEditTableCell, "bold" | "italic" | "fontSize" | "fontFamily" | "color" | "fill">;
 }
 
 export interface PresentationLiveEditShape {
@@ -56,18 +135,37 @@ export interface PresentationLiveEditShape {
   rotation?: number;
   flipH?: boolean;
   flipV?: boolean;
+  fill?: string;
+  gradFill?: PresentationLiveGradient;
+  opacity?: number;
+  stroke?: string;
+  strokeWidth?: number;
+  strokeDash?: string;
+  presetGeom?: string;
+  borderRadius?: number;
+  shadow?: { blur: number; dist: number; angle: number; color: string; alpha: number };
+  vAlign?: "top" | "middle" | "bottom";
+  wordWrap?: boolean;
+  padding?: { l: number; t: number; r: number; b: number };
   imgCrop?: { l: number; t: number; r: number; b: number };
   imgUrl?: string;
   graphicPreviewUrl?: string;
   texts: PresentationLiveEditText[];
   tableRows?: PresentationLiveEditTableCell[][];
-  source?: { editable: boolean; mediaPart?: string };
+  source?: {
+    editable: boolean;
+    kind?: "sp" | "pic" | "cxnSp" | "graphicFrame";
+    mediaPart?: string;
+    /** Present for group members: x/y/w/h are then in the group's child coordinate space. */
+    groupTransform?: unknown;
+  };
 }
 
 export interface PresentationLiveEditSlide {
   id: string;
   aspectRatio?: string;
   bg?: string;
+  bgGrad?: PresentationLiveGradient;
   notes?: string;
   sourcePart?: string;
   notesPart?: string;
@@ -179,6 +277,8 @@ interface PresentationLiveShapeState {
   id: string;
   type: string;
   editable: boolean;
+  /** Grouped objects: geometry is group-relative and cannot be changed by an AI edit. */
+  geometryLocked?: boolean;
   fullSlide: boolean;
   x: number;
   y: number;
@@ -187,8 +287,10 @@ interface PresentationLiveShapeState {
   rotation: number;
   flipH: boolean;
   flipV: boolean;
-  paragraphs?: Array<{ index: number; text: string; edits?: PresentationLiveTextEdit[] }>;
-  table?: Array<Array<{ row: number; column: number; text: string; edits?: PresentationLiveTextEdit[] }>>;
+  create?: { operation: PresentationLiveInsertOperation };
+  format?: PresentationLiveShapeFormat;
+  paragraphs?: PresentationLiveParagraphState[];
+  table?: PresentationLiveTableCellState[][];
   image?: {
     attachedAs?: string;
     crop: { l: number; t: number; r: number; b: number };
@@ -202,6 +304,7 @@ interface PresentationLiveSlideState {
   slideNumber: number;
   active: boolean;
   notes?: string;
+  background?: { color?: string | null; gradient?: PresentationLiveGradient | null };
   create?: {
     layout: PresentationSlideLayout;
     title?: string;
@@ -230,8 +333,85 @@ function clamp(value: unknown, min: number, max: number, fallback: number): numb
   return Math.min(max, Math.max(min, finiteNumber(value, fallback)));
 }
 
+function liveEditString(value: unknown, maxLength = 1_000): string | null {
+  return typeof value === "string"
+    && value.length <= maxLength
+    && !/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(value)
+    ? value
+    : null;
+}
+
+function presentationTextFormat(text: PresentationLiveEditText): PresentationLiveTextFormat | undefined {
+  const format: PresentationLiveTextFormat = {};
+  for (const key of ["bold", "italic", "underline", "strikethrough"] as const) {
+    if (typeof text[key] === "boolean") format[key] = text[key];
+  }
+  for (const key of ["fontSize", "indent", "indentRight", "hanging", "lineSpacing", "spaceBefore", "spaceAfter", "baseline", "spacing"] as const) {
+    if (typeof text[key] === "number" && Number.isFinite(text[key])) format[key] = text[key];
+  }
+  for (const key of ["color", "fontFamily", "align"] as const) {
+    if (typeof text[key] === "string") format[key] = text[key];
+  }
+  if (typeof text.bullet === "string") format.bullet = text.bullet;
+  return Object.keys(format).length > 0 ? format : undefined;
+}
+
+function presentationTableCellFormat(
+  cell: PresentationLiveEditTableCell,
+): PresentationLiveTableCellState["format"] | undefined {
+  const format: NonNullable<PresentationLiveTableCellState["format"]> = {};
+  for (const key of ["bold", "italic"] as const) {
+    if (typeof cell[key] === "boolean") format[key] = cell[key];
+  }
+  if (typeof cell.fontSize === "number" && Number.isFinite(cell.fontSize)) format.fontSize = cell.fontSize;
+  for (const key of ["fontFamily", "color", "fill"] as const) {
+    if (typeof cell[key] === "string") format[key] = cell[key];
+  }
+  return Object.keys(format).length > 0 ? format : undefined;
+}
+
+function presentationShapeFormat(shape: PresentationLiveEditShape): PresentationLiveShapeFormat {
+  return {
+    fill: shape.fill ?? null,
+    gradientFill: shape.gradFill ?? null,
+    ...(shape.opacity == null ? {} : { opacity: shape.opacity }),
+    stroke: shape.stroke ?? null,
+    ...(shape.strokeWidth == null ? {} : { strokeWidth: shape.strokeWidth }),
+    strokeDash: shape.strokeDash ?? null,
+    ...(shape.presetGeom == null ? {} : { preset: shape.presetGeom }),
+    ...(shape.borderRadius == null ? {} : { borderRadius: shape.borderRadius }),
+    shadow: shape.shadow ?? null,
+    ...(shape.vAlign == null ? {} : { verticalAlignment: shape.vAlign }),
+    ...(shape.wordWrap == null ? {} : { wordWrap: shape.wordWrap }),
+    ...(shape.padding == null ? {} : { padding: shape.padding }),
+  };
+}
+
 function isEditable(shape: PresentationLiveEditShape): boolean {
   return shape.source?.editable !== false;
+}
+
+function preservesLockedPresentationShapeOrder(
+  shapes: PresentationLiveEditShape[],
+  states: PresentationLiveShapeState[],
+): boolean {
+  const sourceIndex = new Map(shapes.map((shape, index) => [shape.id, index]));
+  const nextIndex = new Map(states.map((state, index) => [state.id, index]));
+  for (const lockedShape of shapes.filter((shape) => !isEditable(shape))) {
+    const lockedSourceIndex = sourceIndex.get(lockedShape.id);
+    const lockedNextIndex = nextIndex.get(lockedShape.id);
+    if (lockedSourceIndex == null || lockedNextIndex == null) return false;
+    for (const shape of shapes) {
+      if (shape.id === lockedShape.id) continue;
+      const shapeNextIndex = nextIndex.get(shape.id);
+      const shapeSourceIndex = sourceIndex.get(shape.id);
+      if (shapeNextIndex == null || shapeSourceIndex == null) continue;
+      if (
+        (shapeSourceIndex < lockedSourceIndex) !== (shapeNextIndex < lockedNextIndex)
+      ) return false;
+    }
+  }
+  return true;
 }
 
 function isFullSlideImage(shape: PresentationLiveEditShape): boolean {
@@ -259,6 +439,90 @@ export function presentationLiveEditTargetShape(
     || null;
 }
 
+function isGeometryLocked(shape: PresentationLiveEditShape): boolean {
+  return shape.source?.groupTransform != null;
+}
+
+/** Rounded geometry exactly as serialized for the model; merges diff against this, not the raw shape. */
+function shownPresentationGeometry(shape: PresentationLiveEditShape): Pick<
+  PresentationLiveShapeState,
+  "x" | "y" | "w" | "h" | "rotation" | "flipH" | "flipV"
+> {
+  return {
+    x: Number(shape.x.toFixed(2)),
+    y: Number(shape.y.toFixed(2)),
+    w: Number(shape.w.toFixed(2)),
+    h: Number(shape.h.toFixed(2)),
+    rotation: Number((shape.rotation || 0).toFixed(2)),
+    flipH: Boolean(shape.flipH),
+    flipV: Boolean(shape.flipV),
+  };
+}
+
+function shownPresentationCrop(shape: PresentationLiveEditShape): PresentationImageCropState {
+  return {
+    l: Number((shape.imgCrop?.l || 0).toFixed(2)),
+    t: Number((shape.imgCrop?.t || 0).toFixed(2)),
+    r: Number((shape.imgCrop?.r || 0).toFixed(2)),
+    b: Number((shape.imgCrop?.b || 0).toFixed(2)),
+  };
+}
+
+/** Half the serialized precision: an echoed value is never a change. */
+const PRESENTATION_LIVE_GEOMETRY_TOLERANCE = 0.005;
+
+function liveNumberChanged(value: unknown, shown: number): value is number | string {
+  if (value === undefined || value === null || value === "") return false;
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) && Math.abs(number - shown) > PRESENTATION_LIVE_GEOMETRY_TOLERANCE;
+}
+
+/**
+ * Applies only the transform fields the model actually changed. Unchanged
+ * fields keep the source's exact values (including undefined rotation/flips),
+ * so accepting an unrelated AI edit never rewrites an object's geometry.
+ * Bounds never force a zero-extent line to a nonzero size and never pull an
+ * object that already sits (partly) off-slide back onto the slide.
+ */
+function mergePresentationLiveGeometry(
+  shape: PresentationLiveEditShape,
+  state: PresentationLiveShapeState,
+): Pick<PresentationLiveEditShape, "x" | "y" | "w" | "h" | "rotation" | "flipH" | "flipV"> {
+  const geometry = { x: shape.x, y: shape.y, w: shape.w, h: shape.h, rotation: shape.rotation, flipH: shape.flipH, flipV: shape.flipV };
+  if (isGeometryLocked(shape)) return geometry;
+  const shown = shownPresentationGeometry(shape);
+  if (liveNumberChanged(state.w, shown.w)) {
+    geometry.w = clamp(state.w, Math.min(1, shape.w), Math.max(100, shape.w), shape.w);
+  }
+  if (liveNumberChanged(state.h, shown.h)) {
+    geometry.h = clamp(state.h, Math.min(0.5, shape.h), Math.max(100, shape.h), shape.h);
+  }
+  const xChanged = liveNumberChanged(state.x, shown.x);
+  if (xChanged || geometry.w !== shape.w) {
+    geometry.x = clamp(
+      xChanged ? state.x : shape.x,
+      Math.min(0, shape.x),
+      Math.max(100 - geometry.w, shape.x),
+      shape.x,
+    );
+  }
+  const yChanged = liveNumberChanged(state.y, shown.y);
+  if (yChanged || geometry.h !== shape.h) {
+    geometry.y = clamp(
+      yChanged ? state.y : shape.y,
+      Math.min(0, shape.y),
+      Math.max(100 - geometry.h, shape.y),
+      shape.y,
+    );
+  }
+  if (liveNumberChanged(state.rotation, shown.rotation)) {
+    geometry.rotation = clamp(state.rotation, -360, 360, shape.rotation || 0);
+  }
+  if (typeof state.flipH === "boolean" && state.flipH !== shown.flipH) geometry.flipH = state.flipH;
+  if (typeof state.flipV === "boolean" && state.flipV !== shown.flipV) geometry.flipV = state.flipV;
+  return geometry;
+}
+
 function shapeState(
   shape: PresentationLiveEditShape,
   slideNumber: number,
@@ -268,17 +532,18 @@ function shapeState(
     id: shape.id,
     type: shape.imgUrl ? "image" : shape.tableRows ? "table" : shape.type || "shape",
     editable: isEditable(shape),
+    ...(isGeometryLocked(shape) ? { geometryLocked: true } : {}),
     fullSlide: isFullSlideImage(shape),
-    x: Number(shape.x.toFixed(2)),
-    y: Number(shape.y.toFixed(2)),
-    w: Number(shape.w.toFixed(2)),
-    h: Number(shape.h.toFixed(2)),
-    rotation: Number((shape.rotation || 0).toFixed(2)),
-    flipH: Boolean(shape.flipH),
-    flipV: Boolean(shape.flipV),
+    ...shownPresentationGeometry(shape),
+    format: presentationShapeFormat(shape),
   };
   if (shape.texts.length > 0) {
-    state.paragraphs = shape.texts.map((paragraph, index) => ({ index, text: paragraph.text, edits: [] }));
+    state.paragraphs = shape.texts.map((paragraph, index) => ({
+      index,
+      text: paragraph.text,
+      edits: [],
+      ...(presentationTextFormat(paragraph) ? { format: presentationTextFormat(paragraph) } : {}),
+    }));
   }
   if (shape.tableRows) {
     state.table = shape.tableRows.map((row, rowIndex) => row.map((cell, columnIndex) => ({
@@ -286,6 +551,7 @@ function shapeState(
       column: columnIndex,
       text: cell.text,
       edits: [],
+      ...(presentationTableCellFormat(cell) ? { format: presentationTableCellFormat(cell) } : {}),
     })));
   }
   if (shape.imgUrl) {
@@ -293,12 +559,7 @@ function shapeState(
       ...(shape.id === attachedShapeId
         ? { attachedAs: `current-slide-${slideNumber}-image${mediaExtension(shape.source?.mediaPart)}` }
         : {}),
-      crop: {
-        l: Number((shape.imgCrop?.l || 0).toFixed(2)),
-        t: Number((shape.imgCrop?.t || 0).toFixed(2)),
-        r: Number((shape.imgCrop?.r || 0).toFixed(2)),
-        b: Number((shape.imgCrop?.b || 0).toFixed(2)),
-      },
+      crop: shownPresentationCrop(shape),
     };
   }
   return state;
@@ -319,18 +580,29 @@ export function buildPresentationLiveEditContent(
     activeSlide: activeSlideIndex + 1,
     targetShapeId: targetShape?.id || null,
     instructions: [
-      "Preserve IDs and shape/paragraph structure for existing slides. Slides may be reordered or removed.",
+      "Preserve slide IDs. Slides and editable shapes may be reordered or removed; shapes with editable=false must remain unchanged.",
       "To add a slide, append one slides item with a unique ai-slide-* id and create:{layout,title,body}; supported layouts are title-body, title-only, section, and blank.",
       "Add one slide scaffold per patch before filling its title/body so the editor can preview creation while the response streams.",
-      "Whenever text changes, update text and add ordered zero-based character edits against the original text as {start,end,text}; use separate edits for separate replacements.",
-      "Coordinates and crop values are percentages from 0 to 100.",
+      "This JSON is the reviewable PPTX AI edit contract. Stream each change here so the canvas can preview it; the user must Accept before the presentation file is saved. A new editable object may use only shape.insert, textbox.insert, or table.insert.",
+      "Shape format supports fill/gradientFill, stroke/strokeWidth/strokeDash, preset, shadow, text padding/alignment/wrap; opacity is image-only. Table/chart frames use cell/chart-specific formatting. Paragraph and table-cell format may be changed without replacing unrelated objects.",
+      "Gradient values use exactly {angle,stops:[{pos,color,alpha},...]}; pos is 0..100 and alpha is 0..1. Shape shadows use exactly {blur,dist,angle,color,alpha}.",
+      "A background cannot have both color and gradient non-null. A shape format cannot have both fill and gradientFill non-null. Set the unused fill kind to null when switching.",
+      "Example shape gradient: format:{fill:null,gradientFill:{angle:90,stops:[{pos:0,color:'#111827',alpha:1},{pos:100,color:'#334155',alpha:1}]}}.",
+      "Whenever text changes, update text and add ordered zero-based Unicode character edits against the original text as {start,end,text}; end is exclusive and applying the edits must reproduce text exactly. For a complete replacement, use one edit starting at 0 whose edit text is the complete new paragraph.",
+      "Example complete replacement of original 旧标题: {index:0,text:'新标题',edits:[{start:0,end:3,text:'新标题'}]}.",
+      "Coordinates and crop values are percentages from 0 to 100. Leave x/y/w/h/rotation/flip untouched unless the object should move; unchanged values keep the object's exact source geometry.",
+      "Shapes with geometryLocked=true belong to a group: their coordinates are group-relative and their position and size cannot be changed.",
       "For semantic image changes, generate a replacement from the attached image instead of adding image bytes here.",
     ],
     slides: slides.map((slide, index) => ({
       id: slide.id,
       slideNumber: index + 1,
       active: index === activeSlideIndex,
-      ...(slide.notesPart ? { notes: slide.notes || "" } : {}),
+      notes: slide.notes || "",
+      background: {
+        color: slide.bg ?? null,
+        gradient: slide.bgGrad ?? null,
+      },
       shapes: slide.shapes.map((shape) => shapeState(shape, index + 1, targetShape?.id || null)),
     })),
   };
@@ -370,11 +642,17 @@ function presentationLiveTextEditSpans(
   if (originalText === editedText) return [];
   if (!Array.isArray(edits) || edits.length === 0) return null;
   const originalCharacters = Array.from(originalText);
+  const normalizedEdits = edits.length === 1
+    && edits[0]?.start === 0
+    && typeof edits[0].text === "string"
+    && edits[0].text === editedText
+    ? [{ ...edits[0], end: originalCharacters.length }]
+    : edits;
   const rendered: string[] = [];
   const spans: PresentationTextEditSpan[] = [];
   let originalCursor = 0;
   let editedCursor = 0;
-  for (const edit of edits) {
+  for (const edit of normalizedEdits) {
     if (
       !Number.isInteger(edit.start)
       || !Number.isInteger(edit.end)
@@ -400,25 +678,321 @@ function presentationLiveTextEditSpans(
   return rendered.join("") === editedText ? spans : null;
 }
 
+function presentationLiveParagraphEditSpans(
+  paragraph: PresentationLiveEditText,
+  editedText: string,
+  edits: PresentationLiveTextEdit[] | undefined,
+): PresentationTextEditSpan[] | null {
+  const explicitSpans = presentationLiveTextEditSpans(paragraph.text, editedText, edits);
+  if (explicitSpans) return explicitSpans;
+  if (
+    (Array.isArray(edits) && edits.length > 0)
+    || paragraph.sourceContainsField
+    || (paragraph.runs?.length || 0) > 0
+  ) return null;
+
+  // A plain single-run paragraph has only one possible source range. Models
+  // occasionally return the updated text while leaving the generated
+  // `edits: []` placeholder untouched; accepting that full-range replacement
+  // is safe and keeps complex multi-run or dynamic-field text fail-closed.
+  return [{
+    originalStart: 0,
+    originalEnd: Array.from(paragraph.text).length,
+    editedStart: 0,
+    editedEnd: Array.from(editedText).length,
+  }];
+}
+
+function presentationLiveColor(value: unknown): string | null {
+  if (typeof value !== "string" || value.length > 64) return null;
+  const color = value.trim();
+  return color === "transparent"
+    || /^#[\da-f]{3}(?:[\da-f]{3})?$/i.test(color)
+    || /^rgba?\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}(?:\s*,\s*(?:0|1|0?\.\d+))?\s*\)$/i.test(color)
+    ? color
+    : null;
+}
+
+function normalizedPresentationGradient(value: unknown): PresentationLiveGradient | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<PresentationLiveGradient>;
+  if (!Number.isFinite(candidate.angle) || !Array.isArray(candidate.stops)
+    || candidate.stops.length < 2 || candidate.stops.length > 16) return null;
+  let previous = -1;
+  const stops: PresentationLiveGradient["stops"] = [];
+  for (const stop of candidate.stops) {
+    if (!stop || typeof stop !== "object") return null;
+    const rawStop = stop as unknown as Record<string, unknown>;
+    if (
+      rawStop.pos !== undefined
+      && rawStop.position !== undefined
+      && rawStop.pos !== rawStop.position
+    ) return null;
+    if (
+      rawStop.alpha !== undefined
+      && rawStop.opacity !== undefined
+      && rawStop.alpha !== rawStop.opacity
+    ) return null;
+    const rawPos = rawStop.pos ?? rawStop.position;
+    const rawAlpha = rawStop.alpha ?? rawStop.opacity;
+    if (!Number.isFinite(rawPos) || Number(rawPos) < previous) return null;
+    const color = presentationLiveColor(rawStop.color);
+    if (!color) return null;
+    const pos = clamp(rawPos, 0, 100, 0);
+    const alpha = clamp(rawAlpha, 0, 1, 1);
+    previous = pos;
+    stops.push({ pos, color, alpha });
+  }
+  return { angle: clamp(candidate.angle, 0, 360, 0), stops };
+}
+
+function normalizedPresentationShadow(
+  value: PresentationLiveShapeFormat["shadow"],
+): NonNullable<PresentationLiveShapeFormat["shadow"]> | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as unknown as Record<string, unknown>;
+  if (raw.dist !== undefined && raw.distance !== undefined && raw.dist !== raw.distance) return null;
+  if (raw.alpha !== undefined && raw.opacity !== undefined && raw.alpha !== raw.opacity) return null;
+  const dist = raw.dist ?? raw.distance;
+  const alpha = raw.alpha ?? raw.opacity;
+  const color = presentationLiveColor(raw.color);
+  if (!color || ![raw.blur, dist, raw.angle, alpha].every(Number.isFinite)) return null;
+  return {
+    blur: clamp(raw.blur, 0, 4_032, 0),
+    dist: clamp(dist, 0, 4_032, 0),
+    angle: clamp(raw.angle, 0, 360, 0),
+    color,
+    alpha: clamp(alpha, 0, 1, 1),
+  };
+}
+
+function mergePresentationTextFormat(
+  text: PresentationLiveEditText,
+  format: PresentationLiveTextFormat | undefined,
+): PresentationLiveEditText | null {
+  if (format == null) return text;
+  if (typeof format !== "object") return null;
+  const next = { ...text };
+  for (const key of ["bold", "italic", "underline", "strikethrough"] as const) {
+    if (format[key] !== undefined) {
+      if (typeof format[key] !== "boolean") return null;
+      next[key] = format[key];
+    }
+  }
+  const numericLimits: Record<string, [number, number]> = {
+    fontSize: [1, 409], indent: [0, 4_032], indentRight: [0, 4_032], hanging: [-4_032, 4_032],
+    lineSpacing: [0.1, 20], spaceBefore: [0, 4_032], spaceAfter: [0, 4_032], baseline: [-100, 100], spacing: [-100, 100],
+  };
+  for (const key of Object.keys(numericLimits) as Array<keyof typeof numericLimits>) {
+    const value = format[key as keyof PresentationLiveTextFormat];
+    if (value !== undefined) {
+      if (typeof value !== "number" || !Number.isFinite(value)) return null;
+      const [minimum, maximum] = numericLimits[key];
+      (next as unknown as Record<string, unknown>)[key] = Math.min(maximum, Math.max(minimum, value));
+    }
+  }
+  if (format.color !== undefined) {
+    const color = presentationLiveColor(format.color);
+    if (!color) return null;
+    next.color = color;
+  }
+  for (const key of ["fontFamily", "align"] as const) {
+    if (format[key] !== undefined) {
+      const value = liveEditString(format[key], 255);
+      if (value == null) return null;
+      next[key] = value;
+    }
+  }
+  if (format.bullet !== undefined) {
+    if (format.bullet === null) delete next.bullet;
+    else {
+      const bullet = liveEditString(format.bullet, 16);
+      if (bullet == null) return null;
+      next.bullet = bullet;
+    }
+  }
+  return next;
+}
+
+function mergePresentationTableCellFormat(
+  cell: PresentationLiveEditTableCell,
+  format: PresentationLiveTableCellState["format"],
+): PresentationLiveEditTableCell | null {
+  if (format == null) return cell;
+  if (typeof format !== "object") return null;
+  const next = { ...cell };
+  for (const key of ["bold", "italic"] as const) {
+    if (format[key] !== undefined) {
+      if (typeof format[key] !== "boolean") return null;
+      next[key] = format[key];
+    }
+  }
+  if (format.fontSize !== undefined) {
+    if (!Number.isFinite(format.fontSize)) return null;
+    next.fontSize = clamp(format.fontSize, 1, 409, cell.fontSize || 12);
+  }
+  if (format.fontFamily !== undefined) {
+    const family = liveEditString(format.fontFamily, 255);
+    if (family == null) return null;
+    next.fontFamily = family;
+  }
+  for (const key of ["color", "fill"] as const) {
+    if (format[key] !== undefined) {
+      const color = presentationLiveColor(format[key]);
+      if (!color) return null;
+      next[key] = color;
+    }
+  }
+  return next;
+}
+
+function mergePresentationShapeFormat(
+  shape: PresentationLiveEditShape,
+  format: PresentationLiveShapeFormat | undefined,
+): PresentationLiveEditShape | null {
+  if (format == null) return shape;
+  if (typeof format !== "object") return null;
+  const next = { ...shape };
+  const fillChanged = format.fill !== undefined && format.fill !== (shape.fill ?? null);
+  const gradientChanged = format.gradientFill !== undefined
+    && JSON.stringify(format.gradientFill) !== JSON.stringify(shape.gradFill ?? null);
+  if (fillChanged && gradientChanged && format.fill !== null && format.gradientFill !== null) return null;
+  if (fillChanged) {
+    if (format.fill === null) delete next.fill;
+    else {
+      const color = presentationLiveColor(format.fill);
+      if (!color) return null;
+      next.fill = color;
+    }
+  }
+  if (gradientChanged) {
+    if (format.gradientFill === null) delete next.gradFill;
+    else {
+      const gradient = normalizedPresentationGradient(format.gradientFill);
+      if (!gradient) return null;
+      next.gradFill = gradient;
+    }
+  }
+  if (gradientChanged && format.gradientFill !== null) delete next.fill;
+  if (fillChanged && format.fill !== null) delete next.gradFill;
+  const strokeValue = format.stroke;
+  if (strokeValue !== undefined) {
+    if (strokeValue === null) delete next.stroke;
+    else {
+      const color = presentationLiveColor(strokeValue);
+      if (!color) return null;
+      next.stroke = color;
+    }
+  }
+  for (const [stateKey, shapeKey, minimum, maximum] of [
+    ["opacity", "opacity", 0, 1],
+    ["strokeWidth", "strokeWidth", 0, 72],
+    ["borderRadius", "borderRadius", 0, 50],
+  ] as const) {
+    const value = format[stateKey];
+    if (value === undefined) continue;
+    if (!Number.isFinite(value)) return null;
+    next[shapeKey] = Math.min(maximum, Math.max(minimum, value));
+  }
+  if (format.strokeDash !== undefined) {
+    if (format.strokeDash === null) delete next.strokeDash;
+    else {
+      if (format.strokeDash !== shape.strokeDash && !isPresentationStrokeDash(format.strokeDash)) return null;
+      next.strokeDash = format.strokeDash;
+    }
+  }
+  if (format.preset !== undefined) {
+    if (format.preset !== shape.presetGeom && !isPresentationEditablePreset(format.preset)) return null;
+    next.presetGeom = format.preset;
+  }
+  if (format.shadow !== undefined) {
+    if (format.shadow === null) delete next.shadow;
+    else {
+      const shadow = normalizedPresentationShadow(format.shadow);
+      if (!shadow) return null;
+      next.shadow = shadow;
+    }
+  }
+  if (format.verticalAlignment !== undefined) {
+    if (!["top", "middle", "bottom"].includes(format.verticalAlignment)) return null;
+    next.vAlign = format.verticalAlignment;
+  }
+  if (format.wordWrap !== undefined) {
+    if (typeof format.wordWrap !== "boolean") return null;
+    next.wordWrap = format.wordWrap;
+  }
+  if (format.padding !== undefined) {
+    if (!format.padding || typeof format.padding !== "object") return null;
+    const values = [format.padding.l, format.padding.t, format.padding.r, format.padding.b];
+    if (!values.every((value) => Number.isFinite(value) && value >= 0 && value <= 4_032)) return null;
+    next.padding = { ...format.padding };
+  }
+  return next;
+}
+
+function presentationShapeFormatHasChange(
+  shape: PresentationLiveEditShape,
+  format: PresentationLiveShapeFormat | undefined,
+): boolean {
+  if (!format || typeof format !== "object") return false;
+  const current = presentationShapeFormat(shape);
+  return (Object.keys(format) as Array<keyof PresentationLiveShapeFormat>).some((key) => (
+    format[key] !== undefined
+    && JSON.stringify(format[key]) !== JSON.stringify(current[key])
+  ));
+}
+
+function presentationShapeFormatIsPersistable(
+  shape: PresentationLiveEditShape,
+  format: PresentationLiveShapeFormat | undefined,
+): boolean {
+  if (!presentationShapeFormatHasChange(shape, format)) return true;
+  if (shape.source?.kind === "graphicFrame" || shape.tableRows) return false;
+  if (
+    format?.opacity !== undefined
+    && format.opacity !== shape.opacity
+    && !shape.imgUrl
+    && shape.source?.kind !== "pic"
+  ) return false;
+  return true;
+}
+
+function presentationLiveParagraphs(
+  states: PresentationLiveParagraphState[] | undefined,
+): PresentationLiveEditText[] | null {
+  if (!Array.isArray(states) || states.length > 200
+    || !states.every((paragraph, index) => paragraph.index === index)) return null;
+  const paragraphs: PresentationLiveEditText[] = [];
+  for (const state of states) {
+    const text = liveEditString(state.text, 50_000);
+    if (text == null) return null;
+    const paragraph = mergePresentationTextFormat({ text }, state.format);
+    if (!paragraph) return null;
+    paragraphs.push(paragraph);
+  }
+  return paragraphs;
+}
+
 function mergeShape(
   shape: PresentationLiveEditShape,
   state: PresentationLiveShapeState,
 ): PresentationLiveEditShape | null {
   if (!isEditable(shape) || state.editable === false) return shape;
-  const w = clamp(state.w, 1, 100, shape.w);
-  const h = clamp(state.h, 0.5, 100, shape.h);
-  const next: PresentationLiveEditShape = {
+  let next: PresentationLiveEditShape = {
     ...shape,
-    w,
-    h,
-    x: clamp(state.x, 0, 100 - w, shape.x),
-    y: clamp(state.y, 0, 100 - h, shape.y),
-    rotation: clamp(state.rotation, -360, 360, shape.rotation || 0),
-    flipH: typeof state.flipH === "boolean" ? state.flipH : shape.flipH,
-    flipV: typeof state.flipV === "boolean" ? state.flipV : shape.flipV,
+    ...mergePresentationLiveGeometry(shape, state),
   };
+  if (!presentationShapeFormatIsPersistable(shape, state.format)) return null;
+  const formattedShape = mergePresentationShapeFormat(next, state.format);
+  if (!formattedShape) return null;
+  next = formattedShape;
   if (shape.imgUrl && state.image) {
-    next.imgCrop = normalizedCrop(state.image.crop, shape.imgCrop);
+    const shownCrop = shownPresentationCrop(shape);
+    const crop = state.image.crop;
+    const cropChanged = Boolean(crop) && (["l", "t", "r", "b"] as const).some((key) => (
+      liveNumberChanged(crop[key], shownCrop[key])
+    ));
+    if (cropChanged) next.imgCrop = normalizedCrop(crop, shape.imgCrop);
   }
   if (shape.texts.length > 0) {
     if (
@@ -427,32 +1001,42 @@ function mergeShape(
     ) return null;
     next.texts = shape.texts.map((paragraph, index) => {
       const paragraphState = state.paragraphs![index];
-      const text = typeof paragraphState.text === "string"
-        ? paragraphState.text
-        : paragraph.text;
-      if (text === paragraph.text) return paragraph;
-      const editSpans = presentationLiveTextEditSpans(paragraph.text, text, paragraphState.edits);
-      if (!editSpans) return null;
-      const sourceMap = reconcilePresentationTextSourceMap(
-        paragraph.text,
-        text,
-        paragraph.sourceMap,
-        editSpans,
-      );
-      return {
-        ...paragraph,
-        text,
-        sourceMap,
-        runs: reconcilePresentationTextRuns(
-          paragraph.runs,
+      const text = liveEditString(paragraphState.text, 50_000);
+      if (text == null) return null;
+      let editedParagraph: PresentationLiveEditText = paragraph;
+      if (text !== paragraph.text) {
+        const editSpans = presentationLiveParagraphEditSpans(paragraph, text, paragraphState.edits);
+        if (!editSpans) return null;
+        const sourceMap = reconcilePresentationTextSourceMap(
           paragraph.text,
           text,
-          sourceMap,
           paragraph.sourceMap,
-        ),
-      };
+          editSpans,
+        );
+        editedParagraph = {
+          ...paragraph,
+          text,
+          sourceMap,
+          runs: reconcilePresentationTextRuns(
+            paragraph.runs,
+            paragraph.text,
+            text,
+            sourceMap,
+            paragraph.sourceMap,
+          ),
+        };
+      }
+      return mergePresentationTextFormat(editedParagraph, paragraphState.format);
     }).filter((paragraph): paragraph is PresentationLiveEditText => paragraph != null);
     if (next.texts.length !== shape.texts.length) return null;
+  } else if (state.paragraphs !== undefined) {
+    const isNativeTextShape = shape.source
+      ? shape.source.kind === "sp"
+      : shape.type == null || shape.type === "shape" || shape.type === "textbox";
+    if (!isNativeTextShape || shape.imgUrl || shape.tableRows) return null;
+    const paragraphs = presentationLiveParagraphs(state.paragraphs);
+    if (!paragraphs) return null;
+    next.texts = paragraphs;
   }
   if (shape.tableRows) {
     if (state.table?.length !== shape.tableRows.length) return null;
@@ -467,23 +1051,120 @@ function mergeShape(
       for (let columnIndex = 0; columnIndex < shape.tableRows[rowIndex].length; columnIndex += 1) {
         const cell = shape.tableRows[rowIndex][columnIndex];
         const cellState = state.table[rowIndex][columnIndex];
-        const text = typeof cellState.text === "string" ? cellState.text : cell.text;
-        if (text === cell.text) {
-          row.push(cell);
-          continue;
+        const text = liveEditString(cellState.text, 50_000);
+        if (text == null) return null;
+        let editedCell: PresentationLiveEditTableCell = cell;
+        if (text !== cell.text) {
+          const editSpans = presentationLiveTextEditSpans(cell.text, text, cellState.edits);
+          if (!editSpans) return null;
+          editedCell = {
+            ...cell,
+            text,
+            sourceMap: reconcilePresentationTextSourceMap(cell.text, text, cell.sourceMap, editSpans),
+          };
         }
-        const editSpans = presentationLiveTextEditSpans(cell.text, text, cellState.edits);
-        if (!editSpans) return null;
-        row.push({
-          ...cell,
-          text,
-          sourceMap: reconcilePresentationTextSourceMap(cell.text, text, cell.sourceMap, editSpans),
-        });
+        const formattedCell = mergePresentationTableCellFormat(editedCell, cellState.format);
+        if (!formattedCell) return null;
+        row.push(formattedCell);
       }
       rows.push(row);
     }
     next.tableRows = rows;
   }
+  return next;
+}
+
+function createPresentationLiveShape(state: PresentationLiveShapeState): PresentationLiveEditShape | null {
+  if (!state.id.startsWith("ai-shape-") || !state.create || state.editable === false) return null;
+  if (!Object.values(PresentationLiveInsertOperation).includes(state.create.operation)) return null;
+  if (![state.x, state.y, state.w, state.h, state.rotation].every((value) => Number.isFinite(Number(value)))) return null;
+  const w = clamp(state.w, 1, 100, 20);
+  const h = clamp(state.h, 0.5, 100, 10);
+  let shape: PresentationLiveEditShape = {
+    id: state.id,
+    type: state.create.operation === PresentationLiveInsertOperation.TableInsert
+      ? "table"
+      : state.create.operation === PresentationLiveInsertOperation.TextboxInsert
+        ? "textbox"
+        : "shape",
+    x: clamp(state.x, 0, 100 - w, 0),
+    y: clamp(state.y, 0, 100 - h, 0),
+    w,
+    h,
+    rotation: clamp(state.rotation, -360, 360, 0),
+    flipH: Boolean(state.flipH),
+    flipV: Boolean(state.flipV),
+    presetGeom: "rect",
+    texts: [],
+  };
+  if (!presentationShapeFormatIsPersistable(shape, state.format)) return null;
+  if (
+    state.create.operation === PresentationLiveInsertOperation.TableInsert
+    && presentationShapeFormatHasChange(shape, state.format)
+  ) return null;
+  const formatted = mergePresentationShapeFormat(shape, state.format);
+  if (!formatted) return null;
+  shape = formatted;
+
+  if (state.create.operation === PresentationLiveInsertOperation.TableInsert) {
+    if (!Array.isArray(state.table) || state.table.length < 1 || state.table.length > 200) return null;
+    const width = state.table[0]?.length || 0;
+    if (width < 1 || width > 50 || state.table.some((row) => row.length !== width)) return null;
+    const rows: PresentationLiveEditTableCell[][] = [];
+    for (let rowIndex = 0; rowIndex < state.table.length; rowIndex += 1) {
+      const row: PresentationLiveEditTableCell[] = [];
+      for (let columnIndex = 0; columnIndex < width; columnIndex += 1) {
+        const cellState = state.table[rowIndex][columnIndex];
+        if (cellState.row !== rowIndex || cellState.column !== columnIndex) return null;
+        const text = liveEditString(cellState.text, 50_000);
+        if (text == null) return null;
+        const cell = mergePresentationTableCellFormat({ text }, cellState.format);
+        if (!cell) return null;
+        row.push(cell);
+      }
+      rows.push(row);
+    }
+    shape.tableRows = rows;
+    return shape;
+  }
+  if (state.table !== undefined) return null;
+  if (state.paragraphs !== undefined) {
+    const paragraphs = presentationLiveParagraphs(state.paragraphs);
+    if (!paragraphs) return null;
+    shape.texts = paragraphs;
+  }
+  return shape;
+}
+
+function mergePresentationSlideBackground<T extends PresentationLiveEditSlide>(
+  slide: T,
+  background: PresentationLiveSlideState["background"],
+): T | null {
+  if (background == null) return slide;
+  if (typeof background !== "object") return null;
+  const next = { ...slide };
+  const colorChanged = background.color !== undefined && background.color !== (slide.bg ?? null);
+  const gradientChanged = background.gradient !== undefined
+    && JSON.stringify(background.gradient) !== JSON.stringify(slide.bgGrad ?? null);
+  if (colorChanged && gradientChanged && background.color !== null && background.gradient !== null) return null;
+  if (colorChanged) {
+    if (background.color === null) delete next.bg;
+    else {
+      const color = presentationLiveColor(background.color);
+      if (!color) return null;
+      next.bg = color;
+    }
+  }
+  if (gradientChanged) {
+    if (background.gradient === null) delete next.bgGrad;
+    else {
+      const gradient = normalizedPresentationGradient(background.gradient);
+      if (!gradient) return null;
+      next.bgGrad = gradient;
+    }
+  }
+  if (gradientChanged && background.gradient !== null) delete next.bg;
+  if (colorChanged && background.color !== null) delete next.bgGrad;
   return next;
 }
 
@@ -514,7 +1195,7 @@ export function applyPresentationLiveEditContent<T extends PresentationLiveEditS
         slideState.create.body,
         slideState.create.aspectRatio,
       ].some((value) => value !== undefined && typeof value !== "string")) return null;
-      const created = createPresentationSlide({
+      let created = createPresentationSlide({
         id: slideState.id,
         layout: slideState.create.layout,
         aspectRatio: slideState.create.aspectRatio || slides[0]?.aspectRatio,
@@ -522,27 +1203,64 @@ export function applyPresentationLiveEditContent<T extends PresentationLiveEditS
         subtitle: slideState.create.subtitle,
         body: slideState.create.body,
       });
+      if (slideState.notes !== undefined) {
+        const notes = liveEditString(slideState.notes, 100_000);
+        if (notes == null) return null;
+        created = { ...created, notes };
+      }
+      const createdWithBackground = mergePresentationSlideBackground(created, slideState.background);
+      if (!createdWithBackground) return null;
+      created = createdWithBackground;
+      if (slideState.shapes !== undefined) {
+        if (!Array.isArray(slideState.shapes) || slideState.shapes.length > 500) return null;
+        const ids = new Set<string>();
+        const addedShapes: PresentationLiveEditShape[] = [];
+        for (const shapeState of slideState.shapes) {
+          if (!shapeState || typeof shapeState.id !== "string" || ids.has(shapeState.id)) return null;
+          ids.add(shapeState.id);
+          const added = createPresentationLiveShape(shapeState);
+          if (!added) return null;
+          addedShapes.push(added);
+        }
+        created = { ...created, shapes: [...created.shapes, ...addedShapes] };
+      }
       mergedSlides.push(created as T);
       continue;
     }
     const slide = slideById.get(slideState.id);
     if (!slide || !Array.isArray(slideState.shapes)) return null;
-    if (slideState.shapes.length !== slide.shapes.length) return null;
+    if (slideState.shapes.length > 500) return null;
     const shapeStateById = new Map(slideState.shapes.map((shape) => [shape.id, shape]));
-    if (shapeStateById.size !== slide.shapes.length) return null;
+    if (shapeStateById.size !== slideState.shapes.length) return null;
+    if (slide.shapes.some((shape) => !isEditable(shape) && !shapeStateById.has(shape.id))) return null;
+    if (!preservesLockedPresentationShapeOrder(slide.shapes, slideState.shapes)) return null;
+    const shapeById = new Map(slide.shapes.map((shape) => [shape.id, shape]));
     const shapes: PresentationLiveEditShape[] = [];
-    for (const shape of slide.shapes) {
-      const nextShapeState = shapeStateById.get(shape.id);
-      if (!nextShapeState) return null;
-      const merged = mergeShape(shape, nextShapeState);
+    for (const nextShapeState of slideState.shapes) {
+      if (!nextShapeState || typeof nextShapeState.id !== "string" || !nextShapeState.id.trim()) return null;
+      const shape = shapeById.get(nextShapeState.id);
+      if (shape && nextShapeState.create) return null;
+      const merged = shape
+        ? mergeShape(shape, nextShapeState)
+        : createPresentationLiveShape(nextShapeState);
       if (!merged) return null;
       shapes.push(merged);
     }
-    const next = {
+    if (slideState.notes !== undefined && liveEditString(slideState.notes, 100_000) == null) return null;
+    let next = {
       ...slide,
-      ...(slide.notesPart && typeof slideState.notes === "string" ? { notes: slideState.notes } : {}),
+      ...(typeof slideState.notes === "string" ? { notes: slideState.notes } : {}),
       shapes,
     };
+    const backgroundChanged = slideState.background !== undefined
+      && JSON.stringify(slideState.background) !== JSON.stringify({
+        color: slide.bg ?? null,
+        gradient: slide.bgGrad ?? null,
+      });
+    if (backgroundChanged && (slide as T & { bgImgUrl?: string }).bgImgUrl) return null;
+    const backgroundMerged = mergePresentationSlideBackground(next, slideState.background);
+    if (!backgroundMerged) return null;
+    next = backgroundMerged;
     mergedSlides.push(next as T);
   }
   return mergedSlides;

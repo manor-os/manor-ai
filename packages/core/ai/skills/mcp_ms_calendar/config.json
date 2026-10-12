@@ -20,5 +20,9 @@
     "mcp__ms_calendar__get_schedule",
     "mcp__ms_calendar__find_meeting_times",
     "mcp__ms_calendar__list_event_instances"
-  ]
+  ],
+  "search": {
+    "terms": ["outlook calendar", "schedule", "appointment", "availability", "office 365", "invite", "free time", "meeting"],
+    "examples": ["find free slot next week", "create event on outlook calendar", "cancel tomorrow meeting", "accept meeting invite from colleague"]
+  }
 }

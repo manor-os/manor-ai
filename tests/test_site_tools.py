@@ -283,3 +283,190 @@ async def test_publish_site_handler_hosting_unconfigured(entity_fs, tool_db, mon
     out = json.loads(await handler(entity_id=eid, user_id="u1", path="s", name="Demo"))
     assert out["published"] is False
     assert "MANOR_SITES_DOMAIN" in out["error"]
+
+
+async def _create_project(tool_db, eid: str, root_path: str, *, profile="static_site", workspace_id=None):
+    from packages.core.models.code_project import CodeProject
+
+    async with tool_db() as session:
+        project = CodeProject(
+            entity_id=eid, name="Proj", root_path=root_path, profile=profile, workspace_id=workspace_id,
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        return project
+
+
+@pytest.mark.asyncio
+async def test_publish_site_by_project_id_keeps_one_url_across_republishes(entity_fs, tool_db):
+    from packages.core.models.site import Site
+
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    (root / "Code/shop").mkdir(parents=True)
+    (root / "Code/shop/index.html").write_bytes(b"<html>v1</html>")
+    project = await _create_project(tool_db, eid, "Code/shop", workspace_id="ws-source")
+    _, handler = site_tools.get_tools()[0]
+
+    first = json.loads(await handler(entity_id=eid, user_id=owner.id, project_id=project.id, name="Shop"))
+    assert first["published"] is True, first
+    assert first["project_id"] == project.id
+    # The project's Workspace is only offered, never applied.
+    assert first["workspace_id"] is None
+    assert first["connectable_workspace_id"] == "ws-source"
+
+    (root / "Code/shop/about.html").write_bytes(b"<html>about</html>")
+    second = json.loads(await handler(entity_id=eid, user_id=owner.id, project_id=project.id, name="Shop"))
+    assert second["slug"] == first["slug"]
+    assert second["revision"] == 2
+
+    async with tool_db() as session:
+        site = await session.get(Site, first["site_id"])
+        assert site.project_id == project.id
+        assert site.workspace_id is None
+
+
+@pytest.mark.asyncio
+async def test_publish_site_by_path_links_an_existing_project(entity_fs, tool_db):
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    (root / "Code/blog").mkdir(parents=True)
+    (root / "Code/blog/index.html").write_bytes(b"<html>blog</html>")
+    project = await _create_project(tool_db, eid, "Code/blog")
+    _, handler = site_tools.get_tools()[0]
+    out = json.loads(await handler(entity_id=eid, user_id=owner.id, path="Code/blog", name="Blog"))
+    assert out["published"] is True
+    assert out["project_id"] == project.id
+
+
+@pytest.mark.asyncio
+async def test_publish_site_refuses_projects_without_a_site_target(entity_fs, tool_db):
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    (root / "Code/data").mkdir(parents=True)
+    (root / "Code/data/index.html").write_bytes(b"<html></html>")
+    project = await _create_project(tool_db, eid, "Code/data", profile="generic")
+    _, handler = site_tools.get_tools()[0]
+    out = json.loads(await handler(entity_id=eid, user_id=owner.id, project_id=project.id, name="Data"))
+    assert out["published"] is False
+    assert "cannot be published as a site" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_publish_site_workspace_connection_requires_workspace_management(entity_fs, tool_db):
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    (root / "Code/w").mkdir(parents=True)
+    (root / "Code/w/index.html").write_bytes(b"<html></html>")
+    _, handler = site_tools.get_tools()[0]
+    out = json.loads(await handler(
+        entity_id=eid, user_id=owner.id, path="Code/w", name="W", workspace_id="ws-missing",
+    ))
+    assert out["published"] is False
+    assert "Workspace owner" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_publish_site_needs_exactly_one_target(entity_fs, tool_db):
+    _, eid = entity_fs
+    _, handler = site_tools.get_tools()[0]
+    out = json.loads(await handler(entity_id=eid, user_id="u1", path="a", project_id="p", name="X"))
+    assert out["published"] is False
+    assert "exactly one" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_publish_site_connects_a_workspace_only_when_asked(entity_fs, tool_db):
+    from packages.core.models.site import Site
+    from packages.core.models.workspace import Workspace
+
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    async with tool_db() as session:
+        workspace = Workspace(entity_id=eid, name="Web Ops", status="active")
+        session.add(workspace)
+        await session.commit()
+        await session.refresh(workspace)
+    (root / "Code/c").mkdir(parents=True)
+    (root / "Code/c/index.html").write_bytes(b"<html></html>")
+    _, handler = site_tools.get_tools()[0]
+
+    connected = json.loads(await handler(
+        entity_id=eid, user_id=owner.id, path="Code/c", name="C", workspace_id=workspace.id,
+    ))
+    assert connected["published"] is True, connected
+    assert connected["workspace_id"] == workspace.id
+
+    # Republishing without workspace_id leaves the connection alone.
+    again = json.loads(await handler(entity_id=eid, user_id=owner.id, path="Code/c", name="C"))
+    assert again["workspace_id"] == workspace.id
+    async with tool_db() as session:
+        assert (await session.get(Site, again["site_id"])).workspace_id == workspace.id
+
+
+_LEAD_FORM = (
+    b"<!doctype html><form data-manor-action='lead'><input name='email'>"
+    b"<button type='submit'>Send</button></form>"
+)
+
+
+@pytest.mark.asyncio
+async def test_agent_workspace_connection_includes_chat_and_form_flows(entity_fs, tool_db):
+    from packages.core.models.site import Site
+    from packages.core.models.workspace import Workspace
+
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    async with tool_db() as session:
+        workspace = Workspace(entity_id=eid, name="Web Ops", status="active")
+        session.add(workspace)
+        await session.commit()
+        await session.refresh(workspace)
+    (root / "Code/f").mkdir(parents=True)
+    (root / "Code/f/index.html").write_bytes(_LEAD_FORM)
+    _, handler = site_tools.get_tools()[0]
+
+    first = json.loads(await handler(
+        entity_id=eid, user_id=owner.id, path="Code/f", name="F", workspace_id=workspace.id,
+    ))
+    assert first["published"] is True, first
+    assert first["connections"] == {
+        "analytics": True,
+        "customer_service_chat": True,
+        "lead_form_flow": True,
+        "subscription_form_flow": False,
+    }
+
+    # A form added later gets its flow on republish, without passing workspace_id again,
+    # and the chat and lead flow are reused rather than duplicated.
+    (root / "Code/f/news.html").write_bytes(
+        b"<!doctype html><form data-manor-action='subscription'><input name='email'>"
+        b"<button type='submit'>Join</button></form>"
+    )
+    second = json.loads(await handler(entity_id=eid, user_id=owner.id, path="Code/f", name="F"))
+    assert second["connections"]["subscription_form_flow"] is True
+    async with tool_db() as session:
+        site = await session.get(Site, first["site_id"])
+        assert site.workspace_id == workspace.id
+        chat_id = site.connections["customer_service_channel_config_id"]
+    third = json.loads(await handler(entity_id=eid, user_id=owner.id, path="Code/f", name="F"))
+    async with tool_db() as session:
+        site = await session.get(Site, third["site_id"])
+        assert site.connections["customer_service_channel_config_id"] == chat_id
+
+
+@pytest.mark.asyncio
+async def test_unconnected_sites_get_analytics_but_no_chat(entity_fs, tool_db):
+    root, eid = entity_fs
+    owner = await _create_tool_user(tool_db, eid, role="owner")
+    (root / "Code/u").mkdir(parents=True)
+    (root / "Code/u/index.html").write_bytes(b"<!doctype html><h1>hi</h1>")
+    _, handler = site_tools.get_tools()[0]
+    out = json.loads(await handler(entity_id=eid, user_id=owner.id, path="Code/u", name="U"))
+    assert out["connections"] == {
+        "analytics": True,
+        "customer_service_chat": False,
+        "lead_form_flow": False,
+        "subscription_form_flow": False,
+    }

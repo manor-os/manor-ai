@@ -113,73 +113,17 @@ async def test_paused_workspace_still_accepts_direct_user_chat(client: AsyncClie
     )
 
 
-@pytest.mark.asyncio
-async def test_deleted_workspace_wiki_index_fails_closed_for_workspace_and_knowledge_net(
-    client: AsyncClient,
-    db_session,
-    tmp_path,
-):
-    """Knowledge graph scope must not expose a soft-deleted Workspace's net."""
-    from packages.core.config import get_settings
-    from packages.core.models.document import DocumentGroup
-
-    settings = get_settings()
-    old_root = settings.MANOR_FS_ROOT
-    old_enabled = settings.MANOR_FS_ENABLED
-    old_mode = settings.DEPLOYMENT_MODE
-    settings.MANOR_FS_ROOT = str(tmp_path)
-    settings.MANOR_FS_ENABLED = True
-    settings.DEPLOYMENT_MODE = "oss"
-    try:
-        _, headers = await _register(client, "lifecycle_deleted_wiki")
-        created = await client.post(
-            "/api/v1/workspaces",
-            headers=headers,
-            json={"name": "Deleted Knowledge Workspace"},
-        )
-        assert created.status_code == 201
-        workspace_id = created.json()["id"]
-        group = DocumentGroup(
-            entity_id=created.json()["entity_id"],
-            workspace_id=workspace_id,
-            name="Deleted Workspace Knowledge",
-        )
-        db_session.add(group)
-        await db_session.commit()
-
-        deleted = await client.delete(f"/api/v1/workspaces/{workspace_id}", headers=headers)
-        assert deleted.status_code == 204
-
-        workspace_scope = await client.get(
-            "/api/v1/fs/wiki-index",
-            headers=headers,
-            params={"workspace_id": workspace_id},
-        )
-        net_scope = await client.get(
-            "/api/v1/fs/wiki-index",
-            headers=headers,
-            params={"group_id": group.id},
-        )
-
-        assert workspace_scope.status_code == 404
-        assert net_scope.status_code == 404
-    finally:
-        settings.MANOR_FS_ROOT = old_root
-        settings.MANOR_FS_ENABLED = old_enabled
-        settings.DEPLOYMENT_MODE = old_mode
 
 
 @pytest.mark.asyncio
-async def test_deleted_workspace_hides_provenance_documents_without_hiding_entity_documents(
+async def test_deleted_workspace_keeps_entity_knowledge_available(
     client: AsyncClient,
-    db_session,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ):
-    """A soft-deleted Workspace must also hide its durable artifact projection."""
+    """Workspace deletion does not revoke independently owned Knowledge."""
     from apps.api.routers import documents as documents_router
     from packages.core.config import get_settings
-    from packages.core.models.document import Document
 
     settings = get_settings()
     monkeypatch.setattr(documents_router, "settings", settings)
@@ -194,13 +138,14 @@ async def test_deleted_workspace_hides_provenance_documents_without_hiding_entit
         create = await client.post(
             "/api/v1/workspaces",
             headers=headers,
-            json={"name": "Deleted document provenance"},
+            json={"name": "Deleted workspace artifacts"},
         )
         assert create.status_code == 201
         workspace_id = create.json()["id"]
+        artifact_folder_id = create.json()["artifact_folder_id"]
 
         artifact = await client.post(
-            "/api/v1/documents/upload?visibility=entity",
+            f"/api/v1/documents/upload?folder_id={artifact_folder_id}&visibility=workspace",
             headers=headers,
             files={"file": ("workspace-artifact.md", b"workspace artifact", "text/markdown")},
         )
@@ -214,11 +159,6 @@ async def test_deleted_workspace_hides_provenance_documents_without_hiding_entit
         artifact_id = artifact.json()["id"]
         entity_document_id = entity_document.json()["id"]
 
-        document = await db_session.get(Document, artifact_id)
-        assert document is not None
-        document.metadata_ = {"origin": {"workspace_id": workspace_id}}
-        await db_session.commit()
-
         for doc_id in (artifact_id, entity_document_id):
             assert (await client.get(f"/api/v1/documents/{doc_id}", headers=headers)).status_code == 200
             assert (await client.get(f"/api/v1/documents/{doc_id}/content", headers=headers)).status_code == 200
@@ -226,17 +166,21 @@ async def test_deleted_workspace_hides_provenance_documents_without_hiding_entit
 
         delete = await client.delete(f"/api/v1/workspaces/{workspace_id}", headers=headers)
         assert delete.status_code == 204
+        workspace = await client.get(f"/api/v1/workspaces/{workspace_id}", headers=headers)
+        assert workspace.status_code == 404, workspace.text
 
         for suffix in ("", "/content", "/download"):
-            denied = await client.get(f"/api/v1/documents/{artifact_id}{suffix}", headers=headers)
-            assert denied.status_code == 404, denied.text
+            artifact_allowed = await client.get(
+                f"/api/v1/documents/{artifact_id}{suffix}", headers=headers,
+            )
+            assert artifact_allowed.status_code == 200, artifact_allowed.text
             allowed = await client.get(f"/api/v1/documents/{entity_document_id}{suffix}", headers=headers)
             assert allowed.status_code == 200, allowed.text
 
         listed = await client.get("/api/v1/documents", headers=headers)
         assert listed.status_code == 200
         listed_ids = {item["id"] for item in listed.json()["items"]}
-        assert artifact_id not in listed_ids
+        assert artifact_id in listed_ids
         assert entity_document_id in listed_ids
     finally:
         settings.MANOR_FS_ROOT = old_root
@@ -272,7 +216,7 @@ async def test_restore_brings_workspace_back(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_restore_requeues_only_workspace_deleted_embedding_rows(
+async def test_restore_does_not_requeue_entity_knowledge_embeddings(
     client: AsyncClient,
     db_session,
     monkeypatch,
@@ -292,16 +236,14 @@ async def test_restore_requeues_only_workspace_deleted_embedding_rows(
     document = Document(
         id=generate_ulid(),
         entity_id=workspace["entity_id"],
-        name="blocked-until-restore.md",
+        name="independent-knowledge.md",
         folder_id=workspace["artifact_folder_id"],
         file_type="md",
         mime_type="text/markdown",
         vector_status=VectorStatus.PENDING,
         metadata_={
             "indexing": {
-                "step": "blocked",
-                "blocked_reason": "workspace_deleted",
-                "blocked_at": datetime.now(timezone.utc).isoformat(),
+                "step": "pending",
             }
         },
     )
@@ -328,10 +270,8 @@ async def test_restore_requeues_only_workspace_deleted_embedding_rows(
     assert restore.status_code == 200, restore.text
     await db_session.refresh(document)
     assert document.vector_status == VectorStatus.PENDING
-    assert document.metadata_["indexing"]["step"] == "queued"
-    assert "blocked_reason" not in document.metadata_["indexing"]
-    assert "blocked_at" not in document.metadata_["indexing"]
-    assert dispatched == [document.id]
+    assert document.metadata_["indexing"] == {"step": "pending"}
+    assert dispatched == []
 
 
 @pytest.mark.asyncio
@@ -399,12 +339,14 @@ async def test_delete_restore_syncs_runtime_schedules(client: AsyncClient, db_se
 
 
 @pytest.mark.asyncio
-async def test_pause_pauses_workspace_automations(client: AsyncClient, db_session):
+@pytest.mark.parametrize("on_demand_trigger", ["manual", "mcp"])
+async def test_pause_pauses_workspace_automations(client: AsyncClient, db_session, on_demand_trigger):
     from sqlalchemy import select
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.scheduler import ScheduledJob
     from packages.core.models.workflow import WorkflowBinding
+    from packages.core.models.workspace import Workspace, WorkspaceOperationDraft
 
     _, headers = await _register(client, "lifecycle_pause_automations")
     create = await client.post(
@@ -455,7 +397,7 @@ async def test_pause_pauses_workspace_automations(client: AsyncClient, db_sessio
         workflow_id=generate_ulid(),
         workspace_id=ws_id,
         name="Attached flow",
-        trigger_type="manual",
+        trigger_type=on_demand_trigger,
         enabled=True,
         status="active",
     )
@@ -465,10 +407,32 @@ async def test_pause_pauses_workspace_automations(client: AsyncClient, db_sessio
     before_ids = set((await db_session.execute(
         select(ScheduledJob.id).where(ScheduledJob.workspace_id == ws_id)
     )).scalars().all())
+    workspace_before = await db_session.get(Workspace, ws_id)
+    assert workspace_before is not None
+    assert workspace_before.heartbeat_enabled is False
+    revision_before = workspace_before.operation_revision
+    draft_ids_before = set((await db_session.execute(
+        select(WorkspaceOperationDraft.id).where(
+            WorkspaceOperationDraft.workspace_id == ws_id,
+            WorkspaceOperationDraft.entity_id == entity_id,
+        )
+    )).scalars().all())
     pause = await client.post(f"/api/v1/workspaces/{ws_id}/pause", headers=headers)
     assert pause.status_code == 200
 
     db_session.expire_all()
+    workspace_after = await db_session.get(Workspace, ws_id)
+    assert workspace_after is not None
+    assert workspace_after.status == "paused"
+    assert workspace_after.heartbeat_enabled is False
+    assert workspace_after.operation_revision == revision_before
+    draft_ids_after = set((await db_session.execute(
+        select(WorkspaceOperationDraft.id).where(
+            WorkspaceOperationDraft.workspace_id == ws_id,
+            WorkspaceOperationDraft.entity_id == entity_id,
+        )
+    )).scalars().all())
+    assert draft_ids_after == draft_ids_before
     workspace_jobs = list((await db_session.execute(
         select(ScheduledJob).where(ScheduledJob.workspace_id == ws_id)
     )).scalars().all())
@@ -654,6 +618,7 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
     from packages.core.models.base import generate_ulid
     from packages.core.models.consolidation_report import ConsolidationReport
     from packages.core.models.experiment import Experiment
+    from packages.core.models.execution import ExecutionPlan
     from packages.core.models.hitl_request import HitlRequest
     from packages.core.models.marketplace_resource_link import MarketplaceResourceLink
     from packages.core.models.notification import (
@@ -736,17 +701,37 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
     current_user = (await client.get("/api/v1/auth/me", headers=headers)).json()
 
     # Create a Task scoped to this workspace
+    # Explicit ids: the task-keyed sandbox tickets below reference them before
+    # the first flush would have assigned one.
     task = Task(
+        id=generate_ulid(),
         entity_id=entity_id,
         workspace_id=ws_id,
         title="Pre-purge task",
         status="pending",
     )
     preserved_task = Task(
+        id=generate_ulid(),
         entity_id=entity_id,
         workspace_id=preserved_workspace_id,
         title="Preserved task",
         status="pending",
+    )
+    workspace_plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=ws_id,
+        task_id=task.id,
+        status="running",
+        plan_dag={"steps": []},
+    )
+    preserved_plan = ExecutionPlan(
+        id=generate_ulid(),
+        entity_id=entity_id,
+        workspace_id=preserved_workspace_id,
+        task_id=preserved_task.id,
+        status="running",
+        plan_dag={"steps": []},
     )
     scheduled_job = ScheduledJob(
         entity_id=entity_id,
@@ -1170,6 +1155,9 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
     preserved_runtime_run_id = generate_ulid()
     workspace_sandbox_reservation_id = generate_ulid()
     preserved_sandbox_reservation_id = generate_ulid()
+    workspace_task_ticket_id = generate_ulid()
+    preserved_task_ticket_id = generate_ulid()
+    workspace_task_sandbox_id = f"sbx-task-{generate_ulid()[-8:].lower()}"
     workspace_sandbox_id = f"sandbox-{ws_id}"
     preserved_sandbox_id = f"sandbox-{preserved_workspace_id}"
     workspace_runtime_run = RuntimeRun(
@@ -1212,6 +1200,40 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
         deadline_at=now + timedelta(hours=1),
         status="consumed",
     )
+    # Task workers reserve without a RuntimeRun: the ticket is keyed by the
+    # Task (requester_kind="task"). It must be purged through the Workspace's
+    # tasks, while the preserved Workspace's task ticket survives.
+    workspace_task_ticket = SandboxReservation(
+        id=workspace_task_ticket_id,
+        runtime_run_id=None,
+        root_run_id=None,
+        requester_kind="task",
+        requester_id=task.id,
+        tool_call_id=f"{task.id}:ticket",
+        entity_id=entity_id,
+        user_id=current_user["id"],
+        deadline_at=now + timedelta(hours=1),
+        status="consumed",
+    )
+    preserved_task_ticket = SandboxReservation(
+        id=preserved_task_ticket_id,
+        runtime_run_id=None,
+        root_run_id=None,
+        requester_kind="task",
+        requester_id=preserved_task.id,
+        tool_call_id=f"{preserved_task.id}:ticket",
+        entity_id=entity_id,
+        user_id=current_user["id"],
+        deadline_at=now + timedelta(hours=1),
+        status="consumed",
+    )
+    workspace_task_sandbox_instance = SandboxInstance(
+        sandbox_id=workspace_task_sandbox_id,
+        reservation_id=workspace_task_ticket_id,
+        runtime_run_id=None,
+        root_run_id=None,
+        runner_id="lifecycle-runner",
+    )
     workspace_sandbox_instance = SandboxInstance(
         sandbox_id=workspace_sandbox_id,
         reservation_id=workspace_sandbox_reservation_id,
@@ -1237,6 +1259,30 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
         aggregate_id=preserved_runtime_run_id,
         dedupe_key=f"lifecycle:{preserved_runtime_run_id}",
         payload={},
+    )
+    workspace_task_outbox = RuntimeOutboxEvent(
+        event_type="runtime.dispatch_task_execution",
+        aggregate_id=task.id,
+        dedupe_key=f"lifecycle:task:{task.id}",
+        payload={"task_id": task.id},
+    )
+    preserved_task_outbox = RuntimeOutboxEvent(
+        event_type="runtime.dispatch_task_execution",
+        aggregate_id=preserved_task.id,
+        dedupe_key=f"lifecycle:task:{preserved_task.id}",
+        payload={"task_id": preserved_task.id},
+    )
+    workspace_plan_outbox = RuntimeOutboxEvent(
+        event_type="runtime.dispatch_plan_cycle",
+        aggregate_id=workspace_plan.id,
+        dedupe_key=f"plan-cycle:{workspace_plan.id}",
+        payload={"plan_id": workspace_plan.id, "wake_generation": generate_ulid()},
+    )
+    preserved_plan_outbox = RuntimeOutboxEvent(
+        event_type="runtime.dispatch_plan_cycle",
+        aggregate_id=preserved_plan.id,
+        dedupe_key=f"plan-cycle:{preserved_plan.id}",
+        payload={"plan_id": preserved_plan.id, "wake_generation": generate_ulid()},
     )
     workspace_operation_draft = WorkspaceOperationDraft(
         entity_id=entity_id,
@@ -1265,6 +1311,8 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
     db_session.add_all([
         task,
         preserved_task,
+        workspace_plan,
+        preserved_plan,
         scheduled_job,
         preserved_scheduled_job,
         conversation,
@@ -1322,10 +1370,17 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
         preserved_runtime_run,
         workspace_sandbox_reservation,
         preserved_sandbox_reservation,
+        workspace_task_ticket,
+        preserved_task_ticket,
         workspace_sandbox_instance,
         preserved_sandbox_instance,
+        workspace_task_sandbox_instance,
         workspace_runtime_outbox,
         preserved_runtime_outbox,
+        workspace_task_outbox,
+        preserved_task_outbox,
+        workspace_plan_outbox,
+        preserved_plan_outbox,
         workspace_operation_draft,
         preserved_operation_draft,
         workspace_work_batch,
@@ -1601,6 +1656,10 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
         component_key="blueprint-agent-component",
     )
     agent_id = agent.id
+    workspace_task_id = task.id
+    preserved_task_id = preserved_task.id
+    workspace_plan_id = workspace_plan.id
+    preserved_plan_id = preserved_plan.id
     skill_id = skill.id
     shared_skill_id = shared_skill.id
     skill_binding_id = skill_binding.id
@@ -1838,6 +1897,10 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
         runtime_cleanup_leaks.append("SandboxReservation")
     if await db_session.get(SandboxInstance, workspace_sandbox_id) is not None:
         runtime_cleanup_leaks.append("SandboxInstance")
+    if await db_session.get(SandboxReservation, workspace_task_ticket_id) is not None:
+        runtime_cleanup_leaks.append("SandboxReservation(task)")
+    if await db_session.get(SandboxInstance, workspace_task_sandbox_id) is not None:
+        runtime_cleanup_leaks.append("SandboxInstance(task)")
     runtime_outbox_check = await db_session.execute(
         select(RuntimeOutboxEvent).where(
             RuntimeOutboxEvent.aggregate_id == workspace_runtime_run_id
@@ -1845,12 +1908,38 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
     )
     if runtime_outbox_check.scalar_one_or_none() is not None:
         runtime_cleanup_leaks.append("RuntimeOutboxEvent")
+    task_outbox_check = await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.aggregate_id == workspace_task_id
+        )
+    )
+    if task_outbox_check.scalar_one_or_none() is not None:
+        runtime_cleanup_leaks.append("RuntimeOutboxEvent(task)")
+    plan_outbox_check = await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.aggregate_id == workspace_plan_id
+        )
+    )
+    if plan_outbox_check.scalar_one_or_none() is not None:
+        runtime_cleanup_leaks.append("RuntimeOutboxEvent(plan)")
     preserved_runtime_outbox_check = await db_session.execute(
         select(RuntimeOutboxEvent).where(
             RuntimeOutboxEvent.aggregate_id == preserved_runtime_run_id
         )
     )
     assert preserved_runtime_outbox_check.scalar_one_or_none() is not None
+    preserved_task_outbox_check = await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.aggregate_id == preserved_task_id
+        )
+    )
+    assert preserved_task_outbox_check.scalar_one_or_none() is not None
+    preserved_plan_outbox_check = await db_session.execute(
+        select(RuntimeOutboxEvent).where(
+            RuntimeOutboxEvent.aggregate_id == preserved_plan_id
+        )
+    )
+    assert preserved_plan_outbox_check.scalar_one_or_none() is not None
     if await db_session.get(WorkspaceOperationDraft, workspace_operation_draft_id) is not None:
         runtime_cleanup_leaks.append("WorkspaceOperationDraft")
     if await db_session.get(WorkspaceWorkBatch, workspace_work_batch_id) is not None:
@@ -1861,6 +1950,7 @@ async def test_purge_workspace_cascades(client: AsyncClient, db_session):
         SandboxReservation, preserved_sandbox_reservation_id
     ) is not None
     assert await db_session.get(SandboxInstance, preserved_sandbox_id) is not None
+    assert await db_session.get(SandboxReservation, preserved_task_ticket_id) is not None
     assert await db_session.get(WorkspaceOperationDraft, preserved_operation_draft_id) is not None
     assert await db_session.get(WorkspaceWorkBatch, preserved_work_batch_id) is not None
     assert await db_session.get(WorkflowRun, workflow_run_id) is None

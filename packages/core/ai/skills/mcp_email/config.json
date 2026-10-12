@@ -11,6 +11,7 @@
     "mcp__email__get_message",
     "mcp__email__list_attachments",
     "mcp__email__download_attachment",
+    "mcp__email__save_attachment_to_workspace",
     "mcp__email__list_threads",
     "mcp__email__get_thread",
     "mcp__email__send_email",
@@ -27,5 +28,9 @@
     "mcp__email__move_message",
     "mcp__email__delete_message",
     "mcp__email__list_folders"
-  ]
+  ],
+  "search": {
+    "terms": ["imap", "smtp", "mailbox", "inbox", "attachment", "mail", "custom email", "non gmail", "delete old emails from folder"],
+    "examples": ["read latest emails in my inbox", "search mailbox for invoice attachment", "reply to email thread via imap", "delete old emails from folder"]
+  }
 }

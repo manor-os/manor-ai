@@ -50,6 +50,7 @@ from packages.core.integrations.registry import (
     register_health_checker,
     register_integration,
 )
+from packages.core.database_runtime import release_read_transaction
 from packages.core.services import smtp_transport
 
 # Convenience: every Meta Graph URL in this module pulls its version
@@ -1032,6 +1033,28 @@ async def test_elevenlabs(creds: dict) -> HealthResult:
     return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
 
 
+async def test_suno(creds: dict) -> HealthResult:
+    """Validate Suno auth with a read-only account-usage request."""
+    t0 = time.monotonic()
+    raw_api_key = creds.get("api_key", "")
+    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
+    if not api_key:
+        return _fail("No Suno API key on record.", t0)
+    try:
+        resp = await _http_get(
+            "https://api.suno.com/v0/account/usage",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10,
+        )
+    except Exception as exc:
+        return _fail(f"Network error: {exc}", t0)
+    if resp.status_code == 200:
+        return _ok("Suno key valid", t0)
+    if resp.status_code in (401, 403):
+        return _fail(f"{resp.status_code} — key rejected.", t0)
+    return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
+
+
 async def test_tavily(creds: dict) -> HealthResult:
     """Validate Tavily credentials without consuming search credits."""
     t0 = time.monotonic()
@@ -1053,6 +1076,64 @@ async def test_tavily(creds: dict) -> HealthResult:
     if resp.status_code in (401, 403):
         return _fail(f"{resp.status_code} - key rejected; reconnect.", t0)
     return _fail(f"HTTP {resp.status_code}: {resp.text[:120]}", t0)
+
+
+async def test_lark(creds: dict) -> HealthResult:
+    """Verify the selected user or app identity without changing a resource."""
+    from packages.core.ai.mcp.lark import LarkClient, LarkError
+
+    t0 = time.monotonic()
+    try:
+        client = LarkClient(creds)
+        if client.user_token is not None:
+            identity = await client.get_user_info()
+            open_id = identity.get("open_id")
+            if not isinstance(open_id, str) or not open_id or (
+                creds.get("open_id") and open_id != creds["open_id"]
+            ):
+                raise LarkError("Lark account identity changed; reconnect.", "credentials_rejected")
+        else:
+            await client.get_tenant_token(force_refresh=True)
+    except LarkError as exc:
+        result = _fail(str(exc), t0)
+        result["reason_code"] = exc.reason_code
+        return result
+    except Exception:
+        return _fail("Lark connection check failed; try again.", t0)
+    result = _ok(
+        "Lark identity verified. Chat, document and Base access still require "
+        "the relevant scopes and resource permissions.", t0,
+    )
+    result["reason_code"] = "healthy"
+    return result
+
+
+async def test_apify(creds: dict) -> HealthResult:
+    """Verify the official MCP tool contract without starting a billable Actor."""
+    from packages.core.ai.mcp._remote import RemoteMCPClient, RemoteMCPError
+    from packages.core.services.apify_client import APIFY_MCP_ENDPOINT
+
+    t0 = time.monotonic()
+    raw_api_key = creds.get("api_key", "")
+    api_key = raw_api_key.strip() if isinstance(raw_api_key, str) else ""
+    if not api_key:
+        return _fail("No Apify API token on record.", t0)
+    try:
+        client = RemoteMCPClient(APIFY_MCP_ENDPOINT, api_key, timeout=10)
+        tools = await asyncio.wait_for(client.list_tools(), timeout=15)
+    except RemoteMCPError as exc:
+        return _fail(f"Apify MCP check failed (code {exc.code}); check the API token and account access.", t0)
+    except Exception:
+        return _fail("Apify MCP is unreachable; try the connection test again.", t0)
+    required = {"call-actor", "get-actor-run", "get-dataset-items", "abort-actor-run"}
+    discovered = {
+        tool["name"] for tool in tools
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+    }
+    missing = required - discovered
+    if missing:
+        return _fail(f"Apify MCP is missing required tools: {', '.join(sorted(missing))}.", t0)
+    return _ok("Official Apify MCP reachable; required collection tools available.", t0)
 
 
 async def test_jimeng(creds: dict) -> HealthResult:
@@ -1081,9 +1162,23 @@ async def test_jimeng(creds: dict) -> HealthResult:
     return _fail(f"Gateway HTTP {resp.status_code}", t0)
 
 
+async def test_manor_pms(creds: dict) -> HealthResult:
+    """Verify the selected management identity without reading business records."""
+    from packages.core.ai.mcp.manor_pms import check_connection
+
+    t0 = time.monotonic()
+    result = await check_connection(creds)
+    return {
+        **result,
+        "latency_ms": round((time.monotonic() - t0) * 1000, 1),
+        "checked_at": _now_iso(),
+    }
+
+
 # ── Registry ────────────────────────────────────────────────────────────────
 
 _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
+    "manor_pms":        test_manor_pms,
     "gmail":            test_google_userinfo,
     "google_calendar":  test_google_userinfo,
     "google_drive":     test_google_userinfo,
@@ -1093,6 +1188,7 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "email":            test_email_login,
     "telegram":         test_telegram,
     "slack":            test_slack,
+    "lark":             test_lark,
     "discord":          test_discord,
     "whatsapp":         test_whatsapp,
     "twilio":           test_twilio,
@@ -1108,7 +1204,9 @@ _TESTS: Dict[str, Callable[[dict], Awaitable[HealthResult]]] = {
     "webhook":          test_webhook,
     "replicate":        test_replicate,
     "elevenlabs":       test_elevenlabs,
+    "suno":             test_suno,
     "tavily":           test_tavily,
+    "apify":            test_apify,
     "jimeng":           test_jimeng,
 }
 
@@ -1311,6 +1409,7 @@ async def _test_whatsapp_account_readiness(
         deployment = load_whatsapp_business_config()
         if not nango_secret:
             raise RuntimeError("Nango is unavailable")
+        await release_read_transaction(db)
         provisioning = await inspect_whatsapp_business_number(
             nango_secret=nango_secret,
             provider_config_key=provider_config_key,
@@ -1463,6 +1562,7 @@ async def _resolve_nango_runtime_credentials(
         if not secret:
             return leased_creds or {}
 
+        await release_read_transaction(db)
         assert httpx is not None, "httpx required"
         async with httpx.AsyncClient(timeout=15.0) as cx:
             r = await cx.get(
@@ -1546,6 +1646,16 @@ async def _resolve_nango_runtime_credentials(
         return leased_creds or {}
 
 
+def _changed_during_health_check() -> HealthResult:
+    return {
+        "ok": False,
+        "detail": "Connection changed during the health check; retry with its current configuration.",
+        "reason_code": "connection_changed",
+        "latency_ms": 0.0,
+        "checked_at": _now_iso(),
+    }
+
+
 async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
     """Run the health check for an ``Integration`` row and stash the
     result into its ``config.last_health_check`` field.
@@ -1578,6 +1688,8 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
             "checked_at": _now_iso(),
         }
 
+    observed_revision = getattr(row, "updated_at", None)
+    released = await release_read_transaction(db)
     try:
         creds = get_credential_service().lease_integration(
             row,
@@ -1616,6 +1728,7 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
     # extension/Nango provider has no first-party checker.
     register_integration(provider_key)
     if provider_key == "whatsapp":
+        released = await release_read_transaction(db) or released
         result = await _test_whatsapp_account_readiness(
             db,
             row,
@@ -1624,6 +1737,7 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
             wiring_ctx,
         )
     else:
+        released = await release_read_transaction(db) or released
         result = await run_test(
             row.provider, resolved_creds or {}, wiring_ctx=wiring_ctx,
         )
@@ -1644,6 +1758,15 @@ async def run_and_persist_integration(db, integration_id: str) -> HealthResult:
             webhook_configured=nango_meta.get("webhook_configured"),
         )
 
+    if released:
+        # A reconnect/edit during the probe must not be overwritten by its old
+        # credentials' result. Lock only for the short conditional writeback.
+        row = (await db.execute(
+            select(Integration).where(Integration.id == integration_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if row is None or row.updated_at != observed_revision or row.status != "active":
+            return _changed_during_health_check()
     cfg = dict(row.config or {})
     if provider_key == "whatsapp":
         whatsapp = dict(cfg.get("whatsapp") or {})
@@ -1825,6 +1948,42 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
     if not row:
         return {"ok": False, "detail": "oauth account not found", "latency_ms": 0.0, "checked_at": _now_iso()}
 
+    from packages.core.services.manor_integration_oauth import (
+        is_manor_oauth_provider, manor_oauth_account_matches, manor_oauth_binding,
+        verify_manor_oauth_account,
+    )
+
+    if is_manor_oauth_provider(row.provider):
+        from packages.core.services.integration_access import _is_active_entity_member
+
+        # Rotating refresh invalidates the previous access token immediately.
+        # Hold the same row lock as refresh/disconnect before leasing tokens so
+        # an old-token probe cannot mark a freshly rotated grant for reconnect.
+        row = (await db.execute(
+            select(OAuthAccount).where(OAuthAccount.id == oauth_account_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if row is None:
+            return {"ok": False, "detail": "oauth account not found", "latency_ms": 0.0, "checked_at": _now_iso()}
+        if not manor_oauth_account_matches(row) or not await _is_active_entity_member(
+            db, user_id=row.user_id, entity_id=manor_oauth_binding(row).get("entity_id", ""),
+        ):
+            result = {"ok": False, "detail": "This OAuth connection is unavailable in its current owner/Entity/deployment; reconnect.", "latency_ms": 0.0, "checked_at": _now_iso(), "needs_reconnect": True}
+            row.profile = {**(row.profile or {}), "last_health_check": result}
+            await db.flush()
+            return result
+
+    observed_revision = getattr(row, "updated_at", None)
+    if canonical_integration_key(row.provider) == "lark":
+        from packages.core.services.lark_oauth import lark_oauth_account_matches
+
+        if not await lark_oauth_account_matches(db, row):
+            result = _fail("Lark app configuration changed; reconnect this account.", time.monotonic())
+            result["reason_code"] = "credentials_rejected"
+            row.profile = {**(row.profile or {}), "last_health_check": result}
+            await db.flush()
+            return {**result, "needs_reconnect": True}
+    released = await release_read_transaction(db)
     # Lease only stored token credentials here. Provider-specific profile
     # metadata is merged explicitly below so arbitrary profile fields never
     # become credential material.
@@ -1835,6 +1994,13 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
             reason="oauth.integration_health",
         )
     except CredentialDecryptError:
+        if released:
+            row = (await db.execute(
+                select(OAuthAccount).where(OAuthAccount.id == oauth_account_id)
+                .with_for_update().execution_options(populate_existing=True)
+            )).scalar_one_or_none()
+            if row is None or row.updated_at != observed_revision:
+                return _changed_during_health_check()
         result = mark_oauth_account_credential_reconnect_required(
             row,
             provider=canonical_integration_key(row.provider),
@@ -1849,6 +2015,27 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
         return {**result, "needs_reconnect": True}
 
     provider_key = canonical_integration_key(row.provider)
+    if provider_key == "lark":
+        profile = row.profile
+        creds = {
+            "access_token": (creds or {}).get("access_token"),
+            "token_type": "user_access_token", "platform": "lark",
+            "app_id": profile["app_id"], "open_id": profile["open_id"],
+        }
+    if is_manor_oauth_provider(provider_key):
+        from packages.core.services.oauth_flow import OAuthFlowError
+
+        t0 = time.monotonic()
+        try:
+            await verify_manor_oauth_account(row, str((creds or {}).get("access_token") or ""))
+            result = _ok("OAuth account identity and Entity verified.", t0)
+        except OAuthFlowError as exc:
+            result = _fail(exc.message, t0)
+            if exc.status in {401, 403}:
+                row.profile = {**(row.profile or {}), "oauth_refresh": {"reauth_required": True, "error": "identity_rejected"}}
+        row.profile = {**(row.profile or {}), "last_health_check": result}
+        await db.flush()
+        return result
     if provider_key == "quickbooks":
         profile = row.profile if isinstance(row.profile, dict) else {}
         realm_id = str(profile.get("realm_id") or "").strip()
@@ -1880,8 +2067,16 @@ async def run_and_persist_oauth(db, oauth_account_id: str) -> HealthResult:
         }
 
     register_integration(provider_key)
+    released = await release_read_transaction(db) or released
     result = await run_test(row.provider, creds, wiring_ctx=wiring_ctx)
 
+    if released:
+        row = (await db.execute(
+            select(OAuthAccount).where(OAuthAccount.id == oauth_account_id)
+            .with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if row is None or row.updated_at != observed_revision:
+            return _changed_during_health_check()
     profile = dict(row.profile or {})
     profile["last_health_check"] = result
     row.profile = profile

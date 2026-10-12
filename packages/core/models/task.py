@@ -189,6 +189,11 @@ class Conversation(Base, TimestampMixin):
     workspace_id: Mapped[Optional[str]] = mapped_column(String(26))
     title: Mapped[Optional[str]] = mapped_column(String(500))
     summary: Mapped[Optional[str]] = mapped_column(Text)
+    # Ordered durable boundary for the rolling summary.  The pair matches the
+    # message query order so equal created_at values remain deterministic.
+    summary_covered_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    summary_covered_message_id: Mapped[Optional[str]] = mapped_column(String(26))
+    summary_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     channel: Mapped[str] = mapped_column(String(50), default="web")
     status: Mapped[str] = mapped_column(String(20), default="active")
     meta: Mapped[dict] = mapped_column("metadata", JSONB, server_default="{}")

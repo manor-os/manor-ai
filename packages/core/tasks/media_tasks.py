@@ -11,13 +11,15 @@ import mimetypes
 import os
 import shutil
 import subprocess
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlsplit
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 
+from packages.core.services.file_refs import parse_file_reference
+from packages.core.services.generated_file_refs import entity_fs_open_url
 from packages.core.services.workspace_layout import WorkspaceArtifactDir
 from packages.core.tasks import video_adapters
 from packages.core.constants.media import (
@@ -54,6 +56,10 @@ MEDIA_API_TIMEOUT = httpx.Timeout(connect=30.0, read=300.0, write=180.0, pool=30
 MEDIA_JOB_STALE_SECONDS = int(os.getenv("MEDIA_JOB_STALE_SECONDS", "120"))
 MEDIA_JOB_MAX_PROCESSING_SECONDS = int(os.getenv("MEDIA_JOB_MAX_PROCESSING_SECONDS", "1800"))
 MEDIA_JOB_ORPHAN_GRACE_SECONDS = int(os.getenv("MEDIA_JOB_ORPHAN_GRACE_SECONDS", "600"))
+SUNO_WORKER_LEASE_SECONDS = int(os.getenv("SUNO_WORKER_LEASE_SECONDS", "300"))
+# One delivery of media.process_video_job owns a job at a time. Longer than the
+# task's own time limit, so a live worker never loses its lease mid-poll.
+VIDEO_WORKER_LEASE_SECONDS = int(os.getenv("VIDEO_WORKER_LEASE_SECONDS", "1260"))
 VIDEO_DURATION_DEFAULT_SECONDS = 5
 VIDEO_DURATION_MIN_SECONDS = 4
 VIDEO_DURATION_MAX_SECONDS = 15
@@ -89,6 +95,10 @@ class ProviderPollTimeout(TimeoutError):
     """Provider job is still pending after this worker's active poll window."""
 
 
+class SunoSubmissionReconciliationRequired(RuntimeError):
+    """A paid Suno submit may have succeeded, so automatic retry is unsafe."""
+
+
 def parse_video_duration(value: Any) -> int | None:
     """Best-effort parse of user/tool duration values into whole seconds."""
     if value is None or isinstance(value, bool):
@@ -106,12 +116,13 @@ def parse_video_duration(value: Any) -> int | None:
         return None
 
 
-def normalize_video_duration(value: Any) -> int:
+def normalize_video_duration(value: Any, model: str | None = None) -> int:
     """Clamp duration to the provider-supported short-video range."""
     duration = parse_video_duration(value)
     if duration is None:
         duration = VIDEO_DURATION_DEFAULT_SECONDS
-    return min(max(duration, VIDEO_DURATION_MIN_SECONDS), VIDEO_DURATION_MAX_SECONDS)
+    max_seconds = 30 if model == "bytedance/seedance-2.5" else VIDEO_DURATION_MAX_SECONDS
+    return min(max(duration, VIDEO_DURATION_MIN_SECONDS), max_seconds)
 
 
 def normalize_video_resolution(model: str | None, value: Any) -> str:
@@ -164,6 +175,10 @@ async def process_video_job(job_id: str) -> None:
     4. Updates job status
     5. Pushes real-time notification (both success AND failure)
     """
+    from packages.core.services.room_generated_files import room_media_job_approved_for_execution
+
+    if not await room_media_job_approved_for_execution(job_id):
+        return
     ok = await _mark_video_job_processing(job_id)
     if not ok:
         return
@@ -178,6 +193,8 @@ async def process_video_job(job_id: str) -> None:
             job_id,
             exc,
         )
+        # Hand the job to recovery polling right away.
+        await _release_media_worker_lease(job_id)
         return
     except Exception as exc:
         error_message = _provider_exception_message(exc)
@@ -185,6 +202,36 @@ async def process_video_job(job_id: str) -> None:
         result = {"error": error_message}
 
     await _finalize_video_job(job_id, result)
+
+
+async def process_suno_audio_job(job_id: str) -> None:
+    """Submit once, poll, project, and settle one Catalog Suno audio job."""
+    from packages.core.services.room_generated_files import room_media_job_approved_for_execution
+
+    if not await room_media_job_approved_for_execution(job_id):
+        return
+    if not await _mark_suno_audio_job_processing(job_id):
+        return
+    try:
+        result = await _call_suno_audio_api(job_id)
+    except ProviderPollTimeout as exc:
+        logger.info("Suno audio job %s remains pending: %s", job_id, exc)
+        await _release_suno_worker_lease(job_id)
+        return
+    except SunoSubmissionReconciliationRequired as exc:
+        # Keep the reservation active: a timed-out paid POST may have been
+        # accepted, and releasing it would understate Manor's exposure.
+        await _finalize_suno_audio_failure(job_id, str(exc), release_reservation=False)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Suno audio job %s failed: %s", job_id, exc, exc_info=True)
+        await _finalize_suno_audio_failure(
+            job_id,
+            _provider_exception_message(exc),
+            release_reservation=True,
+        )
+        return
+    await _finalize_suno_audio_success(job_id, result)
 
 
 @celery_app.task(
@@ -204,6 +251,22 @@ def process_video_job_task(job_id: str) -> dict:
             _run_async(_finalize_video_job(job_id, {"error": _provider_exception_message(exc)}))
         except Exception:
             logger.exception("Failed to mark crashed video job %s as failed", job_id)
+        return {"ok": False, "job_id": job_id, "error": _provider_exception_message(exc)}
+
+
+@celery_app.task(
+    name="media.process_suno_audio_job",
+    max_retries=0,
+    soft_time_limit=600,
+    time_limit=720,
+)
+def process_suno_audio_job_task(job_id: str) -> dict:
+    """Run a durable Suno Catalog job without Celery-level retries."""
+    try:
+        _run_async(process_suno_audio_job(job_id))
+        return {"ok": True, "job_id": job_id}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("media.process_suno_audio_job crashed for %s: %s", job_id, exc)
         return {"ok": False, "job_id": job_id, "error": _provider_exception_message(exc)}
 
 
@@ -284,9 +347,19 @@ def cleanup_media_references_task() -> dict:
     time_limit=300,
 )
 def recover_stale_jobs_task() -> dict:
-    """Recover video jobs stranded by API reloads, worker crashes, or lost polls."""
+    """Recover async media jobs stranded by reloads, crashes, or lost polls."""
     try:
-        return _run_async(recover_stale_video_jobs())
+        async def _recover_all() -> dict:
+            from packages.core.services.room_generated_files import reconcile_completed_room_media_jobs
+
+            return {
+                "ok": True,
+                "video": await recover_stale_video_jobs(),
+                "suno_audio": await recover_stale_suno_audio_jobs(),
+                "room_files": await reconcile_completed_room_media_jobs(),
+            }
+
+        return _run_async(_recover_all())
     except Exception as exc:  # noqa: BLE001
         logger.exception("media.recover_stale_jobs failed: %s", exc)
         return {"ok": False, "error": _provider_exception_message(exc)}
@@ -296,13 +369,45 @@ def recover_stale_jobs_task() -> dict:
 _background_tasks: set = set()
 
 
+async def drain_media_background_tasks() -> None:
+    """Finish inline heavy-worker children before their per-task loop closes.
+
+    Agent waits normally keep this loop alive, but a Workflow tool node can
+    return its pending receipt immediately. Teardown must not cancel a paid
+    submission before its provider state or final Knowledge output is saved.
+    Only children belonging to this loop are owned by this invocation.
+    """
+    loop = asyncio.get_running_loop()
+    while tasks := [task for task in _background_tasks
+                    if task.get_loop() is loop and not task.done()]:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _media_jobs_detached() -> bool:
+    from packages.core.ai.runtime.media_job_scope import runtime_media_jobs_detached
+
+    return runtime_media_jobs_detached() is not None
+
+
+def _leave_pending_for_sweeper(label: str, job_id: str) -> None:
+    """A parking host's job is never run on its loop (drained while parked)
+    or a daemon thread; it stays PENDING and media.recover_stale_jobs
+    dispatches it again once the broker is back."""
+    logger.warning(
+        "Celery dispatch failed for %s job %s; left pending for the stale-job sweeper",
+        label, job_id, exc_info=True,
+    )
+
+
 def schedule_video_job(job_id: str) -> None:
     """Schedule a video job for background processing.
 
     Prefer Celery so provider polling survives API reloads. A heavy worker must
     run the child in its current loop: video tasks share the heavy queue, and a
     Workflow waiting for its own queued child would otherwise deadlock when the
-    worker concurrency is one.
+    worker concurrency is one. A host that parks instead of waiting (the Task
+    agent loop) always dispatches through Celery: run_in_worker would drain an
+    in-loop job after the host parks, holding the heavy worker.
     """
     async def _run():
         try:
@@ -320,8 +425,10 @@ def schedule_video_job(job_id: str) -> None:
         task.add_done_callback(_background_tasks.discard)
         return True
 
+    detached = _media_jobs_detached()
     if (
-        os.getenv("MANOR_SERVICE_ROLE", "").strip().lower() == "worker-heavy"
+        not detached
+        and os.getenv("MANOR_SERVICE_ROLE", "").strip().lower() == "worker-heavy"
         and _schedule_in_current_loop()
     ):
         return
@@ -330,8 +437,55 @@ def schedule_video_job(job_id: str) -> None:
         process_video_job_task.delay(job_id)
         return
     except Exception:
+        if detached:
+            _leave_pending_for_sweeper("video", job_id)
+            return
         logger.warning("Celery dispatch failed for video job %s; falling back in-process", job_id, exc_info=True)
 
+    if _schedule_in_current_loop():
+        return
+
+    import threading
+    threading.Thread(target=lambda: asyncio.run(_run()), daemon=True).start()
+
+
+def schedule_suno_audio_job(job_id: str) -> None:
+    """Schedule Suno work with no automatic retry of the paid submit."""
+    async def _run():
+        try:
+            await process_suno_audio_job(job_id)
+        except Exception:
+            logger.error("Suno audio job %s crashed", job_id, exc_info=True)
+
+    def _schedule_in_current_loop() -> bool:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        task = loop.create_task(_run())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+        return True
+
+    detached = _media_jobs_detached()
+    if (
+        not detached
+        and os.getenv("MANOR_SERVICE_ROLE", "").strip().lower() == "worker-heavy"
+        and _schedule_in_current_loop()
+    ):
+        return
+    try:
+        process_suno_audio_job_task.delay(job_id)
+        return
+    except Exception:
+        if detached:
+            _leave_pending_for_sweeper("Suno audio", job_id)
+            return
+        logger.warning(
+            "Celery dispatch failed for Suno audio job %s; falling back in-process",
+            job_id,
+            exc_info=True,
+        )
     if _schedule_in_current_loop():
         return
 
@@ -342,15 +496,503 @@ def schedule_video_job(job_id: str) -> None:
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 
+async def _mark_suno_audio_job_processing(job_id: str) -> bool:
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job or job.kind != "audio" or job.model != "suno/music":
+            logger.error("Suno audio job %s was not found", job_id)
+            return False
+        if job.status in MEDIA_JOB_TERMINAL_STATUSES:
+            return False
+        params = dict(job.params or {})
+        lease_at_raw = str(params.get("worker_lease_at") or "").strip()
+        if job.status == MediaJobStatus.PROCESSING.value and lease_at_raw:
+            try:
+                lease_at = _aware_utc(datetime.fromisoformat(lease_at_raw))
+            except ValueError:
+                lease_at = None
+            if lease_at and (
+                datetime.now(timezone.utc) - lease_at
+            ).total_seconds() < SUNO_WORKER_LEASE_SECONDS:
+                return False
+        job.status = MediaJobStatus.PROCESSING.value
+        if not job.started_at:
+            job.started_at = datetime.now(timezone.utc)
+        params["worker_lease_at"] = datetime.now(timezone.utc).isoformat()
+        job.params = params
+        await db.commit()
+        return True
+
+
+async def _release_suno_worker_lease(job_id: str) -> None:
+    await _release_media_worker_lease(job_id)
+
+
+async def _release_media_worker_lease(job_id: str) -> None:
+    """Let the next delivery claim a job this worker stopped processing."""
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
+            return
+        params = dict(job.params or {})
+        params.pop("worker_lease_at", None)
+        job.params = params
+        await db.commit()
+
+
+async def _claim_suno_submit(job_id: str) -> bool:
+    """Atomically claim the one allowed paid submit for this job."""
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
+            return False
+        params = dict(job.params or {})
+        if params.get("provider_job_id"):
+            return False
+        submit_state = params.get("provider_submit_state")
+        if submit_state == "submitting":
+            raise ProviderPollTimeout("Another worker is already submitting this Suno job")
+        if submit_state != "not_started":
+            raise SunoSubmissionReconciliationRequired(
+                "Suno submission has no durable provider job id and may already have been charged; "
+                "automatic resubmission is disabled. Reconcile the job in Suno Platform."
+            )
+        params["provider_submit_state"] = "submitting"
+        params["provider_submit_started_at"] = datetime.now(timezone.utc).isoformat()
+        job.params = params
+        await db.commit()
+        return True
+
+
+async def _persist_suno_provider_job_id(job_id: str, provider_job_id: str) -> None:
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job:
+            raise RuntimeError("Suno audio job disappeared after provider submission")
+        params = dict(job.params or {})
+        params["provider_job_id"] = provider_job_id
+        params["provider_submit_state"] = "accepted"
+        params["provider_submit_completed_at"] = datetime.now(timezone.utc).isoformat()
+        job.params = params
+        await db.commit()
+
+
+async def _persist_suno_artifact_result(job_id: str, result: dict[str, Any]) -> None:
+    """Save the durable artifact receipt before strict billing settlement."""
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job:
+            raise RuntimeError("Suno audio job disappeared after artifact projection")
+        params = dict(job.params or {})
+        params["artifact_result"] = dict(result)
+        params["artifact_projected_at"] = datetime.now(timezone.utc).isoformat()
+        job.params = params
+        await db.commit()
+
+
+async def _load_suno_audio_job(job_id: str):
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        return (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id)
+        )).scalar_one_or_none()
+
+
+async def _call_suno_audio_api(job_id: str) -> dict[str, Any]:
+    from packages.core.ai.mcp import suno
+    from packages.core.ai.runtime import runtime_resolve_suno_audio_credentials
+
+    job = await _load_suno_audio_job(job_id)
+    if not job:
+        raise RuntimeError("Suno audio job not found")
+    credentials = await runtime_resolve_suno_audio_credentials(
+        user_id=job.user_id or "",
+        entity_id=job.entity_id,
+        byok=bool(job.byok),
+    )
+    if not credentials.api_key:
+        raise RuntimeError("No Suno API key is available for this stored job route")
+    if bool(credentials.is_byok) != bool(job.byok):
+        raise RuntimeError("The stored Suno billing route no longer has its matching credential")
+
+    params = dict(job.params or {})
+    artifact_result = params.get("artifact_result")
+    if isinstance(artifact_result, dict) and artifact_result.get("document_id"):
+        return dict(artifact_result)
+    provider_job_id = str(params.get("provider_job_id") or "").strip()
+    if not provider_job_id:
+        claimed = await _claim_suno_submit(job_id)
+        if not claimed:
+            job = await _load_suno_audio_job(job_id)
+            provider_job_id = str((job.params or {}).get("provider_job_id") or "").strip() if job else ""
+        if not provider_job_id:
+            try:
+                response = await suno.submit_music_generation(
+                    api_key=credentials.api_key,
+                    description=None if params.get("lyrics") or params.get("style") else job.prompt,
+                    lyrics=params.get("lyrics") or None,
+                    style=params.get("style") or None,
+                    title=params.get("title") or None,
+                    instrumental=bool(params.get("instrumental")),
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code < 500 and exc.response.status_code != 429:
+                    raise
+                raise SunoSubmissionReconciliationRequired(
+                    "Suno submission returned an uncertain provider error without a durable "
+                    "job id; automatic resubmission is disabled. Reconcile it in Suno Platform."
+                ) from exc
+            except httpx.RequestError as exc:
+                raise SunoSubmissionReconciliationRequired(
+                    "Suno submission ended without a durable provider job id and may already "
+                    "have been charged; automatic resubmission is disabled. Reconcile it in Suno Platform."
+                ) from exc
+            provider_job_id = suno.generation_id(response)
+            if not provider_job_id:
+                raise SunoSubmissionReconciliationRequired(
+                    "Suno accepted the submission response without a usable provider job id; "
+                    "automatic resubmission is disabled. Reconcile it in Suno Platform."
+                )
+            await _persist_suno_provider_job_id(job_id, provider_job_id)
+
+    deadline = time.monotonic() + 210.0
+    while time.monotonic() < deadline:
+        try:
+            response = await suno.fetch_generation(
+                api_key=credentials.api_key,
+                generation_id=provider_job_id,
+            )
+        except httpx.HTTPError as exc:
+            raise ProviderPollTimeout("Suno status check is temporarily unavailable") from exc
+        status = suno.generation_status(response)
+        if status == "failed":
+            raise RuntimeError(suno.generation_error(response))
+        audio_url = suno.generation_audio_url(response)
+        if status == "completed" and audio_url:
+            try:
+                audio_bytes, audio_format = await _download_suno_audio(audio_url)
+                if job.room_agent_run_id:
+                    from packages.core.ai.tools.extended_tools import (
+                        _audio_format_to_ext, _audio_format_to_mime,
+                    )
+                    from packages.core.services.room_generated_files import store_room_media_bytes
+
+                    document_id = await store_room_media_bytes(
+                        job_id=job.id, content=audio_bytes,
+                        extension=_audio_format_to_ext(audio_format),
+                        mime_type=_audio_format_to_mime(audio_format),
+                    )
+                    result_url = f"group-document:{document_id}"
+                else:
+                    from packages.core.ai.tools.extended_tools import (
+                        _fs_path_from_result_url,
+                        _save_generated_audio_bytes,
+                    )
+
+                    result_url = await _save_generated_audio_bytes(
+                        entity_id=job.entity_id,
+                        user_id=job.user_id or "",
+                        prompt=job.prompt,
+                        model=job.model or "suno/music",
+                        purpose="music",
+                        audio_bytes=audio_bytes,
+                        audio_format=audio_format,
+                        is_byok=bool(job.byok),
+                        output_name=str(params.get("output_name") or ""),
+                        workspace_id=params.get("workspace_id") or None,
+                        task_id=params.get("task_id") or None,
+                        agent_id=job.agent_id,
+                        conversation_id=job.conversation_id,
+                        bill_media=False,
+                    )
+                    fs_path = _fs_path_from_result_url(result_url, job.entity_id)
+                    document_id = await _suno_result_document_id(job.entity_id, fs_path)
+                if not document_id:
+                    raise RuntimeError("Knowledge projection did not return a document id")
+                result = {
+                    "result_url": result_url,
+                    "source_url": audio_url,
+                    "file_size": len(audio_bytes),
+                    "document_id": document_id,
+                }
+                await _persist_suno_artifact_result(job_id, result)
+                return result
+            except ProviderPollTimeout:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise ProviderPollTimeout(
+                    "Suno completed, but durable audio projection must be retried"
+                ) from exc
+        await asyncio.sleep(5.0)
+    raise ProviderPollTimeout("Suno generation is still pending after the active poll window")
+
+
+async def _download_suno_audio(audio_url: str) -> tuple[bytes, str]:
+    """Download a bounded public HTTPS audio result with DNS pinning."""
+    from packages.core.services.dashboard_http import (
+        create_public_https_transport,
+        resolve_public_https_target,
+    )
+
+    current_url = audio_url
+    max_bytes = 100 * 1024 * 1024
+    for redirect_index in range(4):
+        target = await resolve_public_https_target(current_url)
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=15.0),
+            follow_redirects=False,
+            trust_env=False,
+            transport=create_public_https_transport(target),
+            headers={"Accept": "audio/*,application/octet-stream"},
+        ) as client:
+            async with client.stream("GET", target.url) as response:
+                if response.is_redirect:
+                    if redirect_index >= 3 or not response.headers.get("location"):
+                        raise RuntimeError("Suno audio URL redirected too many times")
+                    current_url = urljoin(current_url, response.headers["location"])
+                    continue
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                if content_type and not (
+                    content_type.startswith("audio/")
+                    or content_type == "application/octet-stream"
+                ):
+                    raise RuntimeError("Suno result did not return audio content")
+                declared_size = int(response.headers.get("content-length") or 0)
+                if declared_size > max_bytes:
+                    raise RuntimeError("Suno audio result exceeds 100 MB")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes(256 * 1024):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise RuntimeError("Suno audio result exceeds 100 MB")
+                    chunks.append(chunk)
+                if total <= 0:
+                    raise RuntimeError("Suno returned an empty audio result")
+                suffix = os.path.splitext(urlsplit(current_url).path)[1].lower().lstrip(".")
+                by_mime = {
+                    "audio/mpeg": "mp3",
+                    "audio/mp3": "mp3",
+                    "audio/wav": "wav",
+                    "audio/x-wav": "wav",
+                    "audio/flac": "flac",
+                    "audio/ogg": "ogg",
+                    "audio/aac": "aac",
+                    "audio/opus": "opus",
+                }
+                audio_format = by_mime.get(content_type) or (
+                    suffix if suffix in {"mp3", "wav", "flac", "ogg", "aac", "opus"} else "mp3"
+                )
+                return b"".join(chunks), audio_format
+    raise RuntimeError("Suno audio URL could not be resolved")
+
+
+async def _suno_result_document_id(entity_id: str, fs_path: str | None) -> str | None:
+    if not fs_path:
+        return None
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.document import Document
+
+    async with async_session() as db:
+        return (await db.execute(
+            select(Document.id).where(
+                Document.entity_id == entity_id,
+                Document.fs_path == fs_path,
+                Document.is_trashed == False,  # noqa: E712
+            ).limit(1)
+        )).scalar_one_or_none()
+
+
+async def _wake_parked_task(db, job) -> None:
+    """Wake a Task agent loop parked on this job, in the job's own transaction.
+
+    A savepoint keeps a failed wake from voiding the job's terminal state; the
+    Task recovery sweep is the backstop for a wake that was not staged.
+    """
+    from packages.core.services.task_coordinator_wakeup import wake_task_coordinator_for_media_job
+
+    if not (job.params or {}).get("task_id"):
+        return
+    try:
+        async with db.begin_nested():
+            await wake_task_coordinator_for_media_job(db, job)
+    except Exception:
+        logger.warning("Media job %s could not wake its parked Task", job.id, exc_info=True)
+
+
+async def _finalize_suno_audio_failure(
+    job_id: str,
+    error: str,
+    *,
+    release_reservation: bool,
+) -> None:
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
+            return
+        job.status = MediaJobStatus.FAILED.value
+        job.error = error[:1000]
+        job.completed_at = datetime.now(timezone.utc)
+        params = dict(job.params or {})
+        params["provider_poll_status"] = (
+            "reconciliation_required" if not release_reservation else "failed"
+        )
+        job.params = params
+        if release_reservation and not job.byok:
+            from packages.core.services.credit_reservations import release_reservation_by_source
+
+            await release_reservation_by_source(
+                db,
+                source_kind="media_job",
+                source_id=job.id,
+                reason=job.error,
+            )
+        await _wake_parked_task(db, job)
+        await db.commit()
+
+
+async def _finalize_suno_audio_success(job_id: str, result: dict[str, Any]) -> None:
+    from sqlalchemy import select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    async with async_session() as db:
+        job = (await db.execute(
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
+        )).scalar_one_or_none()
+        if not job or job.status in MEDIA_JOB_TERMINAL_STATUSES:
+            return
+        if not job.byok:
+            from packages.core.services.credit_reservations import consume_reservation_by_source
+            from packages.core.services.usage_service import record_direct_credit_usage
+
+            credits = int(job.credits or 0)
+            await record_direct_credit_usage(
+                db,
+                job.entity_id,
+                credits=credits,
+                kind="audio",
+                model=job.model or "suno/music",
+                operation_id=job.id,
+                workspace_id=str((job.params or {}).get("workspace_id") or "") or None,
+                user_id=job.user_id,
+                agent_id=job.agent_id,
+                conversation_id=job.conversation_id,
+                cost_usd=float(job.cost_usd or 0),
+            )
+            reservation = await consume_reservation_by_source(
+                db,
+                source_kind="media_job",
+                source_id=job.id,
+                consumed_credits=credits,
+            )
+            if reservation is None:
+                raise RuntimeError("Suno credit reservation is missing")
+        job.status = MediaJobStatus.COMPLETED.value
+        job.result_url = str(result.get("result_url") or "")
+        job.source_url = str(result.get("source_url") or "")
+        job.file_size = int(result.get("file_size") or 0)
+        job.completed_at = datetime.now(timezone.utc)
+        params = dict(job.params or {})
+        params["provider_poll_status"] = "completed"
+        params["result_document_id"] = result.get("document_id")
+        job.params = params
+        await _wake_parked_task(db, job)
+        await db.commit()
+    await _project_group_media_if_ready(job_id)
+
+
+async def _project_group_media_if_ready(job_id: str) -> None:
+    """Best-effort room handoff after durable media and billing settlement."""
+    from packages.core.services.room_generated_files import project_completed_room_media_job
+
+    try:
+        await project_completed_room_media_job(job_id)
+    except Exception:  # noqa: BLE001
+        # A generated result stays in its private Knowledge folder when the
+        # room audience or policy changed. The completed-job sweeper retries
+        # transient failures without resubmitting or rebilling the provider.
+        logger.warning("Media job %s room-file publication deferred", job_id, exc_info=True)
+
+
+def _video_worker_lease_live(params: dict | None, now: datetime | None = None) -> bool:
+    """Whether a worker is still processing this video job right now."""
+    lease_at_raw = str((params or {}).get("worker_lease_at") or "").strip()
+    if not lease_at_raw:
+        return False
+    try:
+        lease_at = _aware_utc(datetime.fromisoformat(lease_at_raw))
+    except ValueError:
+        return False
+    if lease_at is None:
+        return False
+    return ((now or datetime.now(timezone.utc)) - lease_at).total_seconds() < VIDEO_WORKER_LEASE_SECONDS
+
+
 async def _mark_video_job_processing(job_id: str) -> bool:
-    """Move a job into processing unless it already reached a terminal state."""
+    """Claim a job for this worker unless it is terminal or another worker holds it.
+
+    Duplicate deliveries of the same job (recovery sweeps re-enqueue jobs that
+    are still polling) must not process it concurrently: the second writer
+    finds the first one's finished file and fails a job that succeeded.
+    """
     from packages.core.database import async_session
     from packages.core.models.media_job import MediaJob
     from sqlalchemy import select
 
     async with async_session() as db:
         job = (await db.execute(
-            select(MediaJob).where(MediaJob.id == job_id)
+            select(MediaJob).where(MediaJob.id == job_id).with_for_update()
         )).scalar_one_or_none()
         if not job:
             logger.error("Video job %s not found", job_id)
@@ -358,10 +1000,16 @@ async def _mark_video_job_processing(job_id: str) -> bool:
         if job.status in MEDIA_JOB_TERMINAL_STATUSES:
             logger.info("Video job %s already terminal (%s); skipping", job_id, job.status)
             return False
+        params = dict(job.params or {})
+        if job.status == MediaJobStatus.PROCESSING.value and _video_worker_lease_live(params):
+            logger.info("Video job %s is being processed by another worker; skipping", job_id)
+            return False
 
         job.status = MediaJobStatus.PROCESSING.value
         if not job.started_at:
             job.started_at = datetime.now(timezone.utc)
+        params["worker_lease_at"] = datetime.now(timezone.utc).isoformat()
+        job.params = params
         await db.commit()
         return True
 
@@ -418,6 +1066,7 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
         params["provider_poll_completed_at"] = datetime.now(timezone.utc).isoformat()
         job.params = params
         job.completed_at = datetime.now(timezone.utc)
+        await _wake_parked_task(db, job)
         await db.commit()
 
         # Bill usage (only on success + platform key)
@@ -427,6 +1076,9 @@ async def _finalize_video_job(job_id: str, result: dict[str, Any], *, force: boo
                 await _consume_video_reservation(job.id, int(job.credits or 0) or None)
         elif job.status == MediaJobStatus.COMPLETED and not job.byok:
             await _release_video_reservation(job.id, "video completed without billable cost")
+
+        if job.status == MediaJobStatus.COMPLETED:
+            await _project_group_media_if_ready(job.id)
 
         # Always push notification — success or failure.
         await _push_notification(job)
@@ -568,6 +1220,11 @@ async def recover_stale_video_jobs(
     for job in processing_jobs:
         stats["checked"] += 1
         params = job.params or {}
+        if _video_worker_lease_live(params, now):
+            # A worker is polling and saving this job right now; finishing it
+            # here too would race its write and fail a clip that succeeded.
+            stats["still_pending"] += 1
+            continue
         poll_state = params.get("provider_poll") or {}
         poll_url = poll_state.get("poll_url") if isinstance(poll_state, dict) else ""
         age_seconds = _job_age_seconds(job)
@@ -633,8 +1290,84 @@ async def recover_stale_video_jobs(
     return stats
 
 
+async def recover_stale_suno_audio_jobs(
+    *,
+    stale_after_seconds: int = MEDIA_JOB_STALE_SECONDS,
+    max_processing_seconds: int = MEDIA_JOB_MAX_PROCESSING_SECONDS,
+    orphan_grace_seconds: int = MEDIA_JOB_ORPHAN_GRACE_SECONDS,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Requeue safe Suno polling while refusing ambiguous paid resubmits."""
+    from sqlalchemy import or_, select
+
+    from packages.core.database import async_session
+    from packages.core.models.media_job import MediaJob
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=stale_after_seconds)
+    stats = {
+        "checked": 0,
+        "requeued": 0,
+        "reconciliation_required": 0,
+    }
+    async with async_session() as db:
+        jobs = (await db.execute(
+            select(MediaJob)
+            .where(
+                MediaJob.kind == "audio",
+                MediaJob.model == "suno/music",
+                MediaJob.status.in_([
+                    MediaJobStatus.PENDING.value,
+                    MediaJobStatus.PROCESSING.value,
+                ]),
+                or_(MediaJob.started_at.is_(None), MediaJob.started_at <= cutoff),
+            )
+            .order_by(MediaJob.created_at.asc())
+            .limit(limit)
+        )).scalars().all()
+
+    for job in jobs:
+        stats["checked"] += 1
+        params = dict(job.params or {})
+        provider_job_id = str(params.get("provider_job_id") or "").strip()
+        submit_state = str(params.get("provider_submit_state") or "not_started")
+        age_seconds = _job_age_seconds(job)
+        if provider_job_id and age_seconds >= max_processing_seconds:
+            await _finalize_suno_audio_failure(
+                job.id,
+                (
+                    f"Suno generation remained unresolved for {int(age_seconds)}s after "
+                    "submission. The provider job was not replayed; reconcile it in Suno Platform."
+                ),
+                release_reservation=False,
+            )
+            stats["reconciliation_required"] += 1
+            continue
+        if provider_job_id or submit_state == "not_started":
+            try:
+                process_suno_audio_job_task.delay(job.id)
+                stats["requeued"] += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Could not requeue Suno audio job %s: %s", job.id, exc)
+            continue
+        if submit_state == "submitting" and age_seconds >= orphan_grace_seconds:
+            await _finalize_suno_audio_failure(
+                job.id,
+                (
+                    "Suno submission stopped before a provider job id was saved and may "
+                    "already have been charged; automatic resubmission is disabled. "
+                    "Reconcile it in Suno Platform."
+                ),
+                release_reservation=False,
+            )
+            stats["reconciliation_required"] += 1
+    return stats
+
+
 async def _resume_video_job_from_provider(job) -> dict[str, Any]:
     """Poll a stranded provider job once and download the result if complete."""
+    from packages.core.contracts.media_job_output import media_job_output_kwargs
+
     params = job.params or {}
     poll_state = params.get("provider_poll") or {}
     poll_url = poll_state.get("poll_url") if isinstance(poll_state, dict) else ""
@@ -716,8 +1449,10 @@ async def _resume_video_job_from_provider(job) -> dict[str, Any]:
         agent_id=getattr(job, "agent_id", None),
         conversation_id=getattr(job, "conversation_id", None),
         user_id=getattr(job, "user_id", None),
+        room_agent_run_id=getattr(job, "room_agent_run_id", None),
         with_audio=_seedance_bool(params.get("generate_audio")),
         has_video_input=bool(params.get("reference_video_urls")),
+        **media_job_output_kwargs(params),
     )
 
 
@@ -827,6 +1562,10 @@ async def _bill_usage(job) -> bool:
     try:
         from packages.core.database import async_session
         from packages.core.services.usage_service import record_media_usage
+        workspace_id = (
+            str((getattr(job, "params", None) or {}).get("workspace_id") or "").strip()
+            or None
+        )
         async with async_session() as db:
             recorded = await record_media_usage(
                 db,
@@ -835,11 +1574,13 @@ async def _bill_usage(job) -> bool:
                 model=job.model or "bytedance/seedance-2.0",
                 cost_usd=job.cost_usd,
                 units=job.duration_seconds or 0,
+                workspace_id=workspace_id,
                 user_id=getattr(job, "user_id", None),
                 agent_id=getattr(job, "agent_id", None),
                 conversation_id=getattr(job, "conversation_id", None),
                 source="tool:video",
                 byok=job.byok,
+                strict=True,
             )
             await db.commit()
             return bool(recorded)
@@ -1279,6 +2020,9 @@ async def _build_frame_images(
     )
 
 
+_LEGACY_MEDIA_OUTPUT = object()
+
+
 async def _download_and_save(
     video_url: str, prompt: str, model: str, job_id: str,
     entity_id: str, duration: int, resolution: str,
@@ -1288,12 +2032,21 @@ async def _download_and_save(
     agent_id: str | None = None,
     conversation_id: str | None = None,
     user_id: str | None = None,
+    room_agent_run_id: str | None = None,
     with_audio: bool = False,
     has_video_input: bool = False,
+    output_contract: object = _LEGACY_MEDIA_OUTPUT,
 ) -> dict:
     """Download video from URL, save to entity FS, register as KB document."""
+    from packages.core.contracts.media_job_output import MediaJobOutputContract
     from packages.core.services.entity_fs import get_entity_root, write_entity_file_atomic
 
+    # Only jobs created before the output contract existed may use the old
+    # resolver. Malformed/present contracts never downgrade to legacy naming.
+    prepared_output = (
+        None if output_contract is _LEGACY_MEDIA_OUTPUT
+        else MediaJobOutputContract.from_dict(output_contract)
+    )
     content_type = ""
     if video_url.startswith("data:"):
         try:
@@ -1314,39 +2067,115 @@ async def _download_and_save(
 
     ext = ".webm" if "webm" in content_type else ".mp4"
 
+    if room_agent_run_id:
+        from packages.core.services.room_generated_files import store_room_media_bytes
+        from packages.core.services.billing_service import estimate_video_cost, video_to_credits
+
+        document_id = await store_room_media_bytes(
+            job_id=job_id, content=video_bytes, extension=ext,
+            mime_type="video/webm" if ext == ".webm" else "video/mp4",
+        )
+        return {
+            "result_url": f"group-document:{document_id}",
+            "document_id": document_id,
+            "source_url": video_url,
+            "file_size": len(video_bytes),
+            "duration_seconds": duration,
+            "cost_usd": estimate_video_cost(
+                model, duration, resolution,
+                with_audio=with_audio, has_video_input=has_video_input,
+            ),
+            "credits": video_to_credits(
+                model, duration, resolution,
+                with_audio=with_audio, has_video_input=has_video_input,
+            ),
+        }
+
     entity_root = get_entity_root(entity_id)
     from packages.core.services.generated_media_naming import (
         build_generated_media_target,
         resolve_workspace_artifact_base_dir,
         scope_workspace_artifact_path,
         workspace_artifact_default_dir,
+        workspace_task_artifact_dir,
     )
     workspace_base_dir = await resolve_workspace_artifact_base_dir(
         entity_id=entity_id,
         workspace_id=workspace_id,
-        task_id=task_id,
+        task_id=None if prepared_output is not None else task_id,
     )
-    target = build_generated_media_target(
-        prompt=prompt,
-        desired_name=scope_workspace_artifact_path(
-            output_name,
+    write_precondition = None
+    if prepared_output is not None:
+        from packages.core.ai.runtime.authorization_receipts import RuntimeToolAuthorizationWriteError
+
+        plan = prepared_output.plan
+        allowed_bases = {
             workspace_base_dir,
-            preserve_leaf_default=True,
-        ),
-        ext=ext,
-        fallback="generated-video",
-        default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
-        entity_root=entity_root,
-    )
+            workspace_task_artifact_dir(workspace_base_dir, task_id),
+        }
+        archive_suffix = plan.artifact_base_dir.removeprefix(f"{workspace_base_dir}/")
+        archive_parts = archive_suffix.split("/")
+        if (
+            workspace_base_dir
+            and plan.artifact_base_dir.startswith(f"{workspace_base_dir}/")
+            and len(archive_parts) == 2
+            and archive_parts[0] in {"workflow", "runs"}
+            and archive_parts[1] not in {"", ".", ".."}
+        ):
+            # The server persisted this exact plan before provider submission;
+            # retries keep its lineage identity independently of worker context.
+            allowed_bases.add(plan.artifact_base_dir)
+        if plan.artifact_base_dir not in allowed_bases:
+            raise RuntimeToolAuthorizationWriteError("Video output Workspace changed after authorization")
+        prepared_output.validate_scope(
+            job_id=job_id,
+            entity_id=entity_id,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            task_id=task_id,
+            artifact_base_dir=plan.artifact_base_dir,
+        )
+        requested_name = scope_workspace_artifact_path(
+            output_name, plan.artifact_base_dir, preserve_leaf_default=True,
+        )
+        if requested_name != plan.requested_name:
+            raise RuntimeToolAuthorizationWriteError("Video output name changed after authorization")
+        target = plan.target_for_extension(ext)
+        expected_path = os.path.abspath(os.path.join(entity_root, target.rel_path))
+
+        def write_precondition(path: str, target_exists: bool, resolved_path: str) -> None:
+            # This explicit guard survives the worker handoff. An expired
+            # originating tool ContextVar/lease is neither required nor reused.
+            if (
+                path != target.rel_path
+                or os.path.abspath(resolved_path) != expected_path
+                or os.path.realpath(expected_path) != expected_path
+                or target_exists
+            ):
+                raise RuntimeToolAuthorizationWriteError("Video output target changed after authorization")
+    else:
+        target = build_generated_media_target(
+            prompt=prompt,
+            desired_name=scope_workspace_artifact_path(
+                output_name,
+                workspace_base_dir,
+                preserve_leaf_default=True,
+            ),
+            ext=ext,
+            fallback="generated-video",
+            default_dir=workspace_artifact_default_dir(workspace_base_dir, WorkspaceArtifactDir.VIDEOS.value),
+            entity_root=entity_root,
+        )
     filepath = write_entity_file_atomic(
         entity_id,
         target.rel_path,
         video_bytes,
         expected_size=len(video_bytes),
         allow_empty=False,
+        write_precondition=write_precondition,
     )
 
-    local_url = f"/api/v1/fs/{entity_id}/{target.rel_path}"
+    local_url = entity_fs_open_url(entity_id, target.rel_path)
     logger.info("Video job %s saved: %s (%d bytes)", job_id, filepath, len(video_bytes))
 
     # Register as KB document
@@ -1525,19 +2354,22 @@ def _entity_rel_path_from_reference(value: str, entity_id: str, entity_root: str
             payload = verify_file_access_token(token)
         except Exception:
             payload = None
+        if payload and payload.get("conversation_id"):
+            # A scoped attachment capability must keep its original actor,
+            # content digest and expiry; never remint it as a legacy media URL.
+            return None
         if payload and payload.get("entity_id") == entity_id:
             return _safe_entity_rel_path(str(payload.get("path") or ""))
         return None
 
-    if path.startswith("/api/v1/fs/"):
-        # /api/v1/fs/{entity_id}/path/to/file -> path/to/file
-        parts = path.split("/", 5)
-        if len(parts) < 6:
-            return None
-        if parts[4] != entity_id:
+    file_ref = parse_file_reference(value)
+    if file_ref is not None and file_ref.entity_id:
+        if file_ref.entity_id != entity_id:
             logger.warning("Entity mismatch for local media URL conversion: %s", value)
             return None
-        return _safe_entity_rel_path(parts[5])
+        return file_ref.fs_path or None
+    if _looks_like_entity_fs_reference(value):
+        return None  # an fs URL without an entity path
 
     if parsed.scheme:
         return None
@@ -1566,17 +2398,18 @@ def _looks_like_entity_fs_reference(value: str) -> bool:
 def _invalid_entity_fs_reference_message(value: str, entity_id: str) -> str:
     parsed = urlsplit(value)
     path = parsed.path if parsed.scheme else value
-    parts = path.split("/", 5)
-    if len(parts) < 6:
+    file_ref = parse_file_reference(value)
+    if file_ref is None or not file_ref.entity_id:
         return (
             "Invalid Manor media reference. `/api/v1/fs/...` URLs must include "
-            f"the entity id and path: `/api/v1/fs/{entity_id}/path/to/file.png`. "
+            "the entity id and path: "
+            f"`{entity_fs_open_url(entity_id, 'path/to/file.png')}`. "
             "Use a plain Knowledge-relative path such as `project/storyboards/frame.png` "
             "when the entity id is not available."
         )
     return (
         "Invalid Manor media reference. The entity segment in "
-        f"`{path}` is `{parts[4]}`, but this job belongs to `{entity_id}`. "
+        f"`{path}` is `{file_ref.entity_id}`, but this job belongs to `{entity_id}`. "
         "Use the plain Knowledge-relative path or a URL generated by Manor."
     )
 
@@ -1730,9 +2563,10 @@ def _copy_or_trim_video_reference(
     source_abs: str,
     source_label: str,
     copy_entity_file_atomic,
+    max_seconds: float = VIDEO_REFERENCE_MAX_SECONDS,
 ) -> str:
     duration = _video_reference_duration_seconds(source_abs)
-    if duration is None or duration <= VIDEO_REFERENCE_MAX_SECONDS:
+    if duration is None or duration <= max_seconds:
         return copy_entity_file_atomic(
             entity_id,
             target_rel,
@@ -1745,26 +2579,26 @@ def _copy_or_trim_video_reference(
         _trim_local_reference_video(
             source_abs,
             target_abs,
-            target_seconds=VIDEO_REFERENCE_TRIM_SECONDS,
+            target_seconds=max_seconds - 0.1,
         )
     except Exception as exc:
         raise ValueError(
             f"Seedance reference video `{source_label}` is {duration:.2f}s, "
-            f"but reference videos must be <= {VIDEO_REFERENCE_MAX_SECONDS:g}s. "
+            f"but reference videos must be <= {max_seconds:g}s. "
             f"Automatic trim failed: {exc}"
         ) from exc
 
     trimmed_duration = _video_reference_duration_seconds(target_abs)
-    if trimmed_duration is not None and trimmed_duration > VIDEO_REFERENCE_MAX_SECONDS:
+    if trimmed_duration is not None and trimmed_duration > max_seconds:
         raise ValueError(
             f"Seedance reference video `{source_label}` is {trimmed_duration:.2f}s after trimming; "
-            f"trim it below {VIDEO_REFERENCE_MAX_SECONDS:g}s before generating."
+            f"trim it below {max_seconds:g}s before generating."
         )
     logger.info(
         "Trimmed Seedance reference video %s from %.2fs to %s",
         source_label,
         duration,
-        f"{trimmed_duration:.2f}s" if trimmed_duration is not None else f"{VIDEO_REFERENCE_TRIM_SECONDS:.2f}s",
+        f"{trimmed_duration:.2f}s" if trimmed_duration is not None else f"{max_seconds - 0.1:.2f}s",
     )
     return target_abs
 
@@ -1782,7 +2616,7 @@ def _decode_image_data_uri(value: str) -> tuple[bytes, str] | None:
     return base64.b64decode(encoded), mime_type
 
 
-def _snapshot_one_video_reference(value: str, entity_id: str, job_id: str, slot: str, index: int) -> str:
+def _snapshot_one_video_reference(value: str, entity_id: str, job_id: str, slot: str, index: int, *, max_video_seconds: float = VIDEO_REFERENCE_MAX_SECONDS) -> str:
     """Copy transient/local reference media into a job-owned hidden path.
 
     Providers fetch references after the tool has returned a pending job. If a
@@ -1819,7 +2653,7 @@ def _snapshot_one_video_reference(value: str, entity_id: str, job_id: str, slot:
             expected_size=len(image_bytes),
             allow_empty=False,
         )
-        return f"/api/v1/fs/{entity_id}/{target_rel}"
+        return entity_fs_open_url(entity_id, target_rel)
 
     assert rel_path is not None
     source_abs = os.path.realpath(os.path.join(entity_root, rel_path))
@@ -1844,6 +2678,7 @@ def _snapshot_one_video_reference(value: str, entity_id: str, job_id: str, slot:
                 source_abs=source_abs,
                 source_label=rel_path,
                 copy_entity_file_atomic=copy_entity_file_atomic,
+                max_seconds=max_video_seconds,
             )
         else:
             copy_entity_file_atomic(
@@ -1853,7 +2688,7 @@ def _snapshot_one_video_reference(value: str, entity_id: str, job_id: str, slot:
                 expected_size=os.path.getsize(source_abs),
                 allow_empty=False,
             )
-    return f"/api/v1/fs/{entity_id}/{target_rel}"
+    return entity_fs_open_url(entity_id, target_rel)
 
 
 def snapshot_video_reference_urls(
@@ -1865,8 +2700,13 @@ def snapshot_video_reference_urls(
     reference_urls: list[str] | None = None,
     reference_video_urls: list[str] | None = None,
     audio_reference_urls: list[str] | None = None,
+    model: str = "",
 ) -> dict[str, Any]:
     """Return video reference params with local inputs persisted per job."""
+    from packages.core.constants.models import video_model_capabilities
+
+    capabilities = video_model_capabilities(model or "bytedance/seedance-2.0")
+    max_video_seconds = 30.0 if model == "bytedance/seedance-2.5" else VIDEO_REFERENCE_MAX_SECONDS
     refs = list(reference_urls or [])
     video_refs = list(reference_video_urls or [])
     audio_refs = list(audio_reference_urls or [])
@@ -1882,13 +2722,13 @@ def snapshot_video_reference_urls(
     if last:
         last = _snapshot_one_video_reference(last, entity_id, job_id, "last-frame", slot_index)
         slot_index += 1
-    for idx, ref in enumerate(refs[:9]):
+    for idx, ref in enumerate(refs[:capabilities["max_reference_images"]]):
         out_refs.append(_snapshot_one_video_reference(ref, entity_id, job_id, f"reference-{idx + 1}", slot_index))
         slot_index += 1
-    for idx, ref in enumerate(video_refs[:3]):
-        out_video_refs.append(_snapshot_one_video_reference(ref, entity_id, job_id, f"reference-video-{idx + 1}", slot_index))
+    for idx, ref in enumerate(video_refs[:capabilities["max_reference_videos"]]):
+        out_video_refs.append(_snapshot_one_video_reference(ref, entity_id, job_id, f"reference-video-{idx + 1}", slot_index, max_video_seconds=max_video_seconds))
         slot_index += 1
-    for idx, ref in enumerate(audio_refs[:3]):
+    for idx, ref in enumerate(audio_refs[:capabilities["max_audio_references"]]):
         out_audio_refs.append(_snapshot_one_video_reference(ref, entity_id, job_id, f"reference-audio-{idx + 1}", slot_index))
         slot_index += 1
     return {

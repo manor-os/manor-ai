@@ -90,6 +90,17 @@ async def get_or_create_conversation(
     ):
         raise ValueError("AI Edit requires a target")
 
+    if conversation_id or (workspace_id and thread_ref_kind == "task" and thread_ref_id):
+        from packages.core.services.task_comment_approval_origin import lock_task_comment_turn_boundary
+
+        # Task Session binding below locks Task even for a general Task.
+        # Fence foreground lifecycle first, before that or any editor row lock.
+        await lock_task_comment_turn_boundary(
+            db, entity_id=entity_id, conversation_id=conversation_id,
+            workspace_id=workspace_id,
+            task_id=thread_ref_id if thread_ref_kind == "task" else None,
+        )
+
     if conversation_id:
         conversation_query = select(Conversation).where(
             Conversation.id == conversation_id,
@@ -216,6 +227,11 @@ async def rename_conversation(
         return None
     clean_title = (title or "").strip()[:500]
     conv.title = clean_title or "Untitled"
+    from packages.core.services.conversation_generated_files import (
+        rename_conversation_generated_folder,
+    )
+
+    await rename_conversation_generated_folder(db, conv)
     await db.flush()
     await db.refresh(conv)
     return conv
@@ -348,6 +364,25 @@ async def delete_conversation(
         delete(ConversationShare).where(
             ConversationShare.conversation_id == conversation_id,
             ConversationShare.entity_id == entity_id,
+        )
+    )
+    from packages.core.models.agent_delegation_session import AgentDelegationSession
+    from packages.core.models.agent_delegation_session import AgentContextArchive
+    await db.execute(update(RuntimeRun).where(RuntimeRun.conversation_id == conversation_id, RuntimeRun.entity_id == entity_id).values(context_state=None))
+    await db.execute(
+        delete(AgentContextArchive).where(
+            AgentContextArchive.runtime_run_id.in_(select(RuntimeRun.id).where(RuntimeRun.conversation_id == conversation_id, RuntimeRun.entity_id == entity_id))
+        )
+    )
+    await db.execute(
+        delete(AgentDelegationSession).where(
+            AgentDelegationSession.conversation_id == conversation_id,
+        )
+    )
+    from packages.core.models.conversation_transcript import ConversationTranscriptItem
+    await db.execute(
+        delete(ConversationTranscriptItem).where(
+            ConversationTranscriptItem.conversation_id == conversation_id,
         )
     )
     # Keep the same parent-to-child lock order as feedback persistence:

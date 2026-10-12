@@ -4,7 +4,7 @@ import hashlib
 import json
 from typing import Any
 
-from packages.core.ai.runtime.approval_classifier import bash_write_targets
+from packages.core.ai.runtime.approval_classifier import bash_write_targets, is_chrome_basic_call
 from packages.core.ai.runtime.approvals import RuntimeApprovalAction
 
 
@@ -16,14 +16,38 @@ __all__ = [
     "approval_paths",
     "approval_preview_arguments",
     "approval_public_content",
+    "is_chrome_publication_call",
+    "RuntimeApprovalContinuationError",
     "describe_runtime_approval_action",
     "runtime_approval_prompt",
     "runtime_approval_rejected_message",
+    "runtime_approval_continuation",
+    "runtime_approval_runtime_metadata",
     "runtime_approval_retry_args",
     "runtime_approval_resume_guidance",
     "runtime_file_approval_guidance",
     "runtime_approval_retry_message",
 ]
+
+
+_RUNTIME_APPROVAL_CONTINUATION_MAX_CHARS = 64_000
+CHROME_APPROVAL_CONTEXT_KEYS = frozenset({"control_epoch", "controlEpoch"})
+_CHROME_PUBLICATION_LOCATOR_KEYS = frozenset({
+    "ref", "node_id", "selector", "target", "snapshot_id", "snapshotId",
+    "expect", "fallbackReason", "fallback_reason", "x", "y",
+})
+
+
+def is_chrome_publication_call(tool_name: str, arguments: dict[str, Any]) -> bool:
+    intent = arguments.get("operation_intent")
+    return (
+        tool_name.startswith("mcp__chrome__") and isinstance(intent, dict)
+        and intent.get("effect") == "publish" and isinstance(intent.get("publication"), dict)
+    )
+
+
+class RuntimeApprovalContinuationError(ValueError):
+    """An approval payload cannot be preserved for deterministic replay."""
 
 
 _CONTEXT_KEYS = {
@@ -35,14 +59,8 @@ _CONTEXT_KEYS = {
     "_user_id_from_context",
     "_active_user_message_from_context",
     "_manual_skill_selected_from_context",
-    # Browser page-snapshot version token. It changes every time the agent
-    # re-reads the page — which it must do to locate the element again after
-    # the user approves. Hashing it made every retry look like "the content
-    # changed after approval": the grant was superseded and a fresh card
-    # minted, so the user approved the same text repeatedly and the action
-    # never ran. It carries no content — the target stays pinned by `ref` /
-    # `tabId`, which remain hashed so approving a fill on one element can
-    # never authorize another.
+    # Snapshot versions do not describe consent, but remain useful execution
+    # context. Keep them in the continuation even though the hash ignores them.
     "snapshot_id",
 }
 _BOOLEAN_CONTROL_KEYS = {"confirm"}
@@ -77,8 +95,19 @@ _FILE_MUTATION_TOOL_NAMES = {
 }
 
 
-def approval_args_hash(arguments: dict[str, Any]) -> str:
-    clean = _strip_context(arguments)
+def _approval_operation_arguments(arguments: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    # Chrome control leases belong to the current execution, not human consent.
+    # Strip only top-level Runtime fields; nested content keeps its exact meaning.
+    if tool_name.startswith("mcp__chrome__") and isinstance(arguments, dict):
+        return {key: value for key, value in arguments.items() if key not in CHROME_APPROVAL_CONTEXT_KEYS}
+    return arguments
+
+
+def approval_args_hash(arguments: dict[str, Any], *, tool_name: str = "") -> str:
+    operation = _approval_operation_arguments(arguments, tool_name)
+    if is_chrome_publication_call(tool_name, arguments):
+        operation = {key: value for key, value in operation.items() if key not in _CHROME_PUBLICATION_LOCATOR_KEYS}
+    clean = _strip_context(operation)
     encoded = json.dumps(clean, sort_keys=True, ensure_ascii=False, default=str, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -120,6 +149,22 @@ def _strip_context(value: Any) -> Any:
     return value
 
 
+def _strip_runtime_context_exact(value: Any, *, preserve_snapshot: bool = False) -> Any:
+    """Remove injected runtime fields without changing public value types."""
+
+    if isinstance(value, dict):
+        return {
+            str(key): item
+            for key, item in value.items()
+            if (str(key) not in _CONTEXT_KEYS or preserve_snapshot and str(key) == "snapshot_id")
+            and not (
+                str(key).startswith("_")
+                and str(key).endswith("_from_context")
+            )
+        }
+    return value
+
+
 def _strip_mutable_review_content(value: Any) -> Any:
     if isinstance(value, dict):
         return {
@@ -148,8 +193,8 @@ def _coerce_control_bool(value: Any) -> Any:
     return value
 
 
-def approval_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    clean = _strip_context(arguments)
+def approval_preview_arguments(arguments: dict[str, Any], *, tool_name: str = "") -> dict[str, Any]:
+    clean = _strip_context(_approval_operation_arguments(arguments, tool_name))
     encoded = json.dumps(clean, ensure_ascii=False, default=str)
     if len(encoded) <= 3000:
         return clean if isinstance(clean, dict) else {"payload": clean}
@@ -180,7 +225,7 @@ def runtime_approval_prompt(
     described = describe_runtime_approval_action(tool_name, arguments)
     if described:
         return described
-    payload = approval_preview_arguments(arguments)
+    payload = arguments if tool_name.startswith("mcp__chrome__") else approval_preview_arguments(arguments)
     content = approval_public_content(payload)
     if content:
         return f"{action.title.capitalize()}: {content[:300]}"
@@ -192,6 +237,12 @@ def runtime_approval_resume_guidance(text: str | None) -> str | None:
 
     if not runtime_approval_resume_intent(text):
         return None
+    if "[Chrome publication approved]" in str(text):
+        return _chrome_publication_resume_guidance()
+    if any(marker in str(text) for marker in (
+        "[Chrome basic action approved]", "[Chrome browser action approved]",
+    )):
+        return _chrome_basic_resume_guidance()
     return (
         "## Runtime Approval Resume\n"
         "- The latest user message is an internal approval-resume instruction, "
@@ -263,7 +314,13 @@ def _bash_intent_verb(command: str) -> str:
 
 def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) -> str:
     """Tool-specific one-line description of what is about to happen."""
-    args = arguments or {}
+    from packages.core.ai.runtime.composite_tools import (
+        RuntimeCompositeToolCallFactory,
+    )
+
+    canonical_call = RuntimeCompositeToolCallFactory.create(tool_name, arguments)
+    tool_name = canonical_call.tool_name
+    args = canonical_call.arguments
 
     def _str(key: str, default: str = "") -> str:
         v = args.get(key)
@@ -395,8 +452,8 @@ def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) 
     # workspace" via the paths channel. We add a backend label too so
     # non-frontend consumers (logs, audit, CLI) still see something
     # readable. ──────────────────────────────────────────────────────────
-    if tool_name in ("write_file", "edit_file", "patch_file", "delete_file"):
-        path = _str("path") or _str("name") or _str("filename")
+    if tool_name in ("write_file", "edit_file", "patch_file", "replace_file", "delete_file"):
+        path = _str("target_path") or _str("path") or _str("name") or _str("filename")
         verb = "Delete" if tool_name == "delete_file" else "Modify"
         if path:
             return f"{verb} workspace file: {path}"
@@ -446,9 +503,6 @@ def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) 
         target = _payload_str("assignee", "assignee_id", "user_id")
         tid = _payload_str("task_id", "id") or "(task)"
         return f"Assign task {tid} to {target}" if target else f"Assign task: {tid}"
-    if manor_action in ("delete_task",):
-        tid = _payload_str("task_id", "id") or "(task)"
-        return f"Delete task: {tid}"
     if manor_action in ("update_task_runtime", "workspace_update_task_runtime"):
         tid = _payload_str("task_id", "id") or "(task)"
         return f"Update task settings: {tid}"
@@ -482,9 +536,6 @@ def describe_runtime_approval_action(tool_name: str, arguments: dict[str, Any]) 
     if manor_action in ("run_scheduled_job_now",):
         job = _payload_str("job_id", "id") or "(automation)"
         return f"Run automation now: {job}"
-    if manor_action in ("sync_file_to_knowledge",):
-        target = _payload_str("name", "path", "document_id") or "(document)"
-        return f"Add to Knowledge: {target}"
     if manor_action in ("delete_document",):
         target = _payload_str("document_id", "name", "path") or "(document)"
         return f"Delete document: {target}"
@@ -546,7 +597,14 @@ def approval_paths(
 
 
 def runtime_approval_retry_args(item: dict[str, Any], hitl_id: str) -> dict[str, Any]:
-    args = item.get("retry_args")
+    continuation = item.get("continuation")
+    args = (
+        continuation.get("arguments")
+        if isinstance(continuation, dict)
+        and continuation.get("version") == 1
+        and isinstance(continuation.get("arguments"), dict)
+        else item.get("retry_args")
+    )
     if not isinstance(args, dict):
         args = item.get("args_preview")
     retry_args = dict(args) if isinstance(args, dict) else {}
@@ -554,11 +612,207 @@ def runtime_approval_retry_args(item: dict[str, Any], hitl_id: str) -> dict[str,
     return retry_args
 
 
+def runtime_approval_continuation(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    """Freeze one exact, typed call for post-approval execution."""
+
+    clean = _strip_runtime_context_exact(
+        _approval_operation_arguments(arguments, tool_name),
+        preserve_snapshot=tool_name.startswith("mcp__chrome__"),
+    )
+    if not isinstance(clean, dict):
+        raise RuntimeApprovalContinuationError(
+            "Runtime approval arguments must be a JSON object."
+        )
+    try:
+        encoded = json.dumps(
+            clean,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeApprovalContinuationError(
+            "Runtime approval arguments are not JSON serializable."
+        ) from exc
+    if len(encoded.encode("utf-8")) > _RUNTIME_APPROVAL_CONTINUATION_MAX_CHARS:
+        raise RuntimeApprovalContinuationError(
+            "Runtime approval arguments are too large to preserve exactly."
+        )
+    return {
+        "version": 1,
+        "tool": str(tool_name or "").strip(),
+        "arguments": json.loads(encoded),
+    }
+
+
+def is_chrome_basic_approval_item(item: dict[str, Any]) -> bool:
+    """Use the frozen host classification when a ref has no caller label."""
+    tool_name = str(item.get("tool") or "").strip()
+    arguments = runtime_approval_retry_args(item, "")
+    if is_chrome_basic_call(tool_name, arguments):
+        return True
+    continuation = item.get("continuation")
+    proof = item.get("chrome_basic_approval_policy_v1")
+    from packages.core.ai.runtime.chrome_tool_catalog import CHROME_TARGET_ACTIONS, normalize_chrome_call
+
+    if (
+        normalize_chrome_call(tool_name, arguments)[0] not in CHROME_TARGET_ACTIONS
+        or not isinstance(continuation, dict)
+        or continuation.get("version") != 1
+        or continuation.get("tool") != tool_name
+        or not isinstance(continuation.get("arguments"), dict)
+        or not isinstance(proof, dict)
+        or proof.get("version") != 1
+        or proof.get("tool_name") != tool_name
+        or proof.get("action_key") != "chrome.browser.interact"
+        or proof.get("operation") != "modify"
+        or proof.get("resource_kind") != "browser"
+        or proof.get("capability_id") != "manor.composite"
+    ):
+        return False
+    tab_id = arguments.get("tabId")
+    ref = str(arguments.get("ref") or arguments.get("node_id") or "").strip()
+    snapshot_id = str(arguments.get("snapshot_id") or arguments.get("snapshotId") or "").strip()
+    return (
+        isinstance(tab_id, int) and not isinstance(tab_id, bool)
+        and bool(ref) and bool(snapshot_id)
+        and proof.get("tab_id") == tab_id
+        and proof.get("ref") == ref
+        and proof.get("snapshot_id") == snapshot_id
+    )
+
+
+def runtime_approval_runtime_metadata(
+    item: dict[str, Any],
+    hitl_id: str,
+) -> dict[str, Any] | None:
+    """Resume the exact approved action with its permitted follow-up surface."""
+
+    tool_name = str(item.get("tool") or "").strip()
+    if not tool_name:
+        return None
+    continuation = item.get("continuation")
+    if isinstance(continuation, dict):
+        if continuation.get("version") != 1:
+            return None
+        if str(continuation.get("tool") or "").strip() != tool_name:
+            return None
+        arguments = continuation.get("arguments")
+    else:
+        # Compatibility for approval rows created before structured
+        # continuations were persisted. A truncated preview is never replayed.
+        arguments = item.get("retry_args")
+        if not isinstance(arguments, dict):
+            preview = item.get("args_preview")
+            arguments = (
+                preview
+                if isinstance(preview, dict) and preview.get("truncated") is not True
+                else None
+            )
+    if not isinstance(arguments, dict):
+        return None
+    retry_args = json.loads(json.dumps(arguments, ensure_ascii=False))
+    retry_args["approval_token"] = hitl_id
+    if is_chrome_publication_call(tool_name, arguments):
+        approved_call = {"name": tool_name, "arguments": retry_args}
+        return {
+            "extra_tool_names": list(dict.fromkeys([
+                tool_name, "mcp__chrome__read_page", "mcp__chrome__wait", "mcp__chrome__finalize_tabs",
+            ])),
+            "approved_tool_call": approved_call,
+            "approval_resume_guidance": (
+                _chrome_publication_resume_guidance()
+                + "\nApproved publication context:\n" + json.dumps(approved_call, ensure_ascii=False)
+            ),
+        }
+    if is_chrome_basic_approval_item(item):
+        from packages.core.ai.runtime.chrome_routing import CHROME_LOCAL_BROWSER_DEFAULT_TOOLS
+
+        return {
+            "extra_tool_names": list(dict.fromkeys([
+                tool_name, *CHROME_LOCAL_BROWSER_DEFAULT_TOOLS, "mcp__chrome__resolve_target",
+            ])),
+            "forced_tool_calls": [{
+                "name": tool_name,
+                "arguments": retry_args,
+                "disable_followup_tools": False,
+            }],
+            "approval_resume_guidance": _chrome_basic_resume_guidance(),
+            **({"chrome_basic_approval_policy_v1": dict(item["chrome_basic_approval_policy_v1"])}
+               if isinstance(item.get("chrome_basic_approval_policy_v1"), dict) else {}),
+        }
+    return {
+        "extra_tool_names": [tool_name],
+        **({"chrome_basic_approval_policy_v1": dict(item["chrome_basic_approval_policy_v1"])}
+           if isinstance(item.get("chrome_basic_approval_policy_v1"), dict) else {}),
+        "forced_tool_calls": [
+            {
+                "name": tool_name,
+                "arguments": retry_args,
+                # The approved action gets one deterministic attempt. After
+                # it returns, the model may summarize the result but cannot
+                # improvise another side-effecting tool call in this turn.
+                "disable_followup_tools": True,
+            }
+        ],
+        "approval_resume_guidance": (
+            "Execute the supplied approved tool call exactly once. Do not "
+            "rediscover, rewrite, or issue a second copy of the action. After "
+            "the call returns, report its actual result without retrying it."
+        ),
+    }
+
+
+def _chrome_basic_resume_guidance() -> str:
+    return (
+        "[Chrome browser action approved]\n"
+        "The supplied exact approved browser call runs once before you continue. "
+        "Continue the original browser task from its actual result. Do not replay "
+        "the approved action or reuse its approval_token on later actions. "
+        "Read the live page and use fresh refs and snapshot_id to continue "
+        "ordinary page interactions, verify the requested values, and finalize "
+        "the original tabs for handoff. If execution is uncertain, inspect the "
+        "page instead of repeating the action. Later calls still use current "
+        "permissions and approval policy; final submission or publication needs "
+        "its own approval. Preserve the user's instruction to leave a draft "
+        "unsubmitted. Report completed, unverified and blocked work accurately."
+    )
+
+
+def _chrome_publication_resume_guidance() -> str:
+    return (
+        "[Chrome publication approved]\n"
+        "Continue the original browser task. The user approved this publication. "
+        "First read the live page on the approved tab; locate its current controls "
+        "using fresh refs and snapshot_id. Keep the approved account, destination, "
+        "content and attachments. Use the same approval_token on the publication call; "
+        "locator or observation changes do not require another approval. "
+        "If the action definitely did not execute, resolve the blocker and retry with "
+        "the same approval. If it executed or execution is uncertain, inspect the "
+        "result instead of repeating the publication. Continue ordinary page interactions, "
+        "verification and tab finalization. Report the observed result; delayed "
+        "verification alone does not mean publication failed."
+    )
+
+
 def runtime_approval_retry_message(item: dict[str, Any], hitl_id: str) -> str:
     tool_name = str(item.get("tool") or "").strip()
     action_key = str(item.get("action_key") or "").strip()
     retry_args = runtime_approval_retry_args(item, hitl_id)
     args_json = json.dumps(retry_args, ensure_ascii=False, indent=2, sort_keys=True)
+    if is_chrome_publication_call(tool_name, retry_args):
+        return (
+            "[Runtime approval approved]\n" + _chrome_publication_resume_guidance()
+            + f"\nApproved tool: `{tool_name}`\nApproved context:\n```json\n{args_json}\n```"
+        )
+    if is_chrome_basic_approval_item(item):
+        return (
+            "[Runtime approval approved]\n" + _chrome_basic_resume_guidance()
+            + f"\nApproved tool: `{tool_name}`\nExact arguments:\n```json\n{args_json}\n```"
+        )
     truncated_note = (
         "\nThe stored argument preview was truncated. Use the exact previous "
         "approved payload from the conversation and add the approval token."
@@ -588,6 +842,13 @@ def runtime_approval_rejected_message(item: dict[str, Any]) -> str:
 
 def approval_public_content(payload: Any) -> str:
     if isinstance(payload, dict):
+        intent = payload.get("operation_intent")
+        publication = intent.get("publication") if isinstance(intent, dict) else None
+        if isinstance(publication, dict) and intent.get("effect") == "publish":
+            # The declared publication is the reviewable content. In particular,
+            # expect.state.text is an assertion, never a publication receipt.
+            text = publication.get("text")
+            return text.strip()[:1800] if isinstance(text, str) else ""
         for key in ("text", "message", "content", "body", "caption", "subject", "title", "name", "job_id", "path", "id"):
             val = payload.get(key)
             if isinstance(val, str) and val.strip():

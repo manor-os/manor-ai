@@ -19,14 +19,26 @@
   "tools": [
     "video_edit",
     "generate_file",
-    "write_file",
-    "edit_file",
+    "patch_file",
     "wait_media_jobs",
     "probe_media",
     "read_file",
-    "list_files"
+    "search_documents",
+    "list_files",
+    "list_skills",
+    "invoke_skill",
+    "normalize_audio_loudness",
+    "build_narration_timeline",
+    "transcribe_video",
+    "analyze_audio",
+    "render_frame_samples"
   ],
+  "invocable_skills": ["motion-design", "video-type-playbooks"],
   "max_rounds": 30,
   "max_tokens": 14000,
-  "temperature": 0.2
+  "temperature": 0.2,
+  "search": {
+    "terms": ["video editor", "clips", "timeline", "subtitles", "screen recording", "screencast", "tutorial video", "ad", "trailer"],
+    "examples": ["edit screen recording into product demo", "make app walkthrough video from screenshots", "add captions to uploaded clip", "cut launch promo from footage"]
+  }
 }

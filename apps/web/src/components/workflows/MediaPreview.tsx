@@ -11,10 +11,14 @@ export default function MediaPreview({
   refItem,
   maxHeight = 180,
   compact = false,
+  onVideoReady,
+  onPreviewError,
 }: {
   refItem: MediaRef;
   maxHeight?: number;
   compact?: boolean;
+  onVideoReady?: (duration: number) => void;
+  onPreviewError?: () => void;
 }) {
   const { url, type, name } = refItem;
   const [src, setSrc] = useState<string | null>(null);
@@ -30,9 +34,11 @@ export default function MediaPreview({
         if (alive) { setSrc(r.url); revoke = r.revoke; }
         else r.revoke();
       })
-      .catch(() => alive && setErr(true));
+      .catch(() => {
+        if (alive) { setErr(true); onPreviewError?.(); }
+      });
     return () => { alive = false; revoke(); };
-  }, [url]);
+  }, [url, onPreviewError]);
 
   // In compact (on-node) mode only images render; other types fall back to a chip.
   if (err || (compact && type !== "image")) return <FileChip name={name} type={type} />;
@@ -69,6 +75,8 @@ export default function MediaPreview({
         controls
         playsInline
         preload="metadata"
+        onLoadedData={(event) => onVideoReady?.(event.currentTarget.duration)}
+        onError={() => { setErr(true); onPreviewError?.(); }}
         aria-label={name || "Video output"}
         style={{ width: "100%", maxHeight, borderRadius: radius, background: "#000" }}
       />

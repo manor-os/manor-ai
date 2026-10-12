@@ -1,28 +1,43 @@
 import ChatMarkdown from "./ChatMarkdown";
 import CollapsibleSentMessage from "./chat/CollapsibleSentMessage";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import type { CSSProperties } from "react";
 import type {
   AssistantBlock,
   AssistantProcessStep,
   AssistantResponseSurfaceBlock,
+  HITLRequest,
   ResponseSurfaceSubmissionReceipt,
   ResponseSurfaceSubmissionResult,
   SubAgentEvent,
   ToolCall,
 } from "../lib/chatStream";
-import { formatPublicToolResult } from "../lib/chatStream";
+import {
+  formatByokProviderErrorMessage,
+  formatFilePermissionErrorMessage,
+  formatPublicToolResult,
+  LLM_CONFIGURATION_ERROR_MESSAGE,
+} from "../lib/chatStream";
 import type { WorkspaceLedgerOverview } from "../lib/api";
-import { shouldExpandAssistantProcessBlock } from "../lib/assistantProcessFlow";
+import { groupConsecutiveByKey, hasUnrecoveredProcessError, isUnrecoveredProcessStep, shouldExpandAssistantProcessBlock } from "../lib/assistantProcessFlow";
+import { isWebsiteAccessDenied, websiteAccessDeniedSource } from "../lib/websiteAccessDenied";
+import {
+  formatProcessDuration,
+  isLiveAssistantProcess,
+  processClockTiming,
+  useLiveProcessClock,
+} from "../lib/assistantProcessPresentation";
 import {
   projectAssistantText,
+  projectAssistantProcessTimeline,
+  type AssistantProcessTimelineEntry,
   visibleAssistantText,
 } from "../lib/assistantTextProjection";
 import { t } from "../lib/i18n";
 import { matchSubAgentRuns } from "../lib/subAgentDisplay";
 import { formatUserFacingStructuredText } from "../lib/taskDisplay";
-import { processSurfaceSummary, runtimeToolBadge } from "../lib/toolRuntimeSurface";
 import { normalizeResponseSurfaceBlock } from "../lib/responseSurface";
+import { PendingActionKind } from "../lib/pendingActionKinds";
 import {
   coalesceWorkspaceLedgerQueryBlocks,
   isWorkspaceLedgerOverview,
@@ -31,8 +46,66 @@ import {
   workspaceLedgerQueryFrameHeights,
 } from "../lib/workspaceLedgerVisualization";
 import AgentLoopStep from "./ui/AgentLoopStep";
+import ToolActivityGroup from "./ui/ToolActivityGroup";
+import { summarizeToolActivity } from "../lib/toolActivitySummary";
+import AgentActivityOrb, { agentActivityLabel, inferAgentActivity } from "./ui/AgentActivityOrb";
 import InteractiveResponseSurface from "./InteractiveResponseSurface";
 import Button from "./ui/Button";
+import { IconInfo } from "./icons";
+
+export type AssistantPendingActionKind = "approval" | "input" | null;
+
+type AssistantProcessHITLRequest = Pick<
+  HITLRequest,
+  "type" | "tool" | "resolved" | "resolution"
+> & Partial<Pick<HITLRequest, "id">>;
+
+type AssistantProcessDisplayStatus = "running" | "error" | "completed" | "not_run" | "unverified" | "unavailable";
+
+const NOT_RUN_APPROVAL_RESOLUTIONS = new Set([
+  "reject",
+  "rejected",
+  "deny",
+  "denied",
+  "decline",
+  "no",
+  "revise",
+  "cancel",
+  "cancelled",
+  "canceled",
+  "expired",
+]);
+
+type AssistantPendingActionMessage = {
+  hitl_requests?: Array<{ resolved?: boolean; type?: string }> | null;
+  pending_action?: { kind?: string; hitl_type?: unknown } | null;
+  resolved_at?: unknown;
+};
+
+const INPUT_PENDING_ACTION_KINDS = new Set<string>([
+  PendingActionKind.HUMAN_INPUT,
+  PendingActionKind.NEEDS_INPUT,
+  PendingActionKind.NEEDS_LOGIN,
+  PendingActionKind.TASK_RECOVERY,
+  PendingActionKind.RETRY_STRATEGIST_REVIEW,
+  PendingActionKind.WORKFLOW_INPUT,
+  PendingActionKind.WORKFLOW_STARTER_INPUT,
+  PendingActionKind.WORKFLOW_RETRY,
+]);
+
+export function assistantPendingActionKindForMessage(
+  message: AssistantPendingActionMessage,
+): AssistantPendingActionKind {
+  const unresolved = (message.hitl_requests || []).filter((request) => !request.resolved);
+  if (unresolved.some((request) => request.type === "approval")) return "approval";
+  if (unresolved.length > 0) return "input";
+  if (message.resolved_at || !message.pending_action?.kind) return null;
+  const hitlType = String(message.pending_action.hitl_type || "").toLowerCase();
+  if (hitlType === "error" || hitlType === "failure") return null;
+  return INPUT_PENDING_ACTION_KINDS.has(message.pending_action.kind)
+    ? "input"
+    : "approval";
+}
 
 function processStepToToolCall(step: AssistantProcessStep): ToolCall {
   const status =
@@ -55,29 +128,20 @@ function processStepToToolCall(step: AssistantProcessStep): ToolCall {
   };
 }
 
-function formatDuration(ms?: number) {
-  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "";
-  if (ms < 1000) return "";
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds <= 0) return "";
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (!minutes) return `${seconds}s`;
-  return `${minutes}m ${seconds}s`;
-}
-
 function CollapsibleFinalMarkdown({
   content,
   isUser,
   streaming,
   returnTo,
   enabled,
+  enableFileCards,
 }: {
   content: string;
   isUser: boolean;
   streaming: boolean;
   returnTo?: string;
   enabled: boolean;
+  enableFileCards?: boolean;
 }) {
   return (
     <CollapsibleSentMessage text={content} enabled={enabled && !streaming} tone={isUser ? "user" : "assistant"}>
@@ -86,15 +150,147 @@ function CollapsibleFinalMarkdown({
         isUser={isUser}
         streaming={streaming}
         returnTo={returnTo}
+        enableFileCards={enableFileCards}
       />
     </CollapsibleSentMessage>
   );
 }
 
-function normalizeStepStatus(status?: string) {
+function normalizeStepStatus(status?: string): AssistantProcessDisplayStatus {
   if (status === "running" || status === "pending") return "running";
   if (status === "error") return "error";
+  if (status === "unverified") return "unverified";
+  if (status === "not_run") return "not_run";
   return "completed";
+}
+
+const PUBLIC_ATTEMPT_REASON_KEYS = {
+  "The selected attachment is no longer accessible for approval.": "component.assistant_message_blocks.attachment_unavailable_for_approval",
+  "The selected attachment is missing or no longer accessible.": "component.assistant_message_blocks.attachment_unavailable",
+  "The requested file is missing or no longer accessible.": "component.assistant_message_blocks.source_file_unavailable",
+  "The selected attachment exceeds the transfer size limit.": "component.assistant_message_blocks.attachment_too_large",
+  "The selected attachment has changed. Select it again.": "component.assistant_message_blocks.attachment_changed",
+  "The selected attachment is unavailable or has changed.": "component.assistant_message_blocks.attachment_unavailable_or_changed",
+  "The selected attachment is currently in use. Try again shortly.": "component.assistant_message_blocks.attachment_busy",
+  "Downloading the selected attachment is not allowed.": "component.assistant_message_blocks.attachment_download_denied",
+  "The Chrome connection is unavailable.": "component.assistant_message_blocks.chrome_connection_unavailable",
+  "The Chrome connection has changed. Start a new transfer.": "component.assistant_message_blocks.chrome_connection_changed",
+} as const;
+
+function visibleProcessStepError(
+  status: AssistantProcessDisplayStatus,
+  resultText?: string,
+): string {
+  if (status !== "error") return "";
+  const result = String(resultText || "").trim();
+  const structured = parsePreviewObject(result);
+  // A failed command can still print a document to stdout. Only explicit
+  // diagnostics belong in the inline error; the complete output stays in details.
+  const diagnostic = structured
+    ? [structured.stderr, structured.error, structured.message]
+      .find((value) => typeof value === "string" && value.trim())
+    : result;
+  const text = String(formatPublicToolResult(diagnostic) || "").trim();
+  if (!text || text.length > 280 || /[\r\n]/.test(text)
+    || /^(?:[#{[>`]|[-+*]\s|\d+[.)]\s)/.test(text)) return "";
+  // A generic failure sentence says nothing the step state does not; the
+  // step reads as what was done. Specific, actionable reasons stay below.
+  if (text === t("lib.chat_stream.request_failed_with_detail").split("\n\n", 1)[0]
+    || text === "Sorry, the request failed. Please try again.") {
+    return "";
+  }
+  if (Object.prototype.hasOwnProperty.call(PUBLIC_ATTEMPT_REASON_KEYS, text)) {
+    return t(PUBLIC_ATTEMPT_REASON_KEYS[text as keyof typeof PUBLIC_ATTEMPT_REASON_KEYS]);
+  }
+  const publicMessage = formatFilePermissionErrorMessage(text) || formatByokProviderErrorMessage(text);
+  if (publicMessage) return publicMessage;
+  if (!structured
+    && text !== LLM_CONFIGURATION_ERROR_MESSAGE
+    && text !== t("lib.chat_stream.request_failed_with_detail").split("\n\n", 1)[0]
+    && !/^(?:(?:error|failure|failed|timeout|timed out|permission denied|authentication required|authorization required|rate limit|quota|credits? exhausted)\b|(?:[\w.]+(?:Error|Exception))[:\s]|command exited with (?:status|code) -?[1-9]\d*\b|(?:(?:this|the)\s+)?(?:execution|command|request|operation|render(?:ing)?|sandbox|file|connection)\b.{0,40}\b(?:failed|denied|unavailable|blocked|not found|timed out)\b)/i.test(text)) return "";
+  return formatUserFacingStructuredText(text);
+}
+
+function neutralProcessStepCaption(step: AssistantProcessStep): string {
+  if (step.presentation?.tone !== "neutral") return "";
+  if (step.presentation.kind === "chrome_wait_observation_timeout") {
+    return t("component.assistant_message_blocks.chrome_wait_observation_timeout");
+  }
+  if (step.presentation.kind === "chrome_stale_snapshot_rejection") {
+    return t("component.assistant_message_blocks.chrome_stale_snapshot_rejection");
+  }
+  return "";
+}
+
+function completedProcessOutcomeTitle(outcomeStatus: unknown): string | undefined {
+  if (outcomeStatus === "answered" || outcomeStatus === "completed") {
+    return t("component.assistant_message_blocks.processed");
+  }
+  if (outcomeStatus === "partial") {
+    return t("component.assistant_message_blocks.process_partial");
+  }
+  if (outcomeStatus === "blocked") {
+    return t("component.assistant_message_blocks.process_needs_attention");
+  }
+  if (outcomeStatus === "not_attempted") {
+    return t("component.assistant_message_blocks.process_not_run");
+  }
+  return undefined;
+}
+
+function displayProcessStepStatus(
+  step: AssistantProcessStep,
+  steps: AssistantProcessStep[],
+  index: number,
+  isLiveTurn: boolean,
+): AssistantProcessDisplayStatus {
+  if (isWebsiteAccessDenied(step)) return "unavailable";
+  const normalized = normalizeStepStatus(step.status);
+  if (normalized === "running") return isLiveTurn ? "running" : "completed";
+  if (normalized === "unverified") return "completed";
+  if (step.status === "error" && !isUnrecoveredProcessStep(steps, index)) return "completed";
+  return normalized;
+}
+
+function isApprovalGateStep(step: AssistantProcessStep) {
+  const preview = String(step.result_preview || "");
+  return (
+    /"__hitl__"\s*:\s*true/.test(preview) ||
+    /"(?:error|status)"\s*:\s*"approval_required"/.test(preview)
+  );
+}
+
+function approvalGateStepStatusByIndex(
+  steps: AssistantProcessStep[],
+  hitlRequests?: AssistantProcessHITLRequest[] | null,
+) {
+  const statuses = new Map<number, "running" | "completed" | "not_run">();
+  const requests = hitlRequests || [];
+  for (let requestIndex = requests.length - 1; requestIndex >= 0; requestIndex -= 1) {
+    const request = requests[requestIndex];
+    const tool = String(request?.tool || "").trim();
+    if (request?.type !== "approval" || !tool) continue;
+    for (let stepIndex = steps.length - 1; stepIndex >= 0; stepIndex -= 1) {
+      const step = steps[stepIndex];
+      if (
+        statuses.has(stepIndex) ||
+        (!(step.approval_request_id === request.id && request.id) &&
+          (step.name !== tool ||
+            normalizeStepStatus(step.status) !== "error" ||
+            !isApprovalGateStep(step)))
+      ) {
+        continue;
+      }
+      const resolution = String(request.resolution || "").trim().toLowerCase();
+      const wasNotRun = NOT_RUN_APPROVAL_RESOLUTIONS.has(resolution);
+      statuses.set(
+        stepIndex,
+        request.resolved ? (wasNotRun ? "not_run" : "completed") : "running",
+      );
+      break;
+    }
+  }
+  return statuses;
 }
 
 function hasAny(value: string, tokens: string[]) {
@@ -373,6 +569,13 @@ function processVerb(step: AssistantProcessStep) {
   return t("component.assistant_process.tool.generic", { target: display });
 }
 
+function websiteAccessDeniedLabel(step: AssistantProcessStep) {
+  const source = websiteAccessDeniedSource(step);
+  return source
+    ? t("component.assistant_message_blocks.website_access_denied_source", { source })
+    : t("component.assistant_message_blocks.website_access_denied");
+}
+
 function prettyIdentifier(value?: string) {
   return String(value || "").replace(/[_-]+/g, " ").trim();
 }
@@ -612,51 +815,23 @@ function parsePreviewObject(value?: string) {
   }
 }
 
-function processMetaText(steps: AssistantProcessStep[]) {
-  const completed = steps.filter((step) => normalizeStepStatus(step.status) === "completed").length;
-  const running = steps.some((step) => normalizeStepStatus(step.status) === "running");
-  const errored = steps.filter((step) => normalizeStepStatus(step.status) === "error").length;
-  const parts: string[] = [];
-  if (completed) parts.push(t("component.assistant_message_blocks.completed_actions", { count: completed }));
-  if (running) parts.push(t("component.assistant_message_blocks.processing"));
-  if (errored) parts.push(t("component.assistant_message_blocks.failed_actions", { count: errored }));
-  return parts.join(" · ") || t("component.assistant_message_blocks.preparing");
-}
-
-function StepIcon({ status }: { status: string }) {
+function StepIcon({ status, neutral = false }: { status: string; neutral?: boolean }) {
   if (status === "running") return <span className="assistant-process-spinner" />;
+  if (status === "unavailable") return <span className="assistant-process-step-icon assistant-process-step-icon--unavailable" aria-hidden="true" />;
+  if (status === "error" && neutral) {
+    return <IconInfo size={12} className="assistant-process-step-icon assistant-process-step-icon--neutral" />;
+  }
   if (status === "error") return <span className="assistant-process-step-icon assistant-process-step-icon--error" />;
+  if (status === "unverified") return <span className="assistant-process-step-icon assistant-process-step-icon--unverified" title={t("component.assistant_message_blocks.process_unverified")} />;
+  if (status === "not_run") return <span className="assistant-process-step-icon assistant-process-step-icon--not-run" />;
   return <span className="assistant-process-step-icon" />;
 }
 
-function RuntimeSurfaceBadge({
-  badge,
-  compact,
-}: {
-  badge: { label: string; bg: string; color: string; border: string };
-  compact?: boolean;
-}) {
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        flexShrink: 0,
-        height: compact ? 16 : 18,
-        borderRadius: 4,
-        border: `1px solid ${badge.border}`,
-        background: badge.bg,
-        color: badge.color,
-        fontSize: compact ? 9 : 10,
-        fontWeight: 700,
-        lineHeight: 1,
-        padding: compact ? "0 4px" : "0 5px",
-        whiteSpace: "nowrap",
-      }}
-    >
-      {badge.label}
-    </span>
-  );
+function notRunStepLabel(step: AssistantProcessStep) {
+  const target = stepTarget(step, parsePreviewObject(step.arguments_preview));
+  return target
+    ? t("component.assistant_message_blocks.not_run_target", { target })
+    : t("component.assistant_message_blocks.not_run_action");
 }
 
 function stripInternalProtocolText(value?: string | null) {
@@ -762,154 +937,237 @@ function AssistantLedgerVisualization({
   );
 }
 
+/** A completed turn with no tool step and an answer on screen: nothing to show. */
+export function isToolFreeCompletedProcess(
+  block: Extract<AssistantBlock, { type: "process" }>,
+  { hasFinalOutput, pending, live }: { hasFinalOutput: boolean; pending: boolean; live: boolean },
+): boolean {
+  return block.lifecycle_status === "completed"
+    && !(block.steps || []).length
+    && !String(block.note || "").trim()
+    && hasFinalOutput && !pending && !live;
+}
+
 function AssistantProcessBlock({
   block,
-  openingText,
-  progressByStepSeq,
+  timeline,
+  hasFinalOutput = false,
   minimal = false,
-  hasPendingAction = false,
+  pendingActionKind = null,
+  hitlRequests,
   returnTo,
   subAgentRuns = [],
+  streaming = false,
+  queueStatus,
+  enableFileCards,
 }: {
   block: Extract<AssistantBlock, { type: "process" }>;
-  openingText: string;
-  progressByStepSeq: Map<number, string>;
+  timeline: AssistantProcessTimelineEntry[];
+  hasFinalOutput?: boolean;
   minimal?: boolean;
-  hasPendingAction?: boolean;
+  pendingActionKind?: AssistantPendingActionKind;
+  hitlRequests?: AssistantProcessHITLRequest[] | null;
   returnTo?: string;
   subAgentRuns?: SubAgentEvent[];
+  streaming?: boolean;
+  queueStatus?: string;
+  enableFileCards?: boolean;
 }) {
   const steps = block.steps || [];
-  const hasRunning = steps.some((step) => normalizeStepStatus(step.status) === "running");
-  const hasError = steps.some((step) => normalizeStepStatus(step.status) === "error");
-  const stepAssistantTexts = steps
-    .map((step) => step.assistant_text?.trim())
-    .filter(Boolean) as string[];
-  const openingTextIsDuplicatedInSteps = Boolean(
-    openingText.trim() && stepAssistantTexts.some((text) => text === openingText.trim()),
-  );
-  // Workspace chat (minimal) stays collapsed unless actively running — a failed
-  // step must not auto-expand its traceback.
-  const autoExpand = shouldExpandAssistantProcessBlock(block, minimal);
-  const [expanded, setExpanded] = useState(autoExpand);
-  const tools = useMemo(() => steps.map(processStepToToolCall), [steps]);
+  const approvalGateStatuses = approvalGateStepStatusByIndex(steps, hitlRequests);
+  const displaySteps = steps.map((step, index) => {
+    const status = approvalGateStatuses.get(index);
+    return status ? { ...step, status } : step;
+  });
+  const hasRunning = displaySteps.some((step) => normalizeStepStatus(step.status) === "running");
+  const hasError = hasUnrecoveredProcessError(displaySteps);
+  const hasNotRun = displaySteps.some((step) => normalizeStepStatus(step.status) === "not_run");
+  const hasNotRunApproval = [...approvalGateStatuses.values()].includes("not_run");
+  const hasRecoveredError = displaySteps.some((step) => step.status === "error" && step.recovered_by_step_id && !isWebsiteAccessDenied(step));
+  const [expandedOverride, setExpandedOverride] = useState<boolean | null>(null);
   const subAgentRunByStep = useMemo(
     () => matchSubAgentRuns(steps, subAgentRuns),
     [steps, subAgentRuns],
   );
-  const duration = formatDuration(block.duration_ms);
-  const surfaceSummary =
-    subAgentRunByStep.size > 0
-      ? ""
-      : processSurfaceSummary(steps.map((step) => step.name));
-  const title = hasRunning
-    ? t("component.assistant_message_blocks.processing")
-    : hasPendingAction
-      ? t("component.assistant_message_blocks.process_waiting_approval")
-    : hasError
-      ? t("component.assistant_message_blocks.process_error")
-      : t("component.assistant_message_blocks.processed");
+  const isLiveTurn = !queueStatus && isLiveAssistantProcess(block, streaming, Boolean(pendingActionKind));
+  const expanded = expandedOverride ?? (!queueStatus && shouldExpandAssistantProcessBlock(block, {
+    streaming,
+    waitingForHuman: Boolean(pendingActionKind),
+    hasFinalOutput,
+  }));
+  const lifecycle = block.lifecycle_status;
+  const summarizing = hasFinalOutput || block.default_collapsed === true;
+  const activity = queueStatus ? "breathing" : summarizing ? "composing" : inferAgentActivity({
+    content: "",
+    assistant_blocks: [{ ...block, steps: displaySteps }],
+    sub_agent_events: [...subAgentRunByStep.values()],
+  });
+  const processFailed = lifecycle === "failed" || (!lifecycle && hasError);
+  const completedOutcomeTitle = lifecycle === "completed"
+    ? completedProcessOutcomeTitle(block.outcome_status)
+    : undefined;
+  let title = t("component.assistant_message_blocks.processed");
+  if (queueStatus) {
+    title = queueStatus;
+  } else if (pendingActionKind === "approval") {
+    title = t("component.assistant_message_blocks.process_waiting_approval");
+  } else if (pendingActionKind === "input" || lifecycle === "waiting") {
+    title = t("component.assistant_message_blocks.process_waiting_input");
+  } else if (isLiveTurn) {
+    title = summarizing
+      ? t("component.assistant_message_blocks.summarizing")
+      : agentActivityLabel(activity);
+  } else if (lifecycle === "cancelled") {
+    title = t("component.assistant_message_blocks.process_stopped");
+  } else if (processFailed) {
+    title = t("component.assistant_message_blocks.process_error");
+  } else if (completedOutcomeTitle && hasNotRunApproval) {
+    title = t("component.assistant_message_blocks.process_not_run");
+  } else if (completedOutcomeTitle) {
+    title = completedOutcomeTitle;
+  } else if (lifecycle === "completed" && (hasError || hasNotRun)) {
+    title = t("component.assistant_message_blocks.processed_with_issues");
+  } else if (hasNotRun) {
+    title = t("component.assistant_message_blocks.process_not_run");
+  } else if ((!lifecycle && hasRunning) || lifecycle === "running") {
+    title = t("component.assistant_message_blocks.process_status_pending");
+  } else if (hasRecoveredError) {
+    title = t("component.assistant_message_blocks.processed_after_retry");
+  }
 
-  useEffect(() => {
-    setExpanded(autoExpand);
-  }, [autoExpand]);
+  const clockTiming = processClockTiming(block);
+  const elapsedMs = useLiveProcessClock({
+    live: isLiveTurn,
+    ...clockTiming,
+  });
+  const duration = queueStatus || (!clockTiming.startedAtMs && !clockTiming.serverDurationMs)
+    ? "" : formatProcessDuration(elapsedMs);
 
-  if (steps.length === 0 && !openingText && progressByStepSeq.size === 0) return null;
+  const renderStep = (index: number) => {
+    const step = displaySteps[index];
+    const tool = processStepToToolCall(step);
+    const subAgentRun = subAgentRunByStep.get(index);
+    const status = displayProcessStepStatus(step, displaySteps, index, isLiveTurn);
+    const stepDuration = formatProcessDuration(step.duration_ms);
+    const label = status === "unavailable"
+      ? websiteAccessDeniedLabel(step)
+      : status === "not_run" ? notRunStepLabel(step) : processVerb(step);
 
-  return (
-    <section className="assistant-process-flow">
-      <button className="assistant-process-flow-header" type="button" onClick={() => setExpanded((value) => !value)}>
-        <span>{title}</span>
-        {duration && <span>{duration}</span>}
+    if (subAgentRun) {
+      return (
+        <AgentLoopStep
+          key={step.id || index}
+          run={subAgentRun}
+          live={isLiveTurn}
+        />
+      );
+    }
+
+    const resultText = formatPublicToolResult(tool.result);
+    const argumentsText = step.arguments_preview ? formatUserFacingStructuredText(step.arguments_preview) : "";
+    const displayResultText = resultText ? formatUserFacingStructuredText(resultText) : "";
+    const neutralCaption = status === "error" ? neutralProcessStepCaption(step) : "";
+    const visibleError = neutralCaption || visibleProcessStepError(status, resultText);
+    const detailResultText = neutralCaption || status === "unavailable" ? ""
+      : status === "error" ? resultText || "" : displayResultText;
+    const canInspect = !minimal && Boolean(argumentsText || detailResultText);
+    const stepLabel = (
+      <>
+        <StepIcon status={status} neutral={status === "error"} />
+        <span className="assistant-process-step-label">
+          {label}
+          {stepDuration && <span className="assistant-process-step-duration">{stepDuration}</span>}
+        </span>
+      </>
+    );
+    return (
+      <div className="assistant-process-step-group" key={step.id || index}>
+        {canInspect ? (
+          <details
+            className="assistant-process-step"
+            title={t("component.assistant_message_blocks.view_tool_details")}
+          >
+            <summary>{stepLabel}</summary>
+            <div className="assistant-process-step-detail">
+              {argumentsText && <pre>{argumentsText}</pre>}
+              {detailResultText && <pre>{detailResultText}</pre>}
+            </div>
+          </details>
+        ) : (
+          <div className="assistant-process-step--minimal">
+            {stepLabel}
+          </div>
+        )}
+        {visibleError && (
+          <div className="assistant-process-step-error assistant-process-step-error--neutral">{visibleError}</div>
+        )}
+        {step.drafting && step.draft_preview && isLiveTurn && (
+          // What the model is writing into this call right now.
+          <div className="assistant-process-step-draft">{step.draft_preview}</div>
+        )}
+      </div>
+    );
+  };
+  const timelineGroups = groupConsecutiveByKey(timeline, (entry) => {
+    if (entry.type !== "step" || subAgentRunByStep.has(entry.stepIndex)) return null;
+    const kind = displaySteps[entry.stepIndex].kind;
+    return !kind || kind === "tool" ? "tools" : null;
+  });
+
+  const headerContent = (
+    <>
+      {(queueStatus || isLiveTurn) && <span aria-hidden="true"><AgentActivityOrb activity={activity} label={title} iconOnly paused={Boolean(queueStatus)} /></span>}
+      <span className="assistant-process-flow-title" aria-live={queueStatus ? undefined : "polite"}>{title}</span>
+      {duration && <span className="assistant-process-flow-duration">{duration}</span>}
+      {timeline.length > 0 && (
         <svg className={`assistant-process-flow-chevron${expanded ? " expanded" : ""}`} width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
           <polyline points="6 9 12 15 18 9" />
         </svg>
-      </button>
+      )}
+    </>
+  );
 
-      {expanded && (
+  return (
+    <section className="assistant-process-flow" role={!isLiveTurn && processFailed ? "alert" : undefined}>
+      {timeline.length > 0 ? <button
+        className="assistant-process-flow-header"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpandedOverride(!expanded)}
+      >
+        {headerContent}
+      </button> : <div className="assistant-process-flow-header" role="status">{headerContent}</div>}
+      {expanded && timeline.length > 0 && (
         <div className="assistant-process-flow-body">
-          <div className="assistant-process-flow-summary">
-            {[hasRunning ? t("component.assistant_message_blocks.working") : processMetaText(steps), surfaceSummary]
-              .filter(Boolean)
-              .join(" · ")}
-          </div>
-          {!minimal && block.note && (
-            <div className="assistant-process-note">
-              <ChatMarkdown content={formatUserFacingStructuredText(block.note)} streaming={hasRunning} returnTo={returnTo} />
-            </div>
-          )}
-          {!minimal && openingText && !openingTextIsDuplicatedInSteps && (
-            <div className="assistant-process-thinking">
-              <ChatMarkdown content={formatUserFacingStructuredText(openingText)} streaming={hasRunning} returnTo={returnTo} />
-            </div>
-          )}
-          {tools.map((tool, index) => {
-            const step = steps[index];
-            const subAgentRun = subAgentRunByStep.get(index);
-            const status = normalizeStepStatus(step.status);
-            const stepDuration = formatDuration(step.duration_ms);
-            const badge = runtimeToolBadge(step.name);
-
-            if (subAgentRun) {
+          {timelineGroups.map((group) => {
+            const entry = group.items[0];
+            if (entry.type === "commentary") {
+              const liveCommentary = isLiveTurn && !hasFinalOutput && group.startIndex === timeline.length - 1;
               return (
-                <AgentLoopStep
-                  key={step.id || index}
-                  run={subAgentRun}
-                />
-              );
-            }
-
-            // Minimal (workspace chat): just the verb + status, never the
-            // arguments / result / thinking — no AI "running code" surfaces.
-            if (minimal) {
-              return (
-                <div className="assistant-process-step assistant-process-step--minimal" key={step.id || index}>
-                  <StepIcon status={status} />
-                  <RuntimeSurfaceBadge badge={badge} compact />
-                  <span className="assistant-process-step-label">
-                    {processVerb(step)}
-                    {stepDuration && <span className="assistant-process-step-duration">{stepDuration}</span>}
-                  </span>
+                <div key={entry.id} className={`assistant-process-commentary${liveCommentary ? " assistant-process-commentary--live" : ""}`}>
+                  <ChatMarkdown content={formatUserFacingStructuredText(entry.text)} streaming={liveCommentary} returnTo={returnTo} enableFileCards={enableFileCards} />
                 </div>
               );
             }
-
-            const resultText = formatPublicToolResult(tool.result);
-            const argumentsText = step.arguments_preview ? formatUserFacingStructuredText(step.arguments_preview) : "";
-            const displayResultText = resultText ? formatUserFacingStructuredText(resultText) : "";
-            const progressText = progressByStepSeq.get(Number(step.seq || index + 1)) || "";
+            if (!group.key) return renderStep(entry.stepIndex);
+            const indices = group.items.flatMap((item) => item.type === "step" ? [item.stepIndex] : []);
+            const runningIndex = [...indices].reverse().find((index) => displayProcessStepStatus(displaySteps[index], displaySteps, index, isLiveTurn) === "running");
             return (
-              <div className="assistant-process-step-group" key={step.id || index}>
-                {step.assistant_text && (
-                  <div className="assistant-process-thinking assistant-process-thinking--step">
-                    <ChatMarkdown content={formatUserFacingStructuredText(step.assistant_text)} streaming={hasRunning && status === "running"} returnTo={returnTo} />
-                  </div>
-                )}
-                <details
-                  className="assistant-process-step"
-                  title={t("component.assistant_message_blocks.view_tool_details")}
-                >
-                  <summary>
-                    <StepIcon status={status} />
-                    <RuntimeSurfaceBadge badge={badge} />
-                    <span className="assistant-process-step-label">
-                      {processVerb(step)}
-                      {stepDuration && <span className="assistant-process-step-duration">{stepDuration}</span>}
-                    </span>
-                  </summary>
-                  {(argumentsText || displayResultText) && (
-                    <div className="assistant-process-step-detail">
-                      {argumentsText && <pre>{argumentsText}</pre>}
-                      {displayResultText && <pre>{displayResultText}</pre>}
-                    </div>
-                  )}
-                </details>
-                {progressText && (
-                  <div className="assistant-process-thinking assistant-process-thinking--progress">
-                    <ChatMarkdown content={formatUserFacingStructuredText(progressText)} streaming={hasRunning} returnTo={returnTo} />
-                  </div>
-                )}
-              </div>
+              <ToolActivityGroup
+                key={entry.id}
+                summary={summarizeToolActivity(indices.map((index) => ({
+                  ...displaySteps[index],
+                  status: displayProcessStepStatus(displaySteps[index], displaySteps, index, isLiveTurn),
+                  label: isWebsiteAccessDenied(displaySteps[index])
+                    ? websiteAccessDeniedLabel(displaySteps[index])
+                    : displaySteps[index].status === "not_run" ? notRunStepLabel(displaySteps[index]) : processVerb(displaySteps[index]),
+                })))}
+                runningLabel={runningIndex === undefined ? undefined : processVerb(displaySteps[runningIndex])}
+                liveDetail={isLiveTurn && runningIndex !== undefined && displaySteps[runningIndex].drafting
+                  ? displaySteps[runningIndex].draft_preview : undefined}
+              >
+                {indices.map(renderStep)}
+              </ToolActivityGroup>
             );
           })}
         </div>
@@ -932,7 +1190,10 @@ export default function AssistantMessageBlocks({
   onResponseSurfaceSubmit,
   responseSurfaceSubmissionReceipts = [],
   sourceMessageId,
-  hasPendingAction = false,
+  pendingActionKind = null,
+  hitlRequests,
+  queueStatus,
+  enableFileCards,
 }: {
   blocks?: AssistantBlock[] | null;
   content?: string | null;
@@ -948,35 +1209,75 @@ export default function AssistantMessageBlocks({
     | Promise<void | boolean | ResponseSurfaceSubmissionResult>;
   responseSurfaceSubmissionReceipts?: ResponseSurfaceSubmissionReceipt[];
   sourceMessageId: string;
-  /** A persisted HITL/action is still waiting for the user. */
-  hasPendingAction?: boolean;
-  /** Workspace chat: hide tool/step technical detail (args, results,
-   *  thinking) — show only the agent's final text + a quiet step summary. */
+  /** The persisted HITL/action state still waiting for the user. */
+  pendingActionKind?: AssistantPendingActionKind;
+  /** Exact tool approvals attached to this message's process steps. */
+  hitlRequests?: AssistantProcessHITLRequest[] | null;
+  /** Current resource/worker wait, projected inside the shared process card. */
+  queueStatus?: string;
+  /** Group files are delivered through room-scoped attachment controls. */
+  enableFileCards?: boolean;
+  /** Workspace chat keeps user-facing progress and tool labels, hiding raw
+   *  arguments/results while preserving the same process order. */
   minimal?: boolean;
+  /** Simple chat shares the same process timeline and collapsed tool details. */
+  hideProcess?: boolean;
   /** Collapse long final answers on compact surfaces such as Workspace Chat. */
   collapseLongFinal?: boolean;
 }) {
-  const blocks = useMemo(() => sanitizeAssistantBlocks(rawBlocks), [rawBlocks]);
+  const hasLiveProcess = streaming && !isUser && !pendingActionKind;
+  const activeQueueStatus = hasLiveProcess ? queueStatus : undefined;
   const content = isUser ? rawContent : stripInternalProtocolText(rawContent);
+  const blocks = useMemo(() => {
+    const sanitized = sanitizeAssistantBlocks(rawBlocks);
+    if (!isUser && !sanitized.some((block) => block.type === "process")
+      && (hasLiveProcess || pendingActionKind || sanitized.length || content)) {
+      // Live placeholders and legacy prose share the same presentation. An
+      // older message has no authoritative duration or tool history to invent.
+      const process: AssistantBlock = {
+        id: `${keyPrefix}-live-process`, type: "process",
+        lifecycle_status: activeQueueStatus || pendingActionKind ? "waiting" : hasLiveProcess ? "running" : "completed",
+        default_collapsed: !hasLiveProcess, steps: [],
+      };
+      const finalIndex = sanitized.findIndex((block) => block.type === "text" && block.phase === "final");
+      const index = finalIndex < 0 ? sanitized.length : finalIndex;
+      return [...sanitized.slice(0, index), process, ...sanitized.slice(index),
+        ...(!sanitized.length && content ? [{ id: `${keyPrefix}-final`, type: "text" as const,
+          phase: "final" as const, text: content }] : [])];
+    }
+    return sanitized;
+  }, [rawBlocks, content, activeQueueStatus, hasLiveProcess, pendingActionKind, isUser, keyPrefix]);
 
   if (!Array.isArray(blocks) || blocks.length === 0) return null;
 
   const {
-    progressByStepSeq,
     authoritativeContent,
     shouldUseAuthoritativeContent,
     recoveredFinalText,
     liveFinalText,
+    liftedFinalText,
     fallbackFinalText,
-    openingText,
+    hasFinalOutput,
+    processOpeningText,
+    progressByStepSeq,
+    trailingProgressText,
     shouldSuppressFinalText,
   } = projectAssistantText(content, blocks, streaming);
+  const firstProcessIndex = blocks.findIndex((block) => block.type === "process");
+  const lastProcessIndex = blocks.reduce((last, block, index) => block.type === "process" ? index : last, -1);
 
   return (
     <>
       {blocks.map((block, index) => {
         if (block.type === "text") {
           if (!block.text) return null;
+          if (firstProcessIndex < 0 && block.phase === "opening" && streaming && !hasFinalOutput) {
+            return (
+              <div key={block.id || `${keyPrefix}-opening-${index}`} className={`assistant-process-commentary${streaming ? " assistant-process-commentary--live" : ""}`}>
+                <ChatMarkdown content={formatUserFacingStructuredText(block.text)} streaming={streaming} returnTo={returnTo} enableFileCards={enableFileCards} />
+              </div>
+            );
+          }
           if (block.phase !== "final") return null;
           if (shouldSuppressFinalText(block.text)) return null;
           return (
@@ -987,6 +1288,7 @@ export default function AssistantMessageBlocks({
               streaming={streaming && index === blocks.length - 1}
               returnTo={returnTo}
               enabled={collapseLongFinal}
+              enableFileCards={enableFileCards}
             />
           );
         }
@@ -1011,16 +1313,34 @@ export default function AssistantMessageBlocks({
             />
           );
         }
+        if (isToolFreeCompletedProcess(block, {
+          hasFinalOutput: Boolean(hasFinalOutput),
+          pending: Boolean(pendingActionKind),
+          live: Boolean(activeQueueStatus) || (streaming && index === lastProcessIndex),
+        })) {
+          // A finished answer that called no tools has no process to report.
+          return null;
+        }
         return (
           <AssistantProcessBlock
             key={block.id || `${keyPrefix}-process-${index}`}
             block={block}
-            openingText={openingText}
-            progressByStepSeq={progressByStepSeq}
+            timeline={projectAssistantProcessTimeline({
+              steps: block.steps || [],
+              openingText: index === firstProcessIndex ? processOpeningText : "",
+              processNote: block.note,
+              progressByStepSeq,
+              trailingProgressText: index === lastProcessIndex ? trailingProgressText : "",
+            })}
+            hasFinalOutput={Boolean(hasFinalOutput)}
             minimal={minimal}
-            hasPendingAction={hasPendingAction}
+            pendingActionKind={pendingActionKind}
+            hitlRequests={hitlRequests}
             returnTo={returnTo}
             subAgentRuns={subAgentRuns}
+            streaming={streaming}
+            queueStatus={!hasFinalOutput && index === lastProcessIndex ? activeQueueStatus : undefined}
+            enableFileCards={enableFileCards}
           />
         );
       })}
@@ -1032,6 +1352,7 @@ export default function AssistantMessageBlocks({
           streaming={false}
           returnTo={returnTo}
           enabled={collapseLongFinal}
+          enableFileCards={enableFileCards}
         />
       )}
       {liveFinalText && (
@@ -1042,9 +1363,21 @@ export default function AssistantMessageBlocks({
           streaming={streaming}
           returnTo={returnTo}
           enabled={collapseLongFinal}
+          enableFileCards={enableFileCards}
         />
       )}
-      {shouldUseAuthoritativeContent && !liveFinalText && (
+      {liftedFinalText && !liveFinalText && (
+        <CollapsibleFinalMarkdown
+          key={`${keyPrefix}-lifted-final`}
+          content={isUser ? liftedFinalText : formatUserFacingStructuredText(liftedFinalText)}
+          isUser={isUser}
+          streaming={streaming}
+          returnTo={returnTo}
+          enabled={collapseLongFinal}
+          enableFileCards={enableFileCards}
+        />
+      )}
+      {shouldUseAuthoritativeContent && !liveFinalText && !liftedFinalText && (
         <CollapsibleFinalMarkdown
           key={`${keyPrefix}-authoritative-final`}
           content={isUser ? authoritativeContent : formatUserFacingStructuredText(authoritativeContent)}
@@ -1052,6 +1385,7 @@ export default function AssistantMessageBlocks({
           streaming={streaming}
           returnTo={returnTo}
           enabled={collapseLongFinal}
+          enableFileCards={enableFileCards}
         />
       )}
       {fallbackFinalText && (
@@ -1062,6 +1396,7 @@ export default function AssistantMessageBlocks({
           streaming={false}
           returnTo={returnTo}
           enabled={collapseLongFinal}
+          enableFileCards={enableFileCards}
         />
       )}
     </>

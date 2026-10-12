@@ -13,6 +13,43 @@ import pytest
 from httpx import AsyncClient
 
 from packages.core.services import tool_path_memory as tpm
+from test_read_cache import cached_redis as cached_redis
+
+
+async def test_warm_paths_skip_sql_and_invalidation_follows_commit(client, monkeypatch, cached_redis):
+    from unittest.mock import AsyncMock
+    from packages.core import database, read_cache
+
+    _, user_id, entity_id = await _register_owner(client, "cache-paths")
+    args = dict(entity_id=entity_id, user_id=user_id, user_message="send new post",
+                tool_name="mcp__twitter__create_post")
+    async with database.async_session() as db:
+        await tpm.record_success(db, **args)
+        await db.commit()
+    query = AsyncMock(wraps=tpm._query_user_paths)
+    monkeypatch.setattr(tpm, "_query_user_paths", query)
+    async def read():
+        return await tpm._load_user_paths(entity_id, user_id)
+    assert (await read())[0].success_count == 1
+    assert (await read())[0].success_count == 1
+    query.assert_awaited_once()
+    key = read_cache._keys(tpm._cache_key(entity_id, user_id))[0]
+    await cached_redis.delete(key)
+    assert (await read())[0].success_count == 1
+    assert 1_799_000 <= await cached_redis.pttl(key) <= 1_800_000
+    async with database.async_session() as db:
+        await tpm.record_success(db, **args)
+        assert (await read())[0].success_count == 1
+        await db.commit()
+    assert (await read())[0].success_count == 2
+    assert query.await_count == 3
+    assert 899_000 <= await cached_redis.pttl(key) <= 900_000
+    async with database.async_session() as db:
+        await tpm.record_failure(db, **args)
+        await db.rollback()
+    assert (await read())[0].failure_count == 0
+    assert query.await_count == 3
+    assert await tpm._load_user_paths("different-entity", user_id) == []
 
 
 async def _register_owner(client: AsyncClient, username: str) -> tuple[dict[str, str], str, str]:
@@ -225,8 +262,9 @@ def test_tool_path_memory_outcome_excludes_approval_gates_and_hitl():
     """Review #2: chat_service.py's hooks used to derive recording success
     from status == 'success' alone, but runtime_tool_status_for_chat
     collapses waiting_human/rejected/blocked/cancelled/canceled into its
-    UI-facing 'error' bucket right alongside real execution failures —
-    and a raw __hitl__ interrupt payload parses as a clean 'success'.
+    UI-facing 'error' bucket right alongside real execution failures.
+    A raw __hitl__ interrupt is a clean UI success because the separate
+    approval card owns its waiting state.
     Spec §A3 explicitly excludes approval denials/cancellations/
     availability blocks from failure recording ('those say nothing about
     whether the path fits the task'), and a HITL interrupt is not a
@@ -616,21 +654,22 @@ async def test_approval_interrupt_and_gate_statuses_never_record(
     )
 
 
-async def _set_flag(db, key: str, *, enabled: bool) -> None:
-    """Canonical test-side flag setter — same helper duplicated in
-    tests/test_tool_discovery_v2.py; see that file's docstring for why
-    (no service-level set_flag(); this direct FeatureFlag row upsert +
-    cache bump is the pattern every test in this repo actually uses)."""
+async def _set_retired_discovery_flag(db, *, enabled: bool) -> None:
+    """Persist the retired flag to prove v2 no longer evaluates it."""
     from sqlalchemy import select
 
     from packages.core.models.feature_flag import FeatureFlag
     from packages.core.services import feature_flags as feature_flags_service
 
     flag = (await db.execute(
-        select(FeatureFlag).where(FeatureFlag.key == key)
+        select(FeatureFlag).where(FeatureFlag.key == "tool_discovery_v2")
     )).scalar_one_or_none()
     if flag is None:
-        db.add(FeatureFlag(key=key, description="test", default_enabled=enabled))
+        db.add(FeatureFlag(
+            key="tool_discovery_v2",
+            description="retired test flag",
+            default_enabled=enabled,
+        ))
     else:
         flag.default_enabled = enabled
     await db.commit()
@@ -639,13 +678,8 @@ async def _set_flag(db, key: str, *, enabled: bool) -> None:
 
 def _mock_prompt_pipeline(monkeypatch, captured: dict):
     """Mock the two heavy dependencies of resolve_runtime_chat_context
-    (workspace runtime resolution + prompt assembly) so the test exercises
-    the REAL function end to end for everything else — in particular the
-    new A3 lookup+hint block, which needs a real DB session (tool_path_memory
-    and is_enabled/resolve_usable_mcp_providers all do real SQL) — while
-    keeping the heavier prompt/tool-schema machinery out of scope. Captures
-    the kwargs passed to the (mocked) prompt-assembly call so the test can
-    assert directly on what reached it, mirroring
+    (workspace runtime resolution + prompt assembly) while preserving the
+    real context assembly. Captures the prompt kwargs, mirroring
     tests/test_runtime_chat_context_byok.py's established pattern."""
     from types import SimpleNamespace
 
@@ -703,21 +737,10 @@ def _mock_prompt_pipeline(monkeypatch, captured: dict):
 
 
 @pytest.mark.asyncio
-async def test_resolve_runtime_chat_context_surfaces_path_hint_when_flag_on(
+async def test_resolve_runtime_chat_context_does_not_surface_keyword_path_hint(
     client: AsyncClient, monkeypatch,
 ) -> None:
-    """Uses a first-party manor_mcp_calendar tool rather than the plan's
-    example (mcp__twitter_x__post_tweet): a freshly-registered test entity
-    has zero connected integrations, so ANY externally-connected provider
-    (twitter_x included) correctly fails the A1 usability filter this
-    lookup applies before display (spec §A3: 'Retrieved paths pass through
-    the A1 usability filter before display'). Confirmed directly — with
-    the plan's literal tool name, resolve_usable_mcp_providers legitimately
-    returns frozenset() for this entity, so the hint is correctly empty;
-    that's the intended contract, not a bug, and it's already covered by
-    Part 1's usability-filter tests. A first-party tool isolates the
-    behavior actually under test here (the cache-first lookup + hint
-    surfacing) from that already-tested filter."""
+    """Past wording overlap cannot direct a later Chat tool choice."""
     _, user_id, entity_id = await _register_owner(client, "tpm_ctx_on")
     import packages.core.database as dbmod
     from packages.core.services import runtime_chat_context as module
@@ -728,9 +751,6 @@ async def test_resolve_runtime_chat_context_surfaces_path_hint_when_flag_on(
             user_message="发 x post", tool_name="mcp__manor_mcp_calendar__update_working_hours",
         )
         await db.commit()
-
-    async with dbmod.async_session() as db:
-        await _set_flag(db, "tool_discovery_v2", enabled=True)
 
     captured: dict = {}
     _mock_prompt_pipeline(monkeypatch, captured)
@@ -745,12 +765,12 @@ async def test_resolve_runtime_chat_context_surfaces_path_hint_when_flag_on(
         (captured.get("legacy_extra_context") or "")
         + (captured.get("initial_extra_context") or "")
     )
-    assert "mcp__manor_mcp_calendar__update_working_hours" in combined
-    assert "mcp__manor_mcp_calendar__update_working_hours" in ctx.hinted_tool_names
+    assert "mcp__manor_mcp_calendar__update_working_hours" not in combined
+    assert ctx.hinted_tool_names == set()
 
 
 @pytest.mark.asyncio
-async def test_resolve_runtime_chat_context_no_hint_when_flag_off(
+async def test_resolve_runtime_chat_context_stays_hint_free_with_retired_flag_off(
     client: AsyncClient, monkeypatch,
 ) -> None:
     _, user_id, entity_id = await _register_owner(client, "tpm_ctx_off")
@@ -763,7 +783,8 @@ async def test_resolve_runtime_chat_context_no_hint_when_flag_off(
             user_message="发 x post", tool_name="mcp__manor_mcp_calendar__update_working_hours",
         )
         await db.commit()
-    # tool_discovery_v2 flag intentionally left unset (off by default).
+    async with dbmod.async_session() as db:
+        await _set_retired_discovery_flag(db, enabled=False)
 
     captured: dict = {}
     _mock_prompt_pipeline(monkeypatch, captured)
@@ -796,9 +817,6 @@ async def test_resolve_runtime_chat_context_no_hint_for_non_matching_message(
             user_message="发 x post", tool_name="mcp__manor_mcp_calendar__update_working_hours",
         )
         await db.commit()
-    async with dbmod.async_session() as db:
-        await _set_flag(db, "tool_discovery_v2", enabled=True)
-
     captured: dict = {}
     _mock_prompt_pipeline(monkeypatch, captured)
 
@@ -830,72 +848,39 @@ def _boost_synthetic_pool():
     ]
 
 
-def test_intent_path_boost_breaks_a_small_score_gap():
-    """Task 5 contract (plan §Task 5, spec §A3 'ranking boost'): facebook
-    naturally outscores twitter by a small margin on keyword match alone
-    (query 'post extra' matches 'post' in both tool names, +'extra' only
-    in facebook's description) — intent_path_boosts should be able to
-    overcome that small gap in the boosted provider's favor.
-
-    Deviations from the plan's literal test framing, both found by running
-    the un-boosted baseline and inspecting scores directly rather than
-    assuming:
-    1. ('two providers tie') An EXACT tie isn't decided by pool/insertion
-       order in this ranking — ties break on (score, provider_name) with
-       reverse=True, so 'twitter_x' > 'facebook' alphabetically always
-       wins an exact tie regardless of pool order. A genuine small
-       nonzero gap (not a coincidental tie) is what actually demonstrates
-       the boost nudging the ranking, and is the more realistic scenario
-       for what the boost is for in production anyway.
-    2. The per-tool final ranked score is `provider_score + tool_score`,
-       and `provider_score` already includes `best_tool_score` once — so
-       with one tool per provider, a raw tool-score gap between two
-       single-tool providers is effectively counted TWICE in the final
-       ranking, while a boost (added only inside provider_score) counts
-       once. A facebook/twitter gap of 3 (via two matched name terms vs
-       one) doubles to 6, comfortably beating a +5 boost — confirmed
-       directly before picking a smaller, boost-beatable gap. Using a
-       1-point gap (one desc-only match, not a name match) here instead,
-       which doubles to ~2 and is easily overcome by +5."""
+def test_intent_path_boost_cannot_create_a_provider_keyword_route():
+    """Historical path memory cannot bypass worker-model provider matching."""
     from packages.core.ai.runtime.tool_search import runtime_search_tool_candidates
 
     baseline, _ = runtime_search_tool_candidates(
         tool_schemas=_boost_synthetic_pool(), query="post extra", max_results=2,
     )
-    # Confirm the (small, non-boosted) gap actually favors facebook first.
-    assert baseline[0]["name"].startswith("mcp__facebook__")
-
     boosted, _ = runtime_search_tool_candidates(
         tool_schemas=_boost_synthetic_pool(), query="post extra", max_results=2,
         intent_path_boosts={"twitter_x": 5.0},
     )
-    assert boosted[0]["name"].startswith("mcp__twitter_x__")
+    assert baseline == []
+    assert boosted == []
 
 
-def test_intent_path_boost_never_beats_a_strong_alias_match():
-    """A strong keyword+alias match (query names the OTHER provider
-    explicitly) must still win even against the max +9 boost — the boost
-    is a nudge among near-ties, never a hard override."""
+def test_provider_alias_text_does_not_bypass_worker_model_matching():
     from packages.core.ai.runtime.tool_search import runtime_search_tool_candidates
 
     results, _ = runtime_search_tool_candidates(
         tool_schemas=_boost_synthetic_pool(), query="facebook post", max_results=2,
         intent_path_boosts={"twitter_x": 5.0},
     )
-    assert results[0]["name"].startswith("mcp__facebook__")
+    assert results == []
 
 
-def test_intent_path_boost_is_capped_at_nine():
-    """A boost value far above the cap must not be applied uncapped —
-    otherwise a stale/over-confident memory could eventually out-rank a
-    strong alias match too."""
+def test_large_intent_path_boost_does_not_bypass_worker_model_matching():
     from packages.core.ai.runtime.tool_search import runtime_search_tool_candidates
 
     results, _ = runtime_search_tool_candidates(
         tool_schemas=_boost_synthetic_pool(), query="facebook post", max_results=2,
         intent_path_boosts={"twitter_x": 1000.0},
     )
-    assert results[0]["name"].startswith("mcp__facebook__")
+    assert results == []
 
 
 @pytest.mark.asyncio

@@ -7,26 +7,13 @@ from pathlib import Path
 import pytest
 from pypdf import PdfReader
 
-pytest.importorskip("fpdf")
-
-from packages.core.ai.skills.pdf.scripts.generate_from_template import (  # noqa: E402
-    SKILL_ROOT,
+from packages.core.ai.skills.pdf.scripts.generate_from_template import (
     TEMPLATES_DIR,
     generate_from_template,
     list_templates,
 )
 
-
-def test_pdf_skill_requires_one_verified_canonical_delivery() -> None:
-    instructions = (SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8")
-
-    assert "/skill/output/pdf/<descriptive-name>.pdf" in instructions
-    assert "Save the final PDF exactly once" in instructions
-    assert "Never save helper scripts" in instructions
-    assert "Do not generate a DOCX substitute" in instructions
-    assert "collection_font_number=2" in instructions
-    assert 'generate_file(kind="image")' in instructions
-    assert "prepare_image_asset.py" in instructions
+pytestmark = pytest.mark.oss_regression
 
 
 @pytest.mark.parametrize("template_id", ["business-report", "project-proposal", "invoice", "academic-paper"])

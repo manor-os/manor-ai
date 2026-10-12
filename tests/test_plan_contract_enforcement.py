@@ -39,8 +39,26 @@ def _gappy_plan():
 
 def _clean_plan():
     """A plan with no contract gaps — single self-contained llm step that
-    declares its output shape."""
-    return Plan(steps=[_llm_step("a", output_shape="TextResult")])
+    declares its output shape and execution contract."""
+    return Plan(steps=[PlanStep(
+        key="a", kind="llm", service_key="content_creation",
+        output_shape="TextResult", params={"prompt": "do the thing"},
+        execution_contract={"delivery": "inline", "effects": "read_only"},
+    )])
+
+
+@pytest.mark.parametrize("extra,issue", [
+    ({"expects": ["files"]}, "unexecutable_file_creation"),
+    ({"params": {"prompt": "Use the writing Skill", "skill_refs": ["writer"]}},
+     "unexecutable_skill_invocation"),
+])
+def test_text_only_step_cannot_declare_tool_dependent_work(extra, issue):
+    from packages.core.plans.service import plan_contract_gaps
+
+    step = _llm_step("draft", output_shape="TextResult").model_copy(update=extra)
+    assert issue in {gap.kind for gap in plan_contract_gaps([step])}
+    step.kind = "subagent"
+    assert issue not in {gap.kind for gap in plan_contract_gaps([step])}
 
 
 def _stale_artifact_review_plan():
@@ -54,6 +72,7 @@ def _stale_artifact_review_plan():
                 service_key="partnership_development",
                 output_shape="ArtifactResult",
                 params={"prompt": "Prepare the outreach packet as files."},
+                execution_contract={"delivery": "artifact", "effects": "artifact_write"},
             ),
             PlanStep(
                 key="calvin_approval",
@@ -71,6 +90,7 @@ def _stale_artifact_review_plan():
                 output_shape="TextResult",
                 params={"prompt": "Report on " + artifact_ref},
                 depends_on=["calvin_approval"],
+                execution_contract={"delivery": "inline", "effects": "read_only"},
             ),
         ]
     )
@@ -110,6 +130,7 @@ def test_required_plan_steps_reject_a_plan_missing_the_upload_step():
             service_key="stickman.production",
             output_shape="ArtifactResult",
             params={"prompt": "Produce the finished MP4."},
+            execution_contract={"delivery": "artifact", "effects": "artifact_write"},
         ),
     ])
 
@@ -149,6 +170,7 @@ async def test_required_plan_steps_trigger_one_replan_before_persisting(monkeypa
             service_key="stickman.production",
             output_shape="ArtifactResult",
             params={"prompt": "Produce the finished MP4."},
+            execution_contract={"delivery": "artifact", "effects": "artifact_write"},
         ),
     ])
     second = Plan(steps=[
@@ -158,6 +180,7 @@ async def test_required_plan_steps_trigger_one_replan_before_persisting(monkeypa
             service_key="stickman.production",
             output_shape="ArtifactResult",
             params={"prompt": "Produce the finished MP4."},
+            execution_contract={"delivery": "artifact", "effects": "artifact_write"},
         ),
         PlanStep(
             key="upload_to_youtube",
@@ -165,6 +188,7 @@ async def test_required_plan_steps_trigger_one_replan_before_persisting(monkeypa
             service_key="stickman.production",
             output_shape="ArtifactResult",
             depends_on=["produce_video"],
+            execution_contract={"delivery": "inline", "effects": "authorized"},
             params={
                 "prompt": "Use Chrome to upload the exact MP4 to YouTube Studio.",
                 "video": "${{ steps.produce_video.result }}",
@@ -607,26 +631,73 @@ class _FakeDB:
         return None
 
 
+def _dummy_task_coordinator_claim(task_id):
+    from datetime import datetime, timedelta, timezone
+
+    from packages.core.services.task_coordinator_wakeup import TaskCoordinatorClaim
+
+    return TaskCoordinatorClaim(
+        run_id="run_1", task_id=task_id, event_id="event_1",
+        wake_generation="generation_1", claim_token="claim_1",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+        state_version=1,
+    )
+
+
 @pytest.mark.asyncio
-async def test_plan_task_rejects_inactive_workspace_before_context(monkeypatch):
+@pytest.mark.parametrize("workspace_state", ["missing", "deleted", "archived"])
+@pytest.mark.parametrize("manual_user_id", [None, "operator"])
+async def test_plan_task_rejects_unavailable_workspace_before_context(
+    monkeypatch, workspace_state, manual_user_id,
+):
     from types import SimpleNamespace
 
     task = _FakeTask()
     task.workspace_id = "ws_1"
 
-    async def _deleted_workspace(*_args, **_kwargs):
-        return SimpleNamespace(deleted_at=object(), status="active")
+    async def _unavailable_workspace(*_args, **_kwargs):
+        if workspace_state == "missing":
+            return None
+        return SimpleNamespace(
+            deleted_at=object() if workspace_state == "deleted" else None,
+            status="archived" if workspace_state == "archived" else "active",
+        )
 
     async def _unexpected_context(*_args, **_kwargs):
-        raise AssertionError("inactive Workspace must fail before context/provider work")
+        raise AssertionError("unavailable Workspace must fail before context/provider work")
 
     monkeypatch.setattr(
         "packages.core.services.workspace_access.lock_workspace_access_boundary",
-        _deleted_workspace,
+        _unavailable_workspace,
     )
     monkeypatch.setattr(planner_mod, "_gather_context", _unexpected_context)
 
-    with pytest.raises(planner_mod.PlannerError, match="not active"):
+    with pytest.raises(planner_mod.PlannerError, match="Workspace is unavailable for planning"):
+        await planner_mod.plan_task(
+            _FakeDB(task), task.id, execution_mode="live", manual_user_id=manual_user_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_workspace_task_plan_requires_v3_claim_before_context(monkeypatch):
+    from types import SimpleNamespace
+
+    task = _FakeTask()
+    task.workspace_id = "ws_1"
+
+    async def _active_workspace(*_args, **_kwargs):
+        return SimpleNamespace(deleted_at=None, status="active")
+
+    async def _unexpected_context(*_args, **_kwargs):
+        raise AssertionError("a claim-less Workspace Plan must not reach provider context")
+
+    monkeypatch.setattr(
+        "packages.core.services.workspace_access.lock_workspace_access_boundary",
+        _active_workspace,
+    )
+    monkeypatch.setattr(planner_mod, "_gather_context", _unexpected_context)
+
+    with pytest.raises(planner_mod.TaskPlanOwnedByCoordinatorError, match="requires its Task coordinator"):
         await planner_mod.plan_task(_FakeDB(task), task.id, execution_mode="live")
 
 
@@ -671,7 +742,7 @@ async def test_plan_task_rejects_model_labeled_setup_work_while_setup_is_blocked
     # Matching the allowlisted label is not authorization. Setup automation
     # enters through the server-owned ScheduledJob path, not Planner.
     task.details = {"strategist_task_key": "prepare_workspace_identity"}
-    workspace = SimpleNamespace(id="ws_1")
+    workspace = SimpleNamespace(id="ws_1", entity_id=task.entity_id)
 
     async def _context(_db, _task):
         return SimpleNamespace(workspace=workspace)
@@ -711,7 +782,10 @@ async def test_plan_task_rejects_model_labeled_setup_work_while_setup_is_blocked
     monkeypatch.setattr(planner_mod, "_generate_plan", _generate)
 
     with pytest.raises(planner_mod.PlannerError, match="setup is incomplete"):
-        await planner_mod.plan_task(_FakeDB(task), task.id, execution_mode="live")
+        await planner_mod.plan_task(
+            _FakeDB(task), task.id, execution_mode="live",
+            task_coordinator_claim=_dummy_task_coordinator_claim(task.id),
+        )
 
     assert generated is False
 
@@ -728,7 +802,9 @@ async def test_plan_task_rechecks_setup_before_plan_persistence(monkeypatch):
     task = _FakeTask()
     task.workspace_id = "ws_1"
     task.details = {"strategist_task_key": "normal_growth_task"}
-    context = SimpleNamespace(workspace=SimpleNamespace(id="ws_1"))
+    context = SimpleNamespace(
+        workspace=SimpleNamespace(id="ws_1", entity_id=task.entity_id), subscriptions=[],
+    )
     checks = 0
 
     async def _context(_db, _task):
@@ -773,13 +849,32 @@ async def test_plan_task_rechecks_setup_before_plan_persistence(monkeypatch):
         "evaluate_current_workspace_blocking_setup",
         _becomes_blocked,
     )
+    async def _dispatchable(*_args, **_kwargs):
+        return []
+
+    async def _coordinated_runtime(*_args, **_kwargs):
+        # This fake-session test owns setup recheck ordering only. Runtime
+        # factory/persistence behavior is covered with real subscriptions.
+        return SimpleNamespace(coordinator=None)
+
     monkeypatch.setattr(planner_mod, "runtime_planner_llm_billing_context", _noop_billing)
     monkeypatch.setattr(planner_mod, "_generate_plan", _generate)
     monkeypatch.setattr(planner_mod, "_enforce_allowlists", lambda plan, ctx: None)
+    # The dispatch preflight reads real Worker/Subscription rows; this test
+    # runs on a fake session and only exercises the setup re-check ordering.
+    monkeypatch.setattr(planner_mod, "plan_dispatch_preflight", _dispatchable)
+    monkeypatch.setattr(
+        planner_mod,
+        "_require_coordinated_plan_execution",
+        _coordinated_runtime,
+    )
     monkeypatch.setattr(planner_mod, "create_plan_from_dag", _persist)
 
     with pytest.raises(planner_mod.PlannerError, match="setup is incomplete"):
-        await planner_mod.plan_task(_FakeDB(task), task.id, execution_mode="live")
+        await planner_mod.plan_task(
+            _FakeDB(task), task.id, execution_mode="live",
+            task_coordinator_claim=_dummy_task_coordinator_claim(task.id),
+        )
 
     assert checks == 2
     assert persisted is False
@@ -1028,15 +1123,20 @@ def test_plan_and_run_task_redispatches_the_committed_active_plan(monkeypatch):
     from packages.core.tasks import ai_tasks
 
     def _raise_active(coro):
+        name = coro.cr_code.co_name
         coro.close()
-        raise ActiveTaskPlanError("task-1", "plan-1", "draft")
+        if name == "_go":
+            raise ActiveTaskPlanError("task-1", "plan-1", "draft")
+        assert name == "_load_existing_plan_for_dispatch"
+        return "plan-1", "draft", object()
 
     dispatched: list[str] = []
     monkeypatch.setattr(ai_tasks, "_run_async", _raise_active)
+    from packages.core.plans import wakeup
     monkeypatch.setattr(
-        ai_tasks.run_plan,
-        "delay",
-        lambda plan_id: dispatched.append(plan_id),
+        wakeup,
+        "dispatch_plan_cycle_wake_hint",
+        lambda _wake, **_kwargs: dispatched.append("plan-1"),
     )
 
     result = ai_tasks.plan_and_run_task.run("task-1")
@@ -1046,67 +1146,75 @@ def test_plan_and_run_task_redispatches_the_committed_active_plan(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_from_task_api_retry_dispatches_the_committed_active_plan(monkeypatch):
+async def test_from_task_api_submits_v3_without_sync_plan_or_dispatch(monkeypatch):
     from types import SimpleNamespace
 
-    from apps.api.routers import plans as plans_router
-    from packages.core.plans.service import ActiveTaskPlanError
+    from fastapi import Response
 
-    plan = SimpleNamespace(
-        id="plan-1",
-        task_id="task-1",
-        entity_id="entity-1",
-        workspace_id="workspace-1",
-        execution_mode="live",
+    from apps.api.routers import plans as plans_router
+    from packages.core.models.task_plan_submission import TaskPlanSubmissionKind
+    from packages.core.services import task_plan_submission
+
+    task = SimpleNamespace(
+        id="task-1", entity_id="entity-1", workspace_id="workspace-1",
+        details={"strategist_review_id": "review-1"},
     )
 
     class _Db:
         def __init__(self):
-            self.rollbacks = 0
-            self.refreshed = []
+            self.commits = 0
 
-        async def rollback(self):
-            self.rollbacks += 1
+        async def execute(self, _statement):
+            return SimpleNamespace(one_or_none=lambda: SimpleNamespace(
+                id=task.id, workspace_id=task.workspace_id,
+            ))
 
-        async def refresh(self, row):
-            self.refreshed.append(row)
+        async def commit(self):
+            self.commits += 1
 
     db = _Db()
-    dispatched: list[str] = []
+    submitted = []
 
-    async def _authorize(*_args, **_kwargs):
-        return None
+    async def _lock_task(*_args, **_kwargs):
+        return task
 
-    async def _raise_active(*_args, **_kwargs):
-        raise ActiveTaskPlanError("task-1", "plan-1", "draft")
+    async def _submit(_db, **kwargs):
+        submitted.append(kwargs)
+        return SimpleNamespace(
+            id="submission-1", task_id=task.id, state="pending", plan_id=None,
+        )
 
-    async def _get_plan(*_args, **_kwargs):
-        return plan
+    async def _unexpected_sync_plan(*_args, **_kwargs):
+        raise AssertionError("Workspace planning must enter the durable V3 request")
 
-    async def _writable(*_args, **_kwargs):
-        return None
+    monkeypatch.setattr(plans_router, "_lock_task_for_plan", _lock_task)
+    monkeypatch.setattr(task_plan_submission, "submit_task_plan_request", _submit)
+    monkeypatch.setattr(plans_router, "plan_task_and_commit", _unexpected_sync_plan)
+    monkeypatch.setattr(plans_router, "_maybe_dispatch", _unexpected_sync_plan)
 
-    async def _dispatch(_db, row, **_kwargs):
-        dispatched.append(row.id)
-
-    monkeypatch.setattr(plans_router, "_authorize_task_for_planner", _authorize)
-    monkeypatch.setattr(plans_router, "plan_task_and_commit", _raise_active)
-    monkeypatch.setattr(plans_router, "get_plan", _get_plan)
-    monkeypatch.setattr(plans_router, "require_workspace_writable", _writable)
-    monkeypatch.setattr(plans_router, "_maybe_dispatch", _dispatch)
-    monkeypatch.setattr(plans_router, "_to_plan", lambda row: row.id)
-
+    user = SimpleNamespace(id="user-1", entity_id="entity-1")
+    response = Response()
     result = await plans_router.create_from_task(
         "task-1",
         plans_router.PlanFromTaskRequest(),
-        user=SimpleNamespace(id="user-1", entity_id="entity-1"),
+        response,
+        user=user,
         db=db,
     )
 
-    assert result == "plan-1"
-    assert db.rollbacks == 1
-    assert db.refreshed == [plan]
-    assert dispatched == ["plan-1"]
+    assert response.status_code == 202
+    assert result.submission_id == "submission-1"
+    assert result.task_id == task.id
+    assert result.runtime == "task_coordinator_v3"
+    assert result.plan_id is None
+    assert db.commits == 1
+    assert submitted == [{
+        "task": task,
+        "requested_by_user_id": user.id,
+        "kind": TaskPlanSubmissionKind.PLANNER,
+        "execution_mode": "live",
+    }]
+    assert task.details["strategist_review_id"] == "review-1"
 
 
 def test_plan_and_run_task_schedules_one_claim_recovery(monkeypatch):

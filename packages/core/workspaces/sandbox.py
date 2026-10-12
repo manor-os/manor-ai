@@ -204,6 +204,7 @@ async def create_sandbox_workspace(
     db: AsyncSession,
     *,
     entity_id: str,
+    user_id: str | None = None,
     name: str = "Twitter Growth — Workspace Simulation",
     kind: str = "social_media",
     seed_task_title: str = "Publish your first AI-agent tutorial tweet",
@@ -236,6 +237,7 @@ async def create_sandbox_workspace(
         return await _create_leasing_sandbox_workspace(
             db,
             entity_id=entity_id,
+            user_id=user_id,
             name=name,
             kind="leasing",
             seed_task_title=(
@@ -276,6 +278,8 @@ async def create_sandbox_workspace(
     )
     db.add(workspace)
     await db.flush([workspace])
+    from packages.core.governance.approval_policy_service import initialize_workspace_approval
+    await initialize_workspace_approval(db, workspace)
 
     from packages.core.goals.service import create_goal
 
@@ -512,6 +516,7 @@ async def _create_leasing_sandbox_workspace(
     db: AsyncSession,
     *,
     entity_id: str,
+    user_id: str | None,
     name: str,
     kind: str,
     seed_task_title: str,
@@ -701,6 +706,8 @@ async def _create_leasing_sandbox_workspace(
     )
     db.add(workspace)
     await db.flush([workspace])
+    from packages.core.governance.approval_policy_service import initialize_workspace_approval
+    await initialize_workspace_approval(db, workspace)
 
     subscriptions: dict[str, tuple[str, str]] = {}
     for spec in service_specs:
@@ -947,6 +954,7 @@ async def _create_leasing_sandbox_workspace(
     db.add(ChannelConfig(
         id=webchat_cc_id,
         entity_id=entity_id,
+        owner_user_id=user_id,
         workspace_id=workspace_id,
         channel_type="webchat",
         provider="manor_public_chat",
@@ -969,6 +977,7 @@ async def _create_leasing_sandbox_workspace(
         entity_id=entity_id,
         workspace_id=workspace_id,
         type="webchat",
+        user_id=user_id,
         name="Workspace simulation leasing webchat",
         config={
             "channel_config_id": webchat_cc_id,

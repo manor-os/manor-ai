@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from packages.core.constants.agents import MANOR_AGENT_FS_ID as MASTER_AGENT_ID
+from packages.core.constants.agents import MANOR_AGENT_IDS
 from packages.core.services.entity_fs import (
     append_log,
     get_agent_dir,
@@ -64,8 +65,8 @@ _provisioned: set[tuple[str, str]] = set()
 
 
 def effective_agent_id(agent_id: str | None) -> str:
-    """Return agent_id or MASTER_AGENT_ID for the master agent."""
-    return agent_id or MASTER_AGENT_ID
+    """Use one filesystem identity for every supported master-agent entry."""
+    return MASTER_AGENT_ID if not agent_id or agent_id in MANOR_AGENT_IDS else agent_id
 
 
 def _safe_user_dir(entity_id: str, agent_id: str, user_id: str) -> str:
@@ -108,6 +109,7 @@ def read_agent_file(
     falls back to the entity-level default.
     """
     # Try per-user override first
+    agent_id = effective_agent_id(agent_id)
     if user_id:
         user_dir = _safe_user_dir(entity_id, agent_id, user_id)
         content = _read_file(os.path.join(user_dir, filename))
@@ -135,6 +137,7 @@ def write_agent_file(
     if filename not in AGENT_FILES:
         raise ValueError(f"Unknown agent file: {filename}. Valid: {AGENT_FILE_NAMES}")
 
+    agent_id = effective_agent_id(agent_id)
     if user_id:
         target_dir = _safe_user_dir(entity_id, agent_id, user_id)
     else:
@@ -166,16 +169,17 @@ def _read_with_level(
     agent_id: str,
     filename: str,
     user_id: str | None,
+    strict: bool = False,
 ) -> tuple[str | None, str]:
     """Read a file and return (content, level) where level is 'user'|'entity'|'none'."""
     if user_id:
         user_dir = _safe_user_dir(entity_id, agent_id, user_id)
-        content = _read_file(os.path.join(user_dir, filename))
+        content = _read_file(os.path.join(user_dir, filename), strict=strict)
         if content is not None:
             return content, "user"
 
     agent_dir = get_agent_dir(entity_id, agent_id)
-    content = _read_file(os.path.join(agent_dir, filename))
+    content = _read_file(os.path.join(agent_dir, filename), strict=strict)
     if content is not None:
         return content, "entity"
     return None, "none"
@@ -200,12 +204,14 @@ def load_agent_files_with_levels(
     agent_id: str,
     *,
     user_id: str | None = None,
+    strict: bool = False,
 ) -> tuple[AgentFileSet, dict[str, str]]:
     """Load all agent definition files and return (files, levels).
 
     levels is a dict of {filename: "user"|"entity"|"none"} showing
     where each file was loaded from.
     """
+    agent_id = effective_agent_id(agent_id)
     mapping = [
         ("SOUL.md", "soul"),
         ("AGENT.md", "agent"),
@@ -220,7 +226,7 @@ def load_agent_files_with_levels(
     levels: dict[str, str] = {}
     values: dict[str, str | None] = {}
     for fname, attr in mapping:
-        content, level = _read_with_level(entity_id, agent_id, fname, user_id)
+        content, level = _read_with_level(entity_id, agent_id, fname, user_id, strict=strict)
         values[attr] = content
         if content is not None:
             levels[fname] = level
@@ -390,14 +396,16 @@ def build_agent_prompt_from_files(
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
-def _read_file(filepath: str) -> str | None:
+def _read_file(filepath: str, *, strict: bool = False) -> str | None:
     """Read a text file. Returns None if missing or empty."""
     try:
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
+        from packages.core.memory.cache import read_memory_text
+        content = read_memory_text(filepath)
         return content if content and content.strip() else None
     except FileNotFoundError:
         return None
     except Exception as e:
+        if strict:
+            raise
         logger.warning("Failed to read agent file %s: %s", filepath, e)
         return None

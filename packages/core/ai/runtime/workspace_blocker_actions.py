@@ -64,6 +64,7 @@ async def runtime_workspace_answer_task_blocker_action(
                 refuse=refuse,
             )
             plan_to_run = result.pop("_plan_to_run", None)
+            task_to_run = result.pop("_task_to_run", None)
             await db.commit()
         except Exception:
             await db.rollback()
@@ -72,36 +73,21 @@ async def runtime_workspace_answer_task_blocker_action(
                 "error": "answer_task_blocker_failed",
                 "request_id": request_id,
             })
+        if task_to_run:
+            # A legacy agent task parked by request_input: re-run it with the
+            # answer now that it is committed.
+            from packages.core.services.task_input_resume import dispatch_task_input_resume
+
+            result["dispatched"] = dispatch_task_input_resume(*task_to_run)
         if plan_to_run:
-            try:
-                from packages.core.tasks.ai_tasks import run_plan
+            from packages.core.plans.wakeup import hint_pending_plan_cycle
 
-                run_plan.delay(plan_to_run)
-                result["dispatched"] = True
-            except Exception:
-                logger.warning(
-                    "Task blocker continuation dispatch failed: plan=%s",
-                    plan_to_run,
-                    exc_info=True,
-                )
-                result["dispatched"] = False
-                try:
-                    from packages.core.services.task_retry_service import (
-                        mark_plan_continuation_dispatch_failed,
-                    )
-
-                    await mark_plan_continuation_dispatch_failed(
-                        db,
-                        plan_id=plan_to_run,
-                        user_id=user_id,
-                        reason="task_blocker_dispatch_failed",
-                    )
-                    await db.commit()
-                except Exception:
-                    await db.rollback()
-                    logger.error(
-                        "Could not persist task blocker dispatch failure: plan=%s",
-                        plan_to_run,
-                        exc_info=True,
-                    )
+            # ``answer_task_blocker`` stages this wake with the blocker
+            # mutation. A broker hint is optional and can never unwind the
+            # already committed answer or park the Task again.
+            result["dispatched"] = await hint_pending_plan_cycle(
+                db,
+                plan_to_run,
+                reason="task_blocker_post_commit_hint",
+            )
     return _dumps(result)

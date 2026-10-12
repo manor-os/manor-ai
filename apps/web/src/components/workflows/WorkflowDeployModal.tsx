@@ -6,6 +6,7 @@ import Modal from "../ui/Modal";
 import Button from "../ui/Button";
 import Input from "../ui/Input";
 import Select from "../ui/Select";
+import { workflowRunInputs } from "../../lib/workflowRunInputs";
 
 const TRIGGER_OPTIONS = [
   { value: "manual", label: "Manual — run on demand / API" },
@@ -30,7 +31,7 @@ export default function WorkflowDeployModal({
   open,
   onClose,
 }: {
-  flow: { id: string; name: string } | null;
+  flow: Parameters<typeof workflowRunInputs>[0] & { id: string; name: string } | null;
   open: boolean;
   onClose: () => void;
 }) {
@@ -114,9 +115,15 @@ export default function WorkflowDeployModal({
   });
 
   const needsEvent = triggerType === "event" || triggerType === "workspace_event";
+  // A cron fires with no one to fill the Run dialog; the server rejects this too.
+  const unscheduledInputs = flow
+    ? workflowRunInputs(flow).filter((input) => input.required && !input.defaultValue.trim())
+    : [];
+  const scheduleBlocked = triggerType === "schedule" && unscheduledInputs.length > 0;
   const canDeploy =
     (!needsEvent || eventName.trim().length > 0) &&
-    (triggerType !== "schedule" || cron.trim().split(/\s+/).length === 5);
+    (triggerType !== "schedule" || cron.trim().split(/\s+/).length === 5) &&
+    !scheduleBlocked;
 
   return (
     <Modal
@@ -232,6 +239,12 @@ export default function WorkflowDeployModal({
             <span style={{ fontSize: 11, color: "var(--text-faint)" }}>
               Standard 5-field cron (UTC). Creates an automation that fires this workflow.
             </span>
+            {scheduleBlocked && (
+              <span role="alert" style={{ fontSize: 12, color: "var(--danger, #c14a44)" }}>
+                A schedule can't supply required inputs ({unscheduledInputs.map((input) => input.label).join(", ")}).
+                Give them default values on the start node, or run this workflow manually or from a Workspace.
+              </span>
+            )}
           </Field>
         )}
 

@@ -4,7 +4,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from packages.core.ai.runtime import runtime_tool_call_context_from_kwargs
+from packages.core.ai.runtime.tool_context import (
+    runtime_tool_call_context_from_kwargs,
+    runtime_trusted_workspace_id_from_context,
+)
 from packages.core.ai.runtime.task_actions import (
     runtime_create_task_action,
     runtime_get_task_details_action,
@@ -13,6 +16,7 @@ from packages.core.ai.runtime.task_actions import (
     runtime_task_summary_dict,
     runtime_update_task_action,
 )
+from packages.core.constants.task import TASK_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +33,10 @@ SEARCH_TASKS_SCHEMA = {
     "function": {
         "name": "search_tasks",
         "description": (
-            "Search for tasks by query text, status, or priority. "
-            "Returns a list of matching tasks with their key fields."
+            "Search tasks with all known filters in one call. Values within a plural "
+            "filter are ORed; different filters and ranges are ANDed. Range endpoints "
+            "are inclusive. Filtering happens before pagination, and total is the exact "
+            "filtered count. Do not issue one call per status or priority."
         ),
         "parameters": {
             "type": "object",
@@ -41,27 +47,133 @@ SEARCH_TASKS_SCHEMA = {
                 },
                 "status": {
                     "type": "string",
-                    "enum": [
-                        "pending", "in_progress", "completed",
-                        "failed", "cancelled", "blocked",
-                    ],
-                    "description": "Filter by task status.",
+                    "enum": list(TASK_STATUSES),
+                    "description": "Legacy single-status filter. Use statuses for multiple values.",
+                },
+                "statuses": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(TASK_STATUSES)},
+                    "minItems": 1,
+                    "maxItems": len(TASK_STATUSES),
+                    "uniqueItems": True,
+                    "description": "Match any listed status in one query (OR).",
                 },
                 "priority": {
                     "type": "integer",
-                    "description": "Filter by priority (5=critical, 4=high, 3=medium, 2=low, 1=minimal).",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "Legacy exact priority filter. Use priorities for multiple values.",
+                },
+                "priorities": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "minItems": 1,
+                    "maxItems": 5,
+                    "uniqueItems": True,
+                    "description": "Match any listed priority in one query (OR).",
+                },
+                "priority_min": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "Inclusive minimum priority.",
+                },
+                "priority_max": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "description": "Inclusive maximum priority.",
                 },
                 "assignee_id": {
                     "type": "string",
-                    "description": "Filter by assignee/staff ID.",
+                    "description": "Legacy single assignee/staff ID filter.",
+                },
+                "assignee_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
+                    "description": "Match any listed assignee/staff ID (OR).",
+                },
+                "workspace_id": {
+                    "type": "string",
+                    "description": "Legacy single Workspace ID filter.",
+                },
+                "workspace_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
+                    "description": "Match Tasks in any listed Workspace (OR).",
+                },
+                "category_id": {
+                    "type": "string",
+                    "description": "Legacy single Task category ID filter.",
+                },
+                "category_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                    "uniqueItems": True,
+                    "description": "Match any listed Task category ID (OR).",
+                },
+                "task_type": {
+                    "type": "string",
+                    "description": "Legacy single Task type slug filter.",
+                },
+                "task_types": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "uniqueItems": True,
+                    "description": "Match any listed Task type slug (OR).",
+                },
+                "created_after": {
+                    "type": "string",
+                    "description": "Inclusive created-at lower bound as ISO-8601 datetime.",
+                },
+                "created_before": {
+                    "type": "string",
+                    "description": "Inclusive created-at upper bound as ISO-8601 datetime.",
+                },
+                "updated_after": {
+                    "type": "string",
+                    "description": "Inclusive updated-at lower bound as ISO-8601 datetime.",
+                },
+                "updated_before": {
+                    "type": "string",
+                    "description": "Inclusive updated-at upper bound as ISO-8601 datetime.",
                 },
                 "completed_after": {
                     "type": "string",
-                    "description": "Filter completed tasks at or after this ISO-8601 datetime.",
+                    "description": "Inclusive completed-at lower bound as ISO-8601 datetime.",
+                },
+                "completed_before": {
+                    "type": "string",
+                    "description": "Inclusive completed-at upper bound as ISO-8601 datetime.",
+                },
+                "deadline_after": {
+                    "type": "string",
+                    "description": "Inclusive deadline lower bound as ISO-8601 datetime.",
+                },
+                "deadline_before": {
+                    "type": "string",
+                    "description": "Inclusive deadline upper bound as ISO-8601 datetime.",
                 },
                 "limit": {
                     "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100,
                     "description": "Max results to return (default 20).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Filtered-result offset for pagination (default 0).",
                 },
             },
             "required": [],
@@ -95,7 +207,8 @@ CREATE_TASK_SCHEMA = {
                 },
                 "assignee_id": {
                     "type": "string",
-                    "description": "User ID to assign the task to.",
+                    "maxLength": 26,
+                    "description": "Existing user ID to assign the task to. Omit for an unassigned task; do not use an Entity ID.",
                 },
                 "deadline": {
                     "type": "string",
@@ -175,7 +288,13 @@ def _task_to_dict(task) -> dict:
 # ---------------------------------------------------------------------------
 
 async def _search_tasks(entity_id: str, **kwargs: Any) -> str:
-    return await runtime_search_tasks_action(entity_id=entity_id, params=kwargs)
+    context = runtime_tool_call_context_from_kwargs(kwargs)
+    return await runtime_search_tasks_action(
+        entity_id=entity_id,
+        user_id=context.user_id,
+        workspace_id=runtime_trusted_workspace_id_from_context(context),
+        params=kwargs,
+    )
 
 
 async def _create_task(entity_id: str, **kwargs: Any) -> str:
@@ -195,7 +314,13 @@ async def _update_task(entity_id: str, **kwargs: Any) -> str:
 
 
 async def _get_task_details(entity_id: str, **kwargs: Any) -> str:
-    return await runtime_get_task_details_action(entity_id=entity_id, params=kwargs)
+    context = runtime_tool_call_context_from_kwargs(kwargs)
+    return await runtime_get_task_details_action(
+        entity_id=entity_id,
+        user_id=context.user_id,
+        workspace_id=runtime_trusted_workspace_id_from_context(context),
+        params=kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------

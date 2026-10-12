@@ -26,6 +26,7 @@ import pytest
 from packages.core.blueprints.payload import migrate_payload
 from packages.core.ai.runtime.strategist import (
     RUNTIME_STRATEGIST_WORKFLOW_RUN_GUIDANCE,
+    _format_proposal_outcomes,
     runtime_strategist_user_prompt,
     runtime_strategist_template_block as _format_strategist_template,
 )
@@ -89,6 +90,20 @@ class _StubProposal:
     tasks: list = field(default_factory=list)
     notes: str | None = None
     summary: str = ""
+
+
+def test_legacy_proposal_context_keeps_code_only_rejection_feedback() -> None:
+    task = SimpleNamespace(
+        title="Score active Goals from current evidence",
+        owner_service_key="readiness_and_learning",
+        details={"rejection_reason_code": "WRONG_DIRECTION"},
+        actual_output={},
+    )
+    text = _format_proposal_outcomes(
+        _StubCtx(recent_proposal_outcomes={"rejected": [task]})
+    )
+    assert "Score active Goals from current evidence" in text
+    assert "Reason code: WRONG_DIRECTION" in text
 
 
 def test_strategist_prompt_closes_db_transaction_before_runtime_completion() -> None:
@@ -639,3 +654,92 @@ def test_v10_payload_carries_no_strategist_template():
     }
     p11 = migrate_payload(p10)
     assert p11["recipe"]["strategist"] is None
+
+
+
+def test_strategist_completion_reraises_stream_idle_timeout() -> None:
+    from packages.core.strategist.context import StrategistContext
+    from packages.core.strategist.prompt import generate_proposal
+
+    ctx = StrategistContext(
+        workspace=SimpleNamespace(id="ws_1", entity_id="ent_1", name="Ops Workspace"),
+    )
+
+    async def fake_load_skill_preamble(_db, _entity_id):
+        return None
+
+    async def fake_runtime_completion(_system_prompt, _user_prompt, **_kwargs):
+        raise TimeoutError("LLM streaming response stalled for 45s without a chunk")
+
+    with (
+        patch(
+            "packages.core.strategist.prompt._load_skill_preamble",
+            new=fake_load_skill_preamble,
+        ),
+        patch(
+            "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+            new=fake_runtime_completion,
+        ),
+    ):
+        with pytest.raises(TimeoutError, match="stalled"):
+            asyncio.run(generate_proposal(ctx, review_id="rv_stall"))
+
+
+def test_strategist_completion_reraises_stream_provider_error() -> None:
+    from packages.core.ai.llm_client import LLMStreamProviderError
+    from packages.core.strategist.context import StrategistContext
+    from packages.core.strategist.prompt import generate_proposal
+
+    ctx = StrategistContext(
+        workspace=SimpleNamespace(id="ws_1", entity_id="ent_1", name="Ops Workspace"),
+    )
+
+    async def fake_load_skill_preamble(_db, _entity_id):
+        return None
+
+    async def fake_runtime_completion(_system_prompt, _user_prompt, **_kwargs):
+        raise LLMStreamProviderError("provider error frame")
+
+    with (
+        patch(
+            "packages.core.strategist.prompt._load_skill_preamble",
+            new=fake_load_skill_preamble,
+        ),
+        patch(
+            "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+            new=fake_runtime_completion,
+        ),
+    ):
+        with pytest.raises(LLMStreamProviderError, match="provider error"):
+            asyncio.run(generate_proposal(ctx, review_id="rv_provider"))
+
+
+def test_strategist_completion_fails_when_provider_missing() -> None:
+    from packages.core.strategist.context import StrategistContext
+    from packages.core.strategist.prompt import StrategistProposalGenerationError, generate_proposal
+
+    ctx = StrategistContext(
+        workspace=SimpleNamespace(id="ws_1", entity_id="ent_1", name="Ops Workspace"),
+    )
+
+    async def fake_load_skill_preamble(_db, _entity_id):
+        return None
+
+    async def fake_runtime_completion(_system_prompt, _user_prompt, **_kwargs):
+        raise RuntimeError("No usable LLM API key found")
+
+    with (
+        patch(
+            "packages.core.strategist.prompt._load_skill_preamble",
+            new=fake_load_skill_preamble,
+        ),
+        patch(
+            "packages.core.strategist.prompt.runtime_execute_strategist_completion",
+            new=fake_runtime_completion,
+        ),
+    ):
+        with pytest.raises(StrategistProposalGenerationError) as caught:
+            asyncio.run(generate_proposal(ctx, review_id="rv_no_key"))
+
+    assert caught.value.code == "proposal_llm_unavailable"
+    assert "No usable LLM API key found" in caught.value.details["cause"]

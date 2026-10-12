@@ -4,6 +4,9 @@ title: Nango
 
 # Nango
 
+请创建自己的供应商 OAuth 应用，并为本部署配置回调 URL。未启用 profile 或
+未配置供应商只禁用相应连接器，不假定可使用托管 Nango 账户或 Manor 凭据。
+
 Nango 是一个可选的自托管 OAuth 与 API 连接器服务。Manor AI 可以借助它
 连接众多 SaaS 提供商，而无需从零构建每一个 OAuth 流程。
 

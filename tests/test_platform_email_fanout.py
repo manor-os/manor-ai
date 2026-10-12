@@ -125,6 +125,68 @@ async def test_bulk_email_disabled_pretends_success():
         email_mod.smtp_transport.send_message_async = original
 
 
+@pytest.mark.asyncio
+async def test_announcement_email_embeds_images_and_attaches_files():
+    captured = {}
+
+    async def capture_send(*, message, **kwargs):
+        captured["message"] = message
+
+    mock_send = AsyncMock(side_effect=capture_send)
+    email_mod, original = _swap_transport(mock_send)
+    image_id = "01K4A1B2C3D4E5F6G7H8J9KMNP"
+    file_id = "01K4A1B2C3D4E5F6G7H8J9KMNQ"
+    image_url = f"/api/v1/platform/announcement-media/{image_id}/shot.png"
+    file_url = f"/api/v1/platform/announcement-media/{file_id}/guide.pdf"
+    image_content_id = f"announcement-{image_id}@manor.ai"
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv("EMAIL_ENABLED", "true")
+            ok = await email_mod.send_announcement_email(
+                "reader@corp.com",
+                title="Media release",
+                body_md=(
+                    f"![Screenshot]({image_url})\n\n"
+                    f"[Download the guide]({file_url})"
+                ),
+                severity="info",
+                media=(
+                    email_mod.EmailAttachment(
+                        filename="shot.png",
+                        mime_type="image/png",
+                        data=b"png-bytes",
+                        content_id=image_content_id,
+                        source_url=image_url,
+                    ),
+                    email_mod.EmailAttachment(
+                        filename="guide.pdf",
+                        mime_type="application/pdf",
+                        data=b"pdf-bytes",
+                        source_url=file_url,
+                    ),
+                ),
+            )
+        assert ok is True
+        message = captured["message"]
+        parts = list(message.walk())
+        html_part = next(part for part in parts if part.get_content_type() == "text/html")
+        html_body = html_part.get_payload(decode=True).decode(html_part.get_content_charset())
+        assert f'src="cid:{image_content_id}"' in html_body
+        assert image_url not in html_body
+        assert "Download the guide — attached to this email" in html_body
+
+        image_part = next(part for part in parts if part.get_filename() == "shot.png")
+        assert image_part.get_content_disposition() == "inline"
+        assert image_part["Content-ID"] == f"<{image_content_id}>"
+        assert image_part.get_payload(decode=True) == b"png-bytes"
+
+        file_part = next(part for part in parts if part.get_filename() == "guide.pdf")
+        assert file_part.get_content_disposition() == "attachment"
+        assert file_part.get_payload(decode=True) == b"pdf-bytes"
+    finally:
+        email_mod.smtp_transport.send_message_async = original
+
+
 # ── RFC-2047 subject encoding ───────────────────────────────────────────────
 
 

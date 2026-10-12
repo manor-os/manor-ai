@@ -26,7 +26,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.blueprints.exporter import ExportContext, export_workspace
+from packages.core.blueprints.exporter import ExportContext, ExportError, export_workspace
 from packages.core.blueprints.installer import (
     InstallError,
     InstallMode,
@@ -34,7 +34,9 @@ from packages.core.blueprints.installer import (
     sync_workspace_live_setup_requirements,
 )
 from packages.core.models.base import generate_ulid
-from packages.core.models.document import Document, DocumentGroup, DocumentGroupMember
+from packages.core.models.user import Entity
+from packages.core.governance.approval_policy_service import account_defaults
+from packages.core.models.document import Document, DocumentFolder, DocumentGroup, DocumentGroupMember
 from packages.core.models.goal import Goal
 from packages.core.models.mcp import AgentMCPBinding, MCPServer
 from packages.core.models.memory import AgentMemory
@@ -54,9 +56,13 @@ from packages.core.services.workspace_readiness import (
 
 
 @pytest.fixture
-def entity_id() -> str:
-    """Per-test unique entity_id (ULID = 26 chars, matches column width)."""
-    return generate_ulid()
+async def entity_id(db_session) -> str:
+    """Install into an account with explicit root defaults."""
+    entity = Entity(id=generate_ulid(), name="Blueprint install account",
+                    settings={"approval_defaults": account_defaults()})
+    db_session.add(entity)
+    await db_session.commit()
+    return entity.id
 
 
 def _base_payload(**overrides) -> dict:
@@ -144,6 +150,26 @@ async def test_live_install_does_not_persist_simulation_only_settings(
     workspace = (await db_session.execute(select(Workspace).where(Workspace.id == result.workspace_id))).scalar_one()
     assert "sandbox" not in workspace.settings
     assert "simulation_experience" not in workspace.settings
+
+
+async def test_installed_usage_guide_remains_available_and_reexports(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    guide = "Start in Workspace Chat.\nReview the first result before approving actions."
+    result = await install_blueprint(
+        db_session,
+        entity_id=entity_id,
+        payload=_base_payload(**{"manifest.usage_guide": guide}),
+        mode=InstallMode.LIVE,
+    )
+    workspace = (await db_session.execute(
+        select(Workspace).where(Workspace.id == result.workspace_id)
+    )).scalar_one()
+    assert workspace.settings["_blueprint"]["usage_guide"] == guide
+
+    exported = await export_workspace(db_session, result.workspace_id, title="Test")
+    assert exported["manifest"]["usage_guide"] == guide
 
 
 async def test_install_does_not_infer_undeclared_business_ledgers(
@@ -1040,26 +1066,27 @@ async def test_governance_blocks_embedded_agent_tool(
                 }
             ],
             "policy.governance": {
-                "never_allow_actions": ["x.delete_*"],  # matches!
+                "approval": {"rules": [{"id": "author-delete-ban", "effect": "deny",
+                    "selector": {"kind": "action", "action_key": tool_name.removeprefix("tool.")}}]},
                 "max_risk_level": "medium",
             },
         }
     )
-    with pytest.raises(InstallError, match="permanently blocked by governance"):
+    with pytest.raises(InstallError, match="prohibited by author-delete-ban"):
         await install_blueprint(
             db_session,
             entity_id=entity_id,
             payload=payload,
-            governance_preset="standard",
+            governance_preset="follow_default",
+            install_author_hard_blocks=True,
         )
 
 
-async def test_governance_safe_preset_passes_benign_tool(
+async def test_governance_confirm_changes_preset_passes_benign_tool(
     db_session: AsyncSession,
     entity_id: str,
 ):
-    """Safe preset only adds wildcard HITL, doesn't expand never_allow —
-    a benign tool binding survives. Sanity check on the preview path."""
+    """Confirm changes requires consent without prohibiting a benign binding."""
     tool_name = f"tool.benign.read.{entity_id}"
     agent_slug = f"reader-{entity_id}"
     db_session.add(
@@ -1098,7 +1125,7 @@ async def test_governance_safe_preset_passes_benign_tool(
         db_session,
         entity_id=entity_id,
         payload=payload,
-        governance_preset="safe",
+        governance_preset="confirm_changes",
     )
     await db_session.commit()
     agent = (await db_session.execute(select(Agent).where(Agent.slug == agent_slug))).scalar_one_or_none()
@@ -1918,6 +1945,61 @@ async def test_knowledge_pack_creates_document_group(
     ]
 
 
+async def test_identical_duplicate_knowledge_groups_export_as_one_pack(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(**{
+        "embedded.knowledge_packs": [{
+            "slug": "workspace-knowledge",
+            "title": "Workspace Knowledge",
+            "purpose": "General background",
+            "mode": "skeleton",
+            "folder_structure": [],
+            "starter_documents": [],
+            "external_source": None,
+        }],
+    })
+    source = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    original = (await db_session.execute(select(DocumentGroup).where(
+        DocumentGroup.workspace_id == source.workspace_id,
+    ))).scalar_one()
+    db_session.add(DocumentGroup(
+        id=generate_ulid(), entity_id=entity_id, workspace_id=source.workspace_id,
+        name=original.name, settings=dict(original.settings or {}),
+    ))
+    await db_session.flush()
+
+    exported = await export_workspace(db_session, source.workspace_id, title="Copy")
+    assert [pack["slug"] for pack in exported["embedded"]["knowledge_packs"]] == [
+        "workspace-knowledge",
+    ]
+    installed = await install_blueprint(db_session, entity_id=entity_id, payload=exported)
+    assert installed.workspace_id != source.workspace_id
+
+
+async def test_conflicting_duplicate_knowledge_groups_fail_export(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(**{
+        "embedded.knowledge_packs": [{
+            "slug": "workspace-knowledge", "title": "Workspace Knowledge",
+            "purpose": "Original", "mode": "skeleton", "folder_structure": [],
+            "starter_documents": [], "external_source": None,
+        }],
+    })
+    source = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    db_session.add(DocumentGroup(
+        id=generate_ulid(), entity_id=entity_id, workspace_id=source.workspace_id,
+        name="Workspace Knowledge", settings={"purpose": "Different"},
+    ))
+    await db_session.flush()
+
+    with pytest.raises(ExportError, match="conflicting Blueprint slug"):
+        await export_workspace(db_session, source.workspace_id, title="Copy")
+
+
 async def test_knowledge_pack_inline_text_materializes_documents(
     db_session: AsyncSession,
     entity_id: str,
@@ -2022,6 +2104,43 @@ async def test_knowledge_pack_inline_text_materializes_documents(
     assert next(row for row in reloaded if row.name == "voice.md").metadata_["blueprint_template"]["id"] == (
         "test-live-voice"
     )
+
+
+async def test_knowledge_pack_starters_use_basename_and_parent_folders_only(
+    db_session: AsyncSession,
+    entity_id: str,
+):
+    payload = _base_payload(**{
+        "embedded.knowledge_packs": [{
+            "slug": "nested-starters",
+            "title": "Nested starters",
+            "mode": "inline_text",
+            "folder_structure": [{"path": "empty/", "description": "metadata only"}],
+            "starter_documents": [
+                {"key": "brand-guide", "path": "brand/guide.md", "body_md": "# Brand"},
+                {"key": "ops-guide", "path": "ops/guide.md", "body_md": "# Ops"},
+            ],
+        }],
+    })
+
+    result = await install_blueprint(db_session, entity_id=entity_id, payload=payload)
+    documents = list((await db_session.scalars(
+        select(Document).where(Document.entity_id == entity_id).order_by(Document.id)
+    )).all())
+    assert [document.name for document in documents] == ["guide.md", "guide.md"]
+    assert {document.metadata_["blueprint_starter_path"] for document in documents} == {
+        "brand/guide.md", "ops/guide.md",
+    }
+    assert {document.metadata_["blueprint_document_key"] for document in documents} == {
+        "brand-guide", "ops-guide",
+    }
+    folders = list((await db_session.scalars(
+        select(DocumentFolder).where(DocumentFolder.entity_id == entity_id)
+    )).all())
+    folder_by_id = {folder.id: folder for folder in folders}
+    assert {folder_by_id[document.folder_id].name for document in documents} == {"brand", "ops"}
+    assert "empty" not in {folder.name for folder in folders}
+    assert result.workspace_id
 
 
 async def test_shared_knowledge_document_installs_once_with_two_memberships(

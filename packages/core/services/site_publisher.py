@@ -469,6 +469,18 @@ def _control_has_script_hook(control: _HtmlControl, script_source: str) -> bool:
     return False
 
 
+def site_path_candidates(resolved: str) -> tuple[str, ...]:
+    """Files a site-relative path can serve, in the order the site host tries them.
+
+    ``/`` and ``dir/`` serve ``index.html``; a clean URL ``/about`` serves
+    ``about.html`` when there is no ``about`` file or folder.
+    """
+    path = os.path.normpath(resolved or ".").replace(os.sep, "/")
+    if path == ".":
+        return ("index.html",)
+    return (path, f"{path}/index.html", f"{path}.html")
+
+
 def _add_reference_error(
     *,
     source_rel: str,
@@ -501,7 +513,7 @@ def _add_reference_error(
     if resolved.startswith(".."):
         errors.append(f"{location}: reference escapes site root: {value!r}")
         return
-    candidates = (resolved, os.path.join(resolved, "index.html"))
+    candidates = site_path_candidates(resolved)
     if any(candidate in included for candidate in candidates):
         return
     if any(candidate in excluded for candidate in candidates):
@@ -646,6 +658,7 @@ async def publish(
     workspace_id: str | None = None,
     connections: dict | None = None,
     prepared: PreparedPublication | None = None,
+    project_id: str | None = None,
 ) -> PublishResult:
     """Snapshot-publish a folder or single HTML file. Creates or updates the
     Site row for (entity_id, source_path); each publish bumps the revision and
@@ -734,6 +747,8 @@ async def publish(
             site.connections = dict(connections)
         elif workspace_changed:
             site.connections = {}
+        if project_id is not None:
+            site.project_id = project_id
         try:
             await session.commit()
         except Exception:

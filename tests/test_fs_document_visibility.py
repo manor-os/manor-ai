@@ -155,9 +155,19 @@ async def test_unprojected_file_is_not_a_raw_fs_acl_bypass(client: AsyncClient, 
     nested_loose_file = loose_file.parent / "Readable Folder" / "nested-secret.md"
     nested_loose_file.parent.mkdir(parents=True, exist_ok=True)
     nested_loose_file.write_text("also not projected", encoding="utf-8")
-    member, _ = await _invite_and_accept_member(
+    member, member_data = await _invite_and_accept_member(
         client, owner, "fsvis.unprojected@test.com"
     )
+    grant = await client.post(
+        f"/api/v1/folders/{folder.json()['id']}/grants",
+        headers=owner,
+        json={
+            "subject_type": "user",
+            "subject_id": member_data["user_id"],
+            "capabilities": ["view"],
+        },
+    )
+    assert grant.status_code == 201, grant.text
 
     # Entity admins can diagnose loose bytes, but ordinary members cannot use
     # an absent Document row as an authorization bypass.

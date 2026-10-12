@@ -67,8 +67,9 @@ Workspace 暂停后仍可直接聊天，受暂停限制的操作不会恢复；�
 
 统一语音链路先在本地检测人声，减少背景噪声造成的误识别和误打断。疑似发声只暂时暂停播放，识别出新的话语后才正式打断；空识别会恢复原来的声音。
 已完成的回复会保留在通话面板中，不因打断而清空。首句单独合成，后续语音在播放期间准备。
-面板分别显示语音识别、Chat 思考和语音生成阶段，并在声音生成前显示 Chat 回复。通话面板显示麦克风音量。
-没有声音时，先检查音量条、浏览器输出设备和音量，再检查服务器到语音网关的网络连接。
+面板分别显示语音识别、Chat 思考和语音生成阶段，并在声音生成前显示 Chat 回复。通话面板显示麦克风音量，
+并提供不调用服务商的“测试扬声器”提示音。没有声音时，先检查音量条、扬声器测试、浏览器输出设备和音量，
+再检查服务器到语音网关的网络连接。
 
 挂断、离开页面、切换聊天、失去权限或达到 30 分钟上限都会结束通话。
 断线后需手动重新呼叫，已完成的操作不会自动重放。
@@ -84,11 +85,38 @@ Workspace 暂停后仍可直接聊天，受暂停限制的操作不会恢复；�
 | `DATABASE_MAX_OVERFLOW` | `2` | 突发负载下允许超出池大小的额外连接数。 |
 | `DATABASE_POOL_TIMEOUT` | `10` | 等待空闲连接的秒数,超时报错。 |
 | `DATABASE_POOL_RECYCLE` | `1800` | 池中连接的回收周期(秒)。 |
+| `DATABASE_ADMISSION_LIMIT` | `0` | 每个进程/事件循环允许的并发 Session 事务数。`0` 对本地连接池和直连 PostgreSQL 的 worker 保留池大小 + overflow − 1，最小为 1；PgBouncer 下取 app `4` / worker `1`，其他应用 `NullPool` 取 `4`。 |
+| `DATABASE_MAX_WAITERS` | `14` | 并发事务已满时最多排队的事务数。 |
+| `DATABASE_ADMISSION_TIMEOUT` | `2` | 排队等待上限(秒)。过载返回 HTTP 503，包含 `detail.code=database_busy` 和 `Retry-After`。 |
+| `DATABASE_HOLD_WARN_SECONDS` | `5` | 连接占用超过此秒数后，记录带 request ID 的警告。 |
+| `DATABASE_STATEMENT_TIMEOUT_MS` | `0` | 可选的 PostgreSQL 事务内语句时限(毫秒)。`0` 保持数据库默认值。 |
+| `DATABASE_LOCK_TIMEOUT_MS` | `0` | 可选的事务内等待数据库锁时限(毫秒)。 |
+| `DATABASE_IDLE_TRANSACTION_TIMEOUT_MS` | `0` | 可选的事务内空闲时限(毫秒)。 |
 
-连接池默认值按单机部署设定。若调高 `API_WORKERS`,注意每个 worker 进程有
-独立连接池:总连接数 ≈ `API_WORKERS × (DATABASE_POOL_SIZE +
-DATABASE_MAX_OVERFLOW)` 再加 Celery worker。总和须低于 PostgreSQL 的
-`max_connections`。
+须计算所有 API/chat 副本与进程：连接池上限为
+`sum(副本数 × 进程数 × (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW))`。
+另外计入各 Celery 进程的事务预算、迁移/运维连接和安全余量，总和应低于 PostgreSQL 的
+`max_connections`。Celery 使用一次性 `NullPool` 引擎；准入名额只在同一事件
+循环内共享，不跨 worker 进程，可保守按并发进程数 × 准入上限计算。
+直连 PostgreSQL 的 worker 虽然使用 `NullPool`，仍保留原有自动额度（默认池参数下为 6），
+避免将已有嵌套 Session 缩减为单名额。这是兼容性默认值，不代表本地连接池。
+显式额度为 1 时，调用方持有事务期间仍无法让第二个 Session 同时查询。
+`NullPool` 的正数显式额度不受未使用的 `DATABASE_POOL_SIZE/MAX_OVERFLOW` 限制。
+PgBouncer 客户端预算应计入副本 × 进程 × 事务额度、独立探针、滚动更新、退出中的 Pod 和 Job；
+服务端连接池另行约束 PostgreSQL 总连接数，也须设置后端排队时限。两层容量不能混为一谈。
+
+名额按数据库事务持有，不按整个请求、WebSocket、LLM 调用或文件流持有。
+使用实际本地连接池时，自动限制在池容量至少为 2 时，为有时限的就绪探针保留一个名额。显式限制不能
+超过池大小 + overflow。过载不会自动重放写入；重试应遵守 `Retry-After`，
+并使用对应操作的幂等约定。
+
+启用可选时限前，须审计任务/审批中长时间持锁的流程。设置仅在当前事务内生效，
+兼容 PgBouncer，不会终止已经释放数据库连接的慢 LLM 或 sandbox 工作。
+自托管模式的 `/health/deep` 提供连接占用/长占用次数、活跃事务、排队/拒绝次数
+和最长等待时间。`queue_full` 表示队列已满、尚未进入排队就被拒绝的次数；
+`wait_timeouts` 表示已排队但超过准入时限的次数。`peak_active_transactions`
+和 `peak_waiters` 是当前进程/事件循环的峰值，不代表整个部署的容量，重启会清零。
+长占用日志只记录 request ID，不记录 SQL 参数或凭据。
 
 ## Redis {#redis}
 
@@ -113,6 +141,13 @@ DATABASE_MAX_OVERFLOW)` 再加 Celery worker。总和须低于 PostgreSQL 的
 | `API_LIMIT_CONCURRENCY` | `120` | 单 worker 并发连接上限,超出即拒绝请求。 |
 | `API_BACKLOG` | `256` | 等待连接的 socket backlog。 |
 | `API_TIMEOUT_KEEP_ALIVE` | `5` | Keep-alive 超时(秒)。 |
+
+共享 WebSocket 推送管理器每进程最多同时发送 32 条帧，每次发送和失败连接的
+关闭操作分别有 2 秒时限。同一 socket 的发送串行化，组织索引仅定位目标组织的
+候选连接，不缓存权限；内容推送前仍校验当前成员关系、可见范围和 Token 版本。
+慢连接会被关闭，重连后须与已落库消息对齐。实时推送是尽力交付，不是持久化的
+送达回执。这些上限不等于可支持的用户数；调整进程、副本或连接预算前，须一起
+压测真实 socket、消息频率、数据库延迟和后台任务。
 
 ## 限流 {#rate-limits}
 
@@ -178,7 +213,7 @@ Manor AI 使用 MinIO 做对象存储、JuiceFS 做实体级文件系统。默�
 | --- | --- | --- |
 | `JWT_SECRET_KEY` | `change-this-to-a-random-string` | 任何共享部署**必须**替换。 |
 | `JWT_ALGORITHM` | `HS256` | Token 签名算法。 |
-| `JWT_EXPIRE_MINUTES` | `1440` | 会话有效期(默认 24 小时)。 |
+| `JWT_EXPIRE_MINUTES` | `1440` | 访问令牌有效期，最长 24 小时。Remember me 使用独立的 30 天浏览器会话。 |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | 未设置 | 启用"使用 Google 登录"。在 Google Cloud Console 创建 Web OAuth 客户端。 |
 | `VITE_GOOGLE_CLIENT_ID` / `VITE_GOOGLE_DRIVE_API_KEY` | 未设置 | 启用知识页的 Google Drive 选择器。需在 Google Cloud 项目中启用 Google Picker API 和 Google Drive API。 |
 
@@ -227,12 +262,61 @@ Manor AI 使用 MinIO 做对象存储、JuiceFS 做实体级文件系统。默�
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `FLOWS_AVAILABLE` | 未设置 | 工作流上线开关。本地/开发环境默认启用 Flows;`MANOR_ENV` 为 `prod`/`production` 时导航项显示 **Soon**,直到设为 `true`。 |
+| `FLOWS_AVAILABLE` | 未设置 | 自托管稳定 Flows 默认启用，包括 `prod`/`production`；设为 `false` 可显式禁用。Cloud production 保留上线闸口。 |
+| `FLOWS_RELEASED` | 未设置 | 自托管默认不显示 **Soon** 标签；显式配置可覆盖默认值。 |
 | `MANOR_PREVIEW_INTEGRATIONS` | 未设置 | 逗号分隔的提供商 key(如 `facebook,gmail`),在非生产部署上提前展示"即将上线"的集成,供测试用户使用。 |
 | `MANOR_PREVIEW_CHANNELS` | 未设置 | 同上,针对消息渠道。 |
 
 `DEPLOYMENT_MODE=oss` 时 `MANOR_ENV` 默认为 `local`,因此标准自托管安装
 无需额外配置即启用 Flows。
+
+## Manor PMS 与 Minutes {#manor-pms}
+
+在 **Integrations → Manor PMS / Manor Minutes** 中选择 **连接**，登录相应应用并
+确认授权。完成后返回 Integrations，显示账号和连接状态。无需先在 Apps 安装应用或
+复制个人访问令牌；可通过账号菜单测试、重新连接或断开。
+
+运维人员需要在各应用中注册 Manor OAuth 客户端，并在 Manor 配置对应的客户端凭据。
+应用的回调白名单必须包含本部署的精确地址：
+
+- PMS：`{APP_URL}/api/v1/integrations/oauth/manor_pms/callback`
+- Minutes：`{APP_URL}/api/v1/integrations/oauth/manor_mcp_minutes/callback`
+
+| 变量 | 用途 |
+| --- | --- |
+| `PMS_OAUTH_CLIENT_ID` / `PMS_OAUTH_CLIENT_SECRET` | PMS 为 Manor 注册的客户端凭据。 |
+| `PMS_OAUTH_BASE_URL` | 部署配置的 PMS API 源地址，用于换取令牌、核验身份和撤销授权。 |
+| `PMS_OAUTH_AUTHORIZE_URL` | 浏览器访问的 PMS 授权地址，以 `/oauth/authorize` 结尾；前端和 API 地址不同时需单独设置。 |
+| `MINUTES_OAUTH_CLIENT_ID` / `MINUTES_OAUTH_CLIENT_SECRET` | Minutes 为 Manor 注册的客户端凭据。 |
+| `MINUTES_OAUTH_BASE_URL` | 部署配置的 Minutes API 源地址。 |
+| `MINUTES_OAUTH_AUTHORIZE_URL` | 浏览器访问的 Minutes 授权地址，以 `/oauth/authorize` 结尾。 |
+
+在 API 和 worker 环境中配置这些设置。客户端秘密及账号令牌保存在凭据库，不应进入
+聊天、任务参数或 Blueprint。应用还需要保留自身 **使用 Manor 登录** 的客户端配置，
+以验证应用用户身份。
+
+授权码流程使用 PKCE；连接绑定发起授权的 Manor 用户、组织和应用核验后的身份。
+OAuth worker 负责刷新并轮换令牌。部署端点变化或授权失效后需要重新连接。
+断开时会立即停用本地工具访问；远端撤销失败时显示错误并允许重试，不能将此状态
+当作应用端已经完成撤销。
+重新连接也会撤销旧授权；这一步失败时，连接保持停用，“断开连接”会重试清理
+两份授权。更改应用 API 地址前应先在原配置下断开；旧凭据不会发送到新地址。
+
+PMS 管理访问要求 owner/admin 账号。44 个工具覆盖物业、租客、租约、维修、付款及
+短租业务。调用使用所选连接的令牌，写操作继续遵守 Manor 审批规则。
+已保存的手动 PMS 凭据保留以便迁移，新连接采用 OAuth；`PMS_API_URL` 继续配置
+部署使用的 PMS 工具网关。
+
+Minutes 工具通过所连接的账号读取会议、转写、摘要和行动项。连接不会绕过会议访问
+规则及会议问答计费。`MINUTES_MCP_URL` 用于配置其 HTTP MCP 端点。
+
+启用连接前，应部署配套的应用 OAuth 接口及数据库迁移。新 Manor 身份建立隔离的
+应用命名空间；历史物业和会议数据需要运维人员显式维护身份映射，不能靠名称或
+邮箱匹配授予访问权限。
+
+升级时，需要由负责启动初始化的 API 服务刷新集成目录和 OAuth 客户端配置。
+标准 OSS API 在启动时自动执行；拆分部署需要指定负责初始化的服务
+（`MANOR_STARTUP_SIDE_EFFECTS_OWNER=1`）。Chat 和 worker 服务不会自行刷新目录。
 
 ## 渠道集成 {#channel-integrations}
 
@@ -249,6 +333,7 @@ Manor AI 使用 MinIO 做对象存储、JuiceFS 做实体级文件系统。默�
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` | Slack OAuth 应用。 |
 | `NOTION_CLIENT_ID` / `NOTION_CLIENT_SECRET` | Notion OAuth 应用。 |
 | `QUICKBOOKS_CLIENT_ID` / `QUICKBOOKS_CLIENT_SECRET` | QuickBooks OAuth 应用。 |
+| `LARK_APP_ID` / `LARK_APP_SECRET` | 国际版 Lark OAuth 应用凭据。 |
 | `ROBINHOOD_CLIENT_ID` | Robinhood 官方 Trading MCP 的公开 OAuth 客户端，无需 Client Secret。 |
 | `MS_CLIENT_ID` / `MS_CLIENT_SECRET` | 一个 Azure AD 应用注册即可覆盖 Outlook、OneDrive、Microsoft 日历、Teams 和 Excel。重定向 URI 设为上述回调地址;所需 Microsoft Graph 委托权限列表见 `.env.example`。 |
 | `MS_TENANT` | `common`(工作/学校 + 个人账号)、`organizations`、`consumers`,或指定 Azure AD 租户 GUID。 |
@@ -257,8 +342,36 @@ Manor AI 使用 MinIO 做对象存储、JuiceFS 做实体级文件系统。默�
 | `DISCORD_BOT_TOKEN` | 机器人发消息时必需。 |
 | `TWILIO_ALLOW_UNSIGNED_LOCAL` | 仅用于本地 Twilio webhook 调试；staging/production 保持 `false`。Twilio Account SID、Auth Token 和电话号码在每个 Integration 中配置。 |
 | `OPENAI_REALTIME_MODEL` | Browser 与 Twilio Voice 共用的原生 OpenAI Realtime 模型，默认 `gpt-realtime`。 |
-| `VERCEL_REALTIME_MODEL` | Browser 与 Twilio Voice 共用的托管 Vercel Realtime 模型，当前仅支持 `openai/gpt-realtime-mini`。 |
-| `OPENAI_API_KEY` | 可选的托管原生 OpenAI route；“账户 → 模型”中的原生 OpenAI Primary AI 密钥会作为 BYOK 优先使用。 |
+
+在“账户 → 模型”为**语音合成**配置提供商凭据；使用 `suno/music` 时，为
+**音乐与配乐**配置原生 Suno BYOK 密钥。这些角色级凭据遵循 Entity 的模型配置。
+缺少密钥或密钥与模型不匹配时，生成会在供应商请求前被拒绝；自托管音频不会
+使用部署级托管凭据兜底。
+
+
+### 国际版 Lark OAuth {#international-lark-oauth}
+
+Lark 用户 OAuth 只支持国际版 Lark 服务。在 [Lark 开发者控制台](https://open.larksuite.com/app)
+创建 OAuth 应用，并登记以下精确回调 URI：
+
+`{APP_URL}/api/v1/integrations/oauth/lark/callback`
+
+为应用启用以下用户权限：
+
+```text
+offline_access contact:user.base:readonly im:chat:read im:message
+im:message.send_as_user im:message.group_msg:get_as_user
+im:message.p2p_msg:get_as_user docx:document bitable:app
+```
+
+在 API 和 worker 环境中设置 `LARK_APP_ID` 和 `LARK_APP_SECRET`；或者作为自托管
+管理员，在本地 OAuth client 配置中保存它们。应用会把本地保存的 secret 存入凭据库；
+本地管理员配置优先于环境变量启动初始化的值。
+
+之后，每位用户都在**集成**中为 Lark 选择**连接**，并自行授予其账号所需的访问权限。
+连接同时绑定该用户和已注册的 Lark 应用。授权被撤销或过期后，请使用相同账号和应用
+重新连接；更换应用凭据后必须重新取得用户授权。历史飞书应用或机器人账号仍是独立
+集成，其凭据不能用于国际版 Lark OAuth。
 
 ### Robinhood Trading MCP {#robinhood-trading-mcp}
 

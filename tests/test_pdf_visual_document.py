@@ -7,12 +7,12 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader
 
-pytest.importorskip("fpdf")
-
-from packages.core.ai.skills.pdf.scripts.compose_visual_document import (  # noqa: E402
+from packages.core.ai.skills.pdf.scripts.compose_visual_document import (
     generate_visual_document,
     validate_recipe,
 )
+
+pytestmark = pytest.mark.oss_regression
 
 
 def _make_image(path: Path, size: tuple[int, int], color: tuple[int, int, int]) -> None:

@@ -16,6 +16,10 @@ title: 升级与发布
 4. 重新构建镜像并重启栈——迁移会在 API 启动时应用。
 5. 观察 API 和 worker 日志直到健康。
 
+共享部署升级前，应从备份恢复到独立数据库，演练准确的已安装 revision 到候选
+revision。检查会话 transcript、工作区/任务数据、凭据引用及在途 run 状态。
+实验任务引擎维持默认关闭，升级不会切换既有 run 的引擎。
+
 ```bash
 git pull
 docker compose up --build -d
@@ -40,6 +44,10 @@ docker compose logs worker --tail=200
   上一个版本。不要用旧版本应用去跑新版本的 schema。
 
 务必保留紧邻升级前的那份备份，以便数据库和对象存储能够一起恢复。
+
+保留旧镜像/源码 revision 和匹配配置。恢复前停止执行，将 PostgreSQL、MinIO
+与 JuiceFS 元数据作为同一组恢复，并在隔离环境演练。未经验证的 Alembic
+downgrade 不能作为回滚保证。蓝图 JSON 是可移植配置，不是完整备份。
 
 ## 版本标签 {#version-tags}
 

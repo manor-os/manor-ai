@@ -68,33 +68,7 @@ async def workflow_wait_has_standing_approval(
     run: WorkflowRun,
     config: dict[str, Any],
 ) -> bool:
-    """Honor the same durable Always store used by runtime tool approvals."""
-    if not config.get("allow_always"):
-        return False
-    action_key, resource_id, capability_id = workflow_wait_approval_scope(config)
-    if not action_key and not capability_id:
-        return False
-    if run.workspace_id:
-        from packages.core.governance.service import workspace_policy_auto_approves
-
-        return await workspace_policy_auto_approves(
-            db,
-            workspace_id=run.workspace_id,
-            action_key=action_key,
-            resource_id=resource_id,
-            capability_id=capability_id,
-        )
-    from packages.core.ai.runtime.approval_preferences import (
-        runtime_approval_preference_mode,
-    )
-
-    return await runtime_approval_preference_mode(
-        db,
-        user_id=run.started_by,
-        action_key=action_key,
-        resource_id=resource_id,
-        capability_id=capability_id,
-    ) == "always_approve"
+    return False
 
 
 async def grant_workflow_wait_standing_approval(
@@ -105,69 +79,12 @@ async def grant_workflow_wait_standing_approval(
     config: dict[str, Any],
     authority_prechecked: bool = False,
 ) -> None:
-    if not config.get("allow_always"):
-        raise ValueError("Always approve is not enabled for this Workflow approval")
-    action_key, resource_id, capability_id = workflow_wait_approval_scope(config)
-    if not action_key and not capability_id:
-        raise ValueError("Always approve requires a stable action or capability scope")
-    if not authority_prechecked:
-        from packages.core.governance.approvals import ApprovalAuthorityError
-        from packages.core.services.runtime_authorization import (
-            authorize_hitl_action,
-        )
-
-        authority = await authorize_hitl_action(
-            db,
-            entity_id=run.entity_id,
-            workspace_id=run.workspace_id,
-            by_user_id=user_id,
-            action_key=action_key,
-            capability_id=capability_id,
-            standing=True,
-            requested_by=run.started_by,
-        )
-        if not authority.allowed:
-            raise ApprovalAuthorityError(authority)
-    if run.workspace_id:
-        from packages.core.governance.service import (
-            add_auto_approve_action,
-            add_auto_approve_capability,
-        )
-
-        if action_key:
-            await add_auto_approve_action(
-                db,
-                entity_id=run.entity_id,
-                workspace_id=run.workspace_id,
-                action_key=action_key,
-                resource_id=resource_id,
-                changed_by=user_id,
-            )
-        elif capability_id:
-            await add_auto_approve_capability(
-                db,
-                entity_id=run.entity_id,
-                workspace_id=run.workspace_id,
-                capability_id=capability_id,
-                changed_by=user_id,
-            )
-        return
-
-    from packages.core.ai.runtime.approval_preferences import (
-        set_runtime_approval_preference,
-    )
-
-    await set_runtime_approval_preference(
-        db,
-        user_id=user_id,
-        mode="always_approve",
-        action_key=action_key,
-        resource_id=resource_id,
-        capability_id=capability_id,
-    )
+    raise ValueError("Explicit Workflow reviews cannot create standing consent; use approval settings")
 
 
 def _review_variable(config: dict[str, Any]) -> str | None:
+    if config.get("review_read_only") is True:
+        return None
     match = _REVIEW_VARIABLE_PATTERN.match(str(config.get("review") or ""))
     return match.group(1) if match else None
 
@@ -180,6 +97,29 @@ def _review_matches_original(original: Any, submitted: Any) -> bool:
     if isinstance(original, list):
         return isinstance(submitted, list)
     return isinstance(submitted, type(original))
+
+
+def workflow_chat_wait_config(
+    run: WorkflowRun,
+    step: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the effective config only for a human-resumable wait."""
+    if not isinstance(step, dict):
+        return None
+    if step.get("type") == "wait":
+        config = step.get("config")
+        return config if isinstance(config, dict) else {}
+    if step.get("type") != "stage":
+        return None
+
+    from packages.core.ai.workflow_runner import workflow_stage_wait_context
+
+    stage_wait = workflow_stage_wait_context(run, step)
+    if stage_wait is None:
+        return None
+    operation = stage_wait[1]
+    config = operation.get("config")
+    return config if isinstance(config, dict) else {}
 
 
 def _replace_projected_review(message: Message, review: Any) -> None:
@@ -276,7 +216,9 @@ async def resolve_chat_workflow_wait(
         ),
         None,
     )
-    config = step.get("config") if isinstance(step, dict) and isinstance(step.get("config"), dict) else {}
+    config = workflow_chat_wait_config(run, step)
+    if config is None:
+        return "This Workflow step is not a human wait."
 
     from packages.core.services.runtime_authorization import authorize_hitl_action
 
@@ -353,11 +295,29 @@ async def resolve_chat_workflow_wait(
     )
 
     if normalized_choice in cancel_choices:
-        run.status = "cancelled"
-        run.completed_at = datetime.now(timezone.utc)
+        nested = context.get("nested") is True
+        if nested:
+            from packages.core.ai.workflow_runner import (
+                mark_workflow_terminal_effects_pending,
+            )
+            from packages.core.services.workflow_run_control import cancel_run
+
+            cancel_run(run, actor_id=user_id)
+            trigger_data = dict(run.trigger_data or {})
+            trigger_data["_workflow_chat_cancel_ancestors"] = {
+                "host_run_id": str(context.get("host_run_id") or ""),
+                "cancelled_by": user_id,
+            }
+            run.trigger_data = trigger_data
+            mark_workflow_terminal_effects_pending(run)
+        else:
+            run.status = "cancelled"
+            run.completed_at = datetime.now(timezone.utc)
         from packages.core.services.workflow_chat_projection import project_workflow_run_status
 
         await project_workflow_run_status(db, run=run)
+        if nested:
+            _enqueue_after_commit(db, run.id)
         return "The Workflow was cancelled from its originating Chat."
 
     if normalized_choice == "always_approve":
@@ -376,20 +336,44 @@ async def resolve_chat_workflow_wait(
         **({"standing": True} if normalized_choice == "always_approve" else {}),
     }
     run.variables = {**dict(run.variables or {}), response_variable: response_value}
-    previous = dict((run.step_results or {}).get(step_id) or {})
-    previous.update({
-        "status": "completed",
-        "resumed": True,
-        "workflow_response": response_value,
-        **(
-            {"review": deepcopy(submitted_review)}
-            if submitted_review is not None
-            else {}
-        ),
-        "resumed_at": datetime.now(timezone.utc).isoformat(),
-        **approval_metadata,
-    })
-    run.step_results = {**dict(run.step_results or {}), step_id: previous}
+    if isinstance(step, dict) and step.get("type") == "stage":
+        from packages.core.ai.workflow_runner import (
+            complete_workflow_stage_wait,
+            workflow_stage_wait_context,
+        )
+
+        stage_wait = workflow_stage_wait_context(run, step)
+        if stage_wait is None:
+            return "This Workflow step is not a human wait."
+        complete_workflow_stage_wait(
+            run,
+            step,
+            stage_wait,
+            metadata={
+                "workflow_response": response_value,
+                **(
+                    {"review": deepcopy(submitted_review)}
+                    if submitted_review is not None
+                    else {}
+                ),
+                **approval_metadata,
+            },
+        )
+    else:
+        previous = dict((run.step_results or {}).get(step_id) or {})
+        previous.update({
+            "status": "completed",
+            "resumed": True,
+            "workflow_response": response_value,
+            **(
+                {"review": deepcopy(submitted_review)}
+                if submitted_review is not None
+                else {}
+            ),
+            "resumed_at": datetime.now(timezone.utc).isoformat(),
+            **approval_metadata,
+        })
+        run.step_results = {**dict(run.step_results or {}), step_id: previous}
     run.status = "running"
     run.error = None
 

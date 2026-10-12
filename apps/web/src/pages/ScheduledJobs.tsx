@@ -1,5 +1,6 @@
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { agentListQueryOptions, useCatalogScope } from "../lib/catalogQueries";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, translateApiError } from "../lib/api";
 import { useToastStore } from "../stores/toast";
@@ -23,6 +24,12 @@ import { t } from "../lib/i18n";
 import { formatUserFacingText } from "../lib/taskDisplay";
 import { stringifyJobRunResult, summarizeJobRunResult } from "../lib/jobRunResult";
 import { usePreviewFeatureAccess } from "../lib/previewFeatureAccess";
+import InlineFileReferenceCard from "../components/InlineFileReferenceCard";
+import Button from "../components/ui/Button";
+import {
+  formatWorkflowValue, resolveWorkflowFinalResult, workflowFinalArtifactRefs,
+  workflowFinalHeadline, workflowArtifactLabel, type WorkflowHistoryNode,
+} from "../components/workflows/workflowRunDisplay";
 import {
   IconEdit, IconTrash, IconClock, IconChevronRight, IconPlay, IconFlow, IconWorkspace,
 } from "../components/icons";
@@ -191,10 +198,49 @@ function fmtSchedule(job: ScheduledJob): string {
 }
 
 /* ── Run detail panel (lazy-loaded, inline) ── */
+const ACTIVE_JOB_RUN_STATUSES = new Set(["pending", "queued", "running"]);
+
+function AutomationWorkflowResult({ runId }: { runId: string }) {
+  const query = useQuery({
+    queryKey: ["workflow-run-history-detail", runId],
+    queryFn: ({ signal }) => api.workflows.getRun(runId, true, signal),
+    retry: false,
+    refetchInterval: (query) => !query.state.error && ACTIVE_JOB_RUN_STATUSES.has(query.state.data?.status) ? 3_000 : false,
+  });
+  if (query.isLoading) return <LoadingSpinner size={14} />;
+  if (query.isError || !query.data) return <div role="alert">
+    <p>{t("page.scheduled_jobs.failed_to_load_run_detail")}</p>
+    <Button variant="ghost" size="sm" onClick={() => query.refetch()}>{t("component.workflow_run_history.try_again")}</Button>
+  </div>;
+  const run = query.data;
+  // Persisted display snapshots use `targets` for every outgoing graph edge.
+  const steps = run.definition_snapshot?.steps || (run.definition_snapshot?.nodes || [])
+    .map((node: WorkflowHistoryNode) => ({ ...node, next: node.targets }));
+  const result = resolveWorkflowFinalResult(steps, run);
+  const headline = workflowFinalHeadline(result?.output);
+  const artifacts = workflowFinalArtifactRefs(result?.output ?? run.step_results, 50);
+  const output = result ? formatWorkflowValue(result.output, t("component.workflow_run.error_truncated")) : "";
+  return <section aria-label={t("page.scheduled_jobs.execution_result")} style={{ marginTop: 12, color: "var(--text-default)", overflowWrap: "anywhere" }}>
+    <span className="manor-label">{t("component.workflow_run_history.run_detail")} · {t(`component.workflow_run.status.${run.status}`)}</span>
+    {headline?.title && <h3 style={{ fontSize: 14 }}>{headline.title}</h3>}
+    {headline?.summary && <p style={{ whiteSpace: "pre-wrap", fontSize: 13 }}>{headline.summary}</p>}
+    {run.error && <p role="alert">{formatWorkflowValue(run.error, t("component.workflow_run.error_truncated"))}</p>}
+    {artifacts.map((ref, index) => <InlineFileReferenceCard key={`${ref.document_id || ref.fs_path}:${index}`}
+      reference={ref.document_id ? `/viewer/${encodeURIComponent(ref.document_id)}` : ref.fs_path!}
+      label={workflowArtifactLabel(ref, t("component.workflow_run_history.artifact_number", { count: index + 1 }))} compact />)}
+    {output ? <details open={!headline && artifacts.length === 0} style={{ marginTop: 8 }}>
+      <summary>{t("page.scheduled_jobs.execution_result")}</summary>
+      <pre style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 12, maxHeight: 320, overflow: "auto" }}>{output}</pre>
+    </details> : artifacts.length === 0 && <p>{t(ACTIVE_JOB_RUN_STATUSES.has(run.status) ? "page.scheduled_jobs.loading_run" : "page.scheduled_jobs.no_detailed_result_recorded")}</p>}
+  </section>;
+}
+
 function RunDetail({ jobId, runId }: { jobId: string; runId: string }) {
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["job-run-detail", jobId, runId],
     queryFn: () => api.jobs.runDetail(jobId, runId),
+    retry: false,
+    refetchInterval: (query) => !query.state.error && ACTIVE_JOB_RUN_STATUSES.has(query.state.data?.run.status) ? 3_000 : false,
   });
 
   if (isLoading) {
@@ -205,7 +251,10 @@ function RunDetail({ jobId, runId }: { jobId: string; runId: string }) {
     );
   }
   if (error || !data) {
-    return <div style={{ fontSize: 11, color: "#d65f59", padding: "6px 0" }}>{t("page.scheduled_jobs.failed_to_load_run_detail")}</div>;
+    return <div role="alert" style={{ fontSize: 12, color: "var(--danger)", padding: "6px 0" }}>
+      <p>{t("page.scheduled_jobs.failed_to_load_run_detail")}</p>
+      <Button variant="ghost" size="sm" onClick={() => refetch()}>{t("component.workflow_run_history.try_again")}</Button>
+    </div>;
   }
 
   const { run, task, agent_execution: ae } = data;
@@ -239,13 +288,18 @@ function RunDetail({ jobId, runId }: { jobId: string; runId: string }) {
         {ae?.tools_used?.length > 0 && <span>{ae.tools_used.length} {t("page.scheduled_jobs.tool_calls")}</span>}
       </div>
 
+      {typeof run.result?.workflow_run_id === "string" && run.result.workflow_run_id && (
+        <AutomationWorkflowResult runId={run.result.workflow_run_id} />
+      )}
       {run.error && (
         <Section label={t("page.job_logs.error")}>
           <Pre text={run.error} />
         </Section>
       )}
       {resultText && (
-        <Section label={t("page.scheduled_jobs.execution_result")}>
+        <details open={!run.result?.workflow_run_id && !ae?.output_message && !task?.response} style={{ marginTop: 10 }}>
+          <summary>{t(run.result?.workflow_run_id || ae?.output_message || task?.response
+            ? "component.workflow_run_history.technical_details" : "page.scheduled_jobs.execution_result")}</summary>
           {resultSummary.length > 0 && (
             <div style={{
               display: "flex", flexDirection: "column", gap: 3,
@@ -262,7 +316,7 @@ function RunDetail({ jobId, runId }: { jobId: string; runId: string }) {
             </div>
           )}
           <Pre text={resultText} />
-        </Section>
+        </details>
       )}
       {!resultText && !task && !ae && (
         <p style={{ fontSize: 11, color: "#a8a29e", margin: "10px 0 0" }}>
@@ -369,6 +423,12 @@ interface ScheduledJobsProps {
 
 /* ── main ── */
 export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsEnabled, canWriteWorkspace = true }: ScheduledJobsProps) {
+  const [searchParams] = useSearchParams();
+  const requestedJobId = workspaceId ? null : searchParams.get("job");
+  const requestedRunId = requestedJobId ? searchParams.get("run") : null;
+  const autoOpenedRequest = useRef("");
+  useEffect(() => { autoOpenedRequest.current = ""; }, [requestedJobId, requestedRunId]);
+  const catalogScope = useCatalogScope();
   const qc = useQueryClient();
   const toast = useToastStore();
   const flowsAccess = usePreviewFeatureAccess("flows");
@@ -440,7 +500,21 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
     placeholderData: (previousData) => previousData,
   });
   const allJobs: ScheduledJob[] = (jobsData?.items as ScheduledJob[] | undefined) ?? [];
-  const jobs = showWorkflowAutomations ? allJobs : allJobs.filter((job) => job.execution_type !== "workflow");
+  const focusedJobQuery = useQuery({
+    queryKey: ["scheduled-jobs", "detail", requestedJobId],
+    queryFn: () => api.jobs.get(requestedJobId!),
+    enabled: Boolean(requestedJobId),
+    retry: false,
+  });
+  const fetchedJob = (focusedJobQuery.isError ? undefined : focusedJobQuery.data) as ScheduledJob | undefined;
+  const focusedJob = fetchedJob && (showWorkflowAutomations || fetchedJob.execution_type !== "workflow") ? fetchedJob : undefined;
+  const visibleJobs = showWorkflowAutomations ? allJobs : allJobs.filter((job) => job.execution_type !== "workflow");
+  const jobs = focusedJob
+    ? [focusedJob, ...visibleJobs.filter((job) => job.id !== focusedJob.id)]
+    : visibleJobs;
+  useEffect(() => {
+    if (focusedJob) setExpandedId(focusedJob.id);
+  }, [focusedJob?.id, requestedJobId, requestedRunId]);
   const totalPages = Math.max(1, Math.ceil((jobsData?.total ?? 0) / PAGE_SIZE));
 
   useEffect(() => {
@@ -457,7 +531,7 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
     queryFn: () => workspaceId ? api.workflows.listBindings({ workspace_id: workspaceId }) : Promise.resolve([]),
     enabled: !!workspaceId && showWorkflowAutomations,
   });
-  const { data: agents = [] } = useQuery({ queryKey: ["agents"], queryFn: () => api.agents.list() });
+  const { data: agents = [] } = useQuery(agentListQueryOptions(catalogScope));
   const { data: availableWorkspaces = [] } = useQuery({
     queryKey: ["workspaces"],
     queryFn: () => api.workspaces.list(),
@@ -497,7 +571,31 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
   const activeFilterCount = (statusFilter === "all" ? 0 : 1)
     + (agentFilter === "all" ? 0 : 1)
     + (!workspaceId && workspaceFilter !== "all" ? 1 : 0);
-  const { data: runs = [] } = useQuery({ queryKey: ["job-runs", expandedId], queryFn: () => expandedId ? api.jobs.runs(expandedId) : Promise.resolve([]), enabled: !!expandedId });
+  const { data: runs = [], isLoading: runsLoading, isError: runsError, refetch: refetchRuns } = useQuery({
+    queryKey: ["job-runs", expandedId],
+    queryFn: () => expandedId ? api.jobs.runs(expandedId) : Promise.resolve([]),
+    enabled: !!expandedId,
+    retry: false,
+    refetchInterval: (query) => !query.state.error && query.state.data?.some((run) => ACTIVE_JOB_RUN_STATUSES.has(run.status)) ? 3_000 : false,
+  });
+  const requestedRunQuery = useQuery({
+    queryKey: ["job-run-detail", focusedJob?.job_id, requestedRunId],
+    queryFn: () => api.jobs.runDetail(focusedJob!.job_id, requestedRunId!),
+    enabled: Boolean(focusedJob && requestedRunId),
+    retry: false,
+  });
+  const recentRuns = (runs as JobRun[]).slice(0, 10);
+  const historyRuns = expandedId === focusedJob?.id && requestedRunQuery.data
+    ? [requestedRunQuery.data.run as JobRun, ...recentRuns.filter((run) => run.id !== requestedRunId)]
+    : recentRuns;
+  useEffect(() => {
+    const request = `${requestedJobId}:${requestedRunId || "latest"}`;
+    if (!focusedJob || expandedId !== focusedJob.id || runsLoading || runsError || autoOpenedRequest.current === request) return;
+    const selectedRun = requestedRunId ? requestedRunQuery.data?.run : runs[0];
+    if (!selectedRun) return;
+    autoOpenedRequest.current = request;
+    setOpenRunId(selectedRun.id);
+  }, [requestedJobId, requestedRunId, focusedJob?.id, expandedId, runs, runsLoading, runsError, requestedRunQuery.data]);
   const invalidateJobs = () => qc.invalidateQueries({ queryKey: ["scheduled-jobs"] });
 
   const createMut = useMutation({
@@ -788,6 +886,15 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
         actions={<PageHeaderAddButton label={t("page.scheduled_jobs.add_automation")} onClick={openNewModal} disabled={!!workspaceId && !canWriteWorkspace} />}
       />
 
+      {requestedJobId && focusedJobQuery.isLoading && <LoadingSpinner size={24} />}
+      {requestedJobId && focusedJobQuery.isError && <div role="alert">
+        <p>{translateApiError(focusedJobQuery.error, t("page.scheduled_jobs.failed_to_load_run_detail"))}</p>
+        <Button variant="ghost" size="sm" onClick={() => focusedJobQuery.refetch()}>{t("component.workflow_run_history.try_again")}</Button>
+      </div>}
+      {requestedJobId && fetchedJob?.execution_type === "workflow" && !showWorkflowAutomations && (
+        <p role="status">{t("component.chat_mode.flows_coming_soon")}</p>
+      )}
+
       <FilterBar
         activeCount={activeFilterCount}
         trailing={isFetching ? <LoadingSpinner size={14} /> : undefined}
@@ -895,10 +1002,10 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
                 <button
                   type="button"
                   onClick={() => runBindingMut.mutate(binding.id)}
-                  disabled={!canWriteWorkspace || !enabled || (runBindingMut.isPending && runBindingMut.variables === binding.id)}
+                  disabled={!canWriteWorkspace || (runBindingMut.isPending && runBindingMut.variables === binding.id)}
                   className="btn-manor-ghost workspace-workflow-automation-action"
                   aria-label={`Run ${binding.name || workflow?.name || "workflow automation"}`}
-                  title={enabled ? t("page.scheduled_jobs.run_now") : t("page.scheduled_jobs.enable_first")}
+                  title={t("page.scheduled_jobs.run_now")}
                 ><IconPlay size={13} /></button>
                 <button
                   type="button"
@@ -947,7 +1054,13 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
             padding: 0, overflow: "visible", borderRadius: 8, transform: "none",
           }}>
             {/* Main row */}
-            <div onClick={() => setExpandedId(exp ? null : job.id)}
+            <div onClick={() => { setExpandedId(exp ? null : job.id); setOpenRunId(null); }}
+              role="button" tabIndex={0} aria-expanded={exp} aria-label={job.name}
+              onKeyDown={(event) => {
+                if (event.target === event.currentTarget && (event.key === "Enter" || event.key === " ")) {
+                  event.preventDefault(); setExpandedId(exp ? null : job.id); setOpenRunId(null);
+                }
+              }}
               className="scheduled-job-row scheduled-automation-grid"
               style={{ cursor: "pointer", transition: "background 0.15s", borderRadius: exp ? "8px 8px 0 0" : 8 }}>
 
@@ -1063,10 +1176,10 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
                 />
                 <button
                   onClick={() => runNowMut.mutate(job.id)}
-                  disabled={!canManageJob || !effectiveEnabled || (runNowMut.isPending && runNowMut.variables === job.id)}
+                  disabled={!canManageJob || (runNowMut.isPending && runNowMut.variables === job.id)}
                   className="btn-manor-ghost"
                   style={{ width: 28, height: 28, padding: 0, borderRadius: 8, color: "#4f7d75" }}
-                  title={effectiveEnabled ? t("page.scheduled_jobs.run_now") : t("page.scheduled_jobs.enable_first")}
+                  title={t("page.scheduled_jobs.run_now")}
                 ><IconPlay size={13} /></button>
                 <button onClick={() => openModal(job)} disabled={!canManageJob} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8 }} title={t("action.edit")}><IconEdit size={13} /></button>
                 <button onClick={() => setDeleteTarget(job.job_id)} disabled={!canManageJob} className="btn-manor-ghost" style={{ width: 28, height: 28, padding: 0, borderRadius: 8, color: "#a8a29e" }} title={t("action.delete")}><IconTrash size={13} /></button>
@@ -1077,28 +1190,38 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
 
             {/* Runs */}
             {exp && (
-              <div style={{ padding: "0 18px 16px 70px", borderTop: "1px solid rgba(28,25,23,0.06)" }}>
+              <div style={{ padding: "0 18px 16px", borderTop: "1px solid rgba(28,25,23,0.06)" }}>
                 <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", margin: "12px 0 8px" }}>
                   <span className="manor-label" style={{ margin: 0 }}>{t("page.scheduled_jobs.recent_runs")}</span>
                   {job.created_at && <span style={{ fontSize: 10, color: "#d6d3d1" }}>{t("page.dashboard.created")} {relativeTime(job.created_at)}</span>}
                 </div>
-                {(runs as JobRun[]).length === 0 ? (
+                {runsLoading ? <LoadingSpinner size={14} /> : runsError ? <div role="alert">
+                  <p>{t("page.scheduled_jobs.failed_to_load_run_detail")}</p>
+                  <Button variant="ghost" size="sm" onClick={() => refetchRuns()}>{t("component.workflow_run_history.try_again")}</Button>
+                </div> : historyRuns.length === 0 && !requestedRunId ? (
                   <p style={{ fontSize: 12, color: "#a8a29e", margin: 0 }}>{t("page.flows.no_runs")}</p>
                 ) : (
                   <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
-                    {(runs as JobRun[]).slice(0, 10).map((r) => {
+                    {requestedRunId && job.id === focusedJob?.id && requestedRunQuery.isLoading && <LoadingSpinner size={14} />}
+                    {requestedRunId && job.id === focusedJob?.id && requestedRunQuery.isError && (
+                      <div role="alert">
+                        <p>{t("page.scheduled_jobs.failed_to_load_run_detail")}</p>
+                        <Button variant="ghost" size="sm" onClick={() => requestedRunQuery.refetch()}>{t("component.workflow_run_history.try_again")}</Button>
+                      </div>
+                    )}
+                    {historyRuns.map((r) => {
                       const isOpen = openRunId === r.id;
-                      const dot = r.status === "success" ? "#4f9c84"
+                      const dot = r.status === "success" || r.status === "completed" ? "#4f9c84"
                                 : r.status === "running" || r.status === "queued" ? "#cf9b44"
                                 : "#d65f59";
                       return (
                         <div key={r.id}>
-                          <div
+                          <button type="button" aria-expanded={isOpen}
                             onClick={() => setOpenRunId(isOpen ? null : r.id)}
                             style={{
                               display: "flex", alignItems: "center", gap: 10, fontSize: 11,
                               padding: "6px 0", borderBottom: isOpen ? "none" : "1px solid rgba(245,245,244,0.5)",
-                              cursor: "pointer",
+                              cursor: "pointer", background: "transparent", border: 0, width: "100%", textAlign: "left", flexWrap: "wrap",
                             }}
                           >
                             <IconChevronRight
@@ -1110,7 +1233,7 @@ export default function ScheduledJobs({ workspaceId, workspaceStatus, workflowsE
                             <span style={{ color: "#a8a29e", minWidth: 44 }}>{r.duration_ms != null ? `${(r.duration_ms / 1000).toFixed(1)}s` : "--"}</span>
                             {r.error && !isOpen && <span style={{ color: "#d65f59", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.error}</span>}
                             <span style={{ color: "#d6d3d1", marginLeft: "auto", fontSize: 10 }}>{r.created_at ? relativeTime(r.created_at) : ""}</span>
-                          </div>
+                          </button>
                           {isOpen && <RunDetail jobId={job.job_id} runId={r.id} />}
                         </div>
                       );

@@ -1,6 +1,7 @@
 """E2E tests: threaded comments — create, reply, edit, delete, reactions."""
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from httpx import AsyncClient
@@ -38,6 +39,39 @@ def test_document_comment_filter_uses_the_normalized_resource_index() -> None:
     assert "lower(trim(comments.resource_type))" in sql.lower()
     assert "'document'" in sql
     assert "'documents'" in sql
+
+
+@pytest.mark.asyncio
+async def test_document_comment_manager_requires_explicit_global_manage_permission(
+    monkeypatch,
+) -> None:
+    from apps.api.routers import comments as comments_router
+    from packages.core.permissions import Permission
+
+    checked: list[object] = []
+
+    async def deny_global_manage(_db, _user, permission):
+        checked.append(permission)
+        return False
+
+    monkeypatch.setattr(
+        comments_router,
+        "effective_user_has_permission",
+        deny_global_manage,
+    )
+    admin = SimpleNamespace(id="admin-1", role="admin")
+
+    assert not await comments_router._user_is_document_manager(
+        SimpleNamespace(),
+        admin,
+        SimpleNamespace(owner_id="owner-1", created_by="owner-1"),
+    )
+    assert checked == [Permission.DOCS_MANAGE_ALL]
+    assert await comments_router._user_is_document_manager(
+        SimpleNamespace(),
+        admin,
+        SimpleNamespace(owner_id="admin-1", created_by="owner-1"),
+    )
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,8 @@ def _job_id(stat: WorkspaceStat) -> str:
 def should_schedule(stat: WorkspaceStat) -> bool:
     return bool(
         stat.status == "active"
-        and stat.collector_type != "manual"
+        # Agent review has one Workflow-owned clock for the whole batch.
+        and stat.collector_type not in {"manual", "agent_review"}
         and stat.collection_cadence
     )
 

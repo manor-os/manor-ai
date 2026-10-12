@@ -96,17 +96,95 @@ async def _persist_system_sample(snap: dict) -> None:
         logger.warning("ops system sample DB write failed: %s", exc)
 
 
+_SNAPSHOT_LOCK_KEY = "ops:snapshot:lock"
+# Near the worst collection seen (130 s on a 66-container host) rather than
+# far above it: a hard-killed worker must not blank the dashboard for long,
+# and a successor tick re-running is harmless.
+_SNAPSHOT_LOCK_TTL_S = 240
+# Compare-and-delete so a run that outlived the TTL cannot release a lock the
+# next run now holds.
+_RELEASE_IF_OWNER = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) end return 0"
+
+
+async def _try_acquire_snapshot_lock(token: str) -> bool:
+    """Single-flight: one snapshot at a time across every worker.
+
+    A snapshot that outlives its 30 s beat interval must not stack up behind
+    itself; the next tick simply finds the lock held and skips. Redis down
+    means "run" — a duplicate is cheaper than a dashboard that never updates.
+    """
+    r = _fresh_redis()
+    if r is None:
+        return True
+    try:
+        return bool(await r.set(_SNAPSHOT_LOCK_KEY, token, nx=True, ex=_SNAPSHOT_LOCK_TTL_S))
+    except Exception as exc:
+        logger.debug("ops snapshot lock unavailable: %s", exc)
+        return True
+    finally:
+        try:
+            await r.aclose()
+        except Exception:
+            pass
+
+
+async def _release_snapshot_lock(token: str) -> None:
+    r = _fresh_redis()
+    if r is None:
+        return
+    try:
+        await r.eval(_RELEASE_IF_OWNER, 1, _SNAPSHOT_LOCK_KEY, token)
+    except Exception as exc:
+        logger.debug("ops snapshot lock release failed: %s", exc)
+    finally:
+        try:
+            await r.aclose()
+        except Exception:
+            pass
+
+
+def _run_coroutine(factory):
+    """Run ``factory()`` to completion whether or not a loop is already running.
+
+    Takes a factory, not a coroutine: a coroutine that raised cannot be
+    re-awaited, so a fallback that retried it would only mask the error.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())
+    # A loop is already running in this thread (never the case under Celery
+    # prefork, but a caller in an async context must not deadlock or get
+    # "another loop is running"): run the coroutine on a worker thread.
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(lambda: asyncio.run(factory())).result()
+
+
 @celery_app.task(name="ops.collect_snapshot")
 def collect_snapshot_task() -> dict:
     """Collect a snapshot and store it in Redis. Returns a small summary
     so Flower / task-result inspectors can see what happened."""
+    import uuid
+
     started = time.monotonic()
+    token = uuid.uuid4().hex
+    if not _run_coroutine(lambda: _try_acquire_snapshot_lock(token)):
+        return {"ok": True, "skipped": "snapshot already running"}
     try:
-        from packages.core.services.ops_service import collect_snapshot
-        snap = collect_snapshot()
-    except Exception as exc:
-        logger.warning("ops.collect_snapshot failed: %s", exc, exc_info=True)
-        return {"ok": False, "error": str(exc)}
+        try:
+            from packages.core.services.ops_service import collect_snapshot
+            snap = collect_snapshot()
+        except Exception as exc:
+            logger.warning("ops.collect_snapshot failed: %s", exc, exc_info=True)
+            return {"ok": False, "error": str(exc)}
+        return _store_snapshot(snap, started)
+    finally:
+        _run_coroutine(lambda: _release_snapshot_lock(token))
+
+
+def _store_snapshot(snap: dict, started: float) -> dict:
 
     try:
         asyncio.run(_write_snapshot_to_redis(snap))
@@ -183,12 +261,11 @@ def alert_tick_task() -> dict:
         snap = None
 
     if not snap:
-        try:
-            from packages.core.services.ops_service import collect_snapshot
-            snap = collect_snapshot()
-        except Exception as exc:
-            logger.warning("ops.alert_tick: snapshot collect failed: %s", exc)
-            return {"ok": False, "error": str(exc)}
+        # Never collect here: the Docker walk scales with the host and this
+        # task lives on the control plane. A missing snapshot means the heavy
+        # worker is behind (or Redis is down); the rules wait for the next one.
+        logger.info("ops.alert_tick: no fresh snapshot; skipping this tick")
+        return {"ok": True, "skipped": "no snapshot"}
 
     try:
         from packages.core.services.ops_alerts import evaluate_and_dispatch_sync

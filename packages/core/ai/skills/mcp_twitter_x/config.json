@@ -19,5 +19,9 @@
     "mcp__twitter_x__retweet",
     "mcp__twitter_x__follow_user",
     "mcp__twitter_x__get_my_timeline"
-  ]
+  ],
+  "search": {
+    "terms": ["tweet", "x post", "thread", "retweet", "follow", "timeline", "hashtag", "social"],
+    "examples": ["post a tweet about our launch", "write thread on x", "search recent tweets about topic", "reply to tweet and like it"]
+  }
 }

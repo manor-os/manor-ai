@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 STAT_KEY_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,119}$")
 SUPPORTED_VALUE_TYPES = {"number", "percent", "currency", "duration"}
-SUPPORTED_COLLECTOR_TYPES = {"manual", "workspace_internal", "integration"}
+SUPPORTED_COLLECTOR_TYPES = {"manual", "workspace_internal", "integration", "agent_review"}
 SUPPORTED_WINDOWS = {
     "latest", "lifetime", "rolling_24h", "rolling_7d", "rolling_30d",
     "calendar_week", "calendar_month",
@@ -127,6 +127,8 @@ async def create_stat(
     collector_type = str(collector_type or "manual").strip().lower()
     window = str(window or "latest").strip().lower()
     _validate_definition(key=key, value_type=value_type, collector_type=collector_type, window=window)
+    from packages.core.stats.assessment import validate_review_definition
+    validate_review_definition(collector_type, collector_config or {}, collection_cadence)
     existing = (await db.execute(select(WorkspaceStat).where(
         WorkspaceStat.workspace_id == workspace_id,
         WorkspaceStat.key == key,
@@ -250,8 +252,14 @@ async def list_stats(db: AsyncSession, *, entity_id: str, workspace_id: str) -> 
 async def update_stat(db: AsyncSession, stat: WorkspaceStat, **fields: Any) -> WorkspaceStat:
     allowed = {
         "name", "description", "unit", "window", "collector_config",
-        "collection_cadence", "freshness_limit_seconds", "status", "goal_eligible",
+        "collection_cadence", "freshness_limit_seconds", "status", "goal_eligible", "collector_type",
     }
+    from packages.core.stats.assessment import validate_review_definition
+    collector_type = fields.get("collector_type", stat.collector_type)
+    _validate_definition(key=stat.key, value_type=stat.value_type, collector_type=collector_type,
+                         window=fields.get("window", stat.window))
+    validate_review_definition(collector_type, fields.get("collector_config", stat.collector_config),
+                               fields.get("collection_cadence", stat.collection_cadence))
     changed = False
     for key, value in fields.items():
         if key not in allowed:
@@ -293,14 +301,34 @@ async def record_observation(
     db: AsyncSession,
     stat: WorkspaceStat,
     *,
-    value: Decimal | float | int,
+    value: Decimal | float | int | None,
     source: str,
     observed_at: Optional[datetime] = None,
     window_start: Optional[datetime] = None,
     window_end: Optional[datetime] = None,
     evidence: Optional[dict[str, Any]] = None,
     idempotency_key: Optional[str] = None,
+    expected_revision: Optional[int] = None,
+    assessment_actor_id: Optional[str] = None,
 ) -> WorkspaceStatObservation:
+    from packages.core.goals.locking import lock_workspace_for_goal_mutation
+
+    workspace = await lock_workspace_for_goal_mutation(
+        db, workspace_id=stat.workspace_id, entity_id=stat.entity_id,
+    )
+    if workspace is None:
+        raise StatError("stat workspace is unavailable")
+    stat = (await db.execute(select(WorkspaceStat).where(
+        WorkspaceStat.id == stat.id, WorkspaceStat.entity_id == stat.entity_id,
+        WorkspaceStat.workspace_id == workspace.id,
+    ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if stat is None or stat.status != "active":
+        raise StatError("stat is unavailable or inactive")
+    if value is None and not (evidence or {}).get("gaps"):
+        raise StatError("an unknown assessment requires explicit evidence gaps")
+    if stat.collector_type == "agent_review" and source != "agent_assessment":
+        raise StatError(f"stat {stat.id} requires record_stat_assessment with evidence; read get_stat_status")
+    value_dec = _normalize_stat_number(value) if value is not None else None
     observed_at = observed_at or _utcnow()
     idempotency_key = idempotency_key or f"manual:{generate_ulid()}"
     existing = (await db.execute(select(WorkspaceStatObservation).where(
@@ -308,9 +336,19 @@ async def record_observation(
         WorkspaceStatObservation.idempotency_key == idempotency_key,
     ))).scalar_one_or_none()
     if existing:
+        if existing.value != value_dec or existing.evidence != evidence:
+            raise StatError("idempotency key already records a different assessment")
         return existing
-
-    value_dec = _normalize_stat_number(value)
+    if expected_revision is not None and expected_revision != stat.revision:
+        raise StatError(f"stat definition changed: expected revision {expected_revision}, current {stat.revision}")
+    if source == "agent_assessment":
+        from packages.core.stats.assessment import validate_assessment, validate_assessment_sources
+        validate_assessment({
+            "value": value, "expected_revision": expected_revision, "idempotency_key": idempotency_key,
+            "status": (evidence or {}).get("status"), "evidence": (evidence or {}).get("references"),
+            "gaps": (evidence or {}).get("gaps"), "reasoning": (evidence or {}).get("reasoning"),
+        }, stat)
+        await validate_assessment_sources(db, stat, assessment_actor_id, evidence)
     observation = WorkspaceStatObservation(
         stat_id=stat.id,
         entity_id=stat.entity_id,
@@ -325,11 +363,25 @@ async def record_observation(
         idempotency_key=idempotency_key,
     )
     db.add(observation)
-    stat.current_value = value_dec
-    stat.current_value_updated_at = observed_at
-    stat.last_collection_status = "success"
-    stat.last_collection_error = None
+    latest_time = (await db.execute(select(func.max(WorkspaceStatObservation.observed_at)).where(
+        WorkspaceStatObservation.stat_id == stat.id,
+    ))).scalar_one_or_none()
+    is_latest = latest_time is None or observed_at >= latest_time
+    if is_latest:
+        if value_dec is not None:
+            stat.current_value = value_dec
+            stat.current_value_updated_at = observed_at
+        stat.last_collection_status = "success" if value_dec is not None else "insufficient_evidence"
+        stat.last_collection_error = None
     await db.flush()
+    if value_dec is None or not is_latest:
+        if is_latest:
+            stat.last_assessment = {"observation_id": observation.id, "status": "insufficient_evidence",
+                                    "collector_revision": stat.revision, "observed_at": observed_at.isoformat(), "evidence": evidence}
+            await db.flush()
+        return observation
+    stat.last_assessment = {"observation_id": observation.id, "status": "measured",
+                            "collector_revision": stat.revision, "observed_at": observed_at.isoformat(), "evidence": evidence}
 
     from packages.core.goals.service import record_measurement as record_goal_measurement
     from packages.core.goals.numbers import project_stat_value_to_goal_number
@@ -363,6 +415,7 @@ async def record_observation(
             source=f"workspace_stat:{stat.key}",
             meta={"stat_id": stat.id, "observation_id": observation.id},
             measured_at=observed_at,
+            _stat_projection=True,
         )
     if projection_errors:
         stat.last_collection_status = "error"
@@ -389,6 +442,8 @@ async def collect_stat(
 ) -> WorkspaceStatObservation:
     if stat.status != "active":
         raise StatError(f"stat is {stat.status}")
+    if stat.collector_type == "agent_review":
+        raise StatError("run the bound assessment Workflow; this is not a numeric collector")
     if stat.collector_type == "manual":
         raise StatError("manual stat requires an explicit value")
 
@@ -586,6 +641,14 @@ async def _collect_integration(
         raise StatError(
             "integration collector requires a supported integration_key and metric_key"
         )
+
+    from packages.core.services.workspace_integration_scope import load_disabled_workspace_providers
+
+    disabled = await load_disabled_workspace_providers(
+        db, workspace_id=stat.workspace_id, entity_id=stat.entity_id,
+    )
+    if spec.provider_key in disabled:
+        raise StatError(f"integration {integration_key!r} is disabled in this workspace")
 
     from packages.core.goals import measurers as measurer_registry
     measurer = measurer_registry.get(spec.measurer_key)

@@ -124,6 +124,7 @@ async def runtime_assemble_prompt_for_turn(
     blocked_tool_names: Iterable[str] | None = None,
     skill_refs: Iterable[dict] | None = None,
     disable_tools: bool = False,
+    split_turn_context: bool = False,
 ) -> RuntimePromptAssemblyResult:
     """Assemble one runtime-owned prompt context for an AI turn.
 
@@ -157,7 +158,9 @@ async def runtime_assemble_prompt_for_turn(
         skill_refs=skill_refs,
         disable_tools=disable_tools,
     )
-    prompt = await build_default_prompt_builder().build(prepared.context) or ""
+    prompt = await build_default_prompt_builder().build(
+        prepared.context, split_turn_context=split_turn_context,
+    ) or ""
     return RuntimePromptAssemblyResult(
         prompt=prompt,
         context=prepared.context,
@@ -501,7 +504,12 @@ async def runtime_prepare_prompt_context_for_turn(
         mcp_scope_unrestricted=mcp_scope_unrestricted,
         skill_refs=skill_refs,
     )
-    ctx.tools = runtime_surface_result.tool_schemas
+    from packages.core.ai.runtime.workspace_delegation_actions import runtime_specialize_delegate_to_agent
+
+    ctx.tools = await runtime_specialize_delegate_to_agent(
+        db, list(runtime_surface_result.tool_schemas),
+        entity_id=request.entity_id, workspace_id=request.workspace_id, agent_id=agent_id,
+    )
     ctx.tool_names = [
         tool.get("function", {}).get("name") or tool.get("name", "?")
         for tool in ctx.tools

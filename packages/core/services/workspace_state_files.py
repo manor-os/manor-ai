@@ -15,6 +15,7 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.constants.execution import PLAN_TERMINAL_STATUSES
 from packages.core.constants.goals import GoalStatus
 from packages.core.memory.canonical import (
     ensure_workspace_memory_docs,
@@ -26,6 +27,7 @@ from packages.core.models.goal import Goal
 from packages.core.models.task import Task
 from packages.core.models.workspace import Agent, AgentSubscription, Workspace, WorkspaceWorkBatch
 from packages.core.services.document_metadata import metadata_artifact, metadata_origin
+from packages.core.services.task_state_machine import TERMINAL_STATUSES
 
 
 STATE_FILENAME = "STATE.md"
@@ -416,6 +418,16 @@ def _render_state_md(
     else:
         lines.append("_No active agent subscriptions._")
 
+    task_status_by_id = {
+        str(task.id): str(task.status or "")
+        for task in recent_tasks
+        if getattr(task, "id", None)
+    }
+    live_plans = [
+        plan for plan in recent_plans
+        if _plan_is_live(plan, task_status_by_id.get(str(plan.task_id or "")))
+    ]
+
     lines.extend(["", "## Current Work"])
     if active_batches:
         for batch in active_batches:
@@ -425,6 +437,14 @@ def _render_state_md(
             )
     else:
         lines.append("_No active work batch._")
+    if live_plans:
+        for plan in live_plans[:12]:
+            lines.append(_format_plan_line(plan, task_status_by_id, live=True))
+    else:
+        lines.append(
+            "_No live plans. Status `replanned`/`cancelled`/`failed`/`completed` "
+            "is terminal history, not in-flight work._"
+        )
 
     lines.extend(["", "## Recent Tasks"])
     if recent_tasks:
@@ -441,9 +461,13 @@ def _render_state_md(
     lines.extend(["", "## Recent Plans"])
     if recent_plans:
         for plan in recent_plans[:12]:
+            task_status = task_status_by_id.get(str(plan.task_id or ""))
             lines.append(
-                f"- `{plan.id}` status={plan.status}, task={plan.task_id or 'none'}, "
-                f"mode={plan.execution_mode}"
+                _format_plan_line(
+                    plan,
+                    task_status_by_id,
+                    live=_plan_is_live(plan, task_status),
+                )
             )
     else:
         lines.append("_No recent plans._")
@@ -456,6 +480,38 @@ def _render_state_md(
         "- Database rows remain the source of truth when this cache looks stale.",
     ])
     return "\n".join(lines).rstrip() + "\n"
+
+
+
+def _plan_status_value(plan: ExecutionPlan) -> str:
+    status = getattr(plan, "status", "")
+    return str(getattr(status, "value", status) or "")
+
+
+def _plan_is_live(plan: ExecutionPlan, task_status: str | None) -> bool:
+    """A plan is live only if both the plan and its task are non-terminal."""
+    plan_status = _plan_status_value(plan)
+    if plan_status in {status.value for status in PLAN_TERMINAL_STATUSES}:
+        return False
+    if task_status and task_status in TERMINAL_STATUSES:
+        return False
+    return True
+
+
+def _format_plan_line(
+    plan: ExecutionPlan,
+    task_status_by_id: dict[str, str],
+    *,
+    live: bool,
+) -> str:
+    task_id = str(getattr(plan, "task_id", None) or "none")
+    task_status = task_status_by_id.get(str(getattr(plan, "task_id", "") or ""), "unknown")
+    history = "" if live else " (terminal history)"
+    return (
+        f"- `{plan.id}` status={_plan_status_value(plan)}{history}, "
+        f"task=`{task_id}`, task_status={task_status}, "
+        f"mode={plan.execution_mode}"
+    )
 
 
 def _render_files_md(
@@ -485,7 +541,9 @@ def _render_files_md(
         return "\n".join(lines).rstrip() + "\n"
 
     lines.extend([
-        "| Name | Document ID | What | Display Path | Storage Location | Origin | Updated |",
+        # Storage Location first: agents copy the first path they see, and it
+        # is the one tools accept. People keep the Display Path column.
+        "| Name | Document ID | What | Storage Location | Display Path | Origin | Updated |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ])
     for item in files:
@@ -502,7 +560,7 @@ def _render_files_md(
         lines.append(
             f"| {_cell(item.name)} | {_cell(item.document_id or '-')} | "
             f"{_cell(item.description or item.kind or 'Workspace file')} | "
-            f"{_cell(item.display_location or item.location)} | {_cell(item.location)} | "
+            f"{_cell(item.location)} | {_cell(item.display_location or item.location)} | "
             f"{_cell('; '.join(origin_bits) or 'workspace')} | "
             f"{_cell(updated)} |"
         )

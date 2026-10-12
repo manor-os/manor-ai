@@ -141,6 +141,9 @@ def validate_sequence(events: list[dict[str, Any]]) -> list[str]:
         if tool == "name_session":
             saw_name_session = True
 
+        if tool in {"open", "open_new_tab", "open_or_reuse", "navigate", "claim_tab"} and "active" in args:
+            violations.append("foreground_activation_parameter_not_supported")
+
         if tool == "open":
             task_navigation_count += 1
             violations.append("used_legacy_open_instead_of_open_or_reuse")
@@ -156,9 +159,6 @@ def validate_sequence(events: list[dict[str, Any]]) -> list[str]:
                 violations.append("opened_synthesized_search_url")
             if clicked_result_since_last_open and ("zhuanlan.zhihu.com/p/" in url or "zhihu.com/question/" in url):
                 violations.append("opened_result_url_instead_of_using_click_target_tab")
-            if args.get("active") is not False:
-                violations.append("open_or_reuse_should_use_active_false")
-
         if tool == "activate_tab":
             violations.append("activated_tab_without_user_request")
 
@@ -208,7 +208,7 @@ def main() -> int:
 
     healthy = [
         {"tool": "name_session", "args": {"name": "🔎 Zhihu Research", "groupTitle": "Zhihu Research"}, "result": {"ok": True}},
-        {"tool": "open_or_reuse", "args": {"url": "https://www.zhihu.com/", "active": False, "groupTitle": "Zhihu Research"}, "result": {"tabId": 1118233892}},
+        {"tool": "open_or_reuse", "args": {"url": "https://www.zhihu.com/", "groupTitle": "Zhihu Research"}, "result": {"tabId": 1118233892}},
         {"tool": "read_page", "args": {"tabId": 1118233892}, "result": SEARCH_READ_PAGE},
         {"tool": "click_element", "args": {"tabId": 1118233892, "ref": "e65"}, "result": {"acted_tab_id": 1118233892, "target_tab_id": 1118233999, "opened_new_tab": True}},
         {"tool": "read_page", "args": {"tabId": 1118233999}, "expected_tabId": 1118233999, "result": ARTICLE_READ_PAGE},
@@ -243,7 +243,7 @@ def main() -> int:
         "clicked_search_refinement_instead_of_result",
         "clicked_non_result_on_search_page",
         "open_or_reuse_before_name_session",
-        "open_or_reuse_should_use_active_false",
+        "foreground_activation_parameter_not_supported",
         "used_legacy_open_instead_of_open_or_reuse",
         "opened_extra_url_after_entry_page",
         "opened_result_url_instead_of_using_click_target_tab",

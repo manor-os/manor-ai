@@ -11,7 +11,6 @@ from packages.core.ai.runtime.completions import (
     runtime_one_shot_messages,
 )
 from packages.core.ai.runtime.sources import RUNTIME_STRATEGIST_SOURCE
-from packages.core.ai.runtime.task_requirements import strategist_task_capability_descriptors
 
 
 RUNTIME_STRATEGIST_DEFAULT_PREAMBLE = """\
@@ -28,16 +27,46 @@ Hard constraints:
   * Keep total proposals to ≤5 unless an emergency truly requires more.
   * If recent reviews already proposed similar work that's still
     unfinished, DON'T re-propose — note it in `notes` instead.
+  * Plan status `replanned` is terminal history, not in-flight work.
+    Do not treat a `replanned`/`cancelled`/`failed`/`completed` plan as
+    unfinished live work. Missing Goal current_value is a measurement
+    gap, not missing materials. If scores predate newer Goal-driving work,
+    explain that measurement gap; do not automatically create a scoring task.
+    Only propose measurement work when evidence and the operator's direction
+    justify it. Missing evidence is unknown, not an invented zero.
+    That gap alone is not a human_request. Do not re-propose recently completed
+    work.
+    If Goals are still incomplete and there is no live work batch or
+    evidenced active execution, consider the next high-impact Goal-driving task.
+    A non-terminal Plan label alone is not active execution; distinguish queued
+    dependencies and blocked recovery from work that is actually running.
+    Agents may produce new Goal-driving artifacts or repair an existing
+    not-ready artifact in place. A not-ready existing artifact is not
+    leftover for the operator. Leftover for the operator is only login,
+    pay, sign, send, or inventing facts only the user can supply.
+    Forbidding another copy of the same artifact is not forbidding
+    in-place repair of the current one.
   * If the Work batch reconciliation section lists stalled work, prioritize
     repair, retry, unblock, or explicit operator close-out tasks before
     proposing unrelated new work. Do not duplicate the stalled task unless the
     new task is clearly a recovery attempt.
+    Exception: waiting_configuration is a recovery request on the original
+    Task. Do not create another Task requiring the same missing capability;
+    resolve its configuration review and continue that Task instead.
+  * Do not wait for the user to send a workspace chat message.
+    Chat is not the collection surface. If core facts only the user
+    has are missing, emit `human_requests`. Otherwise propose
+    Goal-driving tasks and keep unknowns explicit.
   * Prefer fewer high-impact tasks over many small ones.
   * Priority scale is 5=Critical, 4=High, 3=Medium, 2=Low,
     1=Minimal. Higher numbers are more urgent.
-  * Learn from prior reviews: if similar work was rejected with a
-    reason, do NOT re-propose it the same way. If similar work
-    completed successfully, lean into that pattern.
+  * Learn from prior reviews: a rejection reason_code is feedback even without
+    a comment. Do NOT repeat rejected work under a new title. WRONG_DIRECTION
+    requires a different approach; BAD_TIMING requires changed timing or state.
+    Reconsider only when new evidence or an explicit operator request addresses
+    the rejection, and explain what changed in `notes`. A measurement gap does
+    not override a rejection. If similar work completed successfully, lean into
+    that pattern.
   * Never propose meta/bookkeeping tasks — writing or updating
     learnings, memory, LEARNINGS.md/MEMORY.md/STATE.md, "document
     what we learned", consolidating notes, or process retrospectives.
@@ -79,6 +108,12 @@ Hard constraints:
     exactly N records, set both `minItems` and `maxItems` to N on the relevant
     array. The runtime hard-validates this contract before the terminal step
     can complete, so do not omit constraints stated in the task description.
+  * For files with a project-specific Knowledge destination, set each file
+    deliverable's `document_id_path` (JSON Pointer into the Task result),
+    `workspace_folder` (exact relative logical folder, no storage root), and
+    `require_readback=true`. Require that Document ID in `expected_output`.
+    The runtime verifies the actual Document, folder, file write and subsequent
+    readback; a path or saved=true claim alone cannot satisfy this contract.
 
 Time horizon — pick the right owner for the timeline:
   * Agent-driven services (AI handles the work) typically complete
@@ -121,6 +156,29 @@ nothing needs to change" is a legitimate, valuable conclusion. Never
 fabricate tasks to fill a quota; an empty proposal is strictly better than a
 padded one.
 
+Do not treat plan status `replanned` as in-flight work; it is terminal
+history. Missing Goal current_value is a measurement gap, not missing
+materials. A missing or stale score does not automatically require a task.
+Only propose measurement work when evidence and the operator's direction
+justify it. Missing evidence is unknown, not an invented zero.
+A measurement gap does not override a rejection: reason_code is feedback even
+without a comment. Do not repeat rejected work under a new title; reconsider
+only when new evidence, changed timing/state, or an explicit operator request
+addresses the rejection, and explain what changed in `notes`.
+That gap alone is not a human_request. Do not re-propose
+recently completed work. If Goals are still incomplete and there is no live work batch or
+evidenced active execution, consider the next high-impact Goal-driving task.
+A non-terminal Plan label alone is not active execution; queued work and blocked
+recovery still need a decision, not an assumption that a worker is running.
+Agents may produce new Goal-driving artifacts or repair an existing
+not-ready artifact in place. A not-ready existing artifact is not
+leftover for the operator. Leftover for the operator is only login,
+pay, sign, send, or inventing facts only the user can supply.
+Forbidding another copy of the same artifact is not forbidding
+in-place repair of the current one. An empty proposal is valid when
+remaining Goals are done, on track, or blocked on an open Need Input
+item. Do not wait for a user chat message.
+
 Do not propose high-risk changes for any domain listed under "Coverage gaps"
 in the briefing: data for those domains is unavailable or stale this cycle,
 so there is no evidence basis for risky changes to them."""
@@ -158,10 +216,12 @@ unique in this proposal), `request_kind` (decision | review | input |
 manual_work), `question` (the concrete question or request, self-contained),
 and optionally `role_required` (workspace role expected to answer),
 `expected_by_hours` (soft deadline in hours), and `context`. Human requests
-are created automatically without approval and appear in the workspace's
-Human queue; the addressee may decline. Never use a human_request for work an
-agent service could do — propose a task instead. Omit the field or return []
-when no human input is needed."""
+are created automatically without approval and appear as Need Input;
+the addressee may decline. Never ask for this in workspace chat.
+Never use a human_request for work an agent service could do — propose a
+task instead. Never use a human_request for missing Goal current_value.
+Omit the field or return [] when no
+human input is needed."""
 
 
 RUNTIME_STRATEGIST_EXPERIMENTS_GUIDANCE = """\
@@ -305,9 +365,13 @@ RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT = {
 
 # v2 (briefing_mode) variant — identical to the legacy hint plus the
 # non-task item kinds (human_requests / experiments / the three change
-# arrays). The legacy hint above must stay byte-identical.
+# arrays). Execution evidence is added to either hint when a snapshot is supplied.
 RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2 = {
     **RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT,
+    "tasks": [{
+        **RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT["tasks"][0],
+        "required_skills": ["<bound Skill slug for owner_service_key, or omit>"],
+    }],
     "human_requests": [
         {
             "request_key": "stable_snake_case_key_unique_in_this_review",
@@ -417,6 +481,7 @@ async def runtime_execute_strategist_completion(
     *,
     entity_id: str | None = None,
     workspace_id: str | None = None,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute a Strategist review completion with Runtime-owned defaults."""
 
@@ -427,6 +492,7 @@ async def runtime_execute_strategist_completion(
         ),
         entity_id=entity_id,
         workspace_id=workspace_id,
+        user_id=user_id,
         source=RUNTIME_STRATEGIST_SOURCE,
         max_tokens=4096,
     )
@@ -441,18 +507,23 @@ def runtime_strategist_system_prompt(
     """Build the stable Strategist system prompt for a review cycle.
 
     ``briefing_mode=True`` (strategist_review_v2 path only) appends the
-    empty-proposal legitimization + coverage-gap restriction paragraph;
-    the default keeps the legacy prompt byte-identical.
+    empty-proposal legitimization + coverage-gap restriction paragraph.
+    Both paths retain the same execution evidence contract.
     """
 
     services_block = runtime_strategist_services_block(ctx)
-    capabilities_block = runtime_strategist_task_capabilities_block()
-    schema_hint = json.dumps(
-        RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2
-        if briefing_mode
-        else RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT,
-        indent=2,
-    )
+    capabilities_block = runtime_strategist_task_capabilities_block(ctx)
+    hint = dict(RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT_V2 if briefing_mode else RUNTIME_STRATEGIST_PROPOSAL_JSON_HINT)
+    if getattr(ctx, "execution_snapshot", None):
+        hint["execution_review"] = {
+            "revision": "<copy the execution snapshot revision exactly>",
+            "references": [{
+                "task_id": "<exact task_id>", "plan_id": "<its plan_id or null>",
+                "observed_state": "<copy its observed_state exactly>",
+                "blocker_ref": "<its current_blocker.ref or null>",
+            }],
+        }
+    schema_hint = json.dumps(hint, indent=2)
 
     base = preamble or RUNTIME_STRATEGIST_DEFAULT_PREAMBLE
     try:
@@ -470,8 +541,15 @@ def runtime_strategist_system_prompt(
         f"{services_block}"
     )
     parts.append(
-        "Available task runtime capabilities (use only these ids in required_capabilities):\n"
+        "Available task runtime capabilities (resolved requirements, never tool grants):\n"
         f"{capabilities_block}"
+    )
+    parts.append(
+        "Assign each task only to owner/delegate services whose resolved capability_ids "
+        "cover its required_capabilities. A capability on another service is not inherited. "
+        "Unknown or unavailable scope is not proof of access; propose a configuration "
+        "request instead of retrying unchanged work. Resolved scope does not prove live "
+        "provider health and does not bypass operation approval."
     )
     parts.append(
         "Every task MUST list at least one deliverable in `deliverables`. "
@@ -479,7 +557,34 @@ def runtime_strategist_system_prompt(
         "ArtifactResult, TextResult, DocumentResult, ListResult, "
         "PublishResult, CountResult, DraftPack."
     )
+    if briefing_mode:
+        parts.append(
+            "If a task must run a bound Skill, list its exact owner-service slug in "
+            "`required_skills`; execution and completion will require a real invocation. "
+            "Do not name a Skill unavailable to that owner service. "
+            "Check its required inputs before proposing execution. Cite existing canonical "
+            "inputs, or propose the missing upstream deliverable and declare depends_on_task_keys. "
+            "If that prerequisite cannot fit this cohort, defer its consumer to the next review. "
+            "Missing internal artifacts call for upstream work, not a user questionnaire. "
+            "Retry a blocked Skill only after the named prerequisite or capability has changed."
+        )
     parts.append(RUNTIME_STRATEGIST_EXTERNAL_ACTION_GUIDANCE)
+    parts.append(
+        "Current execution evidence is a server observation at observed_at, not a tool grant. "
+        "It outranks historical plans, reports, proposal outcomes and memory for execution state. "
+        "When a snapshot is supplied, return execution_review with its exact revision, and "
+        "reference every existing Task whose execution or blocker informs your decision (max 8; "
+        "use [] if none). Copy task_id, plan_id and observed_state from the SAME observation. "
+        "A blocker_ref must belong to that Task, never another Task or Plan. "
+        "pending/not_started means queued, NOT running; a raw running Plan is not active-worker proof. "
+        "Completed Steps do not prove accepted delivery. Old failures describe past attempts, "
+        "not current provider health. configuration_changed requires recheck, not another claim "
+        "of missing access. unavailable means unknown. A business capability ID is not a setting "
+        "or credential, and access on another Agent is not inherited. "
+        "Keep summary/notes about your proposed strategy; do not rewrite execution status or "
+        "diagnose blockers in free prose. The server renders referenced execution facts separately. "
+        "These observations do not dispatch, retry, repair, approve or close Tasks."
+    )
     if briefing_mode:
         parts.append(RUNTIME_STRATEGIST_EMPTY_OK)
         parts.append(RUNTIME_STRATEGIST_BASIS_GUIDANCE)
@@ -643,11 +748,17 @@ def runtime_strategist_user_prompt(ctx: Any, *, review_id: str) -> str:
     if evaluation_section:
         sections.append("# Workspace evaluation scorecard\n" + evaluation_section)
     sections.append("# Recent tasks (last 30d)\n" + (_format_tasks(ctx) or "_(none)_"))
+    failure_evidence = _format_failed_task_evidence(ctx)
+    if failure_evidence:
+        sections.append("# Task failure evidence\n" + failure_evidence)
     sections.append("# Recent plans\n" + (_format_plans(ctx) or "_(none)_"))
     reconciliation_section = _format_work_batch_reconciliation(ctx)
     if reconciliation_section:
         sections.append("# Work batch reconciliation\n" + reconciliation_section)
     sections.append("# Recent workspace activity\n" + (_format_activity(ctx) or "_(none)_"))
+    declined_section = _format_declined_human_requests(ctx)
+    if declined_section:
+        sections.append("# Declined human requests\n" + declined_section)
     runtime_section = _format_runtime_learning(ctx)
     if runtime_section:
         sections.append("# Runtime evidence + agent learning candidates\n" + runtime_section)
@@ -663,6 +774,7 @@ def runtime_strategist_user_prompt(ctx: Any, *, review_id: str) -> str:
     if calibration_section:
         sections.append("# Your calibration so far\n" + calibration_section)
 
+    sections.extend(_execution_snapshot_sections(ctx))
     sections.append(
         "Now produce the JSON Proposal. review_id MUST equal "
         f"`{review_id}` exactly."
@@ -693,6 +805,10 @@ def runtime_strategist_user_prompt_v2(
 
     sections.extend(_missing_setup_sections(ctx))
 
+    declined_section = _format_declined_human_requests(ctx)
+    if declined_section:
+        sections.append("# Declined human requests\n" + declined_section)
+
     if getattr(ctx, "open_proposed_tasks", None):
         sections.append(
             "# Already-proposed tasks not yet approved\n" + _format_open_proposed(ctx)
@@ -718,12 +834,24 @@ def runtime_strategist_user_prompt_v2(
         "# Review briefing (deterministic domain reports)\n"
         + briefing_markdown.strip()
     )
+    failure_evidence = _format_failed_task_evidence(ctx)
+    if failure_evidence:
+        sections.append("# Task failure evidence\n" + failure_evidence)
 
+    sections.extend(_execution_snapshot_sections(ctx))
     sections.append(
         "Now produce the JSON Proposal. review_id MUST equal "
         f"`{review_id}` exactly."
     )
     return "\n\n".join(sections)
+
+
+def _execution_snapshot_sections(ctx: Any) -> list[str]:
+    snapshot = getattr(ctx, "execution_snapshot", None)
+    if not snapshot:
+        return []
+    return ["# Current execution evidence (authoritative as of observed_at)\n"
+            + json.dumps(snapshot, ensure_ascii=False, sort_keys=True, default=str)]
 
 
 def _missing_setup_sections(ctx: Any) -> list[str]:
@@ -812,21 +940,36 @@ def runtime_strategist_services_block(ctx: Any) -> str:
             agent,
         )
         agent_name = agent.name if agent else "?"
+        bound_skills = (getattr(ctx, "bound_skills_by_service", None) or {}).get(subscription.service_key, [])
+        skill_note = f", bound_skills={','.join(bound_skills)}" if bound_skills else ""
         lines.append(
-            f"  - {subscription.service_key} ({kind} · {horizon}, agent={agent_name})"
+            f"  - {subscription.service_key} ({kind} · {horizon}, agent={agent_name}{skill_note})"
         )
+        contracts = (getattr(ctx, "bound_skill_contracts_by_service", None) or {}).get(subscription.service_key, [])
+        for contract in contracts:
+            lines.append("    Skill contract: " + json.dumps(contract, ensure_ascii=False))
+        scope = (getattr(ctx, "service_capabilities", None) or {}).get(subscription.service_key)
+        if scope is None:
+            lines.append('    {"scope_status":"unknown","capability_ids":[]}')
+        else:
+            lines.append("    " + json.dumps(scope.prompt_dict(), ensure_ascii=False))
     return "\n".join(lines) or "  (no services available — propose 0 tasks)"
 
 
-def runtime_strategist_task_capabilities_block() -> str:
-    """Render the business capability catalog available to proposed tasks."""
+def runtime_strategist_task_capabilities_block(ctx: Any = None) -> str:
+    """Describe only capabilities present on this review's scheduled services."""
 
     lines: list[str] = []
-    for capability in strategist_task_capability_descriptors():
-        approval = "approval-gated" if capability.get("required_approval") else "read/safe"
+    capabilities = {}
+    for key, scope in (getattr(ctx, "service_capabilities", None) or {}).items():
+        if key in getattr(ctx, "allowed_service_keys", ()) and scope.available:
+            for capability in scope.capabilities:
+                capabilities.setdefault(capability.capability_id, capability)
+    for capability in sorted(capabilities.values(), key=lambda entry: entry.capability_id):
+        approval = "approval-gated" if capability.required_approval else "runtime-governed"
         lines.append(
-            f"  - {capability['id']} ({capability['risk_level']}, {approval}): "
-            f"{capability['description']}"
+            f"  - {capability.capability_id} ({capability.risk_level}, {approval}): "
+            f"{capability.description[:220]}"
         )
     return "\n".join(lines) or "  (no task runtime capabilities available)"
 
@@ -973,27 +1116,41 @@ def _format_governance_policy(ctx: Any) -> str:
     policy = getattr(ctx, "governance_policy", None) or {}
     if not policy:
         return ""
-    lines: list[str] = []
-    hitl = policy.get("hitl_required_actions") or []
-    blocked = policy.get("never_allow_actions") or []
-    auto = policy.get("auto_approve_actions") or []
-    if hitl:
-        lines.append("HITL required actions: " + ", ".join(str(value) for value in hitl))
-    if blocked:
-        lines.append("Never allow actions: " + ", ".join(str(value) for value in blocked))
-    if auto:
-        lines.append("Auto-approve actions: " + ", ".join(str(value) for value in auto))
-    else:
-        lines.append("Auto-approve actions: _(none configured)_")
+    from packages.core.governance.approval_projection import approval_summary
+
+    lines = approval_summary(policy)
     if policy.get("max_risk_level"):
         lines.append(f"Max risk level: {policy['max_risk_level']}")
     return "\n".join(lines)
 
 
+def _format_failed_task_evidence(ctx: Any) -> str:
+    """Keep concrete blockers visible even when the briefing compresses outcomes."""
+    failures = []
+    for task in getattr(ctx, "recent_tasks", []) or []:
+        if task.status != TaskStatus.FAILED:
+            continue
+        output = task.actual_output if isinstance(task.actual_output, dict) else {}
+        errors = [
+            {"type": str(step["error"].get("type") or "")[:100],
+             "message": str(step["error"].get("message") or "")[:1200]}
+            for step in (output.get("steps") or [])
+            if isinstance(step, dict) and isinstance(step.get("error"), dict)
+        ][:3]
+        failures.append({
+            "task_id": task.id, "title": str(task.title)[:200],
+            "supervisor_evidence": str(output.get("supervisor_evidence") or "")[:600],
+            "errors": errors,
+        })
+        if len(failures) >= 5:
+            break
+    return json.dumps(failures, ensure_ascii=False) if failures else ""
+
+
 def _format_tasks(ctx: Any) -> str:
     lines = []
     for task in ctx.recent_tasks:
-        bits = [f"- [{task.status}] {task.title}"]
+        bits = [f"- [{task.status}] {task.title} task_id={getattr(task, 'id', 'unknown')}"]
         if task.owner_service_key:
             bits.append(f"(owner={task.owner_service_key})")
         if task.completed_at:
@@ -1009,14 +1166,52 @@ def _format_tasks(ctx: Any) -> str:
 
 
 def _format_plans(ctx: Any) -> str:
-    lines = []
+    from packages.core.constants.execution import PLAN_TERMINAL_STATUSES
+
+    task_status_by_id = {
+        str(getattr(task, "id", "") or ""): str(getattr(task, "status", "") or "")
+        for task in getattr(ctx, "recent_tasks", []) or []
+        if getattr(task, "id", None)
+    }
+    terminal_plan = {status.value for status in PLAN_TERMINAL_STATUSES}
+    observations = {
+        row["task_id"]: row
+        for row in (getattr(ctx, "execution_snapshot", None) or {}).get("tasks", [])
+    }
+    live_lines: list[str] = []
+    inactive_lines: list[str] = []
+    history_lines: list[str] = []
     for plan in ctx.recent_plans:
         cost = (plan.cost_tracking or {}).get("usd")
         cost_part = f" cost=${cost:.3f}" if cost else ""
-        lines.append(
-            f"- {plan.id} status={plan.status} mode={plan.execution_mode}{cost_part}"
+        plan_status = str(getattr(plan, "status", "") or "")
+        task_id = str(getattr(plan, "task_id", None) or "none")
+        fact = observations.get(task_id, {})
+        task_status = fact.get("task_status") or task_status_by_id.get(task_id, "unknown")
+        observed = fact.get("observed_state", "unknown") if fact.get("plan_id") == plan.id else "unknown"
+        is_live = plan_status not in terminal_plan and observed in {"running", "planning"}
+        history = " (terminal history)" if plan_status in terminal_plan else ""
+        line = (
+            f"- {plan.id} status={plan_status}{history} "
+            f"task={task_id} task_status={task_status} "
+            f"observed_state={observed} mode={plan.execution_mode}{cost_part}"
         )
-    return "\n".join(lines)
+        (history_lines if history else live_lines if is_live else inactive_lines).append(line)
+    if not live_lines and not history_lines and not inactive_lines:
+        return ""
+    parts = []
+    if live_lines:
+        parts.append("Live plans:")
+        parts.extend(live_lines)
+    else:
+        parts.append("Live plans: none. `replanned` is terminal history, not in-flight work.")
+    if history_lines:
+        parts.append("Historical plans (not in-flight):")
+        parts.extend(history_lines)
+    if inactive_lines:
+        parts.append("Other recorded plans (not proof of active execution):")
+        parts.extend(inactive_lines)
+    return "\n".join(parts)
 
 
 def _format_work_batch_reconciliation(ctx: Any) -> str:
@@ -1075,6 +1270,18 @@ def _format_activity(ctx: Any) -> str:
     return "\n".join(lines)
 
 
+def _format_declined_human_requests(ctx: Any) -> str:
+    questions = getattr(ctx, "declined_human_requests", None) or []
+    if not questions:
+        return ""
+    return (
+        "These inputs were declined or skipped. Do not repeat the same request "
+        "solely because its answer is absent. Check actual readiness and continue "
+        "independent work; keep genuinely required missing inputs blocked.\n"
+        + "\n".join(f"- [declined] {question}" for question in questions)
+    )
+
+
 def _format_runtime_learning(ctx: Any) -> str:
     try:
         from packages.core.services.runtime_learning import format_runtime_learning_context
@@ -1112,7 +1319,9 @@ _OUTCOME_LABELS = {
     "completed": "✅ Approved + completed (lean into these patterns)",
     "rejected": "❌ Rejected by operator (don't re-propose the same way)",
     "abandoned": "⚠️ Abandoned / failed (similar work stalled — rethink approach)",
-    "in_progress": "⏳ Approved + still running (informational only)",
+    "pending": "Queued / not started (not running)",
+    "blocked": "Blocked / paused (not running)",
+    "in_progress": "Recorded in_progress (consult execution evidence for activity)",
 }
 
 
@@ -1155,7 +1364,7 @@ def _format_proposal_outcomes(ctx: Any) -> str:
     if not ctx.recent_proposal_outcomes:
         return ""
     blocks: list[str] = []
-    for bucket in ("completed", "rejected", "abandoned", "in_progress"):
+    for bucket in ("completed", "rejected", "abandoned", "pending", "blocked", "in_progress"):
         rows = ctx.recent_proposal_outcomes.get(bucket) or []
         if not rows:
             continue
@@ -1166,9 +1375,13 @@ def _format_proposal_outcomes(ctx: Any) -> str:
             output = task.actual_output or {}
             artifacts = _output_artifact_refs(output)
 
-            line = f"- [{owner}] {task.title}"
+            line = (f"- [{owner}] {task.title} task_id={getattr(task, 'id', 'unknown')} "
+                    f"status={getattr(task, 'status', 'unknown')}")
 
             reason = details.get("rejection_reason")
+            reason_code = details.get("rejection_reason_code")
+            if bucket == "rejected" and reason_code:
+                line += f"\n  Reason code: {str(reason_code)[:64]}"
             if bucket == "rejected" and reason:
                 line += f"\n  Reason: {reason}"
 

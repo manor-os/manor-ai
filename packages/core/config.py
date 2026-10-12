@@ -51,6 +51,14 @@ class Settings:
     DATABASE_MAX_OVERFLOW: int
     DATABASE_POOL_TIMEOUT: int
     DATABASE_POOL_RECYCLE: int
+    DATABASE_ADMISSION_ENABLED: bool
+    DATABASE_ADMISSION_LIMIT: int
+    DATABASE_MAX_WAITERS: int
+    DATABASE_ADMISSION_TIMEOUT: float
+    DATABASE_HOLD_WARN_SECONDS: float
+    DATABASE_STATEMENT_TIMEOUT_MS: int
+    DATABASE_LOCK_TIMEOUT_MS: int
+    DATABASE_IDLE_TRANSACTION_TIMEOUT_MS: int
 
     # Redis
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6389/0")
@@ -67,7 +75,7 @@ class Settings:
     # Auth
     JWT_SECRET_KEY: str = os.getenv("JWT_SECRET_KEY", INSECURE_DEFAULT_JWT_SECRET)
     JWT_ALGORITHM: str = os.getenv("JWT_ALGORITHM", "HS256")
-    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "60"))
+    JWT_EXPIRE_MINUTES: int = int(os.getenv("JWT_EXPIRE_MINUTES", "1440"))
 
     # LLM
     LLM_MODEL: str = os.getenv("LLM_MODEL", "anthropic/claude-sonnet-4")
@@ -111,6 +119,10 @@ class Settings:
         os.getenv("SANDBOX_RUNNER_EXECUTING_LIMIT", "2")
     )
     SANDBOX_QUEUE_MAX_PENDING: int = int(os.getenv("SANDBOX_QUEUE_MAX_PENDING", "100"))
+    # How many of one user's tickets may be in allocation at once. Enforced
+    # when the scheduler claims, not at admission: a user's further tickets
+    # stay queued (costing a row, not a worker slot) and other users' tickets
+    # are claimed ahead of them.
     SANDBOX_QUEUE_MAX_PENDING_PER_USER: int = int(
         os.getenv("SANDBOX_QUEUE_MAX_PENDING_PER_USER", "3")
     )
@@ -127,6 +139,8 @@ class Settings:
 
     # Deployment
     DEPLOYMENT_MODE: str = os.getenv("DEPLOYMENT_MODE", "oss")  # oss | cloud
+    # Optional HTTPS provider fallback for IP-derived registration defaults.
+    GEO_IP_API_KEY: str
     MANOR_SERVICE_ROLE: str = os.getenv("MANOR_SERVICE_ROLE", "api")
     MANOR_AUTOSCALING_METRICS_ENABLED: bool = _env_bool(
         "MANOR_AUTOSCALING_METRICS_ENABLED"
@@ -174,6 +188,7 @@ class Settings:
     DEV_CREDENTIAL_KEY: str = os.getenv("DEV_CREDENTIAL_KEY", "")
 
     def __init__(self) -> None:
+        self.GEO_IP_API_KEY = os.getenv("GEO_IP_API_KEY", "").strip()
         self.API_WORKERS = int(os.getenv("API_WORKERS", "1"))
         self.API_LIMIT_CONCURRENCY = int(os.getenv("API_LIMIT_CONCURRENCY", "120"))
         self.API_BACKLOG = int(os.getenv("API_BACKLOG", "256"))
@@ -189,6 +204,17 @@ class Settings:
         self.DATABASE_MAX_OVERFLOW = int(os.getenv("DATABASE_MAX_OVERFLOW", "2"))
         self.DATABASE_POOL_TIMEOUT = int(os.getenv("DATABASE_POOL_TIMEOUT", "10"))
         self.DATABASE_POOL_RECYCLE = int(os.getenv("DATABASE_POOL_RECYCLE", "1800"))
+        admission_enabled = os.getenv("DATABASE_ADMISSION_ENABLED", "true").strip().lower()
+        if admission_enabled not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+            raise ValueError("DATABASE_ADMISSION_ENABLED must be a boolean")
+        self.DATABASE_ADMISSION_ENABLED = admission_enabled in {"1", "true", "yes", "on"}
+        self.DATABASE_ADMISSION_LIMIT = int(os.getenv("DATABASE_ADMISSION_LIMIT", "0"))
+        self.DATABASE_MAX_WAITERS = int(os.getenv("DATABASE_MAX_WAITERS", "14"))
+        self.DATABASE_ADMISSION_TIMEOUT = float(os.getenv("DATABASE_ADMISSION_TIMEOUT", "2"))
+        self.DATABASE_HOLD_WARN_SECONDS = float(os.getenv("DATABASE_HOLD_WARN_SECONDS", "5"))
+        self.DATABASE_STATEMENT_TIMEOUT_MS = int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "0"))
+        self.DATABASE_LOCK_TIMEOUT_MS = int(os.getenv("DATABASE_LOCK_TIMEOUT_MS", "0"))
+        self.DATABASE_IDLE_TRANSACTION_TIMEOUT_MS = int(os.getenv("DATABASE_IDLE_TRANSACTION_TIMEOUT_MS", "0"))
         self.REDIS_RATE_LIMIT_ENABLED = _env_bool("REDIS_RATE_LIMIT_ENABLED")
         self.DEGRADED_MODE = _env_bool("DEGRADED_MODE")
         self.DEGRADED_DISABLE_CHAT_STREAM = _env_bool("DEGRADED_DISABLE_CHAT_STREAM", "true")

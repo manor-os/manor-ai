@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 import warnings
 
+from packages.core.services.generated_file_refs import entity_fs_open_url
+
 
 async def runtime_duckduckgo_news_results(
     *,
@@ -92,7 +94,7 @@ async def runtime_register_video_edit_artifact(
         "document_id": document_id,
         "name": abs_path.name,
         "fs_path": rel_path,
-        "url": f"/api/v1/fs/{entity_id}/{rel_path}",
+        "url": entity_fs_open_url(entity_id, rel_path),
         "mime_type": mime_type,
         "size_bytes": abs_path.stat().st_size,
     }

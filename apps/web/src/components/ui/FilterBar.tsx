@@ -1,11 +1,14 @@
 import {
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type ComponentType,
   type CSSProperties,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
 import { t } from "../../lib/i18n";
 import { IconCheck, IconChevronDown, IconFilter } from "../icons";
 
@@ -135,7 +138,14 @@ export function FilterSelect<T extends string>({
 }: FilterSelectProps<T>) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [menuPosition, setMenuPosition] = useState<{
+    left: number;
+    top: number;
+    width: number;
+    maxHeight: number;
+  } | null>(null);
   const ref = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const isActive = value !== "all";
   const selectedOption = options.find((option) => option.key === value);
@@ -150,15 +160,61 @@ export function FilterSelect<T extends string>({
     ? Math.max(width, Math.min(300, Math.max(dropdownMinWidth, 248)))
     : Math.max(width, dropdownMinWidth);
 
+  const updateMenuPosition = useCallback(() => {
+    const anchor = ref.current?.getBoundingClientRect();
+    if (!anchor) return;
+    const gutter = 12;
+    const gap = 6;
+    const width = Math.min(menuWidth, window.innerWidth - gutter * 2);
+    const left = Math.max(gutter, Math.min(anchor.left, window.innerWidth - gutter - width));
+    const below = Math.max(0, window.innerHeight - anchor.bottom - gap - gutter);
+    const above = Math.max(0, anchor.top - gap - gutter);
+    const contentHeight = menuRef.current?.scrollHeight ?? 0;
+    const openAbove = contentHeight > below && above > below;
+    const maxHeight = openAbove ? above : below;
+    const top = openAbove
+      ? anchor.top - gap - Math.min(contentHeight, maxHeight)
+      : anchor.bottom + gap;
+    setMenuPosition((current) =>
+      current?.left === left && current.top === top
+      && current.width === width && current.maxHeight === maxHeight
+        ? current
+        : { left, top, width, maxHeight },
+    );
+  }, [menuWidth]);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    updateMenuPosition();
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
+    return () => {
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
+    };
+  }, [open, updateMenuPosition]);
+
+  useLayoutEffect(() => {
+    if (open && menuPosition && menuRef.current) updateMenuPosition();
+  }, [open, menuPosition, filteredOptions.length, updateMenuPosition]);
+
   useEffect(() => {
     if (!open) return;
     const handleClick = (event: MouseEvent) => {
-      if (ref.current && !ref.current.contains(event.target as Node)) {
+      if (ref.current && !ref.current.contains(event.target as Node)
+        && !menuRef.current?.contains(event.target as Node)) {
         setOpen(false);
       }
     };
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
     document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
+    document.addEventListener("keydown", handleEscape);
+    return () => {
+      document.removeEventListener("mousedown", handleClick);
+      document.removeEventListener("keydown", handleEscape);
+    };
   }, [open]);
 
   useEffect(() => {
@@ -179,6 +235,7 @@ export function FilterSelect<T extends string>({
     >
       <button
         type="button"
+        aria-expanded={open}
         onClick={() => {
           setOpen((current) => !current);
           setQuery("");
@@ -290,17 +347,17 @@ export function FilterSelect<T extends string>({
         </span>
       </button>
 
-      {open && (
+      {open && menuPosition && createPortal(
         <div
+          ref={menuRef}
           style={{
-            position: "absolute",
-            top: "calc(100% + 6px)",
-            left: 0,
-            zIndex: 300,
-            width: menuWidth,
-            maxWidth: useChipMenu ? 300 : 320,
-            maxHeight: useChipMenu ? undefined : 264,
-            overflowY: useChipMenu ? "visible" : "auto",
+            position: "fixed",
+            top: menuPosition.top,
+            left: menuPosition.left,
+            zIndex: 3000,
+            width: menuPosition.width,
+            maxHeight: Math.min(menuPosition.maxHeight, 264),
+            overflowY: "auto",
             padding: useChipMenu ? 0 : 5,
             borderRadius: useChipMenu ? 16 : 12,
             border: useChipMenu ? "none" : "1px solid rgba(214,211,209,0.88)",
@@ -517,7 +574,8 @@ export function FilterSelect<T extends string>({
               );
             })
           )}
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

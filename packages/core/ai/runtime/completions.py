@@ -252,6 +252,7 @@ async def runtime_execute_agent_prompt_preview_completion(
     entity_id: str,
     system_prompt: str,
     test_message: str,
+    user_id: str | None = None,
 ) -> RuntimeTextCompletionResult:
     """Execute an agent prompt preview with Runtime-owned defaults."""
 
@@ -261,6 +262,7 @@ async def runtime_execute_agent_prompt_preview_completion(
             test_message=test_message,
         ),
         entity_id=entity_id,
+        user_id=user_id,
         source=RUNTIME_PROMPT_PREVIEW_SOURCE,
         temperature=0.7,
         max_tokens=800,
@@ -276,6 +278,7 @@ async def runtime_execute_text_completion(
     agent_id: str | None = None,
     workspace_id: str | None = None,
     conversation_id: str | None = None,
+    runtime_surface: str | None = None,
     temperature: float = 0.7,
     response_format: dict[str, Any] | None = None,
     max_tokens: int | None = None,
@@ -289,6 +292,15 @@ async def runtime_execute_text_completion(
 
     from packages.core.ai.llm_client import chat_completion
     from packages.core.ai.runtime.billing import runtime_ensure_billing_context
+    from packages.core.ai.runtime.response_language import (
+        resolve_runtime_response_language,
+        response_language_messages,
+        runtime_response_language_scope,
+    )
+
+    language = await resolve_runtime_response_language(
+        entity_id=entity_id, user_id=user_id, source=source, surface=runtime_surface,
+    )
 
     resolved_model, resolved_metadata, resolved_byok = await runtime_resolve_text_completion_route(
         entity_id=entity_id,
@@ -324,7 +336,10 @@ async def runtime_execute_text_completion(
     }
     if reasoning_effort is not None:
         completion_kwargs["reasoning_effort"] = reasoning_effort
-    content, usage = await chat_completion(list(messages), **completion_kwargs)
+    with runtime_response_language_scope(language):
+        content, usage = await chat_completion(
+            response_language_messages(messages, language), **completion_kwargs,
+        )
     return RuntimeTextCompletionResult(
         content=content or "",
         usage=dict(usage or {}),

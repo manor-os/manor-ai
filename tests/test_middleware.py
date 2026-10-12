@@ -153,6 +153,87 @@ async def test_chat_rate_limit_returns_retry_after(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_chat_reads_have_a_separate_per_user_budget(monkeypatch):
+    """Sidebar and room reads cannot exhaust the write budget or a shared IP bucket."""
+    from httpx import ASGITransport, AsyncClient
+    from apps.api.middleware.rate_limit import ChatRateLimitMiddleware, RateLimiter
+    import apps.api.middleware.rate_limit as rate_limit
+    from packages.core.services import auth_service
+
+    app = FastAPI()
+    app.add_middleware(mw.RateLimitMiddleware)
+    app.add_middleware(ChatRateLimitMiddleware)
+
+    @app.get("/api/v1/chat/{path:path}")
+    async def chat_read(path: str):
+        return {"path": path}
+
+    @app.post("/api/v1/chat/rooms/{room_id}/messages")
+    async def send_message(room_id: str):
+        return {"room_id": room_id}
+
+    monkeypatch.setattr(mw, "_RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(mw, "RATE_LIMIT_PER_MINUTE", 1)
+    mw._buckets.clear()
+    monkeypatch.setattr(rate_limit, "CHAT_RATE_LIMIT_ENABLED", True)
+    monkeypatch.setattr(rate_limit, "CHAT_RATE_LIMIT_REQUESTS", 1)
+    monkeypatch.setattr(rate_limit, "API_RATE_LIMIT_REQUESTS", 6)
+    monkeypatch.setattr(rate_limit, "_limiter", RateLimiter())
+    monkeypatch.setattr(
+        auth_service, "decode_token",
+        lambda token: {"sub": token} if token in {"alice", "bob"} else None,
+    )
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        alice = {"Authorization": "Bearer alice"}
+        bob = {"Authorization": "Bearer bob"}
+        for path in (
+            "/api/v1/chat/conversations",
+            "/api/v1/chat/flow-entrypoints",
+            "/api/v1/chat/rooms/group-usage",
+            "/api/v1/chat/rooms",
+            "/api/v1/chat/rooms/room-1",
+            "/api/v1/chat/rooms/room-1/presence",
+        ):
+            assert (await client.get(path, headers=alice)).status_code == 200
+        assert (await client.get("/api/v1/chat/rooms/room-1/presence", headers=bob)).status_code == 200
+        limited = await client.get("/api/v1/chat/conversations", headers=alice)
+        assert limited.status_code == 429
+        assert limited.headers["retry-after"].isdigit()
+        # Reading chat did not spend its separate write or global budgets.
+        assert (await client.post("/api/v1/chat/rooms/room-1/messages", headers=alice)).status_code == 200
+        mw._buckets.clear()
+        assert (await client.post("/api/v1/chat/rooms/room-1/messages", headers=alice)).status_code == 429
+        # Invalid credentials cannot bypass the existing shared-IP global limit.
+        assert (await client.get("/api/v1/chat/conversations", headers={"Authorization": "Bearer invalid"})).status_code == 200
+        assert (await client.get("/api/v1/chat/conversations", headers={"Authorization": "Bearer invalid"})).status_code == 429
+
+    mw._buckets.clear()
+
+
+def test_chat_read_classifier_keeps_mutations_and_downloads_strict():
+    from apps.api.middleware.rate_limit import is_chat_read_request
+
+    for path in (
+        "/api/v1/chat/conversations",
+        "/api/v1/chat/flow-entrypoints",
+        "/api/v1/chat/rooms/group-usage",
+        "/api/v1/chat/rooms",
+        "/api/v1/chat/rooms/room-1",
+        "/api/v1/chat/rooms/room-1/messages",
+        "/api/v1/chat/rooms/room-1/presence",
+    ):
+        assert is_chat_read_request("GET", path)
+    assert not is_chat_read_request("POST", "/api/v1/chat/rooms/room-1/messages")
+    assert not is_chat_read_request("POST", "/api/v1/chat/rooms/room-1/files")
+    assert not is_chat_read_request("POST", "/api/v1/chat/rooms/room-1/message-retractions")
+    assert not is_chat_read_request("GET", "/api/v1/chat/rooms/room-1/files/file-1")
+    assert not is_chat_read_request("GET", "/api/v1/chat/conversations/conv-1/export")
+    assert not is_chat_read_request("GET", "/api/v1/chat/shared/public-token")
+    assert not is_chat_read_request("GET", "/api/v1/workspaces/ws-1")
+
+
+@pytest.mark.anyio
 async def test_redis_rate_limiter_enforces_shared_bucket():
     """Redis-backed limiter uses a fixed-window bucket and reports retry_after."""
     from apps.api.middleware.rate_limit import RateLimiter

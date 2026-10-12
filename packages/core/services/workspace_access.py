@@ -9,14 +9,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import and_, exists, or_, select
+from sqlalchemy import and_, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.models.base import generate_ulid
 from packages.core.models.staff import Staff, StaffRole
 from packages.core.models.user import User, UserMembership
 from packages.core.models.workspace import Workspace, WorkspaceStaff
-from packages.core.permissions import Permission, user_staff_role_assignment
+from packages.core.permissions import Permission, has_permission, user_staff_role_assignment
 
 
 WORKSPACE_ACCESS_MODE_KEY = "access_mode"
@@ -26,6 +26,12 @@ WORKSPACE_ACCESS_MODES = {
     WORKSPACE_ACCESS_MODE_ENTITY_VISIBLE,
     WORKSPACE_ACCESS_MODE_MEMBERS_ONLY,
 }
+# Match workspace_access_mode's str.strip(); SQL trim defaults to ASCII spaces.
+_ACCESS_MODE_STRIP_CHARS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 ENTITY_ADMIN_ROLES = {"owner", "admin"}
 ENTITY_WORKSPACE_READ_ROLES = {"owner", "admin", "member", "viewer"}
 WORKSPACE_ARTIFACT_WRITE_ROLES = {"owner", "editor", "contributor"}
@@ -135,6 +141,39 @@ def is_entity_admin_role(role: str | None) -> bool:
     return str(role or "").strip().lower() in ENTITY_ADMIN_ROLES
 
 
+def is_entity_owner_role(role: str | None) -> bool:
+    return str(role or "").strip().lower() == "owner"
+
+
+async def user_can_read_all_workspaces(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    user_id: str | None,
+    role: str | None,
+    can_read_all_workspaces: bool | None = None,
+) -> bool:
+    """Resolve the explicit tenant-wide Workspace visibility override."""
+    if can_read_all_workspaces is not None:
+        return can_read_all_workspaces
+    resolved_role = str(role or "").strip().lower() or None
+    if user_id:
+        has_staff_record, _, assigned_role, permissions = await user_staff_role_assignment(
+            db,
+            user_id,
+            entity_id,
+        )
+        if has_staff_record:
+            return Permission.WORKSPACES_READ_ALL.value in {
+                str(permission) for permission in permissions
+            }
+        resolved_role = str(assigned_role or resolved_role or "").strip().lower() or None
+    return bool(
+        resolved_role
+        and has_permission(resolved_role, Permission.WORKSPACES_READ_ALL)
+    )
+
+
 async def resolve_workspace_read_access(
     db: AsyncSession,
     *,
@@ -240,7 +279,12 @@ async def user_can_write_workspace_artifacts(
         user_id=user_id,
         role=entity_role,
     )
-    if is_entity_admin_role(resolved_role):
+    if is_entity_admin_role(resolved_role) and await user_can_read_all_workspaces(
+        db,
+        entity_id=str(entity_id),
+        user_id=user_id,
+        role=resolved_role,
+    ):
         return True
     role = await user_workspace_role(
         db,
@@ -282,7 +326,12 @@ async def user_can_manage_workspace(
         user_id=user_id,
         role=entity_role,
     )
-    if is_entity_admin_role(resolved_role):
+    if is_entity_admin_role(resolved_role) and await user_can_read_all_workspaces(
+        db,
+        entity_id=str(entity_id),
+        user_id=user_id,
+        role=resolved_role,
+    ):
         return True
     membership = (
         await db.execute(
@@ -313,16 +362,19 @@ async def manageable_workspace_ids_for_user(
     entity_id: str,
     user_id: str | None,
     entity_role: str | None = None,
+    include_deleted: bool = False,
 ) -> set[str]:
     """Return manageable ids for an already-scoped Workspace batch.
 
     This preserves :func:`user_can_manage_workspace` semantics while avoiding
     a role-resolution and membership query for every row in list responses.
+    Lifecycle recovery may explicitly include deleted rows to check retained
+    ownership; ordinary management must continue to exclude them.
     """
     workspace_ids = {
         str(workspace.id)
         for workspace in workspaces
-        if workspace.entity_id == entity_id and workspace.deleted_at is None
+        if workspace.entity_id == entity_id and (include_deleted or workspace.deleted_at is None)
     }
     if not workspace_ids or not user_id:
         return set()
@@ -332,9 +384,26 @@ async def manageable_workspace_ids_for_user(
         user_id=user_id,
         role=entity_role,
     )
-    if is_entity_admin_role(resolved_role):
+    if is_entity_admin_role(resolved_role) and await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+    ):
         return workspace_ids
 
+    return await owned_workspace_ids_for_user(db, workspace_ids=workspace_ids, user_id=user_id)
+
+
+async def owned_workspace_ids_for_user(
+    db: AsyncSession,
+    *,
+    workspace_ids: set[str],
+    user_id: str | None,
+) -> set[str]:
+    """Return active owner memberships within the caller's authorized scope."""
+    if not workspace_ids or not user_id:
+        return set()
     rows = list((await db.execute(
         select(
             WorkspaceStaff.workspace_id,
@@ -413,6 +482,7 @@ async def user_can_read_workspace_by_identity(
     user_id: str | None,
     role: str | None = None,
     can_read_entity_workspaces: bool | None = None,
+    can_read_all_workspaces: bool | None = None,
 ) -> bool:
     if (
         not workspace
@@ -427,7 +497,13 @@ async def user_can_read_workspace_by_identity(
         role=role,
         can_read_entity_workspaces=can_read_entity_workspaces,
     )
-    if is_entity_admin_role(resolved_role):
+    if await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+        can_read_all_workspaces=can_read_all_workspaces,
+    ):
         return True
     if await get_active_workspace_membership(
         db,
@@ -449,6 +525,7 @@ async def user_can_read_workspace_id(
     user_id: str | None,
     role: str | None = None,
     can_read_entity_workspaces: bool | None = None,
+    can_read_all_workspaces: bool | None = None,
 ) -> bool:
     workspace = (
         await db.execute(
@@ -471,6 +548,7 @@ async def user_can_read_workspace_id(
         user_id=user_id,
         role=role,
         can_read_entity_workspaces=can_read_entity_workspaces,
+        can_read_all_workspaces=can_read_all_workspaces,
     )
 
 
@@ -482,6 +560,7 @@ async def user_readable_workspace_ids(
     role: str | None = None,
     workspace_ids: set[str] | None = None,
     can_read_entity_workspaces: bool | None = None,
+    can_read_all_workspaces: bool | None = None,
 ) -> set[str]:
     """Resolve readable Workspace ids in one query for list authorization."""
     resolved_role, can_read_entity_workspaces = await resolve_workspace_read_access(
@@ -499,7 +578,14 @@ async def user_readable_workspace_ids(
         if not workspace_ids:
             return set()
         query = query.where(Workspace.id.in_(workspace_ids))
-    if not is_entity_admin_role(resolved_role):
+    read_all = await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+        can_read_all_workspaces=can_read_all_workspaces,
+    )
+    if not read_all:
         active_membership = exists(
             select(WorkspaceStaff.id).where(
                 WorkspaceStaff.workspace_id == Workspace.id,
@@ -512,8 +598,10 @@ async def user_readable_workspace_ids(
             )
         )
         entity_visible = and_(
-            Workspace.settings[WORKSPACE_ACCESS_MODE_KEY].astext
-            == WORKSPACE_ACCESS_MODE_ENTITY_VISIBLE,
+            func.btrim(
+                Workspace.settings[WORKSPACE_ACCESS_MODE_KEY].astext,
+                _ACCESS_MODE_STRIP_CHARS,
+            ) == WORKSPACE_ACCESS_MODE_ENTITY_VISIBLE,
             can_read_entity_workspaces,
         )
         query = query.where(or_(active_membership, entity_visible))
@@ -537,7 +625,12 @@ async def user_writable_workspace_ids(
         user_id=user_id,
         role=role,
     )
-    if is_entity_admin_role(resolved_role):
+    if is_entity_admin_role(resolved_role) and await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+    ):
         query = select(Workspace.id).where(
             Workspace.id.in_(workspace_ids),
             Workspace.entity_id == entity_id,
@@ -578,6 +671,12 @@ async def filter_workspaces_for_user(
         user_id=user.id,
         role=user.role,
     )
+    can_read_all_workspaces = await user_can_read_all_workspaces(
+        db,
+        entity_id=user.entity_id,
+        user_id=user.id,
+        role=resolved_role,
+    )
     visible: list[Workspace] = []
     for workspace in workspaces:
         if await user_can_read_workspace_by_identity(
@@ -587,6 +686,7 @@ async def filter_workspaces_for_user(
             user_id=user.id,
             role=resolved_role,
             can_read_entity_workspaces=can_read_entity_workspaces,
+            can_read_all_workspaces=can_read_all_workspaces,
         ):
             visible.append(workspace)
     return visible
@@ -626,7 +726,12 @@ async def user_can_write_workspace_id(
         user_id=user_id,
         role=role,
     )
-    if is_entity_admin_role(resolved_role):
+    if is_entity_admin_role(resolved_role) and await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+    ):
         return True
     membership = await get_active_workspace_membership(
         db, workspace_id=workspace_id, user_id=user_id
@@ -645,8 +750,8 @@ async def readable_workspace_ids_for_user(
 ) -> set[str] | None:
     """Workspace ids this user may read, or ``None`` for an unrestricted caller.
 
-    Returns ``None`` for an entity owner/admin (firm-wide visibility — no
-    restriction should be applied) so callers can skip filtering entirely.
+    Returns ``None`` only for a role with the explicit tenant-wide read
+    permission so callers can skip filtering entirely.
     Otherwise returns the set of readable workspace ids: the user's active,
     non-expired memberships plus every ``entity_visible`` workspace (when the
     role is allowed entity-wide read). The set may be empty — that is distinct
@@ -663,7 +768,12 @@ async def readable_workspace_ids_for_user(
         user_id=user_id,
         role=role,
     )
-    if is_entity_admin_role(resolved_role):
+    if await user_can_read_all_workspaces(
+        db,
+        entity_id=entity_id,
+        user_id=user_id,
+        role=resolved_role,
+    ):
         return None
 
     readable: set[str] = set()
@@ -723,8 +833,23 @@ async def ensure_workspace_owner_membership(
         await db.execute(
             select(User).where(
                 User.id == user_id,
-                User.entity_id == entity_id,
+                User.status == "active",
                 User.deleted_at.is_(None),
+                or_(
+                    exists().where(
+                        UserMembership.user_id == User.id,
+                        UserMembership.entity_id == entity_id,
+                        UserMembership.status == "active",
+                        UserMembership.deleted_at.is_(None),
+                    ),
+                    and_(
+                        User.entity_id == entity_id,
+                        ~exists().where(
+                            UserMembership.user_id == User.id,
+                            UserMembership.entity_id == entity_id,
+                        ),
+                    ),
+                ),
             ).limit(1)
         )
     ).scalar_one_or_none()
@@ -740,21 +865,6 @@ async def ensure_workspace_owner_membership(
             ).limit(1)
         )
     ).scalar_one_or_none()
-    if staff is None:
-        staff = Staff(
-            id=generate_ulid(),
-            entity_id=entity_id,
-            kind="employee",
-            name=user.display_name or user.email.split("@")[0],
-            email=user.email,
-            avatar_url=user.avatar_url,
-            user_id=user.id,
-            meta={"role": user.role},
-            status="active",
-        )
-        db.add(staff)
-        await db.flush()
-
     membership = (
         await db.execute(
             select(WorkspaceStaff)
@@ -762,7 +872,7 @@ async def ensure_workspace_owner_membership(
                 WorkspaceStaff.workspace_id == workspace_id,
                 or_(
                     WorkspaceStaff.user_id == user_id,
-                    WorkspaceStaff.staff_id == staff.id,
+                    WorkspaceStaff.staff_id == staff.id if staff else False,
                 ),
             )
             .limit(1)
@@ -772,7 +882,7 @@ async def ensure_workspace_owner_membership(
         membership = WorkspaceStaff(
             id=generate_ulid(),
             workspace_id=workspace_id,
-            staff_id=staff.id,
+            staff_id=staff.id if staff else None,
             user_id=user_id,
             role="owner",
             added_by=added_by or user_id,
@@ -781,7 +891,7 @@ async def ensure_workspace_owner_membership(
         )
         db.add(membership)
     else:
-        membership.staff_id = membership.staff_id or staff.id
+        membership.staff_id = membership.staff_id or (staff.id if staff else None)
         membership.user_id = membership.user_id or user_id
         membership.role = "owner"
         membership.status = "active"

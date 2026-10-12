@@ -10,6 +10,7 @@ import { relativeTime } from "../../lib/format";
 import { t } from "../../lib/i18n";
 import {
   formatWorkspaceStatValue,
+  workspaceStatAssessmentNote,
   workspaceStatAttentionPresentation,
 } from "../../lib/workspaceStats";
 import { useToastStore } from "../../stores/toast";
@@ -272,9 +273,9 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
         <div className="workspace-stats-grid">
           {stats.map((stat) => {
             const attentionStatus = workspaceStatAttentionPresentation(stat.freshness_status);
-            const timing = stat.current_value_updated_at
+            const timing = workspaceStatAssessmentNote(stat) || (stat.current_value_updated_at
               ? `${t("page.workspace_stats.updated")} ${relativeTime(stat.current_value_updated_at)}`
-              : t("page.workspace_stats.waiting_for_value");
+              : t("page.workspace_stats.waiting_for_value"));
             return (
               <CompactCard
                 key={stat.id}
@@ -491,7 +492,7 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
                 <div style={{ fontSize: 34, fontWeight: 750, color: "var(--text-strong)", lineHeight: 1.1 }}>{formatWorkspaceStatValue(selectedStat)}</div>
                 <div style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 5 }}>{selectedStat.description}</div>
               </div>
-              {canManage && selectedStat.collector_type !== "manual" && (
+              {canManage && !["manual", "agent_review"].includes(selectedStat.collector_type) && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -517,7 +518,8 @@ export default function WorkspaceStatsPanel({ workspaceId, canManage, context = 
               </div>
             )}
 
-            {canManage && (
+            {workspaceStatAssessmentNote(selectedStat) && <p>{workspaceStatAssessmentNote(selectedStat)}</p>}
+            {canManage && selectedStat.collector_type !== "agent_review" && (
               <div style={{ paddingTop: 14, borderTop: "1px solid var(--border-subtle)" }}>
                 <div style={{ fontSize: 12, fontWeight: 700, color: "var(--text-strong)", marginBottom: 8 }}>{t("page.workspace_stats.record_value")}</div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 160px), 1fr))", gap: 8, alignItems: "end" }}>

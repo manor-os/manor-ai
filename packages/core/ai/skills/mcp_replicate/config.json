@@ -10,5 +10,9 @@
     "mcp__replicate__generate_image",
     "mcp__replicate__generate_video",
     "mcp__replicate__run_model"
-  ]
+  ],
+  "search": {
+    "terms": ["ai image", "ai video", "text to image", "text to video", "stable diffusion", "flux", "text prompt", "model run"],
+    "examples": ["generate image with replicate model", "make short ai video from prompt", "run specific replicate model", "text to image picture of cat"]
+  }
 }

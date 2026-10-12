@@ -63,6 +63,12 @@ async def soft_delete_user(
 
     now = datetime.now(timezone.utc)
     user.deleted_at = now
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration
+    from sqlalchemy import or_
+    await db.execute(sa_update(WorkspaceCollaboration).where(or_(
+        WorkspaceCollaboration.user_id == user_id, WorkspaceCollaboration.authorized_by == user_id,
+        WorkspaceCollaboration.requested_by == user_id, WorkspaceCollaboration.email == user.email.casefold(),
+    )).values(status="revoked", snapshot={}))
 
     # Best-effort OAuth revocation — running in foreground so the
     # caller (the API request handler) gets a deterministic answer.
@@ -153,11 +159,68 @@ async def purge_user(db: AsyncSession, user_id: str) -> bool:
         return False
 
     entity_id = user.entity_id
+    from packages.core.models.apify_collection import ApifyCollection
+    from packages.core.services.apify_collections import guard_collection_purge
+
+    # User credentials and provider run identities cannot disappear before
+    # outstanding collection costs have been reconciled. Include company
+    # memberships, not just this user's primary entity.
+    collection_entities = set((await db.execute(
+        select(ApifyCollection.entity_id).where(ApifyCollection.user_id == user_id)
+    )).scalars())
+    remaining_active = (await db.execute(select(func.count(User.id)).where(
+        User.entity_id == entity_id, User.id != user_id, User.deleted_at.is_(None),
+    ))).scalar_one() or 0
+    entity = await db.get(Entity, entity_id)
+    deleting_entity = remaining_active == 0 and entity is not None and entity.deleted_at is not None
+    # A user account must not disappear while recoverable personal Knowledge
+    # still points at it. Entity owners/global transfer managers first move the
+    # content to entity ownership through the explicit offboarding action.
+    # The only exception is a fully deleted entity, whose data is being purged
+    # as one lifecycle unit.
+    from packages.core.models.document import Document, DocumentFolder
+
+    document_owner_query = select(func.count(Document.id)).where(
+        Document.owner_id == user_id,
+    )
+    folder_owner_query = select(func.count(DocumentFolder.id)).where(
+        DocumentFolder.owner_id == user_id,
+    )
+    if deleting_entity:
+        document_owner_query = document_owner_query.where(Document.entity_id != entity_id)
+        folder_owner_query = folder_owner_query.where(DocumentFolder.entity_id != entity_id)
+    owned_document_count = (await db.execute(document_owner_query)).scalar_one() or 0
+    owned_folder_count = (await db.execute(folder_owner_query)).scalar_one() or 0
+    if owned_document_count or owned_folder_count:
+        logger.warning(
+            "Deferring user purge for %s: %d documents and %d folders still require ownership transfer",
+            user_id,
+            owned_document_count,
+            owned_folder_count,
+        )
+        return False
+    if deleting_entity:
+        collection_entities.add(entity_id)
+    for collection_entity_id in sorted(collection_entities):
+        if not await guard_collection_purge(
+            db, entity_id=collection_entity_id,
+            user_id=None if deleting_entity and collection_entity_id == entity_id else user_id,
+        ):
+            return False
     from packages.core.models.chat_feedback import ChatMessageFeedback
     from packages.core.models.channel import TwilioVoiceCallSession
     from packages.core.models.product_growth import ProductGrowthEvent
     from packages.core.models.runtime_learning import RuntimeEvidence
     from packages.core.models.task import Conversation, Message
+    from packages.core.models.agent_delegation_session import AgentDelegationSession
+    from packages.core.models.agent_delegation_session import AgentContextArchive
+    from packages.core.models.runtime_run import RuntimeRun
+    await db.execute(sa_update(RuntimeRun).where(RuntimeRun.user_id == user_id, RuntimeRun.entity_id == entity_id).values(context_state=None))
+    await db.execute(
+        sa_delete(AgentContextArchive).where(
+            AgentContextArchive.runtime_run_id.in_(select(RuntimeRun.id).where(RuntimeRun.user_id == user_id, RuntimeRun.entity_id == entity_id))
+        )
+    )
     from packages.core.services.chat_feedback import (
         COMPLETION_FEEDBACK_EVIDENCE_TYPES,
     )
@@ -191,11 +254,21 @@ async def purge_user(db: AsyncSession, user_id: str) -> bool:
         sa_delete(ProductGrowthEvent).where(ProductGrowthEvent.user_id == user_id)
     )
     await db.execute(
+        sa_delete(AgentDelegationSession).where(AgentDelegationSession.user_id == user_id)
+    )
+    await db.execute(
         sa_delete(TwilioVoiceCallSession).where(
             TwilioVoiceCallSession.owner_user_id == user_id
         )
     )
     await _anonymize_user_references(db, user_id)
+    from packages.core.models.webchat_resident import WebchatResidentBinding
+    await db.execute(sa_delete(WebchatResidentBinding).where(
+        (WebchatResidentBinding.manor_user_id == user_id)
+        | WebchatResidentBinding.target_account_id.in_(
+            select(OAuthAccount.id).where(OAuthAccount.user_id == user_id)
+        )
+    ))
     await db.execute(sa_delete(OAuthAccount).where(OAuthAccount.user_id == user_id))
     await db.delete(user)
     await db.flush()
@@ -209,10 +282,15 @@ async def purge_user(db: AsyncSession, user_id: str) -> bool:
         )
     )).scalar_one() or 0
     if remaining == 0:
-        entity = await db.get(Entity, entity_id)
+        entity = (await db.execute(
+            select(Entity)
+            .where(Entity.id == entity_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
         if entity is not None and entity.deleted_at is not None:
-            # Workspaces get cleared by the workspace purge task; here
-            # we just drop the entity row itself + its OAuth integrations.
+            # Workspace purge retains Knowledge. Terminal Entity deletion
+            # removes that Knowledge together with the company's integrations.
             from packages.core.models.document import Integration
             await db.execute(
                 sa_delete(TwilioVoiceCallSession).where(
@@ -222,9 +300,16 @@ async def purge_user(db: AsyncSession, user_id: str) -> bool:
             await db.execute(
                 sa_delete(Integration).where(Integration.entity_id == entity_id)
             )
-            # Any remaining soft-deleted workspaces under this entity —
-            # surface them to the workspace-purge task by leaving them
-            # in place; they'll be picked up on the next sweep.
+            # Only actual Entity hard deletion removes shared recovery state;
+            # purging one member must leave other members' file journals intact.
+            from packages.core.models.runtime_file_commit import RuntimeFileCommit
+            await db.execute(sa_delete(RuntimeFileCommit).where(
+                RuntimeFileCommit.entity_id == entity_id,
+            ))
+            from packages.core.services.workspace_artifact_purge import (
+                purge_entity_knowledge,
+            )
+            await purge_entity_knowledge(db, entity_id)
             await db.delete(entity)
             await db.flush()
     return True
@@ -392,6 +477,15 @@ async def _anonymize_user_references(
     forensic records and a separate compliance discussion. If privacy
     requirements get stricter we'll add a per-row policy later.
     """
+    from packages.core.models.workspace_collaboration import WorkspaceCollaboration, WorkspaceCollaborationEntry
+    from sqlalchemy import or_
+    await db.execute(sa_update(WorkspaceCollaboration).where(or_(
+        WorkspaceCollaboration.user_id == user_id, WorkspaceCollaboration.authorized_by == user_id,
+        WorkspaceCollaboration.requested_by == user_id,
+    )).values(status="revoked", snapshot={}, email="deleted-user@invalid.test", user_id=None, requested_by=None, authorized_by=None))
+    await db.execute(sa_update(WorkspaceCollaborationEntry).where(WorkspaceCollaborationEntry.created_by == user_id)
+        .values(created_by="deleted-user"))
+
     # ── String-typed display-name columns → sentinel ──
     # ``TaskLog.created_by`` is a String(100) author label (used for
     # both system + user actions); rewrite to the deleted-user sentinel

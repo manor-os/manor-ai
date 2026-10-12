@@ -12,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 from starlette.datastructures import Headers, UploadFile
 
 from apps.api import chat_audio
-from apps.api.routers import public_chat
+from apps.api.routers import chat, public_chat
 from packages.core.ai.tools import extended_tools
 from packages.core.database import get_db
 from packages.core.services import agent_subscription_service
@@ -172,7 +172,7 @@ async def test_call_delivery_options_are_forwarded_without_changing_spoken_text(
         voice="Aoede",
         voice_profile="deep",
         voice_instructions="Warm and natural.",
-        language="zh-CN",
+        language="zh",
     )
     assert response.body == b"audio"
     assert captured["prompt"] == "你好"
@@ -182,9 +182,30 @@ async def test_call_delivery_options_are_forwarded_without_changing_spoken_text(
     assert captured["params"]["language"] == "zh-CN"
 
 
+async def test_authenticated_speech_forwards_the_user_language(monkeypatch, speech_services):
+    case = speech_services
+    monkeypatch.setattr(chat, "authenticated_audio_scope", AsyncMock(return_value=case.scope))
+    monkeypatch.setattr(chat, "chat_speech_response", AsyncMock(return_value=Response(b"audio")))
+    lease = SimpleNamespace(release=AsyncMock())
+    monkeypatch.setattr(chat, "acquire_audio_lease", AsyncMock(return_value=lease))
+
+    response = await chat.text_to_speech(
+        chat_audio.SpeechRequest(text="Hello", language="de"),
+        user=SimpleNamespace(id="owner"),
+        db=case.db,
+    )
+
+    assert response.body == b"audio"
+    assert chat.chat_speech_response.await_args.kwargs["language"] == "de"
+    lease.release.assert_awaited_once()
+
+
 @pytest.fixture
 async def public_audio(monkeypatch):
     db = AsyncMock()
+    # This fixture is an anonymous conversation with no resident tombstone.
+    # Keep the real private-access guard; an unconfigured AsyncMock looks bound.
+    db.scalar.return_value = None
     cc = SimpleNamespace(id="channel", entity_id="business", owner_user_id="owner", config={"login_required": False})
     binding = SimpleNamespace(user_id="owner", config={})
     contact = SimpleNamespace(id="contact", status="active", user_id=None, profile={}, display_name="Visitor")
@@ -243,7 +264,7 @@ async def public_request(case, operation):
     path = f"/api/v1/public/chat/token/audio/{operation}"
     if operation == "speech":
         return await case.client.post(
-            path, json={"session_id": "session", "message_id": "reply", "offset": 6, "length": 5}
+            path, json={"session_id": "session", "message_id": "reply", "offset": 6, "length": 5, "language": "zh"}
         )
     return await case.client.post(
         path, data={"session_id": "session"}, files={"file": ("voice.webm", b"audio", "audio/webm")}
@@ -285,6 +306,7 @@ async def test_public_audio_bills_channel_owner_and_releases_lease(public_audio,
     assert scope == chat_audio.ChatAudioScope("business", "owner", "workspace", "conversation", "agent")
     if operation == "speech":
         assert function.await_args.args[2] == "world"
+        assert function.await_args.kwargs["language"] == "zh-CN"
         assert public_chat.list_public_webchat_messages.await_args.kwargs == {
             "session_id": "session",
             "message_ids": ["reply"],
@@ -315,6 +337,22 @@ async def test_public_speech_reuses_the_same_generated_chunk(public_audio):
     public_audio.lease.release.assert_awaited_once()
     assert next(iter(public_audio.cached_audio)).startswith("public-voice-speech:v1:")
     assert public_chat.enforce_public_audio_budget.await_count == 2
+
+
+async def test_public_speech_cache_varies_by_user_language(public_audio):
+    first = await public_request(public_audio, "speech")
+    second = await public_audio.client.post(
+        "/api/v1/public/chat/token/audio/speech",
+        json={"session_id": "session", "message_id": "reply", "offset": 6, "length": 5, "language": "en"},
+    )
+
+    assert first.status_code == second.status_code == 200
+    assert public_chat.chat_speech_response.await_count == 2
+    assert [call.kwargs["language"] for call in public_chat.chat_speech_response.await_args_list] == [
+        "zh-CN",
+        "en-US",
+    ]
+    assert len(public_audio.cached_audio) == 2
 
 
 async def test_public_audio_budget_checks_hashed_session_and_ip(monkeypatch):

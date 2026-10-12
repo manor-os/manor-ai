@@ -79,6 +79,29 @@ async def test_cache_miss():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("close_blocks", [False, True])
+async def test_cancelled_initial_ping_closes_unregistered_pool(monkeypatch, close_blocks):
+    started = asyncio.Event()
+    async def ping():
+        started.set()
+        await asyncio.Event().wait()
+    redis = _make_mock_redis()
+    redis.ping.side_effect = ping
+    if close_blocks:
+        async def close():
+            await asyncio.Event().wait()
+        redis.aclose.side_effect = close
+    monkeypatch.setattr("redis.asyncio.from_url", lambda *args, **kwargs: redis)
+    task = asyncio.create_task(cache_module._get_redis())
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 0.5)
+    redis.aclose.assert_awaited_once()
+    assert asyncio.get_running_loop() not in cache_module._redis_by_loop
+
+
+@pytest.mark.asyncio
 async def test_cache_delete():
     """delete() removes the key from Redis."""
     mock_redis = _make_mock_redis()
@@ -115,6 +138,44 @@ async def test_cache_touch_extends_prefixed_key_ttl():
 
     assert await Cache().touch("knowledge:key", 900) is True
     mock_redis.expire.assert_awaited_once_with("manor:knowledge:key", 900)
+
+
+@pytest.mark.asyncio
+@pytest.mark.oss_regression
+async def test_governance_cache_keys_follow_the_live_cache_namespace(monkeypatch):
+    """A cache instance created before a test namespace change must not leak keys."""
+    from packages.core import cache as cache_module
+    from packages.core.governance import policy_cache
+
+    redis = _make_mock_redis()
+    redis.eval = AsyncMock(return_value=1)
+    monkeypatch.setattr(policy_cache, "_get_redis", AsyncMock(return_value=redis))
+    monkeypatch.setattr(cache_module.cache, "PREFIX", "manor:")
+    governance_cache = policy_cache.RedisGovernancePolicyCache()
+    default_fence = await governance_cache.begin_mutation("workspace")
+
+    monkeypatch.setattr(cache_module.cache, "PREFIX", "manor:test:isolated:")
+    isolated_fence = await governance_cache.begin_mutation("workspace")
+    await governance_cache.store_if_current(
+        policy_cache.GovernancePolicySnapshot("workspace", 3, {"mode": "automatic"})
+    )
+
+    default_keys = redis.eval.await_args_list[0].args[2:4]
+    fence_keys = redis.eval.await_args_list[1].args[2:4]
+    store_keys = redis.eval.await_args_list[2].args[2:4]
+    body_prefix = redis.eval.await_args_list[2].args[5]
+    assert default_keys == (
+        "manor:governance:policy:v2:workspace:mutating",
+        "manor:governance:policy:v2:workspace:head",
+    )
+    assert fence_keys == (
+        "manor:test:isolated:governance:policy:v2:workspace:mutating",
+        "manor:test:isolated:governance:policy:v2:workspace:head",
+    )
+    assert store_keys == fence_keys
+    assert body_prefix == "manor:test:isolated:governance:policy:v2:workspace:revision:"
+    assert default_fence.active is True
+    assert isolated_fence.active is True
 
 
 @pytest.mark.asyncio
@@ -302,3 +363,105 @@ def test_get_redis_does_not_close_client_owned_by_another_active_loop(monkeypatc
     assert not failures
     assert len(clients) == 2
     assert clients[0].close_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("operation", "expected"), [
+    (lambda c: c.get("test"), None),
+    (lambda c: c.set("test", 1), False),
+    (lambda c: c.get_many(keys=["one", "two"]), [None, None]),
+    (lambda c: c.set_many({"test": 1}), False),
+    (lambda c: c.delete("test"), False),
+    (lambda c: c.touch("test", 60), False),
+    (lambda c: c.incr("test"), None),
+    (lambda c: c.delete_pattern("test:*"), 0),
+])
+async def test_optional_cache_operations_bound_client_acquisition(monkeypatch, operation, expected):
+    async def black_hole():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(cache_module, "_CACHE_IO_TIMEOUT_SECONDS", 0.02)
+    getter = AsyncMock(side_effect=black_hole)
+    monkeypatch.setattr(cache_module, "_get_redis", getter)
+    assert await asyncio.wait_for(operation(Cache()), 0.5) == expected
+    getter.assert_awaited_once()  # Timeout must not retry an uncertain write.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["acquire_lease", "release_lease", "extend_lease"])
+async def test_lease_operations_do_not_inherit_optional_cache_deadline(monkeypatch, method):
+    redis = _make_mock_redis()
+
+    async def delayed_result(*_args, **_kwargs):
+        await asyncio.sleep(0.04)
+        return True
+
+    redis.set = AsyncMock(side_effect=delayed_result)
+    redis.eval = AsyncMock(side_effect=delayed_result)
+    monkeypatch.setattr(cache_module, "_get_redis", AsyncMock(return_value=redis))
+    monkeypatch.setattr(cache_module, "_CACHE_IO_TIMEOUT_SECONDS", 0.01)
+    assert await asyncio.wait_for(getattr(Cache(), method)("test", "owner"), 0.5) is True
+
+
+@pytest.mark.asyncio
+async def test_cache_deadline_includes_command_and_preserves_task_cancellation(monkeypatch):
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def black_hole(*_args):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    redis = _make_mock_redis()
+    redis.get = AsyncMock(side_effect=black_hole)
+    monkeypatch.setattr(cache_module, "_get_redis", AsyncMock(return_value=redis))
+    monkeypatch.setattr(cache_module, "_CACHE_IO_TIMEOUT_SECONDS", 0.02)
+    assert await asyncio.wait_for(Cache().get("test"), 0.5) is None
+    assert cancelled.is_set()
+    redis.get.assert_awaited_once()
+
+    monkeypatch.setattr(cache_module, "_CACHE_IO_TIMEOUT_SECONDS", 10)
+    started.clear()
+    cancelled.clear()
+    task = asyncio.create_task(Cache().get("test"))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_ping_closes_unregistered_client(monkeypatch):
+    import redis.asyncio as aioredis
+
+    redis = _make_mock_redis()
+
+    async def black_hole():
+        await asyncio.Event().wait()
+
+    redis.ping = AsyncMock(side_effect=black_hole)
+    monkeypatch.setattr(aioredis, "from_url", MagicMock(return_value=redis))
+    monkeypatch.setattr(cache_module, "_CACHE_IO_TIMEOUT_SECONDS", 0.02)
+    assert await asyncio.wait_for(Cache().get("test"), 0.5) is None
+    redis.aclose.assert_awaited_once()
+    assert not cache_module._redis_by_loop
+
+
+@pytest.mark.asyncio
+async def test_shared_runtime_client_has_no_cache_deadline(monkeypatch):
+    # Runtime transports intentionally perform long XREAD/BLPOP/PubSub waits.
+    redis = _make_mock_redis()
+    cache_module._redis = redis
+    cache_module._redis_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(cache_module, "_CACHE_IO_TIMEOUT_SECONDS", 0.01)
+
+    async def blocking_read():
+        await asyncio.sleep(0.04)
+        return "runtime-event"
+
+    redis.xread = AsyncMock(side_effect=blocking_read)
+    assert await (await cache_module._get_redis()).xread() == "runtime-event"

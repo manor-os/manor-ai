@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "profiles": {
+    "office-modern": {
+      "title": ["Carlito", "Liberation Sans", "Noto Sans"],
+      "body": ["Carlito", "Liberation Sans", "Noto Sans"],
+      "code": ["Liberation Mono", "DejaVu Sans Mono"],
+      "cjk": ["Noto Sans CJK SC", "Noto Sans CJK JP"]
+    },
+    "microsoft-365": {
+      "title": ["Aptos Display", "Carlito", "Liberation Sans"],
+      "body": ["Aptos", "Carlito", "Liberation Sans"],
+      "code": ["Cascadia Code", "Liberation Mono"],
+      "cjk": ["Noto Sans CJK SC", "Noto Sans CJK JP"]
+    },
+    "editorial": {
+      "title": ["Liberation Serif", "Noto Serif"],
+      "body": ["Noto Sans", "Liberation Sans"],
+      "code": ["Liberation Mono", "DejaVu Sans Mono"],
+      "cjk": ["Noto Serif CJK SC", "Noto Sans CJK SC"]
+    },
+    "product": {
+      "title": ["Lato", "Noto Sans"],
+      "body": ["Lato", "Noto Sans"],
+      "code": ["Liberation Mono", "DejaVu Sans Mono"],
+      "cjk": ["Noto Sans CJK SC", "Noto Sans CJK JP"]
+    },
+    "cjk": {
+      "title": ["Noto Sans CJK SC", "Noto Sans"],
+      "body": ["Noto Sans CJK SC", "Noto Sans"],
+      "code": ["Liberation Mono", "DejaVu Sans Mono"],
+      "cjk": ["Noto Sans CJK SC", "Noto Sans CJK JP"]
+    }
+  }
+}

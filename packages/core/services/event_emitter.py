@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from weakref import WeakKeyDictionary
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from time import monotonic
 from typing import Any
 
 from sqlalchemy import and_, event, exists, or_, select, update
@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.constants.notification_types import NotificationOutboxStatus
 from packages.core.models.base import generate_ulid
 from packages.core.models.event import EventLog
+from packages.core.services.external_delivery_capacity import external_delivery_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,11 @@ _EXTERNAL_EVENT_DELIVERY_TASKS: set[asyncio.Task[None]] = set()
 _WORKER_EVENT_PERSISTENCE_TIMEOUT_SECONDS = 10.0
 _WORKER_EXTERNAL_EVENT_DRAIN_TIMEOUT_SECONDS = 2.0
 _EXTERNAL_EVENT_ATTEMPT_TIMEOUT_SECONDS = 30.0
-_EXTERNAL_EVENT_MAX_CONCURRENCY = 2
+_EXTERNAL_EVENT_ADMISSION_WAIT_SECONDS = 2.0
+# Leave room for a final 30 s attempt and receipt drain before the 45 s worker
+# soft limit. This bounds new claims; already admitted work finishes normally.
+_EXTERNAL_EVENT_SWEEP_BUDGET_SECONDS = 10.0
+_EXTERNAL_EVENT_CHECKPOINT_DRAIN_TIMEOUT_SECONDS = 2.0
 _EXTERNAL_EVENT_DELIVERY_LEASE = timedelta(minutes=2)
 _EXTERNAL_EVENT_MAX_ATTEMPTS = 5
 _EXTERNAL_EVENT_RETRY_DELAYS = (
@@ -33,10 +38,14 @@ _EXTERNAL_EVENT_RETRY_DELAYS = (
     timedelta(minutes=15),
     timedelta(hours=1),
 )
-_EXTERNAL_EVENT_DELIVERY_SEMAPHORES: WeakKeyDictionary[
-    asyncio.AbstractEventLoop,
-    asyncio.Semaphore,
-] = WeakKeyDictionary()
+
+
+class _ExternalEventDeliveryCanceled(RuntimeError):
+    pass
+
+
+class _ExternalEventDeliveryStale(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -165,8 +174,11 @@ async def _claim_external_event_deliveries(
     when: datetime,
     batch_size: int,
     event_ids: tuple[str, ...] | None = None,
+    exclude_event_ids: tuple[str, ...] = (),
 ) -> tuple[list[_ExternalEventDeliveryClaim], int, int]:
     eligible = _eligible_external_event_delivery(when)
+    if exclude_event_ids:
+        eligible = and_(eligible, EventLog.id.not_in(exclude_event_ids))
     canceled = await _cancel_inactive_workspace_deliveries(
         db,
         eligible=eligible,
@@ -313,6 +325,8 @@ async def _mark_external_sink_completed(
     claim: _ExternalEventDeliveryClaim,
     completed_sinks: dict[str, Any],
     sink_key: str,
+    *,
+    db: AsyncSession | None = None,
 ) -> dict[str, Any]:
     updated = dict(completed_sinks)
     updated[sink_key] = True
@@ -326,12 +340,48 @@ async def _mark_external_sink_completed(
         )
         .values(external_delivery_completed_sinks=updated)
     )
-    from packages.core.database import async_session
+    if db is not None:
+        result = await db.execute(statement)
+        await db.commit()
+    else:
+        from packages.core.database import async_session
 
-    async with async_session() as mark_db:
-        await mark_db.execute(statement)
-        await mark_db.commit()
+        async with async_session() as mark_db:
+            result = await mark_db.execute(statement)
+            await mark_db.commit()
+    if not result.rowcount:
+        raise _ExternalEventDeliveryStale("external event claim changed")
     return updated
+
+
+async def _check_external_delivery_allowed(
+    db: AsyncSession, claim: _ExternalEventDeliveryClaim,
+) -> None:
+    """Hold the lifecycle lock only until this target's receipt is committed."""
+    from packages.core.models.workspace import Workspace
+
+    # This session owns delivery work only. Release the prior target/read
+    # transaction before acquiring fresh lifecycle authority for this target.
+    await db.commit()
+    if claim.workspace_id:
+        workspace = (await db.execute(
+            select(Workspace).where(
+                Workspace.id == claim.workspace_id,
+                Workspace.entity_id == claim.entity_id,
+            ).with_for_update().execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        if workspace is None or workspace.deleted_at is not None or workspace.status != "active":
+            raise _ExternalEventDeliveryCanceled("workspace inactive or deleted before external event delivery")
+    current_claim = await db.scalar(select(EventLog.id).where(
+        EventLog.id == claim.event_id,
+        EventLog.external_delivery_status == NotificationOutboxStatus.PROCESSING.value,
+        EventLog.external_delivery_claim_token == claim.claim_token,
+    ))
+    if current_claim is None:
+        raise _ExternalEventDeliveryStale("external event claim changed")
+    if not claim.workspace_id:
+        # Entity-scoped events have no lifecycle lock to retain during I/O.
+        await db.commit()
 
 
 async def _deliver_and_finish_external_event(
@@ -341,67 +391,63 @@ async def _deliver_and_finish_external_event(
 ) -> str:
     completed_sinks = dict(claim.completed_sinks or {})
 
+    async def before_send() -> None:
+        if db is not None:
+            await _check_external_delivery_allowed(db, claim)
+
     async def mark_completed(sink_key: str) -> None:
         nonlocal completed_sinks
-        completed_sinks = await asyncio.shield(
-            _mark_external_sink_completed(
-                claim,
-                completed_sinks,
-                sink_key,
-            )
-        )
+        checkpoint = asyncio.create_task(_mark_external_sink_completed(
+            claim, completed_sinks, sink_key, db=db,
+        ))
+        try:
+            completed_sinks = await asyncio.shield(checkpoint)
+        except asyncio.CancelledError:
+            # The child borrows our connection. Drain it before the parent's
+            # context rolls back/closes; otherwise a sent receipt races close().
+            try:
+                await asyncio.wait_for(checkpoint, _EXTERNAL_EVENT_CHECKPOINT_DRAIN_TIMEOUT_SECONDS)
+            except Exception:
+                logger.warning("External event checkpoint did not finish during cancellation", exc_info=True)
+            raise
 
+    delivery_kwargs = {"db": db, "before_send": before_send} if db is not None else {}
+    outcome = NotificationOutboxStatus.DELIVERED.value
+    error = None
     try:
         if completed_sinks.get("webhook") is not True:
-            await deliver_webhook_event(claim.entity_id, claim.event_type, claim.payload)
+            await before_send()
+            await deliver_webhook_event(claim.entity_id, claim.event_type, claim.payload, **delivery_kwargs)
             await mark_completed("webhook")
         if completed_sinks.get("task_external") is not True:
+            if claim.event_type.startswith("task."):
+                await before_send()
             await deliver_task_external_event(
                 claim.entity_id,
                 claim.event_type,
                 claim.payload,
                 completed_sinks=completed_sinks,
                 mark_sink_completed=mark_completed,
+                **delivery_kwargs,
             )
             await mark_completed("task_external")
     except asyncio.CancelledError:
         raise
+    except _ExternalEventDeliveryStale:
+        return "stale"
+    except _ExternalEventDeliveryCanceled as exc:
+        outcome = NotificationOutboxStatus.CANCELED.value
+        error = str(exc)
     except Exception as exc:  # noqa: BLE001
-        if db is not None:
-            return await _finish_external_event_delivery_in_session(
-                db,
-                claim,
-                outcome=NotificationOutboxStatus.FAILED.value,
-                when=datetime.now(timezone.utc),
-                error=str(exc),
-            )
-        return await _finish_external_event_delivery(
-            claim,
-            outcome=NotificationOutboxStatus.FAILED.value,
-            when=datetime.now(timezone.utc),
-            error=str(exc),
-        )
+        outcome = NotificationOutboxStatus.FAILED.value
+        error = str(exc)
     if db is not None:
         return await _finish_external_event_delivery_in_session(
-            db,
-            claim,
-            outcome=NotificationOutboxStatus.DELIVERED.value,
-            when=datetime.now(timezone.utc),
+            db, claim, outcome=outcome, when=datetime.now(timezone.utc), error=error,
         )
     return await _finish_external_event_delivery(
-        claim,
-        outcome=NotificationOutboxStatus.DELIVERED.value,
-        when=datetime.now(timezone.utc),
+        claim, outcome=outcome, when=datetime.now(timezone.utc), error=error,
     )
-
-
-def _external_event_delivery_semaphore() -> asyncio.Semaphore:
-    loop = asyncio.get_running_loop()
-    semaphore = _EXTERNAL_EVENT_DELIVERY_SEMAPHORES.get(loop)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(_EXTERNAL_EVENT_MAX_CONCURRENCY)
-        _EXTERNAL_EVENT_DELIVERY_SEMAPHORES[loop] = semaphore
-    return semaphore
 
 
 async def _process_external_event_delivery_unbounded(
@@ -409,41 +455,12 @@ async def _process_external_event_delivery_unbounded(
 ) -> str:
     try:
         async with asyncio.timeout(_EXTERNAL_EVENT_ATTEMPT_TIMEOUT_SECONDS):
-            if claim.workspace_id:
-                from packages.core.database import async_session
-                from packages.core.models.workspace import Workspace
+            from packages.core.database import async_session
 
-                async with async_session() as db:
-                    workspace = (await db.execute(
-                        select(Workspace)
-                        .where(
-                            Workspace.id == claim.workspace_id,
-                            Workspace.entity_id == claim.entity_id,
-                        )
-                        .with_for_update()
-                        .execution_options(populate_existing=True)
-                    )).scalar_one_or_none()
-                    if (
-                        workspace is None
-                        or workspace.deleted_at is not None
-                        or workspace.status != "active"
-                    ):
-                        outcome = await _finish_external_event_delivery_in_session(
-                            db,
-                            claim,
-                            outcome=NotificationOutboxStatus.CANCELED.value,
-                            when=datetime.now(timezone.utc),
-                            error="workspace inactive or deleted before external event delivery",
-                        )
-                        await db.commit()
-                        return outcome
-                    outcome = await _deliver_and_finish_external_event(
-                        claim,
-                        db=db,
-                    )
-                    await db.commit()
-                    return outcome
-            return await _deliver_and_finish_external_event(claim)
+            async with async_session() as db:
+                outcome = await _deliver_and_finish_external_event(claim, db=db)
+                await db.commit()
+                return outcome
     except asyncio.CancelledError:
         # The processing lease is the durable recovery marker. A later sweep
         # reclaims it without making the committed business task run again.
@@ -457,45 +474,72 @@ async def _process_external_event_delivery_unbounded(
         )
 
 
-async def _process_external_event_delivery(
-    claim: _ExternalEventDeliveryClaim,
-) -> str:
-    # One delivery can hold the Workspace lifecycle session while opening
-    # additional durable sink sessions. Apply backpressure before any of those
-    # connections are checked out so a burst of committed artifact events
-    # cannot starve foreground workflow credit and governance checks.
-    async with _external_event_delivery_semaphore():
-        return await _process_external_event_delivery_unbounded(claim)
-
-
 async def dispatch_due_external_events(
     *,
     batch_size: int = 10,
     event_ids: tuple[str, ...] | None = None,
     when: datetime | None = None,
 ) -> dict[str, int]:
-    """Claim and deliver a bounded batch from the durable EventLog outbox."""
+    """Admit before claiming, so queued work never consumes a delivery lease."""
     from packages.core.database import async_session
 
-    current_time = when or datetime.now(timezone.utc)
-    async with async_session() as db:
-        claims, exhausted, canceled = await _claim_external_event_deliveries(
-            db,
-            when=current_time,
-            batch_size=batch_size,
-            event_ids=event_ids,
-        )
-    outcomes = await asyncio.gather(
-        *(_process_external_event_delivery(claim) for claim in claims)
-    )
-    counts = {
-        "claimed": len(claims),
-        "delivered": outcomes.count(NotificationOutboxStatus.DELIVERED.value),
-        "retried": outcomes.count("retried"),
-        "failed": exhausted + outcomes.count(NotificationOutboxStatus.FAILED.value),
-        "canceled": canceled + outcomes.count(NotificationOutboxStatus.CANCELED.value),
-        "stale": outcomes.count("stale"),
-    }
+    claimed_ids: set[str] = set()
+    queue_empty = False
+    remaining = max(1, batch_size)
+    if event_ids is not None:
+        remaining = min(remaining, len(set(event_ids)))
+    deadline = monotonic() + _EXTERNAL_EVENT_SWEEP_BUDGET_SECONDS
+    gate = external_delivery_semaphore()
+    counts = {"claimed": 0, "delivered": 0, "retried": 0, "failed": 0, "canceled": 0, "stale": 0}
+
+    async def dispatch_worker() -> None:
+        nonlocal queue_empty, remaining
+        while remaining > 0 and not queue_empty:
+            budget = deadline - monotonic()
+            if budget <= 0:
+                return
+            # Wait before opening a session or consuming an attempt. A busy
+            # process leaves durable pending rows for the next sweep.
+            try:
+                async with asyncio.timeout(min(budget, _EXTERNAL_EVENT_ADMISSION_WAIT_SECONDS)):
+                    await gate.acquire()
+            except TimeoutError:
+                return
+            try:
+                if queue_empty or remaining <= 0 or monotonic() >= deadline:
+                    return
+                remaining -= 1
+                async with async_session() as db:
+                    claims, exhausted, canceled = await _claim_external_event_deliveries(
+                        db, when=when or datetime.now(timezone.utc), batch_size=1,
+                        event_ids=event_ids, exclude_event_ids=tuple(claimed_ids),
+                    )
+                counts["failed"] += exhausted
+                counts["canceled"] += canceled
+                if not claims:
+                    queue_empty = True
+                    return
+                claim = claims[0]
+                claimed_ids.add(claim.event_id)
+                counts["claimed"] += 1
+                outcome = await _process_external_event_delivery_unbounded(claim)
+                counts[outcome] += 1
+            finally:
+                gate.release()
+
+    # The shared gate allows at most two sends. Reuse bounded dispatchers
+    # instead of creating one waiting task for every row in a large batch.
+    workers = [asyncio.create_task(dispatch_worker()) for _ in range(min(2, remaining))]
+    try:
+        await asyncio.gather(*workers)
+    finally:
+        # gather propagates the first error/cancellation before every sibling
+        # has closed its session. Drain them before the worker disposes its
+        # engine; do not interrupt cleanup with a second cancellation.
+        for worker in workers:
+            if not worker.done() and not worker.cancelling():
+                worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
     return counts
 
 
@@ -692,11 +736,15 @@ async def deliver_webhook_event(
     entity_id: str,
     event_type: str,
     payload: dict[str, Any] | None = None,
+    *,
+    db: AsyncSession | None = None,
+    before_send=None,
 ) -> None:
     """Deliver an already-committed domain event to webhook subscribers."""
     from packages.core.services.webhook_service import deliver_event
 
-    result = await deliver_event(entity_id, event_type, payload or {})
+    kwargs = {"db": db, "before_send": before_send} if db is not None else {}
+    result = await deliver_event(entity_id, event_type, payload or {}, **kwargs)
     if int((result or {}).get("failed", 0)) > 0:
         raise RuntimeError(f"webhook delivery failed: {result}")
 
@@ -708,6 +756,8 @@ async def deliver_task_external_event(
     *,
     completed_sinks: dict[str, Any] | None = None,
     mark_sink_completed=None,
+    db: AsyncSession | None = None,
+    before_send=None,
 ) -> None:
     """Deliver committed task events to configured external channels."""
     from packages.core.services.task_external_notifications import (
@@ -720,6 +770,7 @@ async def deliver_task_external_event(
         payload or {},
         completed_sinks=completed_sinks,
         mark_sink_completed=mark_sink_completed,
+        **({"db": db, "before_send": before_send} if db is not None else {}),
     )
 
 

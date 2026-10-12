@@ -1,0 +1,17 @@
+{
+  "id": "video-type-playbooks",
+  "name": "video-type-playbooks",
+  "display_name": "Video Type Playbooks",
+  "type": "runtime_guidance",
+  "execution_mode": "instructions_only",
+  "description": "Per-type production playbooks for an explicitly selected Video Studio type: structure and beats, visual rules, production route, known pitfalls and an acceptance checklist.",
+  "category": "video",
+  "output_format": "guidance",
+  "bundle_roots": ["references"],
+  "tags": ["video", "playbook", "video-studio", "runtime-guidance", "builtin"],
+  "tools": [],
+  "search": {
+    "terms": ["video template", "video genre", "storyboard beats", "checklist", "studio catalogue", "video format guide"],
+    "examples": ["playbook for selected video type", "beats and pitfalls for explainer type", "acceptance checklist for video studio type", "visual rules for chosen video category"]
+  }
+}

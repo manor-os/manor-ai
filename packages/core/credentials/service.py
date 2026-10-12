@@ -196,6 +196,44 @@ class CredentialService:
         cc.credential_scheme = self._kp.backend
         cc.credentials = {}
 
+    # ── Resident Webchat (never a management credential) ──
+
+    @staticmethod
+    def _webchat_resident_context(row) -> dict[str, str]:
+        return {"kind": "webchat_resident_v1", "id": row.id,
+                "entity_id": row.entity_id, "channel_id": row.channel_config_id,
+                "contact_id": row.channel_contact_id, "conversation_id": row.conversation_id,
+                "issuer": row.issuer}
+
+    @staticmethod
+    def _resident_create_context(row):
+        return {"kind": "webchat_resident_create_v1", "id": row.id,
+                "binding_id": row.binding_id, "issuer": row.issuer}
+
+    def store_resident_create(self, row, plaintext: dict) -> None:
+        row.credential_ref = self._kp.encrypt(
+            json.dumps(plaintext).encode("utf-8"), self._resident_create_context(row),
+        )
+        row.credential_scheme = self._kp.backend
+
+    def lease_resident_create(self, row, *, requester: Requester, reason: str) -> dict:
+        return self._lease(scheme=row.credential_scheme, ref=row.credential_ref,
+            legacy_plaintext=None, context=self._resident_create_context(row),
+            requester=requester, reason=reason)
+
+    def store_webchat_resident(self, row, plaintext: dict) -> None:
+        row.credential_ref = self._kp.encrypt(
+            json.dumps(plaintext).encode("utf-8"), self._webchat_resident_context(row),
+        )
+        row.credential_scheme = self._kp.backend
+
+    def lease_webchat_resident(self, row, *, requester: Requester, reason: str) -> dict:
+        return self._lease(
+            scheme=row.credential_scheme, ref=row.credential_ref,
+            legacy_plaintext=None, context=self._webchat_resident_context(row),
+            requester=requester, reason=reason,
+        )
+
     # ── IntegrationSession (browser cookies / storage_state) ──
 
     def lease_browser_session(
@@ -244,7 +282,7 @@ class CredentialService:
     # Many GUI-only platforms (douyin operator, kuaishou,
     # boss-zhipin, ...) don't expose an OAuth or API-key flow. The
     # operator stores their login as a password_pair Integration, then
-    # the Playwright MCP server leases it just-in-time to log in,
+    # an approved integration runtime leases it just-in-time to log in,
     # extracts a session, and persists that session under an
     # IntegrationSession (cookie_jar) so subsequent runs reuse cookies.
     #

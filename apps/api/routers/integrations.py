@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
@@ -74,6 +74,40 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/integrations", tags=["integrations"])
 
+
+class DefaultEmailAccountRequest(BaseModel):
+    sender_id: str = Field(min_length=1, max_length=255)
+
+
+@router.get("/email-accounts")
+async def list_email_accounts(
+    response: Response, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    from packages.core.services.connected_email_accounts import ConnectedEmailAccountsUnavailable, email_account_settings
+
+    response.headers["Cache-Control"] = "private, no-store"
+    try:
+        return await email_account_settings(db, entity_id=user.entity_id, user_id=user.id)
+    except ConnectedEmailAccountsUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@router.put("/email-accounts/default", status_code=204)
+async def update_default_email_account(
+    body: DefaultEmailAccountRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db),
+):
+    from packages.core.services.connected_email_accounts import ConnectedEmailAccountsUnavailable, set_default_email_sender
+
+    try:
+        changed = await set_default_email_sender(
+            db, entity_id=user.entity_id, user_id=user.id, sender_id=body.sender_id,
+        )
+    except ConnectedEmailAccountsUnavailable as exc:
+        raise HTTPException(503, str(exc)) from exc
+    if not changed:
+        raise HTTPException(409, "The selected sending account is no longer available")
+    await db.commit()
+
 _HIDDEN_CATALOG_SERVER_KEYS = {
     "nango",          # plumbing layer; per-provider cards own user flows
 }
@@ -81,7 +115,12 @@ _HIDDEN_CATALOG_SERVER_KEYS = {
 
 def _is_hidden_catalog_server_key(server_key: str | None) -> bool:
     key = str(server_key or "").strip().lower()
-    if key.startswith("manor_mcp_") or key in _HIDDEN_CATALOG_SERVER_KEYS:
+    # Manor Calendar is an always-on first-party runtime capability, not a
+    # connection that users need to manage in Integrations. Hide both the
+    # canonical key and the obsolete pre-canonicalization alias.
+    if key in {"manor_calendar", "manor_mcp_calendar"}:
+        return True
+    if (key.startswith("manor_mcp_") and key != "manor_mcp_minutes") or key in _HIDDEN_CATALOG_SERVER_KEYS:
         return True
     return False
 
@@ -189,6 +228,8 @@ class MCPServerStatus(BaseModel):
     # Discovery metadata — drives the catalog card visuals
     tagline: str | None = None
     docs_url: str | None = None
+    # Public application navigation; no credentials or OAuth grant implied.
+    app_url: str | None = None
     setup_hint: str | None = None
     color_hex: str | None = None
     supports_multi_account: bool = False
@@ -218,6 +259,10 @@ class MCPServerStatus(BaseModel):
     agent_can_use: bool
     requires_explicit_account: bool = False
     hint: str
+    # Snapshot reads can show real cards before external setup is resolved.
+    # This is presentation state only; runtime account authorization is unchanged.
+    setup_pending: bool = False
+    setup_unavailable: bool = False
 
     # ── Nango bridge metadata ──
     # When the entity has a Nango admin Integration set up AND the
@@ -249,12 +294,44 @@ class MCPServerStatus(BaseModel):
     # disables the connect button and shows "Coming soon" when true.
     # Single source of truth: _COMING_SOON_SERVERS in integration_service.
     coming_soon: bool = False
-
     # Legacy flags — kept for frontend compat. Mirror the first/any element
     # of connections[] so existing UIs don't break.
     user_connected: bool = False
     user_expires_at: str | None = None
+    plugin_key: str | None = None
+    plugin_enabled: bool | None = None
+    plugin_skills: list["BuiltinPluginSkillStatus"] = Field(default_factory=list)
 
+
+class BuiltinPluginSkillStatus(BaseModel):
+    slug: str
+    display_name: str
+    description: str
+    installed: bool
+
+
+class BuiltinPluginUpdateRequest(BaseModel):
+    enabled: bool
+
+
+class BuiltinPluginPreferenceResponse(BaseModel):
+    plugin_key: str
+    enabled: bool
+
+
+def _builtin_plugin_skill_statuses(
+    definition: Any,
+    installed_skill_slugs: set[str],
+) -> list[BuiltinPluginSkillStatus]:
+    return [
+        BuiltinPluginSkillStatus(
+            slug=skill.slug,
+            display_name=skill.display_name,
+            description=skill.description,
+            installed=skill.slug in installed_skill_slugs,
+        )
+        for skill in definition.skills
+    ]
 
 class MCPToolOperation(BaseModel):
     name: str
@@ -497,6 +574,21 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
               "docs_url": "https://api.slack.com/start/apps",
               "setup_hint": "Create a Slack app at api.slack.com/apps and install it.",
               "color_hex": "#4A154B", "supports_multi_account": True},
+    "lark": {"category": "Messaging", "tagline": "Lark chats, messages, documents, and Bitable records.",
+             "docs_url": "https://open.larksuite.com/document/",
+             "setup_hint": "An administrator configures the international Lark App ID, App Secret, callback URL and user permissions in OAuth client settings (Platform Admin integrations in Cloud). Connect your Lark account and grant the requested access. Existing Lark/Feishu app accounts keep their app identity and resource permissions; Feishu credentials cannot authorize international Lark OAuth.",
+             "color_hex": "#3370FF", "supports_multi_account": True,
+             "capabilities": [
+                 "List chats and read chat messages available to the selected account",
+                 "Send text messages and reply to a message",
+                 "Read document metadata and plain text; create documents and append text",
+                 "List Bitable tables, fields and records; create and update records",
+             ],
+             "example_prompts": [
+                 "Summarize recent messages in this Lark chat.",
+                 "Read this Feishu document and summarize its action items.",
+                 "Update the approved status field in this Bitable record.",
+             ]},
     "discord": {"category": "Messaging", "tagline": "Post messages and reactions in Discord servers.",
                 "docs_url": "https://discord.com/developers/docs/intro",
                 "setup_hint": "Create a bot at discord.com/developers/applications.",
@@ -584,6 +676,32 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                    "When a PR has been waiting > 48h for review, ping the reviewer in Slack.",
                    "Open a release PR from dev → main with the changelog from the last 20 commits.",
                ]},
+    "manor_pms": {
+        "category": "Productivity",
+        "tagline": "Leasing, property management, and short-stay operations with your PMS account.",
+        "setup_hint": "Connect your PMS account with OAuth. Existing management-token connections remain available.",
+        "supports_multi_account": True,
+        "capabilities": [
+            "Find available units and manage leads, tours, applications, and leases",
+            "Manage properties, residents, maintenance, payments, and accounting records",
+            "Manage reservations, guests, pricing, cleaning, and short-stay operations",
+            "Create records and perform approved updates within the connected PMS account",
+        ],
+        "example_prompts": [
+            "Show the properties managed by my connected PMS account.",
+            "Which units are available at the selected property?",
+            "Book a tour for this lead at the selected property and time.",
+            "List open maintenance requests for the selected property.",
+        ],
+    },
+    "manor_mcp_minutes": {
+        "category": "Productivity",
+        "tagline": "Search and read meeting notes with your connected Minutes account.",
+        "setup_hint": "Connect Minutes with OAuth using your current Manor user and Entity.",
+        "supports_multi_account": True,
+        "capabilities": ["Search recorded meetings", "Read transcripts, summaries, and action items", "Ask questions about a meeting"],
+        "example_prompts": ["Find our latest meeting about pricing."],
+    },
     "webhook": {"category": "Developer", "tagline": "Outbound HTTP calls to any URL with a bearer token.",
                 "docs_url": None,
                 "setup_hint": "Enter the target URL and a bearer token (or 'none').",
@@ -626,10 +744,29 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "setup_hint": "Get an API key at elevenlabs.io → Settings → API Keys.",
                        "color_hex": "#000000",
                        "supports_multi_account": True},
+    "suno":           {"category": "AI Tools", "tagline": "Original songs, covers, and mashups through Suno's official API.",
+                       "docs_url": "https://platform.suno.com/",
+                       "setup_hint": "Create an API key at platform.suno.com, then paste it here. Music creation uses your Suno account credits.",
+                       "color_hex": "#000000",
+                       "supports_multi_account": True,
+                       "capabilities": [
+                           "Generate songs from a description or custom lyrics and style",
+                           "Create covers and mashups from existing Suno audio",
+                           "Check generation status and account usage without starting new work",
+                       ],
+                       "example_prompts": [
+                           "Create an upbeat instrumental launch theme in a warm indie-pop style.",
+                           "Turn these approved lyrics into a cinematic electronic track.",
+                       ]},
     "tavily":         {"category": "AI Tools", "tagline": "Agent-tuned web search + extraction. 1000 calls/month free.",
                        "docs_url": "https://app.tavily.com/home",
                        "setup_hint": "Sign up at tavily.com to get an API key (starts with tvly-).",
                        "color_hex": "#0F766E",
+                       "supports_multi_account": True},
+    "apify":          {"category": "Social", "tagline": "Collect Instagram posts and Reels through Apify's official MCP within a budget.",
+                       "docs_url": "https://console.apify.com/settings/integrations",
+                       "setup_hint": "Connect to Apify's official MCP with an API token from Apify Console → Settings → Integrations. Runs on this connection use your Apify account balance.",
+                       "color_hex": "#F86606",
                        "supports_multi_account": True},
     "jimeng":         {"category": "AI Tools", "tagline": "即梦 — Chinese image + video gen via reverse-engineered gateway.",
                        "docs_url": "https://jimeng.jianying.com",
@@ -641,21 +778,24 @@ _PROVIDER_DISPLAY: dict[str, dict] = {
                        "setup_hint": "Create a PH OAuth app at api.producthunt.com → API → Applications, then connect.",
                        "color_hex": "#DA552F",
                        "supports_multi_account": False},
-    "facebook":       {"category": "Social", "tagline": "Post to your Facebook Pages, reply to comments, and handle Messenger DMs.",
-                       "docs_url": "https://developers.facebook.com/docs/pages",
-                       "setup_hint": "Click Connect → sign in to Facebook → choose which Pages the agent can manage.",
-                       "color_hex": "#1877F2",
+    "facebook":       {"category": "Social", "tagline": "3 products · one Facebook login",
+                       "description": "Connect Facebook once to use Pages you manage, their Messenger inboxes, and Instagram Business or Creator accounts linked to those Pages. Grant the relevant Page and Instagram permissions during login. This integration covers Page posts, comments, insights and Live broadcasts; Messenger conversations; and your linked Instagram media, comments and insights. A Facebook connection alone does not confirm Instagram access. WhatsApp Business needs separate setup; Threads, Meta Ads, Instagram DMs, and a dedicated Instagram publishing screen are not included.",
+                       "docs_url": "https://developers.facebook.com/docs/graph-api/",
+                       "setup_hint": "Sign in with Facebook and select the Pages to manage. For Instagram tools, link a Business or Creator account to one of those Pages and grant Instagram permissions. The Meta app needs the relevant permissions approved for production use.",
+                       "color_hex": "#0467DF",
                        "supports_multi_account": True,
                        "capabilities": [
-                           "Post to your Page (text, link, photo, scheduled)",
-                           "Auto-reply to comments on your posts",
-                           "Hide spam, delete posts, fetch insights",
-                           "Send Messenger DMs (within 24h window)",
+                           "Facebook Pages: manage profile details and publish text, links, photos or videos, including scheduled posts",
+                           "Facebook Pages: read and moderate comments; view Page and post insights",
+                           "Facebook Live: set up, inspect and end Page broadcasts (an RTMP encoder supplies the video)",
+                           "Messenger: read Page conversations and send text or images within Meta's messaging rules",
+                           "Instagram: list recent owned posts and Reels; publish a single-image post or Reel from a public media URL",
+                           "Instagram: read, reply to and delete comments; view account insights",
                        ],
                        "example_prompts": [
-                           "Every weekday at 10am post our top product of the day to the Page.",
-                           "Whenever a comment is negative, draft a polite reply for me to approve.",
-                           "Pull last week's reach + engagement and summarize trends.",
+                           "Summarize last week's Facebook Page and Instagram reach.",
+                           "Draft a reply to comments on my latest Instagram post for approval.",
+                           "Show the recent Messenger conversations for my Page.",
                        ]},
     "youtube":        {"category": "Social",
                        "description": "YouTube Data API v3 — search videos and channels, read video, channel, comment, and caption data, upload videos from a user-approved public HTTPS URL, and manage owned video metadata, privacy, scheduling, comments, ratings, and playlists.",
@@ -889,6 +1029,7 @@ _CATEGORY_ORDER = [
 async def list_mcp_server_status(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    snapshot: bool = False,
 ):
     """List every MCP server + per-user + per-entity connection status.
 
@@ -909,12 +1050,55 @@ async def list_mcp_server_status(
     )).scalars().all()
     servers = [s for s in servers if not _is_hidden_catalog_server_key(s.server_key)]
 
+    from packages.core.models.skill import Skill
+    from packages.core.services.builtin_plugin_service import (
+        BUILTIN_PLUGINS,
+        normalize_builtin_plugin_preferences,
+    )
+    if not snapshot:
+        from packages.core.services.builtin_skill_loader import seed_builtin_skills
+
+        # Preserve the existing repair of missing AND stale packaged Skills.
+        # Only the fast snapshot skips this work; it paints before the full read.
+        async with db.begin_nested():
+            await seed_builtin_skills(db)
+    expected_plugin_skill_slugs = {
+        skill.slug
+        for definition in BUILTIN_PLUGINS.values()
+        for skill in definition.skills
+    }
+    installed_skill_slugs = set((await db.execute(
+        select(Skill.slug).where(
+            Skill.entity_id.is_(None),
+            Skill.status == "active",
+            Skill.slug.in_(expected_plugin_skill_slugs),
+        )
+    )).scalars().all())
+    plugin_preferences = normalize_builtin_plugin_preferences(user.preferences)
+
     # Pull the Nango catalog (providers configured in Nango admin) so we
     # can (a) augment overlapping built-in cards with a nango Connect
     # path and (b) surface Nango-only platforms (HubSpot, Linear, ...)
-    # as their own cards. Failure is non-fatal -- we just skip the
-    # augmentation if Nango isn't reachable / configured.
-    nango_provider_keys = await _collect_nango_provider_keys(db, user.entity_id)
+    # as their own cards. Snapshot reads use only last-known configuration;
+    # full reads revalidate it before setup actions are enabled.
+    nango_setup_pending = False
+    nango_setup_unavailable = False
+    if snapshot:
+        nango_provider_keys, nango_setup_pending = await _read_nango_provider_snapshot(db, user.entity_id)
+    else:
+        try:
+            nango_provider_keys = await _collect_nango_provider_keys(db, user.entity_id)
+        except HTTPException as exc:
+            if exc.status_code != 503:
+                raise
+            # Keep database-backed cards and known provider routing available
+            # during an external outage. Failure is local to unresolved setup.
+            nango_provider_keys, nango_setup_unavailable = await _read_nango_provider_snapshot(db, user.entity_id)
+            if nango_setup_unavailable and not nango_provider_keys:
+                # No verified routing is available. Do not replace a client's
+                # full catalog with an apparently authoritative empty config.
+                # First-time page visits can still display the separate snapshot.
+                raise
     nango_config_key_by_server = {
         canonical_provider_key(nango_key): nango_key
         for nango_key in nango_provider_keys
@@ -924,6 +1108,9 @@ async def list_mcp_server_status(
     # "OAuth not configured" hint vs an active Connect CTA.
     from packages.core.services.oauth_provider_config import (
         is_oauth_provider, oauth_client_configured, oauth_client_secret_required,
+    )
+    from packages.core.services.manor_integration_oauth import (
+        is_manor_oauth_provider, manor_application_url,
     )
     oauth_configured_keys: set[str] = set()
     for s in servers:
@@ -956,12 +1143,17 @@ async def list_mcp_server_status(
         *nango_provider_keys.keys(),
         *(alias for key in server_keys for alias in provider_key_aliases(key)),
     })
+    needs_saved_nango_routes = (snapshot and nango_setup_pending) or nango_setup_unavailable
     catalog_snapshot = await load_integration_catalog_accounts(
         db,
         user_id=user.id,
         entity_id=user.entity_id,
-        provider_keys=lookup_keys,
+        # An uncached external provider may still have an actor-visible saved
+        # account. The same registry must authorize its fallback metadata.
+        provider_keys=None if needs_saved_nango_routes else lookup_keys,
     )
+    if needs_saved_nango_routes:
+        lookup_keys = list({*lookup_keys, *(binding.provider for binding in catalog_snapshot.integrations)})
     runtime_accounts_by_provider = {
         provider: list(catalog_snapshot.accounts_for(provider))
         for provider in lookup_keys
@@ -1001,6 +1193,20 @@ async def list_mcp_server_status(
             select(Integration).where(Integration.id.in_(integration_account_ids))
         )).scalars().all()
         integration_rows_by_id = {row.id: row for row in integration_source_rows}
+
+    if needs_saved_nango_routes:
+        # Actor-specific fallback metadata must never mutate shared cache data.
+        nango_provider_keys = dict(nango_provider_keys)
+        for row in integration_rows_by_id.values():
+            config = row.config if isinstance(row.config, dict) else {}
+            nango = config.get("nango")
+            if not isinstance(nango, dict):
+                continue
+            key = nango.get("provider_config_key")
+            if not isinstance(key, str) or not key or _is_hidden_catalog_server_key(key):
+                continue
+            nango_provider_keys.setdefault(key, row.provider)
+            nango_config_key_by_server.setdefault(canonical_provider_key(row.provider), key)
 
     owner_ids = {
         account.owner_user_id
@@ -1314,13 +1520,14 @@ async def list_mcp_server_status(
                 s.server_key,
                 s.transport,
             ),
-            name=s.name,
+            name="Meta" if s.server_key == "facebook" else s.name,
             category=display.get("category"),
             description=display.get("description", s.description),
             auth_type=s.auth_type,
             scopes=s.scopes,
             tagline=display.get("tagline"),
             docs_url=display.get("docs_url"),
+            app_url=manor_application_url(s.server_key),
             setup_hint=display.get("setup_hint"),
             color_hex=display.get("color_hex"),
             supports_multi_account=bool(display.get("supports_multi_account")),
@@ -1355,6 +1562,57 @@ async def list_mcp_server_status(
             browser_spec=_browser_spec_payload(browser_specs_by_id.get(s.id)),
         ))
 
+    remotion_plugin = BUILTIN_PLUGINS["remotion"]
+    remotion_skills = _builtin_plugin_skill_statuses(
+        remotion_plugin,
+        installed_skill_slugs,
+    )
+    remotion_installed = all(skill.installed for skill in remotion_skills)
+    remotion_enabled = plugin_preferences["remotion"]
+    out.append(MCPServerStatus(
+        server_key="remotion",
+        server_kind=MCPServerKind.MANAGED,
+        name="Remotion",
+        category="AI Tools",
+        description=(
+            "Build editable programmatic videos with React and Remotion, then "
+            "validate stills and render in Manor's isolated sandbox."
+        ),
+        auth_type="skill_plugin",
+        tagline="Make videos agentically",
+        docs_url="https://www.remotion.dev/docs/",
+        setup_hint="Built-in Skill plugin — no account connection required.",
+        color_hex="#0B84F3",
+        supports_multi_account=False,
+        capabilities=[
+            "Create and edit Remotion React compositions",
+            "Animate deterministic timelines, transitions, and text",
+            "Work with local video, audio, images, and captions",
+            "Validate compositions and review representative stills",
+            "Render MP4 videos and return editable source bundles",
+        ],
+        example_prompts=[
+            "Create an animated chart with five bars",
+            "Make an animated subscribe call to action",
+            "Use Remotion to add captions and audio to a composition",
+        ],
+        connections=[],
+        entity_accounts=[],
+        entity_connected=remotion_installed,
+        user_has_required_permission=True,
+        agent_can_use=bool(remotion_enabled and remotion_installed),
+        hint=(
+            "Remotion built-in plugin is enabled."
+            if remotion_enabled and remotion_installed
+            else "Enable Remotion to let agents use its 12 bundled Skills."
+            if not remotion_enabled
+            else "Remotion is enabled, but one or more bundled Skills are missing."
+        ),
+        plugin_key="remotion",
+        plugin_enabled=remotion_enabled,
+        plugin_skills=remotion_skills,
+    ))
+
     # Append Nango-only providers (no built-in MCP module) as virtual
     # cards so the user sees them in the same grid alongside built-ins.
     builtin_keys = {s.server_key for s in servers}
@@ -1363,7 +1621,7 @@ async def list_mcp_server_status(
             continue  # already covered by built-in card above
         # The connection / account counts come from any mirrored
         # Integration row that the sync flow wrote.
-        provider_accounts = runtime_accounts_by_provider.get(nango_key, [])
+        provider_accounts = catalog_snapshot.accounts_for(nango_key)
         catalog_binding = catalog_snapshot.integration(nango_key)
         requires_explicit_account = bool(
             catalog_binding and catalog_binding.requires_explicit_account
@@ -1431,10 +1689,71 @@ async def list_mcp_server_status(
             ).get("operations") or {},
         ))
 
+    for row in out:
+        row.setup_unavailable = bool(
+            nango_setup_unavailable
+            and (
+                row.nango_provider_config_key
+                or row.server_key == "whatsapp"
+                or (
+                    row.auth_type == "oauth2" and not row.oauth_configured
+                    and not is_manor_oauth_provider(row.server_key)
+                )
+            )
+        )
+        row.setup_pending = bool(
+            (
+                nango_setup_pending and (
+                    row.nango_provider_config_key
+                    or (
+                        row.auth_type in {"oauth2", "credentials", "api_key", "bearer"}
+                        and not is_manor_oauth_provider(row.server_key)
+                    )
+                )
+            )
+            or row.setup_unavailable
+            or (snapshot and row.plugin_key and any(not skill.installed for skill in row.plugin_skills))
+        )
+
     # Stable sort: by category order, then name
     cat_rank = {name: i for i, name in enumerate(_CATEGORY_ORDER)}
     out.sort(key=lambda m: (cat_rank.get(m.category or "", 999), m.name))
     return out
+
+
+@router.put(
+    "/plugins/{plugin_key}",
+    response_model=BuiltinPluginPreferenceResponse,
+)
+async def update_builtin_plugin_preference(
+    plugin_key: str,
+    payload: BuiltinPluginUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Enable or disable one optional built-in plugin for the current user."""
+    from packages.core.services.builtin_plugin_service import (
+        builtin_plugin_definition,
+        set_user_builtin_plugin_enabled,
+    )
+
+    definition = builtin_plugin_definition(plugin_key)
+    if definition is None:
+        raise HTTPException(404, "Built-in plugin not found")
+    try:
+        preferences = await set_user_builtin_plugin_enabled(
+            db,
+            user_id=user.id,
+            plugin_key=definition.key,
+            enabled=payload.enabled,
+        )
+    except LookupError as exc:
+        raise HTTPException(404, "User not found") from exc
+    await db.commit()
+    return BuiltinPluginPreferenceResponse(
+        plugin_key=definition.key,
+        enabled=preferences[definition.key],
+    )
 
 
 @router.get(
@@ -1620,11 +1939,40 @@ def _humanize_provider(slug: str) -> str:
     return slug.replace("_", " ").replace("-", " ").title() if slug else "Unknown"
 
 
+def _nango_catalog_cache_key(entity_id: str, secret: str) -> str:
+    import hashlib
+    from packages.core.ai.mcp.nango import _NANGO_BASE
+
+    # Rotated credentials or a changed endpoint must never reuse old routing.
+    fingerprint = hashlib.sha256(f"{_NANGO_BASE}\0{secret}".encode()).hexdigest()
+    return f"integration-catalog:nango:{entity_id}:{fingerprint}"
+
+
+async def _read_nango_provider_snapshot(
+    db: AsyncSession, entity_id: str,
+) -> tuple[dict[str, str | None], bool]:
+    import asyncio
+    from packages.core.cache import cache
+    from packages.core.ai.mcp.nango import get_nango_secret
+
+    secret = await get_nango_secret(db, entity_id)
+    if not secret:
+        return {}, False
+    try:
+        cached = await asyncio.wait_for(
+            cache.get(_nango_catalog_cache_key(entity_id, secret)), timeout=0.15,
+        )
+    except Exception:
+        cached = None
+    # Even a cached path is revalidated by the full read. A cache miss means
+    # unknown, never proof that the deployment has no Nango providers.
+    return cached if isinstance(cached, dict) else {}, True
+
+
 async def _collect_nango_provider_keys(db: AsyncSession, entity_id: str) -> dict[str, str | None]:
     """Return a map ``{provider_config_key: provider}`` of integrations
-    configured in this Manor instance's Nango admin. Empty dict if
-    Nango is not set up or unreachable -- callers treat that as
-    "no Nango bridge."""
+    configured in this Manor instance's Nango admin. Only an unconfigured
+    bridge or a successful empty response proves there are no providers."""
     from packages.core.ai.mcp.nango import _NANGO_BASE, get_nango_secret
     import httpx
 
@@ -1640,8 +1988,10 @@ async def _collect_nango_provider_keys(db: AsyncSession, entity_id: str) -> dict
             )
             r.raise_for_status()
             body = r.json()
-    except Exception:
-        return {}
+    except Exception as exc:
+        # Returning {} here erases virtual cards and changes OAuth routing.
+        # Let consumers retain their snapshot and offer a refresh retry.
+        raise HTTPException(503, "Integration configuration is temporarily unavailable") from exc
 
     out: dict[str, str | None] = {}
     raw_configs = body.get("configs") if isinstance(body, dict) else body
@@ -1650,6 +2000,16 @@ async def _collect_nango_provider_keys(db: AsyncSession, entity_id: str) -> dict
         if not key:
             continue
         out[key] = cfg.get("provider") or key
+    import asyncio
+    from packages.core.cache import cache
+
+    try:
+        await asyncio.wait_for(
+            cache.set(_nango_catalog_cache_key(entity_id, secret), out, ttl=300),
+            timeout=0.15,
+        )
+    except Exception:
+        pass  # Cache availability must not affect the authoritative response.
     return out
 
 
@@ -1703,6 +2063,46 @@ async def disconnect_account(
     )).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "Connection not found")
+    from packages.core.services.manor_integration_oauth import (
+        is_manor_oauth_provider, manor_oauth_binding, revoke_manor_oauth_grants,
+    )
+
+    if is_manor_oauth_provider(row.provider):
+        if manor_oauth_binding(row).get("entity_id") != user.entity_id:
+            raise HTTPException(404, "Connection not found")
+        # Commit local disablement before remote I/O. A failed revoke remains
+        # visible and retryable by its owner, but cannot execute or refresh.
+        await db.refresh(row, with_for_update=True)
+        credential_ref = row.credential_ref
+        row.profile = {**(row.profile or {}), "oauth_disconnect": {"status": "pending"}}
+        await db.commit()
+        # The commit released the scope lock. Reacquire scope before the row
+        # lock, as callback/default normalization do, then lease current state.
+        await lock_runtime_integration_account_scope(
+            db, kind=IntegrationAccountKind.OAUTH_ACCOUNT, user_id=user.id,
+            entity_id=user.entity_id, provider=server_key,
+        )
+        await db.refresh(row, with_for_update=True)
+        if row.credential_ref != credential_ref:
+            raise HTTPException(409, "Connection changed during disconnect; review and retry.")
+        try:
+            tokens = lease_oauth_account_tokens(
+                row, requester_id=user.id, requester_kind="user", reason="oauth.disconnect",
+            )
+        except CredentialError as exc:
+            raise HTTPException(502, "Connection is disabled in Manor. Provider revocation requires credential access; retry Disconnect.") from exc
+        revoked = await revoke_manor_oauth_grants(db, row, tokens)
+        credential_ref = row.credential_ref
+        await db.commit()
+        if not revoked:
+            raise HTTPException(502, "Connection is disabled in Manor. Provider revocation is not confirmed; retry Disconnect.")
+        await lock_runtime_integration_account_scope(
+            db, kind=IntegrationAccountKind.OAUTH_ACCOUNT, user_id=user.id,
+            entity_id=user.entity_id, provider=server_key,
+        )
+        await db.refresh(row, with_for_update=True)
+        if row.credential_ref != credential_ref:
+            raise HTTPException(409, "Connection changed during disconnect; review and retry.")
     if canonical_provider_key(server_key) == "discord":
         guild_id = str((row.profile or {}).get("guild_id") or "").strip()
         app = await resolve_discord_app_config(db)
@@ -2386,6 +2786,10 @@ async def test_oauth_connection(
     )).scalar_one_or_none()
     if not row:
         raise HTTPException(404, "Connection not found")
+    from packages.core.services.manor_integration_oauth import is_manor_oauth_provider, manor_oauth_binding
+
+    if is_manor_oauth_provider(row.provider) and manor_oauth_binding(row).get("entity_id") != user.entity_id:
+        raise HTTPException(404, "Connection not found")
 
     result = await run_and_persist_oauth(db, connection_id)
     await db.commit()
@@ -2735,8 +3139,18 @@ async def oauth_start(
         )).scalar_one_or_none()
         if not reconnect_row:
             raise HTTPException(404, "Connection not found")
+        from packages.core.services.manor_integration_oauth import is_manor_oauth_provider, manor_oauth_binding
 
-    config = await resolve_oauth_config(db, server_key)
+        if is_manor_oauth_provider(server_key):
+            if manor_oauth_binding(reconnect_row).get("entity_id") != user.entity_id:
+                raise HTTPException(404, "Connection not found")
+            if (reconnect_row.profile or {}).get("oauth_disconnect"):
+                raise HTTPException(409, "Finish disconnecting this account before reconnecting.")
+
+    try:
+        config = await resolve_oauth_config(db, server_key)
+    except ValueError as exc:
+        raise HTTPException(503, "OAuth deployment configuration is invalid.") from exc
     if not config:
         raise HTTPException(
             501,
@@ -2794,14 +3208,34 @@ async def oauth_callback(
     import os
     from packages.core.models.base import generate_ulid
     from packages.core.models.user import OAuthAccount, UserMembership
-    from packages.core.services.oauth_provider_config import resolve_oauth_config
+    from packages.core.services.oauth_provider_config import is_google_provider, resolve_oauth_config
     from packages.core.services.oauth_flow import (
         complete_authorization, render_oauth_error_page, OAuthFlowError,
         get_pending_state,
         resolve_oauth_identity,
     )
 
-    # Provider rejected (scope, cancel, app not approved) → human page.
+    # Cancellation consumes the same one-time state as a successful callback;
+    # no token exchange or account mutation occurs.
+    from packages.core.services.manor_integration_oauth import is_manor_oauth_provider
+
+    if error == "access_denied" and (is_manor_oauth_provider(server_key) or server_key == "lark"):
+        from fastapi.responses import RedirectResponse
+        from packages.core.services.oauth_flow import consume_pending_state
+
+        try:
+            cancelled = await consume_pending_state(state or "", server_key=server_key)
+        except OAuthFlowError as exc:
+            raise HTTPException(exc.status, exc.message) from exc
+        target = _safe_oauth_return_path(cancelled.get("return_to")) or "/integrations"
+        parts = urlsplit(target)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query.pop("connected", None)
+        query["oauth_cancelled"] = server_key
+        path = urlunsplit(("", "", parts.path, urlencode(query), parts.fragment))
+        return RedirectResponse(url=os.getenv("APP_URL", "http://localhost:3010").rstrip("/") + path, status_code=302)
+
+    # Other provider failures retain the existing human-readable error page.
     if error or not code or not state:
         return render_oauth_error_page(server_key, error, error_description)
 
@@ -2815,7 +3249,10 @@ async def oauth_callback(
     except OAuthFlowError as exc:
         raise HTTPException(exc.status, exc.message)
 
-    config = await resolve_oauth_config(db, server_key)
+    try:
+        config = await resolve_oauth_config(db, server_key)
+    except ValueError as exc:
+        raise HTTPException(503, "OAuth deployment configuration is invalid.") from exc
     if not config:
         raise HTTPException(
             501, f"{server_key} OAuth is not configured for this deployment."
@@ -2839,13 +3276,20 @@ async def oauth_callback(
     refresh_token = tokens.refresh_token
     token_expires_at = tokens.expires_at
     try:
-        provider_user_id, identity_profile = await resolve_oauth_identity(
-            server_key,
-            tokens,
-            application_id=config.client_id,
-        )
+        from packages.core.services.manor_integration_oauth import is_manor_oauth_provider, resolve_manor_oauth_identity
+
+        if is_manor_oauth_provider(server_key):
+            provider_user_id, identity_profile = await resolve_manor_oauth_identity(
+                server_key, tokens.access_token, user_id=user_id, entity_id=oauth_entity_id,
+            )
+        else:
+            provider_user_id, identity_profile = await resolve_oauth_identity(
+                server_key, tokens, application_id=config.client_id,
+            )
     except OAuthFlowError as exc:
         raise HTTPException(exc.status, exc.message) from exc
+    if is_google_provider(server_key) and provider_user_id.startswith("token:"):
+        raise HTTPException(502, "Could not verify the Google account identity; reconnect and try again.")
     if server_key == "quickbooks" and str(realm_id or "").strip():
         identity_profile["realm_id"] = str(realm_id).strip()
     oauth_owner = (await db.execute(
@@ -2888,6 +3332,17 @@ async def oauth_callback(
                 OAuthAccount.provider.in_(aliases),
             )
         )).scalar_one_or_none()
+        if server_key == "lark" and reconnect_row is None:
+            raise HTTPException(404, "Connection not found")
+    if (
+        reconnect_row
+        and is_google_provider(server_key)
+        and not reconnect_row.provider_user_id.startswith("token:")
+        and reconnect_row.provider_user_id != provider_user_id
+    ):
+        raise HTTPException(409, "Select the same Google account to reconnect this connection.")
+    if reconnect_row and server_key == "lark" and reconnect_row.provider_user_id != provider_user_id:
+        raise HTTPException(409, "Select the same Lark account and app to reconnect this connection.")
     identity_row = (await db.execute(
         select(OAuthAccount).where(
             OAuthAccount.user_id == user_id,
@@ -2900,12 +3355,38 @@ async def oauth_callback(
     # row or violating the per-user external-account uniqueness constraint.
     existing = identity_row or reconnect_row
 
+    if existing and is_manor_oauth_provider(server_key):
+        from packages.core.services.manor_integration_oauth import manor_oauth_binding
+
+        if manor_oauth_binding(existing).get("entity_id") != oauth_entity_id:
+            raise HTTPException(409, "This OAuth account belongs to a different Entity.")
+        from packages.core.services.manor_integration_oauth import prepare_manor_oauth_replacement
+
+        try:
+            await prepare_manor_oauth_replacement(
+                db, existing, access_token=access_token, refresh_token=refresh_token,
+            )
+        except OAuthFlowError as exc:
+            raise HTTPException(exc.status, exc.message) from exc
+
     if existing:
         preserved_refresh_token = refresh_token
+        refresh_state = (existing.profile or {}).get("oauth_refresh")
+        old_refresh_rejected = (
+            isinstance(refresh_state, dict)
+            and bool(refresh_state.get("reauth_required"))
+        )
+        # An expired Google access token does not invalidate its refresh token.
+        can_preserve_refresh = oauth_account_is_runtime_usable(existing) or (
+            is_google_provider(server_key)
+            and bool(existing.credential_ref or existing.refresh_token)
+            and not old_refresh_rejected
+        )
         if (
             server_key != "facebook"
             and not preserved_refresh_token
-            and oauth_account_is_runtime_usable(existing)
+            and existing.provider_user_id == provider_user_id
+            and can_preserve_refresh
         ):
             preserved_refresh_token = lease_oauth_account_tokens(
                 existing,
@@ -2913,6 +3394,8 @@ async def oauth_callback(
                 requester_kind="user",
                 reason="oauth.token.rotate_preserve_refresh_before_provider_update",
             ).get("refresh_token")
+        if is_google_provider(server_key) and not preserved_refresh_token:
+            raise HTTPException(502, "Google did not provide a refresh token; reconnect this account again.")
         existing.provider = server_key
         existing.provider_user_id = provider_user_id
         from packages.core.services.oauth_account_credentials import store_oauth_account_tokens
@@ -2951,9 +3434,13 @@ async def oauth_callback(
         # below will write a fresh result after it validates the new token.
         profile.pop("last_health_check", None)
         profile.pop("oauth_refresh", None)
+        if is_manor_oauth_provider(server_key):
+            profile.pop("oauth_disconnect", None)
         existing.profile = profile
         oauth_row_id = existing.id
     else:
+        if is_google_provider(server_key) and not refresh_token:
+            raise HTTPException(502, "Google did not provide a refresh token; reconnect this account again.")
         profile = {
             key: value
             for key, value in identity_profile.items()
@@ -3076,6 +3563,9 @@ async def set_oauth_config(
     )
 
     await check_effective_user_permission(db, user, Permission.USERS_MANAGE)
+    from apps.api.routers.admin_oauth import _require_local_lark_config_write
+
+    _require_local_lark_config_write(server_key)
 
     if not is_oauth_provider(server_key):
         raise HTTPException(400, f"{server_key} is not an OAuth provider")
@@ -3204,10 +3694,36 @@ def _integration_resp(
     creator_id = getattr(i, "created_by_user_id", None)
     owner_id = getattr(i, "owner_user_id", None)
     is_owner = owner_id == requester_user_id if requester_user_id else True
+    credential_preview = _credential_preview(i.credentials or {})
+    if canonical_provider_key(i.provider) == "lark":
+        # Only the actual owner may load settings from encrypted storage for
+        # editing. Shared account access never grants a credential preview.
+        credential_preview = {}
+        if requester_user_id and owner_id == requester_user_id:
+            from packages.core.credentials import Requester
+
+            try:
+                credentials = get_credential_service().lease_integration(
+                    i,
+                    requester=Requester(kind="user", id=requester_user_id),
+                    reason="lark_integration_edit_preview",
+                )
+            except CredentialError as exc:
+                logger.warning(
+                    "Could not load Lark connection settings for integration %s (%s)",
+                    i.id, type(exc).__name__,
+                )
+            else:
+                credential_preview = _credential_preview({
+                    key: credentials[key]
+                    for key in ("app_id", "app_secret", "platform")
+                    if key in credentials
+                })
+                credential_preview.setdefault("platform", "lark")
     return IntegrationResponse(
         id=i.id, entity_id=i.entity_id, provider=i.provider,
         status=i.status, config=_integration_config_preview(i.config),
-        credential_preview=_credential_preview(i.credentials or {}),
+        credential_preview=credential_preview,
         created_by_user_id=creator_id,
         created_by_name=(creator_names or {}).get(creator_id) if creator_id else None,
         owner_user_id=owner_id,

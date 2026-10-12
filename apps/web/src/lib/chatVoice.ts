@@ -65,7 +65,7 @@ export function speechChunks(text: string) {
 
 export async function fetchChatSpeech(
   chunk: ReturnType<typeof speechChunks>[number], scope: ChatVoiceScope,
-  signal: AbortSignal, messageId?: string,
+  signal: AbortSignal, messageId?: string, language?: string,
 ) {
   const isPublic = Boolean(scope.publicToken);
   if (isPublic && (!scope.sessionId || !messageId)) throw new Error("Reply not ready");
@@ -76,8 +76,8 @@ export async function fetchChatSpeech(
     method: "POST", signal,
     headers: { ...headers(), "Content-Type": "application/json" },
     body: JSON.stringify(isPublic ? {
-      session_id: scope.sessionId, message_id: messageId, offset: chunk.offset, length: chunk.length,
-    } : { text: chunk.text, conversation_id: scope.conversationId, workspace_id: scope.workspaceId }),
+      session_id: scope.sessionId, message_id: messageId, offset: chunk.offset, length: chunk.length, language,
+    } : { text: chunk.text, conversation_id: scope.conversationId, workspace_id: scope.workspaceId, language }),
   }));
   return response.blob();
 }

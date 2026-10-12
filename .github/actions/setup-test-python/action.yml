@@ -1,0 +1,19 @@
+name: Set up locked Python tests
+description: Use the same Python and dependency lock for every deterministic test lane.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.12"
+    - uses: astral-sh/setup-uv@v7
+      with:
+        version: "0.11.12"
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+    - name: Validate lock and install test dependencies
+      shell: bash
+      run: |
+        uv lock --check
+        uv sync --locked --extra dev --python 3.12
+        echo "${GITHUB_WORKSPACE}/.venv/bin" >> "$GITHUB_PATH"

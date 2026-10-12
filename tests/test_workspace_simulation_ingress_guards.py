@@ -172,6 +172,7 @@ async def test_scheduler_worker_skips_simulation_before_credit_preflight_or_fano
         heartbeat_enabled=False,
         deleted_at=None,
         kind="content",
+        operating_model={},
         settings={"sandbox": True},
     )
     job = SimpleNamespace(

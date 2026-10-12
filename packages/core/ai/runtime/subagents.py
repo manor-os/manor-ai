@@ -8,6 +8,7 @@ from packages.core.ai.runtime.surfaces import ChatSurface
 
 
 SUBAGENTS_METADATA_KEY = "runtime_subagents"
+PLAN_STEP_MAX_ROUNDS = 80
 
 
 @dataclass(frozen=True)
@@ -17,7 +18,7 @@ class SubAgentSpec:
     profile: RuntimeProfile
     allowed_tools: tuple[str, ...] = ()
     memory_mounts: tuple[str, ...] = ()
-    max_steps: int = 12
+    max_steps: int = 24
     max_cost_credits: int | None = None
     output_contract: dict = field(default_factory=dict)
 
@@ -105,12 +106,15 @@ def subagent_specs_for_surface(
         return (
             SubAgentSpec(
                 name="long_research_worker",
-                purpose="Perform bounded background research for a workflow or scheduled run.",
+                purpose=(
+                    "Execute a bounded background plan step and delegate work through "
+                    "the available Workspace services."
+                ),
                 profile=profile,
                 allowed_tools=("workspace_search", "web_search", "web_fetch", "search_tools"),
                 memory_mounts=workspace_memory_mounts,
-                max_steps=12,
-                max_cost_credits=10,
+                max_steps=PLAN_STEP_MAX_ROUNDS,
+                max_cost_credits=60,
                 output_contract={
                     "format": "research_notes",
                     "required_fields": ("summary", "evidence", "next_actions"),
@@ -136,7 +140,7 @@ def _subagent_spec_from_trace(data: dict[str, Any]) -> SubAgentSpec | None:
             profile=profile,
             allowed_tools=tuple(str(v) for v in (data.get("allowed_tools") or ()) if str(v or "").strip()),
             memory_mounts=tuple(str(v) for v in (data.get("memory_mounts") or ()) if str(v or "").strip()),
-            max_steps=int(data.get("max_steps") or 12),
+            max_steps=int(data.get("max_steps") or 24),
             max_cost_credits=data.get("max_cost_credits"),
             output_contract=dict(data.get("output_contract") or {}),
         )

@@ -5,14 +5,16 @@ import hashlib
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import BinaryIO
 
-from packages.core.services.office_process import office_conversion_file_limit
+from packages.core.services.office_process import (
+    office_conversion_file_limit,
+    run_in_process_group,
+)
 
 
 LEGACY_OFFICE_EDITABLE_CACHE_VERSION = "v1-exact-source-bounded"
@@ -422,7 +424,7 @@ def _convert_legacy_office_for_editing_sync(
         environment["XDG_CONFIG_HOME"] = os.path.join(temporary_directory, ".config")
         environment["XDG_CACHE_HOME"] = os.path.join(temporary_directory, ".cache")
         try:
-            result = subprocess.run(
+            result = run_in_process_group(
                 [
                     converter,
                     f"-env:UserInstallation={profile_uri}",

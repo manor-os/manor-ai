@@ -15,6 +15,11 @@ from packages.core.models.task import Task
 from packages.core.models.usage import TokenUsageLog, ToolCallLog
 from packages.core.models.workspace import Workspace
 from packages.core.ai.runtime import runtime_strategist_user_prompt
+from packages.core.constants.execution import (
+    COORDINATOR_CHILD_PARAM_KEY,
+    COORDINATOR_PARAM_KEY,
+    COORDINATOR_PARENT_STEP_PARAM_KEY,
+)
 from packages.core.services.workspace_evaluation import (
     build_workspace_evaluation,
     format_workspace_evaluation_for_prompt,
@@ -40,6 +45,98 @@ async def test_empty_workspace_evaluation_has_no_health_score_or_confidence(db_s
 
     assert snapshot["overall"]["score"] is None
     assert snapshot["overall"]["confidence"] == "insufficient"
+
+
+@pytest.mark.asyncio
+async def test_workspace_evaluation_excludes_coordinator_child_rollup(db_session) -> None:
+    from packages.core.services.credit_service import usd_to_credits
+
+    now = datetime.now(timezone.utc)
+    entity_id = generate_ulid()
+    workspace_id = generate_ulid()
+    plan_id = generate_ulid()
+    child_usd = 0.10
+    parent_own_usd = 0.15
+    rolled_up_usd = child_usd + parent_own_usd
+    workspace = Workspace(
+        id=workspace_id,
+        entity_id=entity_id,
+        name="Coordinator Evaluation Rollup",
+    )
+    plan = ExecutionPlan(
+        id=plan_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        plan_dag={"steps": []},
+        status="running",
+        execution_mode="live",
+        started_at=now - timedelta(minutes=2),
+    )
+    parent = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        step_key="coordinate",
+        kind="subagent",
+        params={COORDINATOR_PARAM_KEY: True},
+        step_status="running",
+        cost={},
+        started_at=now - timedelta(minutes=2),
+    )
+    child = ExecutionStep(
+        id=generate_ulid(),
+        plan_id=plan_id,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        step_key="coordinate__child",
+        kind="subagent",
+        params={
+            COORDINATOR_CHILD_PARAM_KEY: True,
+            COORDINATOR_PARENT_STEP_PARAM_KEY: parent.step_key,
+        },
+        step_status="done",
+        cost={"usd": child_usd},
+        started_at=now - timedelta(minutes=2),
+        finished_at=now - timedelta(minutes=1),
+    )
+    db_session.add_all([workspace, plan, parent, child])
+    await db_session.commit()
+
+    while_parent_running = await build_workspace_evaluation(
+        db_session,
+        workspace_id,
+        entity_id=entity_id,
+        window_days=30,
+        now=now,
+    )
+
+    assert while_parent_running["dimensions"]["execution_health"]["step_count"] == 2
+    assert (
+        while_parent_running["dimensions"]["cost_efficiency"]["window_step_credits"]
+        == usd_to_credits(child_usd)
+    )
+
+    plan.status = "completed"
+    plan.completed_at = now
+    parent.step_status = "done"
+    parent.cost = {"usd": rolled_up_usd}
+    parent.finished_at = now
+    await db_session.commit()
+
+    after_parent_rollup = await build_workspace_evaluation(
+        db_session,
+        workspace_id,
+        entity_id=entity_id,
+        window_days=30,
+        now=now,
+    )
+
+    assert after_parent_rollup["dimensions"]["execution_health"]["step_count"] == 1
+    assert (
+        after_parent_rollup["dimensions"]["cost_efficiency"]["window_step_credits"]
+        == usd_to_credits(rolled_up_usd)
+    )
 
 
 @pytest.mark.asyncio

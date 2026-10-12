@@ -279,7 +279,7 @@ async def _save_sandbox_file(entity_id: str, user_id: str = "", **kwargs: Any) -
             async with RuntimeFileProjectionTransactionFactory.create(
                 entity_id,
             ) as transaction:
-                target = transaction.write_bytes(
+                target = await transaction.write_bytes(
                     rel_path,
                     content_bytes,
                     expected_content_sha256=content_sha256,

@@ -32,5 +32,9 @@
     "mcp__google_drive__resolve_comment",
     "mcp__google_drive__delete_comment",
     "mcp__google_drive__create_reply"
-  ]
+  ],
+  "search": {
+    "terms": ["gdrive", "docs", "sheets", "cloud storage", "shared folder", "permissions", "trash", "google files"],
+    "examples": ["find file in my google drive", "share drive folder with teammate", "move files to another drive folder", "list revisions of drive document"]
+  }
 }

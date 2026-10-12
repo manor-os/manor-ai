@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 import asyncio
+from datetime import timezone
 from typing import Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.execution import (
@@ -16,7 +17,7 @@ from packages.core.constants.execution import (
 )
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.database import get_db
-from packages.core.models.task import Task
+from packages.core.models.task import Task, TaskLog
 from packages.core.models.user import User
 from packages.core.constants.task_actors import TaskActor
 from packages.core.constants.task import TaskLogType, TaskStatus, TaskType, TASK_STATUSES, TASK_PRIORITIES, TASK_CATEGORIES, TASK_TYPES
@@ -51,11 +52,20 @@ from apps.api.deps import (
 logger = logging.getLogger(__name__)
 
 _TASK_RUNTIME_DETAIL_KEYS = frozenset({
+    # Private pointer to the resolver-owned scheduled Task approval
+    # checkpoint. It may only be advanced by task_runtime_approvals.
+    "_runtime_tool_hitl_v1",
     "_pending_plan_dispatch",
     "_replan_context",
+    "_manual_execution",
+    "automation_origin",
+    "scheduled_job_id",
+    "scheduled_run_id",
+    "strategist_review_id",
     "customer_context",
     "proposal_external_authorization",
     "runtime_context",
+    "capability_blocker",
     "workspace_operation_draft_id",
     "workspace_work_batch_id",
 })
@@ -205,6 +215,14 @@ async def _enqueue_learning_candidate_applies(
 
 # ── Schemas ──
 
+class TaskInputRequestResponse(BaseModel):
+    message_id: str
+    request_id: str
+    plan_id: str
+    step_id: str
+    pending_action: dict
+
+
 class TaskResponse(BaseModel):
     id: str
     entity_id: str
@@ -221,6 +239,11 @@ class TaskResponse(BaseModel):
     agent_type: str | None = None
     owner_service_key: str | None = None
     owner_subscription_id: str | None = None
+    owner_agent_id: str | None = None
+    owner_agent_name: str | None = None
+    owner_agent_avatar: str | None = None
+    current_blocker: dict | None = None
+    pending_input_requests: list[TaskInputRequestResponse] = Field(default_factory=list)
     session_host_agent_id: str | None = None
     session_host_subscription_id: str | None = None
     session_host_name: str | None = None
@@ -372,6 +395,11 @@ class RetryTaskRequest(BaseModel):
     note: str | None = None
 
 
+class ResumeDeliveryReviewRequest(BaseModel):
+    expected_plan_id: str = Field(min_length=1, max_length=26)
+    expected_state_version: int = Field(ge=0, strict=True)
+
+
 class ApprovalDecisionRequest(BaseModel):
     choice: str
     note: str | None = None
@@ -512,6 +540,13 @@ async def _resolve_lookups(
         for t in tasks
         if getattr(t, "owner_subscription_id", None)
     }
+    owner_service_scopes = {
+        (t.entity_id, t.workspace_id, t.owner_service_key)
+        for t in tasks
+        if t.workspace_id
+        and getattr(t, "owner_service_key", None)
+        and not getattr(t, "owner_subscription_id", None)
+    }
 
     users: dict = {}
     agents: dict = {}
@@ -584,18 +619,31 @@ async def _resolve_lookups(
                     row = {"name": u.display_name or u.email, "avatar_url": getattr(u, "avatar_url", None)}
                     users.setdefault(u.entity_id, row)
 
-        if owner_subscription_ids and entity_ids:
+        if (owner_subscription_ids or owner_service_scopes) and entity_ids:
             result = await db.execute(
                 select(AgentSubscription).where(
-                    AgentSubscription.id.in_(owner_subscription_ids),
                     AgentSubscription.entity_id.in_(entity_ids),
                     AgentSubscription.status == "active",
+                    or_(
+                        AgentSubscription.id.in_(owner_subscription_ids),
+                        *[
+                            and_(
+                                AgentSubscription.entity_id == entity_id,
+                                AgentSubscription.workspace_id == workspace_id,
+                                AgentSubscription.service_key == service_key,
+                            )
+                            for entity_id, workspace_id, service_key in owner_service_scopes
+                        ],
+                    ),
                 )
             )
             for subscription in result.scalars():
                 subscription_hosts[subscription.id] = {
+                    "subscription_id": subscription.id,
                     "agent_id": subscription.agent_id,
+                    "subscription_entity_id": subscription.entity_id,
                     "workspace_id": subscription.workspace_id,
+                    "service_key": subscription.service_key,
                     "role_label": subscription.name or subscription.service_key,
                 }
 
@@ -625,6 +673,7 @@ async def _resolve_lookups(
             )
             for a in result.scalars():
                 agents[a.id] = {
+                    "entity_id": a.entity_id,
                     "name": a.name,
                     "avatar_url": getattr(a, "avatar_url", None),
                     "available": a.status == "active",
@@ -634,14 +683,143 @@ async def _resolve_lookups(
                 if agent:
                     agents[subscription_id] = {
                         **agent,
-                        "agent_id": subscription["agent_id"],
-                        "workspace_id": subscription["workspace_id"],
-                        "role_label": subscription["role_label"],
+                        **subscription,
                     }
     except Exception as e:
         logger.warning("Failed to resolve task lookups: %s", e)
 
     return users, agents, staff, workspaces, requester_ids, author_agent_ids
+
+
+def _owner_agent_for_task(task, agents: dict | None) -> dict | None:
+    """Resolve the accountable deployment without changing execution authorship."""
+    subscription_id = getattr(task, "owner_subscription_id", None)
+    service_key = getattr(task, "owner_service_key", None)
+    if not agents or not (subscription_id or (task.workspace_id and service_key)):
+        return None
+    candidates = (
+        [agents.get(subscription_id)] if subscription_id else agents.values()
+    )
+    matches = [
+        agent for agent in candidates
+        if agent
+        and agent.get("subscription_id")
+        and agent.get("subscription_entity_id") == task.entity_id
+        and agent.get("workspace_id") == task.workspace_id
+        and (not service_key or agent.get("service_key") == service_key)
+        and agent.get("entity_id") in (None, task.entity_id)
+        and agent.get("available")
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _current_blocker_for_task(task, latest_log=None) -> dict | None:
+    """Project current typed facts, never an error-message interpretation."""
+    if task.status != TaskStatus.BLOCKED.value:
+        return None
+    from packages.core.services.task_execution import task_execution_intent_generation
+
+    details = task.details if isinstance(task.details, dict) else {}
+    meta = getattr(latest_log, "meta", None)
+    meta = meta if isinstance(meta, dict) else {}
+    source = details.get("capability_blocker", meta.get("blocker"))
+    if source is None and "capability_blocker" not in details and "blocker" not in meta:
+        # Legacy logs have no generation fence. Require both the latest recovery
+        # event and a lifecycle clock that proves it is not from an earlier wait.
+        changed_at = getattr(task, "status_changed_at", None)
+        observed_at = getattr(latest_log, "created_at", None)
+        if (
+            latest_log is None
+            or latest_log.log_type != TaskLogType.AI_EXECUTION_FAILED.value
+            or meta.get("capability_gap") is not True
+            or not isinstance(meta.get("missing_capabilities"), list)
+            or not any(isinstance(value, str) and value for value in meta["missing_capabilities"])
+            or not changed_at or not observed_at
+            or observed_at.replace(tzinfo=observed_at.tzinfo or timezone.utc)
+            < changed_at.replace(tzinfo=changed_at.tzinfo or timezone.utc)
+        ):
+            return None
+        source = {
+            "kind": "capability_unavailable",
+            "stage": "planning",
+            "generation": task_execution_intent_generation(task),
+            "missing_capabilities": meta.get("missing_capabilities"),
+        }
+    if (
+        not isinstance(source, dict)
+        or source.get("generation") != task_execution_intent_generation(task)
+        or source.get("kind") not in (
+            "capability_unavailable", "tool_missing", "connection_required",
+            "approval_required", "policy_denied",
+        )
+        or source.get("stage") not in ("planning", "execution")
+    ):
+        return None
+    missing = source.get("missing_capabilities")
+    missing = [value for value in missing if isinstance(value, str) and value] if isinstance(missing, list) else []
+    affected = source.get("affected_agents")
+    affected = [
+        {key: value for key, value in agent.items() if key in {
+            "service_key", "subscription_id", "agent_id", "agent_name",
+        } and isinstance(value, str) and value}
+        for agent in affected if isinstance(agent, dict)
+    ] if isinstance(affected, list) else []
+    result = {
+        "kind": source["kind"], "stage": source["stage"],
+        "generation": source["generation"],
+        "missing_capabilities": list(dict.fromkeys(missing)),
+        "affected_agents": [agent for agent in affected if agent],
+    }
+    for key in ("operation_draft_id", "request_id", "log_id", "observed_at"):
+        if isinstance(source.get(key), str) and source[key]:
+            result[key] = source[key]
+    if latest_log is not None:
+        result["log_id"] = latest_log.id
+        result["observed_at"] = latest_log.created_at.isoformat()
+    return result
+
+
+async def _current_task_blockers(db: AsyncSession, tasks) -> dict[str, dict]:
+    """Use current state directly; batch only historical compatibility lookups."""
+    blockers = {}
+    legacy_tasks = {}
+    for task in tasks:
+        blocker = _current_blocker_for_task(task)
+        if blocker is not None:
+            blockers[task.id] = blocker
+        elif task.status == TaskStatus.BLOCKED.value and "capability_blocker" not in (task.details or {}):
+            legacy_tasks[task.id] = task
+    if not legacy_tasks:
+        return blockers
+    recovery_types = (
+        TaskLogType.STATUS_CHANGE.value, TaskLogType.ASSIGNMENT_CHANGE.value,
+        TaskLogType.REASSIGN.value, TaskLogType.MANUAL_RETRY.value,
+        TaskLogType.AI_NEEDS_REPLAN.value, TaskLogType.AI_EXECUTION_STARTED.value,
+        TaskLogType.AI_EXECUTION_COMPLETED.value, TaskLogType.AI_EXECUTION_FAILED.value,
+        TaskLogType.AI_HITL_REQUESTED.value, TaskLogType.AI_HITL_RESUMED.value,
+        TaskLogType.PLAN_STARTED.value, TaskLogType.PLAN_COMPLETED.value,
+        TaskLogType.PLAN_FAILED.value, TaskLogType.PLAN_CANCELLED.value,
+        TaskLogType.PLAN_REPLANNED.value,
+    )
+    ranked = select(
+        TaskLog.id,
+        func.row_number().over(
+            partition_by=TaskLog.task_id,
+            order_by=(TaskLog.created_at.desc(), TaskLog.id.desc()),
+        ).label("position"),
+    ).where(
+        TaskLog.task_id.in_(legacy_tasks),
+        TaskLog.log_type.in_(recovery_types),
+    ).subquery()
+    result = await db.execute(
+        select(TaskLog).join(ranked, ranked.c.id == TaskLog.id)
+        .where(ranked.c.position == 1)
+    )
+    for log in result.scalars():
+        blocker = _current_blocker_for_task(legacy_tasks[log.task_id], log)
+        if blocker is not None:
+            blockers[log.task_id] = blocker
+    return blockers
 
 
 async def _active_execution_task_ids(db: AsyncSession, tasks) -> set[str]:
@@ -679,6 +857,7 @@ def _to_response(
     author_agent_ids: dict[str, str | None] | None = None,
     *,
     execution_active: bool = False,
+    current_blocker: dict | None = None,
 ) -> TaskResponse:
     """Convert a Task ORM object to TaskResponse with resolved display names.
 
@@ -718,6 +897,7 @@ def _to_response(
         if author_agent_ids is not None
         else None
     )
+    owner_agent = _owner_agent_for_task(t, agents) or {}
 
     if t.workspace_id and workspaces:
         ws = workspaces.get(t.workspace_id)
@@ -803,6 +983,15 @@ def _to_response(
     # queries load the persisted values normally.
     updated_at = getattr(t, "__dict__", {}).get("updated_at")
     status_changed_at = getattr(t, "__dict__", {}).get("status_changed_at")
+    actual_output = getattr(t, "actual_output", None)
+    if actual_output is not None and not isinstance(actual_output, dict):
+        # JSONB accepted scalar outputs before TaskResponse required an object.
+        # Preserve legacy text in the current task-runner response field.
+        actual_output = (
+            {"response": actual_output}
+            if isinstance(actual_output, str)
+            else {"result": actual_output}
+        )
 
     return TaskResponse(
         id=t.id, entity_id=t.entity_id, title=t.title,
@@ -813,6 +1002,10 @@ def _to_response(
         agent_id=t.agent_id, agent_type=t.agent_type,
         owner_service_key=getattr(t, "owner_service_key", None),
         owner_subscription_id=getattr(t, "owner_subscription_id", None),
+        owner_agent_id=owner_agent.get("agent_id"),
+        owner_agent_name=owner_agent.get("name"),
+        owner_agent_avatar=owner_agent.get("avatar_url"),
+        current_blocker=current_blocker or _current_blocker_for_task(t),
         session_host_agent_id=session_host_agent_id,
         session_host_subscription_id=session_host_subscription_id,
         session_host_name=session_host_name,
@@ -832,7 +1025,7 @@ def _to_response(
         sla_breached=bool(getattr(t, "sla_breached", False)),
         escalation_level=int(getattr(t, "escalation_level", 0) or 0),
         details=t.details or {},
-        actual_output=getattr(t, "actual_output", None),
+        actual_output=actual_output,
         deadline=t.deadline.isoformat() if t.deadline else None,
         scheduled_at=(t.details or {}).get("scheduled_at"),
         duration_minutes=(t.details or {}).get("duration_minutes"),
@@ -1042,6 +1235,7 @@ async def list_my_tasks(
         await _resolve_lookups(db, tasks)
     )
     active_execution_ids = await _active_execution_task_ids(db, tasks)
+    blockers = await _current_task_blockers(db, tasks)
     return TaskListResponse(
         items=[
             _to_response(
@@ -1053,6 +1247,7 @@ async def list_my_tasks(
                 requester_ids,
                 author_agent_ids,
                 execution_active=t.id in active_execution_ids,
+                current_blocker=blockers.get(t.id),
             )
             for t in tasks
         ],
@@ -1106,17 +1301,22 @@ async def create_new_task(
     except TaskSessionHostError as exc:
         raise HTTPException(409, str(exc)) from exc
 
-    # If assigned to an AI agent (or manor master), dispatch Celery task
-    from packages.core.constants.agents import is_master_agent, MANOR_AGENT_ID
-    if (
-        req.task_type != TaskType.INTERACTIVE.value
-        and (req.agent_id or is_master_agent(req.agent_id, req.agent_type))
-    ):
+    # Explicit AI execution intent can name either a legacy Agent or a
+    # Workspace service deployment. A naked Workspace Task stays pending even
+    # if Workspace defaults later populate its runtime requirements; the
+    # closed factory decides which explicit intent is actually dispatchable.
+    from packages.core.constants.agents import is_master_agent
+    has_explicit_execution_intent = bool(
+        req.agent_id
+        or req.owner_service_key
+        or req.owner_subscription_id
+        or is_master_agent(req.agent_id, req.agent_type)
+    )
+    if has_explicit_execution_intent:
         try:
-            from packages.core.tasks.ai_tasks import run_agent_task
-            dispatch_id = req.agent_id or MANOR_AGENT_ID
-            run_agent_task.delay(task.id, dispatch_id)
-            logger.info("Dispatched agent task: task=%s agent=%s type=%s", task.id, dispatch_id, req.agent_type)
+            from packages.core.services.task_execution import queue_initial_task_execution
+
+            await queue_initial_task_execution(db, task, user_id=user.id)
         except Exception as e:
             logger.warning("Failed to dispatch agent task: %s", e)
 
@@ -1238,6 +1438,8 @@ async def put_task_board_preferences(
 async def task_board(
     workspace_id: str | None = Query(None),
     workspace_id_alias: str | None = Query(None, alias="workspaceId"),
+    limit_per_status: int = Query(50, ge=1, le=200),
+    offset_per_status: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1251,6 +1453,8 @@ async def task_board(
     board = await get_tasks_by_status(
         db, user.entity_id, workspace_id=effective_workspace_id,
         readable_workspace_ids=readable_ws,
+        limit_per_status=limit_per_status,
+        offset_per_status=offset_per_status,
     )
     counts = board.pop("_counts", {})
     all_tasks = [t for tasks in board.values() for t in tasks]
@@ -1258,6 +1462,7 @@ async def task_board(
         await _resolve_lookups(db, all_tasks)
     )
     active_execution_ids = await _active_execution_task_ids(db, all_tasks)
+    blockers = await _current_task_blockers(db, all_tasks)
     result = {
         status: [
             _to_response(
@@ -1269,6 +1474,7 @@ async def task_board(
                 requester_ids,
                 author_agent_ids,
                 execution_active=t.id in active_execution_ids,
+                current_blocker=blockers.get(t.id),
             )
             for t in tasks
         ]
@@ -1302,6 +1508,54 @@ async def move_task_endpoint(
     return _to_response(
         task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
     )
+
+
+@router.post("/{task_id}/resume-delivery-review")
+async def resume_delivery_review_endpoint(
+    task_id: str,
+    req: ResumeDeliveryReviewRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Explicitly recheck a stopped delivery without retrying any writer."""
+    task = await get_task(db, task_id, user.entity_id)
+    if not task:
+        raise HTTPException(404, "Task not found")
+    await require_workspace_writable(db, user, task.workspace_id)
+    from packages.core.plans.executor import (
+        resume_task_coordinator_delivery_review, resolve_resumed_delivery_review_hitl,
+    )
+    from packages.core.services.task_acceptance_review import TaskAcceptanceError
+
+    try:
+        resumed = await resume_task_coordinator_delivery_review(
+            db, task_id=task_id, plan_id=req.expected_plan_id,
+            expected_state_version=req.expected_state_version, actor_user_id=user.id,
+        )
+    except TaskAcceptanceError as exc:
+        await db.rollback()
+        raise HTTPException(409, {"code": exc.code, "message": str(exc)}) from exc
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    await add_task_log(
+        db, task_id, TaskLogType.AI_HITL_RESUMED,
+        "Resumed verification of the existing delivery; completed Steps were not retried.",
+        actor=TaskActor.USER, created_by=user.display_name or user.email,
+        metadata={"plan_id": req.expected_plan_id, "mode": "delivery_review", "state_version": resumed["state_version"]},
+    )
+    await db.commit()
+    cleanup_pending = False
+    try:
+        await resolve_resumed_delivery_review_hitl(db, task_id=task_id, plan_id=req.expected_plan_id, actor_user_id=user.id)
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        cleanup_pending = True
+        logger.exception("Resumed Task delivery review; obsolete HITL cleanup deferred: %s", task_id)
+    # The durable coordinator outbox owns dispatch. Do not also enqueue a
+    # Plan/Task retry, which would create a second execution intention.
+    return {"status": "review_queued", **resumed, "reset_steps": 0, "hitl_cleanup_pending": cleanup_pending}
 
 
 @router.post("/{task_id}/retry", response_model=RetryTaskResponse)
@@ -1413,11 +1667,16 @@ async def _resume_hitl(
     task,
     user: User,
     *,
-    step_id: str | None,
+    step_id: str | None = None,
     response_text: str,
     payload: dict,
 ) -> dict:
-    """Resume a task waiting on structured human input."""
+    """Resume a task waiting on structured human input.
+
+    ``step_id`` names a plan step; a legacy agent task (parked by
+    ``request_input`` or by the supervisor's needs_hitl verdict) has none,
+    which is how the comment path calls this.
+    """
     from datetime import datetime, timezone
 
     submitted_by = user.display_name or user.email
@@ -1616,34 +1875,22 @@ async def _resume_hitl(
                     "step_id": waiting_step.id,
                 },
             )
-            await db.commit()
-            dispatched = False
-            try:
-                from packages.core.tasks.ai_tasks import run_plan
-                run_plan.delay(plan.id)
-                dispatched = True
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Plan HITL resume dispatch failed: plan=%s error=%s", plan.id, exc)
-                try:
-                    from packages.core.services.task_retry_service import (
-                        mark_plan_continuation_dispatch_failed,
-                    )
+            from packages.core.plans.wakeup import stage_plan_cycle_wake
 
-                    await mark_plan_continuation_dispatch_failed(
-                        db,
-                        plan_id=plan.id,
-                        user_id=user.id,
-                        reason="task_hitl_dispatch_failed",
-                    )
-                    await db.commit()
-                    await db.refresh(task)
-                except Exception:
-                    await db.rollback()
-                    logger.error(
-                        "Could not persist Plan HITL dispatch failure: plan=%s",
-                        plan.id,
-                        exc_info=True,
-                    )
+            plan_wake = await stage_plan_cycle_wake(
+                db,
+                plan.id,
+                reason="task_hitl_resumed",
+            )
+            await db.commit()
+            from packages.core.plans.wakeup import dispatch_plan_cycle_wake_hint
+
+            if plan_wake is not None:
+                dispatch_plan_cycle_wake_hint(
+                    plan_wake,
+                    reason="task_hitl_post_commit_hint",
+                )
+            dispatched = plan_wake is not None
             from packages.core.services.realtime import broadcast_task_runtime_update
 
             await broadcast_task_runtime_update(
@@ -1672,60 +1919,143 @@ async def _resume_hitl(
             "detail": "The Plan input could not be applied safely.",
         }
 
-    # Legacy Agent-run HITL has no Plan/Step or Strategist owner. Fail closed
-    # for every Plan-owned task, including pending approval, draft, replanned,
-    # and planning-failure states that are intentionally outside live_plan_statuses.
-    has_plan_origin = (await db.execute(
-        select(ExecutionPlan.id).where(
-            ExecutionPlan.task_id == task.id,
-            ExecutionPlan.entity_id == task.entity_id,
-        ).limit(1)
-    )).scalar_one_or_none() is not None
-    if has_plan_origin or task.owner_subscription_id or task.owner_service_key:
+    # Re-read and lock the Task before entering the compatibility runtime. The
+    # closed factory owns this decision; assignment fields are not a second
+    # routing switch. An exact Plan row remains an authoritative origin record,
+    # including states intentionally outside ``live_plan_statuses`` above.
+    # The per-Task approval boundary comes first: a terminal transition takes
+    # it before the input request and the Task, so an answer serializes with
+    # it (and with a Task agent loop's park) instead of locking in reverse.
+    from packages.core.services.task_runtime_approvals import lock_task_runtime_approval_boundary
+
+    await lock_task_runtime_approval_boundary(db, task_id=task.id)
+    locked_task = (await db.execute(
+        select(Task).where(
+            Task.id == task.id,
+            Task.entity_id == task.entity_id,
+        ).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if locked_task is None:
         return {
             "resumed": False,
             "dispatched": False,
             "mode": None,
-            "plan_id": getattr(plan, "id", None),
+            "plan_id": None,
+            "step_id": step_id,
+            "detail": "This Task is no longer available for input resume.",
+        }
+    task = locked_task
+
+    from packages.core.services.task_agent_loop_hitl import task_agent_loop_waiting_on_input
+
+    if not step_id and await task_agent_loop_waiting_on_input(db, task):
+        # A Task agent loop parked on its question: the shared answer service
+        # writes the answer into its checkpoint and stages its wake.
+        from packages.core.services.task_input_resume import apply_task_input_answer
+
+        applied = await apply_task_input_answer(
+            db,
+            task=task,
+            user_id=user.id,
+            user_label=submitted_by,
+            response_text=response_text,
+            payload=payload,
+        )
+        if applied["resumed"]:
+            await db.commit()
+            # The wake was committed with the answer; the coordinator outbox
+            # delivers it (there is no separate post-commit hint for it).
+            from packages.core.services.realtime import broadcast_task_runtime_update
+
+            await broadcast_task_runtime_update(
+                task.entity_id,
+                task_id=task.id,
+                workspace_id=task.workspace_id,
+                event="task_hitl_resolved",
+            )
+            return {
+                "resumed": True,
+                "dispatched": True,
+                "mode": "agent_loop",
+                "plan_id": None,
+                "step_id": None,
+            }
+        return {
+            "resumed": False,
+            "dispatched": False,
+            "mode": None,
+            "plan_id": None,
+            "step_id": None,
+            "detail": "This Task is no longer waiting for an answer.",
+        }
+
+    from packages.core.constants.task import TaskRuntimeKind
+    from packages.core.services.task_execution import resolve_task_execution
+
+    execution = await resolve_task_execution(db, task)
+    origin_plan_id = (await db.execute(
+        select(ExecutionPlan.id).where(
+            ExecutionPlan.task_id == task.id,
+            ExecutionPlan.entity_id == task.entity_id,
+        ).order_by(ExecutionPlan.created_at.desc()).limit(1)
+    )).scalar_one_or_none()
+    if origin_plan_id is not None:
+        return {
+            "resumed": False,
+            "dispatched": False,
+            "mode": None,
+            "plan_id": origin_plan_id,
             "step_id": step_id,
             "detail": "This Task is owned by Planner execution; resolve its Plan approval, input, or recovery action instead.",
         }
+    if execution.runtime_kind is not TaskRuntimeKind.LEGACY_AGENT:
+        detail = (
+            "This Task is owned by Planner execution; resolve its Plan "
+            "approval, input, or recovery action instead."
+            if execution.runtime_kind in {
+                TaskRuntimeKind.COORDINATED_PLAN,
+                TaskRuntimeKind.PLAN_RESUME,
+            }
+            else (
+                f"Task runtime {execution.runtime_kind.value!r} does not "
+                "support legacy Agent input resume."
+            )
+        )
+        return {
+            "resumed": False,
+            "dispatched": False,
+            "mode": None,
+            "plan_id": None,
+            "step_id": step_id,
+            "detail": detail,
+        }
 
-    # Only an origin-free legacy Agent task may resume through run_agent_task.
-    from packages.core.constants.agents import MANOR_AGENT_ID
-    from packages.core.services.task_service import task_executing_agent_id
+    # Only an origin-free, factory-selected legacy Agent task may resume
+    # through run_agent_task.
+    from packages.core.services.task_input_resume import (
+        apply_task_input_answer,
+        dispatch_task_input_resume,
+    )
 
     if task.status == TaskStatus.WAITING_ON_CUSTOMER:
-        details = dict(task.details or {})
-        details["_hitl_response"] = response_text
-        details["_hitl_payload"] = payload
-        details["_hitl_responded_by"] = submitted_by
-        await update_task(db, task.id, user.entity_id, status="pending", details=details)
-        await add_task_log(
+        applied = await apply_task_input_answer(
             db,
-            task.id,
-            TaskLogType.AI_HITL_RESUMED,
-            f"Human input received: {response_text[:300]}" if response_text else "Human input received.",
-            actor=TaskActor.USER,
-            created_by=submitted_by,
-            metadata={**meta, "mode": "agent"},
+            task=task,
+            user_id=user.id,
+            user_label=submitted_by,
+            response_text=response_text,
+            payload=payload,
         )
-        dispatch_id = await task_executing_agent_id(db, task) or MANOR_AGENT_ID
-        await db.commit()
-        dispatched = False
-        try:
-            from packages.core.tasks.ai_tasks import run_agent_task
-            run_agent_task.delay(task.id, dispatch_id)
-            dispatched = True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Agent HITL resume dispatch failed: task=%s error=%s", task.id, exc)
-        return {
-            "resumed": True,
-            "dispatched": dispatched,
-            "mode": "agent",
-            "plan_id": None,
-            "step_id": None,
-        }
+        if applied["resumed"]:
+            await db.commit()
+            dispatched = dispatch_task_input_resume(task.id, applied["dispatch_agent_id"])
+            return {
+                "resumed": True,
+                "dispatched": dispatched,
+                "mode": "agent",
+                "plan_id": None,
+                "step_id": None,
+            }
 
     return {
         "resumed": False,
@@ -1952,6 +2282,123 @@ async def decide_approval_task(
     )
 
 
+async def _task_input_requests(db: AsyncSession, task: Task) -> list[TaskInputRequestResponse]:
+    """Project existing, live INPUT cards; never mint a decision from Step prose.
+
+    The Workspace Chat resolver remains the sole writer for these cards. In
+    particular a subagent's WAITING_HUMAN state alone cannot identify an input
+    rather than permission, login, review, or effect reconciliation.
+    """
+    if not task.workspace_id or task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
+        return []
+    from sqlalchemy.orm import aliased
+
+    from packages.core.ai.runtime import runtime_public_tool_payload
+    from packages.core.constants.approvals import ApprovalOriginKind, ApprovalStatus, HitlType
+    from packages.core.constants.execution import WorkLeaseStatus
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+    from packages.core.models.hitl_request import HitlRequest
+    from packages.core.models.task import Conversation, Message
+    from packages.core.models.worker import WorkLease
+    from packages.core.workspace_chat.service import open_pending_action_filters
+
+    newer_request = aliased(HitlRequest)
+    latest_request_id = (
+        select(newer_request.id)
+        .where(
+            newer_request.entity_id == task.entity_id,
+            newer_request.workspace_id == task.workspace_id,
+            newer_request.origin_task_id == task.id,
+            newer_request.origin_plan_id == ExecutionStep.plan_id,
+            newer_request.origin_step_id == ExecutionStep.id,
+            newer_request.origin_kind.in_((ApprovalOriginKind.LEASE.value, ApprovalOriginKind.STEP.value)),
+        )
+        .order_by(newer_request.created_at.desc(), newer_request.id.desc())
+        .limit(1).correlate(ExecutionStep).scalar_subquery()
+    )
+    latest_lease_id = (
+        select(WorkLease.id)
+        .where(
+            WorkLease.step_id == ExecutionStep.id,
+            WorkLease.plan_id == ExecutionStep.plan_id,
+            WorkLease.entity_id == task.entity_id,
+            WorkLease.workspace_id == task.workspace_id,
+        )
+        .order_by(WorkLease.leased_at.desc(), WorkLease.id.desc())
+        .limit(1).correlate(ExecutionStep).scalar_subquery()
+    )
+    live_lease = (
+        select(WorkLease.id).where(
+            WorkLease.id == latest_lease_id,
+            WorkLease.status == WorkLeaseStatus.NEEDS_HUMAN.value,
+            HitlRequest.dedup_key == "lease:" + WorkLease.id + ":" + Message.pending_action["kind"].as_string(),
+        ).correlate(ExecutionStep, HitlRequest, Message).exists()
+    )
+    rows = (await db.execute(
+        select(Message, HitlRequest, ExecutionStep)
+        .join(Conversation, Conversation.id == Message.conversation_id)
+        .join(HitlRequest, HitlRequest.id == Message.pending_action["approval_request_id"].as_string())
+        .join(ExecutionStep, ExecutionStep.id == HitlRequest.origin_step_id)
+        .join(ExecutionPlan, ExecutionPlan.id == ExecutionStep.plan_id)
+        .where(
+            *open_pending_action_filters(task.entity_id, task.workspace_id),
+            Message.message_kind == "hitl_request",
+            or_(
+                Conversation.scope == "workspace_main",
+                and_(Conversation.scope == "workspace_thread", Conversation.thread_ref_kind == "plan", Conversation.thread_ref_id == ExecutionPlan.id),
+            ),
+            ExecutionPlan.task_id == task.id,
+            ExecutionPlan.entity_id == task.entity_id,
+            ExecutionPlan.workspace_id == task.workspace_id,
+            ExecutionPlan.status.in_(("running", "paused", "needs_attention")),
+            ExecutionStep.entity_id == task.entity_id,
+            ExecutionStep.workspace_id == task.workspace_id,
+            ExecutionStep.step_status == ExecutionStepStatus.WAITING_HUMAN.value,
+            HitlRequest.id == latest_request_id,
+            HitlRequest.hitl_type == HitlType.INPUT.value,
+            HitlRequest.status == ApprovalStatus.PENDING.value,
+            or_(HitlRequest.origin_message_id.is_(None), HitlRequest.origin_message_id == Message.id),
+            or_(HitlRequest.origin_conversation_id.is_(None), HitlRequest.origin_conversation_id == Conversation.id),
+            Message.pending_action["kind"].as_string().in_(("human_input", "needs_input")),
+            or_(Message.pending_action["hitl_type"].as_string().is_(None), Message.pending_action["hitl_type"].as_string() == HitlType.INPUT.value),
+            Message.pending_action["step_id"].as_string() == ExecutionStep.id,
+            Message.pending_action["plan_id"].as_string() == ExecutionPlan.id,
+            or_(
+                and_(HitlRequest.origin_kind == ApprovalOriginKind.LEASE.value, live_lease),
+                and_(HitlRequest.origin_kind == ApprovalOriginKind.STEP.value, ExecutionStep.kind == "human"),
+            ),
+        )
+        .order_by(ExecutionStep.created_at.asc(), ExecutionStep.id.asc(), Message.created_at.desc(), Message.id.desc())
+        .limit(100)
+    )).all()
+    requests: list[TaskInputRequestResponse] = []
+    seen: set[str] = set()
+    for message, request, step in rows:
+        if step.id in seen:
+            continue
+        seen.add(step.id)
+        # Public form fields only: no continuation, token, argument preview,
+        # or arbitrary provider payload is copied into the Task response.
+        action = runtime_public_tool_payload({
+            key: value for key, value in message.pending_action.items()
+            if key in {"kind", "title", "context_summary", "questions", "input_schema", "prompt", "question", "options"}
+        })
+        action.update({
+            "hitl_type": HitlType.INPUT.value,
+            "approval_request_id": request.id,
+            "plan_id": step.plan_id,
+            "step_id": step.id,
+            "task_id": task.id,
+        })
+        if action["kind"] == "human_input":
+            action.setdefault("prompt", step.human_input_prompt or request.reason or "")
+        requests.append(TaskInputRequestResponse(
+            message_id=message.id, request_id=request.id,
+            plan_id=step.plan_id, step_id=step.id, pending_action=action,
+        ))
+    return requests
+
+
 @router.get("/{task_id}", response_model=TaskResponse)
 async def get_one_task(
     task_id: str,
@@ -1971,9 +2418,13 @@ async def get_one_task(
     users, agents, staff, workspaces, requester_ids, author_agent_ids = (
         await _resolve_lookups(db, [task])
     )
-    return _to_response(
+    blockers = await _current_task_blockers(db, [task])
+    response = _to_response(
         task, users, agents, staff, workspaces, requester_ids, author_agent_ids,
+        current_blocker=blockers.get(task.id),
     )
+    response.pending_input_requests = await _task_input_requests(db, task)
+    return response
 
 
 @router.delete("/{task_id}", status_code=204)
@@ -2045,6 +2496,10 @@ async def update_one_task(
             await require_workspace_writable(db, user, new_ws)
     old_agent_id = old_task.agent_id if old_task else None
     old_agent_type = old_task.agent_type if old_task else None
+    old_owner_service_key = old_task.owner_service_key if old_task else None
+    old_owner_subscription_id = (
+        old_task.owner_subscription_id if old_task else None
+    )
     old_status = old_task.status if old_task else None
 
     requested_agent_id = str(req.agent_id or "").strip()
@@ -2094,41 +2549,61 @@ async def update_one_task(
     from packages.core.services.task_session import TaskSessionHostError
 
     try:
-        task = await update_task(db, task_id, user.entity_id, user_id=user.id, **update_data)
+        task = await update_task(
+            db, task_id, user.entity_id, user_id=user.id, manual_execution=True, **update_data,
+        )
     except (TaskStatusTransitionError, TaskSessionHostError) as exc:
         raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
-    # If agent assignment changed, dispatch Celery task
-    from packages.core.constants.agents import is_master_agent as _is_master, MANOR_AGENT_ID as _MANOR_ID
-    new_agent_id = update_data.get("agent_id")
-    new_agent_type = update_data.get("agent_type")
+    # Any explicit execution-identity change enters the closed factory. The
+    # factory, not this API, decides whether that Task type/runtime starts.
+    from packages.core.constants.agents import is_master_agent as _is_master
+    new_agent_id = task.agent_id
+    new_agent_type = task.agent_type
     was_master = _is_master(old_agent_id, old_agent_type)
     now_master = _is_master(new_agent_id, new_agent_type)
-    is_new_agent = (new_agent_id and new_agent_id != old_agent_id) or (now_master and not was_master)
+    execution_identity_changed = bool(
+        ("agent_id" in update_data and new_agent_id != old_agent_id)
+        or ("agent_type" in update_data and now_master != was_master)
+        or (
+            "owner_service_key" in update_data
+            and task.owner_service_key != old_owner_service_key
+        )
+        or (
+            "owner_subscription_id" in update_data
+            and task.owner_subscription_id != old_owner_subscription_id
+        )
+    )
+    has_execution_identity = bool(
+        new_agent_id
+        or task.owner_service_key
+        or task.owner_subscription_id
+        or now_master
+    )
     if (
-        task.task_type != TaskType.INTERACTIVE.value
-        and is_new_agent
+        execution_identity_changed
+        and has_execution_identity
         and task.status not in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED,)
     ):
         try:
-            from packages.core.tasks.ai_tasks import run_agent_task
-            dispatch_id = new_agent_id or _MANOR_ID
-            run_agent_task.delay(task.id, dispatch_id)
-            logger.info("Dispatched agent task (reassigned): task=%s agent=%s type=%s", task.id, dispatch_id, new_agent_type)
+            from packages.core.services.task_execution import queue_initial_task_execution
+
+            await queue_initial_task_execution(db, task, user_id=user.id)
         except Exception as e:
             logger.warning("Failed to dispatch agent task: %s", e)
 
-    # HITL resumption: status changed from waiting back to actionable while agent is assigned
+    # HITL resumption is an explicit execution intent. Runtime selection and
+    # dispatchability come exclusively from the factory.
     new_status = update_data.get("status")
-    if (task.task_type != TaskType.INTERACTIVE.value
-        and old_status == "waiting_on_customer" and new_status in ("pending", "in_progress")
-        and (task.agent_id or _is_master(task.agent_id, task.agent_type))):
+    if (
+        old_status == "waiting_on_customer"
+        and new_status in ("pending", "in_progress")
+    ):
         try:
-            from packages.core.tasks.ai_tasks import run_agent_task
-            dispatch_id = task.agent_id or _MANOR_ID
-            run_agent_task.delay(task.id, dispatch_id)
-            logger.info("HITL resumed (status change): task=%s agent=%s", task.id, dispatch_id)
+            from packages.core.services.task_execution import queue_initial_task_execution
+
+            await queue_initial_task_execution(db, task, user_id=user.id)
         except Exception as e:
             logger.warning("HITL resumption failed: %s", e)
 
@@ -2243,6 +2718,16 @@ async def add_log(
         )
         if mention_agent_items or mention_user_items:
             meta["mentions"] = mention_agent_items + mention_user_items
+    if (
+        task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,)
+        and req.log_type == TaskLogType.COMMENT
+    ):
+        # This comment may answer a waiting Task (_resume_hitl below). Take the
+        # per-Task approval boundary before the log row references the Task,
+        # in the terminal path's boundary -> request -> Task order.
+        from packages.core.services.task_runtime_approvals import lock_task_runtime_approval_boundary
+
+        await lock_task_runtime_approval_boundary(db, task_id=task.id)
     log = await add_task_log(
         db, task_id, req.log_type, req.content,
         actor=TaskActor.USER,
@@ -2255,7 +2740,7 @@ async def add_log(
     # HITL resumption: comment on a waiting task resumes execution
     if task.status in (TaskStatus.WAITING_ON_CUSTOMER, TaskStatus.IN_PROGRESS,) and req.log_type == TaskLogType.COMMENT:
         payload = {"response": req.content, "fields": {}, "source": "comment"}
-        hitl_result = await _resume_hitl(db, task, user, response_text=req.content.strip(), payload=payload)
+        hitl_result = await _resume_hitl(db, task, user, step_id=None, response_text=req.content.strip(), payload=payload)
         if hitl_result.get("resumed"):
             queued_learning_ids.extend(await _record_task_user_decision_evidence(
                 db,

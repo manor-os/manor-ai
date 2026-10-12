@@ -26,6 +26,17 @@ TEST_DATABASE_URL = os.getenv(
 )
 
 
+@pytest.fixture(autouse=True)
+def _exercise_enabled_embedding_implementation(monkeypatch):
+    from packages.core.services import embedding_service
+
+    monkeypatch.setattr(
+        embedding_service,
+        "_EMBEDDINGS_TEMPORARILY_PAUSED",
+        False,
+    )
+
+
 @pytest_asyncio.fixture
 async def db_session(_test_database_guard):
     # Plain pooled engine — NOT NullPool. Confirmed by hand (30/30 clean vs.
@@ -196,9 +207,11 @@ async def test_reindexing_replaces_chunks_instead_of_accumulating(db_session):
         pytest.skip("pgvector extension not available")
 
     from unittest.mock import AsyncMock, MagicMock, patch
+    from packages.core.models.user import Entity
     from packages.core.services.embedding_service import index_document
 
     entity_id = generate_ulid()
+    session.add(Entity(id=entity_id, name="Chunk reindexing entity"))
     doc_id = await _make_document(session, entity_id, "living-doc.md")
     # A chunk from a "previous version" of this document, as if a prior
     # index_document run had already populated it.

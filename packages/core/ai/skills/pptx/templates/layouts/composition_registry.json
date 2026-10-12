@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "canvas": {"width": 1280, "height": 720},
+  "families": {
+    "split-hero": {"use": "Opening claim with one dominant visual", "avoid": "Dense tables", "density": "sparse", "regions": [{"id": "title", "x": 64, "y": 64, "width": 650, "height": 165}, {"id": "visual", "x": 760, "y": 90, "width": 450, "height": 530}]},
+    "claim-evidence": {"use": "One claim supported by a focused exhibit", "avoid": "Multiple unrelated claims", "density": "medium", "regions": [{"id": "header", "x": 64, "y": 48, "width": 1152, "height": 150}, {"id": "evidence", "x": 80, "y": 225, "width": 1120, "height": 410}]},
+    "comparison": {"use": "Two alternatives with the same comparison fields", "avoid": "Long prose", "density": "medium", "regions": [{"id": "header", "x": 64, "y": 48, "width": 1152, "height": 140}, {"id": "left", "x": 70, "y": 220, "width": 540, "height": 410}, {"id": "right", "x": 670, "y": 220, "width": 540, "height": 410}]},
+    "metric-focus": {"use": "One verified quantitative outcome", "avoid": "Unverified figures", "density": "sparse", "regions": [{"id": "header", "x": 64, "y": 48, "width": 1152, "height": 140}, {"id": "metric", "x": 100, "y": 230, "width": 560, "height": 340}, {"id": "context", "x": 740, "y": 230, "width": 430, "height": 340}]},
+    "process-flow": {"use": "Three to five ordered stages", "avoid": "Non-sequential alternatives", "density": "medium", "regions": [{"id": "header", "x": 64, "y": 48, "width": 1152, "height": 140}, {"id": "flow", "x": 70, "y": 235, "width": 1140, "height": 385}]},
+    "timeline": {"use": "Dated milestones and their dependency", "avoid": "Unknown dates", "density": "medium", "regions": [{"id": "header", "x": 64, "y": 48, "width": 1152, "height": 140}, {"id": "timeline", "x": 70, "y": 235, "width": 1140, "height": 390}]},
+    "table-focus": {"use": "Small legible matrix or native chart", "avoid": "More rows than fit at readable size", "density": "dense", "regions": [{"id": "header", "x": 64, "y": 48, "width": 1152, "height": 140}, {"id": "table", "x": 75, "y": 220, "width": 1130, "height": 410}]},
+    "quote-visual": {"use": "One short attributed statement", "avoid": "Long paragraphs", "density": "sparse", "regions": [{"id": "quote", "x": 120, "y": 145, "width": 1040, "height": 390}, {"id": "source", "x": 120, "y": 565, "width": 1040, "height": 65}]},
+    "decision-split": {"use": "Recommendation and next action", "avoid": "Unresolved alternatives", "density": "sparse", "regions": [{"id": "decision", "x": 75, "y": 80, "width": 700, "height": 420}, {"id": "next-step", "x": 825, "y": 170, "width": 360, "height": 370}]}
+  }
+}

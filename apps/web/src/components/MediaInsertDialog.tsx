@@ -41,6 +41,7 @@ type MediaInsertDialogProps = {
   onInsert: (asset: InsertableMediaAsset) => void | Promise<void>;
   allowedKinds?: InsertableMediaKind[];
   defaultKind?: InsertableMediaKind;
+  videoAspectRatio?: "16:9" | "9:16" | "1:1";
   title?: string;
 };
 
@@ -157,6 +158,7 @@ export default function MediaInsertDialog({
   onInsert,
   allowedKinds = DEFAULT_ALLOWED_KINDS,
   defaultKind = allowedKinds[0] || "image",
+  videoAspectRatio = "16:9",
   title = t("component.media_insert.title"),
 }: MediaInsertDialogProps) {
   const queryClient = useQueryClient();
@@ -252,7 +254,7 @@ export default function MediaInsertDialog({
     setBusy("generate");
     setError("");
     try {
-      const asset = await generateInsertableMedia(kind, prompt, controller.signal);
+      const asset = await generateInsertableMedia(kind, prompt, controller.signal, videoAspectRatio);
       await queryClient.invalidateQueries({ queryKey: ["media-insert-knowledge"] });
       await finishInsert(asset);
     } catch (generationError) {

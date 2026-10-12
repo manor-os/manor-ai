@@ -73,7 +73,7 @@ async def _gated_scenario(db):
     step_id = generate_ulid()
     agent_id = generate_ulid()
     subscription_id = generate_ulid()
-    approval_actor_id = "operator"
+    approval_actor_id = generate_ulid()
     worker = Worker(
         id=generate_ulid(), entity_id=entity_id, kind="internal",
         display_name="Internal worker",
@@ -124,6 +124,14 @@ async def _gated_scenario(db):
         ),
     ])
     await db.flush()
+    from tests.approval_settings_test_utils import (
+        action_rule, initialize_test_account_approval, initialize_test_approval_owners,
+    )
+
+    await initialize_test_account_approval(db, entity_id=entity_id, user_id=approval_actor_id,
+        user_rules=[action_rule("unclassified.action")])
+    await initialize_test_approval_owners(db, await db.get(Workspace, workspace_id),
+        user_id=approval_actor_id)
     return {
         "entity_id": entity_id,
         "step_id": step_id,
@@ -366,6 +374,7 @@ async def test_unrecognized_failure_falls_back_to_the_raw_message(
         "type": "StepResultFailed",
         "message": "upstream returned 503 from a service nobody has a runbook for",
     }
+    step.error = dict(step.last_execution_error)
     await db_session.flush()
 
     assert await dispatcher.checkout_steps_for_worker(

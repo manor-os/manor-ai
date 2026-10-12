@@ -202,14 +202,12 @@ async def promote_workspace(
 
     # ── Flip ──
     bp_meta = dict(settings.get("_blueprint") or {})
-    settings["sandbox"] = False
     strategist_settings = dict(settings.get("strategist") or {})
-    if strategist_settings.get("auto_approve_proposals_source") == (
-        "blueprint_simulation"
-    ):
-        strategist_settings["auto_approve_proposals"] = False
-        strategist_settings.pop("auto_approve_proposals_source", None)
-        settings["strategist"] = strategist_settings
+    # Simulation grants are removed by the offline policy migration. Promotion
+    # changes runtime mode only; it never grants or rewrites approval policy.
+    strategist_settings.pop("proposal_task_approval_source", None)
+    settings["strategist"] = strategist_settings
+    settings["sandbox"] = False
     if bp_meta.get("original_kind"):
         ws.kind = bp_meta["original_kind"]
 
@@ -235,6 +233,7 @@ async def promote_workspace(
 
     ws.settings = settings
     await db.flush()
+
 
     notes = [
         "Workspace simulation → live. Real plans will run on the next scheduler tick.",

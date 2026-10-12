@@ -116,3 +116,10 @@ export function primaryMediaRef(output: unknown): MediaRef | undefined {
   const refs = extractMediaRefs(output, 6);
   return refs.find((r) => r.type === "image") || refs[0];
 }
+
+/** Previewable media (image/video/audio) for a run's final result. Generic
+ * files are listed as file cards instead, so scan past them: a bundle's
+ * README/JSON entries must not use up the slots before its cover or audio. */
+export function workflowFinalMediaRefs(output: unknown, limit = 3): MediaRef[] {
+  return extractMediaRefs(output, 48).filter((ref) => ref.type !== "file").slice(0, limit);
+}

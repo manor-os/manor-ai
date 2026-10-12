@@ -19,5 +19,9 @@
     "mcp__linkedin__create_comment",
     "mcp__linkedin__react_to_post",
     "mcp__linkedin__delete_post"
-  ]
+  ],
+  "search": {
+    "terms": ["linkedin post", "company page", "professional network", "carousel", "pdf post", "share article", "impressions"],
+    "examples": ["post text update on linkedin", "share document carousel linkedin", "react to comment on my post", "linkedin post engagement stats"]
+  }
 }

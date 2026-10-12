@@ -2,10 +2,39 @@ const HTML_RESOURCE_ATTRIBUTE_RE = /\b(?:src|poster|data)\s*=\s*(["'])(.*?)\1/gi
 const HTML_LINK_RESOURCE_RE = /<(?:link|use|image)\b[^>]*?\b(?:href|xlink:href)\s*=\s*(["'])(.*?)\1[^>]*>/gi;
 const CSS_URL_RE = /url\(\s*(["']?)(.*?)\1\s*\)/gi;
 const CSS_QUOTED_IMPORT_RE = /@import\s+(["'])(.*?)\1/gi;
+const CLOUDFLARE_EMAIL_DECODER_ELEMENT_RE = /<script\b([^>]*?)\bsrc\s*=\s*(["'])(\/cdn-cgi\/scripts\/[^/"'<>\s]+\/cloudflare-static\/email-decode\.min\.js(?:[?#][^"'<>]*)?)\2([^>]*)>[\s\S]*?<\/script>/gi;
+const CLOUDFLARE_EMAIL_DECODER_SCRIPT = [
+  "(() => {",
+  "  const decode = (encoded) => {",
+  "    const value = String(encoded || '').trim();",
+  "    if (!/^[0-9a-f]+$/i.test(value) || value.length < 4 || value.length > 1026 || value.length % 2 !== 0) return null;",
+  "    const key = Number.parseInt(value.slice(0, 2), 16);",
+  "    const bytes = new Uint8Array((value.length - 2) / 2);",
+  "    for (let index = 2; index < value.length; index += 2) {",
+  "      bytes[(index - 2) / 2] = Number.parseInt(value.slice(index, index + 2), 16) ^ key;",
+  "    }",
+  "    try { return new TextDecoder().decode(bytes); } catch { return null; }",
+  "  };",
+  "  const decodeAll = () => {",
+  "    document.querySelectorAll('[data-cfemail]').forEach((element) => {",
+  "      const email = decode(element.getAttribute('data-cfemail'));",
+  "      if (!email) return;",
+  "      element.textContent = email;",
+  "      const link = element.closest('a[href^=\"/cdn-cgi/l/email-protection\"]');",
+  "      if (link) link.setAttribute('href', 'mailto:' + email);",
+  "    });",
+  "  };",
+  "  decodeAll();",
+  "  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', decodeAll, { once: true });",
+  "})();",
+].join("\n");
 
 export function isLocalHtmlPreviewUrl(url) {
   const trimmed = String(url || "").trim();
   if (!trimmed || trimmed.startsWith("#")) return false;
+  // Cloudflare injects this origin-relative virtual path into proxied HTML.
+  // It belongs to the deployment edge, not the entity filesystem.
+  if (/^\/+cdn-cgi(?:\/|$)/i.test(trimmed)) return false;
   return !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(trimmed);
 }
 
@@ -119,6 +148,16 @@ function escapeHtmlRawElementText(value, tagName) {
   return String(value).replace(closingTag, `<\\/${tagName}`);
 }
 
+function rewriteCloudflareEmailProtection(html) {
+  CLOUDFLARE_EMAIL_DECODER_ELEMENT_RE.lastIndex = 0;
+  return html.replace(
+    CLOUDFLARE_EMAIL_DECODER_ELEMENT_RE,
+    (_match, _before, _quote, url) => (
+      `<script data-manor-preview-src="${escapeHtmlPreviewAttribute(url)}">\n${CLOUDFLARE_EMAIL_DECODER_SCRIPT}\n</script>`
+    ),
+  );
+}
+
 export function rewriteCssPreviewAssetUrls(css, replacements) {
   if (!Object.keys(replacements).length) return css;
   return css
@@ -133,8 +172,9 @@ export function rewriteCssPreviewAssetUrls(css, replacements) {
 }
 
 export function rewriteHtmlPreviewAssetUrls(html, assets) {
-  if (!Object.keys(assets).length) return html;
-  return html
+  const edgeSafeHtml = rewriteCloudflareEmailProtection(html);
+  if (!Object.keys(assets).length) return edgeSafeHtml;
+  return edgeSafeHtml
     .replace(/<link\b([^>]*?)\bhref\s*=\s*(["'])(.*?)\2([^>]*)>/gi, (match, before, _quote, url, after) => {
       const asset = assets[String(url).trim()];
       const attributes = `${before || ""} ${after || ""}`;

@@ -10,22 +10,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import fnmatch
-from typing import Optional
+from dataclasses import replace
+
+from typing import Any, Optional
 
 from sqlalchemy import desc, event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.governance.policy import (
-    DEFAULT_POLICY,
     PolicyDecision,
     WorkspacePolicy,
     decide,
-    policy_auto_approves,
     policy_from_dict,
     policy_to_dict,
 )
-from packages.core.governance.approval_scope import approval_scope_key
 from packages.core.constants.approvals import HitlType
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.services.hitl_options import decision_options_for_hitl
@@ -142,12 +140,16 @@ def _register_policy_cache_mutation(
 async def get_policy(
     db: AsyncSession, workspace_id: str,
 ) -> WorkspacePolicy:
-    """Return the current policy for a workspace, falling back to
-    DEFAULT_POLICY if the operator never customised one."""
+    """Read an initialized Workspace binding; missing configuration fails closed."""
     policy_cache = GovernancePolicyCacheFactory.create_default()
     cached = await policy_cache.get_current(workspace_id)
     if cached is not None:
-        return policy_from_dict(cached.policy)
+        from packages.core.governance.approval_policy import ApprovalPolicyBinding
+        policy = policy_from_dict(cached.policy)
+        if not isinstance(policy.approval, ApprovalPolicyBinding):
+            from packages.core.governance.approval_policy_service import ApprovalPolicyIntegrityError
+            raise ApprovalPolicyIntegrityError("Workspace approval binding is missing")
+        return policy
 
     row = (await db.execute(
         select(GovernancePolicy.policy, GovernancePolicy.revision).where(
@@ -155,19 +157,208 @@ async def get_policy(
         )
     )).one_or_none()
     if row is None:
-        snapshot = GovernancePolicySnapshot(
-            workspace_id=workspace_id,
-            revision=0,
-            policy=policy_to_dict(DEFAULT_POLICY),
-        )
-    else:
-        snapshot = GovernancePolicySnapshot(
-            workspace_id=workspace_id,
-            revision=int(row.revision or 0),
-            policy=dict(row.policy or {}),
-        )
+        from packages.core.governance.approval_policy_service import ApprovalPolicyIntegrityError
+        raise ApprovalPolicyIntegrityError("Workspace approval configuration is missing")
+    snapshot = GovernancePolicySnapshot(
+        workspace_id=workspace_id, revision=int(row.revision or 0), policy=dict(row.policy or {}),
+    )
     await policy_cache.store_if_current(snapshot)
-    return policy_from_dict(snapshot.policy)
+    policy = policy_from_dict(snapshot.policy)
+    from packages.core.governance.approval_policy import ApprovalPolicyBinding
+    if not isinstance(policy.approval, ApprovalPolicyBinding):
+        from packages.core.governance.approval_policy_service import ApprovalPolicyIntegrityError
+        raise ApprovalPolicyIntegrityError("Workspace approval binding is missing")
+    return policy
+
+
+async def workflow_run_is_executable(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None,
+    workflow_run_id: str | None,
+) -> bool:
+    """Validate delegated execution against the current durable Workflow origin.
+
+    A started Workflow owns its tool execution; human decisions belong to its
+    explicit wait nodes. This is not a substitute for tool permissions, hard
+    governance rules, or credit checks.
+    """
+    from packages.core.models.workflow import WorkflowRun
+
+    if not entity_id or not user_id or not workflow_run_id:
+        return False
+    run = await db.get(WorkflowRun, workflow_run_id, populate_existing=True)
+    return bool(
+        run is not None
+        and run.entity_id == entity_id
+        and (run.workspace_id or None) == (workspace_id or None)
+        and run.started_by == user_id
+        and run.status == "running"
+    )
+
+
+async def automated_run_always_allowed(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str | None,
+    user_id: str | None,
+    workflow_run_id: str | None = None,
+    task_id: str | None = None,
+) -> bool:
+    """Run identity is not consent; actions use the unified policy gate."""
+    return False
+
+
+async def scheduled_automation_origin_is_valid(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str | None,
+    scheduled_run_id: str | None,
+    execution_type: str | None = None,
+) -> bool:
+    """Verify origin identity without granting consent to any child action."""
+    return await _scheduled_automation_origin_matches(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scheduled_job_id=scheduled_job_id,
+        scheduled_run_id=scheduled_run_id,
+        execution_type=execution_type,
+    )
+
+
+async def _scheduled_automation_origin_matches(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str | None,
+    scheduled_run_id: str | None,
+    execution_type: str | None = None,
+) -> bool:
+    from packages.core.constants.execution import ScheduledRunStatus
+
+    origin = await _load_scheduled_automation_origin(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scheduled_job_id=scheduled_job_id,
+        scheduled_run_id=scheduled_run_id,
+        execution_type=execution_type,
+    )
+    return bool(
+        origin is not None
+        and origin[1].status == ScheduledRunStatus.RUNNING.value
+    )
+
+
+async def _load_scheduled_automation_origin(
+    db: AsyncSession,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str | None,
+    scheduled_run_id: str | None,
+    execution_type: str | None = None,
+) -> tuple[Any, Any] | None:
+    from packages.core.models.scheduler import ScheduledJob, ScheduledJobRun
+
+    job_key = str(scheduled_job_id or "").strip()
+    run_key = str(scheduled_run_id or "").strip()
+    if not job_key or not run_key:
+        return None
+    conditions = [
+        ScheduledJob.job_id == job_key,
+        ScheduledJob.entity_id == str(entity_id),
+        ScheduledJob.workspace_id == str(workspace_id),
+    ]
+    if execution_type:
+        conditions.append(ScheduledJob.execution_type == execution_type)
+    job = (
+        await db.execute(select(ScheduledJob).where(*conditions))
+    ).scalar_one_or_none()
+    if job is None:
+        return None
+    scheduled_run = await db.get(ScheduledJobRun, run_key)
+    if scheduled_run is None or scheduled_run.job_id != job.job_id:
+        return None
+    return job, scheduled_run
+
+
+async def _scheduled_task_origin_matches(
+    db: AsyncSession,
+    *,
+    task,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str,
+    scheduled_run_id: str,
+) -> bool:
+    from packages.core.constants.execution import (
+        ScheduledDispatchKind,
+        ScheduledRunStatus,
+    )
+
+    origin = await _load_scheduled_automation_origin(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scheduled_job_id=scheduled_job_id,
+        scheduled_run_id=scheduled_run_id,
+    )
+    if origin is None:
+        return False
+    _job, scheduled_run = origin
+    result = scheduled_run.result if isinstance(scheduled_run.result, dict) else {}
+    return bool(
+        scheduled_run.status == ScheduledRunStatus.RUNNING.value
+        and result.get("scheduled_child_kind")
+        == ScheduledDispatchKind.AGENT_TASK.value
+        and str(result.get("scheduled_child_id") or "") == str(task.id)
+    )
+
+
+async def _scheduled_strategist_task_origin_matches(
+    db: AsyncSession,
+    *,
+    task,
+    entity_id: str,
+    workspace_id: str,
+    scheduled_job_id: str | None,
+    scheduled_run_id: str | None,
+) -> bool:
+    from packages.core.constants.execution import ScheduledRunStatus
+
+    review_id = str((task.details or {}).get("strategist_review_id") or "").strip()
+    if (
+        not review_id
+        or task.creator_id is not None
+        or task.task_type != "ai_generated"
+    ):
+        return False
+    origin = await _load_scheduled_automation_origin(
+        db,
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        scheduled_job_id=scheduled_job_id,
+        scheduled_run_id=scheduled_run_id,
+        execution_type="strategist_review",
+    )
+    if origin is None:
+        return False
+    _job, scheduled_run = origin
+    if scheduled_run.status not in {
+        ScheduledRunStatus.SUCCESS.value,
+        ScheduledRunStatus.COMPLETED.value,
+    }:
+        return False
+    result = scheduled_run.result if isinstance(scheduled_run.result, dict) else {}
+    return str(result.get("review_id") or "") == review_id
 
 
 async def list_revisions(
@@ -192,21 +383,47 @@ async def update_policy(
     policy: WorkspacePolicy,
     changed_by: Optional[str] = None,
     change_summary: Optional[str] = None,
+    preserve_automated_run_consent: bool = False,
 ) -> GovernancePolicy:
     """Upsert the policy + write a revision. Caller commits.
 
     Raises PolicyError indirectly via policy_from_dict if the given
     policy round-trips to something invalid (defensive — callers pass
     dataclasses, but we re-validate to keep the storage layer honest).
+    Source-rule callers preserve live user-owned rules while holding the
+    Workspace and policy locks so a stale draft cannot overwrite settings.
     """
     # Round-trip to catch unsupported shapes before persistence.
     persisted = policy_to_dict(policy_from_dict(policy_to_dict(policy)))
 
+    from packages.core.governance.approval_policy import ApprovalPolicyBinding, ApprovalPolicyOverride
+    from packages.core.models.workspace import Workspace
+    # All local writers lock Workspace before its policy row. Unified settings
+    # additionally lock Entity first; source writers never need that root lock.
+    workspace = (await db.execute(select(Workspace).where(
+        Workspace.id == workspace_id, Workspace.entity_id == entity_id,
+    ).with_for_update())).scalar_one_or_none()
+    if workspace is None:
+        raise ValueError("Workspace approval owner does not match")
     row = (await db.execute(
         select(GovernancePolicy).where(
-            GovernancePolicy.workspace_id == workspace_id
+            GovernancePolicy.workspace_id == workspace_id,
+            GovernancePolicy.entity_id == entity_id,
         ).with_for_update()
     )).scalar_one_or_none()
+    if isinstance(policy.approval, ApprovalPolicyBinding):
+        if policy.approval.root_entity_id != entity_id:
+            raise ValueError("Workspace approval root does not match")
+    elif isinstance(policy.approval, ApprovalPolicyOverride):
+        persisted["approval"] = ApprovalPolicyBinding(
+            root_entity_id=entity_id, policy=policy.approval,
+        ).model_dump(mode="json")
+    elif row is not None and isinstance((row.policy or {}).get("approval"), dict):
+        persisted["approval"] = row.policy["approval"]
+    else:
+        persisted["approval"] = ApprovalPolicyBinding(
+            root_entity_id=entity_id, policy=ApprovalPolicyOverride(),
+        ).model_dump(mode="json")
     max_revision = (await db.execute(
         select(func.max(GovernanceRevision.revision)).where(
             GovernanceRevision.workspace_id == workspace_id
@@ -260,284 +477,146 @@ async def update_policy(
     return row
 
 
-async def add_auto_approve_action(
-    db: AsyncSession,
-    *,
-    entity_id: str,
-    workspace_id: str,
-    action_key: str,
-    resource_id: Optional[str] = None,
-    changed_by: Optional[str] = None,
-) -> bool:
-    """Add an action scope to a workspace's ``auto_approve_actions``.
-
-    Backs the "always allow" approval choice: once the operator picks it, the
-    same action scope stops triggering HITL on future steps. ``resource_id``
-    narrows the grant when the caller wants a single concrete object. Returns
-    True if the scope was newly added (a policy revision was written), False
-    if it was already auto-approved or inputs were missing. Caller commits.
-    """
-    scope_key = approval_scope_key(action_key, resource_id)
-    if not workspace_id or not scope_key:
-        return False
-    from dataclasses import replace
-
-    policy = await get_policy(db, workspace_id)
-    if scope_key in policy.auto_approve_actions:
-        return False
-    new_policy = replace(
-        policy,
-        auto_approve_actions=[*policy.auto_approve_actions, scope_key],
-    )
-    await update_policy(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=new_policy,
-        changed_by=changed_by,
-        change_summary=f"always-approve action: {scope_key}",
-    )
-    return True
+async def add_auto_approve_action(db, **kwargs):
+    raise ValueError("Retired approval write; use approval settings with expected_version")
 
 
-async def add_auto_approve_capability(
-    db: AsyncSession,
-    *,
-    entity_id: str,
-    workspace_id: str,
-    capability_id: str,
-    changed_by: Optional[str] = None,
-) -> bool:
-    """Add ``capability_id`` to workspace ``auto_approve_capabilities``.
-
-    This backs "always allow" for governance approvals that are capability
-    scoped rather than action scoped, such as a subagent step with
-    ``capability_id=file.write`` and no concrete provider ``action_key``.
-    """
-    if not workspace_id or not capability_id:
-        return False
-    from dataclasses import replace
-
-    policy = await get_policy(db, workspace_id)
-    if capability_id in policy.auto_approve_capabilities:
-        return False
-    new_policy = replace(
-        policy,
-        auto_approve_capabilities=[*policy.auto_approve_capabilities, capability_id],
-    )
-    await update_policy(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=new_policy,
-        changed_by=changed_by,
-        change_summary=f"always-approve capability: {capability_id}",
-    )
-    return True
+async def add_auto_approve_capability(db, **kwargs):
+    raise ValueError("Retired approval write; use an exact action rule")
 
 
-async def remove_auto_approve_action(
-    db: AsyncSession,
-    *,
-    entity_id: str,
-    workspace_id: str,
-    action_key: str,
-    resource_id: Optional[str] = None,
-    changed_by: Optional[str] = None,
-) -> bool:
-    """Remove ``action_key`` from a workspace's ``auto_approve_actions``.
-
-    Backs the standing-grant revoke surface (Settings → Approval
-    automation). Returns True if the action was present and removed (a
-    policy revision was written), False if it was not granted or inputs
-    were missing. Caller commits.
-    """
-    scope_key = approval_scope_key(action_key, resource_id)
-    if not workspace_id or not scope_key:
-        return False
-    from dataclasses import replace
-
-    policy = await get_policy(db, workspace_id)
-    if scope_key not in policy.auto_approve_actions:
-        return False
-    new_policy = replace(
-        policy,
-        auto_approve_actions=[
-            key for key in policy.auto_approve_actions if key != scope_key
-        ],
-    )
-    await update_policy(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=new_policy,
-        changed_by=changed_by,
-        change_summary=f"revoke always-approve action: {scope_key}",
-    )
-    return True
+async def remove_auto_approve_action(db, **kwargs):
+    raise ValueError("Retired approval write; use approval settings with expected_version")
 
 
-async def remove_auto_approve_capability(
-    db: AsyncSession,
-    *,
-    entity_id: str,
-    workspace_id: str,
-    capability_id: str,
-    changed_by: Optional[str] = None,
-) -> bool:
-    """Remove ``capability_id`` from workspace ``auto_approve_capabilities``.
+async def remove_auto_approve_capability(db, **kwargs):
+    raise ValueError("Retired approval write; use approval settings with expected_version")
 
-    Mirror of ``remove_auto_approve_action`` for capability-scoped
-    standing grants. Returns True if removed, False otherwise. Caller
-    commits.
-    """
-    if not workspace_id or not capability_id:
-        return False
-    from dataclasses import replace
-
-    policy = await get_policy(db, workspace_id)
-    if capability_id not in policy.auto_approve_capabilities:
-        return False
-    new_policy = replace(
-        policy,
-        auto_approve_capabilities=[
-            cid for cid in policy.auto_approve_capabilities if cid != capability_id
-        ],
-    )
-    await update_policy(
-        db,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=new_policy,
-        changed_by=changed_by,
-        change_summary=f"revoke always-approve capability: {capability_id}",
-    )
-    return True
-
-
-# ── Dispatcher hook ───────────────────────────────────────────────────
 
 async def check_step_policy(
-    db: AsyncSession,
-    *,
-    workspace_id: Optional[str],
-    kind: str,
-    action_key: Optional[str],
-    resource_id: Optional[str] = None,
-    risk_level: str,
+    db: AsyncSession, *, workspace_id: Optional[str], kind: str,
+    action_key: Optional[str], resource_id: Optional[str] = None, risk_level: str,
     capability_id: Optional[str] = None,
     spent_credits_per_kind: Optional[dict[str, int]] = None,
-    task_id: Optional[str] = None,
+    task_id: Optional[str] = None, resource_ids: tuple[str, ...] = (),
+    entity_id: str | None = None, user_id: str | None = None,
+    room_id: str | None = None, resource_kind: str | None = None,
+    account_id: str | None = None, operation: str | None = None,
+    impact: str | None = None, category: str | None = None,
+    workflow_run_id: str | None = None,
 ) -> PolicyDecision:
-    """Evaluate a step against the workspace's current policy.
-
-    Workspace-less steps (``workspace_id is None``) always pass — they
-    only happen for entity-level system tasks the operator can't
-    realistically govern at the workspace tier.
-    """
-    if not workspace_id:
-        return PolicyDecision(allowed=True)
-    policy = await get_policy(db, workspace_id)
-    decision = decide(
-        policy,
-        kind=kind,
-        action_key=action_key,
-        resource_id=resource_id,
-        risk_level=risk_level,
-        capability_id=capability_id,
-        spent_credits_per_kind=spent_credits_per_kind,
+    """Check independent constraints and the same current inherited consent policy."""
+    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_policy import evaluate_policy
+    from packages.core.governance.approval_policy_service import (
+        ApprovalPolicyIntegrityError, load_policy_chain,
     )
-    if not decision.allowed:
+    if workflow_run_id:
+        if not await workflow_run_is_executable(db, entity_id=entity_id,
+                workspace_id=workspace_id, user_id=user_id, workflow_run_id=workflow_run_id):
+            return PolicyDecision(False, reason="Workflow execution is no longer valid",
+                matched_rule="workflow.origin_not_executable")
+    if workspace_id:
+        from packages.core.models.workspace import Workspace
+        workspace = await db.get(Workspace, workspace_id)
+        if workspace is None or (entity_id and str(workspace.entity_id) != str(entity_id)):
+            return PolicyDecision(False, reason="Workspace approval owner does not match", matched_rule="approval.owner")
+        entity_id = str(workspace.entity_id)
+        policy = await get_policy(db, workspace_id)
+        constraints = decide(policy, kind=kind, action_key=action_key,
+            resource_id=resource_id, risk_level=risk_level, capability_id=capability_id,
+            spent_credits_per_kind=spent_credits_per_kind)
+        if not constraints.allowed:
+            return constraints
+    if not entity_id:
+        return PolicyDecision(False, reason="Approval scope is missing", matched_rule="approval.scope")
+    try:
+        chain = await load_policy_chain(db, entity_id=entity_id,
+            workspace_id=workspace_id, user_id=user_id, room_id=room_id)
+        facts = action_facts(
+            action_key=action_key, capability_id=capability_id, resource_kind=resource_kind,
+            resource_id=resource_id, resource_ids=resource_ids, account_id=account_id,
+            operation=operation, risk_level=risk_level, impact=impact, category=category,
+        )
+        evaluation = evaluate_policy(chain, facts)
+    except ApprovalPolicyIntegrityError as exc:
+        return PolicyDecision(False, reason=str(exc), matched_rule="approval.configuration")
+    decision = PolicyDecision(
+        allowed=evaluation.outcome == "allow", pause_for_hitl=evaluation.outcome == "ask",
+        reason=evaluation.reason_code, matched_rule=evaluation.rule_id or evaluation.reason_code,
+        explanation=evaluation.model_dump(mode="json"),
+    )
+    if evaluation.outcome == "deny":
         return decision
-    task_decision = await _check_task_runtime_rules(
-        db,
-        task_id=task_id,
-        action_key=action_key,
-        capability_id=capability_id,
-        risk_level=risk_level,
-    )
-    return task_decision or decision
+    task_decision = await _check_task_runtime_rules(db, task_id=task_id,
+        action_key=action_key, capability_id=capability_id, risk_level=risk_level, facts=facts)
+    if task_decision is None:
+        return decision
+    if not task_decision.pause_for_hitl:
+        return task_decision
+    # A task restriction adds a requirement; it must not hide an account/local
+    # requirement when checking whether an earlier exact grant still covers it.
+    policy_targets = decision.explanation.get("target_decisions") or [decision.explanation]
+    task_targets = task_decision.explanation.get("target_decisions") or [task_decision.explanation]
+    return replace(task_decision, explanation={**task_decision.explanation,
+        "target_decisions": [*policy_targets, *task_targets]})
 
 
 async def workspace_policy_auto_approves(
-    db: AsyncSession,
-    *,
-    workspace_id: Optional[str],
-    action_key: Optional[str] = None,
-    resource_id: Optional[str] = None,
-    capability_id: Optional[str] = None,
+    db: AsyncSession, *, workspace_id: Optional[str], action_key: Optional[str] = None,
+    resource_id: Optional[str] = None, capability_id: Optional[str] = None,
 ) -> bool:
-    """True when the workspace's policy *explicitly* auto-approves this scope
-    or capability. Used by the dispatcher so a workspace can override a
-    capability's intrinsic ``required_approval``. Workspace-less steps return
-    False (nothing to opt into)."""
     if not workspace_id:
         return False
-    policy = await get_policy(db, workspace_id)
-    return policy_auto_approves(
-        policy,
-        action_key=action_key,
-        resource_id=resource_id,
-        capability_id=capability_id,
-    )
+    decision = await check_step_policy(db, workspace_id=workspace_id, kind="action",
+        action_key=action_key, resource_id=resource_id, capability_id=capability_id,
+        risk_level="medium")
+    return decision.allowed
 
 
 async def _check_task_runtime_rules(
-    db: AsyncSession,
-    *,
-    task_id: Optional[str],
-    action_key: Optional[str],
-    risk_level: str,
-    capability_id: Optional[str] = None,
+    db: AsyncSession, *, task_id: Optional[str], action_key: Optional[str],
+    risk_level: str, capability_id: Optional[str] = None, facts=None,
 ) -> PolicyDecision | None:
-    """Task-level runtime requirements may add restrictions, never loosen them."""
-    if not task_id or (not action_key and not capability_id):
+    """Task source rules add restrictions through the same typed evaluator."""
+    if not task_id:
         return None
     from packages.core.models.task import Task
+    from packages.core.governance.approval_facts import action_facts
+    from packages.core.governance.approval_policy import ApprovalScope, evaluate_policy
+    from packages.core.governance.approval_policy_service import build_policy_chain
+    from packages.core.governance.approval_projection import compile_workspace_rules
 
     task = (await db.execute(select(Task).where(Task.id == task_id))).scalar_one_or_none()
     if not task:
         return None
     runtime = ((task.details or {}).get("runtime_context") or {})
-    rules = runtime.get("rules") or []
-    if not isinstance(rules, list):
-        return None
+    sources = runtime.get("rules") or []
+    if not isinstance(sources, list):
+        return PolicyDecision(False, reason="Task approval constraints are malformed", matched_rule="task.approval.configuration")
+    try:
+        rules = compile_workspace_rules([rule for rule in sources if isinstance(rule, dict) and rule.get("enabled", True) is not False])
+    except ValueError:
+        return PolicyDecision(False, reason="Task approval constraints need migration to typed selectors", matched_rule="task.approval.configuration")
+    facts = facts or action_facts(action_key=action_key, capability_id=capability_id, risk_level=risk_level)
+    asks = []
     for rule in rules:
-        if not isinstance(rule, dict) or rule.get("enabled", True) is False:
-            continue
-        action_patterns = rule.get("action_patterns") or rule.get("actions") or []
-        capability_patterns = rule.get("capability_patterns") or rule.get("capabilities") or []
-        if isinstance(action_patterns, str):
-            action_patterns = [action_patterns]
-        if isinstance(capability_patterns, str):
-            capability_patterns = [capability_patterns]
-        matched_action = bool(action_key) and any(
-            isinstance(pattern, str) and fnmatch.fnmatchcase(action_key or "", pattern)
-            for pattern in action_patterns
-        )
-        matched_capability = bool(capability_id) and any(
-            isinstance(pattern, str) and fnmatch.fnmatchcase(capability_id or "", pattern)
-            for pattern in capability_patterns
-        )
-        if not matched_action and not matched_capability:
-            continue
-        rule_type = str(rule.get("rule_type") or "").strip().lower()
-        key = str(rule.get("rule_key") or rule_type or "task_runtime_rule")
-        desc = str(rule.get("description") or key)
-        subject = action_key or capability_id or "runtime action"
-        if rule_type in {"deny", "never_allow", "block", "draft_only"}:
-            return PolicyDecision(
-                allowed=False,
-                reason=f"task runtime rule blocks {subject!r}: {desc}",
-                matched_rule=key,
-            )
-        if rule_type in {"approval_required", "hitl_required", "require_approval"}:
-            return PolicyDecision(
-                allowed=False,
-                pause_for_hitl=True,
-                reason=f"task runtime rule requires approval for {subject!r}: {desc}",
-                matched_rule=key,
-            )
+        if rule.effect == "allow":
+            continue  # A Task cannot loosen its account or owner policy.
+        scope = ApprovalScope(kind="account", id=task_id, entity_id=str(getattr(task, "entity_id", None) or task_id))
+        chain = build_policy_chain(scope=scope, root={"revision": 1,
+            "policy": {"mode": "automatic", "rules": [rule.model_dump()]}})
+        result = evaluate_policy(chain, facts)
+        matches = [{**item.model_dump(mode="json"), "source": "constraint",
+            "scope": {"kind": "task", "id": task_id}, "rule_id": rule.source_id,
+            "reason_code": "task.rule"} for item in result.target_decisions if item.source == "rule"]
+        if result.outcome == "deny":
+            return PolicyDecision(False, reason=f"Task rule {rule.source_id!r} blocks this action",
+                matched_rule=rule.source_id, explanation={"outcome": "deny", "target_decisions": matches})
+        asks.extend(item for item in matches if item["outcome"] == "ask")
+    if asks:
+        return PolicyDecision(False, True, "Task rules require review", asks[0]["rule_id"],
+            {**asks[0], "target_decisions": asks})
     return None
 
 

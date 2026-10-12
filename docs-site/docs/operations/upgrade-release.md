@@ -16,6 +16,12 @@ back up first, apply, verify, and keep a rollback path.
 4. Rebuild images and restart the stack — migrations apply on API startup.
 5. Watch API and worker logs until healthy.
 
+Before upgrading a shared deployment, rehearse the exact installed revision to
+candidate revision in an isolated database restored from your backup. Check
+conversation transcripts, Workspace/task data, credential references and
+in-progress run state. Experimental task engines stay off by default and
+upgrading does not switch the engine of an existing run.
+
 ```bash
 git pull
 docker compose up --build -d
@@ -42,6 +48,11 @@ Rollback difficulty depends on whether migrations were applied:
 
 Always keep the backup from immediately before the upgrade so database and
 object storage can be restored together.
+
+Keep the previous image/source revision and matching configuration. Stop
+execution before restoring PostgreSQL, MinIO and JuiceFS metadata as one set;
+test that restore in isolation. An untested Alembic downgrade is not a rollback
+guarantee. Blueprint JSON contains portable configuration, not a full backup.
 
 ## Version Tags
 

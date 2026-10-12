@@ -10,13 +10,15 @@ import inspect
 import json
 import logging
 import re
+
+from packages.core.ai.runtime.crm_actions import CRM_ACTIONS, runtime_crm_action
 from typing import Any
 
 from packages.core.ai.runtime.skills import (
     runtime_delete_skill,
     runtime_generate_skill,
     runtime_get_skill,
-    runtime_invoke_skill,
+    runtime_invoke_skill_action,
     runtime_list_skills,
     runtime_skill_descriptor_detail_payload,
     runtime_skill_descriptor_list_payload,
@@ -27,22 +29,18 @@ from packages.core.ai.runtime.manor_actions import (
     runtime_manor_bind_channel,
     runtime_manor_add_task_comment,
     runtime_manor_assign_task,
-    runtime_manor_create_client,
     runtime_manor_create_document_folder,
     runtime_manor_create_order,
     runtime_manor_create_task,
-    runtime_manor_delete_client,
     runtime_manor_delete_document,
     runtime_manor_delete_document_folder,
     runtime_manor_get_document,
-    runtime_manor_get_client,
     runtime_manor_get_order,
     runtime_manor_get_entity_info,
     runtime_manor_get_staff,
     runtime_manor_get_task_details,
     runtime_manor_list_channel_bindings,
     runtime_manor_list_conversations,
-    runtime_manor_list_clients,
     runtime_manor_list_integrations,
     runtime_manor_list_notifications,
     runtime_manor_get_dashboard_summary,
@@ -77,7 +75,6 @@ from packages.core.ai.runtime.manor_actions import (
     runtime_manor_start_workspace_draft,
     runtime_manor_toggle_scheduled_job,
     runtime_manor_unbind_channel,
-    runtime_manor_update_client,
     runtime_manor_update_order,
     runtime_manor_update_task,
     runtime_manor_update_workspace,
@@ -87,15 +84,26 @@ from packages.core.ai.runtime.goal_actions import (
     runtime_get_goal_status_action,
     runtime_update_goal_value_action,
 )
+from packages.core.ai.runtime.stat_actions import STAT_ASSESSMENT_GUIDANCE, runtime_stat_action
 from packages.core.ai.runtime.notification_actions import (
     runtime_notify_members_action,
 )
+from packages.core.ai.runtime.workspace_composite_actions import (
+    runtime_workspace_composite_action,
+)
+from packages.core.ai.runtime.workspace_operation_actions import (
+    WORKSPACE_OPERATION_CONFIGURATION_GUIDANCE,
+    WORKSPACE_OPERATION_EAGER_CONFIGURATION_GUIDANCE,
+)
 from packages.core.ai.runtime.tool_context import (
     RUNTIME_TOOL_CONTEXT_KEYS,
+    runtime_agent_subscription_id_from_context,
     runtime_injected_tool_context_args,
+    runtime_trusted_workspace_id_from_context,
     runtime_allowed_tool_names_from_context,
     runtime_tool_call_context_from_kwargs,
 )
+from packages.core.constants.agents import MANOR_AGENT_ID
 from packages.core.constants.task import TASK_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -110,26 +118,35 @@ _TASK_STATUS_PARAM_GUIDANCE = (
 
 _ACTIONS: dict[str, list[tuple[str, str]]] = {
     "Tasks": [
-        ("list_tasks", f"List tasks with status/priority/assignee filters. {_TASK_STATUS_PARAM_GUIDANCE}"),
+        (
+            "list_tasks",
+            "List Tasks with all filters in one params object. Plural values such as "
+            "statuses/priorities/assignee_ids are ORed; different filters and inclusive "
+            "*_after/*_before or priority_min/priority_max ranges are ANDed. Do not call "
+            f"once per status or priority. {_TASK_STATUS_PARAM_GUIDANCE}",
+        ),
         ("get_task_details", "Get full details of a task by ID"),
         ("create_task", "Create a new task; optional assignee_id/staff_id/assignee_name/assignee_email/agent_id assigns it immediately"),
         ("update_task", f"General task update: title, description, status, priority, category, deadline, details, assignment, and other supported task fields. {_TASK_STATUS_PARAM_GUIDANCE}"),
         ("assign_task", "Assign an existing task; requires task_id plus assignee_id/staff_id/assignee_name/assignee_email/agent_id"),
         ("add_task_comment", "Post a comment / log entry on a task"),
-        ("delete_task", "Delete a task by ID"),
         ("list_task_categories", "List available task categories"),
-        ("get_task_health", "SLA report: overdue, blocked, stalled tasks"),
     ],
     "Documents": [
-        ("list_documents", "List user-visible Knowledge documents; excludes raw filesystem/system files"),
+        (
+            "list_documents",
+            "List user-visible Knowledge documents with plural metadata filters, inclusive "
+            "time/size ranges, exact total, and pagination in one params object; excludes "
+            "raw filesystem/system files",
+        ),
         ("get_document", "Get document details (params: document_id)"),
         ("upload_document", "Upload a document to knowledge base"),
         ("delete_document", "Delete a document (params: document_id)"),
         (
             "search_documents",
-            "Search user-visible document names and metadata by keyword; this does not "
-            "retrieve document-body evidence, so use the separate rag tool for facts, "
-            "values, summaries, comparisons, or calculations from document contents",
+            "Search user-visible document names and metadata with plural filters and "
+            "inclusive time/size ranges in one params object; this does not "
+            "retrieve document-body evidence",
         ),
         ("list_workspace_artifacts", "List AI-generated or saved files associated with a workspace"),
         ("list_document_folders", "List user-visible Knowledge folders"),
@@ -150,11 +167,14 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("list_document_groups", "List document groups/collections used for workspace RAG context"),
     ],
     "Agents": [
-        ("list_agents", "List all agents (system + custom)"),
-        ("get_agent", "Get agent details by ID"),
-        ("list_agent_tools", "List tools bound to an agent"),
-        ("bind_agent_tool", "Bind a tool to an agent"),
-        ("unbind_agent_tool", "Remove tool binding from an agent"),
+        (
+            "list_agents",
+            "Query Agents with all filters in one params object. Plural values are "
+            "ORed; different filters and inclusive time/deployment-count ranges are "
+            "ANDed. Returns exact Agent ids; call this before setting an Automation's "
+            "agent_id, then copy one returned active id. Do not call once per status, "
+            "category, or Workspace.",
+        ),
     ],
     "Communications": [
         (
@@ -172,17 +192,30 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
             "link?, member_ids? (user ids from list_staff/find_team_members; "
             "omit to notify ALL active members of the entity).",
         ),
-        ("mark_notification_read", "Mark notification as read"),
         ("list_channel_bindings", "List every channel (Telegram/Slack/WhatsApp/…) and which agent it routes to"),
         ("bind_channel", "Route a channel's inbound messages to a specific agent (params: channel_config_id, agent_id)"),
         ("unbind_channel", "Remove an agent binding from a channel — inbound still logs but no agent runs (params: channel_id)"),
     ],
     "Dashboard": [
         ("get_dashboard_summary", "Task completion, satisfaction, time range stats"),
-        ("get_system_health", "Task counts by status, staff overview, health score"),
-        ("list_token_usage", "Token usage log"),
     ],
     "Workspace": [
+        (
+            "workspace",
+            "Workspace runtime gateway. Pass params.action plus optional "
+            "params.params for search, tasks, knowledge, rules, operations, "
+            "HITL/blocker resolution, service delegation, goals, and Ledger views. "
+            "For persistent workspace changes use params.action='operation' with "
+            "params.params={action: get_current|create_draft|patch_draft|validate_draft|"
+            "preview_diff|apply_draft|discard_draft, patches: [{op, payload}]}; "
+            "an unknown patch op returns the full op vocabulary. Guardrails are "
+            "derived from rules: first use get_current (read-only) to identify the "
+            "blocking rule_key, rule_type and action/capability patterns, then lift "
+            "or soften that rule with rule.remove / rule.update. Never probe rules "
+            "by creating drafts or updating an invented rule key. create_draft "
+            "requires nonempty patches in the same call; do not create an empty draft first. "
+            + WORKSPACE_OPERATION_CONFIGURATION_GUIDANCE,
+        ),
         ("list_workspaces", "List all workspaces in the entity"),
         ("get_workspace", "Get workspace details including operating model"),
         ("get_workspace_daily_summary", "Deterministic workspace daily summary data: previous-day outcomes, current health, human handoff items, and today's focus"),
@@ -197,7 +230,9 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("unmap_agent_from_service", "Remove agent from a workspace service"),
         ("get_workspace_agents", "Get all agent-service mappings for a workspace"),
         ("get_goal_status", "Get active workspace goal status, current values, and measurement metadata"),
-        ("update_goal_value", "Record a verified manual goal measurement; appends goal_measurements and updates current_value"),
+        ("get_stat_status", "Read workspace metric definitions, latest assessment receipts and source document versions. " + STAT_ASSESSMENT_GUIDANCE),
+        ("record_stat_assessment", "Persist an evidence-backed metric assessment and project linked Goals. " + STAT_ASSESSMENT_GUIDANCE),
+        ("update_goal_value", "Record a verified manual goal measurement; params must include goal_id (ULID or goal_key) AND numeric value in the same call; appends goal_measurements and updates current_value"),
         ("update_workspace_goals", "Update workspace goals"),
         ("update_workspace_rules", "Update workspace rules"),
         ("get_workspace_activity", "Get recent workspace activity log"),
@@ -207,20 +242,13 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("get_entity_info", "Entity details: name, usage, plan"),
         ("list_integrations", "List configured integrations, readiness, and every linked account available to the current user"),
         ("list_ready_integrations", "List callable integrations/MCP servers with all account IDs; defaults are priority only"),
-        ("list_users", "List users in entity"),
     ],
     "Team": [
         ("list_staff", "List team members with kind (employee/contractor/vendor/external) and role filters"),
         ("get_staff", "Get staff member details by ID"),
         ("list_roles", "List entity roles with permission sets and head-counts"),
     ],
-    "Clients": [
-        ("list_clients", "List clients with name/email/status filters"),
-        ("get_client", "Get client details by ID"),
-        ("create_client", "Create a new client"),
-        ("update_client", "Update client fields"),
-        ("delete_client", "Soft-delete a client by ID"),
-    ],
+    "Clients": list(CRM_ACTIONS.items()),
     "Orders": [
         ("list_orders", "List business orders with status filters"),
         ("get_order", "Get order details by ID"),
@@ -236,8 +264,16 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
         ("invoke_skill", "Execute a skill by name"),
     ],
     "Automations": [
-        ("create_scheduled_job", "Create a recurring automation (cron/interval/one-time) with auto-generated skill"),
-        ("list_scheduled_jobs", "List all scheduled automations"),
+        (
+            "create_scheduled_job",
+            "Create a background automation (cron/interval/one-time). Omit params.agent_id to use the calling Agent; to select another Agent, first call list_agents and copy an exact active returned id. Missing, stale, inactive, or unavailable selections fall back to the calling Agent, and a custom Agent cannot select Manor. When enabled, queue an execution Skill; use Agent Initiative instead for proactive Chat delivery",
+        ),
+        (
+            "list_scheduled_jobs",
+            "Query scheduled automations with all filters in one params object. Plural "
+            "values are ORed; different filters and inclusive time/error ranges are "
+            "ANDed. Do not call once per status, Workspace, or Agent.",
+        ),
         ("cancel_scheduled_job", "Delete a scheduled job"),
         ("toggle_scheduled_job", "Enable or disable a scheduled job"),
         ("run_scheduled_job_now", "Force-run a scheduled job immediately"),
@@ -246,15 +282,24 @@ _ACTIONS: dict[str, list[tuple[str, str]]] = {
 
 # Flatten for lookup
 _ALL_ACTIONS: dict[str, str] = {}
-_ACTION_DEPT: dict[str, str] = {}
 for _dept, _actions in _ACTIONS.items():
     for _name, _desc in _actions:
         _ALL_ACTIONS[_name] = _desc
-        _ACTION_DEPT[_name] = _dept
 
 
 def get_manor_action_names() -> set[str]:
     return set(_ALL_ACTIONS.keys())
+
+
+def manor_action_manifests() -> list[dict[str, Any]]:
+    """Catalog projection only: Runtime owns matching, scope and availability."""
+    return [
+        {"catalog_id": f"manor_action:{name}", "kind": "tool", "name": "manor",
+         "description": description,
+         "invoke_with": {"tool": "manor", "arguments": {"action": name}}}
+        for name, description in _ALL_ACTIONS.items()
+        if name in _IMPLEMENTED_ACTIONS
+    ]
 
 
 def _doc_summary(doc: Any, *, details: bool = False) -> dict[str, Any]:
@@ -275,36 +320,19 @@ def _doc_summary(doc: Any, *, details: bool = False) -> dict[str, Any]:
     return data
 
 
-def _search_actions(query: str, max_results: int = 8) -> list[dict]:
-    query_lower = query.lower()
-    scored: list[tuple[int, str, str, str]] = []
-    for name, desc in _ALL_ACTIONS.items():
-        if name not in _IMPLEMENTED_ACTIONS:
-            # Never advertise catalog stubs whose dispatch branch doesn't
-            # exist — a match here sends the model straight into the
-            # "handler not yet implemented" dead end (staging dogfooding
-            # failure: search returned list_users / get_system_health /
-            # list_token_usage, none of which are dispatchable).
-            continue
-        dept = _ACTION_DEPT[name]
-        score = 0
-        for word in query_lower.split():
-            if word in name.lower():
-                score += 3
-            elif word in desc.lower():
-                score += 1
-            elif word in dept.lower():
-                score += 1
-        if score > 0:
-            scored.append((score, name, desc, dept))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [
-        {"action": name, "description": desc, "department": dept}
-        for _, name, desc, dept in scored[:max_results]
-    ]
-
-
 # ── Action handlers (delegate to service layer) ────────────────────────────
+
+def _unsupported_action_response(action: str) -> str:
+    from packages.core.ai.runtime.tool_error_contract import tool_error_payload
+
+    return json.dumps(tool_error_payload(
+        tool_name="manor", code="unsupported_action",
+        message="This Manor action has no executable handler. Discover a current operation with search_tools.",
+        details={"field": "action", "action": action,
+                 "capability_availability": "not_established",
+                 "discovery_tool": "search_tools", "action_executed": False},
+    ), ensure_ascii=False)
+
 
 async def _dispatch_action(
     action: str,
@@ -316,16 +344,23 @@ async def _dispatch_action(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    workflow_run_id: str | None = None,
     approval_token: str | None = None,
     runtime_envelope: Any | None = None,
     active_user_message: str | None = None,
     manual_skill_selected: bool = False,
     allowed_tool_names: set[str] | None = None,
+    runtime_context: Any | None = None,
 ) -> str:
     """Route an action to the appropriate service function."""
     from packages.core.database import async_session
 
     params = dict(params or {})
+    authorization_workspace_id = (
+        runtime_trusted_workspace_id_from_context(runtime_context)
+        if runtime_context is not None
+        else workspace_id if user_id else None
+    )
     runtime_tool_kwargs = runtime_injected_tool_context_args(
         agent_id=agent_id,
         user_id=user_id,
@@ -337,6 +372,29 @@ async def _dispatch_action(
         conversation_id=conversation_id,
         task_id=task_id,
     )
+    if workflow_run_id:
+        runtime_tool_kwargs["_workflow_run_id_from_context"] = workflow_run_id
+
+    if action == "workspace":
+        workspace_action = str(params.get("action") or "").strip()
+        raw_workspace_params = params.get("params")
+        if isinstance(raw_workspace_params, dict):
+            workspace_params = dict(raw_workspace_params)
+        else:
+            workspace_params = {
+                key: value
+                for key, value in params.items()
+                if key not in {"action", "params", "workspace_id"}
+            }
+        return await runtime_workspace_composite_action(
+            entity_id=entity_id,
+            user_id=user_id or "",
+            workspace_id=workspace_id or "",
+            conversation_id=conversation_id or "",
+            action=workspace_action,
+            params=workspace_params,
+            runtime_tool_kwargs=runtime_tool_kwargs,
+        )
 
     try:
         async with async_session() as db:
@@ -345,6 +403,8 @@ async def _dispatch_action(
                 return await runtime_manor_list_tasks(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -352,6 +412,8 @@ async def _dispatch_action(
                 return await runtime_manor_get_task_details(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -366,6 +428,7 @@ async def _dispatch_action(
                     workspace_id=workspace_id or "",
                     user_id=user_id,
                     actor_agent_id=agent_id,
+                    runtime_tool_kwargs=runtime_tool_kwargs,
                 )
 
             if action == "update_task":
@@ -376,6 +439,7 @@ async def _dispatch_action(
                     user_id=user_id,
                     workspace_id=workspace_id or "",
                     task_id=task_id,
+                    runtime_tool_kwargs=runtime_tool_kwargs,
                 )
 
             if action == "assign_task":
@@ -385,6 +449,8 @@ async def _dispatch_action(
                     params=params,
                     workspace_id=workspace_id or "",
                     task_id=task_id,
+                    user_id=user_id,
+                    runtime_tool_kwargs=runtime_tool_kwargs,
                 )
 
             if action == "add_task_comment":
@@ -409,7 +475,7 @@ async def _dispatch_action(
                     entity_id=entity_id,
                     user_id=user_id,
                     params=params,
-                    workspace_id=workspace_id or "",
+                    workspace_id=authorization_workspace_id or "",
                     conversation_id=conversation_id,
                     task_id=task_id,
                     agent_id=agent_id,
@@ -422,6 +488,7 @@ async def _dispatch_action(
                     db,
                     entity_id=entity_id,
                     user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -431,7 +498,7 @@ async def _dispatch_action(
                     entity_id=entity_id,
                     user_id=user_id,
                     params=params,
-                    workspace_id=workspace_id or "",
+                    workspace_id=authorization_workspace_id or "",
                     task_id=task_id or "",
                 )
 
@@ -447,6 +514,8 @@ async def _dispatch_action(
                 return await runtime_manor_delete_document(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
                     params=params,
                 )
 
@@ -454,6 +523,7 @@ async def _dispatch_action(
                 return await runtime_manor_list_document_folders(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -461,6 +531,7 @@ async def _dispatch_action(
                 return await runtime_manor_create_document_folder(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -468,6 +539,7 @@ async def _dispatch_action(
                 return await runtime_manor_rename_document_folder(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -475,6 +547,7 @@ async def _dispatch_action(
                 return await runtime_manor_move_document_folder(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -482,6 +555,7 @@ async def _dispatch_action(
                 return await runtime_manor_delete_document_folder(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
                     params=params,
                 )
 
@@ -495,24 +569,51 @@ async def _dispatch_action(
                 )
 
             if action == "list_document_groups":
-                return await runtime_manor_list_document_groups(db, entity_id=entity_id)
+                return await runtime_manor_list_document_groups(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                )
 
             # Agents
             if action == "list_agents":
-                return await runtime_manor_list_agents(db, entity_id=entity_id)
+                from packages.core.constants.agents import is_master_agent
+
+                return await runtime_manor_list_agents(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id or None,
+                    workspace_id=authorization_workspace_id,
+                    require_schedulable_scope=bool(
+                        agent_id and not is_master_agent(agent_id)
+                    ),
+                    params=params,
+                )
 
             # Dashboard
             if action == "get_dashboard_summary":
-                return await runtime_manor_get_dashboard_summary(db, entity_id=entity_id)
+                return await runtime_manor_get_dashboard_summary(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
+                )
 
             # Workspace
             if action == "list_workspaces":
-                return await runtime_manor_list_workspaces(db, entity_id=entity_id)
+                return await runtime_manor_list_workspaces(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
+                )
 
             if action == "get_workspace":
                 return await runtime_manor_get_workspace(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    runtime_workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -520,7 +621,8 @@ async def _dispatch_action(
                 return await runtime_manor_get_workspace_daily_summary(
                     db,
                     entity_id=entity_id,
-                    workspace_id=workspace_id or "",
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id or "",
                     params=params,
                 )
 
@@ -543,6 +645,8 @@ async def _dispatch_action(
                 return await runtime_manor_update_workspace(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    runtime_workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -550,6 +654,8 @@ async def _dispatch_action(
                 return await runtime_manor_get_operating_model(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    runtime_workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -643,6 +749,8 @@ async def _dispatch_action(
                 return await runtime_manor_get_workspace_agents(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    runtime_workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -650,6 +758,13 @@ async def _dispatch_action(
                 return await runtime_get_goal_status_action(
                     entity_id=entity_id,
                     params=params,
+                )
+
+            if action in {"get_stat_status", "record_stat_assessment"}:
+                return await runtime_stat_action(
+                    action=action, entity_id=entity_id, user_id=user_id,
+                    workspace_id=workspace_id or params.get("workspace_id"), params=params,
+                    origin={"workflow_run_id": workflow_run_id, "task_id": task_id, "conversation_id": conversation_id},
                 )
 
             if action == "update_goal_value":
@@ -694,6 +809,8 @@ async def _dispatch_action(
                 return await runtime_manor_get_workspace_activity(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    runtime_workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -701,6 +818,8 @@ async def _dispatch_action(
                 return await runtime_manor_get_workspace_dashboard(
                     db,
                     entity_id=entity_id,
+                    user_id=user_id,
+                    runtime_workspace_id=authorization_workspace_id,
                     params=params,
                 )
 
@@ -772,6 +891,7 @@ async def _dispatch_action(
                     entity_id=entity_id,
                     category=params.get("category"),
                     tags=params.get("tags", []),
+                    user_id=user_id or None,
                 )
                 await db.commit()
                 return json.dumps({"id": skill.id, "name": skill.name, "created": True}, default=str)
@@ -782,6 +902,7 @@ async def _dispatch_action(
                     skill_id=params.get("skill_id", ""),
                     change_description=params.get("change_description", ""),
                     entity_id=entity_id,
+                    user_id=user_id or None,
                 )
                 await db.commit()
                 return json.dumps({"id": skill.id, "name": skill.name, "version": skill.version, "updated": True}, default=str)
@@ -795,48 +916,82 @@ async def _dispatch_action(
                 return json.dumps({"deleted": deleted})
 
             if action == "invoke_skill":
-                result = await runtime_invoke_skill(
-                    db,
-                    params.get("skill", ""),
-                    entity_id,
-                    params.get("input", ""),
-                    user_id=user_id or None,
-                    workspace_id=workspace_id or None,
-                    conversation_id=conversation_id or None,
-                    task_id=task_id or params.get("task_id") or None,
+                skill_runtime_context = runtime_context or runtime_tool_call_context_from_kwargs(
+                    runtime_tool_kwargs,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    workspace_id=authorization_workspace_id or "",
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    runtime_envelope=runtime_envelope,
                 )
-                return json.dumps(result, default=str)
+                return await runtime_invoke_skill_action(
+                    entity_id=entity_id,
+                    skill_id=params.get("skill_id") or params.get("skill", ""),
+                    input_text=params.get("input", ""),
+                    skill_params=params.get("params"),
+                    runtime_context=skill_runtime_context,
+                    user_id=skill_runtime_context.user_id,
+                    conversation_id=skill_runtime_context.conversation_id,
+                )
 
             # Automations / Scheduled Jobs
             if action == "create_scheduled_job":
+
+                caller_agent_id = agent_id or ""
+                if runtime_context is not None:
+                    caller_agent_id = agent_id or MANOR_AGENT_ID
                 return await runtime_manor_create_scheduled_job(
                     entity_id=entity_id,
                     params=params,
+                    caller_agent_id=caller_agent_id,
+                    caller_agent_subscription_id=(
+                        runtime_agent_subscription_id_from_context(runtime_context)
+                        if runtime_context is not None
+                        else None
+                    ),
                     user_id=user_id,
-                    workspace_id=workspace_id,
+                    workspace_id=authorization_workspace_id or "",
                     conversation_id=conversation_id,
                     task_id=task_id,
                 )
 
             if action == "list_scheduled_jobs":
-                return await runtime_manor_list_scheduled_jobs(entity_id=entity_id)
+                return await runtime_manor_list_scheduled_jobs(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
+                    params=params,
+                    runtime_kwargs=runtime_tool_kwargs,
+                )
 
             if action == "cancel_scheduled_job":
                 return await runtime_manor_cancel_scheduled_job(
                     entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
+                    runtime_kwargs=runtime_tool_kwargs,
                 )
 
             if action == "toggle_scheduled_job":
                 return await runtime_manor_toggle_scheduled_job(
                     entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
+                    runtime_kwargs=runtime_tool_kwargs,
                 )
 
             if action == "run_scheduled_job_now":
                 return await runtime_manor_run_scheduled_job_now(
                     entity_id=entity_id,
+                    user_id=user_id,
+                    workspace_id=authorization_workspace_id,
                     params=params,
+                    runtime_kwargs=runtime_tool_kwargs,
                 )
 
             # Notifications
@@ -852,13 +1007,17 @@ async def _dispatch_action(
                 return await runtime_notify_members_action(
                     entity_id=entity_id,
                     params=params,
-                    workspace_id=workspace_id or None,
+                    workspace_id=authorization_workspace_id,
                     agent_id=getattr(runtime_envelope, "agent_id", None),
                 )
 
             # Conversations
             if action == "list_conversations":
-                return await runtime_manor_list_conversations(db, entity_id=entity_id)
+                return await runtime_manor_list_conversations(
+                    db,
+                    entity_id=entity_id,
+                    user_id=user_id,
+                )
 
             if action == "send_email":
                 return await runtime_manor_send_email(
@@ -909,40 +1068,12 @@ async def _dispatch_action(
             if action == "list_roles":
                 return await runtime_manor_list_roles(db, entity_id=entity_id)
 
-            # Clients
-            if action == "list_clients":
-                return await runtime_manor_list_clients(
-                    db,
-                    entity_id=entity_id,
-                    params=params,
-                )
-
-            if action == "get_client":
-                return await runtime_manor_get_client(
-                    db,
-                    entity_id=entity_id,
-                    params=params,
-                )
-
-            if action == "create_client":
-                return await runtime_manor_create_client(
-                    db,
-                    entity_id=entity_id,
-                    params=params,
-                )
-
-            if action == "update_client":
-                return await runtime_manor_update_client(
-                    db,
-                    entity_id=entity_id,
-                    params=params,
-                )
-
-            if action == "delete_client":
-                return await runtime_manor_delete_client(
-                    db,
-                    entity_id=entity_id,
-                    params=params,
+            # CRM actions share the validated HTTP service and current actor.
+            if action in CRM_ACTIONS:
+                return await runtime_crm_action(
+                    db, action=action, params=params, entity_id=entity_id,
+                    user_id=user_id, workspace_id=workspace_id,
+                    runtime_kwargs=runtime_tool_kwargs,
                 )
 
             # Orders
@@ -975,14 +1106,7 @@ async def _dispatch_action(
                     params=params,
                 )
 
-            # Fallback — a catalog entry with no dispatch branch. Bridge the
-            # action name into the deferred MCP pool so the model gets a
-            # concrete next step instead of a dead end.
-            return await _unimplemented_action_response(
-                action,
-                entity_id=entity_id,
-                user_id=user_id,
-            )
+            return _unsupported_action_response(action)
 
     except ImportError as ie:
         return json.dumps({"error": f"Service not available: {ie}"})
@@ -993,12 +1117,8 @@ async def _dispatch_action(
 
 # ── Implemented-action set ──────────────────────────────────────────────────
 #
-# The catalog above advertises some actions that have no dispatch branch in
-# _dispatch_action (they fall through to the "not implemented" fallback).
-# The dispatcher's own `if action == "..."` chain is the only source of
-# truth for what is actually callable, so derive the implemented set from
-# its source instead of maintaining a second hand-written list that would
-# drift the same way the catalog did.
+# The dispatcher's own `if action == "..."` chain is the source of truth for
+# what is callable. Contract tests require an exact match with the catalog.
 
 def _implemented_action_names() -> frozenset[str]:
     try:
@@ -1008,190 +1128,11 @@ def _implemented_action_names() -> frozenset[str]:
     names = set(re.findall(r'action == "([a-z_]+)"', source))
     for group in re.findall(r"action in \{([^}]*)\}", source):
         names.update(re.findall(r'"([a-z_]+)"', group))
+    names.update(CRM_ACTIONS)
     return frozenset(names)
 
 
 _IMPLEMENTED_ACTIONS: frozenset[str] = _implemented_action_names()
-
-
-# ── Bridge to the deferred MCP tool pool ────────────────────────────────────
-#
-# The manor catalog and the deferred MCP pool (loadable via search_tools)
-# are disjoint surfaces. When the model asks manor for something the
-# catalog can't do, point it at the MCP tools that can — gated by the same
-# per-user availability check search_tools applies (the admin MCP must
-# surface for platform admins and never for regular users).
-
-_MCP_BRIDGE_MAX_MATCHES = 5
-_MCP_BRIDGE_HINT = (
-    "These MCP tools match this request but are not manor actions — load "
-    "and call one via search_tools query='select:<name>'."
-)
-
-
-def _registered_tool_schemas() -> tuple[tuple[str, dict], ...]:
-    """Snapshot of the full tool registry via the runtime registry adapter.
-
-    Imported lazily (registry initialization imports packages.core.ai.tools,
-    so a module-level import here would be circular). The adapter is the
-    only production surface allowed to touch the pool singleton (see
-    test_runtime_tool_registry_is_only_production_tool_pool_import).
-    """
-    from packages.core.ai.runtime.tool_registry import (
-        runtime_registered_tool_schemas,
-    )
-
-    return runtime_registered_tool_schemas()
-
-
-async def _bridge_search_enabled(
-    *,
-    entity_id: str,
-    user_id: str,
-) -> bool:
-    """Gate the bridge lookup on the ``tool_discovery_v2`` flag.
-
-    The availability resolution below (resolve_usable_mcp_providers) makes
-    one sequential can_use_integration call per provider (~40+ providers),
-    which search_tools only pays when tool_discovery_v2 is on — mirror that
-    here so flag-off tenants don't pay it on every manor search or
-    unimplemented-action call. Same is_enabled pattern as the search_tools
-    handler: fallback=False, any failure degrades to no bridge.
-    """
-    try:
-        from packages.core.database import async_session
-        from packages.core.services.feature_flags import is_enabled
-
-        async with async_session() as db:
-            return await is_enabled(
-                db,
-                "tool_discovery_v2",
-                entity_id=entity_id,
-                user_id=user_id,
-                fallback=False,
-            )
-    except Exception:
-        return False
-
-
-async def _usable_mcp_providers(
-    *,
-    entity_id: str,
-    user_id: str,
-    provider_keys: list[str],
-) -> frozenset[str]:
-    """Which MCP providers can the acting user use right now?
-
-    Same source of truth as search_tools' pre-filter and MCP dispatch:
-    can_use_integration via resolve_usable_mcp_providers.
-    """
-    from packages.core.database import async_session
-    from packages.core.services.agent_permission_service import (
-        resolve_usable_mcp_providers,
-    )
-
-    async with async_session() as db:
-        return await resolve_usable_mcp_providers(
-            db,
-            user_id=user_id,
-            entity_id=entity_id,
-            provider_keys=provider_keys,
-        )
-
-
-async def _bridge_mcp_tool_matches(
-    query: str,
-    *,
-    entity_id: str | None,
-    user_id: str | None,
-    max_results: int = _MCP_BRIDGE_MAX_MATCHES,
-) -> list[dict[str, str]]:
-    """Search the deferred MCP tool pool for ``query``.
-
-    Returns name + description manifests only (the model loads full schemas
-    via search_tools). The availability gate always applies: without an
-    acting user there is no gate to evaluate, so nothing is returned. The
-    whole lookup is additionally gated on tool_discovery_v2 (see
-    _bridge_search_enabled) purely for cost; the stub hiding and improved
-    not-implemented wording stay unconditional.
-
-    Phase-2 (not done here): parallelize resolve_usable_mcp_providers'
-    per-provider checks. It cannot be a naive asyncio.gather on the shared
-    session — AsyncSession is not concurrency-safe — so it needs either
-    per-task sessions or a batched query in the permission service.
-    """
-    if not query or not entity_id or not user_id:
-        return []
-    if not await _bridge_search_enabled(entity_id=entity_id, user_id=user_id):
-        return []
-    try:
-        from packages.core.ai.runtime.tool_discovery import (
-            runtime_mcp_provider_from_tool_name,
-        )
-        from packages.core.ai.runtime.tool_search import (
-            runtime_search_tool_registry_candidates,
-        )
-
-        mcp_schemas = [
-            (name, schema)
-            for name, schema in _registered_tool_schemas()
-            if runtime_mcp_provider_from_tool_name(str(name))
-        ]
-        if not mcp_schemas:
-            return []
-        provider_keys = sorted({
-            provider
-            for name, _schema in mcp_schemas
-            if (provider := runtime_mcp_provider_from_tool_name(str(name)))
-        })
-        usable = await _usable_mcp_providers(
-            entity_id=entity_id,
-            user_id=user_id,
-            provider_keys=provider_keys,
-        )
-        if not usable:
-            return []
-        matches, _suppressed = runtime_search_tool_registry_candidates(
-            tool_schemas=mcp_schemas,
-            query=query,
-            max_results=max_results,
-            usable_providers=frozenset(usable),
-        )
-        return [
-            {
-                "name": str(match.get("name") or ""),
-                "description": str(match.get("description") or ""),
-            }
-            for match in matches
-            if str(match.get("name") or "").startswith("mcp__")
-        ][:max_results]
-    except Exception:
-        logger.exception("manor→MCP bridge search failed for query=%r", query)
-        return []
-
-
-async def _unimplemented_action_response(
-    action: str,
-    *,
-    entity_id: str | None,
-    user_id: str | None,
-) -> str:
-    """Error payload for catalog stubs, with bridge suggestions when found."""
-    mcp_matches = await _bridge_mcp_tool_matches(
-        action.replace("_", " "),
-        entity_id=entity_id,
-        user_id=user_id,
-    )
-    payload: dict[str, Any] = {"error": f"Action '{action}' is not implemented."}
-    if mcp_matches:
-        payload["mcp_tool_matches"] = mcp_matches
-        payload["hint"] = (
-            "These MCP tools may do what you need — load one via "
-            "search_tools query='select:<name>'."
-        )
-    else:
-        payload["hint"] = "Use action='search' to find an implemented alternative."
-    return json.dumps(payload, ensure_ascii=False)
 
 
 # ── Tool schema ──────────────────────────────────────────────────────────────
@@ -1225,10 +1166,15 @@ MANOR_SCHEMA = {
     "function": {
         "name": "manor",
         "description": (
-            "Execute Manor platform actions; use action='search' when unsure. "
-            "list_documents/search_documents identify visible files by metadata "
-            "only; use rag for document-body evidence. Use generate_file for "
-            "artifacts and create_scheduled_job for delayed or recurring work."
+            "Manor platform (incl. Manor Calendar, local Knowledge saves): action='search' finds actions. "
+            "action='workspace' uses nested params.action. "
+            "App targets/Workflow attachments use configuration drafts; author/run Workflows via dedicated actions. "
+            "CRM uses company-scoped client/contact/activity/deal/followup actions. Followups/email activities are records; Ledger links stay in the current Workspace. "
+            "Use dedicated actions for ScheduledJobs/Agent Initiatives, never action='workspace'. "
+            "list_documents/search_documents read metadata; generate_file creates artifacts. "
+            "create_agent_initiative is only for private Agent/Manor Chat. "
+            "Workspace recurrence uses create_scheduled_job; ScheduledJobs lack conversational delivery, mute, quiet-hours and Initiative history. "
+            "Use exact active params.agent_id from action='list_agents'; omit for the calling Agent."
         ),
         "parameters": {
             "type": "object",
@@ -1239,11 +1185,26 @@ MANOR_SCHEMA = {
                 },
                 "query": {
                     "type": "string",
-                    "description": "Search query when action='search'.",
+                    "description": "search: English keywords in any user language.",
                 },
                 "params": {
                     "type": "object",
-                    "description": "Action-specific parameters.",
+                    "description": (
+                        "Action parameters. Workspace Task: action='workspace', "
+                        "params={action:'create_task',params:{title,description,"
+                        "runtime_instructions,rules,start}}. description holds objective, "
+                        "filename and deliverables; runtime_instructions holds task "
+                        "rules and output language; start=true runs now. "
+                        "Workspace input: action='workspace', params={action:'resolve_hitl',"
+                        "params:{message_id,action:'respond',response:'the user reply'}}. "
+                        "Use hitl_id when message_id is unavailable; payload.fields/answers "
+                        "and payload.attachments hold structured input or file references. "
+                        "Use approve/reject only for approval decisions, with optional note. "
+                        "Workspace config: action='workspace', params={action:'operation',"
+                        "params:{action:'create_draft',patches:[{op,payload}]}}. "
+                        + WORKSPACE_OPERATION_EAGER_CONFIGURATION_GUIDANCE
+                        + "Rules use rule.add for new rules or rule.update for existing rules. "
+                    ),
                     "additionalProperties": True,
                 },
                 "approval_token": {
@@ -1281,47 +1242,32 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
         # anonymous, so model-supplied top-level values cannot reach this path.
         acting_user_id = str(kwargs.get("user_id") or "").strip() or None
 
-    # Search mode
+    # The Manor platform's own catalog: Manor actions, Workspace actions and
+    # operations (inside a Workspace) and Manor's MCP servers. search_tools
+    # finds general tools, third-party integrations and Skills.
     if action == "search":
-        query = (kwargs.get("query") or "").strip()
-        if not query:
-            summary = {
-                dept: [name for name, _desc in actions if name in _IMPLEMENTED_ACTIONS]
-                for dept, actions in _ACTIONS.items()
-            }
-            summary = {dept: names for dept, names in summary.items() if names}
-            total = sum(len(names) for names in summary.values())
-            return json.dumps({"departments": summary, "total_actions": total})
-        results = _search_actions(query)
-        payload: dict[str, Any] = {"matches": results, "query": query}
-        if not results:
-            payload["hint"] = "Try broader keywords."
-        mcp_matches = await _bridge_mcp_tool_matches(
-            query,
-            entity_id=entity_id,
-            user_id=acting_user_id,
+        from packages.core.ai.runtime.manor_capability_catalog import (
+            runtime_manor_mcp_scope,
+            runtime_manor_search,
         )
-        if mcp_matches:
-            payload["mcp_tool_matches"] = mcp_matches
-            payload["mcp_hint"] = _MCP_BRIDGE_HINT
-        return json.dumps(payload, ensure_ascii=False)
 
-    # Validate action exists before opening DB
-    if action not in _ALL_ACTIONS:
-        suggestions = _search_actions(action, max_results=5)
-        return json.dumps({
-            "error": f"Unknown action: '{action}'",
-            "suggestions": [s["action"] for s in suggestions],
-        })
-
-    # Catalog stubs with no dispatch branch: answer with the bridge instead
-    # of opening a DB session just to hit the not-implemented fallback.
-    if action not in _IMPLEMENTED_ACTIONS:
-        return await _unimplemented_action_response(
-            action,
+        # Only the trusted run context scopes the search; params carry the
+        # model's query words, never identity, mode or provider routing.
+        search_params = kwargs.get("params") if isinstance(kwargs.get("params"), dict) else {}
+        return await runtime_manor_search(
             entity_id=entity_id,
-            user_id=acting_user_id,
+            user_id=acting_user_id or "",
+            workspace_id=runtime_context.workspace_id if isinstance(runtime_context.workspace_id, str) else None,
+            query=kwargs.get("query") or search_params.get("query"),
+            queries=kwargs.get("queries") or search_params.get("queries"),
+            max_results=kwargs.get("max_results") or search_params.get("max_results"),
+            mcp_tool_in_scope=runtime_manor_mcp_scope(
+                runtime_context.runtime_envelope, runtime_context.allowed_tool_names,
+            ),
         )
+
+    if action not in _ALL_ACTIONS or action not in _IMPLEMENTED_ACTIONS:
+        return _unsupported_action_response(action)
 
     params = _merge_action_params(kwargs)
     if legacy_create_workspace and not params.get("initial_brief"):
@@ -1347,12 +1293,14 @@ async def _manor_handler(entity_id: str = "", **kwargs: Any) -> str:
         agent_id=runtime_context.agent_id,
         workspace_id=workspace_id,
         conversation_id=conversation_id,
-        task_id=runtime_context.task_id or params.get("task_id"),
+        task_id=runtime_context.task_id,
+        workflow_run_id=runtime_context.workflow_run_id,
         approval_token=kwargs.get("approval_token") or params.get("approval_token"),
         runtime_envelope=runtime_context.runtime_envelope,
         active_user_message=runtime_context.active_user_message,
         manual_skill_selected=runtime_context.manual_skill_selected,
         allowed_tool_names=runtime_allowed_tool_names_from_context(kwargs),
+        runtime_context=runtime_context,
     )
 
 

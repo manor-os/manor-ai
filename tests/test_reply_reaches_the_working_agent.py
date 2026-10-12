@@ -111,8 +111,17 @@ def test_resuming_no_longer_requires_an_assigned_agent():
 
 
 def test_the_resume_dispatches_to_the_working_agent():
+    """Every answer path (task page, comment, workspace card, blocker) resumes
+    through task_input_resume, which must dispatch to the agent that did the
+    work rather than whoever is assigned."""
     from apps.api.routers import tasks as tasks_router
+    from packages.core.services import task_input_resume
 
-    source = inspect.getsource(tasks_router)
-    assert "dispatch_id = await task_executing_agent_id(db, task) or MANOR_AGENT_ID" in source
-    assert "dispatch_id = task.agent_id or MANOR_AGENT_ID" not in source
+    resume_source = inspect.getsource(task_input_resume)
+    assert "dispatch_id = await task_executing_agent_id(db, task) or MANOR_AGENT_ID" in resume_source
+    assert "dispatch_id = task.agent_id or MANOR_AGENT_ID" not in resume_source
+
+    router_source = inspect.getsource(tasks_router)
+    assert "apply_task_input_answer(" in router_source, "the task page resumes through the shared service"
+    assert 'dispatch_task_input_resume(task.id, applied["dispatch_agent_id"])' in router_source
+    assert "dispatch_id = task.agent_id or MANOR_AGENT_ID" not in router_source

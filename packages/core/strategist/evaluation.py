@@ -36,6 +36,7 @@ from packages.core.models.goal import Goal, GoalMeasurement
 from packages.core.models.task import Task
 from packages.core.models.workspace import Workspace, WorkspaceActivity
 from packages.core.models.base import generate_ulid
+from packages.core.services.workspace_autonomy import workspace_allows_manual_work
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ async def evaluate_workspace_outcomes(
     workspace_id: str,
     *,
     now: Optional[datetime] = None,
+    require_autonomous_runtime: bool = True,
 ) -> dict[str, Any]:
     """Label all unlabeled completed proposals for one workspace.
 
@@ -74,7 +76,9 @@ async def evaluate_workspace_outcomes(
     )).scalar_one_or_none()
     if workspace is None:
         return {"workspace_id": workspace_id, "skipped": True, "reason": "not_found"}
-    if workspace.status != "active":
+    if workspace.status != "active" and (
+        require_autonomous_runtime or not workspace_allows_manual_work(workspace)
+    ):
         return {
             "workspace_id": workspace_id,
             "skipped": True,

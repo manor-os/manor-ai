@@ -22,7 +22,13 @@ from httpx import AsyncClient
 from sqlalchemy import update
 
 import packages.core.database as db_module
-from packages.core.models.workspace import Workspace, WorkspaceStaff
+from packages.core.models.task import Task
+from packages.core.models.workspace import (
+    Agent,
+    AgentSubscription,
+    Workspace,
+    WorkspaceStaff,
+)
 from packages.core.services.task_service import create_task
 from tests.test_document_permissions import _auth, _create_entity_user
 
@@ -41,6 +47,8 @@ async def _make_workspace(entity_id: str, name: str, owner_user_id: str) -> str:
         )
         db.add(ws)
         await db.flush()
+        from packages.core.governance.approval_policy_service import initialize_workspace_approval
+        await initialize_workspace_approval(db, ws)
         ws_id = ws.id
         db.add(WorkspaceStaff(
             workspace_id=ws_id, staff_id=None, user_id=owner_user_id,
@@ -57,6 +65,110 @@ async def _add_member(ws_id: str, user_id: str, role: str) -> None:
             role=role, status="active",
         ))
         await db.commit()
+
+
+async def _add_workspace_plan_runtime(
+    db,
+    *,
+    entity_id: str,
+    workspace_id: str,
+    service_key: str = "planner",
+) -> AgentSubscription:
+    """Install the minimal active service required by Workspace Plan factory."""
+
+    agent = Agent(
+        entity_id=entity_id,
+        name=f"{service_key} agent",
+        status="active",
+        config={},
+    )
+    db.add(agent)
+    await db.flush()
+    subscription = AgentSubscription(
+        entity_id=entity_id,
+        workspace_id=workspace_id,
+        agent_id=agent.id,
+        service_key=service_key,
+        status="active",
+    )
+    db.add(subscription)
+    await db.flush()
+    return subscription
+
+
+async def _claim_workspace_task_plan(db, task):
+    """Use the real V3 Task owner for Plan admission in regression tests."""
+    from packages.core.services.task_coordinator_wakeup import (
+        claim_task_coordinator_wake,
+        ensure_task_coordinator_run,
+        stage_task_coordinator_wake,
+    )
+    from packages.core.services.task_execution import resolve_task_execution
+
+    selection = (await resolve_task_execution(db, task)).coordinator
+    assert selection is not None
+    await ensure_task_coordinator_run(db, task=task, selection=selection)
+    wake = await stage_task_coordinator_wake(
+        db, task_id=task.id, reason="workspace_plan_authorization_test",
+    )
+    assert wake is not None
+    claim, reason = await claim_task_coordinator_wake(
+        db,
+        task_id=task.id,
+        event_id=wake.event_id,
+        wake_generation=wake.wake_generation,
+        claim_token="workspace-plan-authorization-test-owner",
+        selection=selection,
+        lease_seconds=60,
+    )
+    assert reason == "claimed" and claim is not None
+    await db.commit()
+    return claim
+
+
+@pytest.mark.asyncio
+async def test_only_workspace_managers_can_update_governance(
+    client: AsyncClient,
+):
+    entity_admin_headers = await _auth(client, "governance_authz_admin")
+    admin = await _me(client, entity_admin_headers)
+    entity_id = admin["entity_id"]
+    admin_id = admin.get("user_id") or admin.get("id")
+    ws_id = await _make_workspace(entity_id, "Governance authz", admin_id)
+    viewer = await _create_entity_user(
+        entity_id,
+        "governance_authz_viewer",
+        role="member",
+    )
+    workspace_owner = await _create_entity_user(
+        entity_id,
+        "governance_authz_workspace_owner",
+        role="member",
+    )
+    await _add_member(ws_id, viewer["id"], "viewer")
+    await _add_member(ws_id, workspace_owner["id"], "owner")
+
+    current = (await client.get(
+        f"/api/v1/workspaces/{ws_id}/governance",
+        headers=viewer["headers"],
+    )).json()
+    policy = {key: current["policy"][key] for key in ("max_risk_level", "budget_caps_per_kind")}
+    policy["max_risk_level"] = "medium"
+
+    forbidden = await client.put(
+        f"/api/v1/workspaces/{ws_id}/governance",
+        headers=viewer["headers"],
+        json={"policy": policy, "change_summary": "viewer write"},
+    )
+    assert forbidden.status_code == 403, forbidden.text
+
+    allowed = await client.put(
+        f"/api/v1/workspaces/{ws_id}/governance",
+        headers=workspace_owner["headers"],
+        json={"policy": policy, "change_summary": "workspace owner write"},
+    )
+    assert allowed.status_code == 200, allowed.text
+    assert allowed.json()["policy"]["max_risk_level"] == "medium"
 
 
 @pytest.mark.asyncio
@@ -137,8 +249,8 @@ async def test_external_reply_decision_requires_authority_and_valid_intent(
         headers=editor["headers"],
         json={"choice": "always_approve"},
     )
-    assert standing.status_code == 403, standing.text
-    assert "manage_standing_grants" in standing.json()["detail"]
+    assert standing.status_code == 410, standing.text
+    assert "Execution & approvals settings" in standing.json()["detail"]
 
     async with db_module.async_session() as db:
         message = await db.get(Message, message_id)
@@ -257,6 +369,7 @@ async def test_workspace_owner_cannot_overwrite_a_shared_blueprint_skill(
         "manifest": {
             "slug": "shared-scope-blueprint",
             "blueprint_version": "1.1",
+            "name": "Shared Scope Blueprint",
         },
         "embedded": {
             "skills": [{
@@ -456,6 +569,52 @@ async def test_non_member_cannot_write_into_workspace(client: AsyncClient):
         "/api/v1/tasks", headers=outsider["headers"], json={"title": "entity task"},
     )
     assert r.status_code == 201, f"entity-level create wrongly blocked: {r.text}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/v1/bulk/tasks/status", {"status": "in_progress"}),
+        ("/api/v1/bulk/tasks/update", {"updates": {"priority": 5}}),
+    ],
+)
+async def test_bulk_task_mutation_requires_write_access_for_every_workspace(
+    client: AsyncClient,
+    path: str,
+    payload: dict,
+):
+    owner_headers = await _auth(client, f"bulk_ws_owner_{path.rsplit('/', 1)[-1]}")
+    me = await _me(client, owner_headers)
+    entity_id, owner_id = me["entity_id"], (me.get("user_id") or me.get("id"))
+    ws_id = await _make_workspace(entity_id, "Private bulk ops", owner_id)
+    async with db_module.async_session() as db:
+        task = await create_task(
+            db,
+            entity_id,
+            title="Protected bulk task",
+            workspace_id=ws_id,
+        )
+        await db.commit()
+        task_id = task.id
+
+    outsider = await _create_entity_user(
+        entity_id,
+        f"bulk_ws_outsider_{path.rsplit('/', 1)[-1]}",
+        role="member",
+    )
+    response = await client.post(
+        path,
+        headers=outsider["headers"],
+        json={"task_ids": [task_id], **payload},
+    )
+
+    assert response.status_code == 403, response.text
+    async with db_module.async_session() as db:
+        unchanged = await db.get(Task, task_id)
+        assert unchanged is not None
+        assert unchanged.status == "pending"
+        assert unchanged.priority != 5
 
 
 @pytest.mark.asyncio
@@ -768,6 +927,49 @@ async def test_workspace_plan_detail_steps_and_cancel_enforce_workspace_access(
         step = await db.get(ExecutionStep, step_id)
         assert plan is not None and plan.status == "draft"
         assert step is not None and step.step_status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_plan_cancel_returns_committed_terminal_state(client: AsyncClient):
+    from packages.core.models.execution import ExecutionPlan, ExecutionStep
+
+    headers = await _auth(client, "plancancelresponse")
+    me = await _me(client, headers)
+    entity_id, owner_id = me["entity_id"], (me.get("user_id") or me.get("id"))
+    workspace_id = await _make_workspace(entity_id, "Plan cancel response", owner_id)
+    async with db_module.async_session() as db:
+        plan = ExecutionPlan(
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            status="draft",
+            execution_mode="live",
+            approval_required=False,
+            plan_dag={"steps": []},
+        )
+        db.add(plan)
+        await db.flush()
+        plan_id = plan.id
+        step = ExecutionStep(
+            plan_id=plan_id,
+            entity_id=entity_id,
+            workspace_id=workspace_id,
+            step_key="pending_step",
+            kind="human",
+            params={"prompt": "Wait"},
+            depends_on=[],
+            step_status="pending",
+        )
+        db.add(step)
+        await db.commit()
+        step_id = step.id
+
+    response = await client.post(f"/api/v1/plans/{plan_id}/cancel", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    assert response.json()["updated_at"] is not None
+    async with db_module.async_session() as db:
+        assert (await db.get(ExecutionPlan, plan_id)).status == "cancelled"
+        assert (await db.get(ExecutionStep, step_id)).step_status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -1129,6 +1331,11 @@ async def test_background_planner_revalidates_task_after_workspace_lock(
         )
         db.add(workspace)
         await db.flush()
+        await _add_workspace_plan_runtime(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
         task = await create_task(
             db,
             entity_id,
@@ -1182,8 +1389,10 @@ async def test_background_planner_releases_lifecycle_lock_during_generation(
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.user import User
     from packages.core.plans import planner as planner_module
     from packages.core.plans.schema import Plan, PlanStep
+    from packages.core.services.auth_service import hash_password
 
     entity_id = generate_ulid()
     async with db_module.async_session() as db:
@@ -1194,14 +1403,27 @@ async def test_background_planner_releases_lifecycle_lock_during_generation(
         )
         db.add(workspace)
         await db.flush()
+        await _add_workspace_plan_runtime(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
+        requester = User(
+            entity_id=entity_id, email=f"planner-lock-{entity_id}@test.local",
+            password_hash=hash_password("pass123"), role="owner", status="active",
+        )
+        db.add(requester)
+        await db.flush()
         task = await create_task(
             db,
             entity_id,
             title="Generate without holding lifecycle locks",
             workspace_id=workspace.id,
+            creator_id=requester.id,
         )
         task.status = "in_progress"
         await db.commit()
+        claim = await _claim_workspace_task_plan(db, task)
         workspace_id = workspace.id
         task_id = task.id
 
@@ -1226,7 +1448,9 @@ async def test_background_planner_releases_lifecycle_lock_during_generation(
         nonlocal planning_session
         async with db_module.async_session() as db:
             planning_session = db
-            return await planner_module.plan_task(db, task_id)
+            return await planner_module.plan_task(
+                db, task_id, task_coordinator_claim=claim,
+            )
 
     planning = asyncio.create_task(plan_in_background())
     await asyncio.wait_for(provider_started.wait(), timeout=5)
@@ -1247,7 +1471,7 @@ async def test_background_planner_releases_lifecycle_lock_during_generation(
     finally:
         release_provider.set()
 
-    with pytest.raises(planner_module.PlannerError, match="not active|cancelled"):
+    with pytest.raises(planner_module.PlannerError, match="unavailable|cancelled"):
         await asyncio.wait_for(planning, timeout=5)
 
     async with db_module.async_session() as db:
@@ -1266,8 +1490,10 @@ async def test_background_planner_rejects_task_inputs_changed_during_generation(
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan
     from packages.core.models.task import Task
+    from packages.core.models.user import User
     from packages.core.plans import planner as planner_module
     from packages.core.plans.schema import Plan, PlanStep
+    from packages.core.services.auth_service import hash_password
 
     entity_id = generate_ulid()
     async with db_module.async_session() as db:
@@ -1278,14 +1504,27 @@ async def test_background_planner_rejects_task_inputs_changed_during_generation(
         )
         db.add(workspace)
         await db.flush()
+        await _add_workspace_plan_runtime(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
+        requester = User(
+            entity_id=entity_id, email=f"planner-race-{entity_id}@test.local",
+            password_hash=hash_password("pass123"), role="owner", status="active",
+        )
+        db.add(requester)
+        await db.flush()
         task = await create_task(
             db,
             entity_id,
             title="Original planning request",
             workspace_id=workspace.id,
+            creator_id=requester.id,
         )
         task.status = "in_progress"
         await db.commit()
+        claim = await _claim_workspace_task_plan(db, task)
         task_id = task.id
 
     provider_started = asyncio.Event()
@@ -1304,7 +1543,9 @@ async def test_background_planner_rejects_task_inputs_changed_during_generation(
 
     async def plan_in_background():
         async with db_module.async_session() as db:
-            return await planner_module.plan_task(db, task_id)
+            return await planner_module.plan_task(
+                db, task_id, task_coordinator_claim=claim,
+            )
 
     planning = asyncio.create_task(plan_in_background())
     await asyncio.wait_for(provider_started.wait(), timeout=5)
@@ -1364,6 +1605,11 @@ async def test_task_plan_persistence_allows_only_one_active_plan():
         )
         setup_db.add(workspace)
         await setup_db.flush()
+        await _add_workspace_plan_runtime(
+            setup_db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
         task = await create_task(
             setup_db,
             entity_id,
@@ -1372,6 +1618,7 @@ async def test_task_plan_persistence_allows_only_one_active_plan():
         )
         task.status = "in_progress"
         await setup_db.commit()
+        claim = await _claim_workspace_task_plan(setup_db, task)
         workspace_id = workspace.id
         task_id = task.id
 
@@ -1394,6 +1641,7 @@ async def test_task_plan_persistence_allows_only_one_active_plan():
                 task_id=task_id,
                 agent_subscription_id=None,
                 plan=human_plan(),
+                task_coordinator_claim=claim,
             )
 
     async with db_module.async_session() as first_db:
@@ -1404,6 +1652,7 @@ async def test_task_plan_persistence_allows_only_one_active_plan():
             task_id=task_id,
             agent_subscription_id=None,
             plan=human_plan(),
+            task_coordinator_claim=claim,
         )
         second = asyncio.create_task(create_second_plan())
         await asyncio.wait_for(second_started.wait(), timeout=5)
@@ -1431,6 +1680,8 @@ async def test_task_plan_persistence_allows_only_one_active_plan():
             task_id=task_id,
             agent_subscription_id=None,
             plan=human_plan(),
+            parent_plan_id=first_plan_id,
+            task_coordinator_claim=claim,
         )
         await db.commit()
         replacement_id = replacement.id
@@ -1464,6 +1715,11 @@ async def test_planner_reuses_active_plan_before_provider_work(monkeypatch):
         )
         db.add(workspace)
         await db.flush()
+        await _add_workspace_plan_runtime(
+            db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
         task = await create_task(
             db,
             entity_id,
@@ -1471,6 +1727,8 @@ async def test_planner_reuses_active_plan_before_provider_work(monkeypatch):
             workspace_id=workspace.id,
         )
         task.status = "in_progress"
+        await db.commit()
+        claim = await _claim_workspace_task_plan(db, task)
         plan = await create_plan_from_dag(
             db,
             entity_id=entity_id,
@@ -1482,6 +1740,7 @@ async def test_planner_reuses_active_plan_before_provider_work(monkeypatch):
                 kind="human",
                 params={"prompt": "Confirm the result."},
             )]),
+            task_coordinator_claim=claim,
         )
         await db.commit()
         task_id = task.id
@@ -1497,25 +1756,34 @@ async def test_planner_reuses_active_plan_before_provider_work(monkeypatch):
 
     async with db_module.async_session() as db:
         with pytest.raises(ActiveTaskPlanError) as exc_info:
-            await planner_module.plan_task_and_commit(
+            await planner_module.plan_task(
                 db,
                 task_id,
                 before_provider=_unexpected_preflight,
+                task_coordinator_claim=claim,
             )
 
     assert exc_info.value.plan_id == plan_id
 
 
 @pytest.mark.asyncio
-async def test_api_and_worker_planning_share_one_billable_claim(monkeypatch):
+async def test_v3_task_planning_fences_competing_owner_and_billable_claim(monkeypatch):
     from contextlib import asynccontextmanager
 
     from sqlalchemy import select
 
     from packages.core.models.base import generate_ulid
     from packages.core.models.execution import ExecutionPlan
+    from packages.core.models.user import User
     from packages.core.plans import planner as planner_module
     from packages.core.plans.schema import Plan, PlanStep
+    from packages.core.services.auth_service import hash_password
+    from packages.core.services.task_coordinator_wakeup import claim_task_coordinator_wake
+    from packages.core.services.task_execution import resolve_task_execution
+    from packages.core.services.workflow_run_execution_claim import (
+        commit_fenced_execution_boundary,
+        task_plan_execution_claim,
+    )
 
     entity_id = generate_ulid()
     async with db_module.async_session() as setup_db:
@@ -1526,14 +1794,27 @@ async def test_api_and_worker_planning_share_one_billable_claim(monkeypatch):
         )
         setup_db.add(workspace)
         await setup_db.flush()
+        await _add_workspace_plan_runtime(
+            setup_db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
+        requester = User(
+            entity_id=entity_id, email=f"planner-claim-{entity_id}@test.local",
+            password_hash=hash_password("pass123"), role="owner", status="active",
+        )
+        setup_db.add(requester)
+        await setup_db.flush()
         task = await create_task(
             setup_db,
             entity_id,
             title="Bill the Planner once",
             workspace_id=workspace.id,
+            creator_id=requester.id,
         )
         task.status = "in_progress"
         await setup_db.commit()
+        coordinator_claim = await _claim_workspace_task_plan(setup_db, task)
         task_id = task.id
 
     provider_started = asyncio.Event()
@@ -1562,19 +1843,39 @@ async def test_api_and_worker_planning_share_one_billable_claim(monkeypatch):
         _no_billing,
     )
 
-    async def _first_planner():
+    async def _plan_once():
         async with db_module.async_session() as db:
-            return await planner_module.plan_task_and_commit(db, task_id)
+            async with task_plan_execution_claim(task_id) as execution_claim:
+                if not execution_claim:
+                    raise planner_module.TaskPlanClaimHeldError(task_id)
+                plan = await planner_module.plan_task(
+                    db, task_id, task_coordinator_claim=coordinator_claim,
+                )
+                await commit_fenced_execution_boundary(
+                    db.commit, execution_claim=execution_claim, session=db,
+                    after_commit=execution_claim.mark_terminal_committed,
+                )
+                return plan
 
-    first = asyncio.create_task(_first_planner())
+    first = asyncio.create_task(_plan_once())
     await asyncio.wait_for(provider_started.wait(), timeout=5)
     try:
-        async with db_module.async_session() as duplicate_db:
-            with pytest.raises(planner_module.TaskPlanClaimHeldError):
-                await asyncio.wait_for(
-                    planner_module.plan_task_and_commit(duplicate_db, task_id),
-                    timeout=5,
-                )
+        async with db_module.async_session() as competing_db:
+            task = await competing_db.get(Task, task_id)
+            selection = (await resolve_task_execution(competing_db, task)).coordinator
+            assert selection is not None
+            competing_claim, reason = await claim_task_coordinator_wake(
+                competing_db,
+                task_id=task_id,
+                event_id=coordinator_claim.event_id,
+                wake_generation=coordinator_claim.wake_generation,
+                claim_token="competing-task-owner",
+                selection=selection,
+                lease_seconds=60,
+            )
+            assert competing_claim is None and reason == "claim_held"
+        with pytest.raises(planner_module.TaskPlanClaimHeldError):
+            await asyncio.wait_for(_plan_once(), timeout=5)
     finally:
         release_provider.set()
 
@@ -1606,6 +1907,11 @@ async def test_planning_failure_cannot_overwrite_a_concurrent_plan_commit():
         )
         setup_db.add(workspace)
         await setup_db.flush()
+        await _add_workspace_plan_runtime(
+            setup_db,
+            entity_id=entity_id,
+            workspace_id=workspace.id,
+        )
         task = await create_task(
             setup_db,
             entity_id,
@@ -1614,6 +1920,7 @@ async def test_planning_failure_cannot_overwrite_a_concurrent_plan_commit():
         )
         task.status = "in_progress"
         await setup_db.commit()
+        claim = await _claim_workspace_task_plan(setup_db, task)
         workspace_id = workspace.id
         task_id = task.id
 
@@ -1643,6 +1950,7 @@ async def test_planning_failure_cannot_overwrite_a_concurrent_plan_commit():
                 kind="human",
                 params={"prompt": "Confirm the result."},
             )]),
+            task_coordinator_claim=claim,
         )
         failure = asyncio.create_task(mark_failed())
         await asyncio.wait_for(failure_started.wait(), timeout=5)
@@ -1664,12 +1972,10 @@ async def test_planning_failure_cannot_overwrite_a_concurrent_plan_commit():
 
 
 @pytest.mark.asyncio
-async def test_plan_api_returns_client_error_for_capability_rejection(
+async def test_plan_api_rejects_missing_v3_runtime_before_provider(
     client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    from packages.core.plans.planner import CapabilityError
-
     headers = await _auth(client, "plan_capability_rejection")
     me = await _me(client, headers)
     entity_id, owner_id = me["entity_id"], (me.get("user_id") or me.get("id"))
@@ -1689,12 +1995,15 @@ async def test_plan_api_returns_client_error_for_capability_rejection(
         await db.commit()
         task_id = task.id
 
-    async def reject_capability(*_args, **_kwargs):
-        raise CapabilityError("skill is no longer callable")
+    planner_calls = []
+
+    async def unexpected_planner(*args, **kwargs):
+        planner_calls.append((args, kwargs))
+        raise AssertionError("API admission must not invoke Planner/provider")
 
     monkeypatch.setattr(
         "apps.api.routers.plans.plan_task_and_commit",
-        reject_capability,
+        unexpected_planner,
     )
 
     response = await client.post(
@@ -1703,8 +2012,9 @@ async def test_plan_api_returns_client_error_for_capability_rejection(
         json={"execution_mode": "live"},
     )
 
-    assert response.status_code == 400, response.text
-    assert "capability validation failed" in response.text
+    assert response.status_code == 409, response.text
+    assert "coordinator" in response.text.lower()
+    assert planner_calls == []
 
 
 @pytest.mark.asyncio
@@ -1840,13 +2150,13 @@ async def test_manual_task_plan_rejects_service_outside_owner_delegate_scope(
         },
     )
 
-    assert response.status_code == 400, response.text
-    assert "owner/delegate" in response.text
+    assert response.status_code == 409, response.text
+    assert "manual" in response.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reference", ["step", "subscription"])
-async def test_manual_task_plan_rejects_service_when_assignment_scope_is_empty(
+async def test_manual_ownerless_team_plan_uses_factory_scope(
     client: AsyncClient,
     reference: str,
 ):
@@ -1894,8 +2204,22 @@ async def test_manual_task_plan_rejects_service_when_assignment_scope_is_empty(
 
     response = await client.post("/api/v1/plans", headers=headers, json=payload)
 
-    assert response.status_code == 400, response.text
-    assert "owner/delegate" in response.text
+    assert response.status_code == 202, response.text
+    body = response.json()
+    assert body["task_id"] == task_id
+    assert body["runtime"] == "task_coordinator_v3"
+    assert body["plan_id"] is None
+    async with db_module.async_session() as db:
+        from packages.core.models.task_plan_submission import TaskPlanSubmission
+        from sqlalchemy import select
+
+        submission = (await db.execute(select(TaskPlanSubmission).where(
+            TaskPlanSubmission.id == body["submission_id"],
+        ))).scalar_one()
+        assert submission.plan_dag["steps"][0]["key"] == "perform_work"
+        assert submission.plan_dag["steps"][0]["service_key"] == (
+            "finance" if reference == "step" else None
+        )
 
 
 @pytest.mark.asyncio

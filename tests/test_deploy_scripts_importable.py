@@ -19,8 +19,8 @@ import pytest
 
 ENTRYPOINT = Path("docker/entrypoint.sh")
 
-# Scripts entrypoint.sh invokes on every container start.
-DEPLOY_SCRIPTS = ["scripts/init_db.py"]
+# Scripts entrypoint.sh invokes after the corresponding bootstrap gate.
+DEPLOY_SCRIPTS = ["scripts/init_db.py", "scripts/bootstrap_oauth_provider_clients.py"]
 
 
 def _import_script(path: str):
@@ -58,8 +58,8 @@ def test_every_entrypoint_python_script_is_covered():
     }
     uncovered = invoked - set(DEPLOY_SCRIPTS)
     assert not uncovered, (
-        f"entrypoint.sh runs {sorted(uncovered)} at deploy time with failures "
-        "swallowed; add them to DEPLOY_SCRIPTS so a stale import fails CI"
+        f"entrypoint.sh runs {sorted(uncovered)} at deploy time; "
+        "add them to DEPLOY_SCRIPTS so a stale import fails CI"
     )
 
 

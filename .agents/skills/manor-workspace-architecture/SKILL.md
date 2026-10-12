@@ -9,6 +9,10 @@ A Workspace is an operating boundary over several runtimes. It is not a Task,
 a Workflow, a chat room, or a Blueprint. Any change must first identify which
 runtime node owns the behavior and which downstream contracts it affects.
 
+Apply the repository [testing policy](../../testing.md) when selecting evidence
+for these contracts. Reuse existing coverage where sufficient; the node checklist
+does not require a new test file for every change.
+
 ## Required reading
 
 1. Read [architecture.md](references/architecture.md) completely.

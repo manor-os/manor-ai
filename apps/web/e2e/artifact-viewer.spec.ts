@@ -2,12 +2,14 @@ import { expect, test, type Page } from "@playwright/test";
 
 const name = "AI_SDE_20小时课程_Agenda与课程内容.md";
 const id = "01M1B8KT380NRNZ9DGX8ZVGF7A";
+const folderId = "01M1Y03Z6ZYDV7FN6TXA7G1QC8";
 const workspace = "/workspaces/ws_fixture";
 const body = "# Interview curriculum\n\nAlgorithms, system design, and behavioral practice.\n";
 const document = {
   id, entity_id: "ent_fixture", name, fs_path: `Workspaces/Preparation/${name}`,
   file_type: "md", mime_type: "text/markdown", file_size: body.length,
-  source: "agent", vector_status: "done", current_user_capabilities: ["read", "preview", "download"],
+  source: "agent", vector_status: "done", folder_id: folderId,
+  current_user_capabilities: ["read", "preview", "download"],
 };
 
 async function installApi(page: Page, scenario = "success") {
@@ -39,7 +41,7 @@ async function installApi(page: Page, scenario = "success") {
     if (url.pathname === `/api/v1/documents/${id}`) {
       if (scenario === "denied") return json({ detail: "Document access denied" }, 403);
       if (scenario === "deleted") return json({ detail: "Document not found" }, 404);
-      return json(document);
+      return json(scenario === "root-folder" ? { ...document, folder_id: null } : document);
     }
     if ([`/api/v1/documents/${id}/preview/content`, `/api/v1/documents/${id}/download`].includes(url.pathname)) {
       return route.fulfill({ contentType: "text/markdown", body });
@@ -51,6 +53,41 @@ async function installApi(page: Page, scenario = "success") {
 }
 
 for (const width of [1280, 390]) {
+  test(`viewer containing-folder link opens Knowledge at ${width}px`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 });
+    await installApi(page);
+    await page.goto(`${workspace}?case=canonical`);
+    await page.getByRole("button", { name: new RegExp(name) }).click();
+    const parentFolder = page.locator(".manor-editor-header-main").getByRole("link", { name: "Containing folder", exact: true });
+    await expect(parentFolder).toBeVisible();
+    await expect(parentFolder).toHaveAttribute("title", "Open containing folder");
+    await expect(parentFolder).toHaveAttribute("href", `/knowledge?folder_id=${folderId}`);
+    expect(await parentFolder.evaluate((link) => link.getBoundingClientRect().right <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`viewer-parent-folder-${width}.png`) });
+    await parentFolder.click();
+    await expect(page).toHaveURL(`/knowledge?folder_id=${folderId}`);
+  });
+
+  test(`viewer back arrow returns to the workspace attachment at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await installApi(page);
+    await page.goto(`${workspace}?case=canonical`);
+    await page.getByRole("button", { name: new RegExp(name) }).click();
+    await page.getByRole("button", { name: "Go Back", exact: true }).click();
+    await expect(page).toHaveURL(`${workspace}?case=canonical#completion`);
+    await expect(page.getByRole("button", { name: new RegExp(name) })).toBeVisible();
+  });
+
+  test(`viewer close returns to the workspace attachment at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await installApi(page);
+    await page.goto(`${workspace}?case=canonical`);
+    await page.getByRole("button", { name: new RegExp(name) }).click();
+    await page.getByRole("button", { name: "Close", exact: true }).click();
+    await expect(page).toHaveURL(`${workspace}?case=canonical#completion`);
+    await expect(page.getByRole("button", { name: new RegExp(name) })).toBeVisible();
+  });
+
   test(`legacy task attachment opens real Viewer and survives reload at ${width}px`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height: 900 });
     const errors: string[] = [];
@@ -74,6 +111,21 @@ for (const width of [1280, 390]) {
     expect(errors).toEqual([]);
   });
 }
+
+test("viewer parent-folder navigation survives a direct URL and reload", async ({ page }) => {
+  await installApi(page);
+  await page.goto(`/viewer/${id}`);
+  await page.reload();
+  await page.getByRole("link", { name: "Containing folder", exact: true }).click();
+  await expect(page).toHaveURL(`/knowledge?folder_id=${folderId}`);
+});
+
+test("viewer library link opens the Knowledge root for an unfiled document", async ({ page }) => {
+  await installApi(page, "root-folder");
+  await page.goto(`/viewer/${id}`);
+  await page.getByRole("link", { name: "Open library", exact: true }).click();
+  await expect(page).toHaveURL("/knowledge");
+});
 
 for (const variant of ["plain", "once", "attachment", "attachment-path", "canonical"]) {
   test(`${variant} reference uses the real document ID`, async ({ page }) => {

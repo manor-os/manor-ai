@@ -1,11 +1,32 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from packages.core.ai.runtime.capabilities import _TOOL_CAPABILITY_ALIAS_TARGETS
 from packages.core.ai.runtime.profiles import RuntimeProfile
+from packages.core.ai.runtime.sandbox import runtime_task_binding_key
 from packages.core.ai.runtime.surfaces import ChatSurface
+
+
+# The only tools whose authorization is bound to a sandbox rather than to a
+# chat thread. Derived from the capability aliases so a new ``sandbox_*`` alias
+# cannot silently fall out of the set.
+#
+# This is narrower than the ``sandbox.execute`` capability on purpose: that
+# capability also covers ``video_edit`` and ``coding_based_video``, which
+# resolve their own sessions by the run's real conversation id and never read
+# the sandbox binding. Handing them the binding key would authorize them
+# against a scope they do not use.
+RUNTIME_SANDBOX_BOUND_TOOL_NAMES = frozenset(
+    {"sandbox"}
+    | {
+        name
+        for name, target in _TOOL_CAPABILITY_ALIAS_TARGETS.items()
+        if target == "sandbox"
+    }
+)
 
 
 RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
@@ -23,9 +44,16 @@ RUNTIME_TOOL_CONTEXT_KEYS = frozenset(
         "_allowed_tool_names_from_context",
         "_llm_metadata_from_context",
         "_llm_model_from_context",
+        "_performance_run_id_from_context",
         "_runtime_run_id_from_context",
         "_runtime_tool_call_id_from_context",
         "_runtime_tool_attempt_from_context",
+        "_runtime_validation_duration_ms_from_context",
+        "_runtime_chrome_interaction_mode_from_context",
+        "_runtime_chrome_sequence_child_from_context",
+        "_runtime_chrome_expected_connection_id_from_context",
+        "_runtime_human_input_from_context",
+        "_runtime_parent_skill_from_context",
         "workspace_id",
         "conversation_id",
         "task_id",
@@ -94,6 +122,7 @@ class RuntimeToolCallContext:
     llm_model: str | None = None
     workspace_id: str | None = None
     conversation_id: str | None = None
+    sandbox_binding_key: str | None = None
     task_id: str | None = None
     workflow_project_id: str | None = None
     workflow_run_id: str | None = None
@@ -104,13 +133,51 @@ class RuntimeToolCallContext:
     workflow_scene_id: str | None = None
     workflow_batch_capture: str | None = None
     approved_plan_version: str | None = None
+    performance_run_id: str | None = None
     runtime_run_id: str | None = None
     runtime_tool_call_id: str | None = None
     runtime_tool_attempt: int = 1
+    runtime_validation_duration_ms: float = 0.0
+    chrome_interaction_mode: str | None = None
+    chrome_sequence_child: bool = False
+    chrome_expected_connection_id: str | None = None
+    # The prompt skill whose nested agent loop is executing this call, if any.
+    # A nested loop cannot park the durable run on a checkpoint (its own
+    # state has no checkpoint to resume from), so sandbox admission must not
+    # queue a suspending reservation for it.
+    parent_skill: str | None = None
 
 
 class RuntimeToolContextConflictError(ValueError):
     """Raised when trusted runtime scope sources disagree."""
+
+
+def runtime_agent_subscription_id_from_context(
+    context: RuntimeToolCallContext,
+) -> str | None:
+    """Return the exact deployment id carried by the trusted Runtime envelope."""
+
+    metadata = getattr(context.runtime_envelope, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    return str(metadata.get("agent_subscription_id") or "").strip() or None
+
+
+def runtime_trusted_workspace_id_from_context(
+    context: RuntimeToolCallContext,
+) -> str | None:
+    """Return Workspace scope safe for identity-free background authorization.
+
+    A plain ``workspace_id`` tool argument is model-controlled unless it is
+    corroborated by a Runtime envelope. User-scoped calls can rely on normal
+    ACL checks, while userless calls may use only the envelope's Workspace.
+    """
+
+    if context.user_id:
+        return context.workspace_id
+    return str(
+        getattr(context.runtime_envelope, "workspace_id", None) or ""
+    ).strip() or None
 
 
 def _runtime_scope_value(name: str, *values: Any) -> str | None:
@@ -145,6 +212,78 @@ def runtime_tool_call_context_from_kwargs(
         return tuple(getattr(candidate, name, None) for candidate in envelopes)
 
     allowed = runtime_allowed_tool_names_from_context(kwargs)
+    resolved_user_id = _runtime_scope_value(
+        "user_id",
+        user_id,
+        kwargs.get("_user_id_from_context"),
+        *envelope_values("user_id"),
+    )
+    resolved_conversation_id = _runtime_scope_value(
+        "conversation_id",
+        conversation_id,
+        kwargs.get("conversation_id"),
+        *envelope_values("conversation_id"),
+    )
+    resolved_task_id = _runtime_scope_value(
+        "task_id",
+        task_id,
+        kwargs.get("task_id"),
+        *envelope_values("task_id"),
+    )
+    # A task-worker run has no chat thread, so nothing would bind its sandbox:
+    # admission would refuse to register, the authorization recheck would bail,
+    # and every sandbox call would be denied. Bind it to a deterministic key
+    # derived from the task instead. This is the one choke point for tool
+    # scope, so every consumer sees the same key.
+    #
+    # The key is exposed ONLY as ``sandbox_binding_key``; ``conversation_id``
+    # keeps the run's real conversation (None for these runs), and
+    # ``runtime_injected_tool_context_args`` never carries the key. Injecting
+    # it into the plain ``conversation_id`` kwarg would spread a fake
+    # conversation into every handler: ``workspace_create_task`` would persist
+    # it on the child task, ``manor(action="send_email")`` would stamp it on
+    # message_logs, platform MCP billing would record it on credit
+    # reservations, and the handlers that look a conversation up (file
+    # permission HITL, workflow tools, workspace operation actions) would query
+    # for a row that cannot exist and silently deny where they saw None before.
+    #
+    # The consumers of the key are exactly:
+    #   - sandbox admission and reuse scoping (sandbox_session_service)
+    #   - the sandbox tool handlers' per-call owner match and context load
+    #   - the sandbox media guard in generate_file and the office skill handoff
+    #   - the authorization request for the ``sandbox`` tool and its aliases,
+    #     selected by ``runtime_authorization_conversation_id``
+    #
+    # The key is sized to fit a ``String(26)`` conversation column, so the
+    # sites that persist this scope -- the sandbox binding itself, and
+    # ``hitl_requests.origin_conversation_id`` for a sandbox tool's approval --
+    # store it instead of truncating. The envelope keeps its own null
+    # conversation either way.
+    #
+    # Anti-forgery rests on ``_runtime_scope_value``, not on task_id being
+    # unforgeable: ``conversation_id`` and ``task_id`` are both trusted
+    # runtime keys, and a model-supplied value that disagrees with the
+    # runtime's raises a conflict rather than winning. The residual case is
+    # a run that carries a user but neither a runtime task nor a
+    # conversation, where an unopposed model-supplied task_id could mint a
+    # key. That key is bounded to the same user's owner scope, so it can
+    # only reach sandboxes that user already owns.
+    #
+    # Requires an actor: every consumer of the key (admission's owner
+    # registry, the authorization recheck, the per-call owner match) is
+    # keyed on user_id, and a call with neither conversation nor user is
+    # the identity-free trusted-internal path that those checks skip.
+    #
+    # With cloud external-runner coordination these runs have no durable
+    # ``RuntimeRun`` to suspend on a reservation, so the session service
+    # enqueues a *task* reservation keyed on ``task_id`` and waits
+    # synchronously for the scheduler to allocate a runner; the key below is
+    # still what binds and re-finds the resulting sandbox.
+    sandbox_binding_key = resolved_conversation_id or (
+        runtime_task_binding_key(resolved_task_id)
+        if resolved_task_id and resolved_user_id
+        else None
+    )
     return RuntimeToolCallContext(
         entity_id=_runtime_scope_value("entity_id", entity_id, *envelope_values("entity_id")),
         agent_id=_runtime_scope_value(
@@ -153,12 +292,7 @@ def runtime_tool_call_context_from_kwargs(
             kwargs.get("_agent_id_from_context"),
             *envelope_values("agent_id"),
         ),
-        user_id=_runtime_scope_value(
-            "user_id",
-            user_id,
-            kwargs.get("_user_id_from_context"),
-            *envelope_values("user_id"),
-        ),
+        user_id=resolved_user_id,
         active_user_message=runtime_active_user_message_from_context(kwargs),
         runtime_artifact_urls=frozenset(_url_set(kwargs.get("_runtime_artifact_urls_from_context"))),
         dependency_artifact_urls=frozenset(_url_set(kwargs.get("_dependency_artifact_urls_from_context"))),
@@ -180,18 +314,9 @@ def runtime_tool_call_context_from_kwargs(
             kwargs.get("workspace_id"),
             *envelope_values("workspace_id"),
         ),
-        conversation_id=_runtime_scope_value(
-            "conversation_id",
-            conversation_id,
-            kwargs.get("conversation_id"),
-            *envelope_values("conversation_id"),
-        ),
-        task_id=_runtime_scope_value(
-            "task_id",
-            task_id,
-            kwargs.get("task_id"),
-            *envelope_values("task_id"),
-        ),
+        conversation_id=resolved_conversation_id,
+        sandbox_binding_key=sandbox_binding_key,
+        task_id=resolved_task_id,
         workflow_project_id=str(kwargs.get("_workflow_project_id_from_context") or "") or None,
         workflow_run_id=str(kwargs.get("_workflow_run_id_from_context") or "") or None,
         workflow_lineage_root_run_id=(
@@ -211,13 +336,41 @@ def runtime_tool_call_context_from_kwargs(
         approved_plan_version=(
             str(kwargs.get("_approved_plan_version_from_context") or "") or None
         ),
+        performance_run_id=(
+            str(kwargs.get("_performance_run_id_from_context") or "") or None
+        ),
         runtime_run_id=str(kwargs.get("_runtime_run_id_from_context") or "") or None,
         runtime_tool_call_id=(
             str(kwargs.get("_runtime_tool_call_id_from_context") or "") or None
         ),
+        parent_skill=str(kwargs.get("_runtime_parent_skill_from_context") or "") or None,
         runtime_tool_attempt=max(
             1,
             int(kwargs.get("_runtime_tool_attempt_from_context") or 1),
+        ),
+        runtime_validation_duration_ms=(
+            float(kwargs["_runtime_validation_duration_ms_from_context"])
+            if isinstance(
+                kwargs.get("_runtime_validation_duration_ms_from_context"),
+                (int, float),
+            )
+            and not isinstance(
+                kwargs.get("_runtime_validation_duration_ms_from_context"),
+                bool,
+            )
+            else 0.0
+        ),
+        chrome_interaction_mode=(
+            "fast"
+            if kwargs.get("_runtime_chrome_interaction_mode_from_context") == "fast"
+            else None
+        ),
+        chrome_sequence_child=(
+            kwargs.get("_runtime_chrome_sequence_child_from_context") is True
+        ),
+        chrome_expected_connection_id=(
+            str(kwargs.get("_runtime_chrome_expected_connection_id_from_context") or "").strip()
+            or None
         ),
     )
 
@@ -241,6 +394,23 @@ def runtime_tool_call_context_from_handler(
         else None
     )
     return runtime_tool_call_context_from_kwargs(kwargs, user_id=direct_user_id)
+
+
+def runtime_authorization_conversation_id(
+    context: RuntimeToolCallContext,
+    tool_name: str | None,
+) -> str | None:
+    """Return the conversation scope an authorization request should carry.
+
+    Sandbox-bound tools are authorized against the sandbox binding, so a
+    conversation-less task-worker run must present its binding key or the
+    storage recheck has nothing to look up. Every other tool is authorized
+    against the run's real conversation.
+    """
+
+    if str(tool_name or "").strip() in RUNTIME_SANDBOX_BOUND_TOOL_NAMES:
+        return context.sandbox_binding_key
+    return context.conversation_id
 
 
 def runtime_tool_call_context_is_external_customer(kwargs: dict[str, Any]) -> bool:
@@ -289,6 +459,10 @@ def runtime_injected_tool_context_args(
     workspace_id: str | None = None,
     conversation_id: str | None = None,
     task_id: str | None = None,
+    chrome_interaction_mode: str | None = None,
+    chrome_sequence_child: bool = False,
+    chrome_expected_connection_id: str | None = None,
+    runtime_validation_duration_ms: float | None = None,
 ) -> dict[str, Any]:
     args: dict[str, Any] = {
         "_agent_id_from_context": agent_id,
@@ -333,4 +507,20 @@ def runtime_injected_tool_context_args(
         args["conversation_id"] = conversation_id
     if task_id:
         args["task_id"] = task_id
+    if chrome_interaction_mode == "fast":
+        args["_runtime_chrome_interaction_mode_from_context"] = "fast"
+    if chrome_sequence_child:
+        args["_runtime_chrome_sequence_child_from_context"] = True
+    if chrome_expected_connection_id:
+        args["_runtime_chrome_expected_connection_id_from_context"] = str(
+            chrome_expected_connection_id
+        )
+    if isinstance(runtime_validation_duration_ms, (int, float)) and not isinstance(
+        runtime_validation_duration_ms,
+        bool,
+    ):
+        args["_runtime_validation_duration_ms_from_context"] = max(
+            float(runtime_validation_duration_ms),
+            0.0,
+        )
     return args

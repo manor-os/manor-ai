@@ -43,8 +43,10 @@ deployment's database (encrypted), never in source control or images.
 
 ## Session and Account Security
 
-- Sessions are JWTs signed with `JWT_SECRET_KEY`; expiry defaults to 24 hours
-  (`JWT_EXPIRE_MINUTES`).
+- Access JWTs signed with `JWT_SECRET_KEY` expire after 24 hours by default
+  (`JWT_EXPIRE_MINUTES`, capped at 24 hours). Remember me creates a revocable
+  HttpOnly browser session with a fixed 30-day deadline and rotating credentials.
+  Logout and password changes invalidate existing login authority.
 - Users can enable two-factor authentication (TOTP) and review active
   sessions under **Settings → Security**.
 - API keys for programmatic access are managed under **Settings → API Keys**;

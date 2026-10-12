@@ -19,6 +19,7 @@ async def handle_audio(
 ) -> str:
     if not prompt:
         return json.dumps({"error": "kind=audio requires prompt"}, ensure_ascii=False)
+    storage_scope = str(kwargs.get("storage_scope") or "task").strip().lower()
     return await runtime_generate_audio_media(
         entity_id=entity_id,
         user_id=user_id,
@@ -27,6 +28,6 @@ async def handle_audio(
         params=params,
         workspace_id=kwargs.get("workspace_id"),
         conversation_id=conversation_id,
-        task_id=kwargs.get("task_id"),
+        task_id=None if storage_scope == "workspace" else kwargs.get("task_id"),
         agent_id=agent_id,
     )

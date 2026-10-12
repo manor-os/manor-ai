@@ -57,6 +57,13 @@ class SandboxReservationStatus(str, Enum):
         )
 
 
+class SandboxRequesterKind(str, Enum):
+    """Who owns a reservation: a durable Runtime run, or a polling task worker."""
+
+    RUN = "run"
+    TASK = "task"
+
+
 class SandboxRunnerStatus(str, Enum):
     UNKNOWN = "unknown"
     HEALTHY = "healthy"
@@ -99,6 +106,11 @@ class RuntimeRun(Base, TimestampMixin):
     )
     status_reason: Mapped[Optional[str]] = mapped_column(String(80))
     checkpoint: Mapped[Optional[dict]] = mapped_column(JSONB)
+    # Context summaries are independent from the pending-tool resume checkpoint.
+    context_state: Mapped[Optional[dict]] = mapped_column(JSONB)
+    #: Open ``HitlRequest`` holding the ``request_input`` question this run is
+    #: parked on. ``None`` for a sandbox-capacity wait.
+    human_input_request_id: Mapped[Optional[str]] = mapped_column(String(26))
     execution_payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     result: Mapped[Optional[dict]] = mapped_column(JSONB)
     error: Mapped[Optional[dict]] = mapped_column(JSONB)
@@ -142,10 +154,21 @@ class SandboxReservation(Base, TimestampMixin):
 
     __tablename__ = "sandbox_reservations"
     __table_args__ = (
+        # Run-owned idempotency. Task tickets carry a NULL ``runtime_run_id``
+        # and Postgres never treats two NULLs as equal, so they simply do not
+        # participate in this constraint; they are deduplicated by
+        # ``uq_sandbox_reservations_task_tool`` below instead.
         UniqueConstraint(
             "runtime_run_id",
             "tool_call_id",
             name="uq_sandbox_reservations_run_tool",
+        ),
+        Index(
+            "uq_sandbox_reservations_task_tool",
+            "requester_id",
+            "tool_call_id",
+            unique=True,
+            postgresql_where=text("requester_kind = 'task'"),
         ),
         Index(
             "ix_sandbox_reservations_queue",
@@ -164,8 +187,13 @@ class SandboxReservation(Base, TimestampMixin):
     )
 
     id: Mapped[str] = mapped_column(String(26), primary_key=True, default=generate_ulid)
-    runtime_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    root_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    # NULL for task-worker requesters, which never have a durable RuntimeRun.
+    runtime_run_id: Mapped[Optional[str]] = mapped_column(String(26))
+    root_run_id: Mapped[Optional[str]] = mapped_column(String(26))
+    requester_kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default=SandboxRequesterKind.RUN.value
+    )
+    requester_id: Mapped[Optional[str]] = mapped_column(String(255))
     tool_call_id: Mapped[str] = mapped_column(String(255), nullable=False)
     entity_id: Mapped[str] = mapped_column(String(26), nullable=False)
     user_id: Mapped[str] = mapped_column(String(26), nullable=False)
@@ -190,7 +218,16 @@ class SandboxReservation(Base, TimestampMixin):
 
 
 class SandboxInstance(Base, TimestampMixin):
-    """Authoritative stateful routing for an allocated Sandbox."""
+    """Authoritative stateful routing for an allocated Sandbox.
+
+    Invariant: ``status == "active"`` means "this container exists on this
+    runner", never "this run owns it". Every later operation on a container
+    (including one reused from the owner's warm registry after its run
+    ended) resolves the runner through this row, so it stays active for the
+    life of the container. Ownership lives in the reservation and in the
+    warm registry; a run cancel must consult the warm marker before
+    destroying anything.
+    """
 
     __tablename__ = "sandbox_instances"
     __table_args__ = (
@@ -200,8 +237,9 @@ class SandboxInstance(Base, TimestampMixin):
 
     sandbox_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     reservation_id: Mapped[str] = mapped_column(String(26), nullable=False, unique=True)
-    runtime_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
-    root_run_id: Mapped[str] = mapped_column(String(26), nullable=False)
+    # NULL when the owning reservation came from a task worker (no RuntimeRun).
+    runtime_run_id: Mapped[Optional[str]] = mapped_column(String(26))
+    root_run_id: Mapped[Optional[str]] = mapped_column(String(26))
     runner_id: Mapped[str] = mapped_column(String(80), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
     released_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -218,6 +256,34 @@ class RuntimeOutboxEvent(Base):
             "created_at",
             postgresql_where=text("delivered_at IS NULL"),
         ),
+        Index(
+            "ix_runtime_outbox_due_fair",
+            "available_at",
+            "created_at",
+            "id",
+            postgresql_where=text("delivered_at IS NULL"),
+        ),
+        Index(
+            "ix_runtime_outbox_plan_due",
+            "available_at",
+            "created_at",
+            "id",
+            postgresql_where=text(
+                "delivered_at IS NULL "
+                "AND event_type = 'runtime.dispatch_plan_cycle'"
+            ),
+        ),
+        Index(
+            "ix_runtime_outbox_non_plan_due",
+            "available_at",
+            "created_at",
+            "id",
+            postgresql_where=text(
+                "delivered_at IS NULL "
+                "AND event_type <> 'runtime.dispatch_plan_cycle'"
+            ),
+        ),
+        Index("ix_runtime_outbox_aggregate", "aggregate_id"),
         UniqueConstraint("dedupe_key", name="uq_runtime_outbox_dedupe_key"),
     )
 

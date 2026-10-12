@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from packages.core.config import get_settings
+from packages.core.services.image_formats import heif_mime_from_header
 
 
 class UploadSecurityError(ValueError):
@@ -33,7 +34,7 @@ ALLOWED_UPLOAD_EXTENSIONS = frozenset({
     ".js", ".json", ".jsonl", ".jsx", ".m4a", ".m4v", ".md", ".mjs",
     ".mkv", ".mov", ".mp3", ".mp4", ".odp", ".ods", ".odt", ".ogg",
     ".opus", ".pdf", ".png", ".ppt", ".pptx", ".py", ".rb", ".rs",
-    ".rtf", ".scss", ".sql", ".svg", ".swift", ".tar", ".text",
+    ".rtf", ".scss", ".sql", ".srt", ".svg", ".swift", ".tar", ".text",
     ".tif", ".tiff", ".toml", ".ts", ".tsv", ".tsx", ".txt", ".wav",
     ".webm", ".webp", ".wps", ".xls", ".xlsx", ".xml", ".xhtml",
     ".yaml", ".yml", ".zip",
@@ -42,7 +43,7 @@ ALLOWED_UPLOAD_EXTENSIONS = frozenset({
 _TEXT_EXTENSIONS = frozenset({
     ".c", ".cpp", ".css", ".csv", ".go", ".htm", ".html", ".java",
     ".js", ".json", ".jsonl", ".jsx", ".md", ".mjs", ".py", ".rb",
-    ".rs", ".scss", ".sql", ".swift", ".text", ".toml", ".ts", ".tsv",
+    ".rs", ".scss", ".sql", ".srt", ".swift", ".text", ".toml", ".ts", ".tsv",
     ".tsx", ".txt", ".xml", ".xhtml", ".yaml", ".yml",
 })
 _ZIP_EXTENSIONS = frozenset({
@@ -57,6 +58,16 @@ _IMAGE_SIGNATURES = {
     ".bmp": (b"BM",),
     ".tif": (b"II*\x00", b"MM\x00*"),
     ".tiff": (b"II*\x00", b"MM\x00*"),
+}
+_IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
 }
 _EXECUTABLE_SIGNATURES = (
     b"MZ",                    # Windows PE
@@ -87,6 +98,14 @@ def validate_upload_header(
     if any(header.startswith(signature) for signature in _EXECUTABLE_SIGNATURES):
         raise UploadSecurityError("Executable files are not accepted")
 
+    # Some phone exports retain HEIC bytes under a .png/.jpg filename. Detect
+    # that specific image container; the full bytes still go through ClamAV.
+    heif_mime = heif_mime_from_header(header)
+    if heif_mime and extension in {*_IMAGE_SIGNATURES, ".heic", ".heif"}:
+        return heif_mime
+    if extension in {".heic", ".heif"}:
+        raise UploadSecurityError("File content does not match its HEIF extension")
+
     if extension in _ZIP_EXTENSIONS and not header.startswith((b"PK\x03\x04", b"PK\x05\x06")):
         raise UploadSecurityError("File content does not match its archive/document extension")
     if extension == ".pdf" and not header.startswith(b"%PDF-"):
@@ -99,7 +118,7 @@ def validate_upload_header(
     if extension in _TEXT_EXTENSIONS and b"\x00" in header:
         raise UploadSecurityError("Text uploads must not contain binary NUL bytes")
 
-    inferred = mimetypes.guess_type(f"file{extension}")[0] or "application/octet-stream"
+    inferred = _IMAGE_MIME_TYPES.get(extension) or mimetypes.guess_type(f"file{extension}")[0] or "application/octet-stream"
     declared = (declared_content_type or "").split(";", 1)[0].strip().lower()
     if declared.startswith("image/") and not inferred.startswith("image/"):
         raise UploadSecurityError("Declared image type does not match the filename")

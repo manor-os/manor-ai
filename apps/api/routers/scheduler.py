@@ -23,6 +23,7 @@ from packages.core.database import get_db
 from packages.core.models.user import User
 from packages.core.models.workspace import Workspace
 from packages.core.services.scheduler_service import (
+    ManagedAgentInitiativeDriverError,
     create_scheduled_job, list_scheduled_jobs, get_scheduled_job,
     mutate_scheduled_job, delete_scheduled_job, toggle_scheduled_job,
     summarize_scheduled_jobs,
@@ -30,6 +31,9 @@ from packages.core.services.scheduler_service import (
     create_agent_execution, list_agent_executions, update_agent_execution,
     defer_scheduled_job_skill_generation,
     scheduled_job_workspace_scope,
+)
+from packages.core.services.scheduled_run_lifecycle import (
+    ScheduledAgentLineageDeletionBlockedError,
 )
 from apps.api.deps import get_current_user, require_workspace_readable, require_workspace_writable
 from packages.core.services.workspace_access import (
@@ -42,6 +46,14 @@ jobs_router = APIRouter(prefix="/api/v1/jobs", tags=["scheduled-jobs"])
 executions_router = APIRouter(prefix="/api/v1/executions", tags=["agent-executions"])
 
 logger = logging.getLogger(__name__)
+
+
+def _reject_agent_initiative_driver(job) -> None:
+    """Keep the internal driver behind the Agent Initiative API boundary."""
+    if getattr(job, "agent_initiative_id", None) or str(
+        getattr(job, "execution_type", "") or ""
+    ) == "agent_initiative":
+        raise HTTPException(404, "Scheduled job not found")
 
 
 async def _legacy_compatible_workspace_gate(
@@ -486,6 +498,13 @@ async def create_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if req.execution_type == "agent_initiative" or str(
+        (req.execution_target or {}).get("managed_by") or ""
+    ) == "agent_initiative":
+        raise HTTPException(
+            409,
+            "Agent Initiative drivers can only be created through the Initiative API",
+        )
     try:
         scheduled_job_workspace_scope(req.workspace_id, req.execution_target)
     except ValueError as exc:
@@ -570,6 +589,7 @@ async def get_job(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(job)
     await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
     return _job_response(
         job,
@@ -588,6 +608,7 @@ async def update_job(
     existing = await get_scheduled_job(db, job_id, user.entity_id)
     if not existing:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(existing)
     await _legacy_compatible_workspace_gate(
         db,
         user,
@@ -681,8 +702,16 @@ async def delete_job(
     existing = await get_scheduled_job(db, job_id, user.entity_id)
     if not existing:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(existing)
     await _legacy_compatible_workspace_gate(db, user, existing.workspace_id, writable=True)
-    deleted = await delete_scheduled_job(db, job_id, user.entity_id)
+    try:
+        deleted = await delete_scheduled_job(db, job_id, user.entity_id)
+    except ManagedAgentInitiativeDriverError as exc:
+        # Keep managed drivers hidden even when they become managed between
+        # the endpoint's lookup and the service's authoritative row lock.
+        raise HTTPException(404, "Scheduled job not found") from exc
+    except ScheduledAgentLineageDeletionBlockedError as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not deleted:
         raise HTTPException(404, "Scheduled job not found")
 
@@ -697,6 +726,7 @@ async def toggle_job(
     existing = await get_scheduled_job(db, job_id, user.entity_id)
     if not existing:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(existing)
     await _legacy_compatible_workspace_gate(db, user, existing.workspace_id, writable=True)
     if req.enabled and existing.workspace_id:
         workspace = (await db.execute(
@@ -735,6 +765,7 @@ async def get_job_runs(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(job)
     await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
     runs = await list_job_runs(db, job.job_id, limit=limit)
     return [_run_response(r) for r in runs]
@@ -773,6 +804,7 @@ async def get_job_run_detail(
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(job)
     await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=False)
 
     run = (await db.execute(
@@ -858,22 +890,23 @@ async def run_job_now(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Manually dispatch a scheduled job immediately, without waiting
-    for the next periodic tick. The dispatcher creates the JobRun row
-    on the worker side (same code path as the cron tick), so polling
-    /runs after this call will surface it.
+    """Persist one authenticated manual occurrence before queue publication.
+
+    The durable parent makes retries idempotent and retains the requester
+    independently of the schedule definition's owner or recurring clock.
     """
     from datetime import datetime, timezone
     from packages.core.models.base import generate_ulid
-    from packages.core.tasks.scheduler_tasks import _dispatch_job_task
+    from packages.core.tasks.scheduler_tasks import dispatch_job_occurrence
 
     job = await get_scheduled_job(db, job_id, user.entity_id)
     if not job:
         raise HTTPException(404, "Scheduled job not found")
+    _reject_agent_initiative_driver(job)
     await _legacy_compatible_workspace_gate(db, user, job.workspace_id, writable=True)
-    if not job.enabled:
-        raise HTTPException(409, "Job is disabled — enable it before running")
     if job.workspace_id:
+        from packages.core.services.workspace_autonomy import workspace_allows_manual_work
+
         workspace = (await db.execute(
             select(Workspace).where(
                 Workspace.id == job.workspace_id,
@@ -881,8 +914,8 @@ async def run_job_now(
                 Workspace.deleted_at.is_(None),
             )
         )).scalar_one_or_none()
-        if workspace is not None and workspace.status != "active":
-            raise HTTPException(409, "Workspace is not active - resume it before running automations")
+        if not workspace_allows_manual_work(workspace):
+            raise HTTPException(409, "Workspace is unavailable for manual execution")
         if workspace is not None and is_sandbox_workspace(workspace):
             raise HTTPException(
                 409,
@@ -892,18 +925,24 @@ async def run_job_now(
     now = datetime.now(timezone.utc)
     request_key = idempotency_key or generate_ulid()
     occurrence_key = f"manual:{request_key}"
+    job_db_id = job.id
+    public_job_id = job.job_id
+    requesting_user_id = user.id
+    await db.rollback()
     try:
-        _dispatch_job_task.delay(
-            job.id,
-            now.isoformat(),
-            manual=True,
+        dispatch = await dispatch_job_occurrence(
+            job_db_id=job_db_id,
             occurrence_key=occurrence_key,
+            requesting_user_id=requesting_user_id,
         )
     except Exception as exc:
         raise HTTPException(503, f"Worker queue unreachable: {exc}") from exc
 
+    if dispatch is None:
+        raise HTTPException(409, "Scheduled job is unavailable for manual execution")
+
     return RunNowResponse(
-        job_id=job.job_id,
+        job_id=public_job_id,
         queued_at=now.isoformat(),
         idempotency_key=request_key,
     )

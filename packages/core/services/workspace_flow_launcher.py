@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import json
 from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.constants.pending_actions import PendingActionKind
@@ -17,6 +17,7 @@ from packages.core.models.workflow import (
     WorkflowBinding,
     WorkflowDefinition,
     WorkflowRun,
+    WorkflowTemplateInstallation,
 )
 from packages.core.models.workspace import Workspace
 from packages.core.services.workspace_workflow_router import (
@@ -104,6 +105,7 @@ async def _validate_launch_context(
     workspace_id: str,
     conversation: Conversation,
     origin_message: Message,
+    manual_run: bool = False,
 ) -> None:
     from packages.core.services.workspace_access import (
         user_can_write_workspace_artifacts,
@@ -130,8 +132,10 @@ async def _validate_launch_context(
     if (
         str(binding.entity_id) != entity_id
         or str(binding.workspace_id or "") != workspace_id
-        or not bool(binding.enabled)
-        or str(binding.status or "") != "active"
+        or (
+            (not bool(binding.enabled) or str(binding.status or "") != "active")
+            and not (manual_run and str(binding.status or "") in {"active", "paused"})
+        )
     ):
         raise PermissionError("Flow binding is not active in the requested Workspace")
     if (
@@ -188,14 +192,29 @@ async def _prefill_workflow_result_inputs(
         for item in requested
     }
     rows = (await db.execute(
-        select(WorkflowRun, WorkflowDefinition)
+        select(
+            WorkflowRun,
+            WorkflowDefinition,
+            WorkflowTemplateInstallation.component_key,
+        )
         .join(WorkflowDefinition, WorkflowDefinition.id == WorkflowRun.workflow_id)
+        .outerjoin(
+            WorkflowTemplateInstallation,
+            and_(
+                WorkflowTemplateInstallation.workflow_id == WorkflowDefinition.id,
+                WorkflowTemplateInstallation.entity_id == entity_id,
+                WorkflowTemplateInstallation.component_key.in_(workflow_slugs),
+            ),
+        )
         .where(
             WorkflowRun.entity_id == entity_id,
             WorkflowRun.workspace_id == workspace_id,
             WorkflowRun.status == "completed",
             WorkflowDefinition.entity_id == entity_id,
-            WorkflowDefinition.name.in_(workflow_slugs),
+            or_(
+                WorkflowDefinition.name.in_(workflow_slugs),
+                WorkflowTemplateInstallation.id.is_not(None),
+            ),
         )
         .order_by(
             WorkflowRun.completed_at.desc(),
@@ -205,7 +224,7 @@ async def _prefill_workflow_result_inputs(
     )).all()
 
     latest: dict[tuple[str, str], WorkflowRun] = {}
-    for run, workflow in rows:
+    for run, workflow, component_key in rows:
         origin = (run.trigger_data or {}).get("_workflow_chat_origin")
         if not isinstance(origin, dict):
             origin = (run.trigger_data or {}).get("_workspace_chat_entrypoint")
@@ -214,8 +233,10 @@ async def _prefill_workflow_result_inputs(
             or str(origin.get("conversation_id") or "") != conversation_id
         ):
             continue
-        key = (str(workflow.name or ""), str(run.current_step_id or ""))
-        latest.setdefault(key, run)
+        terminal_step_id = str(run.current_step_id or "")
+        latest.setdefault((str(workflow.name or ""), terminal_step_id), run)
+        if component_key:
+            latest.setdefault((str(component_key), terminal_step_id), run)
 
     result = dict(values)
     for item in requested:
@@ -263,6 +284,7 @@ async def launch_workspace_flow(
     proposal_context: dict[str, Any] | None = None,
     origin_metadata: dict[str, Any] | None = None,
     transaction_owner: TransactionOwner = "launcher",
+    user_requested: bool = False,
 ) -> WorkspaceFlowLaunch:
     """Create or reuse one validated, conversation-projected Flow run."""
     from packages.core.services.conversation_messages import add_message
@@ -284,6 +306,7 @@ async def launch_workspace_flow(
         workspace_id=workspace_id,
         conversation=conversation,
         origin_message=origin_message,
+        manual_run=source == "manual" and bool(user_id),
     )
 
     proposal_item_id = str((proposal_context or {}).get("proposal_item_id") or "") or None
@@ -416,6 +439,7 @@ async def launch_workspace_flow(
         trigger_source="workspace_chat" if source in {"explicit", "intent"} else source,
         started_by=user_id,
         execution_workspace_id=workspace_id,
+        user_requested=user_requested,
     )
     if requires_input:
         run.status = "paused"

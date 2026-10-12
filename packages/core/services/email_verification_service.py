@@ -156,6 +156,9 @@ async def verify_email(db: AsyncSession, email: str, code: str) -> bool:
     ):
         return False
     user.status = "active"
+    from packages.core.services.user_email_proof import mark_email_verified
+
+    mark_email_verified(user, user.email)
     await db.flush()
 
     # Keep the short-lived record until commit/expiry. The pending->active row

@@ -2,24 +2,17 @@ import type { CSSProperties, ReactNode } from "react";
 import type { Workspace } from "../../lib/types";
 import { t } from "../../lib/i18n";
 import {
-  IconAcademicCap,
-  IconBeaker,
-  IconBriefcase,
-  IconBuilding,
-  IconChat,
-  IconChecklist,
-  IconCode,
-  IconGlobe,
-  IconMegaphone,
-  IconRocket,
-  IconShield,
-  IconStore,
   IconTikTok,
   IconTwitter,
   IconYouTube,
   type IconProps,
 } from "../icons";
-import { matchWorkspacePresentationRule } from "./workspace-presentation.mjs";
+import { WORKSPACE_LUCIDE_ICON_COMPONENTS } from "./WorkspaceLucideIcons";
+import {
+  matchWorkspacePresentationRule,
+  workspaceMainIconIndex,
+  workspaceMainIconName,
+} from "./workspace-presentation.mjs";
 
 export type WorkspaceIconComponent = (props: IconProps) => ReactNode;
 
@@ -28,9 +21,12 @@ export interface WorkspacePresentation {
   label: string;
   bg: string;
   fg: string;
+  iconIndex: number;
+  iconName: string;
 }
 
 export interface WorkspacePresentationSource {
+  id?: string | null;
   name?: string | null;
   description?: string | null;
   category?: string | null;
@@ -42,42 +38,46 @@ export interface WorkspacePresentationSource {
   attribute_tags?: string[] | null;
 }
 
-// The matching rule set and keyword logic live in workspace-presentation.mjs
-// as plain, testable JS (word-boundary matching — see that file for why
-// substring matching was wrong). This map is just the icon each rule's
-// `iconKey` renders as, which is a React concern the .mjs module can't hold.
-const PRESENTATION_ICONS: Record<string, WorkspaceIconComponent> = {
-  building: IconBuilding,
-  beaker: IconBeaker,
-  twitter: IconTwitter,
-  tiktok: IconTikTok,
-  youtube: IconYouTube,
-  store: IconStore,
-  chat: IconChat,
-  rocket: IconRocket,
-  megaphone: IconMegaphone,
-  code: IconCode,
-  academicCap: IconAcademicCap,
-  globe: IconGlobe,
-  shield: IconShield,
-  checklist: IconChecklist,
+const BRAND_ICONS: Record<string, WorkspaceIconComponent> = {
+  "brand:twitter": IconTwitter,
+  "brand:tiktok": IconTikTok,
+  "brand:youtube": IconYouTube,
 };
+
+const LUCIDE_ICON_COMPONENTS = WORKSPACE_LUCIDE_ICON_COMPONENTS as unknown as Record<
+  string,
+  WorkspaceIconComponent
+>;
+
+function resolveWorkspaceIcon(iconName: string): WorkspaceIconComponent {
+  return (
+    BRAND_ICONS[iconName]
+    || LUCIDE_ICON_COMPONENTS[iconName]
+    || LUCIDE_ICON_COMPONENTS.BriefcaseBusiness
+  );
+}
 
 export function getWorkspacePresentation(ws: WorkspacePresentationSource): WorkspacePresentation {
   const rule = matchWorkspacePresentationRule(ws);
+  const iconName = workspaceMainIconName(ws, rule?.iconKey);
+  const iconIndex = workspaceMainIconIndex(ws, rule?.iconKey);
   if (rule) {
     return {
-      Icon: PRESENTATION_ICONS[rule.iconKey] || IconBriefcase,
+      Icon: resolveWorkspaceIcon(iconName),
       label: rule.label,
       bg: rule.bg,
       fg: rule.fg,
+      iconIndex,
+      iconName,
     };
   }
   return {
-    Icon: IconBriefcase,
+    Icon: resolveWorkspaceIcon(iconName),
     label: ws.category || t("page.workspaces.workspace"),
     bg: "#f3f1ed",
     fg: "#6f6860",
+    iconIndex,
+    iconName,
   };
 }
 
@@ -94,6 +94,8 @@ export function WorkspacePresentationTile({
 }) {
   return (
     <div
+      data-workspace-main-icon={presentation.iconName}
+      data-workspace-main-icon-index={presentation.iconIndex}
       style={{
         width: size,
         height: size,
@@ -107,7 +109,12 @@ export function WorkspacePresentationTile({
         ...style,
       }}
     >
-      <presentation.Icon size={iconSize} style={{ color: presentation.fg }} />
+      <span aria-hidden="true" style={{ display: "inline-flex" }}>
+        <presentation.Icon
+          size={iconSize}
+          style={{ color: presentation.fg }}
+        />
+      </span>
     </div>
   );
 }

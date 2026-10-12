@@ -96,11 +96,25 @@ async def _load_target(
     deleted target (stop path must always succeed)."""
     target_kind, target_id = _scope(experiment)
     model, _ = _TARGET_SPECS[target_kind]
-    row = await db.get(model, target_id)
+    row = (await db.execute(
+        select(model)
+        .where(model.id == target_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if row is None:
         if required:
             raise ExperimentTargetError(
                 target_kind=target_kind, target_id=target_id, reason="not found",
+            )
+        return None, target_kind, target_id
+    row_entity = str(getattr(row, "entity_id", None) or "")
+    if row_entity != str(experiment.entity_id or ""):
+        if required:
+            raise ExperimentTargetError(
+                target_kind=target_kind,
+                target_id=target_id,
+                reason="belongs to a different entity",
             )
         return None, target_kind, target_id
     row_workspace = getattr(row, "workspace_id", None)
@@ -113,6 +127,17 @@ async def _load_target(
                        f"not {experiment.workspace_id}",
             )
         return None, target_kind, target_id
+    if target_kind == "scheduled_job":
+        from packages.core.services.scheduler_service import (
+            is_agent_initiative_driver,
+        )
+
+        if required and is_agent_initiative_driver(row):
+            raise ExperimentTargetError(
+                target_kind=target_kind,
+                target_id=target_id,
+                reason="is managed by an Agent Initiative",
+            )
     return row, target_kind, target_id
 
 

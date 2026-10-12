@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.core.constants.advisory_locks import AdvisoryLockNamespace
 from packages.core.constants.channels import ExternalMessageActionKey
 from packages.core.database import async_session
+from packages.core.database_runtime import release_read_transaction
 from packages.core.constants.pending_actions import PendingActionKind
 from packages.core.models.base import generate_ulid
 from packages.core.models.channel import ChannelConfig, ChannelContact, MessageLog
@@ -1242,7 +1243,7 @@ async def channel_reply_route_is_active(
             binding=binding,
             contact=(
                 None
-                if channel_type in {"slack", "discord"}
+                if channel_type in {"slack", "discord", "twilio_voice"}
                 else contact
             ),
         )
@@ -1574,6 +1575,9 @@ async def send_actionable_outbound_to_contact(
         return {"sent": False, "error": "channel_route_unavailable"}
     contact, cc = route
 
+    await release_read_transaction(db)
+    # Keep the receipt pending in memory until the provider returns. Flushing
+    # a queued log here would immediately take the connection back.
     log = await create_channel_outbound_log(
         db,
         entity_id=contact.entity_id,
@@ -1581,6 +1585,7 @@ async def send_actionable_outbound_to_contact(
         channel_type=contact.channel_type,
         to_address=str(contact.source_id),
         content=text,
+        flush=False,
     )
 
     adapter = ADAPTERS.get(contact.channel_type)
@@ -1657,6 +1662,9 @@ async def send_outbound_to_contact(
         return {"sent": False, "error": "channel_route_unavailable"}
     contact, cc = route
 
+    await release_read_transaction(db)
+    # Keep the receipt pending in memory until the provider returns. Flushing
+    # a queued log here would immediately take the connection back.
     log = await create_channel_outbound_log(
         db,
         entity_id=contact.entity_id,
@@ -1664,6 +1672,7 @@ async def send_outbound_to_contact(
         channel_type=contact.channel_type,
         to_address=str(contact.source_id),
         content=text,
+        flush=False,
     )
 
     adapter = ADAPTERS.get(contact.channel_type)

@@ -5,7 +5,7 @@ import secrets
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import exists, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -38,6 +38,9 @@ from packages.core.services.team_invite_service import (
 from packages.core.services.people_service import (
     list_clients, get_client, create_client, update_client, delete_client,
     list_staff, get_staff_member, create_staff_member, update_staff_member, delete_staff_member,
+)
+from packages.core.services.knowledge_ownership import (
+    transfer_departed_user_knowledge_to_entity,
 )
 from apps.api.deps import get_current_user
 
@@ -1112,6 +1115,31 @@ async def delete_one_staff(
     # cards after another tab/user removes a row; returning 204 keeps the
     # UI cleanup path smooth without leaking whether a cross-entity ID exists.
     await _require_user_management(db, user)
+    staff = await get_staff_member(db, staff_id, user.entity_id)
+    if staff is not None and staff.user_id:
+        from packages.core.models.document import Document, DocumentFolder
+
+        owns_knowledge = await db.scalar(
+            select(
+                exists().where(
+                    Document.entity_id == user.entity_id,
+                    Document.owner_id == staff.user_id,
+                )
+            )
+        ) or await db.scalar(
+            select(
+                exists().where(
+                    DocumentFolder.entity_id == user.entity_id,
+                    DocumentFolder.owner_id == staff.user_id,
+                )
+            )
+        )
+        if owns_knowledge:
+            raise HTTPException(
+                409,
+                "This staff member still owns Knowledge. Deactivate the account "
+                "and transfer its Knowledge to the company before removal.",
+            )
     await delete_staff_member(db, staff_id, user.entity_id)
 
 
@@ -1122,6 +1150,68 @@ class StaffAccountResponse(BaseModel):
     user_id: str
     email: str
     password: str
+
+
+class KnowledgeOwnershipTransferResponse(BaseModel):
+    departed_user_id: str
+    documents_transferred: int
+    folders_transferred: int
+
+
+@router.post(
+    "/staff/{staff_id}/transfer-knowledge-to-entity",
+    response_model=KnowledgeOwnershipTransferResponse,
+)
+async def transfer_departed_staff_knowledge(
+    staff_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not await user_has_effective_permission(
+        db,
+        user.id,
+        user.entity_id,
+        user.role,
+        Permission.DOCS_TRANSFER_DEPARTED,
+    ):
+        raise HTTPException(403, "Knowledge transfer permission is required")
+
+    staff = (await db.execute(
+        select(Staff).where(
+            Staff.id == staff_id,
+            Staff.entity_id == user.entity_id,
+        ).with_for_update()
+    )).scalar_one_or_none()
+    if staff is None or not staff.user_id:
+        raise HTTPException(404, "Departed staff account not found")
+
+    memberships = list((await db.execute(
+        select(UserMembership).where(
+            UserMembership.user_id == staff.user_id,
+            UserMembership.entity_id == user.entity_id,
+        ).with_for_update()
+    )).scalars().all())
+    active_membership = any(
+        membership.status == "active" and membership.deleted_at is None
+        for membership in memberships
+    )
+    if (
+        (staff.status == "active" and staff.deleted_at is None)
+        or active_membership
+    ):
+        raise HTTPException(409, "Knowledge can only be transferred after the staff member leaves")
+
+    result = await transfer_departed_user_knowledge_to_entity(
+        db,
+        entity_id=user.entity_id,
+        departing_user_id=staff.user_id,
+        actor_user_id=user.id,
+    )
+    return KnowledgeOwnershipTransferResponse(
+        departed_user_id=staff.user_id,
+        documents_transferred=result.document_count,
+        folders_transferred=result.folder_count,
+    )
 
 
 class StaffInviteDeliveryResponse(BaseModel):

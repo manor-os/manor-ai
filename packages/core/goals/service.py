@@ -368,6 +368,8 @@ async def update_goal(
     if not goal:
         return None
     validate_goal_status_transition(goal.status, fields.get("status"))
+    if fields.get("current_value") is not None and (goal.stat_id or fields.get("stat_id")):
+        raise ValueError("A Stat-linked Goal value must be written through record_measurement or record_stat_assessment")
 
     previous_metric_key = goal.metric_key
     previous_stat_id = goal.stat_id
@@ -523,6 +525,7 @@ async def record_measurement(
     measured_at: Optional[datetime] = None,
     recompute_pace_now: bool = True,
     baseline_value_if_missing: Optional[Decimal | float | int] = None,
+    _stat_projection: bool = False,
 ) -> GoalMeasurement:
     """Append a measurement, update goal.current_value, recompute pace.
 
@@ -542,6 +545,29 @@ async def record_measurement(
         GoalStatus.ABANDONED.value,
     }:
         raise GoalLifecycleError(f"goal {goal.id} is {goal.status}")
+    if goal.stat_id and not _stat_projection:
+        from packages.core.models.workspace_stat import WorkspaceStat
+        from packages.core.stats.service import record_observation
+
+        stat = (await db.execute(select(WorkspaceStat).where(
+            WorkspaceStat.id == goal.stat_id,
+            WorkspaceStat.entity_id == goal.entity_id,
+            WorkspaceStat.workspace_id == goal.workspace_id,
+        ))).scalar_one_or_none()
+        if stat is None:
+            raise ValueError("linked stat is unavailable")
+        observation = await record_observation(
+            db, stat, value=value, source=source, evidence=meta,
+            observed_at=measured_at,
+            idempotency_key=(meta or {}).get("idempotency_key"),
+        )
+        measurement = (await db.execute(select(GoalMeasurement).where(
+            GoalMeasurement.goal_id == goal.id,
+            GoalMeasurement.meta["observation_id"].astext == observation.id,
+        ))).scalar_one_or_none()
+        if measurement is None:
+            raise ValueError("observation was recorded but could not project to this Goal")
+        return measurement
     measured_at = measured_at or datetime.now(timezone.utc)
     value_dec = validate_goal_number(value)
 

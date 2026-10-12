@@ -8,7 +8,9 @@ import Input from "../ui/Input";
 
 export const NODE_GROUPS: { group: string; types: string[] }[] = [
   { group: "Triggers", types: ["trigger", "webhook"] },
-  { group: "AI", types: ["llm", "agent", "rag", "classifier", "extract"] },
+  // "rag" is hidden while document indexing is paused; existing rag steps
+  // still render and run.
+  { group: "AI", types: ["llm", "agent", "classifier", "extract"] },
   { group: "Media", types: ["image", "video", "audio"] },
   { group: "Logic", types: ["condition", "switch", "loop", "parallel", "merge", "transform", "filter", "aggregate", "split", "limit", "sort", "dedupe", "datetime", "wait"] },
   { group: "I/O", types: ["http", "connector", "code", "tool", "subworkflow", "extractfromfile", "respond"] },

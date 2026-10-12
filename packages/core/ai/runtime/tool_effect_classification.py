@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
 
 from packages.core.ai.runtime.approvals import RuntimeApprovalAction
+from packages.core.services.generated_media_naming import GeneratedMediaOutputPlan
 from packages.core.services.runtime_authorization.domain import (
     RuntimeAuthorizationAccess,
 )
@@ -43,6 +44,8 @@ class RuntimeWorkspaceFileScope:
 
     existence: WorkspaceFileExistence
     artifact_base_dir: str | None = None
+    media_output_plan: GeneratedMediaOutputPlan | None = None
+    file_targets: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,8 @@ class RuntimeToolAuthorization:
     action_key: str
     capability_id: str | None
     access: RuntimeAuthorizationAccess
+    resource_kind: str | None = None
+    resource_id: str | None = None
 
     def __post_init__(self) -> None:
         if not str(self.action_key or "").strip():

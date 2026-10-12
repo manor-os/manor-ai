@@ -1,17 +1,7 @@
-"""Regression: "Always approve" must actually stick in a workspace chat.
+"""Workspace settings and one-time approvals share the same policy service.
 
-Creating an automation (`create_scheduled_job` → action ``workspace.automation.create``,
-capability ``automation.manage``, risk ``high``) in a workspace whose governance
-policy HITL-gates automation used to loop forever: the approval card's
-"Always approve" wrote a user *preference* that the guard's workspace branch
-never read — every retry re-paused and minted a brand-new card.
-
-Under the unified approval core there is ONE standing store for workspace
-conversations: the workspace policy auto-approve set. "Always approve" on the
-card writes it (``grant_approval(standing=True)``), and both the runtime guard
-and the dispatcher step gate honor it through ``resolve_approval``. Hard
-governance blocks (``never_allow`` / risk ceiling / budget caps) return
-``deny`` without minting a request and can never be approved past.
+Exact saved exceptions affect new operations; existing pending requests retain
+human review. Automated origins cannot bypass the current Workspace rules.
 """
 
 import json
@@ -24,10 +14,11 @@ from packages.core.ai.runtime.approval_service import (
     resolve_runtime_approval_message,
 )
 from packages.core.governance import WorkspacePolicy, update_policy
+from packages.core.governance.approval_policy import ApprovalPolicyOverride, ApprovalRule
+from packages.core.models.hitl_request import HitlRequest
+from tests.approval_settings_test_utils import action_rule, set_workspace_test_approval
+from tests.test_runtime_guard_unified_store import _fixture
 from packages.core.models.base import generate_ulid
-from packages.core.models.task import Conversation
-from packages.core.models.user import User
-from packages.core.models.workspace import Workspace
 
 
 class _SessionContext:
@@ -43,64 +34,50 @@ class _SessionContext:
 
 _CREATE_ARGS = {
     "name": "hourly X post runner health check",
-    "cron": "0 * * * *",
-    "prompt": "Check the runner is healthy.",
+    "schedule_kind": "cron",
+    "cron_expr": "0 * * * *",
+    "payload_message": "Check the runner is healthy.",
 }
 
 
-async def _setup_workspace(
-    db_session,
-    *,
-    policy: WorkspacePolicy,
-) -> dict[str, str]:
-    entity_id = generate_ulid()
-    user_id = generate_ulid()
-    workspace_id = generate_ulid()
-    conversation_id = generate_ulid()
-    db_session.add(
-        User(
-            id=user_id,
-            entity_id=entity_id,
-            email=f"{user_id}@example.com",
-            password_hash="x",
-            role="owner",
-        )
-    )
-    db_session.add(
-        Workspace(
-            id=workspace_id,
-            entity_id=entity_id,
-            name="Automation Workspace",
-            operating_model={},
-        )
-    )
-    db_session.add(
-        Conversation(
-            id=conversation_id,
-            entity_id=entity_id,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            title="Workspace chat",
-        )
-    )
-    await update_policy(
-        db_session,
-        entity_id=entity_id,
-        workspace_id=workspace_id,
-        policy=policy,
-        changed_by=user_id,
-        change_summary="test policy",
-    )
+async def _setup_workspace(db_session, *, policy: WorkspacePolicy) -> dict[str, str]:
+    ids = await _fixture(db_session)
+    await update_policy(db_session, entity_id=ids["entity_id"], workspace_id=ids["workspace_id"],
+        policy=policy, changed_by=ids["user_id"], change_summary="test policy")
     await db_session.commit()
-    return {
-        "entity_id": entity_id,
-        "user_id": user_id,
-        "workspace_id": workspace_id,
-        "conversation_id": conversation_id,
-    }
+    return ids
 
 
-async def _guard(ids, arguments):
+def _runtime_envelope(ids, *, surface, tool_name: str = "create_scheduled_job"):
+    from packages.core.ai.runtime.envelope import RuntimeEnvelope
+    from packages.core.ai.runtime.principals import RuntimePrincipal
+    from packages.core.ai.runtime.profiles import RuntimeProfile
+    from packages.core.constants.runtime_principal import RuntimePrincipalKind
+
+    profile = (
+        RuntimeProfile.WORKFLOW_STEP
+        if surface.value == "workflow_agent_step"
+        else RuntimeProfile.WORKSPACE_OPERATOR
+    )
+    return RuntimeEnvelope(
+        surface=surface,
+        principal=RuntimePrincipal(
+            kind=RuntimePrincipalKind.WORKSPACE_MEMBER,
+            entity_id=ids["entity_id"],
+            actor_user_id=ids["user_id"],
+            execution_user_id=ids["user_id"],
+            workspace_id=ids["workspace_id"],
+        ),
+        profile=profile,
+        entity_id=ids["entity_id"],
+        user_id=ids["user_id"],
+        workspace_id=ids["workspace_id"],
+        conversation_id=ids["conversation_id"],
+        allowed_tool_names=(tool_name,),
+    )
+
+
+async def _guard(ids, arguments, *, runtime_envelope=None, operation="primary"):
     return await guard_workspace_tool_action(
         name="create_scheduled_job",
         arguments=arguments,
@@ -108,6 +85,8 @@ async def _guard(ids, arguments):
         user_id=ids["user_id"],
         workspace_id=ids["workspace_id"],
         conversation_id=ids["conversation_id"],
+        runtime_envelope=runtime_envelope,
+        operation_id=f"test:{ids['conversation_id']}:{operation}",
     )
 
 
@@ -117,7 +96,7 @@ async def test_workspace_hitl_without_grant_still_prompts(db_session, monkeypatc
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     ids = await _setup_workspace(
         db_session,
-        policy=WorkspacePolicy(hitl_required_capabilities=["automation.manage"]),
+        policy=WorkspacePolicy(max_risk_level="high", approval=ApprovalPolicyOverride(rules=[ApprovalRule(id="review-automation", effect="ask", selector={"kind": "category", "category": "automation"})])),
     )
 
     blocked = await _guard(ids, dict(_CREATE_ARGS))
@@ -128,30 +107,21 @@ async def test_workspace_hitl_without_grant_still_prompts(db_session, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_workspace_always_on_card_breaks_hitl_loop(db_session, monkeypatch):
-    """THE loop fix, end to end: Always approve on the card writes the
-    workspace policy standing grant — the next call sails through with no
-    token and no new card."""
+async def test_workspace_exact_setting_keeps_pending_but_admits_new_operations(db_session, monkeypatch):
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
-    ids = await _setup_workspace(
-        db_session,
-        policy=WorkspacePolicy(hitl_required_capabilities=["automation.manage"]),
-    )
-
-    blocked = json.loads(await _guard(ids, dict(_CREATE_ARGS)) or "{}")
-    message = await resolve_runtime_approval_message(
-        db_session,
-        conversation_id=ids["conversation_id"],
-        entity_id=ids["entity_id"],
-        user_id=ids["user_id"],
-        hitl_id=blocked["approval_token"],
-        action="always_approve",
-    )
-    assert message and "Retry the exact same tool call" in message
-
-    assert await _guard(ids, dict(_CREATE_ARGS)) is None
-    # ... and a DIFFERENT payload for the same action is standing-approved too.
-    assert await _guard(ids, {**_CREATE_ARGS, "name": "daily digest"}) is None
+    ids = await _setup_workspace(db_session, policy=WorkspacePolicy(max_risk_level="high",
+        approval=ApprovalPolicyOverride(mode="confirm_changes")))
+    blocked = json.loads(await _guard(ids, dict(_CREATE_ARGS)))
+    with pytest.raises(ValueError, match="[Aa]lways|approval.settings"):
+        await resolve_runtime_approval_message(db_session,
+            conversation_id=ids["conversation_id"], entity_id=ids["entity_id"], user_id=ids["user_id"],
+            hitl_id=blocked["approval_token"], action="always_approve")
+    await set_workspace_test_approval(db_session, workspace_id=ids["workspace_id"],
+        entity_id=ids["entity_id"], actor_id=ids["user_id"],
+        user_rules=[action_rule("workspace.automation.create")])
+    assert (await db_session.get(HitlRequest, blocked["approval_token"])).status == "pending"
+    assert json.loads(await _guard(ids, dict(_CREATE_ARGS)))["approval_token"] == blocked["approval_token"]
+    assert await _guard(ids, {**_CREATE_ARGS, "name": "daily digest"}, operation="new-intent") is None
 
 
 @pytest.mark.asyncio
@@ -160,7 +130,7 @@ async def test_workspace_approve_once_covers_one_retry_only(db_session, monkeypa
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     ids = await _setup_workspace(
         db_session,
-        policy=WorkspacePolicy(hitl_required_capabilities=["automation.manage"]),
+        policy=WorkspacePolicy(max_risk_level="high", approval=ApprovalPolicyOverride(rules=[ApprovalRule(id="review-automation", effect="ask", selector={"kind": "category", "category": "automation"})])),
     )
 
     blocked = json.loads(await _guard(ids, dict(_CREATE_ARGS)) or "{}")
@@ -175,7 +145,7 @@ async def test_workspace_approve_once_covers_one_retry_only(db_session, monkeypa
     )
 
     assert await _guard(ids, {**_CREATE_ARGS, "approval_token": token}) is None
-    reask = json.loads(await _guard(ids, dict(_CREATE_ARGS)) or "{}")
+    reask = json.loads(await _guard(ids, dict(_CREATE_ARGS), operation="new-intent") or "{}")
     assert reask["__hitl__"] is True
     assert reask["approval_token"] != token
 
@@ -187,7 +157,7 @@ async def test_workspace_reject_is_per_request_not_standing(db_session, monkeypa
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     ids = await _setup_workspace(
         db_session,
-        policy=WorkspacePolicy(hitl_required_capabilities=["automation.manage"]),
+        policy=WorkspacePolicy(max_risk_level="high", approval=ApprovalPolicyOverride(rules=[ApprovalRule(id="review-automation", effect="ask", selector={"kind": "category", "category": "automation"})])),
     )
 
     blocked = json.loads(await _guard(ids, dict(_CREATE_ARGS)) or "{}")
@@ -201,7 +171,7 @@ async def test_workspace_reject_is_per_request_not_standing(db_session, monkeypa
     )
     assert message and "rejected" in message
 
-    reask = json.loads(await _guard(ids, dict(_CREATE_ARGS)) or "{}")
+    reask = json.loads(await _guard(ids, dict(_CREATE_ARGS), operation="new-intent") or "{}")
     assert reask["__hitl__"] is True
     assert reask["approval_token"] != blocked["approval_token"]
 
@@ -213,13 +183,119 @@ async def test_workspace_standing_grant_does_not_override_hard_block(db_session,
     monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
     ids = await _setup_workspace(
         db_session,
-        policy=WorkspacePolicy(
-            never_allow_capabilities=["automation.manage"],
-            auto_approve_capabilities=["automation.manage"],
-        ),
+        policy=WorkspacePolicy(max_risk_level="high", approval=ApprovalPolicyOverride(mode="automatic", rules=[
+            ApprovalRule(id="deny-automation", effect="deny", selector={"kind": "category", "category": "automation"}),
+            ApprovalRule(id="allow-create", effect="allow", selector={"kind": "action", "action_key": "workspace.automation.create"}),
+        ])),
     )
 
     blocked = await _guard(ids, dict(_CREATE_ARGS))
+    payload = json.loads(blocked or "{}")
+    assert payload["error"] == "blocked_by_governance"
+    assert payload["capability_id"] == "automation.manage"
+
+
+@pytest.mark.asyncio
+async def test_automated_and_direct_origins_share_the_current_policy(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    ids = await _setup_workspace(
+        db_session,
+        policy=WorkspacePolicy(max_risk_level="high", approval=ApprovalPolicyOverride(mode="automatic", rules=[
+            ApprovalRule(id="review-automation", effect="ask", selector={"kind": "category", "category": "automation"}),
+        ])),
+    )
+    run = WorkflowRun(
+        workflow_id=generate_ulid(),
+        entity_id=ids["entity_id"],
+        workspace_id=ids["workspace_id"],
+        trigger_source="manual",
+        status="running",
+        variables={},
+        step_results={},
+        trigger_data={},
+        definition_snapshot={},
+        execution_snapshot={},
+        execution_trace=[],
+        started_by=ids["user_id"],
+    )
+    db_session.add(run)
+    await db_session.commit()
+
+    from packages.core.ai.runtime.surfaces import ChatSurface
+
+    allowed = await _guard(
+        ids,
+        {
+            **_CREATE_ARGS,
+            "_workflow_run_id_from_context": run.id,
+        },
+        runtime_envelope=_runtime_envelope(
+            ids,
+            surface=ChatSurface.WORKFLOW_AGENT_STEP,
+        ),
+    )
+    spoofed_direct_chat = await _guard(
+        ids,
+        {
+            **_CREATE_ARGS,
+            "_workflow_run_id_from_context": run.id,
+        },
+        runtime_envelope=_runtime_envelope(
+            ids,
+            surface=ChatSurface.WORKSPACE_CHAT,
+        ),
+    )
+    direct_chat = await _guard(ids, dict(_CREATE_ARGS))
+
+    assert json.loads(allowed or "{}")["error"] == "approval_required"
+    assert json.loads(spoofed_direct_chat or "{}")["error"] == "approval_required"
+    assert json.loads(direct_chat or "{}")["error"] == "approval_required"
+
+
+@pytest.mark.asyncio
+async def test_automatic_mode_never_overrides_hard_block(
+    db_session,
+    monkeypatch,
+):
+    from packages.core.models.workflow import WorkflowRun
+
+    monkeypatch.setattr(database, "async_session", lambda: _SessionContext(db_session))
+    ids = await _setup_workspace(
+        db_session,
+        policy=WorkspacePolicy(max_risk_level="high", approval=ApprovalPolicyOverride(mode="automatic", rules=[
+            ApprovalRule(id="deny-automation", effect="deny", selector={"kind": "category", "category": "automation"}),
+        ])),
+    )
+    run = WorkflowRun(
+        workflow_id=generate_ulid(),
+        entity_id=ids["entity_id"],
+        workspace_id=ids["workspace_id"],
+        trigger_source="schedule",
+        status="running",
+        variables={},
+        step_results={},
+        trigger_data={},
+        definition_snapshot={},
+        execution_snapshot={},
+        execution_trace=[],
+        started_by=ids["user_id"],
+    )
+    db_session.add(run)
+    await db_session.commit()
+
+    blocked = await _guard(
+        ids,
+        {
+            **_CREATE_ARGS,
+            "_workflow_run_id_from_context": run.id,
+        },
+    )
+
     payload = json.loads(blocked or "{}")
     assert payload["error"] == "blocked_by_governance"
     assert payload["capability_id"] == "automation.manage"

@@ -10,6 +10,14 @@ import {
 import { useLocation } from "react-router-dom";
 import { useAuthStore } from "../stores/auth";
 import { captureClientError } from "./clientErrors";
+import type { ChatRoomMessage } from "./chatRoomTypes";
+
+export interface ChatRoomChangeEvent {
+  room_id: string;
+  kind?: "changed" | "message" | "reaction" | "retracted";
+  message?: ChatRoomMessage;
+  previous_message_id?: string | null;
+}
 
 interface UseWebSocketOptions {
   onNotification?: (data: Record<string, any>) => void;
@@ -18,6 +26,7 @@ interface UseWebSocketOptions {
   onGoalProgress?: (data: Record<string, any>) => void;
   onWorkspaceChatMessage?: (data: Record<string, any>) => void;
   onConversationMessage?: (data: Record<string, any>) => void;
+  onChatRoomChanged?: (data: ChatRoomChangeEvent) => void;
   /** In-progress reply for a turn this tab is not streaming (see chat_service). */
   onChatStreamSnapshot?: (data: Record<string, any>) => void;
   onConnect?: (data: Record<string, any>) => void;
@@ -146,6 +155,11 @@ function dispatchMessage(event: MessageEvent) {
       case "conversation_message":
         for (const sub of subscribers.values()) {
           sub.optionsRef.current.onConversationMessage?.(msg.data);
+        }
+        break;
+      case "chat_room_changed":
+        for (const sub of subscribers.values()) {
+          sub.optionsRef.current.onChatRoomChanged?.(msg.data as ChatRoomChangeEvent);
         }
         break;
       case "chat_stream_snapshot":

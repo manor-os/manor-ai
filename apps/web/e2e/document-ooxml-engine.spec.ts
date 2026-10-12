@@ -1,6 +1,36 @@
 import { expect, test } from "@playwright/test";
 import JSZip from "jszip";
 
+test("a native-enter paragraph with a copied source identity saves as an insertion", async ({ page }) => {
+  await page.goto("/");
+
+  const savedBytes = await page.evaluate(async () => {
+    const engine = await import("/src/lib/documentOoxml.ts");
+    const originalFile = await engine.buildDocumentFile("<p>First</p>", "native-enter.docx");
+    const originalBuffer = await originalFile.arrayBuffer();
+    const sources = await engine.extractDocumentParagraphSources(originalBuffer);
+    const baselineHtml = engine.annotateDocumentHtml("<p>First</p>", sources);
+    const editedHtml = baselineHtml.replace(
+      "</p>",
+      '</p><p data-docx-paragraph-index="0" data-docx-source-editable="true">Second paragraph revision 2.</p>',
+    );
+
+    const saved = await engine.editDocumentFileWithSnapshot(
+      originalBuffer,
+      baselineHtml,
+      editedHtml,
+      "native-enter.docx",
+    );
+    return Array.from(new Uint8Array(saved.savedBuffer));
+  });
+
+  const zip = await JSZip.loadAsync(Uint8Array.from(savedBytes));
+  const documentXml = await zip.file("word/document.xml")?.async("text");
+  expect(documentXml).toContain("First");
+  expect(documentXml).toContain("Second paragraph revision 2.");
+  expect(documentXml?.match(/<w:p(?:\s|>)/g)).toHaveLength(2);
+});
+
 test("an inserted DOCX table cell stays editable after the first save", async ({ page }) => {
   await page.goto("/");
 

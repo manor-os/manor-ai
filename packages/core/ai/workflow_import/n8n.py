@@ -12,7 +12,7 @@ import re
 
 from .base import WorkflowImporter
 from .connectors import resolve_connector
-from .model import GraphNode, ImportReport, WorkflowGraph
+from .model import HIDDEN_NODE_TYPES, GraphNode, ImportReport, WorkflowGraph
 
 # n8n comparison operations (v1 + v2) -> operators manor's evaluator supports.
 N8N_OP_MAP = {
@@ -276,6 +276,8 @@ class N8nImporter(WorkflowImporter):
                 if pkg and pkg != "n8n-nodes-base" and "langchain" not in pkg:
                     canonical = "connector"
 
+            if canonical in HIDDEN_NODE_TYPES:
+                canonical = None
             if canonical is None:
                 node = self._placeholder(
                     report, name_id, name_id, ntype, rn,

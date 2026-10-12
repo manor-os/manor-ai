@@ -34,11 +34,16 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from packages.core.database_runtime import release_read_transaction
 from packages.core.external_api_versions import META_GRAPH
 from packages.core.services.official_remote_mcp import (
     OfficialRemoteMCPFactory,
 )
 from packages.core.services.robinhood_oauth import ROBINHOOD_MCP_ENDPOINT
+from packages.core.services.lark_oauth import LARK_OAUTH_SCOPES
+from packages.core.services.manor_integration_oauth import (
+    MANOR_OAUTH_PROVIDERS, is_manor_oauth_provider, manor_oauth_endpoints,
+)
 
 logger = logging.getLogger(__name__)
 _OAUTH_SECRET_DECRYPT_WARNED: set[str] = set()
@@ -62,6 +67,16 @@ class OAuthProviderConfig:
 _PAYPAL_OAUTH = OfficialRemoteMCPFactory.paypal_oauth()
 
 _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
+    **{
+        key: {
+            "authorize_url": f"{origin}/oauth/authorize",
+            "token_url": f"{origin}/api/oauth/token",
+            "scopes": scopes,
+            "client_id_env": f"{prefix}_OAUTH_CLIENT_ID",
+            "client_secret_env": f"{prefix}_OAUTH_CLIENT_SECRET",
+        }
+        for key, (prefix, origin, scopes) in MANOR_OAUTH_PROVIDERS.items()
+    },
     "robinhood": {
         "authorize_url": "https://robinhood.com/oauth",
         "token_url": "https://api.robinhood.com/oauth2/token/",
@@ -132,6 +147,13 @@ _PROVIDER_OAUTH_META: dict[str, dict[str, str]] = {
         ),
         "client_id_env": "SLACK_CLIENT_ID",
         "client_secret_env": "SLACK_CLIENT_SECRET",
+    },
+    "lark": {
+        "authorize_url": "https://accounts.larksuite.com/open-apis/authen/v1/authorize",
+        "token_url": "https://open.larksuite.com/open-apis/authen/v2/oauth/token",
+        "scopes": LARK_OAUTH_SCOPES,
+        "client_id_env": "LARK_APP_ID",
+        "client_secret_env": "LARK_APP_SECRET",
     },
     "discord": {
         "authorize_url": "https://discord.com/api/oauth2/authorize",
@@ -434,6 +456,9 @@ def apply_authorize_param_conventions(
     Returns a new dict; the input is left untouched.
     """
     out = dict(params)
+    if is_manor_oauth_provider(config.server_key):
+        out.pop("access_type", None)
+        out.pop("prompt", None)
     if config.server_key in _CLIENT_KEY_PROVIDERS and "client_id" in out:
         out["client_key"] = out.pop("client_id")
     if config.server_key in _GOOGLE_PROVIDERS:
@@ -453,6 +478,9 @@ def apply_authorize_param_conventions(
             out.pop(key, None)
         out["integration_type"] = "0"
         out["permissions"] = "68672"
+    if config.server_key == "lark":
+        for key in ("access_type", "prompt"):
+            out.pop(key, None)
     if config.server_key == "notion":
         for key in (
             "scope",
@@ -505,6 +533,8 @@ def build_token_request_auth(
         # and requires a JSON token request body.
         headers["Content-Type"] = "application/json"
         out_body.pop("client_id", None)
+    if config.server_key == "lark":
+        headers["Content-Type"] = "application/json; charset=utf-8"
 
     if config.server_key in _CLIENT_KEY_PROVIDERS and "client_id" in out_body:
         out_body["client_key"] = out_body.pop("client_id")
@@ -522,7 +552,11 @@ async def resolve_oauth_config(
     seed_oauth_clients_from_env), but can still recover env-seeded rows
     whose encrypted ref became unreadable.
     """
-    meta = _PROVIDER_OAUTH_META.get(server_key)
+    meta = (
+        manor_oauth_endpoints(server_key)
+        if is_manor_oauth_provider(server_key)
+        else _PROVIDER_OAUTH_META.get(server_key)
+    )
     if not meta:
         return None
 
@@ -530,6 +564,7 @@ async def resolve_oauth_config(
     server = (await db.execute(
         select(MCPServer).where(MCPServer.server_key == server_key)
     )).scalar_one_or_none()
+    await release_read_transaction(db)
 
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
@@ -548,7 +583,7 @@ async def resolve_oauth_config(
         # Google verifies the exact scope strings deployed by the application.
         # Never let a stale DB/admin override silently diverge from the reviewed
         # static manifest; all four Google services share this verified client.
-        if scope_override and server_key not in _GOOGLE_PROVIDERS:
+        if scope_override and server_key not in _GOOGLE_PROVIDERS and not is_manor_oauth_provider(server_key):
             scopes = str(scope_override)
         if client_id:
             source = (cfg.get("_oauth_source") or "db").strip() or "db"

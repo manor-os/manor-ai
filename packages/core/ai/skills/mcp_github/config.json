@@ -25,5 +25,9 @@
     "mcp__github__search_code",
     "mcp__github__list_runs",
     "mcp__github__get_job_logs"
-  ]
+  ],
+  "search": {
+    "terms": ["git", "repo", "repository", "pr", "merge request", "commit", "code search", "ci", "workflow runs"],
+    "examples": ["create github issue for bug", "open pull request from branch", "comment on pr review", "check failing github actions run"]
+  }
 }

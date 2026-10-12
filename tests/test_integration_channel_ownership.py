@@ -134,7 +134,8 @@ async def test_discord_channel_binding_records_connection_owner(client):
 
 
 @pytest.mark.asyncio
-async def test_whatsapp_binding_requires_one_exact_active_subscription(client):
+@pytest.mark.parametrize("workspace_status", ["active", "paused"])
+async def test_whatsapp_binding_requires_one_exact_active_subscription(client, workspace_status):
     from packages.core.models.document import Channel
     from packages.core.models.workspace import Agent, AgentSubscription, Workspace
     from packages.core.services.integration_service import (
@@ -154,7 +155,7 @@ async def test_whatsapp_binding_requires_one_exact_active_subscription(client):
         workspace = Workspace(
             entity_id=owner["entity_id"],
             name="WhatsApp Support",
-            status="active",
+            status=workspace_status,
         )
         agent = Agent(
             entity_id=owner["entity_id"],

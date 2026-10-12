@@ -8,7 +8,9 @@
   "description": "Use the connected user's official Robinhood Trading MCP tools. Discover live schemas before use; account consent may include trading permissions.",
   "version": "1.0.0",
   "tags": ["robinhood", "finance", "remote-mcp", "runtime-guidance", "builtin", "mcp"],
-  "discoverable_provider_keys": ["robinhood"],
-  "discoverable_tool_prefixes": ["mcp__robinhood__"],
-  "tools": []
+  "tools": ["search_tools"],
+  "search": {
+    "terms": ["stocks", "brokerage", "holdings", "investments", "positions", "crypto", "shares", "buying power"],
+    "examples": ["show my robinhood portfolio holdings", "add ticker to robinhood watchlist", "research stock before buying", "what are my positions"]
+  }
 }

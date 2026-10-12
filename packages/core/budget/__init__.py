@@ -47,6 +47,8 @@ from packages.core.budget.enforcement import (
     check_worker_budget,
 )
 from packages.core.budget.service import (
+    CreditUsageSummary,
+    get_workspace_credit_usage_summary,
     get_budget_status,
     get_workspace_spent_credits_per_kind,
     set_workspace_budget,
@@ -61,6 +63,8 @@ __all__ = [
     "BudgetExceeded",
     "check_workspace_budget",
     "check_worker_budget",
+    "CreditUsageSummary",
+    "get_workspace_credit_usage_summary",
     "get_budget_status",
     "get_workspace_spent_credits_per_kind",
     "set_workspace_budget",

@@ -20,6 +20,7 @@ from packages.core.models.execution import ExecutionPlan, ExecutionStep
 from packages.core.models.task import Task
 from packages.core.models.user import User
 from packages.core.models.worker import Worker, WorkLease
+from packages.core.models.workspace import Workspace
 from packages.core.workers import internal
 
 
@@ -65,6 +66,7 @@ async def test_lease_snapshot_inherits_task_proposal_external_authorization(
                 role="owner",
                 status="active",
             ),
+            Workspace(id=workspace_id, entity_id=entity_id, name="Publishing"),
             Task(
                 id=task_id,
                 entity_id=entity_id,
@@ -154,6 +156,7 @@ async def test_build_agent_context_adds_worker_runtime_metadata_to_envelope(monk
         return None
 
     async def fake_resolve_workspace_runtime(*_args, **_kwargs):
+        captured["runtime_scope"] = _kwargs
         return SimpleNamespace(
             workspace_id="workspace",
             task_id="task",
@@ -208,11 +211,14 @@ async def test_build_agent_context_adds_worker_runtime_metadata_to_envelope(monk
         entity_id="entity",
         workspace_id="workspace",
         task_id="task",
-        runtime_metadata={"proposal_external_authorization": authorization},
+        agent_subscription_id="resolved-subscription",
+        runtime_metadata={"proposal_external_authorization": authorization, "agent_subscription_id": "stale-subscription"},
     )
 
     assert captured["request"].metadata["proposal_external_authorization"] == authorization
     assert ctx.runtime_envelope.metadata["proposal_external_authorization"] == authorization
+    assert captured["runtime_scope"]["agent_subscription_id"] == "resolved-subscription"
+    assert ctx.runtime_envelope.metadata["agent_subscription_id"] == "resolved-subscription"
 
 
 def test_exec_subagent_forwards_snapshot_runtime_metadata_to_context_builder(monkeypatch):
@@ -285,6 +291,7 @@ def test_exec_subagent_forwards_snapshot_runtime_metadata_to_context_builder(mon
                 "params": {"prompt": "Publish one video"},
                 "entity_id": "entity",
                 "resolved_agent_id": "agent",
+                "resolved_subscription_id": "resolved-subscription",
                 "user_id": "user",
                 "workspace_id": "workspace",
                 "conversation_id": "conversation",
@@ -300,6 +307,7 @@ def test_exec_subagent_forwards_snapshot_runtime_metadata_to_context_builder(mon
     assert context_kwargs["runtime_metadata"] == {
         "proposal_external_authorization": authorization,
     }
+    assert context_kwargs["agent_subscription_id"] == "resolved-subscription"
     assert captured_envelope[0].metadata["proposal_external_authorization"] == authorization
     assert "PROPOSAL AUTHORIZATION RECOVERY STATE" not in captured_user_messages[0]
     assert (
